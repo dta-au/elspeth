@@ -97,8 +97,8 @@ class LookupConfig(BaseModel):
 
     model_config = {"extra": "forbid", "frozen": True}
 
-    target_entity: str  # Dataverse entity to bind to (e.g., "accounts")
-    target_field: str  # Navigation property name (e.g., "parentcustomerid")
+    target_entity: str = Field(description="Target Dataverse EntitySetName to bind to (e.g., 'accounts')")
+    target_field: str = Field(description="Target Dataverse navigation property name (e.g., 'parentcustomerid')")
 
     @field_validator("target_entity")
     @classmethod
@@ -138,7 +138,7 @@ class DataverseSinkConfig(DataPluginConfig):
 
     entity: str = Field(
         ...,
-        description="Target entity logical name",
+        description="Target Dataverse EntitySetName used in the OData collection path",
     )
     mode: Literal["upsert"] = Field(
         default="upsert",
@@ -273,7 +273,7 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b9fde372bcafd0bd"
+    source_file_hash: str | None = "sha256:8008b19c3d7e5aeb"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)
@@ -282,6 +282,35 @@ class DataverseSink(BaseSink, MemberSinkEffectCapability):
     effect_call_type = CallType.HTTP
     supported_effect_modes = frozenset({"upsert"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
+
+    usage_when_to_use: str = (
+        "Use for idempotent Dataverse upsert when every row has an explicit field mapping and a stable string alternate "
+        "key for the target entity set."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for create, update, delete, or bulk modes; duplicate alternate keys; arbitrary lookup URIs; or "
+        "endpoints outside approved Microsoft Dataverse domains."
+    )
+    example_use: str = """sinks:
+  contacts:
+    plugin: dataverse
+    options:
+      environment_url: https://tenant.crm.dynamics.com
+      auth:
+        method: managed_identity
+      entity: contacts
+      mode: upsert
+      field_mapping:
+        email: emailaddress1
+        full_name: fullname
+      alternate_key: emailaddress1
+      schema:
+        mode: fixed
+        fields:
+          - "email: str"
+          - "full_name: str"
+"""
+    capability_tags: tuple[str, ...] = ("dataverse", "odata", "crm", "upsert")
 
     @classmethod
     def _resolve_sink_effect_mode(

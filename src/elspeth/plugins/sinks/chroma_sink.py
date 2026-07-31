@@ -198,7 +198,7 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     name = "chroma_sink"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f65ddd42bba42646"
+    source_file_hash: str | None = "sha256:a0ab8790a4d281d0"
     config_model = ChromaSinkConfig
     supports_resume = False
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
@@ -206,6 +206,36 @@ class ChromaSink(BaseSink, MemberSinkEffectCapability):
     supported_effect_modes = frozenset({"overwrite"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
     effect_mode_remediation = "set on_duplicate=overwrite or choose a sink with a target-side effect marker"
+
+    usage_when_to_use: str = (
+        "Use when rows provide stable string IDs, string documents, and scalar metadata for semantic retrieval or RAG "
+        "in a Chroma collection."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use as an authoritative archive, for nested metadata or caller-supplied embeddings, for resume, or with "
+        "a duplicate policy other than recoverable overwrite."
+    )
+    example_use: str = """sinks:
+  semantic_index:
+    plugin: chroma_sink
+    options:
+      collection: customer_documents
+      mode: persistent
+      persist_directory: outputs/chroma/customer-documents
+      field_mapping:
+        id_field: document_id
+        document_field: body
+        metadata_fields:
+          - category
+      on_duplicate: overwrite
+      schema:
+        mode: fixed
+        fields:
+          - "document_id: str"
+          - "body: str"
+          - "category: str?"
+"""
+    capability_tags: tuple[str, ...] = ("chroma", "vector-store", "embedding", "rag")
 
     @classmethod
     def _resolve_sink_effect_mode(

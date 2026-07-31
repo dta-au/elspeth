@@ -349,7 +349,7 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
     name = "azure_blob"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:d8b04581f0fb6696"
+    source_file_hash: str | None = "sha256:4110c8bcefdca79f"
     config_model = AzureBlobSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
@@ -359,6 +359,29 @@ class AzureBlobSink(BaseSink, RestagingSinkEffectCapability):
 
     # Resume capability: Azure Blobs are immutable - cannot append
     supports_resume: bool = False
+
+    usage_when_to_use: str = (
+        "Use when one bounded run must publish a cumulative CSV, JSON, or JSONL artifact to Azure Blob Storage using "
+        "exactly one operator-approved authentication method."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for append/resume, per-row blobs, mixed authentication methods, or an upload whose serialized "
+        "content cannot be kept within the configured bound."
+    )
+    example_use: str = """sinks:
+  results:
+    plugin: azure_blob
+    options:
+      use_managed_identity: true
+      account_url: https://records.blob.core.windows.net
+      container: outbound
+      blob_path: "runs/{{ run_id }}/results.jsonl"
+      format: jsonl
+      overwrite: false
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("azure", "blob", "cloud", "object-storage")
 
     @classmethod
     def _resolve_sink_effect_mode(

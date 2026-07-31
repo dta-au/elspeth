@@ -145,13 +145,32 @@ class CSVSink(BaseSink):
     name = "csv"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:22018817f8d787f2"
+    source_file_hash: str | None = "sha256:57a234f1305bdeca"
     config_model = CSVSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
     supported_effect_modes = frozenset({"append", "write"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS, SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT})
     supported_audit_export_formats = frozenset({AuditExportFormat.CSV})
+
+    usage_when_to_use: str = (
+        "Use for portable flat tabular output with controlled columns and headers, including append/resume workflows "
+        "whose first accepted row can lock an observed schema."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for nested or binary values, or when output columns may drift after the first accepted row; choose a "
+        "structured format instead."
+    )
+    example_use: str = """sinks:
+  results:
+    plugin: csv
+    options:
+      path: outputs/results.csv
+      collision_policy: auto_increment
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("csv", "file", "batch", "tabular")
 
     @classmethod
     def _resolve_sink_effect_mode(

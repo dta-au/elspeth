@@ -215,7 +215,7 @@ class DatabaseSink(BaseSink):
     name = "database"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b18cfa3366ecca05"
+    source_file_hash: str | None = "sha256:46a66b450425cba4"
     config_model = DatabaseSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.SQL
@@ -225,6 +225,33 @@ class DatabaseSink(BaseSink):
 
     # Resume capability: Database can append to existing tables
     supports_resume: bool = True
+
+    usage_when_to_use: str = (
+        "Use for transactional append to an operator-provisioned SQLite or PostgreSQL table when the target also provides "
+        "the declared exactly-once effect ledger."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use when ELSPETH would need to perform DDL, replace or drop a table, use an unsupported dialect, embed "
+        "credentials in YAML, or publish without the provisioned effect ledger."
+    )
+    example_use: str = """sinks:
+  results:
+    plugin: database
+    options:
+      url:
+        secret_ref: PROVISIONED_SQLITE_URL
+      table: processed_records
+      if_exists: append
+      effect_ledger:
+        table: _elspeth_sink_effects
+        schema_version: 1
+        permissions:
+          - insert
+          - select
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("database", "sql", "tabular", "exactly-once")
 
     @classmethod
     def _resolve_sink_effect_mode(
