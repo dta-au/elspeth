@@ -132,24 +132,25 @@ describe("AcknowledgementStack — ordering", () => {
   it("orders cards by pipeline step, then created_at", () => {
     useSessionStore.setState({
       compositionState: makeCompositionState([
-        makeNode("guided_xform_1", "llm"),
-        makeNode("guided_xform_2", "web_scrape"),
+        makeNode("llm", "llm"),
+        makeNode("web_scrape", "web_scrape"),
       ]),
     });
-    // e1 targets guided_xform_2 (later step) but was created earlier; e2
-    // targets guided_xform_1 (earlier step). Step order must win →
-    // guided_xform_1 (Summarise) before guided_xform_2 (Fetch). Both ids are
-    // Composer-generated, so they resolve via the plugin verb, not their id
-    // (R2-F8b: a user-named id would be title-cased instead — see
-    // interpretationStepLabel.test.ts).
+    // e1 targets node "web_scrape" (later step) but was created earlier; e2
+    // targets node "llm" (earlier step). Step order must win → llm
+    // (Summarise) before web_scrape (Fetch). Both ids are trivially their own
+    // plugin name, so they resolve via the plugin verb, not their id (R2-F8b:
+    // every id is author-chosen — there is no Composer id generator — so a
+    // real author-given name like `extract_invoice` would be title-cased
+    // instead; see interpretationStepLabel.test.ts).
     seedPending([
       makeEvent("e1", {
-        affected_node_id: "guided_xform_2",
+        affected_node_id: "web_scrape",
         kind: "llm_model_choice",
         created_at: "2026-06-20T00:00:00Z",
       }),
       makeEvent("e2", {
-        affected_node_id: "guided_xform_1",
+        affected_node_id: "llm",
         kind: "llm_model_choice",
         created_at: "2026-06-22T00:00:00Z",
       }),

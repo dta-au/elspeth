@@ -2,13 +2,17 @@
 // interpretationStepLabel.ts — humanise an interpretation event's
 // affected_node_id into an operator-facing step label.
 //
-// Internal node ids (e.g. `guided_xform_1`) must not leak into user-facing
-// copy — those still resolve to a per-plugin label ("Summarise", "Fetch",
-// "Output", …). A user-meaningful node id (e.g. `extract_invoice`, chosen by
-// the author) is preferred instead: title-casing the author's own name for
-// the step reads better than a generic plugin verb once the pipeline has more
-// than one node of the same plugin. The raw id is the fallback when the node
-// is absent from the composition entirely.
+// Every node id in a composition is author/LLM-chosen — there is no
+// Composer-side id generator (`transforms.py` takes the caller's id
+// verbatim; the only synthesis anywhere is the unrelated `fork_<connection>`
+// naming on a different path). So the only id NOT worth title-casing as a
+// "name" is one that is trivially just the plugin name (`llm`, `llm_2`, …) —
+// those still resolve to the per-plugin label ("Summarise", "Fetch",
+// "Output", …). Anything else (e.g. `extract_invoice`, or a semantically
+// named id like `llm_rate_coolness`) is title-cased and used as the author's
+// own name for the step — that reads better than a generic plugin verb once
+// the pipeline has more than one node of the same plugin. The raw id is the
+// fallback when the node is absent from the composition entirely.
 //
 // Presentational only — reads existing store state, never mutates.
 // ============================================================================
@@ -25,12 +29,21 @@ const PLUGIN_STEP_LABELS: Record<string, string> = {
   field_mapper: "Output",
 };
 
+/** Escape a string for literal use inside a RegExp source. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
- * Ids the Composer generates itself (`guided_xform_1`, `guided_llm_2`, …) —
- * never author-chosen, so never worth title-casing as a "name". Any id NOT
- * matching this pattern is treated as user-meaningful.
+ * True when `id` is trivially just the plugin name (`llm`) or the plugin name
+ * plus a bare numeric suffix (`llm_2`) — the only shape that carries no
+ * author intent, since every id is author/LLM-chosen and there is no id
+ * generator to detect instead. Anything else is a real, author-given name.
  */
-const GENERATED_NODE_ID_RE = /^guided_[a-z]+_\d+$/;
+function isPluginDerivedId(id: string, plugin: string): boolean {
+  if (id === plugin) return true;
+  return new RegExp(`^${escapeRegExp(plugin)}(_\\d+)?$`).test(id);
+}
 
 /** Title-case a snake/space-delimited string ("field_mapper" → "Field Mapper"). */
 function titleCase(value: string): string {
@@ -75,10 +88,9 @@ export function resolveNodePlugin(
 /**
  * Step label for a composition node id, or null when the id does not resolve
  * (component absent from the composition). THE single choke point for the
- * node-name preference: a user-meaningful id (anything but the Composer's
- * own `guided_<plugin>_<n>` generated form) is title-cased and used as-is —
- * the author's own name for the step beats a generic plugin verb. A
- * generated id falls back to `stepLabelForPlugin`.
+ * node-name preference: an id that is trivially just its own plugin's name
+ * (`isPluginDerivedId`) falls back to `stepLabelForPlugin`; any other id is
+ * the author's own name for the step and is title-cased as-is.
  *
  * Returns null (not the raw id) on an unresolved id so callers can choose
  * their own "unknown" phrasing — `humaniseStepLabel` below falls back to the
@@ -92,7 +104,7 @@ export function stepLabelForNodeId(
 ): string | null {
   const plugin = resolveNodePlugin(state, nodeId);
   if (plugin === null || nodeId === null) return null;
-  if (GENERATED_NODE_ID_RE.test(nodeId)) {
+  if (isPluginDerivedId(nodeId, plugin)) {
     return stepLabelForPlugin(plugin);
   }
   return titleCase(nodeId);

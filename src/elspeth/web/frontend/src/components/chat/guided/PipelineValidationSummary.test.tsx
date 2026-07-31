@@ -546,6 +546,7 @@ describe("PipelineValidationSummary", () => {
     // and the card must agree either way.
     expect(status.textContent).toMatch(/The Rater step is waiting for your review\./);
     expect(status.textContent).not.toMatch(/pipeline_decision/);
+    expect(status.textContent).not.toMatch(/rater/);
     expect(status.textContent).not.toMatch(/'rater'/);
     // The verbatim dump survives behind the expander for the operator read.
     expect(screen.getByText("Technical details")).toBeInTheDocument();

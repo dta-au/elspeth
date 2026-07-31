@@ -1,8 +1,11 @@
 // ============================================================================
 // interpretationStepLabel.test.ts — coverage for humaniseStepLabel's node-name
-// preference (R2-F8b): a user-meaningful node id (e.g. `extract_invoice`) is
-// title-cased and shown as-is; a Composer-generated id (`guided_xform_1`)
-// still falls back to the per-plugin verb ("Summarise" for `llm`, …).
+// preference (R2-F8b). Every node id is author/LLM-chosen — there is no
+// Composer-side id generator — so the only id NOT title-cased as a name is
+// one that is trivially just its own plugin's name (`llm`, `llm_2`): those
+// still fall back to the per-plugin verb ("Summarise" for `llm`, …). Anything
+// else, including a semantically-named id like `llm_rate_coolness`, is
+// title-cased and shown as the author's own name for the step.
 // ============================================================================
 
 import { describe, it, expect } from "vitest";
@@ -61,9 +64,19 @@ describe("humaniseStepLabel — node-name preference (R2-F8b)", () => {
     expect(humaniseStepLabel(state, "extract_invoice")).toBe("Extract Invoice");
   });
 
-  it("falls back to the plugin verb for a Composer-generated node id", () => {
-    const state = makeCompositionState([makeNode("guided_xform_1", "llm")]);
-    expect(humaniseStepLabel(state, "guided_xform_1")).toBe("Summarise");
+  it("falls back to the plugin verb when the node id is exactly the plugin name (llm)", () => {
+    const state = makeCompositionState([makeNode("llm", "llm")]);
+    expect(humaniseStepLabel(state, "llm")).toBe("Summarise");
+  });
+
+  it("falls back to the plugin verb when the node id is the plugin name plus a numeric suffix (llm_2)", () => {
+    const state = makeCompositionState([makeNode("llm_2", "llm")]);
+    expect(humaniseStepLabel(state, "llm_2")).toBe("Summarise");
+  });
+
+  it("title-cases a semantically-named id even though it starts with the plugin name (llm_rate_coolness) — accepted behaviour, not a false positive on the plugin-derived check", () => {
+    const state = makeCompositionState([makeNode("llm_rate_coolness", "llm")]);
+    expect(humaniseStepLabel(state, "llm_rate_coolness")).toBe("Llm Rate Coolness");
   });
 
   it("title-cases a user-meaningful node id for a non-llm plugin too", () => {
@@ -91,9 +104,19 @@ describe("stepLabelForNodeId — the shared choke point (R2-F8b)", () => {
     expect(stepLabelForNodeId(state, "extract_invoice")).toBe("Extract Invoice");
   });
 
-  it("returns the plugin verb for a Composer-generated id", () => {
-    const state = makeCompositionState([makeNode("guided_xform_1", "llm")]);
-    expect(stepLabelForNodeId(state, "guided_xform_1")).toBe("Summarise");
+  it("returns the plugin verb when the id is exactly the plugin name", () => {
+    const state = makeCompositionState([makeNode("llm", "llm")]);
+    expect(stepLabelForNodeId(state, "llm")).toBe("Summarise");
+  });
+
+  it("returns the plugin verb when the id is the plugin name plus a numeric suffix", () => {
+    const state = makeCompositionState([makeNode("web_scrape_3", "web_scrape")]);
+    expect(stepLabelForNodeId(state, "web_scrape_3")).toBe("Fetch");
+  });
+
+  it("does not treat a plugin-name PREFIX as plugin-derived (llm_rate_coolness stays a real name)", () => {
+    const state = makeCompositionState([makeNode("llm_rate_coolness", "llm")]);
+    expect(stepLabelForNodeId(state, "llm_rate_coolness")).toBe("Llm Rate Coolness");
   });
 
   it("returns null (not the raw id) when the node is absent — callers that must not leak an internal id (validationHumaniser's PipelineValidationSummary / ReadinessRowDetail consumers) depend on this", () => {
@@ -105,6 +128,40 @@ describe("stepLabelForNodeId — the shared choke point (R2-F8b)", () => {
     expect(stepLabelForNodeId(null, "extract_invoice")).toBeNull();
     const state = makeCompositionState([makeNode("extract_invoice", "llm")]);
     expect(stepLabelForNodeId(state, null)).toBeNull();
+  });
+
+  // ── resolution fallthrough: sources and outputs (resolveNodePlugin also
+  // searches state.sources and state.outputs, not just state.nodes) ────────
+  it("resolves via state.sources and applies the SAME node-name preference (source id 'manifest', plugin 'csv' → title-cased, not the plugin verb)", () => {
+    const state: CompositionState = {
+      ...makeCompositionState([]),
+      sources: { manifest: { plugin: "csv", options: {} } },
+    };
+    expect(stepLabelForNodeId(state, "manifest")).toBe("Manifest");
+  });
+
+  it("resolves via state.sources and falls back to the plugin verb when the source key IS the plugin name", () => {
+    const state: CompositionState = {
+      ...makeCompositionState([]),
+      sources: { web_scrape: { plugin: "web_scrape", options: {} } },
+    };
+    expect(stepLabelForNodeId(state, "web_scrape")).toBe("Fetch");
+  });
+
+  it("resolves via state.outputs and applies the SAME node-name preference (output name 'results', plugin 'json' → title-cased)", () => {
+    const state: CompositionState = {
+      ...makeCompositionState([]),
+      outputs: [{ name: "results", plugin: "json", options: {} }],
+    };
+    expect(stepLabelForNodeId(state, "results")).toBe("Results");
+  });
+
+  it("resolves via state.outputs and falls back to the well-known plugin verb when the output name IS the plugin name", () => {
+    const state: CompositionState = {
+      ...makeCompositionState([]),
+      outputs: [{ name: "field_mapper", plugin: "field_mapper", options: {} }],
+    };
+    expect(stepLabelForNodeId(state, "field_mapper")).toBe("Output");
   });
 });
 
