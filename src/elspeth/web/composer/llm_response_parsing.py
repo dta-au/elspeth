@@ -428,12 +428,18 @@ def _safe_provider_request_id(response: Any | None) -> str | None:
 
     A legitimate id passes through unchanged; see
     :func:`_bounded_provider_string` for the truncation signal.
+
+    A blank id is absence, not a value — matching :func:`safe_response_model`
+    and the contract's own rule that a whitespace string reaching
+    ``_require_non_empty_str`` is a defect in the extraction site. Admitting
+    one on mere truthiness made the contract raise and destroyed the whole
+    audit row, which is precisely what bounding here exists to prevent.
     """
     if response is None:
         return None
     for attr in ("id", "request_id"):
         value = _provider_field(response, attr)
-        if isinstance(value, str) and value:
+        if isinstance(value, str) and value.strip():
             return _bounded_provider_string(value, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
     return None
 

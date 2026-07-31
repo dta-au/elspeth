@@ -449,8 +449,22 @@ class TestProviderRequestIdTruncatesRatherThanDisappears:
 
         assert _envelope_call(record)["provider_request_id"] == record.provider_request_id
 
-    @pytest.mark.parametrize("request_id", (7, 3.5, [], {}, None, ""))
-    def test_non_string_or_empty_request_id_is_absence_not_a_crash(self, request_id: Any) -> None:
+    @pytest.mark.parametrize("request_id", (7, 3.5, [], {}, None, "", "   ", "\t\n"))
+    def test_non_string_or_blank_request_id_is_absence_not_a_crash(self, request_id: Any) -> None:
+        """A blank id must be absence — admitting it raised and lost the row.
+
+        ``_require_non_empty_str`` rejects a whitespace-only string, so a
+        short blank id admitted on mere truthiness reached the contract and
+        raised, destroying the audit row on exactly the path this bound
+        exists to keep alive. Blank is now absence, as it already was for
+        ``model_returned``.
+        """
         record = _record({"id": request_id, "choices": []})
 
         assert record.provider_request_id is None
+
+    def test_a_blank_id_falls_through_to_a_usable_request_id(self) -> None:
+        """Blank is absence, so the preference order continues past it."""
+        record = _record({"id": "   ", "request_id": "req-fallback", "choices": []})
+
+        assert record.provider_request_id == "req-fallback"
