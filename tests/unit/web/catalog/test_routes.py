@@ -117,6 +117,14 @@ class TestListSources:
         names = [e["name"] for e in resp.json()]
         assert "text" in names
 
+    def test_internal_null_source_is_not_listed(self, client: TestClient) -> None:
+        resp = client.get("/api/catalog/sources")
+        assert resp.status_code == 200
+        sources = resp.json()
+
+        assert "null" not in {source["name"] for source in sources}
+        assert "source:null" not in {f"{source['plugin_type']}:{source['name']}" for source in sources}
+
     def test_csv_source_summary_includes_reference_content(self, client: TestClient) -> None:
         """Wire-shape pin: catalog API returns canonical CSV reference content."""
         resp = client.get("/api/catalog/sources")

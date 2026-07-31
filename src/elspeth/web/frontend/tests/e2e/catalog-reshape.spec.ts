@@ -128,6 +128,9 @@ test.describe("catalog-reshape — Phase 7 demo path", () => {
     ).toHaveCount(0);
 
     const sourcePanel = drawer.getByRole("tabpanel", { name: /sources/i });
+    await expect(
+      sourcePanel.getByRole("article", { name: "Resume Placeholder" }),
+    ).toHaveCount(0);
     const csvSource = sourcePanel.getByRole("article", { name: "CSV" });
     const csvDetails = csvSource.getByRole("button", {
       name: /reference details for csv/i,
