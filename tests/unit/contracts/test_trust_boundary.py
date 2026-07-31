@@ -17,6 +17,7 @@ import pytest
 
 from elspeth.contracts.trust_boundary import (
     TrustBoundaryMetadata,
+    observation_boundary,
     trust_boundary,
 )
 
@@ -309,3 +310,46 @@ def test_non_raising_rejects_test_ref() -> None:
         )
         def contradictory(arguments: dict[str, Any]) -> Any:
             return arguments.get("x")
+
+
+def test_observation_boundary_is_non_raising_passthrough_with_preserved_signature() -> None:
+    """The distinct observation marker delegates to the non-raising runtime contract."""
+
+    def original(arguments: dict[str, Any], *, default: str = "missing") -> str:
+        return arguments.get("value", default)
+
+    decorated = observation_boundary(
+        tier=3,
+        source="optional external observation",
+        source_param="arguments",
+        suppresses=("R1",),
+        invariant="returns the default on absence; never raises on arguments",
+    )(original)
+
+    assert decorated({"value": "present"}) == "present"
+    assert decorated({}) == "missing"
+    assert inspect.signature(decorated) == inspect.signature(original)
+    assert decorated.__trust_boundary__.func is original  # type: ignore[attr-defined]
+    assert decorated.__trust_boundary__.non_raising is True  # type: ignore[attr-defined]
+
+
+def test_observation_boundary_cannot_be_stacked_with_trust_boundary() -> None:
+    """Both public marker forms share the one-boundary-per-function invariant."""
+    with pytest.raises(TypeError, match="cannot be stacked"):
+
+        @observation_boundary(
+            tier=3,
+            source="outer observation",
+            source_param="arguments",
+            suppresses=("R1",),
+            invariant="returns None on absence",
+        )
+        @trust_boundary(
+            tier=3,
+            source="inner validation",
+            source_param="arguments",
+            suppresses=("R1",),
+            invariant="raises ValueError on malformed input",
+        )
+        def _handler(arguments: dict[str, Any]) -> Any:
+            return arguments.get("value")

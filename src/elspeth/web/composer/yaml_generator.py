@@ -33,7 +33,7 @@ from typing import Any, TypedDict, cast
 import yaml
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.guided.state_machine import TerminalKind
 from elspeth.web.composer.guided_blob_refs import (
     GUIDED_REVIEWED_BLOB_PATH_KEYS,
@@ -70,25 +70,23 @@ class PublicCompositionDict(TypedDict):
     outputs: list[dict[str, Any]]
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored source options mapping (untrusted blob_ref value)",
     source_param="options",
     suppresses=("R1",),
     invariant="returns True only when blob_ref is present and non-null; absent keys yield False, never raise",
-    non_raising=True,
 )
 def _has_blob_binding(options: dict[str, Any]) -> bool:
     return options.get("blob_ref") is not None
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored source options mapping (untrusted mode value)",
     source_param="options",
     suppresses=("R1",),
     invariant="returns True only for the exact 'bind_source' mode string; absent or mistyped mode yields False, never raises",
-    non_raising=True,
 )
 def _has_bind_source_mode(options: dict[str, Any]) -> bool:
     return options.get("mode") == "bind_source"

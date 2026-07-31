@@ -6,11 +6,10 @@ recognizes only its built-in marker modules unless an operator-authorized pack
 maps another vocabulary. This pack supplies that mapping without importing or
 executing ELSPETH application code.
 
-Wardline 1.5.0's pack API cannot branch on ELSPETH's literal
-``non_raising=True`` keyword: a pack seed receives only parsed ``TaintState``
-level arguments, not the decorator AST. The canonical gate therefore reports
-Wardline's active boundary-integrity findings for those marker forms rather
-than hiding them with a severity override or suppression.
+ELSPETH uses a distinct ``observation_boundary`` marker for return-not-raise
+paths which inspect external input without promoting it to assured data. The
+separate function identity is intentional: Wardline dispatches on marker FQN
+and cannot branch on arbitrary literal decorator keywords.
 """
 
 from __future__ import annotations
@@ -27,6 +26,11 @@ def _seed_elspeth_boundary(_levels: Mapping[str, TaintState]) -> FunctionTaint:
     return FunctionTaint(TaintState.EXTERNAL_RAW, TaintState.ASSURED)
 
 
+def _seed_elspeth_observation(_levels: Mapping[str, TaintState]) -> FunctionTaint:
+    """Model observation output as still derived from raw external input."""
+    return FunctionTaint(TaintState.EXTERNAL_RAW, TaintState.EXTERNAL_RAW)
+
+
 ELSPETH_TRUST_BOUNDARY = BoundaryType(
     canonical_name="trust_boundary",
     module_prefix="elspeth.contracts.trust_boundary",
@@ -38,5 +42,17 @@ ELSPETH_TRUST_BOUNDARY = BoundaryType(
     builtin=False,
 )
 
+ELSPETH_OBSERVATION_BOUNDARY = BoundaryType(
+    canonical_name="observation_boundary",
+    module_prefix="elspeth.contracts.trust_boundary",
+    group=1,
+    level_args=(),
+    seed=_seed_elspeth_observation,
+    builtin=False,
+)
+
 # Wardline's pack loader extends the built-in grammar with this custom slice.
-grammar = TrustGrammar(boundary_types=(ELSPETH_TRUST_BOUNDARY,), rules=())
+grammar = TrustGrammar(
+    boundary_types=(ELSPETH_TRUST_BOUNDARY, ELSPETH_OBSERVATION_BOUNDARY),
+    rules=(),
+)

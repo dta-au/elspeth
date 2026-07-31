@@ -8,7 +8,7 @@ from typing import Any, Final
 from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.plugins.transforms.llm.providers.openrouter import (
     OPENROUTER_BASE_URL,
     normalize_openrouter_base_url,
@@ -56,7 +56,7 @@ _TRUE_LITERALS: Final[frozenset[str]] = frozenset({"1", "true", "t", "yes", "y",
 _INT_ADAPTER: Final[TypeAdapter[int]] = TypeAdapter(int)
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored aws_s3 source plugin (untrusted author-supplied selection)",
     source_param="plugin",
@@ -65,7 +65,6 @@ _INT_ADAPTER: Final[TypeAdapter[int]] = TypeAdapter(int)
         "non-aws_s3 source plugins are ignored; every aws_s3 source returns the static "
         "policy error because S3 reads would use server credentials with author-chosen keys; never raises"
     ),
-    non_raising=True,
 )
 def web_aws_s3_source_policy_error(plugin: str | None) -> str | None:
     """Reject web-authored AWS S3 sources that would read with server AWS credentials."""
@@ -74,7 +73,7 @@ def web_aws_s3_source_policy_error(plugin: str | None) -> str | None:
     return AWS_S3_SOURCE_POLICY_ERROR
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored aws_s3 source/sink options (untrusted author-supplied mapping)",
     source_param="options",
@@ -83,7 +82,6 @@ def web_aws_s3_source_policy_error(plugin: str | None) -> str | None:
         "non-aws_s3 plugins are ignored; omitted or explicit-null endpoint_url is allowed; "
         "every non-null aws_s3 endpoint_url returns the static policy error; never raises"
     ),
-    non_raising=True,
 )
 def web_aws_s3_endpoint_url_policy_error(
     plugin: str | None,
@@ -97,7 +95,7 @@ def web_aws_s3_endpoint_url_policy_error(
     return AWS_S3_ENDPOINT_URL_POLICY_ERROR
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored provider_config use_managed_identity value (untrusted scalar)",
     source_param="value",
@@ -106,7 +104,6 @@ def web_aws_s3_endpoint_url_policy_error(
         "recognized false-y forms return False, recognized truthy forms return True, and any "
         "ambiguous present value fails closed to True (policy error fires); never raises"
     ),
-    non_raising=True,
 )
 def _provider_config_enables_managed_identity(value: object) -> bool:
     """Return whether a raw web-authored value enables managed identity.
@@ -131,7 +128,7 @@ def _provider_config_enables_managed_identity(value: object) -> bool:
     return bool(value)
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored RAG provider config (untrusted composer-author options mapping)",
     source_param="options",
@@ -141,7 +138,6 @@ def _provider_config_enables_managed_identity(value: object) -> bool:
         "provider_config enables managed identity; any missing or malformed key fails "
         "closed to None (no policy error) and never raises"
     ),
-    non_raising=True,
 )
 def web_rag_provider_config_policy_error(options: Mapping[str, Any]) -> str | None:
     """Reject web-authored RAG Azure Search configs that enable managed identity."""
@@ -168,7 +164,7 @@ def _positive_int_or_none(value: object) -> int | None:
     return None
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web/composer-authored LLM transform options (untrusted author-supplied mapping)",
     source_param="options",
@@ -178,7 +174,6 @@ def _positive_int_or_none(value: object) -> int | None:
         "malformed or unbounded retry budget returns LLM_RETRY_BUDGET_POLICY_ERROR; "
         "never raises on malformed options"
     ),
-    non_raising=True,
 )
 def web_llm_retry_budget_policy_error(plugin: str | None, options: Mapping[str, Any]) -> str | None:
     """Reject web-authored sequential multi-query LLM configs with unbounded local retries."""
@@ -200,7 +195,7 @@ def web_llm_retry_budget_policy_error(plugin: str | None, options: Mapping[str, 
     return None
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored pipeline LLM provider config (untrusted author-supplied options mapping)",
     source_param="options",
@@ -210,7 +205,6 @@ def web_llm_retry_budget_policy_error(plugin: str | None, options: Mapping[str, 
         "explicit base_url is rejected with LLM_BASE_URL_POLICY_ERROR unless it "
         "normalises to the canonical endpoint; never raises on malformed options"
     ),
-    non_raising=True,
 )
 def web_llm_base_url_policy_error(plugin: str | None, options: Mapping[str, Any]) -> str | None:
     """Reject web-authored OpenRouter LLM configs that override base_url.
@@ -248,7 +242,7 @@ def web_llm_base_url_policy_error(plugin: str | None, options: Mapping[str, Any]
     return LLM_BASE_URL_POLICY_ERROR
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored LLM tracing options (untrusted author-supplied mapping)",
     source_param="options",
@@ -257,7 +251,6 @@ def web_llm_base_url_policy_error(plugin: str | None, options: Mapping[str, Any]
         "non-LLM plugins and absent/null tracing return None; every non-null LLM tracing "
         "value returns a static policy error without inspecting or echoing nested values; never raises"
     ),
-    non_raising=True,
 )
 def web_llm_tracing_policy_error(plugin: str | None, options: Mapping[str, Any]) -> str | None:
     """Reject every author-supplied LLM tracing configuration."""

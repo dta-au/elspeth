@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.tools import is_approval_required_blob_store_only_mutation_tool
 
@@ -54,13 +54,12 @@ _PROPOSAL_COMPOSER_CONTEXT_FIELDS: tuple[str, ...] = (
 )
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="persisted LLM tool-call arguments of a stored CompositionProposalRecord (Tier-3 on read-back)",
     source_param="arguments",
     suppresses=("R5",),
     invariant="returns None on any absent/wrong-typed branch of arguments.source.inline_blob.content; never raises on arguments",
-    non_raising=True,
 )
 def _inline_blob_content_for_proposal(
     proposal: CompositionProposalRecord,

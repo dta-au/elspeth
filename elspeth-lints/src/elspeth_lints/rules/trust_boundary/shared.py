@@ -27,56 +27,44 @@ from __future__ import annotations
 
 import ast
 import hashlib
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 from elspeth_lints.core.allowlist import Allowlist, AllowlistEntry, FindingKey, load_allowlist, verify_entry_binding_against_finding
 from elspeth_lints.core.allowlist_governance import allowlist_governance_findings
+from elspeth_lints.core.boundary_aliases import (
+    BoundaryDecoratorKind,
+    argument_names,
+    assignment_target_names,
+    evaluate_alias_flow,
+    evaluate_finally_entry_aliases,
+    function_local_binding_names,
+    identical_alias_join,
+    import_alias_effect,
+    match_pattern_binding_names,
+    resolve_boundary_kind,
+)
 from elspeth_lints.core.protocols import Finding, RuleMetadata
 
-_TRUST_BOUNDARY_EXPORT = "elspeth.contracts.trust_boundary"
-_TRUST_BOUNDARY_FUNCTION = "elspeth.contracts.trust_boundary.trust_boundary"
-_TRUST_BOUNDARY_QUALIFIED_NAMES: frozenset[str] = frozenset(
-    {
-        _TRUST_BOUNDARY_EXPORT,
-        _TRUST_BOUNDARY_FUNCTION,
-    }
-)
 TRUST_BOUNDARY_ALLOWLIST_DIR = "enforce_trust_boundary_honesty"
 
 
-def _dotted_name(expr: ast.expr) -> tuple[str, ...] | None:
-    if isinstance(expr, ast.Name):
-        return (expr.id,)
-    if isinstance(expr, ast.Attribute):
-        base = _dotted_name(expr.value)
-        if base is None:
-            return None
-        return (*base, expr.attr)
-    return None
+@dataclass(frozen=True, slots=True)
+class BoundaryDecoratorMatch:
+    """Import-resolved ELSPETH boundary marker and decorated function."""
+
+    function: ast.FunctionDef | ast.AsyncFunctionDef
+    call: ast.Call
+    kind: BoundaryDecoratorKind
+
+    @property
+    def non_raising(self) -> bool:
+        return self.kind == "observation"
 
 
-def _matches_elspeth_trust_boundary_import(func: ast.expr, import_aliases: Mapping[str, str]) -> bool:
-    parts = _dotted_name(func)
-    if parts is None:
-        return False
-
-    alias_target = import_aliases.get(parts[0])
-    dotted = ".".join(parts)
-    if alias_target is None:
-        return dotted in _TRUST_BOUNDARY_QUALIFIED_NAMES
-
-    target_parts = tuple(alias_target.split("."))
-    if parts[: len(target_parts)] == target_parts:
-        resolved = dotted
-    else:
-        resolved = ".".join((*target_parts, *parts[1:]))
-    return resolved in _TRUST_BOUNDARY_QUALIFIED_NAMES
-
-
-def _is_trust_boundary_decorator(decorator: ast.expr, *, import_aliases: Mapping[str, str]) -> ast.Call | None:
+def _boundary_decorator(decorator: ast.expr, *, import_aliases: Mapping[str, str]) -> tuple[ast.Call, BoundaryDecoratorKind] | None:
     """Return the ``ast.Call`` if ``decorator`` references ``trust_boundary``.
 
     See module docstring for the recognised spellings. Returns ``None`` for any
@@ -84,46 +72,101 @@ def _is_trust_boundary_decorator(decorator: ast.expr, *, import_aliases: Mapping
     """
     if not isinstance(decorator, ast.Call):
         return None
-    return decorator if _matches_elspeth_trust_boundary_import(decorator.func, import_aliases) else None
+    kind = resolve_boundary_kind(decorator.func, import_aliases)
+    return (decorator, kind) if kind is not None else None
 
 
 class _TrustBoundaryDecoratorVisitor(ast.NodeVisitor):
     """Find Elspeth trust-boundary decorators with lexical import awareness."""
 
     def __init__(self) -> None:
-        self.matches: list[tuple[ast.FunctionDef | ast.AsyncFunctionDef, ast.Call]] = []
-        self._import_alias_stack: list[dict[str, str]] = [{}]
+        self.matches: list[BoundaryDecoratorMatch] = []
+        self._import_alias_stack: list[tuple[str, dict[str, str]]] = [("module", {})]
+        self._import_alias_mutation_stack: list[tuple[dict[str, str], set[str]]] = []
 
     @property
     def _import_aliases(self) -> dict[str, str]:
-        return self._import_alias_stack[-1]
+        return self._import_alias_stack[-1][1]
 
-    def _push_scope(self) -> None:
-        self._import_alias_stack.append(dict(self._import_aliases))
+    def _push_scope(self, kind: str, *, local_bindings: Iterable[str] = ()) -> None:
+        """Enter a scope using the nearest Python closure-capable frame.
+
+        A class namespace is visible while method decorators execute, but it
+        is not a closure for method bodies or nested classes. Skipping class
+        frames prevents class-local imports from leaking into method bodies
+        while preserving aliases from an enclosing function or module.
+        """
+        for frame_kind, aliases in reversed(self._import_alias_stack):
+            if frame_kind != "class":
+                scoped_aliases = dict(aliases)
+                for name in local_bindings:
+                    scoped_aliases.pop(name, None)
+                self._import_alias_stack.append((kind, scoped_aliases))
+                return
+        raise AssertionError("module import-alias scope is always present")
 
     def _pop_scope(self) -> None:
         self._import_alias_stack.pop()
 
+    def _record_alias_mutations(self, names: Iterable[str]) -> None:
+        bound_names = set(names)
+        aliases = self._import_aliases
+        for flow_aliases, mutations in self._import_alias_mutation_stack:
+            if flow_aliases is aliases:
+                mutations.update(bound_names)
+
+    def _invalidate_aliases(self, names: Iterable[str]) -> None:
+        bound_names = set(names)
+        self._record_alias_mutations(bound_names)
+        for name in bound_names:
+            self._import_aliases.pop(name, None)
+
+    def _apply_import(self, node: ast.Import | ast.ImportFrom) -> None:
+        effect = import_alias_effect(node)
+        if effect.clears_all:
+            self._record_alias_mutations(self._import_aliases)
+            self._import_aliases.clear()
+        self._invalidate_aliases(effect.invalidated)
+        for name, target in effect.proven:
+            self._record_alias_mutations((name,))
+            self._import_aliases[name] = target
+
+    def _restore_aliases(self, snapshot: Mapping[str, str]) -> None:
+        self._import_aliases.clear()
+        self._import_aliases.update(snapshot)
+
+    def _join_alias_paths(self, paths: Sequence[Mapping[str, str]]) -> None:
+        self._restore_aliases(identical_alias_join(paths))
+
+    def _visit_statements(self, statements: Sequence[ast.stmt]) -> None:
+        for statement in statements:
+            self.visit(statement)
+
+    def _visit_tracked_statements(self, statements: Sequence[ast.stmt]) -> tuple[dict[str, str], set[str]]:
+        aliases = self._import_aliases
+        mutations: set[str] = set()
+        self._import_alias_mutation_stack.append((aliases, mutations))
+        try:
+            self._visit_statements(statements)
+        finally:
+            popped_aliases, popped_mutations = self._import_alias_mutation_stack.pop()
+            if popped_aliases is not aliases or popped_mutations is not mutations:
+                raise AssertionError("honesty alias mutation stack is unbalanced")
+        return dict(aliases), mutations
+
     def visit_Import(self, node: ast.Import) -> None:
-        for alias in node.names:
-            root_name = alias.name.split(".", 1)[0]
-            self._import_aliases[alias.asname or root_name] = alias.name if alias.asname else root_name
+        self._apply_import(node)
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
-        if node.module is None or node.level != 0:
-            return
-        for alias in node.names:
-            if alias.name == "*":
-                continue
-            self._import_aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+        self._apply_import(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
-        self._push_scope()
+        self._push_scope("class")
         try:
-            for statement in node.body:
-                self.visit(statement)
+            self._visit_statements(node.body)
         finally:
             self._pop_scope()
+        self._invalidate_aliases((node.name,))
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._visit_function(node)
@@ -133,20 +176,213 @@ class _TrustBoundaryDecoratorVisitor(ast.NodeVisitor):
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for decorator in node.decorator_list:
-            call = _is_trust_boundary_decorator(decorator, import_aliases=self._import_aliases)
-            if call is not None:
-                self.matches.append((node, call))
+            matched = _boundary_decorator(decorator, import_aliases=self._import_aliases)
+            if matched is not None:
+                call, kind = matched
+                self.matches.append(BoundaryDecoratorMatch(function=node, call=call, kind=kind))
                 # A function should have at most one @trust_boundary; if a
                 # malformed decorator stack accidentally repeats it, we still
                 # yield the first only — duplicate findings would be noise.
                 break
 
-        self._push_scope()
+        self._push_scope("function", local_bindings=function_local_binding_names(node))
         try:
-            for statement in node.body:
-                self.visit(statement)
+            self._visit_statements(node.body)
         finally:
             self._pop_scope()
+        self._invalidate_aliases((node.name,))
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._push_scope("function", local_bindings=argument_names(node.args))
+        try:
+            self.visit(node.body)
+        finally:
+            self._pop_scope()
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        self.generic_visit(node)
+        for target in node.targets:
+            self._invalidate_aliases(assignment_target_names(target))
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        self.generic_visit(node)
+        if node.value is not None:
+            self._invalidate_aliases(assignment_target_names(node.target))
+
+    def visit_AugAssign(self, node: ast.AugAssign) -> None:
+        self.generic_visit(node)
+        self._invalidate_aliases(assignment_target_names(node.target))
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.generic_visit(node)
+        self._invalidate_aliases(assignment_target_names(node.target))
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        self.generic_visit(node)
+        for target in node.targets:
+            self._invalidate_aliases(assignment_target_names(target))
+
+    def _visit_loop_body(
+        self,
+        *,
+        entry_aliases: Mapping[str, str],
+        body: Sequence[ast.stmt],
+        target: ast.expr | None = None,
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        """Visit output sites once and compute reachable loop alias paths."""
+        flow_entry = dict(entry_aliases)
+        if target is not None:
+            for name in assignment_target_names(target):
+                flow_entry.pop(name, None)
+        flow_paths = evaluate_alias_flow(body, flow_entry)
+
+        self._restore_aliases(entry_aliases)
+        if target is not None:
+            self._invalidate_aliases(assignment_target_names(target))
+        self._visit_statements(body)
+
+        normal_paths = [dict(path.aliases) for path in flow_paths if path.transfer in {None, "continue"}]
+        break_paths = [dict(path.aliases) for path in flow_paths if path.transfer == "break"]
+        return normal_paths, break_paths
+
+    def _finish_loop(
+        self,
+        *,
+        entry_aliases: Mapping[str, str],
+        normal_paths: Sequence[Mapping[str, str]],
+        break_paths: Sequence[Mapping[str, str]],
+        orelse: Sequence[ast.stmt],
+    ) -> None:
+        """Join zero/body paths, then reachable ``else`` and break exits."""
+        normal_exit = identical_alias_join((entry_aliases, *normal_paths))
+        self._restore_aliases(normal_exit)
+        self._visit_statements(orelse)
+        orelse_paths = evaluate_alias_flow(orelse, normal_exit)
+        post_loop_paths = [dict(path.aliases) for path in orelse_paths if path.transfer is None]
+        self._join_alias_paths((*post_loop_paths, *break_paths))
+
+    def _visit_for(self, node: ast.For | ast.AsyncFor) -> None:
+        self.visit(node.iter)
+        entry_aliases = dict(self._import_aliases)
+        normal_paths, break_paths = self._visit_loop_body(
+            entry_aliases=entry_aliases,
+            body=node.body,
+            target=node.target,
+        )
+        self._finish_loop(
+            entry_aliases=entry_aliases,
+            normal_paths=normal_paths,
+            break_paths=break_paths,
+            orelse=node.orelse,
+        )
+
+    def visit_For(self, node: ast.For) -> None:
+        self._visit_for(node)
+
+    def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
+        self._visit_for(node)
+
+    def visit_While(self, node: ast.While) -> None:
+        self.visit(node.test)
+        entry_aliases = dict(self._import_aliases)
+        normal_paths, break_paths = self._visit_loop_body(
+            entry_aliases=entry_aliases,
+            body=node.body,
+        )
+        self._finish_loop(
+            entry_aliases=entry_aliases,
+            normal_paths=normal_paths,
+            break_paths=break_paths,
+            orelse=node.orelse,
+        )
+
+    def _visit_with(self, node: ast.With | ast.AsyncWith) -> None:
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self._invalidate_aliases(assignment_target_names(item.optional_vars))
+        self._visit_statements(node.body)
+
+    def visit_With(self, node: ast.With) -> None:
+        self._visit_with(node)
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        self._visit_with(node)
+
+    def visit_TypeAlias(self, node: ast.TypeAlias) -> None:
+        self.generic_visit(node)
+        self._invalidate_aliases(assignment_target_names(node.name))
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        start = dict(self._import_aliases)
+        self._restore_aliases(start)
+        self._visit_statements(node.body)
+        body_aliases = dict(self._import_aliases)
+        self._restore_aliases(start)
+        self._visit_statements(node.orelse)
+        orelse_aliases = dict(self._import_aliases) if node.orelse else start
+        self._join_alias_paths((body_aliases, orelse_aliases))
+
+    def visit_Match(self, node: ast.Match) -> None:
+        self.visit(node.subject)
+        aliases = self._import_aliases
+        start = dict(aliases)
+        match_mutations: set[str] = set()
+        for case in node.cases:
+            self._restore_aliases(start)
+            case_mutations: set[str] = set()
+            self._import_alias_mutation_stack.append((aliases, case_mutations))
+            try:
+                self._invalidate_aliases(match_pattern_binding_names(case.pattern))
+                if case.guard is not None:
+                    self.visit(case.guard)
+                self._visit_statements(case.body)
+            finally:
+                popped_aliases, popped_mutations = self._import_alias_mutation_stack.pop()
+                if popped_aliases is not aliases or popped_mutations is not case_mutations:
+                    raise AssertionError("honesty match alias mutation stack is unbalanced")
+            match_mutations.update(case_mutations)
+        self._restore_aliases({name: target for name, target in start.items() if name not in match_mutations})
+
+    def _visit_try(self, node: ast.Try | ast.TryStar) -> None:
+        start = dict(self._import_aliases)
+        finally_entry = evaluate_finally_entry_aliases(node, start) if node.finalbody else None
+        self._restore_aliases(start)
+        body_aliases, body_mutations = self._visit_tracked_statements(node.body)
+        if node.orelse:
+            self._restore_aliases(body_aliases)
+            self._visit_statements(node.orelse)
+            body_aliases = dict(self._import_aliases)
+        endpoints = [body_aliases]
+
+        handler_start = {name: target for name, target in start.items() if name not in body_mutations}
+        for handler in node.handlers:
+            self._restore_aliases(handler_start)
+            if handler.type is not None:
+                self.visit(handler.type)
+            if handler.name is not None:
+                self._invalidate_aliases((handler.name,))
+            self._visit_statements(handler.body)
+            endpoints.append(dict(self._import_aliases))
+
+        self._join_alias_paths(tuple(endpoints))
+        if finally_entry is not None:
+            self._restore_aliases(finally_entry)
+        self._visit_statements(node.finalbody)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        self._visit_try(node)
+
+    def visit_TryStar(self, node: ast.TryStar) -> None:
+        self._visit_try(node)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.type is not None:
+            self.visit(node.type)
+        if node.name is not None:
+            self._invalidate_aliases((node.name,))
+        self._visit_statements(node.body)
 
 
 def iter_trust_boundary_decorators(
@@ -161,6 +397,14 @@ def iter_trust_boundary_decorators(
     Ordering is deterministic: statements are visited in lexical order while
     preserving import aliases visible at each decorator site.
     """
+    visitor = _TrustBoundaryDecoratorVisitor()
+    visitor.visit(tree)
+    for match in visitor.matches:
+        yield match.function, match.call
+
+
+def iter_boundary_decorators(tree: ast.AST) -> Iterator[BoundaryDecoratorMatch]:
+    """Yield boundary markers with their import-resolved semantic kind."""
     visitor = _TrustBoundaryDecoratorVisitor()
     visitor.visit(tree)
     yield from visitor.matches
@@ -256,7 +500,7 @@ class KeywordExtraction:
     nonliteral_message: str | None
 
 
-def extract_keywords(call: ast.Call) -> KeywordExtraction:
+def extract_keywords(call: ast.Call, *, implicit_non_raising: bool = False) -> KeywordExtraction:
     """Return the decorator's kwargs as a tagged result.
 
     Positional arguments are rejected (the runtime decorator is keyword-only;
@@ -303,6 +547,8 @@ def extract_keywords(call: ast.Call) -> KeywordExtraction:
                 ),
             )
         parsed[keyword.arg] = value
+    if implicit_non_raising:
+        parsed.setdefault("non_raising", True)
     return KeywordExtraction(kwargs=parsed, nonliteral_message=None)
 
 

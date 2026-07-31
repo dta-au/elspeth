@@ -29,7 +29,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.secrets import WebSecretResolver
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError, get_sink_config_model
 from elspeth.web.blobs.protocol import ALLOWED_MIME_TYPES, AllowedMimeType
@@ -931,7 +931,7 @@ def _untrusted_source_field_context(
     )
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored source schema option value (untrusted mapping)",
     source_param="schema",
@@ -941,7 +941,6 @@ def _untrusted_source_field_context(
         "string-list guaranteed_fields plus the declared fields of an explicit (fixed/flexible) "
         "schema; raw labels and malformed members are dropped, never raised on"
     ),
-    non_raising=True,
 )
 def _llm_safe_schema_option(
     schema: Any,
@@ -969,7 +968,7 @@ def _llm_safe_schema_option(
     return safe or {"shape": "object"}
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="committed SourceResolved carrying web-authored options (untrusted mapping values)",
     source_param="current_source",
@@ -979,7 +978,6 @@ def _llm_safe_schema_option(
         "non-mapping options degrade to empty, malformed rows/schema are dropped, never raised on; "
         "blob binding is projected as a bare boolean, never as a reference, path, or blob id"
     ),
-    non_raising=True,
 )
 def _source_revision_context_for_llm(
     current_source: SourceResolved,

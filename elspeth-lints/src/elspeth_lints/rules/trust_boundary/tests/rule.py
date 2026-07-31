@@ -74,7 +74,7 @@ from elspeth_lints.rules.trust_boundary.shared import (
     display_path,
     extract_keywords,
     filter_allowlisted_findings,
-    iter_trust_boundary_decorators,
+    iter_boundary_decorators,
     load_honesty_gate_allowlist,
     make_decorator_finding,
     repository_root,
@@ -164,8 +164,10 @@ class TrustBoundaryTestsRule:
 def analyze_tree(tree: ast.AST, file_path: str, *, repo_root: Path) -> list[Finding]:
     """Return ``trust_boundary.tests`` findings for one parsed syntax tree."""
     findings: list[Finding] = []
-    for func_node, call in iter_trust_boundary_decorators(tree):
-        extraction = extract_keywords(call)
+    for match in iter_boundary_decorators(tree):
+        func_node = match.function
+        call = match.call
+        extraction = extract_keywords(call, implicit_non_raising=match.non_raising)
         if extraction.kwargs is None:
             # Non-literal kwarg (or **-unpacking / positional args). Per the
             # C6-4 honesty-gate hardening (epic elspeth-2ed3bb0f7d, ticket

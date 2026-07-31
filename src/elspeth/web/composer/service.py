@@ -52,7 +52,7 @@ from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.secrets import WebSecretResolver
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.canonical import canonical_json
 from elspeth.core.templates import extract_jinja2_fields
 from elspeth.plugins.transforms.llm.model_catalog import OPENROUTER_LITELLM_PREFIX
@@ -1768,7 +1768,7 @@ class ComposerServiceImpl:
         )
 
     @staticmethod
-    @trust_boundary(
+    @observation_boundary(
         tier=3,
         source="web-authored node/source options mapping (untrusted interpretation requirements)",
         source_param="options",
@@ -1778,7 +1778,6 @@ class ComposerServiceImpl:
             "(kind, user_term); any missing, mistyped, or ambiguous requirement data "
             "yields None and never raises"
         ),
-        non_raising=True,
     )
     def _matching_requirement_draft(
         options: Mapping[str, Any],
@@ -5989,7 +5988,7 @@ def _looks_like_advisor_prompt_injection(value: str) -> bool:
     return _ADVISOR_PROMPT_INJECTION_IGNORE_RE.search(value) is not None or _ADVISOR_PROMPT_INJECTION_CLEAN_RE.search(value) is not None
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored plugin options mapping (untrusted composer-author values)",
     source_param="options",
@@ -5998,7 +5997,6 @@ def _looks_like_advisor_prompt_injection(value: str) -> bool:
         "collects only string values under the advisor summary keys (flat and one "
         "nested level); non-string and absent values are skipped, never raised on"
     ),
-    non_raising=True,
 )
 def _advisor_prompt_option_values(options: Mapping[str, Any]) -> list[tuple[str, str]]:
     values: list[tuple[str, str]] = []
@@ -6254,7 +6252,7 @@ def _node_required_input_fields(node: NodeSpec) -> list[str]:
     return fields
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="NodeSpec carrying web-authored plugin options (untrusted prompt_template value)",
     source_param="node",
@@ -6262,7 +6260,6 @@ def _node_required_input_fields(node: NodeSpec) -> list[str]:
     invariant=(
         "returns the prompt_template string from the flat or nested options shape; absent or non-string values yield None and never raise"
     ),
-    non_raising=True,
 )
 def _node_prompt_template(node: NodeSpec) -> str | None:
     """Return a node's ``prompt_template`` from the flat or nested options shape.

@@ -65,6 +65,59 @@ def _validated_recognized_boundaries(payload: object) -> int:
     return recognized
 
 
+def _clean_text(value: object) -> str:
+    """Render one summary value without multiline or unstable whitespace."""
+    return " ".join(str(value).split())
+
+
+def _taint_path_text(value: object) -> str:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return " -> ".join(_clean_text(item) for item in value if _clean_text(item))
+    return _clean_text(value)
+
+
+def _actionable_defect_lines(payload: object) -> tuple[str, ...]:
+    """Render deterministic evidence from Wardline's ephemeral summary."""
+    if not isinstance(payload, Mapping):
+        return ()
+    defects = payload.get("active_defects")
+    if not isinstance(defects, Sequence) or isinstance(defects, (str, bytes, bytearray)):
+        return ()
+
+    records: list[tuple[tuple[str, str, int, str, str, str], tuple[str, ...]]] = []
+    for defect in defects:
+        if not isinstance(defect, Mapping):
+            continue
+        rule_id = _clean_text(defect.get("rule_id") or "<unknown-rule>")
+        location = defect.get("location")
+        if isinstance(location, Mapping):
+            path = _clean_text(location.get("path") or "<unknown-file>")
+            raw_line = location.get("line_start")
+            line = raw_line if isinstance(raw_line, int) and not isinstance(raw_line, bool) else 0
+        else:
+            path = "<unknown-file>"
+            line = 0
+        qualname = _clean_text(defect.get("qualname") or "<unknown-symbol>")
+        fingerprint = _clean_text(defect.get("fingerprint") or "<unknown-fingerprint>")
+        message = _clean_text(defect.get("message") or "<no message>")
+        primary = f"wardline defect: {rule_id} {path}:{line} {qualname} fp={fingerprint} {message}"
+        taint_path = _taint_path_text(defect.get("taint_path") or "")
+        defect_lines = (primary, f"  taint: {taint_path}") if taint_path else (primary,)
+        records.append(((rule_id, path, line, qualname, fingerprint, message), defect_lines))
+
+    rendered: list[str] = []
+    for _sort_key, rendered_lines in sorted(records, key=lambda record: record[0]):
+        rendered.extend(rendered_lines)
+    return tuple(rendered)
+
+
+def _render_actionable_defects(payload: object) -> bool:
+    lines = _actionable_defect_lines(payload)
+    for line in lines:
+        print(line, file=sys.stderr)
+    return bool(lines)
+
+
 def _pythonpath_with_repo(env: Mapping[str, str]) -> str:
     existing = env.get("PYTHONPATH")
     return str(REPO_ROOT) + (os.pathsep + existing if existing else "")
@@ -106,9 +159,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             print(f"wardline gate error: unreadable agent summary: {exc}", file=sys.stderr)
             return 2
+        defects_rendered = completed.returncode == 1 and _render_actionable_defects(payload)
         try:
             recognized = _validated_recognized_boundaries(payload)
         except GateContractError as exc:
+            if not defects_rendered:
+                _render_actionable_defects(payload)
             print(f"wardline gate failed: {exc}", file=sys.stderr)
             return 1
 
