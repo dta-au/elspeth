@@ -115,6 +115,23 @@ def _make_source_config(**overrides: Any) -> dict[str, Any]:
     return base
 
 
+def _metadata_page() -> DataversePageResponse:
+    """Return the authoritative Contact logical-name/entity-set identity."""
+    return DataversePageResponse(
+        status_code=200,
+        rows=[{"LogicalName": "contact", "EntitySetName": "contacts"}],
+        latency_ms=5.0,
+        headers={"content-type": "application/json"},
+        request_headers={"Authorization": "Bearer fake"},
+        request_url=(
+            "https://testorg.crm.dynamics.com/api/data/v9.2/EntityDefinitions(LogicalName='contact')?$select=LogicalName,EntitySetName"
+        ),
+        next_link=None,
+        paging_cookie=None,
+        more_records=None,
+    )
+
+
 def _make_sink_config(**overrides: Any) -> dict[str, Any]:
     """Build a valid DataverseSink config dict."""
     base = {
@@ -147,17 +164,7 @@ class TestDataverseSourceStructuredQuery:
 
         # Mock the client to return a canned response
         mock_client = MagicMock(spec=DataverseClient)
-        mock_client.get_page.return_value = DataversePageResponse(
-            status_code=200,
-            rows=[{"LogicalName": "contact"}],
-            latency_ms=5.0,
-            headers={"content-type": "application/json"},
-            request_headers={"Authorization": "Bearer fake"},
-            request_url="https://testorg.crm.dynamics.com/api/data/v9.2/EntityDefinitions(LogicalName='contact')?$select=LogicalName",
-            next_link=None,
-            paging_cookie=None,
-            more_records=None,
-        )
+        mock_client.get_page.return_value = _metadata_page()
         mock_client.paginate_odata.return_value = iter(
             [
                 DataversePageResponse(
@@ -194,6 +201,12 @@ class TestDataverseSourceStructuredQuery:
         assert rows[0].row["fullname"] == "Alice"
         assert rows[1].row["emailaddress1"] == "bob@test.com"
 
+        metadata_url = mock_client.get_page.call_args.args[0]
+        assert metadata_url.endswith("EntityDefinitions(LogicalName='contact')?$select=LogicalName,EntitySetName")
+        mock_client.paginate_odata.assert_called_once_with(
+            "https://testorg.crm.dynamics.com/api/data/v9.2/contacts?$select=fullname,emailaddress1"
+        )
+
         # Verify audit recording
         success_calls = [c for c in ctx.calls if c.get("status") == CallStatus.SUCCESS]
         assert len(success_calls) == 2  # Metadata probe + one page fetch
@@ -203,17 +216,7 @@ class TestDataverseSourceStructuredQuery:
         source = DataverseSource(_make_source_config())
 
         mock_client = MagicMock(spec=DataverseClient)
-        mock_client.get_page.return_value = DataversePageResponse(
-            status_code=200,
-            rows=[{"LogicalName": "contact"}],
-            latency_ms=5.0,
-            headers={"content-type": "application/json"},
-            request_headers={"Authorization": "Bearer fake"},
-            request_url="https://testorg.crm.dynamics.com/api/data/v9.2/EntityDefinitions(LogicalName='contact')?$select=LogicalName",
-            next_link=None,
-            paging_cookie=None,
-            more_records=None,
-        )
+        mock_client.get_page.return_value = _metadata_page()
         mock_client.paginate_odata.return_value = iter(
             [
                 DataversePageResponse(
@@ -271,6 +274,7 @@ class TestDataverseSourceFetchXML:
         source = DataverseSource(config)
 
         mock_client = MagicMock(spec=DataverseClient)
+        mock_client.get_page.return_value = _metadata_page()
         mock_client.paginate_fetchxml.return_value = iter(
             [
                 DataversePageResponse(
@@ -300,6 +304,10 @@ class TestDataverseSourceFetchXML:
 
         assert len(rows) == 1
         assert rows[0].row["fullname"] == "Alice"
+        mock_client.paginate_fetchxml.assert_called_once_with(
+            "contacts",
+            '<fetch><entity name="contact"><attribute name="fullname"/></entity></fetch>',
+        )
 
 
 class TestDataverseSourceSchemaLocking:
@@ -310,6 +318,7 @@ class TestDataverseSourceSchemaLocking:
         source = DataverseSource(_make_source_config())
 
         mock_client = MagicMock(spec=DataverseClient)
+        mock_client.get_page.return_value = _metadata_page()
         mock_client.paginate_odata.return_value = iter(
             [
                 DataversePageResponse(
@@ -348,6 +357,7 @@ class TestDataverseSourceSchemaLocking:
         source = DataverseSource(_make_source_config())
 
         mock_client = MagicMock(spec=DataverseClient)
+        mock_client.get_page.return_value = _metadata_page()
         mock_client.paginate_odata.return_value = iter(
             [
                 DataversePageResponse(
@@ -389,6 +399,7 @@ class TestDataverseSourceODataStripping:
         source = DataverseSource(_make_source_config())
 
         mock_client = MagicMock(spec=DataverseClient)
+        mock_client.get_page.return_value = _metadata_page()
         mock_client.paginate_odata.return_value = iter(
             [
                 DataversePageResponse(

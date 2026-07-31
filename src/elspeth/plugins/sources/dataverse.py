@@ -81,6 +81,10 @@ class DataverseSourceConfig(DataPluginConfig):
         default=None,
         description="Entity logical name (e.g., 'contact')",
     )
+    entity_set_name: str | None = Field(
+        default=None,
+        description="Explicit EntitySetName fallback when Dataverse metadata access is forbidden",
+    )
     select: list[str] | None = Field(
         default=None,
         description="$select fields (None = all)",
@@ -143,6 +147,16 @@ class DataverseSourceConfig(DataPluginConfig):
         if not stripped:
             raise ValueError("entity cannot be empty")
         return reject_operator_required_placeholder_value(stripped, field_name="entity")
+
+    @field_validator("entity_set_name")
+    @classmethod
+    def validate_entity_set_name_not_placeholder(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("entity_set_name cannot be empty")
+        return reject_operator_required_placeholder_value(stripped, field_name="entity_set_name")
 
     @field_validator("select")
     @classmethod
@@ -209,7 +223,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a2f692b18aeeb747"
+    source_file_hash: str | None = "sha256:501a04cae1c8c830"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -229,7 +243,7 @@ class DataverseSource(BaseSource):
       environment_url: https://tenant.crm.dynamics.com
       auth:
         method: managed_identity
-      entity: contacts
+      entity: contact
       select:
         - contactid
         - fullname
@@ -248,6 +262,7 @@ class DataverseSource(BaseSource):
         self._auth_config = cfg.auth
         self._api_version = cfg.api_version
         self._entity = cfg.entity
+        self._entity_set_name = cfg.entity_set_name
         self._select = cfg.select
         self._filter = cfg.filter
         self._orderby = cfg.orderby
@@ -305,29 +320,21 @@ class DataverseSource(BaseSource):
             additional_domains=self._additional_domains,
         )
 
-    def _validate_entity_exists(self, ctx: SourceContext) -> None:
-        """Validate that the configured entity exists in Dataverse metadata.
-
-        Issues a lightweight metadata request to check entity availability.
-        Failures are non-fatal — the entity may exist but the metadata
-        endpoint may be restricted. Records the probe through the audited
-        source call path before continuing or raising.
-        """
+    def _resolve_entity_set_name(self, ctx: SourceContext, logical_name: str) -> str:
+        """Resolve a logical table name to its authoritative Web API entity set."""
         if self._client is None:
-            raise RuntimeError("on_start() must be called before _validate_entity_exists() — this is a bug")
-        if self._entity is None:
-            raise RuntimeError("_validate_entity_exists() called outside structured query mode — this is a bug")
-        encoded_entity = urllib.parse.quote(self._entity, safe="")
+            raise RuntimeError("on_start() must be called before _resolve_entity_set_name() — this is a bug")
+        encoded_entity = urllib.parse.quote(logical_name, safe="")
         metadata_url = (
             f"{self._environment_url.rstrip('/')}/api/data/{self._api_version}"
-            f"/EntityDefinitions(LogicalName='{encoded_entity}')?$select=LogicalName"
+            f"/EntityDefinitions(LogicalName='{encoded_entity}')?$select=LogicalName,EntitySetName"
         )
         try:
             page = self._client.get_page(metadata_url)
         except DataverseClientError as e:
             if e.status_code == 404:
                 not_found = DataverseClientError(
-                    f"Entity '{self._entity}' not found in Dataverse. Check the entity logical name in your pipeline config.",
+                    f"Entity '{logical_name}' not found in Dataverse. Check the entity logical name in your pipeline config.",
                     retryable=False,
                     status_code=404,
                     latency_ms=e.latency_ms,
@@ -342,32 +349,132 @@ class DataverseSource(BaseSource):
                     error_reason=not_found.error_category,
                 )
                 raise not_found from e
+            if e.status_code == 403:
+                if self._entity_set_name is not None:
+                    self._record_page_call(
+                        ctx,
+                        url=e.request_url or metadata_url,
+                        error=e,
+                        error_reason=e.error_category,
+                    )
+                    return self._entity_set_name
+                forbidden = DataverseClientError(
+                    "Dataverse metadata access was forbidden, so the Web API entity-set identity cannot be resolved. "
+                    "Configure options.entity_set_name explicitly or grant read access to EntityDefinitions.",
+                    retryable=False,
+                    status_code=403,
+                    latency_ms=e.latency_ms,
+                    error_category="metadata_access_forbidden",
+                    request_url=e.request_url,
+                    request_headers=e.request_headers,
+                )
+                self._record_page_call(
+                    ctx,
+                    url=forbidden.request_url or metadata_url,
+                    error=forbidden,
+                    error_reason=forbidden.error_category,
+                )
+                raise forbidden from e
             self._record_page_call(
                 ctx,
                 url=e.request_url or metadata_url,
                 error=e,
                 error_reason=e.error_category,
             )
-            if e.status_code == 403:
-                return
             if e.status_code == 401 and e.retryable:
                 self._client.reconstruct_credential(self._auth_config)
             # 5xx, network errors, etc. — re-raise. Silently continuing
             # after a server error means the pipeline proceeds with
             # potentially invalid entity config.
             raise
-        self._record_page_call(ctx, url=page.request_url, page=page)
+        metadata_error: DataverseClientError | None = None
+        if len(page.rows) != 1:
+            metadata_error = DataverseClientError(
+                "Dataverse entity metadata did not return exactly one identity record. "
+                "Check the configured logical name and metadata permissions.",
+                retryable=False,
+                status_code=page.status_code,
+                latency_ms=page.latency_ms,
+                error_category="metadata_identity_invalid",
+                request_url=page.request_url,
+                request_headers=page.request_headers,
+            )
+        else:
+            identity = page.rows[0]
+            returned_logical_name = identity.get("LogicalName")
+            entity_set_name = identity.get("EntitySetName")
+            if (
+                not isinstance(returned_logical_name, str)
+                or not returned_logical_name
+                or returned_logical_name != returned_logical_name.strip()
+            ):
+                metadata_error = DataverseClientError(
+                    "Dataverse entity metadata did not provide a usable string LogicalName. "
+                    "Check the metadata response and table configuration.",
+                    retryable=False,
+                    status_code=page.status_code,
+                    latency_ms=page.latency_ms,
+                    error_category="metadata_identity_invalid",
+                    request_url=page.request_url,
+                    request_headers=page.request_headers,
+                )
+            elif returned_logical_name != logical_name:
+                metadata_error = DataverseClientError(
+                    f"Dataverse metadata LogicalName did not match the requested logical name '{logical_name}'. "
+                    "Refusing to query a contradictory table identity.",
+                    retryable=False,
+                    status_code=page.status_code,
+                    latency_ms=page.latency_ms,
+                    error_category="metadata_identity_conflict",
+                    request_url=page.request_url,
+                    request_headers=page.request_headers,
+                )
+            elif not isinstance(entity_set_name, str) or not entity_set_name or entity_set_name != entity_set_name.strip():
+                metadata_error = DataverseClientError(
+                    "Dataverse entity metadata did not provide a usable string EntitySetName. "
+                    "Configure options.entity_set_name only if metadata access is forbidden; malformed metadata fails closed.",
+                    retryable=False,
+                    status_code=page.status_code,
+                    latency_ms=page.latency_ms,
+                    error_category="metadata_identity_invalid",
+                    request_url=page.request_url,
+                    request_headers=page.request_headers,
+                )
+            elif self._entity_set_name is not None and entity_set_name != self._entity_set_name:
+                metadata_error = DataverseClientError(
+                    f"Resolved Dataverse EntitySetName does not match configured entity_set_name for logical name '{logical_name}'. "
+                    "Correct the explicit fallback before retrying.",
+                    retryable=False,
+                    status_code=page.status_code,
+                    latency_ms=page.latency_ms,
+                    error_category="metadata_identity_conflict",
+                    request_url=page.request_url,
+                    request_headers=page.request_headers,
+                )
 
-    def _build_query_url(self) -> str:
+        if metadata_error is not None:
+            self._record_page_call(
+                ctx,
+                url=metadata_error.request_url or metadata_url,
+                error=metadata_error,
+                error_reason=metadata_error.error_category,
+            )
+            raise metadata_error
+
+        assert isinstance(entity_set_name, str)
+        self._record_page_call(ctx, url=page.request_url, page=page)
+        return entity_set_name
+
+    def _build_query_url(self, entity_set_name: str) -> str:
         """Build the initial OData query URL for structured queries.
 
-        Percent-encodes entity name in the path segment and query parameter
+        Percent-encodes the resolved entity-set name in the path segment and query parameter
         values to prevent silent corruption from special characters.
         OData $-prefixed parameter names are kept literal (servers require them).
         """
         if self._entity is None:
             raise RuntimeError("_build_query_url() called outside structured query mode — this is a bug")
-        encoded_entity = urllib.parse.quote(self._entity, safe="")
+        encoded_entity = urllib.parse.quote(entity_set_name, safe="")
         url = f"{self._environment_url.rstrip('/')}/api/data/{self._api_version}/{encoded_entity}"
 
         params: list[str] = []
@@ -590,34 +697,32 @@ class DataverseSource(BaseSource):
         if self._client is None:
             raise RuntimeError("on_start() must be called before load() — this is a bug")
 
-        # Track the last URL seen — used in the error path where we don't
-        # have a page response but need the actual URL for audit accuracy.
-        last_fetched_url: str = self._build_query_url() if self._entity else "(FetchXML)"
-
         if self._entity is not None:
-            self._validate_entity_exists(ctx)
+            entity_set_name = self._resolve_entity_set_name(ctx, self._entity)
+            url = self._build_query_url(entity_set_name)
+            last_fetched_url = url
+        else:
+            if self._fetch_xml is None:
+                raise RuntimeError("config validator ensures entity or fetch_xml — neither is set, this is a bug")
+            root = ET.fromstring(self._fetch_xml)
+            entity_elem = root.find("entity")
+            if entity_elem is None:
+                raise RuntimeError("FetchXML is missing <entity> element — cannot determine entity name for URL")
+            if "name" not in entity_elem.attrib:
+                raise RuntimeError("FetchXML <entity> element missing 'name' attribute")
+            logical_name = entity_elem.attrib["name"]
+            entity_set_name = self._resolve_entity_set_name(ctx, logical_name)
+            encoded_entity_set_name = urllib.parse.quote(entity_set_name, safe="")
+            last_fetched_url = f"{self._environment_url.rstrip('/')}/api/data/{self._api_version}/{encoded_entity_set_name}"
 
         try:
             if self._entity is not None:
                 # Structured OData query
-                url = self._build_query_url()
                 page_iterator = self._client.paginate_odata(url)
             else:
                 # FetchXML query
-                if self._fetch_xml is None:
-                    raise RuntimeError("config validator ensures entity or fetch_xml — neither is set, this is a bug")
-                # Extract entity name from FetchXML
-                root = ET.fromstring(self._fetch_xml)
-                entity_elem = root.find("entity")
-                if entity_elem is None:
-                    raise RuntimeError("FetchXML is missing <entity> element — cannot determine entity name for URL")
-                # entity_elem.attrib is the XML element's attribute dict; FetchXML
-                # is external/user-authored config (Tier 3). A missing 'name'
-                # attribute is a config error, surfaced explicitly here.
-                if "name" not in entity_elem.attrib:
-                    raise RuntimeError("FetchXML <entity> element missing 'name' attribute")
-                entity_name = entity_elem.attrib["name"]
-                page_iterator = self._client.paginate_fetchxml(entity_name, self._fetch_xml)
+                assert self._fetch_xml is not None
+                page_iterator = self._client.paginate_fetchxml(entity_set_name, self._fetch_xml)
 
             for page in page_iterator:
                 pages_fetched += 1

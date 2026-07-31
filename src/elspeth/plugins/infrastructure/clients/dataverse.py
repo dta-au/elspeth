@@ -804,7 +804,7 @@ class DataverseClient:
             ssrf_safe = self._validate_url_ssrf(page.next_link)
             url = page.next_link
 
-    def paginate_fetchxml(self, entity: str, fetch_xml: str) -> Iterator[DataversePageResponse]:
+    def paginate_fetchxml(self, entity_set_name: str, fetch_xml: str) -> Iterator[DataversePageResponse]:
         """Paginate through FetchXML query results.
 
         Uses paging cookie mechanism: injects cookie and page number into
@@ -813,7 +813,7 @@ class DataverseClient:
         avoid re-parsing on every iteration.
 
         Args:
-            entity: Entity logical name for URL construction
+            entity_set_name: Dataverse EntitySetName for URL construction
             fetch_xml: FetchXML query string
 
         Yields:
@@ -843,7 +843,7 @@ class DataverseClient:
         while True:
             xml_str = ET.tostring(root, encoding="unicode")
             encoded_xml = urllib.parse.quote(xml_str)
-            url = f"{self._environment_url}/api/data/{self._api_version}/{entity}?fetchXml={encoded_xml}"
+            url = f"{self._environment_url}/api/data/{self._api_version}/{entity_set_name}?fetchXml={encoded_xml}"
 
             page = self.get_page(url)
             yield page

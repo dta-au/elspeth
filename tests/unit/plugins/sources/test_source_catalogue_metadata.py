@@ -62,6 +62,12 @@ def test_dataverse_warns_against_webhooks_and_change_streams() -> None:
     assert "change streams" in when_not_to_use
 
 
+def test_dataverse_example_uses_contact_logical_name() -> None:
+    source = _declaring_node(SOURCES_BY_NAME["dataverse"])
+    options = cast(Mapping[str, Any], source["options"])
+    assert options["entity"] == "contact"
+
+
 def test_csv_example_uses_the_current_plural_source_shape_and_complete_routing() -> None:
     parsed = load_bounded_pipeline_yaml(SOURCES_BY_NAME["csv"].plugin_cls.example_use)
     assert set(parsed) == {"sources"}
