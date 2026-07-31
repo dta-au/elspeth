@@ -48,6 +48,20 @@ from elspeth.plugins.sources.field_normalization import (
 # OData annotation prefixes to strip from row data
 _ODATA_ANNOTATION_PATTERN = re.compile(r"^@odata\.|@Microsoft\.Dynamics\.CRM\.")
 _FORMATTED_VALUE_SUFFIX = "@OData.Community.Display.V1.FormattedValue"
+_DATAVERSE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _validate_dataverse_identifier(value: object, *, field_name: str) -> str:
+    """Require a Dataverse logical/entity-set name with no URL delimiters."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string containing a valid ASCII identifier")
+    reject_operator_required_placeholder_value(value, field_name=field_name)
+    if _DATAVERSE_IDENTIFIER_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            f"{field_name} must be an ASCII identifier beginning with a letter or underscore "
+            "and containing only letters, digits, and underscores"
+        )
+    return value
 
 
 class DataverseSourceConfig(DataPluginConfig):
@@ -143,20 +157,14 @@ class DataverseSourceConfig(DataPluginConfig):
     def validate_entity_not_placeholder(cls, v: str | None) -> str | None:
         if v is None:
             return None
-        stripped = v.strip()
-        if not stripped:
-            raise ValueError("entity cannot be empty")
-        return reject_operator_required_placeholder_value(stripped, field_name="entity")
+        return _validate_dataverse_identifier(v, field_name="entity")
 
     @field_validator("entity_set_name")
     @classmethod
     def validate_entity_set_name_not_placeholder(cls, v: str | None) -> str | None:
         if v is None:
             return None
-        stripped = v.strip()
-        if not stripped:
-            raise ValueError("entity_set_name cannot be empty")
-        return reject_operator_required_placeholder_value(stripped, field_name="entity_set_name")
+        return _validate_dataverse_identifier(v, field_name="entity_set_name")
 
     @field_validator("select")
     @classmethod
@@ -206,6 +214,9 @@ class DataverseSourceConfig(DataPluginConfig):
                 ) from exc
             if root.tag != "fetch":
                 raise ValueError(f"FetchXML root element must be <fetch>, got <{root.tag}>.")
+            entity_elem = root.find("entity")
+            if entity_elem is not None and "name" in entity_elem.attrib:
+                _validate_dataverse_identifier(entity_elem.attrib["name"], field_name="FetchXML <entity name>")
         return v
 
 
@@ -223,7 +234,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:501a04cae1c8c830"
+    source_file_hash: str | None = "sha256:0c6eacbd5e3773b3"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -387,72 +398,55 @@ class DataverseSource(BaseSource):
             # after a server error means the pipeline proceeds with
             # potentially invalid entity config.
             raise
-        metadata_error: DataverseClientError | None = None
+        metadata_error_message: str | None = None
+        metadata_error_category = "metadata_identity_invalid"
+        returned_logical_name: str | None = None
+        entity_set_name: str | None = None
         if len(page.rows) != 1:
-            metadata_error = DataverseClientError(
+            metadata_error_message = (
                 "Dataverse entity metadata did not return exactly one identity record. "
-                "Check the configured logical name and metadata permissions.",
-                retryable=False,
-                status_code=page.status_code,
-                latency_ms=page.latency_ms,
-                error_category="metadata_identity_invalid",
-                request_url=page.request_url,
-                request_headers=page.request_headers,
+                "Check the configured logical name and metadata permissions."
             )
         else:
             identity = page.rows[0]
-            returned_logical_name = identity.get("LogicalName")
-            entity_set_name = identity.get("EntitySetName")
-            if (
-                not isinstance(returned_logical_name, str)
-                or not returned_logical_name
-                or returned_logical_name != returned_logical_name.strip()
-            ):
-                metadata_error = DataverseClientError(
+            try:
+                returned_logical_name = _validate_dataverse_identifier(identity.get("LogicalName"), field_name="LogicalName")
+            except ValueError:
+                metadata_error_message = (
                     "Dataverse entity metadata did not provide a usable string LogicalName. "
-                    "Check the metadata response and table configuration.",
-                    retryable=False,
-                    status_code=page.status_code,
-                    latency_ms=page.latency_ms,
-                    error_category="metadata_identity_invalid",
-                    request_url=page.request_url,
-                    request_headers=page.request_headers,
+                    "Expected an ASCII identifier; check the metadata response and table configuration."
                 )
-            elif returned_logical_name != logical_name:
-                metadata_error = DataverseClientError(
+            if metadata_error_message is None:
+                try:
+                    entity_set_name = _validate_dataverse_identifier(identity.get("EntitySetName"), field_name="EntitySetName")
+                except ValueError:
+                    metadata_error_message = (
+                        "Dataverse entity metadata did not provide a usable string EntitySetName. "
+                        "Expected an ASCII identifier; malformed metadata fails closed."
+                    )
+            if metadata_error_message is None and returned_logical_name != logical_name:
+                metadata_error_message = (
                     f"Dataverse metadata LogicalName did not match the requested logical name '{logical_name}'. "
-                    "Refusing to query a contradictory table identity.",
-                    retryable=False,
-                    status_code=page.status_code,
-                    latency_ms=page.latency_ms,
-                    error_category="metadata_identity_conflict",
-                    request_url=page.request_url,
-                    request_headers=page.request_headers,
+                    "Refusing to query a contradictory table identity."
                 )
-            elif not isinstance(entity_set_name, str) or not entity_set_name or entity_set_name != entity_set_name.strip():
-                metadata_error = DataverseClientError(
-                    "Dataverse entity metadata did not provide a usable string EntitySetName. "
-                    "Configure options.entity_set_name only if metadata access is forbidden; malformed metadata fails closed.",
-                    retryable=False,
-                    status_code=page.status_code,
-                    latency_ms=page.latency_ms,
-                    error_category="metadata_identity_invalid",
-                    request_url=page.request_url,
-                    request_headers=page.request_headers,
-                )
-            elif self._entity_set_name is not None and entity_set_name != self._entity_set_name:
-                metadata_error = DataverseClientError(
+                metadata_error_category = "metadata_identity_conflict"
+            elif metadata_error_message is None and self._entity_set_name is not None and entity_set_name != self._entity_set_name:
+                metadata_error_message = (
                     f"Resolved Dataverse EntitySetName does not match configured entity_set_name for logical name '{logical_name}'. "
-                    "Correct the explicit fallback before retrying.",
-                    retryable=False,
-                    status_code=page.status_code,
-                    latency_ms=page.latency_ms,
-                    error_category="metadata_identity_conflict",
-                    request_url=page.request_url,
-                    request_headers=page.request_headers,
+                    "Correct the explicit fallback before retrying."
                 )
+                metadata_error_category = "metadata_identity_conflict"
 
-        if metadata_error is not None:
+        if metadata_error_message is not None:
+            metadata_error = DataverseClientError(
+                metadata_error_message,
+                retryable=False,
+                status_code=page.status_code,
+                latency_ms=page.latency_ms,
+                error_category=metadata_error_category,
+                request_url=page.request_url,
+                request_headers=page.request_headers,
+            )
             self._record_page_call(
                 ctx,
                 url=metadata_error.request_url or metadata_url,
@@ -461,7 +455,7 @@ class DataverseSource(BaseSource):
             )
             raise metadata_error
 
-        assert isinstance(entity_set_name, str)
+        assert entity_set_name is not None
         self._record_page_call(ctx, url=page.request_url, page=page)
         return entity_set_name
 

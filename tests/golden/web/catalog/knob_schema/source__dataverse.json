@@ -54,6 +54,15 @@
       },
       {
         "default": null,
+        "description": "Explicit EntitySetName fallback when Dataverse metadata access is forbidden",
+        "kind": "text",
+        "label": "Entity Set Name",
+        "name": "entity_set_name",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "default": null,
         "description": "$select fields (None = all)",
         "item_kind": "text",
         "kind": "string-list",

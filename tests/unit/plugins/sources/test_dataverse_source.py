@@ -369,6 +369,42 @@ class TestDataverseSourceConfigValidation:
         assert cfg.entity == "contact"
         assert cfg.fetch_xml is None
 
+    @pytest.mark.parametrize(
+        "entity",
+        ["contact name", "contact/path", "contact?query", "contact#fragment", "contact\x00name", "1contact", " contact", "contact "],
+    )
+    def test_entity_rejects_values_outside_dataverse_identifier_grammar(self, entity: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        with pytest.raises(PluginConfigError, match="ASCII identifier"):
+            DataverseSourceConfig.from_dict(_base_config(entity=entity))
+
+    @pytest.mark.parametrize(
+        "entity_set_name",
+        [
+            "contact sets",
+            "contacts/path",
+            "contacts?query",
+            "contacts#fragment",
+            "contacts\x00name",
+            "1contacts",
+            " contacts",
+            "contacts ",
+        ],
+    )
+    def test_entity_set_name_rejects_values_outside_dataverse_identifier_grammar(self, entity_set_name: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        with pytest.raises(PluginConfigError, match="ASCII identifier"):
+            DataverseSourceConfig.from_dict(_base_config(entity_set_name=entity_set_name))
+
+    def test_dataverse_identifiers_accept_uppercase_ascii_and_underscore(self) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        cfg = DataverseSourceConfig.from_dict(_base_config(entity="_Contact2", entity_set_name="Contact_Sets2"))
+        assert cfg.entity == "_Contact2"
+        assert cfg.entity_set_name == "Contact_Sets2"
+
     @pytest.mark.parametrize("entity_set_name", ["", "   "])
     def test_entity_set_name_rejects_blank_values(self, entity_set_name: str) -> None:
         from elspeth.plugins.sources.dataverse import DataverseSourceConfig
@@ -397,7 +433,7 @@ class TestDataverseSourceConfigValidation:
         with pytest.raises(PluginConfigError, match="placeholder"):
             DataverseSourceConfig.from_dict(_base_config(entity=entity))
 
-    @pytest.mark.parametrize("entity", ["todo", "unknown", "unset", "required", "<literal>"])
+    @pytest.mark.parametrize("entity", ["todo", "unknown", "unset", "required"])
     def test_plain_placeholder_words_can_be_entity_names(self, entity: str) -> None:
         from elspeth.plugins.sources.dataverse import DataverseSourceConfig
 
@@ -425,6 +461,14 @@ class TestDataverseSourceConfigValidation:
         cfg = DataverseSourceConfig.from_dict(_fetchxml_config())
         assert cfg.entity is None
         assert cfg.fetch_xml is not None
+
+    @pytest.mark.parametrize("logical_name", ["contact name", "contact/path", "contact?query", "contact#fragment", "1contact"])
+    def test_fetchxml_entity_rejects_invalid_logical_name(self, logical_name: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        fetch_xml = f'<fetch><entity name="{logical_name}"><attribute name="fullname"/></entity></fetch>'
+        with pytest.raises(PluginConfigError, match="ASCII identifier"):
+            DataverseSourceConfig.from_dict(_fetchxml_config(fetch_xml=fetch_xml))
 
     def test_mutual_exclusion_both_present(self) -> None:
         """Reject config with both entity and fetch_xml."""
@@ -1041,30 +1085,66 @@ class TestDataverseSourceLoadStructured:
         )
 
     @pytest.mark.parametrize(
-        ("metadata_rows", "message"),
+        ("metadata_rows", "message", "expected_category"),
         [
-            ([{"LogicalName": "contact"}], "EntitySetName"),
-            ([{"LogicalName": "contact", "EntitySetName": ""}], "EntitySetName"),
-            ([{"LogicalName": "contact", "EntitySetName": 123}], "EntitySetName"),
-            ([{"LogicalName": "account", "EntitySetName": "contacts"}], "LogicalName"),
-            ([{"EntitySetName": "contacts"}], "LogicalName"),
-            ([{"LogicalName": "", "EntitySetName": "contacts"}], "LogicalName"),
-            ([{"LogicalName": 123, "EntitySetName": "contacts"}], "LogicalName"),
+            ([], "exactly one", "metadata_identity_invalid"),
+            (
+                [
+                    {"LogicalName": "contact", "EntitySetName": "contacts"},
+                    {"LogicalName": "contact", "EntitySetName": "people"},
+                ],
+                "exactly one",
+                "metadata_identity_invalid",
+            ),
+            ([{"LogicalName": "contact"}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": ""}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": "   "}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": 123}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "account", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_conflict"),
+            ([{"EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "   ", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": 123, "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact/path", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact?query", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact#fragment", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact name", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact\x00name", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": "contacts/path"}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": "contacts?query"}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": "contacts#fragment"}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": "contact sets"}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": "contacts\x00name"}], "EntitySetName", "metadata_identity_invalid"),
         ],
         ids=[
+            "zero-rows",
+            "multiple-rows",
             "missing-entity-set",
             "blank-entity-set",
+            "whitespace-entity-set",
             "non-string-entity-set",
             "mismatched-logical-name",
             "missing-logical-name",
             "blank-logical-name",
+            "whitespace-logical-name",
             "non-string-logical-name",
+            "logical-name-path-delimiter",
+            "logical-name-query-delimiter",
+            "logical-name-fragment-delimiter",
+            "logical-name-space-delimiter",
+            "logical-name-control-character",
+            "entity-set-path-delimiter",
+            "entity-set-query-delimiter",
+            "entity-set-fragment-delimiter",
+            "entity-set-space-delimiter",
+            "entity-set-control-character",
         ],
     )
     def test_invalid_metadata_identity_fails_before_pagination(
         self,
         metadata_rows: list[dict[str, Any]],
         message: str,
+        expected_category: str,
     ) -> None:
         metadata_page = _make_metadata_page("contact", rows=metadata_rows)
         mock_client = _DataverseClientFake(
@@ -1079,7 +1159,9 @@ class TestDataverseSourceLoadStructured:
 
         mock_client.paginate_odata.assert_not_called()
         assert ctx.record_call.call_count == 1
-        assert ctx.record_call.call_args.kwargs["status"] == CallStatus.ERROR
+        audit_call = ctx.record_call.call_args.kwargs
+        assert audit_call["status"] == CallStatus.ERROR
+        assert audit_call["error"]["reason"] == expected_category
 
     def test_load_single_page(self) -> None:
         """Load yields valid rows from a single page."""
