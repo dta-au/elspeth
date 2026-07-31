@@ -58,6 +58,7 @@ from elspeth.web.composer.audit import (
     audit_envelope,
     chat_turn_audit_envelope,
     llm_call_audit_envelope,
+    llm_call_audit_summary,
 )
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.control_messages import replay_composer_control_message
@@ -1447,17 +1448,7 @@ async def _persist_llm_calls(
     is recorded via counter + slog so it cannot mask the primary error.
     """
     for call in llm_calls:
-        content = json.dumps(
-            {
-                "_kind": "llm_call_audit",
-                "status": call.status.value,
-                "model_requested": call.model_requested,
-                "model_returned": call.model_returned,
-                "total_tokens": call.total_tokens,
-                "reasoning_tokens": call.reasoning_tokens,
-                "provider_cost": call.provider_cost,
-            }
-        )
+        content = llm_call_audit_summary(call)
         try:
             await service.add_message(
                 session_id,
@@ -2928,6 +2919,7 @@ __all__ = [
     "inspect_blob_content",
     "json",
     "llm_call_audit_envelope",
+    "llm_call_audit_summary",
     "load_run_accounting_for_settings",
     "maybe_auto_title_session",
     "maybe_resolve_step_1_source_chat",

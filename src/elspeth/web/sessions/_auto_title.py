@@ -26,7 +26,7 @@ from uuid import UUID
 from litellm.exceptions import APIError as LiteLLMAPIError
 from opentelemetry import metrics
 
-from elspeth.web.composer.service import _litellm_acompletion
+from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
 
 if TYPE_CHECKING:
     from elspeth.web.sessions.protocol import SessionServiceProtocol
@@ -94,6 +94,8 @@ async def maybe_auto_title_session(
     model: str,
     temperature: float | None,
     seed: int | None,
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> None:
     """Generate and persist an auto-title for ``session_id``.
 
@@ -102,6 +104,11 @@ async def maybe_auto_title_session(
     operational telemetry and return without poisoning the chat response.
     Programmer bugs and DB write failures propagate to the caller awaiting
     the task; swallowing those would hide regressions in the auto-title path.
+
+    ``api_base``/``api_key`` are the PRIMARY-role endpoint affordance (Phase
+    3 Task 2) — auto-title always uses the primary composer role, never the
+    advisor's. Both default to ``None`` so an unconfigured deployment sends
+    the exact same kwargs as before this affordance existed.
     """
     if not user_message.strip():
         return
@@ -117,6 +124,7 @@ async def maybe_auto_title_session(
         kwargs["temperature"] = temperature
     if seed is not None:
         kwargs["seed"] = seed
+    _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
     try:
         response = await _litellm_acompletion(**kwargs)
         content = response.choices[0].message.content

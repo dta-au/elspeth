@@ -41,6 +41,7 @@ Layer: L3 (application). Imports L0 (contracts.composer_audit), L1
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import threading
 import time
@@ -82,6 +83,7 @@ __all__ = [
     "finish_plugin_crash",
     "finish_success",
     "llm_call_audit_envelope",
+    "llm_call_audit_summary",
     "rebind_dispatch_arguments",
 ]
 
@@ -290,6 +292,7 @@ _LLM_CALL_PUBLIC_AUDIT_FIELDS: Final[tuple[str, ...]] = (
     "model_requested",
     "model_returned",
     "status",
+    "finish_reason",
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
@@ -331,6 +334,72 @@ def llm_call_audit_envelope(call: ComposerLLMCall) -> dict[str, object]:
     """
 
     return {"_kind": "llm_call_audit", "call": _public_llm_call_audit_payload(call)}
+
+
+# Terminal states that are simply "the turn ended normally". ``stop`` is a
+# completed answer; ``tool_calls`` is the ordinary terminal state of every
+# healthy iteration of a tool-using loop. Rendering either on the summary
+# line would put a badge on every row and train the reader to ignore it.
+_ROUTINE_FINISH_REASONS: Final[frozenset[str]] = frozenset({"stop", "tool_calls"})
+
+
+def llm_call_audit_summary(call: ComposerLLMCall) -> str:
+    """Build the human-facing ``content`` summary for an LLM-call audit row.
+
+    Sibling of :func:`llm_call_audit_envelope`. The envelope is the forensic
+    record — complete, but only visible to someone who opens the
+    ``tool_calls`` JSON column. This string is what the message-list view
+    actually renders, so it carries the short projection an operator reads
+    without digging.
+
+    Every drain site that persists an LLM-call audit row
+    (``sessions/routes/_helpers._persist_llm_calls``,
+    ``composer/service._persist_pipeline_planner_audit``,
+    ``sessions/guided_audit.prepare_guided_audit_rows``) builds its
+    ``content`` here, so the three rows are the same projection by
+    construction rather than by three hand-copies staying in sync.
+
+    Abnormal finish reasons
+    -----------------------
+    ``finish_reason`` is included **only** when it is present and is not a
+    routine terminal state. The gap this closes is operator-facing: a turn
+    truncated at the token ceiling (``length``) renders as a half-finished
+    answer with nothing saying so, which reads as model flakiness — an
+    operator tunes prompts or swaps models when the fix was raising
+    ``max_tokens``. ``content_filter`` has the same shape: a provider
+    refusal looks like an ELSPETH bug.
+
+    - ``stop`` / ``tool_calls`` are omitted — see
+      :data:`_ROUTINE_FINISH_REASONS`.
+    - Everything else surfaces, including values we do not recognise:
+      unknown is fail-visible, not fail-quiet, because an unrecognised
+      provider term is precisely the case nobody has triaged yet.
+    - The value is rendered verbatim as recorded — no normalisation, no
+      mapping onto a house vocabulary, so the summary and the envelope
+      never disagree about what the provider said.
+    - ``None`` omits the key entirely rather than emitting ``null``; the
+      envelope is where absence is recorded explicitly.
+
+    The key is appended last so a call with no finish reason — and one that
+    finished routinely — serialises byte-for-byte as it did before this
+    projection carried the field at all.
+
+    This is presentation only. An abnormal finish reason is now *visible*;
+    it is never fatal, and no control flow keys off it.
+    """
+    summary: dict[str, object] = {
+        "_kind": "llm_call_audit",
+        "status": call.status.value,
+        "model_requested": call.model_requested,
+        "model_returned": call.model_returned,
+        "total_tokens": call.total_tokens,
+        "reasoning_tokens": call.reasoning_tokens,
+        "provider_cost": call.provider_cost,
+    }
+    finish_reason = call.finish_reason
+    if finish_reason is not None and finish_reason not in _ROUTINE_FINISH_REASONS:
+        summary["finish_reason"] = finish_reason
+    return json.dumps(summary)
 
 
 def chat_turn_audit_envelope(turn: ComposerChatTurn) -> dict[str, object]:

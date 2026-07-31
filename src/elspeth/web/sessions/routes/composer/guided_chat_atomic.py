@@ -218,6 +218,18 @@ def _current_sink_revision_target(guided: Any) -> tuple[SinkResolved | None, int
     return SinkResolved(outputs=(guided.reviewed_outputs[target.stable_id],)), target_index
 
 
+def _guided_chat_endpoint_kwargs(settings: Any) -> tuple[str | None, str | None]:
+    """Resolve the PRIMARY-role endpoint affordance for guided-chat solvers.
+
+    Guided solvers use the PRIMARY composer role only (never the advisor's —
+    see AGENTS.md two-model independence rule and Phase 3 Task 2). Returns
+    ``(None, None)`` when unset so every solver call below stays
+    byte-identical to pre-affordance behaviour.
+    """
+    api_key = settings.composer_endpoint_api_key
+    return settings.composer_endpoint_base_url, (api_key.get_secret_value() if api_key is not None else None)
+
+
 async def run_guided_chat_provider_attempt(
     *,
     session_id: UUID,
@@ -237,6 +249,7 @@ async def run_guided_chat_provider_attempt(
 
     from elspeth.web.composer.guided.chat_solver import build_step_chat_context_block
 
+    endpoint_base_url, endpoint_api_key = _guided_chat_endpoint_kwargs(settings)
     source = _current_source(guided)
     sink = _current_sink(guided)
     sink_output_indices = _current_sink_output_indices(guided)
@@ -276,6 +289,8 @@ async def run_guided_chat_provider_attempt(
             timeout_seconds=settings.composer_timeout_seconds,
             context_block=context_block,
             allow_plugin_reselection=allow_plugin_reselection,
+            api_base=endpoint_base_url,
+            api_key=endpoint_api_key,
         )
         if not isinstance(source_outcome, GuidedStepChatEmptyResult):
             return source_outcome
@@ -302,6 +317,8 @@ async def run_guided_chat_provider_attempt(
             context_block=context_block,
             progress=progress,
             revision_target_index=revision_target_index,
+            api_base=endpoint_base_url,
+            api_key=endpoint_api_key,
         )
         if not isinstance(sink_outcome, GuidedStepChatEmptyResult):
             return sink_outcome
@@ -318,6 +335,8 @@ async def run_guided_chat_provider_attempt(
                 seed=settings.composer_seed,
                 timeout_seconds=settings.composer_timeout_seconds,
                 context_block=context_block,
+                api_base=endpoint_base_url,
+                api_key=endpoint_api_key,
             ),
             recorder=recorder,
         )
@@ -337,6 +356,8 @@ async def run_guided_chat_provider_attempt(
         recorder=recorder,
         timeout_seconds=settings.composer_timeout_seconds,
         context_block=context_block,
+        api_base=endpoint_base_url,
+        api_key=endpoint_api_key,
     )
     return GuidedStepChatOnlyResult(chat=advisory)
 

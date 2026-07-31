@@ -78,6 +78,7 @@ from elspeth.web.composer.audit import (
     finish_arg_error,
     finish_success,
     llm_call_audit_envelope,
+    llm_call_audit_summary,
 )
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.availability import ComposerAvailability as ComposerAvailability  # re-export; genuine home is availability.py
@@ -493,6 +494,21 @@ def _apply_openrouter_app_identity(kwargs: dict[str, Any]) -> None:
         **(dict(existing) if existing else {}),
     }
     kwargs["extra_headers"] = headers
+
+
+def _apply_endpoint_kwargs(kwargs: dict[str, Any], *, base_url: str | None, api_key: str | None) -> None:
+    """Add ``api_base``/``api_key`` to a LiteLLM kwargs dict, role-scoped.
+
+    Both are omitted entirely when unset (the no-regression guarantee: an
+    unconfigured deployment sends the exact same kwargs as before this
+    affordance existed). Configuration surface only — no client boundary,
+    no model-string rewriting. Callers pick which role's (base_url, api_key)
+    pair to pass; this function has no opinion about roles.
+    """
+    if base_url is not None:
+        kwargs["api_base"] = base_url
+    if api_key is not None:
+        kwargs["api_key"] = api_key
 
 
 async def _litellm_acompletion(**kwargs: Any) -> Any:
@@ -1226,6 +1242,23 @@ class ComposerServiceImpl:
         self._catalog = catalog
         self._sessions_service = sessions_service
         self._model = settings.composer_model
+        # Endpoint affordance (Phase 3 Task 2): resolved once here, not
+        # re-derived per call. The bearer is unwrapped from SecretStr exactly
+        # at this boundary and held only as a plain attribute on this
+        # non-dataclass instance (default object repr does not print
+        # instance attributes), never logged, never placed in an audit
+        # record. None (both endpoint and key unset) means every kwargs
+        # dict built below stays byte-identical to pre-affordance behaviour.
+        self._endpoint_base_url: str | None = settings.composer_endpoint_base_url
+        self._endpoint_api_key: str | None = (
+            settings.composer_endpoint_api_key.get_secret_value() if settings.composer_endpoint_api_key is not None else None
+        )
+        self._advisor_endpoint_base_url: str | None = settings.composer_advisor_endpoint_base_url
+        self._advisor_endpoint_api_key: str | None = (
+            settings.composer_advisor_endpoint_api_key.get_secret_value()
+            if settings.composer_advisor_endpoint_api_key is not None
+            else None
+        )
         self._max_composition_turns = settings.composer_max_composition_turns
         self._max_discovery_turns = settings.composer_max_discovery_turns
         self._timeout_seconds = settings.composer_timeout_seconds
@@ -2410,6 +2443,10 @@ class ComposerServiceImpl:
                 api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
                 escape_hatch_model=self._settings.composer_advisor_model,
                 escape_hatch_provider=self._advisor_provider,
+                api_base=self._endpoint_base_url,
+                api_key=self._endpoint_api_key,
+                escape_hatch_api_base=self._advisor_endpoint_base_url,
+                escape_hatch_api_key=self._advisor_endpoint_api_key,
             ),
             rendered_skill=self._composer_skill_text,
             repair_budget=self._settings.composer_planner_repair_budget,
@@ -2680,6 +2717,10 @@ class ComposerServiceImpl:
                 api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
                 escape_hatch_model=self._settings.composer_advisor_model,
                 escape_hatch_provider=self._advisor_provider,
+                api_base=self._endpoint_base_url,
+                api_key=self._endpoint_api_key,
+                escape_hatch_api_base=self._advisor_endpoint_base_url,
+                escape_hatch_api_key=self._advisor_endpoint_api_key,
             ),
             rendered_skill=load_step_planner_skill(guided.step),
             repair_budget=self._settings.composer_planner_repair_budget,
@@ -2726,17 +2767,7 @@ class ComposerServiceImpl:
         sessions = self._require_sessions_service()
         try:
             for call in llm_calls:
-                content = json.dumps(
-                    {
-                        "_kind": "llm_call_audit",
-                        "status": call.status.value,
-                        "model_requested": call.model_requested,
-                        "model_returned": call.model_returned,
-                        "total_tokens": call.total_tokens,
-                        "reasoning_tokens": call.reasoning_tokens,
-                        "provider_cost": call.provider_cost,
-                    }
-                )
+                content = llm_call_audit_summary(call)
                 await sessions.add_message(
                     session_id,
                     "audit",
@@ -2972,6 +3003,10 @@ class ComposerServiceImpl:
                         api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
                         escape_hatch_model=self._settings.composer_advisor_model,
                         escape_hatch_provider=self._advisor_provider,
+                        api_base=self._endpoint_base_url,
+                        api_key=self._endpoint_api_key,
+                        escape_hatch_api_base=self._advisor_endpoint_base_url,
+                        escape_hatch_api_key=self._advisor_endpoint_api_key,
                     ),
                     rendered_skill=rendered_skill,
                     repair_budget=self._settings.composer_planner_repair_budget,
@@ -4554,6 +4589,7 @@ class ComposerServiceImpl:
                 kwargs["temperature"] = self._settings.composer_temperature
             if self._settings.composer_seed is not None:
                 kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
+            _apply_endpoint_kwargs(kwargs, base_url=self._endpoint_base_url, api_key=self._endpoint_api_key)
             response = await _litellm_acompletion(
                 **kwargs,
             )
@@ -4586,6 +4622,7 @@ class ComposerServiceImpl:
                 kwargs["temperature"] = self._settings.composer_temperature
             if self._settings.composer_seed is not None:
                 kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
+            _apply_endpoint_kwargs(kwargs, base_url=self._endpoint_base_url, api_key=self._endpoint_api_key)
             response = await _litellm_acompletion(
                 **kwargs,
             )
@@ -5094,6 +5131,7 @@ class ComposerServiceImpl:
             kwargs["temperature"] = self._settings.composer_temperature
         if self._settings.composer_seed is not None:
             kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
+        _apply_endpoint_kwargs(kwargs, base_url=self._advisor_endpoint_base_url, api_key=self._advisor_endpoint_api_key)
         try:
             response = await asyncio.wait_for(
                 _litellm_acompletion(**kwargs),

@@ -18,7 +18,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast, final
@@ -215,6 +215,20 @@ class PlannerModelConfig:
     # None disables the hatch: budget exhaustion raises exactly as before.
     escape_hatch_model: str | None = None
     escape_hatch_provider: str | None = None
+    # Endpoint affordance (Phase 3 Task 2): when the operator has pointed the
+    # PRIMARY composer role at a custom OpenAI-compatible endpoint, these are
+    # forwarded as ``api_base``/``api_key`` on every ordinary (non-hatch)
+    # planner completion. None (the default) omits both kwargs entirely.
+    # ``repr=False`` keeps the credential out of any dataclass repr that
+    # might land in a log line or exception message.
+    api_base: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+    # Same affordance for the escape-hatch (ADVISOR) model — used only on
+    # hatch turns, mirroring escape_hatch_model/escape_hatch_provider. Never
+    # falls back to the primary api_base/api_key: the two roles are
+    # deliberately independent (see composer_advisor_endpoint_base_url).
+    escape_hatch_api_base: str | None = None
+    escape_hatch_api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         for string_field_name, string_value in (
@@ -231,6 +245,24 @@ class PlannerModelConfig:
             raise ValueError("escape_hatch_provider must be a non-empty exact string or None")
         if (self.escape_hatch_model is None) != (self.escape_hatch_provider is None):
             raise ValueError("escape_hatch_model and escape_hatch_provider must be configured together")
+        if self.escape_hatch_api_base is not None and self.escape_hatch_model is None:
+            raise ValueError("escape_hatch_api_base requires escape_hatch_model to be configured")
+        if self.escape_hatch_api_key is not None and self.escape_hatch_model is None:
+            raise ValueError("escape_hatch_api_key requires escape_hatch_model to be configured")
+        # Defense-in-depth pairing (belt-and-braces alongside
+        # WebSettings._validate_composer_endpoint_credential_pairing): a
+        # constructed PlannerModelConfig must never carry a base URL without
+        # its explicit key, or vice versa, for either role. An endpoint with
+        # no key would let LiteLLM silently fall back to an ambient provider
+        # credential (e.g. OPENAI_API_KEY) and send it to the configured
+        # endpoint. This does not replace the settings-level validator (the
+        # only production source of these values); it forecloses the same
+        # bug reappearing if a future caller ever constructs this dataclass
+        # from something other than validated WebSettings fields.
+        if (self.api_base is None) != (self.api_key is None):
+            raise ValueError("api_base and api_key must be configured together (or both omitted)")
+        if (self.escape_hatch_api_base is None) != (self.escape_hatch_api_key is None):
+            raise ValueError("escape_hatch_api_base and escape_hatch_api_key must be configured together (or both omitted)")
         for integer_field_name, integer_value in (
             ("max_composition_turns", self.max_composition_turns),
             ("max_discovery_turns", self.max_discovery_turns),
@@ -1730,6 +1762,20 @@ async def _plan_pipeline_inner(
                 kwargs["temperature"] = model_config.temperature
             if model_config.seed is not None:
                 kwargs["seed"] = model_config.seed
+            # Endpoint affordance: select by the SAME condition that selects
+            # effective_model above (model_override set == hatch turn), so
+            # the escape-hatch call never lands on the primary's endpoint —
+            # the two roles are independent by design.
+            if model_override is not None:
+                if model_config.escape_hatch_api_base is not None:
+                    kwargs["api_base"] = model_config.escape_hatch_api_base
+                if model_config.escape_hatch_api_key is not None:
+                    kwargs["api_key"] = model_config.escape_hatch_api_key
+            else:
+                if model_config.api_base is not None:
+                    kwargs["api_base"] = model_config.api_base
+                if model_config.api_key is not None:
+                    kwargs["api_key"] = model_config.api_key
 
             try:
                 response = await asyncio.wait_for(model_config.completion(**kwargs), timeout=remaining)

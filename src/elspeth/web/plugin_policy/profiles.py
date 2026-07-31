@@ -4,18 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, Protocol
-
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from typing import TYPE_CHECKING, Any, Protocol
 
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS, CredentialScope, RuntimeLLMProfile, lower_llm_profile_options
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
 
 if TYPE_CHECKING:
@@ -23,119 +21,13 @@ if TYPE_CHECKING:
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.models import PluginId, WebPluginPolicy
 
-CredentialScope = Literal["server", "user"]
-_ALIAS = re.compile(r"[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*\Z")
-_SECRET_REF = re.compile(r"[A-Z][A-Z0-9_]{0,255}\Z")
-
-
-def validate_profile_alias(alias: str) -> str:
-    if _ALIAS.fullmatch(alias) is None:
-        raise ValueError("profile alias must be a lowercase opaque identifier")
-    return alias
-
-
-class WebLLMProfileSettings(BaseModel):
-    """Operator-owned provider binding; private fields stay out of reprs."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
-
-    provider: str = Field(repr=False)
-    model: str = Field(min_length=1, max_length=512, repr=False)
-    credential_scope: CredentialScope | None = Field(default=None, repr=False)
-    credential_ref: str | None = Field(default=None, repr=False)
-    region_name: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$", repr=False)
-    endpoint: str | None = Field(default=None, repr=False)
-    deployment_name: str | None = Field(default=None, min_length=1, max_length=256, repr=False)
-    api_version: str | None = Field(default=None, min_length=1, max_length=64, repr=False)
-    timeout_seconds: float = Field(default=60.0, gt=0, le=300, repr=False)
-    max_tokens: int | None = Field(default=None, gt=0, le=131072, repr=False)
-
-    @model_validator(mode="after")
-    def _validate_provider_binding(self) -> WebLLMProfileSettings:
-        # Plan 09 owns this registry.  Profile validation consumes it rather
-        # than maintaining a second provider allowlist.
-        from elspeth.plugins.transforms.llm.transform import LLMTransform
-
-        providers = LLMTransform.discriminated_variants()[1]
-        if self.provider not in providers:
-            raise ValueError("profile provider is not registered")
-        if self.provider != "openrouter" and "timeout_seconds" in self.model_fields_set:
-            raise ValueError(f"{self.provider} profile does not support timeout_seconds")
-        if self.provider == "azure" and self.region_name is not None:
-            raise ValueError("azure profile does not support region_name")
-        if self.provider == "bedrock":
-            if self.credential_scope is not None or self.credential_ref is not None:
-                raise ValueError("Bedrock profiles use the keyless AWS credential chain")
-            if self.endpoint is not None or self.deployment_name is not None or self.api_version is not None:
-                raise ValueError("Bedrock profile contains fields owned by another provider")
-            # Reuse Plan 09's provider model validation for model/region shape.
-            providers[self.provider](
-                provider="bedrock",
-                model=self.model,
-                region_name=self.region_name,
-                schema={"mode": "observed"},
-                prompt_template="{{ row }}",
-            )
-        else:
-            if self.credential_scope is None or self.credential_ref is None:
-                raise ValueError("credentialed profile requires explicit scope and reference")
-            if _SECRET_REF.fullmatch(self.credential_ref) is None:
-                raise ValueError("credential reference has invalid syntax")
-            if self.provider == "openrouter" and any(
-                value is not None for value in (self.region_name, self.endpoint, self.deployment_name, self.api_version)
-            ):
-                raise ValueError("OpenRouter profile contains unsupported provider fields")
-            if self.provider == "azure":
-                if self.endpoint is None or self.deployment_name is None:
-                    raise ValueError("Azure profile requires operator endpoint and deployment")
-                if self.model != self.deployment_name:
-                    raise ValueError("Azure profile model must match deployment_name")
-                from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
-
-                validate_credential_safe_https_url(self.endpoint, field_name="endpoint")
-        return self
-
-
-@dataclass(frozen=True, slots=True)
-class RuntimeWebLLMProfile:
-    alias: str
-    provider: str = field(repr=False)
-    model: str = field(repr=False)
-    credential_scope: CredentialScope | None = field(default=None, repr=False)
-    credential_ref: str | None = field(default=None, repr=False)
-    provider_options: tuple[tuple[str, object], ...] = field(default=(), repr=False)
-
-    @classmethod
-    def from_settings(cls, alias: str, settings: WebLLMProfileSettings) -> RuntimeWebLLMProfile:
-        validate_profile_alias(alias)
-        provider_fields = {
-            "bedrock": (("region_name", settings.region_name),),
-            "azure": (
-                ("endpoint", settings.endpoint),
-                ("deployment_name", settings.deployment_name),
-                ("api_version", settings.api_version),
-            ),
-            "openrouter": (("timeout_seconds", settings.timeout_seconds),),
-        }
-        options = tuple(
-            (name, value) for name, value in (*provider_fields[settings.provider], ("max_tokens", settings.max_tokens)) if value is not None
-        )
-        return cls(
-            alias=alias,
-            provider=settings.provider,
-            model=settings.model,
-            credential_scope=settings.credential_scope,
-            credential_ref=settings.credential_ref,
-            provider_options=options,
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class RuntimeWebPluginConfig:
     plugin_allowlist: tuple[str, ...]
     plugin_preferences: tuple[tuple[PluginCapability, tuple[str, ...]], ...]
     plugin_control_modes: tuple[tuple[PluginCapability, ControlMode], ...]
-    llm_profiles: tuple[tuple[str, RuntimeWebLLMProfile], ...] = field(repr=False)
+    llm_profiles: tuple[tuple[str, RuntimeLLMProfile], ...] = field(repr=False)
     default_llm_profile: str | None
     bedrock_guardrail_profiles: tuple[BedrockGuardrailProfileSettings, ...] = field(repr=False)
     bedrock_guardrail_default_profiles: tuple[tuple[str, str], ...]
@@ -155,7 +47,7 @@ class RuntimeWebPluginConfig:
             ),
             plugin_control_modes=tuple(sorted(settings.plugin_control_modes.items(), key=lambda item: item[0].value)),
             llm_profiles=tuple(
-                (alias, RuntimeWebLLMProfile.from_settings(alias, profile)) for alias, profile in sorted(settings.llm_profiles.items())
+                (alias, RuntimeLLMProfile.from_settings(alias, profile)) for alias, profile in sorted(settings.llm_profiles.items())
             ),
             default_llm_profile=settings.default_llm_profile,
             bedrock_guardrail_profiles=tuple(sorted(settings.bedrock_guardrail_profiles, key=lambda profile: profile.alias)),
@@ -216,40 +108,10 @@ class OperatorProfileResolver(Protocol):
     def check_local_requirements(self, alias: str) -> LocalRequirementResult: ...
 
 
-_LLM_PRIVATE_OPTIONS = frozenset(
-    {
-        "provider",
-        "model",
-        "api_key",
-        "api_key_secret",
-        "base_url",
-        "endpoint",
-        "deployment_name",
-        "region_name",
-        "api_version",
-        "credential_ref",
-        "credential_scope",
-        "tracing",
-        "timeout_seconds",
-        "max_tokens",
-        "pool_size",
-        "min_dispatch_delay_ms",
-        "max_dispatch_delay_ms",
-        "backoff_multiplier",
-        "recovery_step_ms",
-        "max_capacity_retry_seconds",
-        "prompt_template_source",
-        "lookup_source",
-        "system_prompt_source",
-        "resolved_prompt_template_hash",
-    }
-)
-
-
 class _LLMProfileResolver:
     def __init__(
         self,
-        profiles: tuple[tuple[str, RuntimeWebLLMProfile], ...],
+        profiles: tuple[tuple[str, RuntimeLLMProfile], ...],
         *,
         preferred_alias: str | None,
     ) -> None:
@@ -276,7 +138,7 @@ class _LLMProfileResolver:
                 if not isinstance(properties, dict):
                     continue
                 for name, property_schema in properties.items():
-                    if name not in _LLM_PRIVATE_OPTIONS and isinstance(property_schema, dict):
+                    if name not in LLM_PROFILE_PRIVATE_FIELDS and isinstance(property_schema, dict):
                         safe_properties.setdefault(name, deepcopy(property_schema))
         safe_properties = {
             "profile": {
@@ -330,23 +192,13 @@ class _LLMProfileResolver:
         )
 
     def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
-        if set(safe_options) & _LLM_PRIVATE_OPTIONS:
+        if set(safe_options) & LLM_PROFILE_PRIVATE_FIELDS:
             raise ValueError("private_profile_option")
         try:
             profile = self._profiles[alias]
         except KeyError:
             raise ValueError("profile_unavailable") from None
-        executable = dict(safe_options)
-        executable["provider"] = profile.provider
-        if profile.provider != "azure":
-            executable["model"] = profile.model
-        executable.update(profile.provider_options)
-        if profile.credential_ref is not None:
-            assert profile.credential_scope is not None
-            executable["api_key"] = {
-                "secret_ref": profile.credential_ref,
-                "secret_scope": profile.credential_scope,
-            }
+        executable, audit_safe = lower_llm_profile_options(alias, profile, safe_options, private_fields=LLM_PROFILE_PRIVATE_FIELDS)
         # Web-authored multi-query LLM nodes cannot set the sequential retry
         # budget themselves — ``pool_size`` and ``max_capacity_retry_seconds``
         # are private profile options rejected by the node's public schema — yet
@@ -359,7 +211,6 @@ class _LLMProfileResolver:
             from elspeth.web.provider_config_policy import WEB_LLM_SEQUENTIAL_MULTI_QUERY_MAX_RETRY_SECONDS
 
             executable["max_capacity_retry_seconds"] = WEB_LLM_SEQUENTIAL_MULTI_QUERY_MAX_RETRY_SECONDS
-        audit_safe = {"profile": alias, **safe_options}
         return LoweredPluginConfig(
             executable_options=MappingProxyType(executable),
             audit_safe_options=MappingProxyType(audit_safe),
@@ -402,7 +253,7 @@ class _LLMProfileResolver:
         return tuple(result)
 
     @staticmethod
-    def _binding_generation(profile: RuntimeWebLLMProfile, *, credential_generation: str | None) -> str:
+    def _binding_generation(profile: RuntimeLLMProfile, *, credential_generation: str | None) -> str:
         return hashlib.sha256(
             json.dumps(
                 {

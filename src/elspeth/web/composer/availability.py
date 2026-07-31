@@ -52,6 +52,25 @@ class ComposerAvailability:
             )
 
 
+def _missing_required_env_keys(provider: str, *, endpoint_configured: bool) -> tuple[str, ...]:
+    """Ambient-provider-env keys still missing for ``provider``.
+
+    When the operator has configured this role's endpoint affordance (a
+    paired ``*_endpoint_base_url``/``*_endpoint_api_key`` — enforced together
+    by ``WebSettings._validate_composer_endpoint_credential_pairing``), the
+    role's readiness must not depend on an ambient provider environment
+    variable: the explicit ``api_key`` travels with every LiteLLM call for
+    that role regardless of what LiteLLM's own provider-inference would have
+    looked for. Requiring the ambient var anyway would be the exact
+    inversion the pairing validator exists to prevent — it fails closed on
+    relying on an ambient key so operators do not have to keep one around,
+    and this gate must not then pressure them into keeping one anyway.
+    """
+    if endpoint_configured:
+        return ()
+    return tuple(key for key in PROVIDER_REQUIRED_ENV_KEYS[provider] if key not in os.environ or not os.environ[key])
+
+
 def compute_availability(service: ComposerServiceImpl) -> ComposerAvailability:
     """Infer whether the configured primary and advisor have required env.
 
@@ -59,6 +78,13 @@ def compute_availability(service: ComposerServiceImpl) -> ComposerAvailability:
     Keep it side-effect-free: LiteLLM provider probing has observable
     startup side effects in web lifespans, while the actual composer call
     path still validates provider requests through LiteLLM.
+
+    A role whose endpoint affordance is configured (paired base URL + key)
+    carries its own explicit credential on every call and is exempt from the
+    ambient-provider-env-key requirement below — see
+    ``_missing_required_env_keys``. Unconfigured deployments (the common
+    case today) see byte-identical behaviour to before this affordance
+    existed.
     """
     provider = infer_provider_from_model_name(service._model) or infer_provider_from_unprefixed_model_name(service._model)
     if provider is None:
@@ -79,9 +105,9 @@ def compute_availability(service: ComposerServiceImpl) -> ComposerAvailability:
             provider=provider,
             reason=f"Composer model {service._model} is unavailable: provider {provider!r} has no configured environment contract.",
         )
-    required_keys = PROVIDER_REQUIRED_ENV_KEYS[provider]
 
-    missing_keys = tuple(key for key in required_keys if key not in os.environ or not os.environ[key])
+    primary_endpoint_configured = service._endpoint_base_url is not None and service._endpoint_api_key is not None
+    missing_keys = _missing_required_env_keys(provider, endpoint_configured=primary_endpoint_configured)
     if missing_keys:
         missing = ", ".join(missing_keys)
         reason = f"Composer model {service._model} is unavailable: missing {missing}."
@@ -106,9 +132,8 @@ def compute_availability(service: ComposerServiceImpl) -> ComposerAvailability:
             ),
         )
 
-    advisor_missing_keys = tuple(
-        key for key in PROVIDER_REQUIRED_ENV_KEYS[advisor_provider] if key not in os.environ or not os.environ[key]
-    )
+    advisor_endpoint_configured = service._advisor_endpoint_base_url is not None and service._advisor_endpoint_api_key is not None
+    advisor_missing_keys = _missing_required_env_keys(advisor_provider, endpoint_configured=advisor_endpoint_configured)
     if advisor_missing_keys:
         missing = ", ".join(advisor_missing_keys)
         return ComposerAvailability(

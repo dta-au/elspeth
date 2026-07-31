@@ -2309,43 +2309,36 @@ class TestProviderCacheTokenAudit:
 
     @pytest.mark.asyncio
     async def test_litellm_normalized_dual_shape_is_deduped_on_attribute_branch(self) -> None:
-        """Pydantic-shaped (attribute) usage object also dedups when siblings present.
+        """Attribute-shaped usage object also dedups when siblings present.
 
-        Real LiteLLM responses are Pydantic ``Usage`` objects, not Mappings.
-        Verifies the elif branch in ``token_usage_from_response`` honors the
-        same dedup rule: nested ``prompt_tokens_details.cached_tokens`` is
-        dropped when an Anthropic sibling is present on the attribute object.
+        Uses REAL litellm objects, not a dataclass fake. A fake could not
+        express the shape under test: litellm declares neither ``usage`` on
+        ``ModelResponse`` nor the Anthropic sibling counters on ``Usage`` —
+        all three live in ``__pydantic_extra__``, so a dataclass double that
+        exposes them as ordinary attributes exercises a reading path
+        production does not take (elspeth-6664a00cb0). The full reconciliation
+        of this path against real litellm lives in
+        ``test_llm_usage_real_litellm.py``.
         """
+        from litellm.types.utils import (
+            Choices,
+            Message,
+            ModelResponse,
+            PromptTokensDetailsWrapper,
+            Usage,
+        )
+
         from elspeth.web.composer.llm_response_parsing import token_usage_from_response
 
-        @dataclass
-        class FakePromptTokensDetails:
-            cached_tokens: int | None
-
-        @dataclass
-        class FakePydanticUsage:
-            prompt_tokens: int
-            completion_tokens: int
-            total_tokens: int
-            prompt_tokens_details: FakePromptTokensDetails
-            cache_creation_input_tokens: int | None
-            cache_read_input_tokens: int | None
-
-        @dataclass
-        class FakeResponseWithPydanticUsage:
-            choices: list[FakeChoice]
-            usage: FakePydanticUsage
-            model: str = "anthropic/claude-3-5-sonnet"
-            id: str = "msg_test"
-
-        text = _make_llm_response(content="Done.")
-        response = FakeResponseWithPydanticUsage(
-            choices=text.choices,
-            usage=FakePydanticUsage(
+        response = ModelResponse(
+            choices=[Choices(message=Message(content="Done.", role="assistant"), finish_reason="stop")],
+            model="anthropic/claude-3-5-sonnet",
+            id="msg_test",
+            usage=Usage(
                 prompt_tokens=8200,
                 completion_tokens=120,
                 total_tokens=8320,
-                prompt_tokens_details=FakePromptTokensDetails(cached_tokens=1100),
+                prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=1100),  # type: ignore[no-untyped-call]
                 cache_creation_input_tokens=7000,
                 cache_read_input_tokens=1100,
             ),

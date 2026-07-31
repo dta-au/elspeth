@@ -11,6 +11,7 @@ from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.engine.orchestrator.preflight import check_config_value_sources
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.plugins.transforms.llm.providers.azure import AzureOpenAIConfig
+from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig
 from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
@@ -439,6 +440,15 @@ def _profile_registry() -> OperatorProfileRegistry:
                     "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
                     "region_name": "ap-southeast-2",
                 },
+                "gateway-task": {
+                    "provider": "gateway",
+                    "model": "standard",
+                    "credential_scope": "server",
+                    "credential_ref": "GATEWAY_BEARER_TOKEN",
+                    "endpoint": "https://gateway.example.com/v1",
+                    "contract_major": 1,
+                    "required_capabilities": ["text", "usage"],
+                },
             },
             default_llm_profile="tutorial",
         )
@@ -553,3 +563,170 @@ def test_profile_lowering_rejects_raw_provider_options() -> None:
             alias="tutorial",
             safe_options={"provider": "bedrock", "prompt_template": "{{ row }}"},
         )
+
+
+# ---------------------------------------------------------------------------
+# Gateway profiles (Phase 2 Task 4) — closes the app-startup KeyError('gateway')
+# crash and covers the credential-seam reconciliation described in the task
+# report.
+# ---------------------------------------------------------------------------
+
+
+def _gateway_settings(**profile_overrides: object) -> WebSettings:
+    profile: dict[str, object] = {
+        "provider": "gateway",
+        "model": "standard",
+        "credential_scope": "server",
+        "credential_ref": "GATEWAY_BEARER_TOKEN",
+        "endpoint": "https://gateway.example.com/v1",
+        "contract_major": 1,
+        "required_capabilities": ["text", "usage"],
+    }
+    profile.update(profile_overrides)
+    return _settings(llm_profiles={"gateway-task": profile}, default_llm_profile="gateway-task")
+
+
+def test_runtime_web_plugin_config_from_settings_does_not_crash_for_gateway_profile() -> None:
+    """Regression test for the Task 2-introduced crash: before this task,
+    ``RuntimeLLMProfile.from_settings``'s hard-coded ``provider_fields[...]``
+    table had no "gateway" arm, so this call raised a bare ``KeyError``
+    (called from every web app boot via ``RuntimeWebPluginConfig.from_settings``,
+    see ``web/app.py``)."""
+    runtime = RuntimeWebPluginConfig.from_settings(_gateway_settings())
+
+    profile = dict(runtime.llm_profiles)["gateway-task"]
+    assert profile.provider == "gateway"
+    assert profile.credential_scope == "server"
+    assert profile.credential_ref == "GATEWAY_BEARER_TOKEN"
+    assert dict(profile.provider_options) == {
+        "endpoint": "https://gateway.example.com/v1",
+        "contract_major": 1,
+        "required_capabilities": ("text", "usage"),
+        "timeout_seconds": 60.0,
+    }
+
+
+def test_gateway_profile_rejects_user_credential_scope() -> None:
+    with pytest.raises(ValidationError, match="credential_scope 'server'"):
+        _gateway_settings(credential_scope="user")
+
+
+@pytest.mark.parametrize(
+    "field_overrides",
+    [
+        {"region_name": "ap-southeast-2"},
+        {"deployment_name": "some-deployment"},
+        {"api_version": "2024-01-01"},
+    ],
+)
+def test_gateway_profile_rejects_other_provider_fields(field_overrides: dict[str, object]) -> None:
+    with pytest.raises(ValidationError, match="another provider"):
+        _gateway_settings(**field_overrides)
+
+
+def test_gateway_profile_requires_endpoint_contract_major_and_capabilities() -> None:
+    with pytest.raises(ValidationError, match="requires operator endpoint"):
+        _gateway_settings(endpoint=None)
+    with pytest.raises(ValidationError, match="requires contract_major"):
+        _gateway_settings(contract_major=None)
+    with pytest.raises(ValidationError, match="requires required_capabilities"):
+        _gateway_settings(required_capabilities=None)
+
+
+def test_gateway_profile_reuses_gatewayconfig_endpoint_validation() -> None:
+    """The profile validator reuses ``GatewayConfig``'s own endpoint
+    validator rather than duplicating the loopback/HTTPS/versioned-base
+    rule — a plain ``http://`` non-loopback endpoint must fail exactly the
+    way ``GatewayConfig`` itself would reject it."""
+    with pytest.raises(ValidationError, match="HTTPS"):
+        _gateway_settings(endpoint="http://gateway.example.com/v1")
+
+
+def test_gateway_profile_rejects_unsupported_contract_major() -> None:
+    with pytest.raises(ValidationError, match="not supported"):
+        _gateway_settings(contract_major=2)
+
+
+def test_gateway_profile_rejects_unknown_capability() -> None:
+    with pytest.raises(ValidationError, match="unknown gateway capability"):
+        _gateway_settings(required_capabilities=["not_a_real_capability"])
+
+
+def test_gateway_profile_lowering_produces_private_executable_and_audit_safe_options() -> None:
+    lowered = _profile_registry().lower_options(
+        PluginId("transform", "llm"),
+        alias="gateway-task",
+        safe_options={"prompt_template": "Summarise {{ row }}", "response_field": "summary"},
+    )
+
+    assert lowered.executable_options["provider"] == "gateway"
+    assert lowered.executable_options["model"] == "standard"
+    assert lowered.executable_options["endpoint"] == "https://gateway.example.com/v1"
+    assert lowered.executable_options["contract_major"] == 1
+    assert lowered.executable_options["required_capabilities"] == ("text", "usage")
+    assert lowered.executable_options["timeout_seconds"] == 60.0
+    assert lowered.executable_options["api_key"] == {
+        "secret_ref": "GATEWAY_BEARER_TOKEN",
+        "secret_scope": "server",
+    }
+    assert deep_thaw(lowered.audit_safe_options) == {
+        "profile": "gateway-task",
+        "prompt_template": "Summarise {{ row }}",
+        "response_field": "summary",
+    }
+    assert "GATEWAY_BEARER_TOKEN" not in repr(lowered)
+    assert "gateway.example.com" not in repr(lowered)
+
+
+def test_gateway_profile_lowering_round_trips_into_gateway_config() -> None:
+    lowered = _profile_registry().lower_options(
+        PluginId("transform", "llm"),
+        alias="gateway-task",
+        safe_options={"prompt_template": "Summarise {{ row }}", "schema": {"mode": "observed"}},
+    )
+    executable = deep_thaw(lowered.executable_options)
+    executable["api_key"] = "resolved-bearer-token"
+    config = GatewayConfig.model_validate(executable)
+
+    assert config.model == "standard"
+    assert config.endpoint == "https://gateway.example.com/v1"
+    assert config.contract_major == 1
+    assert config.required_capabilities == ("text", "usage")
+    assert check_config_value_sources(config, component_id="llm") == ()
+
+
+@pytest.mark.parametrize(
+    "private_field",
+    ["endpoint", "credential_ref", "api_key", "contract_major", "required_capabilities", "credential_scope"],
+)
+def test_gateway_profile_lowering_rejects_every_private_field_in_web_authored_options(private_field: str) -> None:
+    with pytest.raises(ValueError, match="private_profile_option"):
+        _profile_registry().lower_options(
+            PluginId("transform", "llm"),
+            alias="gateway-task",
+            safe_options={"prompt_template": "{{ row }}", private_field: "attacker-supplied"},
+        )
+
+
+def test_gateway_public_schema_excludes_private_fields() -> None:
+    full = create_catalog_service().get_schema("transform", "llm")
+    public = _profile_registry().public_schema(
+        PluginId("transform", "llm"),
+        full,
+        available_aliases=("gateway-task",),
+    )
+    rendered = public.model_dump_json()
+
+    assert '"profile"' in rendered
+    assert '"gateway-task"' in rendered
+    for private_name in (
+        "endpoint",
+        "credential_ref",
+        "credential_scope",
+        "api_key",
+        "contract_major",
+        "required_capabilities",
+        "gateway.example.com",
+        "GATEWAY_BEARER_TOKEN",
+    ):
+        assert private_name not in rendered

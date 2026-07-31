@@ -27,7 +27,7 @@ from opentelemetry import metrics
 from opentelemetry.metrics import Counter, Histogram
 from opentelemetry.util.types import AttributeValue
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -634,9 +634,16 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.composer_boot_probe_enabled:
         from elspeth.web.composer.boot_probe import ComposerBootConfigError, probe_composer_config
 
-        # Advisor is mandatory, so the advisor model is always probed.
-        probe_models = [settings.composer_model, settings.composer_advisor_model]
-        for model in probe_models:
+        # Advisor is mandatory, so the advisor model is always probed. Each
+        # role probes against ITS OWN configured endpoint (Phase 3 Task 2):
+        # a misconfigured custom endpoint must fail boot, not a user's first
+        # turn. None/None (both unset) reproduces the exact pre-affordance
+        # probe request for that role.
+        probe_roles: list[tuple[str, str | None, SecretStr | None]] = [
+            (settings.composer_model, settings.composer_endpoint_base_url, settings.composer_endpoint_api_key),
+            (settings.composer_advisor_model, settings.composer_advisor_endpoint_base_url, settings.composer_advisor_endpoint_api_key),
+        ]
+        for model, endpoint_base_url, endpoint_api_key in probe_roles:
             composer_probe_start = time.monotonic()
             probe_status = "started"
             attributes: dict[str, AttributeValue] = {
@@ -653,6 +660,8 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                         model=model,
                         temperature=settings.composer_temperature,
                         seed=settings.composer_seed,
+                        api_base=endpoint_base_url,
+                        api_key=(endpoint_api_key.get_secret_value() if endpoint_api_key is not None else None),
                     ),
                     timeout=_COMPOSER_BOOT_PROBE_TIMEOUT_SECONDS,
                 )

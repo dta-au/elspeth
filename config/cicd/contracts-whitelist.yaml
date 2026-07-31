@@ -35,6 +35,12 @@ allowed_external_types:
   - "web/deployment_contract:ContractCheck"
   - "web/plugin_policy/models:PluginAvailabilitySnapshot"
   - "core/landscape/database:LandscapeSchemaShape"
+  # Provider-neutral LLM profile runtime dataclass — lives in core because
+  # elspeth.core must never import elspeth.plugins at module scope, while
+  # elspeth.plugins (and eventually the pipeline gateway provider) import it
+  # from core. Web plugin policy is one of several intended consumers, not a
+  # violation of a contracts/-only boundary.
+  - "core/llm_profiles:RuntimeLLMProfile"
 
 # dict[str, Any] patterns that are intentional
 # Format: "file_path:context:param_name"
@@ -255,6 +261,10 @@ allowed_dict_patterns:
   - "src/elspeth/core/config.py:_fingerprint_secrets:return"
   - "src/elspeth/core/config.py:_expand_config_templates:raw_config"
   - "src/elspeth/core/config.py:_expand_config_templates:return"
+  # Raw pre-pydantic config dict rewrite for the batch/CLI llm_profiles
+  # catalog lowering pass — same shape as _expand_env_vars/_expand_config_templates above.
+  - "src/elspeth/core/config.py:_lower_llm_profile_nodes:raw_config"
+  - "src/elspeth/core/config.py:_lower_llm_profile_nodes:return"
   - "src/elspeth/core/config.py:_fingerprint_config_for_audit:config_dict"
   - "src/elspeth/core/config.py:_fingerprint_config_for_audit:return"
   # In-place DSN-password sanitiser for audit copy (placement-based, e.g. database sink url).
@@ -378,6 +388,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/llm/provider.py:LLMProvider.execute_query:response_format"
   - "src/elspeth/plugins/transforms/llm/providers/azure.py:AzureLLMProvider.execute_query:response_format"
   - "src/elspeth/plugins/transforms/llm/providers/openrouter.py:OpenRouterLLMProvider.execute_query:response_format"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider.execute_query:response_format"
 
   # LLM tracing — extra_metadata is provider-specific (deployment, model, query keys vary per caller)
   - "src/elspeth/plugins/transforms/llm/langfuse.py:LangfuseTracer.record_success:extra_metadata"
@@ -455,6 +466,14 @@ allowed_dict_patterns:
   # LLMCallResponse are the typed audit contracts around these mappings.
   - "src/elspeth/plugins/transforms/llm/providers/openrouter.py:OpenRouterLLMProvider._build_llm_request_payload:response_format"
   - "src/elspeth/plugins/transforms/llm/providers/openrouter.py:OpenRouterLLMProvider._record_logical_llm_success:raw_response"
+
+  # ELSPETH LLM Gateway provider — same OpenAI-compatible wire shapes as
+  # OpenRouter above (request_body IS the JSON POST body sent verbatim;
+  # raw_response is the gateway's parsed chat-completion JSON kept for audit).
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._post_chat_completion:request_body"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._build_llm_request_payload:response_format"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._record_logical_llm_success:raw_response"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:_validate_readyz_adapter_identity:payload"
   - "src/elspeth/plugins/infrastructure/clients/replayer.py:ReplayMissError.__init__:request_data"
   - "src/elspeth/plugins/infrastructure/clients/replayer.py:CallReplayer.replay:request_data"
   - "src/elspeth/plugins/infrastructure/clients/verifier.py:CallVerifier.verify:request_data"
@@ -850,6 +869,12 @@ allowed_dict_patterns:
   # Any)``) — the same untyped external-library boundary as the entries above —
   # so it cannot be reduced to a TypedDict without shadowing LiteLLM's own API.
   - "src/elspeth/web/composer/service.py:_apply_openrouter_app_identity:kwargs"
+  # ``_apply_endpoint_kwargs`` (Phase 3 Task 2 endpoint affordance) adds
+  # ``api_base``/``api_key`` to the same open-ended LiteLLM ``acompletion``
+  # kwargs dict as the entry above, for the same reason: it is LiteLLM's
+  # untyped external-library completion surface, not a contract this
+  # codebase owns the shape of.
+  - "src/elspeth/web/composer/service.py:_apply_endpoint_kwargs:kwargs"
   # Blob sync helpers — return dicts for LLM-visible tool response payloads.
   # The list_composer_blobs shape is deliberately metadata-only, enforced by
   # the construction helper; bytes/previews/storage paths stay outside the

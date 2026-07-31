@@ -315,6 +315,81 @@ class TestBedrockProviderTelemetryWiring:
         assert len(llm_events) == 1
 
 
+class TestGatewayProviderTelemetryWiring:
+    """GatewayLLMProvider emits through its AuditedHTTPClient.
+
+    Chain: GatewayLLMProvider.execute_query → AuditedHTTPClient → telemetry_emit
+
+    Unlike Azure/Bedrock, the gateway transport is raw HTTP (like OpenRouter),
+    so the audited client records a CallType.HTTP transport row, not LLM.
+    """
+
+    def test_telemetry_emitted_on_gateway_llm_call(self) -> None:
+        import respx
+
+        from elspeth.plugins.transforms.llm.providers.gateway import GatewayLLMProvider
+
+        endpoint = "https://gateway.example.com/v1"
+        response_body = {
+            "id": "gwcmpl-req-1",
+            "object": "chat.completion",
+            "created": 1_700_000_000,
+            "model": "standard",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "classified"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+        }
+
+        events: list[Any] = []
+        provider = GatewayLLMProvider(
+            endpoint=endpoint,
+            api_key="test-bearer-token",
+            contract_major=1,
+            required_capabilities=(),
+            timeout_seconds=30.0,
+            recorder=cast(PluginAuditWriter, _ExecutionRepositoryDouble()),
+            run_id="test-run",
+            telemetry_emit=events.append,
+        )
+
+        try:
+            with respx.mock:
+                respx.post(f"{endpoint}/chat/completions").mock(
+                    return_value=httpx.Response(
+                        200,
+                        json=response_body,
+                        headers={
+                            "content-type": "application/json",
+                            "X-ELSPETH-LLM-Gateway-Contract": "1",
+                        },
+                    )
+                )
+                result = provider.execute_query(
+                    messages=[{"role": "user", "content": "classify"}],
+                    model="standard",
+                    temperature=0.0,
+                    max_tokens=16,
+                    state_id="state-001",
+                    token_id="token-001",
+                )
+        finally:
+            provider.close()
+
+        assert result.content == "classified"
+        # The underlying transport is HTTP (AuditedHTTPClient), so telemetry
+        # carries the HTTP transport row's completion event — mirroring the
+        # OpenRouter wiring pattern this provider follows.
+        http_events = [event for event in events if isinstance(event, ExternalCallCompleted) and event.call_type == CallType.HTTP]
+        assert len(http_events) >= 1, (
+            f"Expected ExternalCallCompleted(HTTP) event from telemetry_emit, got: {[type(e).__name__ for e in events]}"
+        )
+
+
 class TestAzureSafetyTelemetryWiring:
     """Azure safety transforms wire telemetry_emit through to AuditedHTTPClient.
 
@@ -523,6 +598,7 @@ _KNOWN_AUDITED_CLIENT_USERS: set[str] = {
     "src/elspeth/plugins/transforms/llm/providers/azure.py",
     "src/elspeth/plugins/transforms/llm/providers/bedrock.py",
     "src/elspeth/plugins/transforms/llm/providers/openrouter.py",
+    "src/elspeth/plugins/transforms/llm/providers/gateway.py",
     "src/elspeth/plugins/transforms/azure/base.py",
     "src/elspeth/plugins/transforms/azure/document_intelligence.py",
     "src/elspeth/plugins/transforms/web_scrape.py",
