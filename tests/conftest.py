@@ -10,7 +10,9 @@ Responsibilities:
 
 from __future__ import annotations
 
+import hashlib
 import os
+import stat
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -155,14 +157,77 @@ def _sink_effect_spool_outside_repo(tmp_path_factory: pytest.TempPathFactory) ->
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _REPO_ELSPETH = _REPO_ROOT / ".elspeth"
+_WRITE_OPEN_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
 
 
-def _in_repo_elspeth(candidate: str) -> Path | None:
-    """Return the resolved path when it targets ``<repo>/.elspeth``, else None."""
-    resolved = Path(candidate).expanduser().resolve()
-    if resolved == _REPO_ELSPETH or _REPO_ELSPETH in resolved.parents:
+def _in_elspeth_root(candidate: object, root: Path) -> Path | None:
+    """Return the resolved path when ``candidate`` targets ``root``, else None."""
+    if not isinstance(candidate, (str, bytes, os.PathLike)):
+        return None
+    raw_candidate = os.fspath(candidate)
+    if isinstance(raw_candidate, bytes):
+        raw_candidate = raw_candidate.decode(errors="replace")
+
+    resolved = Path(raw_candidate).expanduser().resolve()
+    if resolved == root or root in resolved.parents:
         return resolved
     return None
+
+
+def _in_repo_elspeth(candidate: object) -> Path | None:
+    """Return the resolved path when it targets ``<repo>/.elspeth``, else None."""
+    return _in_elspeth_root(candidate, _REPO_ELSPETH)
+
+
+def _write_open_requested(mode: object, flags: object) -> bool:
+    """Return whether an ``open`` audit event requests write authority."""
+    if isinstance(mode, str) and any(marker in mode for marker in ("w", "a", "x", "+")):
+        return True
+    return isinstance(flags, int) and bool(flags & _WRITE_OPEN_FLAGS)
+
+
+def _elspeth_tree_snapshot(root: Path) -> bytes:
+    """Return a compact fingerprint of path and inode metadata beneath ``root``."""
+    digest = hashlib.sha256()
+
+    def add_entry(relative_path: Path, entry_stat: os.stat_result) -> None:
+        path_bytes = os.fsencode(relative_path.as_posix())
+        metadata = (
+            entry_stat.st_dev,
+            entry_stat.st_ino,
+            entry_stat.st_mode,
+            entry_stat.st_nlink,
+            entry_stat.st_uid,
+            entry_stat.st_gid,
+            entry_stat.st_size,
+            entry_stat.st_mtime_ns,
+            entry_stat.st_ctime_ns,
+        )
+        record = path_bytes + b"\0" + b"\0".join(str(value).encode("ascii") for value in metadata)
+        digest.update(len(record).to_bytes(8, byteorder="big"))
+        digest.update(record)
+
+    try:
+        root_stat = root.lstat()
+    except FileNotFoundError:
+        return digest.digest()
+
+    add_entry(Path("."), root_stat)
+    if not stat.S_ISDIR(root_stat.st_mode):
+        return digest.digest()
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=raise_walk_error):
+        dirnames.sort(key=os.fsencode)
+        filenames.sort(key=os.fsencode)
+        directory = Path(dirpath)
+        for name in (*dirnames, *filenames):
+            entry = directory / name
+            add_entry(entry.relative_to(root), entry.lstat())
+
+    return digest.digest()
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -176,15 +241,18 @@ def _refuse_in_repo_elspeth_writes() -> Iterator[None]:
     done this: ``payload_store.base_path`` (~800K per full run) and the
     sign-bundle rotation log.
 
-    Two layers, because no single one covers every write:
+    Three layers, because no single one covers every write:
 
-    * ``os.mkdir`` is the choke point for ``Path.mkdir`` and ``os.makedirs``,
-      so refusing there names the offending test and, by raising before the
-      call, keeps the directory from being created at all.
+    * Python's ``open`` audit event covers built-in, ``pathlib``, and
+      ``os.open`` write modes. Refusing there catches writes beneath an
+      existing directory as well as overwrites of an existing file.
+    * ``os.mkdir`` is the choke point for ``Path.mkdir`` and ``os.makedirs``.
+      Refusing there names the offending test and, by raising before the call,
+      keeps the directory from being created at all.
     * The fd-relative walk in ``core.audit_export_content_store`` passes bare
       component names against a parent descriptor, so a path-based hook cannot
-      see it. The session-end sweep catches that, plus any plain file written
-      into ``.elspeth/`` without a ``mkdir``.
+      see where they resolve. The recursive session-end fingerprint catches
+      that and native-extension writes.
 
     Fix a firing guard at the test, never by relaxing this fixture:
 
@@ -194,7 +262,26 @@ def _refuse_in_repo_elspeth_writes() -> Iterator[None]:
       code-owned and reject absolute paths, so CWD is the only lever —
       use ``monkeypatch.chdir(tmp_path)``.
     """
-    before = frozenset(entry.name for entry in _REPO_ELSPETH.iterdir()) if _REPO_ELSPETH.is_dir() else frozenset()
+    before = _elspeth_tree_snapshot(_REPO_ELSPETH)
+    guarded_root = _REPO_ELSPETH
+    audit_active = True
+
+    def guard_write_open(event: str, args: tuple[object, ...]) -> None:
+        if not audit_active or event != "open" or len(args) < 3:
+            return
+        candidate, mode, flags = args[:3]
+        if not _write_open_requested(mode, flags):
+            return
+        resolved = _in_elspeth_root(candidate, guarded_root)
+        if resolved is not None:
+            pytest.fail(
+                f"Test wrote into the repository checkout: {resolved}\n"
+                f"A CWD-relative `.elspeth/` default was left unredirected. Redirect it in "
+                f"the test — see tests/conftest.py::_refuse_in_repo_elspeth_writes.",
+                pytrace=True,
+            )
+
+    sys.addaudithook(guard_write_open)
 
     original_mkdir = os.mkdir
 
@@ -202,7 +289,7 @@ def _refuse_in_repo_elspeth_writes() -> Iterator[None]:
         # dir_fd calls carry a bare component name that cannot be resolved to
         # an absolute path here; the session-end sweep below covers them.
         if dir_fd is None:
-            candidate = os.fspath(path) if not isinstance(path, int) else None  # type: ignore[arg-type]
+            candidate = os.fspath(path) if isinstance(path, (str, bytes, os.PathLike)) else None
             if isinstance(candidate, bytes):
                 candidate = candidate.decode(errors="replace")
             # Cheap pre-filter: almost no mkdir in the suite mentions .elspeth,
@@ -223,18 +310,20 @@ def _refuse_in_repo_elspeth_writes() -> Iterator[None]:
 
     patch = pytest.MonkeyPatch()
     patch.setattr(os, "mkdir", guarded_mkdir)
-    yield
-    patch.undo()
+    try:
+        yield
+    finally:
+        audit_active = False
+        patch.undo()
 
-    after = frozenset(entry.name for entry in _REPO_ELSPETH.iterdir()) if _REPO_ELSPETH.is_dir() else frozenset()
-    created = sorted(after - before)
-    if created:
-        pytest.fail(
-            f"Suite created {', '.join(created)} under {_REPO_ELSPETH}\n"
-            f"A CWD-relative `.elspeth/` default was left unredirected. Redirect it in "
-            f"the test — see tests/conftest.py::_refuse_in_repo_elspeth_writes.",
-            pytrace=False,
-        )
+        after = _elspeth_tree_snapshot(_REPO_ELSPETH)
+        if after != before:
+            pytest.fail(
+                f"Suite modified contents under {_REPO_ELSPETH}\n"
+                f"A CWD-relative `.elspeth/` default was left unredirected. Redirect it in "
+                f"the test — see tests/conftest.py::_refuse_in_repo_elspeth_writes.",
+                pytrace=False,
+            )
 
 
 @pytest.fixture(autouse=True)
