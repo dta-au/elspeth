@@ -924,3 +924,23 @@ bootstrap live outside every Terraform state, so no destroy removes them.
 After the bootstrap destroy succeeds — both destroys still need those
 policies — detach and delete all four through the same paths used to attach
 them.
+
+### Container Insights log-group orphan on redeploy (R2-D3, elspeth-a229c247a1)
+
+`module.scenario.aws_cloudwatch_log_group.container_insights` shares the
+exact name ECS's service-linked role auto-creates for the cluster's
+Container Insights performance metrics. That role re-creates the log group a
+few minutes after the cluster goes `INACTIVE` — its final flush — leaving an
+untagged orphan outside Terraform state. A same-namespace redeploy retry
+after a destroy can then hit `ResourceAlreadyExistsException` on
+`CreateLogGroup`. A `depends_on` ordering fix cannot help; the collision
+happens after destroy completes, not during create.
+
+Delete the orphan once the flush has had time to land
+(`aws logs delete-log-group --log-group-name
+/aws/ecs/containerinsights/<cluster-name>/performance`, tolerant of
+`ResourceNotFoundException`) — see the cold-install runbook's Teardown
+section. If a retry still collides, set `-var=adopt_container_insights_log_group=true`
+on that apply instead: both roots declare the variable (default `false`) and
+gate an `import` block on it that formally adopts the orphan into state
+rather than deleting it.

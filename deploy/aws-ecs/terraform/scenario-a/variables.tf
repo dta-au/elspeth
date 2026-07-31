@@ -326,3 +326,9 @@ variable "content_guardrail" {
   default     = null
   description = "Bedrock Guardrail content policy for content safety (screens model output). Null keeps the module default."
 }
+
+variable "adopt_container_insights_log_group" {
+  type        = bool
+  default     = false
+  description = "Set true only on a same-namespace redeploy retry after a prior destroy: ECS's service-linked role re-creates the Container Insights performance log group minutes after the cluster goes INACTIVE (its final flush), leaving an untagged orphan with the exact name Terraform wants to create, so the next apply's CreateLogGroup fails with ResourceAlreadyExistsException. True formally imports that orphan back into state instead of trying to create it. False (the default) leaves fresh accounts, where no orphan exists, unaffected."
+}

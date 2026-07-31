@@ -307,6 +307,44 @@ def test_container_insights_performance_log_group_is_terraform_owned() -> None:
     assert 'resource "aws_cloudwatch_log_group" "container_insights"' in observability
     assert "depends_on = [aws_cloudwatch_log_group.container_insights]" in ecs
 
+    # R2-D3 (elspeth-a229c247a1): ECS's service-linked role re-creates this
+    # exact log-group name minutes after the cluster goes INACTIVE (a final
+    # Container Insights flush), leaving an untagged, unmanaged orphan that
+    # blocks the next apply's CreateLogGroup with ResourceAlreadyExistsException.
+    # A depends_on ordering fix cannot help — the collision happens after
+    # destroy completes. Each root offers a variable-gated `import` block so
+    # an operator can formally adopt the orphan back into state on a
+    # same-namespace redeploy retry, default false so fresh accounts are
+    # unaffected.
+    for scenario in ("scenario-a", "scenario-b"):
+        main = _text(f"{scenario}/main.tf")
+        variables = _text(f"{scenario}/variables.tf")
+
+        import_block = re.search(r"import \{(?P<body>.*?)\n\}", main, re.DOTALL)
+        assert import_block is not None, f"{scenario}/main.tf is missing the container-insights import block"
+        body = import_block.group("body")
+        assert "to       = module.scenario.aws_cloudwatch_log_group.container_insights" in body
+        assert "var.adopt_container_insights_log_group" in body
+        assert "containerinsights" in body
+        assert "performance" in body
+
+        variable_block = re.search(
+            r'variable "adopt_container_insights_log_group" \{(?P<body>.*?)\n\}',
+            variables,
+            re.DOTALL,
+        )
+        assert variable_block is not None, f"{scenario}/variables.tf is missing adopt_container_insights_log_group"
+        assert re.search(r"type\s*=\s*bool", variable_block.group("body"))
+        assert re.search(r"default\s*=\s*false", variable_block.group("body"))
+
+    cold_install = (REPO_ROOT / "docs" / "runbooks" / "aws-ecs-cold-install.md").read_text(encoding="utf-8")
+    teardown_section = re.search(r"\n## Teardown\n(?P<body>.*)", cold_install, re.DOTALL)
+    assert teardown_section is not None, "cold-install runbook is missing its Teardown section"
+    teardown_body = teardown_section.group("body")
+    assert "containerinsights" in teardown_body
+    assert "delete-log-group" in teardown_body
+    assert "describe-log-groups" in teardown_body
+
 
 def test_installer_secret_reads_are_bound_to_the_two_exact_run_namespaces() -> None:
     template = _installer_policy_template_text()
