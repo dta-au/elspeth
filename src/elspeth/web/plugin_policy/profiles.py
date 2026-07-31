@@ -107,6 +107,8 @@ class OperatorProfileResolver(Protocol):
 
     def check_local_requirements(self, alias: str) -> LocalRequirementResult: ...
 
+    def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None: ...
+
 
 class _LLMProfileResolver:
     def __init__(
@@ -117,9 +119,26 @@ class _LLMProfileResolver:
     ) -> None:
         self._profiles = dict(profiles)
         aliases = tuple(self._profiles)
+        self._preferred_alias = preferred_alias if preferred_alias in self._profiles else None
         self._ordered_aliases = (
-            (preferred_alias, *(alias for alias in aliases if alias != preferred_alias)) if preferred_alias in self._profiles else aliases
+            (self._preferred_alias, *(alias for alias in aliases if alias != self._preferred_alias))
+            if self._preferred_alias is not None
+            else aliases
         )
+
+    def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None:
+        """The operator-designated default, and only that — never a stand-in.
+
+        A missing ``default_llm_profile`` is a supported degraded state: the
+        aliases stay individually authorable, but no alias is the house
+        default, and promoting whichever one sorts first would point the
+        Composer at a provider/model the operator never designated. The same
+        holds when the designated default is not usable by this principal —
+        substituting the next usable alias swaps providers silently.
+        """
+        if self._preferred_alias is not None and self._preferred_alias in usable_aliases:
+            return self._preferred_alias
+        return None
 
     def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
         from elspeth.web.catalog.schemas import PluginSchemaInfo
@@ -421,6 +440,12 @@ class _BedrockGuardrailProfileResolver:
             return LocalRequirementResult(available=False, reason=ProfileUnavailableReason.LOCAL_REQUIREMENT_MISSING)
         return LocalRequirementResult(available=True)
 
+    def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None:
+        # Config validation guarantees an explicit default whenever more than
+        # one profile exists, and ``_ordered_aliases`` puts it first — so the
+        # first usable alias IS the designated (or sole) profile.
+        return usable_aliases[0] if usable_aliases else None
+
     def approved_profile(self, alias: str) -> BedrockGuardrailProfileSettings:
         """Return one exact frozen operator binding for an already-authorized plugin."""
 
@@ -510,6 +535,14 @@ class OperatorProfileRegistry:
         except KeyError:
             return LocalRequirementResult(available=False, reason=ProfileUnavailableReason.LOCAL_REQUIREMENT_MISSING)
         return resolver.check_local_requirements(alias)
+
+    def selected_profile_alias(self, plugin_id: PluginId, *, usable_aliases: tuple[str, ...]) -> str | None:
+        """The designated default among ``usable_aliases``, or None if none is."""
+        try:
+            resolver = self._resolvers[plugin_id]
+        except KeyError:
+            return None
+        return resolver.selected_alias(usable_aliases)
 
     def approved_bedrock_guardrail_profile(
         self,
