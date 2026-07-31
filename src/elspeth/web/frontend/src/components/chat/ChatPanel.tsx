@@ -2560,8 +2560,19 @@ export function ChatPanel({
           // creates a confusing race between tool calls and the eventual
           // answer. User and system turns are always complete, so the gate
           // is a no-op for them. See turns.ts → ChatTurn.isComplete.
+          //
+          // `|| !isComposing` is the terminal escape (elspeth-e074575b6e).
+          // A turn is only "mid-flight" while the composer is still running;
+          // once isComposing goes false nothing more is coming, so an
+          // incomplete turn is one that ENDED without a reply (convergence /
+          // timeout — the backend persists partial state and the tool audit,
+          // then raises 422, and never writes a reply row). Those turns must
+          // still render so their tool calls stay visible; they simply carry
+          // no prose, because the only text on them is the model's internal
+          // narration and presenting that as an answer is the bug this
+          // fixes. Without the escape they would be hidden forever.
           chatTurns
-            .filter((turn: ChatTurn) => turn.isComplete)
+            .filter((turn: ChatTurn) => turn.isComplete || !isComposing)
             .map((turn: ChatTurn) => {
               const repr = turnRepresentativeMessage(turn);
               // Attach the inline-source summary to the most recent complete

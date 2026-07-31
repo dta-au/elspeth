@@ -482,6 +482,20 @@ describe("ChatPanel", () => {
       updated_at: "2026-05-14T00:00:00Z",
     };
 
+    // The composer must be idle for this scenario to be coherent: a proposal
+    // sitting for the user to accept/reject means the turn already returned.
+    // Left composing, the atomic-reveal gate correctly hides the turn — an
+    // assistant row carrying tool_calls is mid-loop narration, not a reply
+    // (turns.ts -> isGenuineReply, elspeth-e074575b6e). This test inherited
+    // isComposing:true from an earlier mockReturnValue.
+    (useComposer as ReturnType<typeof vi.fn>).mockReturnValue({
+      sendMessage: vi.fn(),
+      retryMessage: vi.fn(),
+      cancelComposition: vi.fn(),
+      isComposing: false,
+      compositionState: null,
+      error: null,
+    });
     useSessionStore.setState({
       activeSessionId: "session-1",
       sessions: [session],
