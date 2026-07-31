@@ -82,8 +82,9 @@ export function buildEntityNames(data: WireStageData): Map<string, string> {
 
 /** Plain-language connection state, the register-shifted sibling of
  *  ``rawEdgeRow``'s parenthesised technical status: a first-run user reads
- *  "not yet checked" where the raw row says "no required fields — contract
- *  not applicable". */
+ *  "not yet checked" where the raw row says "contract not statically checked".
+ *  Both are deliberately cause-free — the payload does not carry WHY the
+ *  validator omitted the contract. */
 function edgeStatus(edge: WireEdge): string {
   if (edge.satisfied === true) return "connected";
   if (edge.satisfied === false) return "not connected correctly";
@@ -237,15 +238,21 @@ export function nodeOptionText(entry: NodeOptionSummary): string {
 /** The verbatim engineer-grade row, preserved behind the Technical details
  *  expander for operators (same idiom as the validation summary's raw dump). */
 function rawEdgeRow(edge: WireEdge, routeKeys: ReadonlyMap<string, string>): string {
-  // A null contract is not a pending check: the validator emits no contract
-  // row at all when the consumer requires nothing, so there is nothing left to
-  // check. "(contract unchecked)" read as a check that never arrives.
+  // A null contract is CAUSE-FREE on the wire and must render that way. The
+  // validator omits an EdgeContract for at least four different reasons —
+  // ADR-007 producer abstention with a NON-empty sink_required
+  // (state.py:2846-2874), the error-continue paths that skip a node outright
+  // (state.py:2637-2673), discard edges (emitters.py), and the genuinely
+  // nothing-required case. The payload cannot tell them apart, so the row
+  // reports only that no STATIC verdict exists; naming any one cause would
+  // assert three falsehoods. (The prior "(contract unchecked)" was rejected for
+  // implying a check still pending.)
   const status =
     edge.satisfied === true
       ? "(connected)"
       : edge.satisfied === false
         ? "(not satisfied)"
-        : "(no required fields — contract not applicable)";
+        : "(contract not statically checked)";
   const missing =
     edge.missing_fields.length > 0
       ? ` Missing fields: ${edge.missing_fields.join(", ")}`

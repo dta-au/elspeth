@@ -38,7 +38,8 @@ audit cohorts (32), guided-start negative admission (33), guided schema 10 (34),
 exclusive guided-confirmation proposal admission (35), retryable blob-deletion
 cleanup (36), ordinary guided-plan decline settlement (37), exact decline
 replay message identity (38), the permanent `policy_blocked` guided-operation
-failure code (39), and explicit persisted coalesce timeout metadata (40). The universal web
+failure code (39), explicit persisted coalesce timeout metadata (40), and the
+guided `node_options_summary` projection the review cards render (41). The universal web
 plugin-policy work in 0.7.1 also advances
 `SQLITE_SCHEMA_EPOCH` from 22 to 23 and adds `run_web_plugin_policy`. This
 table is optional per run but required in the schema: web runs receive one
@@ -550,7 +551,7 @@ hard-cut sentinel before creating any session:
 sqlite3 "$DB_PATH" 'PRAGMA user_version;'  # expect 41 (== SESSION_SCHEMA_EPOCH)
 ```
 
-An epoch-35, epoch-36, epoch-37, epoch-38, or epoch-39 result is not repairable in place: keep the service drained,
+An epoch-35, epoch-36, epoch-37, epoch-38, epoch-39, or epoch-40 result is not repairable in place: keep the service drained,
 recreate the session database with the current release, and rerun the probe.
 Then create a new session through the API or UI and confirm no
 `SessionSchemaError` appears in the service journal.

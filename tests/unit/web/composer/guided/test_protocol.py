@@ -8,6 +8,8 @@ from uuid import UUID
 import pytest
 
 from elspeth.web.composer.guided.protocol import (
+    _NODE_OPTION_SUMMARY_ALLOWLIST,
+    _NODE_OPTION_SUMMARY_RENDERERS,
     ComponentReviewPayload,
     ControlSignal,
     GuidedStep,
@@ -22,6 +24,23 @@ from elspeth.web.composer.guided.protocol import (
     validate_current_turn,
     validate_payload,
 )
+
+
+def test_every_allowlisted_node_option_has_a_renderer() -> None:
+    """The allowlist and the renderer table are hand-mirrored — pin the relation.
+
+    ``node_options_summary`` indexes ``_NODE_OPTION_SUMMARY_RENDERERS`` by
+    allowlisted key with no fallback, so an allowlist entry added without its
+    renderer would raise ``KeyError`` inside a live projection — a 500
+    mid-guided-flow, not a lint failure. Requiring the subset makes that
+    omission a red unit test instead.
+    """
+    allowlisted = {key for keys in _NODE_OPTION_SUMMARY_ALLOWLIST.values() for key in keys}
+
+    assert allowlisted <= _NODE_OPTION_SUMMARY_RENDERERS.keys()
+    # Renderers are reachable only through the allowlist; an orphan renderer is
+    # dead code that quietly widens what a future allowlist edit can publish.
+    assert _NODE_OPTION_SUMMARY_RENDERERS.keys() <= allowlisted
 
 
 def _wire_payload_for_cardinality(

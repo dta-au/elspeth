@@ -295,9 +295,12 @@ describe("WireStageTurn", () => {
     expect(screen.getByText("Select only: only the mapped fields are kept")).toBeInTheDocument();
   });
 
-  it("reads an unconstrained consumer as not applicable rather than unchecked", async () => {
-    // The validator emits no contract row when the consumer requires nothing,
-    // so "(contract unchecked)" read as a pending check that never arrives.
+  it("reports a missing contract without asserting why it is missing", async () => {
+    // A null schema_contract is cause-free on the wire: it can mean nothing was
+    // required, but equally an ADR-007 producer abstention, an error-continue
+    // skip, or a discard edge. "(contract unchecked)" implied a pending check;
+    // naming any single cause would be worse — it would assert a fact the
+    // payload does not carry.
     const data = canonicalData({
       connections: canonicalData().connections.map((connection, index) => index === 0
         ? { ...connection, schema_contract: null }
@@ -308,8 +311,36 @@ describe("WireStageTurn", () => {
 
     expect(screen.queryByText(/\(contract unchecked\)/)).not.toBeInTheDocument();
     expect(
-      screen.getByText(/\(no required fields — contract not applicable\)/),
+      screen.getByText(/\(contract not statically checked\)/),
     ).toBeInTheDocument();
+  });
+
+  it("never claims 'no required fields' when a sink DOES require fields and the producer abstains", async () => {
+    // ADR-007 abstention (composer/state.py:2846-2874): sink_required is
+    // NON-empty, but a producer with neither guarantees nor participation — a
+    // select_only field_mapper on an observed schema — makes no static claim,
+    // so the validator emits no EdgeContract and defers to per-row runtime
+    // enforcement. The code comment there prescribes the "not yet checked"
+    // reading; a row claiming "no required fields" would be flatly false.
+    const base = canonicalData();
+    const data = canonicalData({
+      outputs: base.outputs.map((output) => ({ ...output, required_fields: ["mapped", "body"] })),
+      connections: base.connections.map((connection) =>
+        connection.to_endpoint.kind === "output"
+          ? { ...connection, schema_contract: null }
+          : connection),
+    });
+    render(<WireStageTurn data={data} onConfirm={vi.fn()} confirmDisabled={false} />);
+    await userEvent.click(screen.getByText("Technical details"));
+
+    const rawRows = screen.getByText(/00000000-0000-4000-8000-000000000041/).textContent ?? "";
+    expect(rawRows).toContain("(contract not statically checked)");
+    expect(rawRows).not.toContain("no required fields");
+    expect(rawRows).not.toContain("not applicable");
+    // The sink genuinely requires those fields — the surface must still say so.
+    expect(screen.getByText("Required fields: mapped, body")).toBeInTheDocument();
+    // …and the plain-language sibling keeps its own unchanged register.
+    expect(screen.getAllByText(/not yet checked/).length).toBeGreaterThan(0);
   });
 
   it("renders the authoritative node policies, cardinality, fields, structured outputs, and business schema", () => {
