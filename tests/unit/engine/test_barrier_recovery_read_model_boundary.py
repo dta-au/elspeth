@@ -9,6 +9,7 @@ RESTORE_READ_METHODS = {
     "get_live_buffered_outcomes",
 }
 RESTORE_NODE_STATE_READ_METHODS = {
+    "find_released_node_state_token_ids",
     "get_completed_row_ids_for_nodes",
     "get_max_node_state_attempts",
     "get_open_node_state_ids",

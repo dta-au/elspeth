@@ -650,6 +650,36 @@ class TestReleasedRowLookup:
         assert reads.has_released_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-1") is True
         assert reads.has_released_row_for_node(run_id="run-1", node_id="transform-1", row_id="row-2") is False
 
+    def test_find_released_node_state_token_ids_is_token_scoped(self) -> None:
+        # The residual shape: two tokens share ONE row at the union node — the
+        # released member closed COMPLETED, the late-arrival residual closed
+        # FAILED. Row-scoped release evidence sees the row as released; the
+        # token-scoped read must admit only the member.
+        _db, repo, fac, tok = _make_repo_with_token()
+        fac.data_flow.create_token("row-1", token_id="tok-late")
+
+        member = repo.begin_node_state(tok, "transform-1", "run-1", 1, {"name": "test"})
+        residual = repo.begin_node_state("tok-late", "transform-1", "run-1", 1, {"name": "test"}, attempt=1)
+        repo.complete_node_state(member.state_id, NodeStateStatus.COMPLETED, output_data={"ok": True}, duration_ms=1.0)
+        repo.complete_node_state(
+            residual.state_id,
+            NodeStateStatus.FAILED,
+            error=ExecutionError(exception="late_arrival_after_release", exception_type="RowUnionFailure"),
+            duration_ms=1.0,
+        )
+
+        reads = fac.barrier_restore
+        assert reads.get_released_row_ids_for_nodes("run-1", frozenset({"transform-1"})) == {("transform-1", "row-1")}
+        assert reads.find_released_node_state_token_ids(
+            "run-1",
+            node_ids=["transform-1"],
+            token_ids=["tok-1", "tok-late"],
+        ) == frozenset({"tok-1"})
+        # Scoped to the requested nodes and tokens; empty node list short-circuits.
+        assert reads.find_released_node_state_token_ids("run-1", node_ids=["sink-0"], token_ids=["tok-1", "tok-late"]) == frozenset()
+        assert reads.find_released_node_state_token_ids("run-1", node_ids=["transform-1"], token_ids=["tok-late"]) == frozenset()
+        assert reads.find_released_node_state_token_ids("run-1", node_ids=[], token_ids=["tok-1"]) == frozenset()
+
 
 class TestCompleteNodeStateForbiddenFields:
     """Regression tests for elspeth-22e2bca0c1: forbidden fields per status."""
