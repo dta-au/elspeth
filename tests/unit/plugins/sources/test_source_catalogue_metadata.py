@@ -56,6 +56,12 @@ def test_aws_s3_warns_that_ordinary_web_composer_cannot_use_it() -> None:
     assert "ordinary web composer cannot use" in guidance
 
 
+def test_dataverse_warns_against_webhooks_and_change_streams() -> None:
+    when_not_to_use = SOURCES_BY_NAME["dataverse"].plugin_cls.usage_when_not_to_use.casefold()
+    assert "webhooks" in when_not_to_use
+    assert "change streams" in when_not_to_use
+
+
 def test_csv_example_uses_the_current_plural_source_shape_and_complete_routing() -> None:
     parsed = load_bounded_pipeline_yaml(SOURCES_BY_NAME["csv"].plugin_cls.example_use)
     assert set(parsed) == {"sources"}

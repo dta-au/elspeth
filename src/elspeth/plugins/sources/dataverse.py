@@ -209,7 +209,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a39447b9012dcf95"
+    source_file_hash: str | None = "sha256:a2f692b18aeeb747"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -218,8 +218,8 @@ class DataverseSource(BaseSource):
         "entity/OData query or FetchXML."
     )
     usage_when_not_to_use: str = (
-        "Do not use for Dataverse writes, webhooks, local files, or when the environment URL, entity, query, or authentication "
-        "facts would have to be invented."
+        "Do not use for Dataverse writes, webhooks, change streams, local files, or when the environment URL, entity, query, "
+        "or authentication facts would have to be invented."
     )
     example_use: str = """sources:
   contacts:
