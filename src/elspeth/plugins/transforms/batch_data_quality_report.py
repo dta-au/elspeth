@@ -113,7 +113,7 @@ class BatchDataQualityReport(BaseTransform):
     name = "batch_data_quality_report"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:11a4f2132affc147"
+    source_file_hash: str | None = "sha256:48f6f012c7606a45"
     config_model = BatchDataQualityReportConfig
     is_batch_aware = True
     usage_when_to_use: str = (
@@ -136,7 +136,7 @@ class BatchDataQualityReport(BaseTransform):
     options:
       inspect_fields:
         - source
-        - score
+        - score_text
         - label
       schema:
         mode: observed

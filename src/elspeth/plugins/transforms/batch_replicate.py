@@ -98,16 +98,16 @@ class BatchReplicate(BaseTransform):
     name = "batch_replicate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2779baa8c538ca5f"
+    source_file_hash: str | None = "sha256:8cdcf8ae08de148e"
     config_model = BatchReplicateConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
-        "Use for bounded per-row copy expansion when each input row supplies a validated copy count and optional "
-        "copy indexes are useful downstream."
+        "Use for bounded per-row copy expansion. A missing copies_field uses default_copies, while a valid integer "
+        "count controls the emitted copies and optional copy indexes."
     )
     usage_when_not_to_use: str = (
-        "Not for random sampling or unbounded fan-out; max_copies limits each row and invalid copy counts are "
-        "quarantined rather than expanded."
+        "Not for random sampling or unbounded fan-out. A present non-integer count raises TypeError; only integer "
+        "counts outside 1..max_copies are quarantined."
     )
     example_use: str = """aggregations:
   - name: replicate_rows

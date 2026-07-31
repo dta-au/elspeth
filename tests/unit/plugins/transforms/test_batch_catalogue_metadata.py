@@ -179,3 +179,29 @@ def test_statistical_guidance_rejects_unsupported_inference_and_history_claims()
     assert "does not compute p-values" in drift_avoid
     assert "does not establish statistical significance" in effect_avoid
     assert "does not compute a p-value" in experiment_avoid
+
+
+def test_replicate_guidance_distinguishes_missing_wrong_type_and_unsafe_integer_counts() -> None:
+    plugin_cls = BATCH_BY_NAME["batch_replicate"].plugin_cls
+    prose = f"{plugin_cls.usage_when_to_use} {plugin_cls.usage_when_not_to_use}".casefold()
+
+    assert "missing copies_field uses default_copies" in prose
+    assert "a present non-integer count raises typeerror" in prose
+    assert "only integer counts outside 1..max_copies are quarantined" in prose
+
+
+def test_data_quality_catalogue_fields_match_the_maintained_example() -> None:
+    catalogue_node, _ = _declaring_aggregation(BATCH_BY_NAME["batch_data_quality_report"])
+    catalogue_options = cast(Mapping[str, Any], catalogue_node["options"])
+
+    project_root = Path(__file__).resolve().parents[4]
+    authority_path = project_root / "examples/statistical_batch_plugins/settings_data_quality_report.yaml"
+    authority = load_bounded_pipeline_yaml(authority_path.read_text(encoding="utf-8"))
+    authority_aggregations = authority["aggregations"]
+    assert isinstance(authority_aggregations, list)
+    authority_node = cast(Mapping[str, Any], authority_aggregations[0])
+    assert authority_node["plugin"] == "batch_data_quality_report"
+    authority_options = cast(Mapping[str, Any], authority_node["options"])
+
+    assert catalogue_options["inspect_fields"] == authority_options["inspect_fields"]
+    assert catalogue_options["inspect_fields"] == ["source", "score_text", "label"]
