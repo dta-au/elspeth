@@ -1022,6 +1022,10 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/guided/profile.py:WorkflowProfile.from_dict:d"
   - "src/elspeth/web/composer/guided/_discovery.py:_assistant_tool_calls_message:return"
   - "src/elspeth/web/composer/guided/_discovery.py:_execute_discovery_call:return"
+  # Retain-repair thread: OpenAI/LiteLLM wire-shape provider messages
+  # (assistant tool-call turn + role=tool results), same shape family as
+  # _assistant_tool_calls_message above.
+  - "src/elspeth/web/composer/guided/chat_solver.py:_deferred_intent_repair_thread:return (list)"
   - "src/elspeth/web/composer/tools/_dispatch.py:get_discovery_tool_definitions:return (list)"
   - "src/elspeth/web/composer/tools/_dispatch.py:_closed_root_schema:return"
   # Current branch reconciliation: intentional heterogeneous telemetry,

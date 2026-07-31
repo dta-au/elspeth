@@ -642,6 +642,7 @@ def test_step_1_source_plugin_reselection_parser_rejects_non_actions(arguments: 
 async def test_malformed_deferred_action_returns_repair_copy_without_an_action(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
         call = SimpleNamespace(
+            id="call_retain",
             function=SimpleNamespace(
                 name="retain_deferred_intent",
                 arguments=json.dumps(
@@ -752,7 +753,7 @@ async def test_every_malformed_deferred_terminal_payload_gets_the_bounded_deferr
     arguments: object,
 ) -> None:
     async def fake_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
-        call = SimpleNamespace(function=SimpleNamespace(name="retain_deferred_intent", arguments=arguments))
+        call = SimpleNamespace(id="call_retain", function=SimpleNamespace(name="retain_deferred_intent", arguments=arguments))
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
 
     monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
@@ -801,8 +802,8 @@ async def test_mixed_deferred_and_other_terminal_calls_get_the_bounded_deferred_
 
     async def fake_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
         calls = [
-            SimpleNamespace(function=SimpleNamespace(name="retain_deferred_intent", arguments="{}")),
-            SimpleNamespace(function=SimpleNamespace(name=terminal_name, arguments="{}")),
+            SimpleNamespace(id="call_retain", function=SimpleNamespace(name="retain_deferred_intent", arguments="{}")),
+            SimpleNamespace(id="call_resolve", function=SimpleNamespace(name=terminal_name, arguments="{}")),
         ]
         return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
 
@@ -836,6 +837,126 @@ async def test_mixed_deferred_and_other_terminal_calls_get_the_bounded_deferred_
 
     assert type(result) is guided_step_chat_module.GuidedStepChatOnlyResult
     assert result.chat.error_class == "DeferredIntentActionShapeError"
+
+
+_VALID_DEFERRED_ARGUMENTS: dict[str, Any] = {
+    "target_stage": "topology",
+    "catalog_kind": "transform",
+    "catalog_name": "passthrough",
+    "redacted_summary": "Include the named transform during topology authoring.",
+    "constraints": [
+        {
+            "kind": "component_count",
+            "component_kind": "node",
+            "plugin_kind": "transform",
+            "plugin_name": "passthrough",
+            "operator": "at_least",
+            "count": 1,
+        }
+    ],
+}
+
+_EXPECTED_DEFERRED_ACTION = DeferredIntentAction(
+    target_stage="topology",
+    catalog_kind="transform",
+    catalog_name="passthrough",
+    redacted_summary="Include the named transform during topology authoring.",
+    constraints=(
+        ComponentCountConstraint(
+            kind="component_count",
+            component_kind="node",
+            plugin_kind="transform",
+            plugin_name="passthrough",
+            operator="at_least",
+            count=1,
+        ),
+    ),
+)
+
+
+async def _run_stage_solver(stage: str) -> object:
+    if stage == "source":
+        return await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Later use a transform.",
+            plugin_hint=None,
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+        )
+    return await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Later use a transform.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+async def test_malformed_deferred_action_is_repaired_within_one_tool_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    """A malformed retain gets its shape rejection threaded back once, then retains."""
+    calls: list[dict[str, Any]] = []
+
+    async def repairing_acompletion(**kwargs: Any) -> _FakeLLMResponse:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            call = SimpleNamespace(
+                id="call_retain_1",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "topology"})),
+            )
+        else:
+            call = SimpleNamespace(
+                id="call_retain_2",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_acompletion)
+    outcome = await _run_stage_solver(stage)
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
+    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert len(calls) == 2
+    repair_messages = calls[1]["messages"]
+    assert repair_messages[-1]["role"] == "tool"
+    assert repair_messages[-1]["tool_call_id"] == "call_retain_1"
+    assert "retain_deferred_intent rejected" in repair_messages[-1]["content"]
+    assert repair_messages[-2]["role"] == "assistant"
+    assert repair_messages[-2]["tool_calls"][0]["id"] == "call_retain_1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+async def test_deferred_repair_is_bounded_to_one_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    """A retain that stays malformed after its one repair turn raises, bounded."""
+    calls: list[dict[str, Any]] = []
+
+    async def always_malformed(**kwargs: Any) -> _FakeLLMResponse:
+        calls.append(kwargs)
+        call = SimpleNamespace(
+            id=f"call_retain_{len(calls)}",
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "topology"})),
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=[call]))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", always_malformed)
+    from elspeth.web.composer.guided.deferred_intents import DeferredIntentActionShapeError
+
+    with pytest.raises(DeferredIntentActionShapeError):
+        await _run_stage_solver(stage)
+
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio

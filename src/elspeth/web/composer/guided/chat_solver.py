@@ -670,6 +670,73 @@ def _parse_deferred_intent_management_tool_arguments(arguments: object) -> Defer
     return deferred_intent_management_action_from_dict(value)
 
 
+def _deferred_intent_repair_thread(
+    message: Any,
+    tool_calls: Any,
+    *,
+    retain_call: Any,
+    error: DeferredIntentActionShapeError,
+) -> list[dict[str, Any]]:
+    """Thread a retain shape rejection back as tool results for self-repair.
+
+    Mirrors the config-invalid ``resolve_sink`` threading: the assistant
+    tool-call turn is re-materialised, then EVERY call id is answered (the
+    OpenAI/LiteLLM protocol 400s on an unanswered id). The retain call gets
+    the value-free shape rejection; any paired call is told it was withheld
+    so the model resends the complete reply. Shape-error text is value-free
+    by construction (key names, types, vocabulary — never user prose).
+    """
+    thread: list[dict[str, Any]] = [_assistant_tool_calls_message(message, tool_calls)]
+    for tool_call in tool_calls:
+        if tool_call is retain_call:
+            content = (
+                f"retain_deferred_intent rejected: {error} "
+                "Correct the arguments and call retain_deferred_intent again with the "
+                "complete structural constraints."
+            )
+        else:
+            content = (
+                "Not applied: the paired retain_deferred_intent call was rejected. "
+                "After correcting it, resend BOTH calls together in one reply."
+            )
+        thread.append({"role": "tool", "tool_call_id": tool_call.id, "content": content})
+    return thread
+
+
+def _tool_calls_are_repair_threadable(tool_calls: Any) -> bool:
+    """Whether every provider tool call can be re-materialised for a repair turn.
+
+    The repair thread must answer every ``tool_call_id``; a provider reply
+    whose calls carry no usable string id (or non-string arguments) cannot be
+    faithfully re-threaded, so its shape failure stays terminal instead of
+    crashing the repair path on the defective reply.
+    """
+    for tool_call in tool_calls:
+        call_id = getattr(tool_call, "id", None)
+        if type(call_id) is not str or not call_id:
+            return False
+        function = getattr(tool_call, "function", None)
+        if function is not None and type(getattr(function, "arguments", None)) is not str:
+            return False
+    return True
+
+
+def _terminal_shape_error_type(terminal_calls: Any) -> type[GuidedSolverResponseShapeError]:
+    """Classify a malformed multi-terminal reply by the calls it contains.
+
+    A reply carrying a ``retain_deferred_intent`` call is a deferred-intent
+    failure (its caller degrades to durable clarification retention); one
+    carrying only ``manage_deferred_intent`` is a management failure (no
+    retention is wanted); anything else is a generic solver shape defect.
+    """
+    names = {call.function.name for call in terminal_calls if call.function is not None}
+    if "retain_deferred_intent" in names:
+        return DeferredIntentActionShapeError
+    if "manage_deferred_intent" in names:
+        return DeferredIntentManagementActionShapeError
+    return GuidedSolverResponseShapeError
+
+
 def _record_llm_call(
     *,
     recorder: BufferingRecorder | None,
@@ -1551,7 +1618,15 @@ async def maybe_resolve_step_1_source_chat(
         field_aliases = _source_field_aliases(current_source, field_aliases=field_aliases)
 
     retry_addendum: str | None = None
-    for attempt_index in range(2):
+    # Bounded retain self-repair (elspeth-a96b2f1b0a): one malformed
+    # retain_deferred_intent reply gets its shape rejection threaded back as a
+    # tool result (consuming the next attempt) instead of terminalizing the
+    # whole Send. The thread is re-appended after the rebuilt user message on
+    # the retry attempt.
+    deferred_repair_thread: list[dict[str, Any]] = []
+    deferred_repair_used = False
+    max_attempts = 2
+    for attempt_index in range(max_attempts):
         # SPLIT the system prompt: the stable per-step skill is the byte-stable,
         # markable head (messages[0]); the dynamic hint/revise context + tool
         # instructions ride in messages[1]. Only the ~1199-token skill is in the
@@ -1586,6 +1661,7 @@ async def maybe_resolve_step_1_source_chat(
         if untrusted_context is not None:
             messages.append({"role": "user", "content": untrusted_context})
         messages.append({"role": "user", "content": user_message})
+        messages.extend(deferred_repair_thread)
         tools = [_STEP_1_SOURCE_TOOL]
         reselection_tool = _step_1_source_plugin_reselection_tool(
             plugin_hint=plugin_hint if allow_plugin_reselection else None,
@@ -1627,22 +1703,38 @@ async def maybe_resolve_step_1_source_chat(
                 tool_call for tool_call in tool_calls if tool_call.function is not None and tool_call.function.name in terminal_action_names
             ]
             if terminal_calls:
+                retain_calls = [
+                    call for call in terminal_calls if call.function is not None and call.function.name == "retain_deferred_intent"
+                ]
                 if len(terminal_calls) != 1 or len(tool_calls) != 1:
-                    error_type = (
-                        DeferredIntentActionShapeError
-                        if any(
-                            call.function is not None and call.function.name in {"retain_deferred_intent", "manage_deferred_intent"}
-                            for call in terminal_calls
-                        )
-                        else GuidedSolverResponseShapeError
-                    )
-                    raise error_type("step-1 chat must return exactly one terminal guided action")
+                    raise _terminal_shape_error_type(terminal_calls)("step-1 chat must return exactly one terminal guided action")
                 function = terminal_calls[0].function
                 if function is None:  # pragma: no cover - filtered immediately above
                     raise GuidedSolverResponseShapeError("step-1 terminal action has no function")
                 arguments = function.arguments
                 if function.name == "retain_deferred_intent":
-                    deferred = _parse_deferred_intent_tool_arguments(arguments)
+                    try:
+                        deferred = _parse_deferred_intent_tool_arguments(arguments)
+                    except DeferredIntentActionShapeError as exc:
+                        # Bounded self-repair (mirrors the step-2 config-invalid
+                        # resolve_sink threading): thread the value-free shape
+                        # rejection back and let the model correct itself once
+                        # within the same Send. Exhaustion (or an argument shape
+                        # we cannot faithfully re-materialise) re-raises so the
+                        # caller's retention fallback applies.
+                        if deferred_repair_used or attempt_index + 1 >= max_attempts or not _tool_calls_are_repair_threadable(tool_calls):
+                            raise
+                        deferred_repair_used = True
+                        deferred_repair_thread = _deferred_intent_repair_thread(
+                            message,
+                            tool_calls,
+                            retain_call=retain_calls[0],
+                            error=exc,
+                        )
+                        status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+                        error_class = type(exc).__name__
+                        error_message = "malformed_response"
+                        continue
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredIntentOutcome(action=deferred)
                 if function.name == "manage_deferred_intent":
@@ -2136,7 +2228,13 @@ async def maybe_resolve_step_2_sink_chat(
         messages.append({"role": "user", "content": untrusted_context})
     messages.append({"role": "user", "content": user_message})
 
-    for _iteration in range(max(1, iteration_cap)):
+    # Bounded retain self-repair (elspeth-a96b2f1b0a): one malformed
+    # retain_deferred_intent reply gets its shape rejection threaded back as a
+    # tool result (consuming one loop iteration) instead of terminalizing the
+    # whole Send.
+    deferred_repair_used = False
+    iterations = max(1, iteration_cap)
+    for _iteration in range(iterations):
         request_messages = list(messages)
         kwargs: dict[str, Any] = {"model": model, "messages": request_messages, "tools": tools}
         if temperature is not None:
@@ -2165,22 +2263,40 @@ async def maybe_resolve_step_2_sink_chat(
                 and tool_call.function.name in {"resolve_sink", "retain_deferred_intent", "manage_deferred_intent"}
             ]
             if terminal_calls:
+                retain_calls = [
+                    call for call in terminal_calls if call.function is not None and call.function.name == "retain_deferred_intent"
+                ]
                 if len(terminal_calls) != 1 or len(tool_calls) != 1:
-                    error_type = (
-                        DeferredIntentActionShapeError
-                        if any(
-                            call.function is not None and call.function.name in {"retain_deferred_intent", "manage_deferred_intent"}
-                            for call in terminal_calls
-                        )
-                        else GuidedSolverResponseShapeError
-                    )
-                    raise error_type("step-2 chat must return exactly one terminal guided action")
+                    raise _terminal_shape_error_type(terminal_calls)("step-2 chat must return exactly one terminal guided action")
                 function = terminal_calls[0].function
                 if function is None:  # pragma: no cover - filtered immediately above
                     raise GuidedSolverResponseShapeError("step-2 terminal action has no function")
                 arguments = function.arguments
                 if function.name == "retain_deferred_intent":
-                    deferred = _parse_deferred_intent_tool_arguments(arguments)
+                    try:
+                        deferred = _parse_deferred_intent_tool_arguments(arguments)
+                    except DeferredIntentActionShapeError as exc:
+                        # Bounded self-repair (mirrors the config-invalid
+                        # resolve_sink threading below): thread the value-free
+                        # shape rejection back and let the model correct itself
+                        # once within the same Send. Exhaustion (or an argument
+                        # shape we cannot faithfully re-materialise) re-raises
+                        # so the caller's retention fallback applies.
+                        if deferred_repair_used or _iteration + 1 >= iterations or not _tool_calls_are_repair_threadable(tool_calls):
+                            raise
+                        deferred_repair_used = True
+                        messages.extend(
+                            _deferred_intent_repair_thread(
+                                message,
+                                tool_calls,
+                                retain_call=retain_calls[0],
+                                error=exc,
+                            )
+                        )
+                        status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+                        error_class = type(exc).__name__
+                        error_message = "malformed_response"
+                        continue
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredIntentOutcome(action=deferred)
                 if function.name == "manage_deferred_intent":

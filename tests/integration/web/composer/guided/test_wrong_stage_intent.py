@@ -1119,6 +1119,7 @@ def test_real_route_malformed_future_action_keeps_raw_instruction_only_in_privat
         nonlocal provider_calls
         provider_calls += 1
         tool_call = SimpleNamespace(
+            id=f"call_retain_{provider_calls}",
             function=SimpleNamespace(name="retain_deferred_intent", arguments=arguments),
         )
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tool_call]))])
@@ -1138,7 +1139,10 @@ def test_real_route_malformed_future_action_keeps_raw_instruction_only_in_privat
 
     assert response.status_code == 200, response.json()
     response_json = response.json()
-    assert provider_calls == 1
+    # A malformed retain with a threadable tool call gets ONE bounded repair
+    # turn before the failure is terminal; an un-threadable reply (non-string
+    # arguments) stays single-shot.
+    assert provider_calls == (2 if isinstance(arguments, str) else 1)
     assert response_json["assistant_message"] == repair_message
     assert response_json["assistant_message_kind"] == "synthetic_failure"
     if before["composition_state"] is None:
