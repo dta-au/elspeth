@@ -740,6 +740,44 @@ describe("PluginCard — Phase 7B reshape", () => {
     expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
   });
 
+  it("resets details after the same plugin loses and regains reference content", async () => {
+    const user = userEvent.setup();
+    const populatedPlugin = makePlugin({
+      name: "csv",
+      usage_when_to_use: "When the input is a bounded CSV file.",
+      usage_when_not_to_use: "When rows are already structured.",
+      example_use: "source:\n  plugin: csv",
+    });
+    const blankPlugin = makePlugin({
+      name: "csv",
+      usage_when_to_use: "   ",
+      usage_when_not_to_use: "\n\t",
+      example_use: "",
+    });
+    const { container, rerender } = render(
+      <PluginCard plugin={populatedPlugin} schema={null} onExpand={() => {}} />,
+    );
+    await user.click(screen.getByRole("button", { name: /reference details for csv/i }));
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    rerender(
+      <PluginCard plugin={blankPlugin} schema={null} onExpand={() => {}} />,
+    );
+    expect(
+      screen.queryByRole("button", { name: /reference details for csv/i }),
+    ).not.toBeInTheDocument();
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+
+    rerender(
+      <PluginCard plugin={populatedPlugin} schema={null} onExpand={() => {}} />,
+    );
+    const returningDetails = screen.getByRole("button", {
+      name: /reference details for csv/i,
+    });
+    expect(returningDetails).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+  });
+
   it("does NOT render a 'Use in pipeline' button (toolkit affordance removed)", () => {
     render(<PluginCard plugin={makePlugin()} schema={null} onExpand={() => {}} />);
     expect(screen.queryByRole("button", { name: /use in pipeline/i })).not.toBeInTheDocument();
