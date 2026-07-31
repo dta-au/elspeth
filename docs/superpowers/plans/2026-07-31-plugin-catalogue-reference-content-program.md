@@ -342,6 +342,98 @@ git commit -m "docs: complete source catalogue guidance"
 
 ---
 
+### Task 2A: Correct Dataverse logical-name resolution exposed by the catalogue
+
+**Why this is required:** Quality review of the source catalogue proved that
+`DataverseSourceConfig.entity` is authored as a Dataverse `LogicalName`, while
+the same value is currently reused as the Web API `EntitySetName`. A standard
+Contact query therefore cannot make both the metadata probe and data request
+correct. The catalogue must not publish an example that only validates locally.
+
+**Files:**
+
+- Modify: `src/elspeth/plugins/sources/dataverse.py`
+- Modify: `src/elspeth/plugins/infrastructure/clients/dataverse.py`
+- Modify: `tests/unit/plugins/sources/test_dataverse_source.py`
+- Modify: `tests/integration/plugins/test_dataverse_pipeline.py`
+- Modify: `tests/unit/plugins/sources/test_source_catalogue_metadata.py`
+
+- [ ] **Step 1: Write seam-first failing tests**
+
+Use `entity: contact` and a complete metadata response containing both
+`LogicalName: contact` and `EntitySetName: contacts`. Add focused tests proving:
+
+- structured mode requests
+  `EntityDefinitions(LogicalName='contact')?$select=LogicalName,EntitySetName`
+  and passes a `/contacts` URL, with the authored query options intact, to
+  `paginate_odata`;
+- FetchXML retains `<entity name="contact">` but resolves and passes `contacts`
+  as the collection argument to `paginate_fetchxml`;
+- malformed, missing, blank, non-string, or mismatched metadata identities fail
+  closed before data pagination;
+- a metadata 403 fails closed when no explicit fallback is configured; and
+- a metadata 403 may continue only with an explicitly configured, validated
+  `entity_set_name: contacts` fallback.
+
+Run the new focused tests and confirm they fail because the runtime still reuses
+the logical name as the collection path, not because of fixture or syntax errors.
+
+- [ ] **Step 2: Implement the minimal resolver**
+
+Add an optional `entity_set_name` field to `DataverseSourceConfig`. Treat
+`entity` and FetchXML `<entity name>` exclusively as logical names. Replace the
+existence-only probe with a resolver equivalent to:
+
+```python
+def _resolve_entity_set_name(self, ctx: SourceContext, logical_name: str) -> str:
+    """Return the authoritative Web API collection name for a logical name."""
+```
+
+The resolver must select and validate `LogicalName` plus `EntitySetName`, record
+the metadata call through the existing audit boundary, reject contradictory or
+unusable response data, and never pluralize or silently reuse the logical name.
+If metadata access returns 403, use the explicit fallback only; otherwise raise
+an actionable `DataverseClientError`. A successful metadata response must agree
+with any explicit fallback.
+
+Change `_build_query_url` to require the resolved entity-set name explicitly,
+and resolve both structured and FetchXML modes before constructing their data
+requests. Rename/document the client pagination parameter as
+`entity_set_name`; its transport behavior remains unchanged. Reorder error-path
+URL bookkeeping so audit records never claim an unresolved collection URL.
+
+- [ ] **Step 3: Make the catalogue example executable**
+
+Change the Dataverse source example to `entity: contact` while retaining managed
+identity, `select`, observed schema, and validation-failure policy. Extend the
+family assertion so the singular logical-name contract cannot drift back to an
+entity-set name.
+
+- [ ] **Step 4: Refresh integrity metadata and verify**
+
+Refresh `DataverseSource.source_file_hash`, then run:
+
+```bash
+PYTHONPATH=/home/john/elspeth/src /home/john/elspeth/.venv/bin/pytest \
+  tests/unit/plugins/sources/test_dataverse_source.py \
+  tests/unit/plugins/infrastructure/clients/test_dataverse_client.py \
+  tests/integration/plugins/test_dataverse_pipeline.py \
+  tests/unit/plugins/sources/test_source_catalogue_metadata.py \
+  tests/unit/plugins/sources/test_csv_source_metadata.py \
+  tests/unit/web/catalog/test_policy_view.py -q
+PYTHONPATH=elspeth-lints/src /home/john/elspeth/.venv/bin/python \
+  -m elspeth_lints.core.cli check \
+  --rules plugin_contract.plugin_hashes --root src/elspeth
+wardline scan . --fail-on ERROR
+git diff --check
+```
+
+Expected: every focused test and both integrity gates pass. Commit the correction
+separately from the catalogue metadata tranche so the runtime expansion remains
+reviewable and attributable to `elspeth-b1efc0403b`.
+
+---
+
 ### Task 3: Document all eight sinks
 
 **Files:**
