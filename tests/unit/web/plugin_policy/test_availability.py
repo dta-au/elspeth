@@ -172,6 +172,64 @@ def test_configured_tutorial_profile_is_the_selected_usable_alias() -> None:
     assert dict(snapshot.selected_profile_aliases)[llm_id] == "tutorial"
 
 
+def test_missing_default_profile_leaves_no_selected_alias() -> None:
+    """No designated default means no selected alias — not the alphabetical first.
+
+    A missing ``default_llm_profile`` is a supported degraded-readiness state:
+    profiles stay usable for explicit authoring, but the snapshot must not
+    promote whichever alias sorts first into a house default the operator never
+    designated — the Composer would author against the wrong provider/model.
+    """
+    snapshot = _build(
+        _settings(
+            llm_profiles={
+                "alpha": {
+                    "provider": "bedrock",
+                    "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+                },
+                "beta": {
+                    "provider": "bedrock",
+                    "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+                },
+            },
+        )
+    )
+
+    llm_id = PluginId("transform", "llm")
+    assert llm_id in snapshot.available
+    assert dict(snapshot.usable_profile_aliases)[llm_id] == ("alpha", "beta")
+    assert dict(snapshot.selected_profile_aliases)[llm_id] is None
+
+
+def test_unusable_default_profile_is_not_silently_substituted() -> None:
+    """A designated default the principal cannot use selects nothing.
+
+    Substituting the next usable alias would swap providers behind the
+    operator's designation; readiness reports the credential gap instead.
+    """
+    snapshot = _build(
+        _settings(
+            llm_profiles={
+                "house": {
+                    "provider": "openrouter",
+                    "model": "openai/gpt-5-mini",
+                    "credential_scope": "user",
+                    "credential_ref": "OPENROUTER_API_KEY",
+                },
+                "local": {
+                    "provider": "bedrock",
+                    "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+                },
+            },
+            default_llm_profile="house",
+        )
+    )
+
+    llm_id = PluginId("transform", "llm")
+    assert dict(snapshot.usable_profile_aliases)[llm_id] == ("local",)
+    assert dict(snapshot.selected_profile_aliases)[llm_id] is None
+
+
 def test_user_secret_can_narrow_but_never_expand_policy() -> None:
     snapshot = _build(
         _settings(),

@@ -145,7 +145,12 @@ def build_plugin_snapshot(
                 ).hexdigest()
                 profile_bindings.append((plugin_id, profile_state.alias, binding_scope, generation_token))
             usable_profile_aliases.append((plugin_id, aliases))
-            selected_profile_aliases.append((plugin_id, aliases[0] if aliases else None))
+            # The registry adjudicates "selected": only a designated (or sole,
+            # for plugins whose config guarantees one) default counts. With no
+            # designation the deployment has no house profile, and recording
+            # the first usable alias here would fabricate one in every reader
+            # of the snapshot — planner prompts, authoring aids, run audit.
+            selected_profile_aliases.append((plugin_id, profiles.selected_profile_alias(plugin_id, usable_aliases=aliases)))
             if not aliases:
                 unavailable.append(PluginAvailability(plugin_id, PluginUnavailableReason.PROFILE_UNAVAILABLE))
                 continue
