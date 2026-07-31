@@ -173,3 +173,36 @@ def test_coverage_suggestions_are_total_over_reasons() -> None:
 
     reasons = get_args(get_type_hints(ControlCoverageFinding)["reason"])
     assert set(_CONTROL_COVERAGE_SUGGESTIONS) == set(reasons)
+
+
+def test_scope_mismatch_suggestion_repairs_the_control_scope_not_the_wiring() -> None:
+    """A scope mismatch on a correct topology must not be sent upstream.
+
+    When the node's protected fields and the dominating control's scanned
+    fields are BOTH known, the control already dominates the input — the
+    coverage walk only found the two sets disjoint. "Interpose the control
+    upstream" names a repair for wiring that is already right, and a planner
+    that follows it re-emits the same topology and draws the same rejection.
+    """
+    from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
+    from elspeth.web.plugin_policy.coverage import ControlCoverageFinding
+    from elspeth.web.plugin_policy.validation import _control_coverage_finding
+
+    finding = _control_coverage_finding(
+        ControlCoverageFinding(
+            component_id="judge",
+            capability=PluginCapability.PROMPT_SHIELD,
+            role=ControlRole.INPUT,
+            reason="input_not_dominated",
+            protected_fields=("untrusted_prompt",),
+            scanned_fields=("benign_label",),
+        )
+    )
+
+    assert finding.suggestion is not None
+    assert "Interpose" not in finding.suggestion
+    assert "upstream" not in finding.suggestion
+    assert "fields" in finding.suggestion
+    assert "untrusted_prompt" in finding.suggestion
+    assert "benign_label" in finding.suggestion
+    assert "'recommend'" in finding.suggestion

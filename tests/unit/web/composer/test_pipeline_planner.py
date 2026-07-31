@@ -5309,15 +5309,27 @@ class TestStatedThresholdDetector:
             # Comparison wording bound to a number, but about a LIMIT, not a
             # route. Firing here would tell a model to author a gate condition
             # for a pipeline that never asked for one — and a compliant model
-            # would turn a correct fan-out into a wrong pipeline.
+            # would turn a correct fan-out into a wrong pipeline. Under a
+            # repair_budget of 1 that is REPAIR_EXHAUSTED with no proposal.
             "Summarise each row in under 50 words, then fan out to both sinks.",
             "Truncate descriptions over 40 characters and write both copies.",
             "Keep at most 100 rows and fan every row out to both sinks.",
             "Use a temperature below 0.5 for the summariser.",
+            # The same limit prose alongside a REAL routing verb from
+            # _ROUTING_INTENT_PATTERN — the cases the disjoint-vocabulary
+            # negatives above never exercise. Two independent defences must
+            # hold: the unit noun after the number, and the clause boundary
+            # between the limit and the routing verb.
+            "Summarise each row in under 50 words and send the results to the sink.",
+            "Split the rows into two sinks and keep at most 100 rows.",
+            "Split into more than 2 branches.",
+            "Route the summary (limit under 50 words) to both sinks.",
+            # Clause separation alone, with a unit noun that is not listed.
+            "Summarise in under 50 milliseconds. Route every row to both sinks.",
         ],
     )
-    def test_limit_prose_without_routing_language_is_not_detected(self, instruction: str) -> None:
-        """Both halves must hold: a comparison AND routing intent."""
+    def test_limit_prose_is_not_read_as_a_routing_threshold(self, instruction: str) -> None:
+        """Three halves must hold: a comparison, routing intent, same clause, no unit noun."""
         from elspeth.web.composer.pipeline_planner import _stated_threshold_in
 
         assert _stated_threshold_in(instruction) is None
@@ -5410,6 +5422,45 @@ async def test_authored_condition_satisfies_the_stated_threshold(
         tool_context=tool_context,
         completion=completion,
         intent="Add a gate that routes rows with amount > 500 to high_value and every other row to standard.",
+    )
+
+    assert proposal.proposal.repair_count == 0
+
+
+@pytest.mark.asyncio
+async def test_threshold_guard_reads_the_current_stage_intent_not_the_message_transcript(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Guided-staged provenance: earlier-stage text must not trip a later stage.
+
+    ``sessions/routes/composer/guided.py:3263-3268`` deliberately splits the
+    two: ``planner_intent`` is the CURRENT stage's instruction alone, while the
+    root-plus-instruction concatenation goes to
+    ``PlannerOriginatingMessage.content``. The guard reads ``intent``, so a
+    threshold stated at an earlier stage cannot reject a later stage's legal
+    fan-out. Pinned here because the split lives in a route, one refactor away
+    from being "simplified" into a single concatenated string.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        intent="Fan every row out to both the high_value and standard sinks.",
+        originating_message=PlannerOriginatingMessage(
+            session_id=_TEST_SESSION_ID,
+            message_id="00000000-0000-4000-8000-000000000001",
+            content=(
+                "Route rows with amount > 500 to high_value and everything else to standard.\n\n"
+                "Fan every row out to both the high_value and standard sinks."
+            ),
+            user_id="user-1",
+        ),
     )
 
     assert proposal.proposal.repair_count == 0

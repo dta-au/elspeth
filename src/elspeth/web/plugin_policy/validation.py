@@ -240,13 +240,29 @@ def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyF
                 f" It reads row fields {_field_set(coverage.protected_fields)}, while the nearest "
                 f"upstream control scans {_field_set(coverage.scanned_fields)}."
             )
+    suggestion = _CONTROL_COVERAGE_SUGGESTIONS[coverage.reason]
+    if coverage.reason == "input_not_dominated" and coverage.protected_fields and coverage.scanned_fields:
+        # Both field sets are populated only when a control provably dominates
+        # the input (coverage.py decides that with the credit walk itself), so
+        # this rejection is a SCOPE mismatch on correct wiring. The keyed
+        # suggestion would send the author to interpose a control that is
+        # already interposed — a repair that re-emits the same topology and
+        # draws the same rejection.
+        suggestion = (
+            f"The control already covers every path into this node, so do not move it: it scans "
+            f"{_field_set(coverage.scanned_fields)} while the node reads row fields "
+            f"{_field_set(coverage.protected_fields)}. Extend the control's 'fields' to include every "
+            "field the node reads (or set it to 'all'), or change the node so it only reads fields the "
+            "control already scans. Then validate again. If neither is possible, ask the operator to "
+            "relax the control mode to 'recommend' — it is not an authoring change."
+        )
     return PluginPolicyFinding(
         stage="required_control_coverage",
         component_id=coverage.component_id,
         component_type="transform",
         error_code="required_control_coverage",
         message=message,
-        suggestion=_CONTROL_COVERAGE_SUGGESTIONS[coverage.reason],
+        suggestion=suggestion,
     )
 
 

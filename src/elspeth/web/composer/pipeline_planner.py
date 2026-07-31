@@ -750,15 +750,25 @@ def _transform_node_count(pipeline: Mapping[str, Any]) -> int:
 # "the transform above the gate" and "source -> sink" are ordinary authoring
 # prose and must never trip the guard. The operator lookbehind rejects arrow
 # and fat-arrow forms outright.
-_THRESHOLD_NUMBER: Final[str] = r"\$?\d+(?:[.,]\d+)*"
+_THRESHOLD_NUMBER: Final[str] = r"\$?\d+(?:[.,]\d+)*(?!\d)"
+# A number immediately followed by a unit noun measures a LIMIT — prompt
+# length, a row cap, a branch count — not a value a row is routed on. The
+# trailing ``(?!\d)`` on the number above is load-bearing: without it the
+# engine backtracks to a shorter number ("5" out of "50 words") and slips past
+# this lookahead.
+_THRESHOLD_UNIT_NOUN: Final[str] = (
+    r"(?!\s*(?:%|(?:words?|characters?|chars?|rows?|records?|branch|branches|sinks?|nodes?|tokens?|"
+    r"seconds?|secs?|minutes?|ms|milliseconds?|times?|items?|entries|columns?|fields?)\b))"
+)
+_THRESHOLD_QUANTITY: Final[str] = _THRESHOLD_NUMBER + _THRESHOLD_UNIT_NOUN
 _THRESHOLD_OPERATOR: Final[str] = r"(?<![-=<>!])(?:>=|<=|==|>|<)"
 _THRESHOLD_WORDING: Final[str] = (
     r"(?:greater than|less than|more than|fewer than|at least|at most|no more than|no less than|above|below|over|under)"
 )
 _STATED_THRESHOLD_PATTERN: Final[re.Pattern[str]] = re.compile(
-    rf"[A-Za-z_]\w*\s*{_THRESHOLD_OPERATOR}\s*{_THRESHOLD_NUMBER}"
+    rf"[A-Za-z_]\w*\s*{_THRESHOLD_OPERATOR}\s*{_THRESHOLD_QUANTITY}"
     rf"|{_THRESHOLD_NUMBER}\s*{_THRESHOLD_OPERATOR}\s*[A-Za-z_]\w*"
-    rf"|{_THRESHOLD_WORDING}\s+{_THRESHOLD_NUMBER}",
+    rf"|{_THRESHOLD_WORDING}\s+{_THRESHOLD_QUANTITY}",
     re.IGNORECASE,
 )
 
@@ -772,22 +782,47 @@ _ROUTING_INTENT_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\b(?:route|routes|routed|routing|send|sends|sent|go to|goes to|split|splits|gate|divert|diverts|separate|separates)\b",
     re.IGNORECASE,
 )
+# Clause boundaries. "Split the rows into two sinks AND keep at most 100 rows"
+# states a routing action and an unrelated cap; only a comparison in the SAME
+# clause as the routing verb is plausibly the rule that routes.
+_CLAUSE_BOUNDARY_PATTERN: Final[re.Pattern[str]] = re.compile(
+    # ``\.(?!\d)`` splits sentences without splitting decimals: a decimal
+    # point is always followed by a digit, a full stop never is.
+    r"\.(?!\d)|[;:!?\n]|\band\b|\bthen\b|\bbut\b|\bwhile\b|\balso\b",
+    re.IGNORECASE,
+)
 
 
 def _stated_threshold_in(instruction: str) -> str | None:
     """Return the routing comparison the instruction states, or None.
 
-    Deliberately conservative on both axes: a comparison is recognized only
-    when an operator (or comparison wording) is bound to a literal number, AND
-    the instruction asks for routing at all. The matched comparison span is
-    returned verbatim so the repair feedback can quote it. False negatives are
-    the safe direction here — the non-blocking fan-out advisory still names
-    the shape at review.
+    Deliberately conservative on three axes, because a false positive here is
+    worse than a miss: the rejection asserts the instruction stated a routing
+    rule and tells the model to author a gate condition, so on a pipeline that
+    is already correct a compliant model makes it wrong — and under a repair
+    budget of one that ends in REPAIR_EXHAUSTED with no proposal at all. A
+    comparison counts only when
+
+    1. an operator (or comparison wording) is bound to a literal number;
+    2. the number is NOT followed by a unit noun (``under 50 words``,
+       ``at most 100 rows``, ``more than 2 branches`` measure a limit, not a
+       row value); and
+    3. it shares a clause with a routing verb.
+
+    Known false negative, accepted: the expression form
+    ``row['amount'] > 500`` is missed, because the ``]`` breaks the
+    ``[A-Za-z_]\\w*`` operand. Widening the operand to swallow bracket
+    subscripts would also swallow ordinary prose ahead of an operator, and
+    false negatives are the safe direction — the non-blocking
+    ``gate_fan_out_advisory`` still names the shape at review.
     """
-    if _ROUTING_INTENT_PATTERN.search(instruction) is None:
-        return None
-    match = _STATED_THRESHOLD_PATTERN.search(instruction)
-    return match.group(0).strip() if match is not None else None
+    for clause in _CLAUSE_BOUNDARY_PATTERN.split(instruction):
+        if _ROUTING_INTENT_PATTERN.search(clause) is None:
+            continue
+        match = _STATED_THRESHOLD_PATTERN.search(clause)
+        if match is not None:
+            return match.group(0).strip()
+    return None
 
 
 def _threshold_homeless_gate_id(pipeline: Mapping[str, Any]) -> str | None:
