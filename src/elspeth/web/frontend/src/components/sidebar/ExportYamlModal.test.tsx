@@ -122,7 +122,10 @@ describe("ExportYamlModal", () => {
 //     note is unconditional and states what is true of every export.
 describe("ExportYamlModal — export scope note", () => {
   beforeEach(() => {
-    useSessionStore.setState({ exportedYamlBlobBinding: null } as never);
+    useSessionStore.setState({
+      activeSessionId: "s1",
+      exportedYamlBlobBinding: null,
+    } as never);
   });
 
   it("always states that the export carries the pipeline definition only", () => {
@@ -157,5 +160,25 @@ describe("ExportYamlModal — export scope note", () => {
     expect(screen.getByTestId("yaml-export-blob-note")).toHaveTextContent(
       /session-bound/i,
     );
+  });
+
+  // The binding outlives the export that produced it: YamlView clears yaml and
+  // yamlError before each fetch but never the binding, and its error path
+  // leaves it untouched entirely — so a 409 (validation-blocked export) would
+  // otherwise strand the warning on a pipeline it does not describe.
+  it("ignores a binding left behind by a different session", () => {
+    useSessionStore.setState({
+      activeSessionId: "s2",
+      exportedYamlBlobBinding: {
+        sessionId: "s1",
+        yaml: "sources: {}",
+        sourceBlobIds: { source: "blob-1" },
+      },
+    } as never);
+    render(<ExportYamlModal />);
+    fireEvent(window, new CustomEvent(OPEN_YAML_MODAL_EVENT));
+    expect(
+      screen.queryByTestId("yaml-export-blob-note"),
+    ).not.toBeInTheDocument();
   });
 });

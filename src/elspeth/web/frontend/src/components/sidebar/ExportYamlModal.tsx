@@ -10,7 +10,20 @@ export function ExportYamlModal(): JSX.Element | null {
   const titleId = useId();
   // Set by YamlView from fetchYaml's source_blob_ids; null when this export
   // has no blob-backed source.
-  const blobBinding = useSessionStore((s) => s.exportedYamlBlobBinding);
+  //
+  // Scoped to the active session before it is trusted. YamlView clears `yaml`
+  // and `yamlError` before each fetch but leaves the binding standing, and its
+  // error path never touches it — so between opening the modal and the fetch
+  // resolving (or forever, if the fetch 409s on validation errors) the binding
+  // can still describe a PREVIOUS export. Warning "source data is session
+  // bound" off a stale signal would be exactly the unsubstantiated claim the
+  // landscape wording below refuses to make.
+  const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const storedBinding = useSessionStore((s) => s.exportedYamlBlobBinding);
+  const blobBinding =
+    storedBinding !== null && storedBinding.sessionId === activeSessionId
+      ? storedBinding
+      : null;
 
   useFocusTrap(dialogRef, isOpen, ".yaml-modal-close");
 
