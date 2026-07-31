@@ -95,6 +95,63 @@ describe("buildPlainPhraseMap", () => {
   });
 });
 
+// elspeth-bc8a35c1ab: two transforms that land on the same generic phrase used
+// to stutter ("…process each row, process each row, and write a JSON file").
+// The phrases are CATEGORY labels, not identities, so a repeat is expected —
+// the sentence must count the run rather than print it twice. Dropping the
+// repeat silently would under-report the pipeline, so the count is carried.
+describe("pipelineGloss — repeated phrases", () => {
+  function twoGenericTransforms() {
+    return makeComposition(1, {
+      sources: { source: { plugin: "csv", options: {} } },
+      nodes: [
+        {
+          id: "first",
+          node_type: "transform",
+          plugin: "passthrough",
+          input: "source",
+          on_success: null,
+          on_error: null,
+          options: {},
+        },
+        {
+          id: "second",
+          node_type: "transform",
+          plugin: "passthrough",
+          input: "first",
+          on_success: null,
+          on_error: null,
+          options: {},
+        },
+      ],
+      outputs: [{ name: "out", plugin: "json", options: {} }],
+    });
+  }
+
+  it("counts a repeated phrase instead of repeating it", () => {
+    expect(pipelineGloss(twoGenericTransforms())).toBe(
+      "This pipeline will read your CSV, process each row twice, and write a JSON file.",
+    );
+  });
+
+  it("counts runs longer than two numerically", () => {
+    const state = twoGenericTransforms();
+    const third = { ...state.nodes[1], id: "third", input: "second" };
+    expect(pipelineGloss({ ...state, nodes: [...state.nodes, third] })).toBe(
+      "This pipeline will read your CSV, process each row 3 times, and write a JSON file.",
+    );
+  });
+
+  // The phrase map is an identity lookup keyed by component_id, consumed by
+  // PipelineValidationSummary to attribute findings. Two nodes sharing a
+  // phrase is correct there — collapsing would break attribution.
+  it("leaves the plain-phrase map un-collapsed", () => {
+    const map = buildPlainPhraseMap(twoGenericTransforms());
+    expect(map.get("first")).toBe("process each row");
+    expect(map.get("second")).toBe("process each row");
+  });
+});
+
 // A declared queue is uncorrelated structural fan-in: many producers publish
 // one connection name and the queue interleaves those rows. The gloss must say
 // so in plain language and must NOT reach for merge/join/union/buffer/priority
