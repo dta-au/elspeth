@@ -888,7 +888,9 @@ class TestStep2IntraStep:
         else:
             # The reviewed sink now carries required_fields, so the bare
             # pass-through the provider re-proposed is rejected on contract
-            # rather than sealed green.
+            # rather than sealed green. The 502 is the planner loop's rejection
+            # SURFACE (repair budget exhausted, then the escape hatch), not the
+            # contract under test — the invariants asserted below are.
             assert settled.status_code == 502, settled.json()
             assert settled.json()["detail"]["failure_code"] == "invalid_provider_response"
         with app.state.session_engine.connect() as conn:
