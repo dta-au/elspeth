@@ -48,15 +48,29 @@ from elspeth.plugins.sources.field_normalization import (
 # OData annotation prefixes to strip from row data
 _ODATA_ANNOTATION_PATTERN = re.compile(r"^@odata\.|@Microsoft\.Dynamics\.CRM\.")
 _FORMATTED_VALUE_SUFFIX = "@OData.Community.Display.V1.FormattedValue"
-_DATAVERSE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_DATAVERSE_LOGICAL_NAME_PATTERN = re.compile(r"^[a-z_][a-z0-9_]*$")
+_DATAVERSE_ENTITY_SET_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _validate_dataverse_identifier(value: object, *, field_name: str) -> str:
-    """Require a Dataverse logical/entity-set name with no URL delimiters."""
+def _validate_dataverse_logical_name(value: object, *, field_name: str) -> str:
+    """Require a lowercase Dataverse LogicalName with no URL delimiters."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string containing a valid lowercase ASCII identifier")
+    reject_operator_required_placeholder_value(value, field_name=field_name)
+    if _DATAVERSE_LOGICAL_NAME_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            f"{field_name} must be a lowercase ASCII identifier beginning with a lowercase letter or underscore "
+            "and containing only lowercase letters, digits, and underscores"
+        )
+    return value
+
+
+def _validate_dataverse_entity_set_name(value: object, *, field_name: str) -> str:
+    """Require a case-preserving Dataverse EntitySetName with no URL delimiters."""
     if not isinstance(value, str):
         raise ValueError(f"{field_name} must be a string containing a valid ASCII identifier")
     reject_operator_required_placeholder_value(value, field_name=field_name)
-    if _DATAVERSE_IDENTIFIER_PATTERN.fullmatch(value) is None:
+    if _DATAVERSE_ENTITY_SET_NAME_PATTERN.fullmatch(value) is None:
         raise ValueError(
             f"{field_name} must be an ASCII identifier beginning with a letter or underscore "
             "and containing only letters, digits, and underscores"
@@ -157,14 +171,14 @@ class DataverseSourceConfig(DataPluginConfig):
     def validate_entity_not_placeholder(cls, v: str | None) -> str | None:
         if v is None:
             return None
-        return _validate_dataverse_identifier(v, field_name="entity")
+        return _validate_dataverse_logical_name(v, field_name="entity")
 
     @field_validator("entity_set_name")
     @classmethod
     def validate_entity_set_name_not_placeholder(cls, v: str | None) -> str | None:
         if v is None:
             return None
-        return _validate_dataverse_identifier(v, field_name="entity_set_name")
+        return _validate_dataverse_entity_set_name(v, field_name="entity_set_name")
 
     @field_validator("select")
     @classmethod
@@ -216,7 +230,7 @@ class DataverseSourceConfig(DataPluginConfig):
                 raise ValueError(f"FetchXML root element must be <fetch>, got <{root.tag}>.")
             entity_elem = root.find("entity")
             if entity_elem is not None and "name" in entity_elem.attrib:
-                _validate_dataverse_identifier(entity_elem.attrib["name"], field_name="FetchXML <entity name>")
+                _validate_dataverse_logical_name(entity_elem.attrib["name"], field_name="FetchXML <entity name>")
         return v
 
 
@@ -234,7 +248,7 @@ class DataverseSource(BaseSource):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:0c6eacbd5e3773b3"
+    source_file_hash: str | None = "sha256:285d2c6baf4a7630"
     determinism = Determinism.EXTERNAL_CALL  # Live REST API, not static file read
     config_model = DataverseSourceConfig
 
@@ -355,7 +369,7 @@ class DataverseSource(BaseSource):
                 )
                 self._record_page_call(
                     ctx,
-                    url=not_found.request_url or metadata_url,
+                    url=not_found.request_url,
                     error=not_found,
                     error_reason=not_found.error_category,
                 )
@@ -364,7 +378,7 @@ class DataverseSource(BaseSource):
                 if self._entity_set_name is not None:
                     self._record_page_call(
                         ctx,
-                        url=e.request_url or metadata_url,
+                        url=e.request_url,
                         error=e,
                         error_reason=e.error_category,
                     )
@@ -381,14 +395,14 @@ class DataverseSource(BaseSource):
                 )
                 self._record_page_call(
                     ctx,
-                    url=forbidden.request_url or metadata_url,
+                    url=forbidden.request_url,
                     error=forbidden,
                     error_reason=forbidden.error_category,
                 )
                 raise forbidden from e
             self._record_page_call(
                 ctx,
-                url=e.request_url or metadata_url,
+                url=e.request_url,
                 error=e,
                 error_reason=e.error_category,
             )
@@ -410,15 +424,15 @@ class DataverseSource(BaseSource):
         else:
             identity = page.rows[0]
             try:
-                returned_logical_name = _validate_dataverse_identifier(identity.get("LogicalName"), field_name="LogicalName")
+                returned_logical_name = _validate_dataverse_logical_name(identity.get("LogicalName"), field_name="LogicalName")
             except ValueError:
                 metadata_error_message = (
                     "Dataverse entity metadata did not provide a usable string LogicalName. "
-                    "Expected an ASCII identifier; check the metadata response and table configuration."
+                    "Expected a lowercase ASCII identifier; check the metadata response and table configuration."
                 )
             if metadata_error_message is None:
                 try:
-                    entity_set_name = _validate_dataverse_identifier(identity.get("EntitySetName"), field_name="EntitySetName")
+                    entity_set_name = _validate_dataverse_entity_set_name(identity.get("EntitySetName"), field_name="EntitySetName")
                 except ValueError:
                     metadata_error_message = (
                         "Dataverse entity metadata did not provide a usable string EntitySetName. "
@@ -449,7 +463,7 @@ class DataverseSource(BaseSource):
             )
             self._record_page_call(
                 ctx,
-                url=metadata_error.request_url or metadata_url,
+                url=metadata_error.request_url,
                 error=metadata_error,
                 error_reason=metadata_error.error_category,
             )
@@ -595,7 +609,7 @@ class DataverseSource(BaseSource):
         self,
         ctx: SourceContext,
         *,
-        url: str,
+        url: str | None,
         page: DataversePageResponse | None = None,
         error: DataverseClientError | None = None,
         error_reason: str | None = None,
@@ -694,7 +708,6 @@ class DataverseSource(BaseSource):
         if self._entity is not None:
             entity_set_name = self._resolve_entity_set_name(ctx, self._entity)
             url = self._build_query_url(entity_set_name)
-            last_fetched_url = url
         else:
             if self._fetch_xml is None:
                 raise RuntimeError("config validator ensures entity or fetch_xml — neither is set, this is a bug")
@@ -706,8 +719,6 @@ class DataverseSource(BaseSource):
                 raise RuntimeError("FetchXML <entity> element missing 'name' attribute")
             logical_name = entity_elem.attrib["name"]
             entity_set_name = self._resolve_entity_set_name(ctx, logical_name)
-            encoded_entity_set_name = urllib.parse.quote(entity_set_name, safe="")
-            last_fetched_url = f"{self._environment_url.rstrip('/')}/api/data/{self._api_version}/{encoded_entity_set_name}"
 
         try:
             if self._entity is not None:
@@ -720,7 +731,6 @@ class DataverseSource(BaseSource):
 
             for page in page_iterator:
                 pages_fetched += 1
-                last_fetched_url = page.request_url
 
                 # Record successful page fetch — use the actual URL from the
                 # response DTO, not the rebuilt initial URL. For pages 2+, the
@@ -891,14 +901,9 @@ class DataverseSource(BaseSource):
                     yield SourceRow.valid(validated_row, contract=contract, source_row_index=current_source_row_index)
 
         except DataverseClientError as e:
-            # Use the actual failing URL from the error when available
-            # (carried on DataverseClientError since the request metadata fix).
-            # Falls back to last_fetched_url for errors raised outside
-            # _execute_request (e.g. SSRF validation before the HTTP call).
-            error_url = e.request_url or last_fetched_url
             self._record_page_call(
                 ctx,
-                url=error_url,
+                url=e.request_url,
                 error=e,
                 error_reason=e.error_category,
             )

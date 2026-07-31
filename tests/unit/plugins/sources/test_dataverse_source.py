@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from elspeth.contracts import CallStatus
+from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.dataverse import (
+    DataverseClient,
     DataverseClientError,
     DataversePageResponse,
 )
@@ -267,6 +271,23 @@ def _client_secret_credential_factory(*_args: Any, **_kwargs: Any) -> _Credentia
     return _CredentialFake()
 
 
+def _make_ssrf_safe(url: str) -> SSRFSafeRequest:
+    parsed = urllib.parse.urlparse(url)
+    hostname = parsed.hostname or "localhost"
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    return SSRFSafeRequest(
+        original_url=url,
+        resolved_ip="127.0.0.1",
+        host_header=hostname,
+        port=parsed.port or 443,
+        path=path,
+        scheme=parsed.scheme,
+        bare_hostname=hostname,
+    )
+
+
 def _dataverse_client_factory(client: _DataverseClientFake) -> Callable[..., _DataverseClientFake]:
     def factory(*_args: Any, **_kwargs: Any) -> _DataverseClientFake:
         return client
@@ -398,12 +419,26 @@ class TestDataverseSourceConfigValidation:
         with pytest.raises(PluginConfigError, match="ASCII identifier"):
             DataverseSourceConfig.from_dict(_base_config(entity_set_name=entity_set_name))
 
-    def test_dataverse_identifiers_accept_uppercase_ascii_and_underscore(self) -> None:
+    @pytest.mark.parametrize("entity", ["contact", "_contact2", "contact_name2"])
+    def test_logical_names_accept_lowercase_ascii_identifiers(self, entity: str) -> None:
         from elspeth.plugins.sources.dataverse import DataverseSourceConfig
 
-        cfg = DataverseSourceConfig.from_dict(_base_config(entity="_Contact2", entity_set_name="Contact_Sets2"))
-        assert cfg.entity == "_Contact2"
-        assert cfg.entity_set_name == "Contact_Sets2"
+        cfg = DataverseSourceConfig.from_dict(_base_config(entity=entity))
+        assert cfg.entity == entity
+
+    @pytest.mark.parametrize("entity", ["Contact", "CONTACT", "contact_Name"])
+    def test_logical_names_reject_uppercase_ascii(self, entity: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        with pytest.raises(PluginConfigError, match="lowercase ASCII identifier"):
+            DataverseSourceConfig.from_dict(_base_config(entity=entity))
+
+    @pytest.mark.parametrize("entity_set_name", ["contacts", "_Contacts2", "Contact_Sets2"])
+    def test_entity_set_names_preserve_ascii_case(self, entity_set_name: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        cfg = DataverseSourceConfig.from_dict(_base_config(entity_set_name=entity_set_name))
+        assert cfg.entity_set_name == entity_set_name
 
     @pytest.mark.parametrize("entity_set_name", ["", "   "])
     def test_entity_set_name_rejects_blank_values(self, entity_set_name: str) -> None:
@@ -462,7 +497,10 @@ class TestDataverseSourceConfigValidation:
         assert cfg.entity is None
         assert cfg.fetch_xml is not None
 
-    @pytest.mark.parametrize("logical_name", ["contact name", "contact/path", "contact?query", "contact#fragment", "1contact"])
+    @pytest.mark.parametrize(
+        "logical_name",
+        ["Contact", "contact_Name", "contact name", "contact/path", "contact?query", "contact#fragment", "1contact"],
+    )
     def test_fetchxml_entity_rejects_invalid_logical_name(self, logical_name: str) -> None:
         from elspeth.plugins.sources.dataverse import DataverseSourceConfig
 
@@ -1084,6 +1122,23 @@ class TestDataverseSourceLoadStructured:
             "?$select=contactid,fullname&$filter=statecode%20eq%200&$orderby=createdon%20desc&$top=25"
         )
 
+    def test_metadata_error_without_request_url_does_not_invent_audit_url(self) -> None:
+        mock_client = _DataverseClientFake()
+        mock_client.get_page.side_effect = DataverseClientError(
+            "metadata request rejected before URL binding",
+            retryable=False,
+            error_category="protocol_error",
+        )
+        source = _make_source_for_start_and_load(_base_config(), mock_client=mock_client)
+        ctx = _mock_source_context()
+
+        with pytest.raises(DataverseClientError, match="before URL binding"):
+            next(source.load(ctx))
+
+        mock_client.paginate_odata.assert_not_called()
+        ctx.record_call.assert_called_once()
+        assert ctx.record_call.call_args.kwargs["request_data"]["url"] is None
+
     @pytest.mark.parametrize(
         ("metadata_rows", "message", "expected_category"),
         [
@@ -1110,6 +1165,8 @@ class TestDataverseSourceLoadStructured:
             ([{"LogicalName": "contact#fragment", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
             ([{"LogicalName": "contact name", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
             ([{"LogicalName": "contact\x00name", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "Contact", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact_Name", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
             ([{"LogicalName": "contact", "EntitySetName": "contacts/path"}], "EntitySetName", "metadata_identity_invalid"),
             ([{"LogicalName": "contact", "EntitySetName": "contacts?query"}], "EntitySetName", "metadata_identity_invalid"),
             ([{"LogicalName": "contact", "EntitySetName": "contacts#fragment"}], "EntitySetName", "metadata_identity_invalid"),
@@ -1133,6 +1190,8 @@ class TestDataverseSourceLoadStructured:
             "logical-name-fragment-delimiter",
             "logical-name-space-delimiter",
             "logical-name-control-character",
+            "logical-name-uppercase-leading",
+            "logical-name-uppercase-interior",
             "entity-set-path-delimiter",
             "entity-set-query-delimiter",
             "entity-set-fragment-delimiter",
@@ -1527,6 +1586,62 @@ class TestDataverseSourceLoadFetchXML:
         source._client.paginate_fetchxml.assert_called_once()
         assert source._client.paginate_fetchxml.call_args.args == ("contacts", original_xml)
         source._client.paginate_odata.assert_not_called()
+
+    def test_fetchxml_pre_request_ssrf_rejection_audits_full_candidate_url(self) -> None:
+        """The composed source/client audit records the rejected FetchXML candidate."""
+        original_xml = '<fetch><entity name="contact"><attribute name="fullname"/></entity></fetch>'
+        source = _make_source(_fetchxml_config(fetch_xml=original_xml))
+        client = DataverseClient(
+            environment_url=VALID_ENV_URL,
+            credential=_CredentialFake(),  # type: ignore[arg-type]  # test fake
+        )
+        client._client.close()
+        transport_requests: list[httpx.Request] = []
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            transport_requests.append(request)
+            return httpx.Response(
+                status_code=200,
+                json={"value": [{"LogicalName": "contact", "EntitySetName": "contacts"}]},
+            )
+
+        client._client = httpx.Client(transport=httpx.MockTransport(handle_request), timeout=30.0)
+        source._client = client
+        ctx = _mock_source_context()
+        serialized_xml = '<fetch><entity name="contact"><attribute name="fullname" /></entity></fetch>'
+        expected_url = f"{VALID_ENV_URL}/api/data/v9.2/contacts?fetchXml={urllib.parse.quote(serialized_xml)}"
+
+        def validate_candidate(url: str, **_kwargs: Any) -> SSRFSafeRequest:
+            if "fetchXml=" in url:
+                raise SSRFBlockedError("candidate rejected")
+            return _make_ssrf_safe(url)
+
+        try:
+            with (
+                patch(
+                    "elspeth.plugins.infrastructure.clients.dataverse.validate_url_for_ssrf",
+                    side_effect=validate_candidate,
+                ),
+                pytest.raises(DataverseClientError) as exc_info,
+            ):
+                next(source.load(ctx))
+        finally:
+            client.close()
+
+        error = exc_info.value
+        assert error.error_category == "ssrf_rejected"
+        assert error.request_url == expected_url
+        assert len(transport_requests) == 1
+        assert ctx.record_call.call_count == 2
+        audit_call = ctx.record_call.call_args.kwargs
+        assert audit_call["status"] == CallStatus.ERROR
+        assert audit_call["request_data"]["url"] == expected_url
+        audit_headers = audit_call["request_data"]["headers"]
+        assert audit_headers["Accept"] == "application/json"
+        auth_value = audit_headers.get("Authorization")
+        if auth_value is not None:
+            assert auth_value.startswith("<fingerprint:")
+        assert audit_call["error"]["reason"] == "ssrf_rejected"
 
 
 # ─────────────────────────────────────────────────────────────────────────

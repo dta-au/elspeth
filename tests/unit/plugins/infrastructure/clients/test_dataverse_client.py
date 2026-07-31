@@ -704,6 +704,28 @@ class TestPaginateOdata:
         ):
             list(client.paginate_odata(f"{ENV_URL}/api/data/v9.2/accounts"))
 
+    def test_pre_request_ssrf_rejection_carries_request_context(self, client: DataverseClient) -> None:
+        """A rejected candidate URL retains its audit URL and safe headers."""
+        url = f"{ENV_URL}/api/data/v9.2/accounts?fetchXml=%3Cfetch%3E%3C/fetch%3E"
+
+        with (
+            patch(
+                "elspeth.plugins.infrastructure.clients.dataverse.validate_url_for_ssrf",
+                side_effect=SSRFBlockedError("DNS rebinding detected"),
+            ),
+            pytest.raises(DataverseClientError) as exc_info,
+        ):
+            client.get_page(url)
+
+        error = exc_info.value
+        assert error.error_category == "ssrf_rejected"
+        assert error.request_url == url
+        assert error.request_headers is not None
+        assert error.request_headers["Accept"] == "application/json"
+        auth_value = error.request_headers.get("Authorization")
+        if auth_value is not None:
+            assert auth_value.startswith("<fingerprint:")
+
     def test_single_page_no_next_link(self, client: DataverseClient, transport: MockTransport) -> None:
         transport.add_response(_make_json_response({"value": [{"id": 1}]}))
         pages = list(client.paginate_odata(f"{ENV_URL}/api/data/v9.2/accounts"))
