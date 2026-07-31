@@ -19,6 +19,11 @@ source ─(raw)─> content_filter ─┬─(clean)─> truncate ─(trimmed)─
 elspeth run --settings examples/error_routing/settings.yaml --execute
 ```
 
+The packaged fixture deliberately contains four blocked-content rows. They are
+recorded as transform failures, routed to `quarantine.csv`, and make the run
+end `PARTIAL` with process exit 1. This is the expected demonstration result:
+all 17 inputs still reach exactly one terminal sink.
+
 ## Output
 
 Results appear in `output/`:

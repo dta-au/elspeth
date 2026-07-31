@@ -21,23 +21,25 @@ These run immediately with no setup:
 |---------|------|-------|
 | `audit_export` | 8 | Demonstrates audit data export |
 | `batch_aggregation` | 15 | Batch accumulation and trigger |
+| `report_assemble` | 5 (3 reports) | Paginated report aggregation with count and end-of-source flushes |
 | `statistical_batch_plugins` | 8 each | Statistical batch plugin examples; run one `settings_*.yaml` file at a time |
 | `boolean_routing` | 10 | True/false gate routing |
 | `checkpoint_resume` | 20 | Checkpoint/resume on interruption |
 | `database_sink` | 8 (4 to DB) | SQLite database output — durable exactly-once sink; run via `./examples/database_sink/run.sh` (seeds the operator-owned target + `_elspeth_*` effect ledger first; a bare `elspeth run` fails preflight by design) |
 | `deaggregation` | 6 | Expanding aggregated rows (6→11 output) |
-| `deep_routing` | 20 | Multi-level cascading gates |
-| `error_routing` | 17 | Error-triggered routing paths |
+| `deep_routing` | 20 | Multi-level cascading gates; fixture ends PARTIAL/exit 1 with 2 blocked rows quarantined by design |
+| `error_routing` | 17 | Error-triggered routing; fixture ends PARTIAL/exit 1 with 4 blocked rows quarantined by design |
 | `explicit_routing` | 10 | Named route destinations |
 | `fork_coalesce` | 5 | Parallel path fork/join DAG pattern |
 | `row_union_ab_experiment` | 8 (16 unioned, 1 comparison row) | Fork-based A/B: `row_union` releases both variant branches as one correlated group; run one `settings*.yaml` at a time. `settings_screened.yaml` ends PARTIAL **by design** (3 tickets screened out, their orphaned siblings fail closed) |
 | `json_explode` | 3 | JSON source with array expansion (3→6 output) |
+| `transform_pipeline` | 5 | Type coercion followed by dependent derived-field calculations |
 | `landscape_journal` | 2 | JSON source, audit journal |
 | `multi_flow` | 4 | Two independent named source flows in one run |
 | `multi_source_queue` | 3 | Multiple named sources fan into a queue |
-| `large_scale_test` | 10,000 | Performance test — committed `input.csv` is 10k rows (~1.5 min); regenerate larger via `generate_data.py` (default 50k) |
+| `large_scale_test` | 10,000 | Performance test — committed `input.csv` is 10k rows (observed ~4 min locally); regenerate larger via `generate_data.py` (default 50k) |
 | `retention_purge` | 5 | Payload retention policy demo |
-| `blob_transforms` | 200 offline expansion rows | Run `./examples/blob_transforms/run.sh`; it packages local fixtures into the payload store before executing. The hosted HTML fetch remains opt-in. |
+| `blob_transforms` | 200 offline expansion rows | Run `./examples/blob_transforms/run.sh`; it packages local fixtures into the payload store before executing. The hosted HTML fetch is opt-in via `./examples/blob_transforms/run_hosted_fetch.sh`. |
 | `schema_contracts_demo` | 5 | Schema validation contracts |
 | `threshold_gate` | 8 | Numeric threshold routing |
 
@@ -113,8 +115,9 @@ ChromaDB runs embedded — no server setup needed, but requires `chromadb` packa
 
 | Example | Rows | Notes |
 |---------|------|-------|
-| `chroma_rag` | 8 | Vector retrieval only (~1s) |
-| `chroma_rag_qa` | 8 | RAG + OpenRouter LLM QA (~19s, uses API credits) |
+| `chroma_rag` | 8 | Vector retrieval only; run `./examples/chroma_rag/run.sh` to seed and query |
+| `chroma_rag_indexed` | 10 index + 5 query | Dependency-managed indexing and retrieval; run `elspeth run --settings examples/chroma_rag_indexed/query_pipeline.yaml --execute` |
+| `chroma_rag_qa` | 8 | RAG + OpenRouter LLM QA; run `./examples/chroma_rag_qa/run.sh` (~19s, uses API credits) |
 
 ### OpenRouter (real API, costs money)
 
@@ -163,8 +166,10 @@ If a pipeline is interrupted, resume with the command shown in the output.
 `multi_worker_showcase` start their own ChaosLLM server inside `run.sh` (with
 `--workers 1`), establish a process-scoped fingerprint key when needed, and
 orchestrate a leader + `elspeth join` follower(s); run them via their `run.sh`,
-not a bare `elspeth run`. (`elspeth join` takes no `--execute` flag — only
-`elspeth run` does.)
+not a bare `elspeth run`. Their default ChaosLLM profiles add latency without
+terminal faults so the self-verifying launchers have a deterministic clean-run
+contract; each README documents a separate opt-in fault profile. (`elspeth
+join` takes no `--execute` flag — only `elspeth run` does.)
 
 ```bash
 .venv/bin/elspeth run --settings examples/concurrent_scheduler/settings.yaml --execute
@@ -179,5 +184,5 @@ workers — the heaviest of the three). For a bounded smoke, run `multi_worker`
 | Example | Rows / Work units | Notes |
 |---------|-------------------|-------|
 | `concurrent_scheduler` | 6 (2×3 CSV rows) | Count-6 rendezvous; proves concurrent scheduling; `elspeth run` only |
-| `multi_worker` | ~600 (1 JSONL row → 600 exploded items) | `elspeth join` leader+follower; asserts ≥2 workers shared rows; `WORKERS` env |
+| `multi_worker` | 120 (1 JSONL row → 120 exploded items) | `elspeth join` leader+follower; asserts ≥2 workers shared rows; `WORKERS` env |
 | `multi_worker_showcase` | 200 (10×20 exploded items) | 4-worker swarm + stats card; asserts ≥2 workers shared outcomes; NOT for dogfood gate |

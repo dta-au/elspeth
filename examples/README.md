@@ -1,16 +1,35 @@
 # ELSPETH Examples
 
-This directory contains runnable pipeline examples demonstrating ELSPETH's features. Most examples have a `settings.yaml` entry point; some use named pipeline files instead (see notes below).
+This directory contains runnable pipeline examples demonstrating ELSPETH's
+features. Most examples have a `settings.yaml` entry point; launchers and named
+pipeline entry points are listed below and in each example's README.
 
 ## Quick Start
 
 ```bash
-# Run any example from the repository root
+# Standard case: run from the repository root
 elspeth run --settings examples/<name>/settings.yaml --execute
 
-# Explore the audit trail after a run
+# Explore the audit trail using the URL configured by that example
 elspeth explain --run latest --database examples/<name>/runs/audit.db
 ```
+
+Some examples need setup or use multiple configurations:
+
+| Example | Canonical entry point |
+|---------|-----------------------|
+| `database_sink` | `./examples/database_sink/run.sh` |
+| `blob_transforms` (offline) | `./examples/blob_transforms/run.sh` |
+| `blob_transforms` (hosted fetch) | `./examples/blob_transforms/run_hosted_fetch.sh` |
+| `chroma_rag` | `./examples/chroma_rag/run.sh` |
+| `chroma_rag_qa` (OpenRouter) | `./examples/chroma_rag_qa/run.sh` |
+| `chroma_rag_indexed` | `elspeth run --settings examples/chroma_rag_indexed/query_pipeline.yaml --execute` |
+| `multi_worker` | `./examples/multi_worker/run.sh` |
+| `multi_worker_showcase` | `./examples/multi_worker_showcase/run.sh` |
+| `statistical_batch_plugins` | Run one `settings_*.yaml` file at a time |
+
+Landscape database names vary between variants. Read the selected YAML or the
+individual README before using `elspeth explain`.
 
 ## Example Index
 
@@ -32,17 +51,23 @@ These examples run locally with no credentials or external services.
 | [`statistical_batch_plugins`](statistical_batch_plugins/) | Statistical batch QA: distributions, experiments, classifier metrics, paired preferences, drift, outliers, data quality, top-k, thresholds, and effect sizes |
 | [`deaggregation`](deaggregation/) | 1-to-N row expansion via `batch_replicate` |
 | [`json_explode`](json_explode/) | Expand nested JSON arrays into individual rows |
-| [`database_sink`](database_sink/) | Write pipeline output to a SQLite database |
+| [`transform_pipeline`](transform_pipeline/) | Normalize CSV field types, then compute derived values with `type_coerce` and `value_transform` |
+| [`database_sink`](database_sink/) | Write pipeline output to SQLite via `./examples/database_sink/run.sh`, which provisions the operator-owned target and effect ledger |
 | [`checkpoint_resume`](checkpoint_resume/) | Crash recovery via checkpointing and `elspeth resume` |
 | [`retention_purge`](retention_purge/) | Payload retention lifecycle and `elspeth purge` |
-| [`blob_transforms`](blob_transforms/) | Blob-backed ingestion: self-contained offline CSV expansion via `./examples/blob_transforms/run.sh`, plus an opt-in hosted tutorial HTML fetch |
+| [`blob_transforms`](blob_transforms/) | Blob-backed ingestion: offline CSV expansion via `run.sh`, plus opt-in hosted tutorial HTML fetch via `run_hosted_fetch.sh` |
 | [`audit_export`](audit_export/) | Export the Landscape audit trail to JSON |
 | [`landscape_journal`](landscape_journal/) | Event journaling for real-time audit monitoring |
 | [`multi_flow`](multi_flow/) | Two independent named source flows in one run |
 | [`multi_source_queue`](multi_source_queue/) | Multiple named sources fan into a durable pass-through queue |
 | [`schema_contracts_demo`](schema_contracts_demo/) | DAG-time schema validation (`guaranteed_fields` / `required_input_fields`) |
 | [`large_scale_test`](large_scale_test/) | Performance testing with large datasets |
-| [`threshold_gate_container`](threshold_gate_container/) | Docker-packaged pipeline deployment |
+
+### Container Deployment
+
+| Example | What It Demonstrates |
+|---------|---------------------|
+| [`threshold_gate_container`](threshold_gate_container/) | The threshold-gate pipeline packaged with `/app/pipeline/` paths for Docker |
 
 ### RAG / ChromaDB (requires `chromadb` — no API keys for retrieval-only)
 
@@ -50,8 +75,8 @@ These examples demonstrate Retrieval-Augmented Generation using ChromaDB as a ve
 
 | Example | What It Demonstrates |
 |---------|---------------------|
-| [`chroma_rag`](chroma_rag/) | Basic RAG retrieval — query a pre-populated ChromaDB collection |
-| [`chroma_rag_qa`](chroma_rag_qa/) | RAG + LLM — retrieve context then generate answers via OpenRouter (requires `OPENROUTER_API_KEY`) |
+| [`chroma_rag`](chroma_rag/) | Basic RAG retrieval — `./examples/chroma_rag/run.sh` seeds the collection, then runs retrieval |
+| [`chroma_rag_qa`](chroma_rag_qa/) | RAG + LLM via `./examples/chroma_rag_qa/run.sh` (requires `OPENROUTER_API_KEY`) |
 | [`chroma_rag_indexed`](chroma_rag_indexed/) | **Pipeline dependencies** — `depends_on` runs an indexing pipeline first, commencement gate verifies the collection, then query pipeline retrieves context. Entry point: `query_pipeline.yaml` |
 
 ### 0.6.0 — Multi-Worker & Concurrent Scheduling
@@ -106,6 +131,17 @@ shown in the individual READMEs.
 | [`chaosweb`](chaosweb/) | Web scraping resilience with ChaosWeb fault injection |
 | [`chaosllm`](chaosllm/) | Response data used by ChaosLLM server (not a runnable pipeline) |
 
+### Expected Non-Complete Demonstrations
+
+Some examples deliberately exercise failure accounting:
+
+| Example or variant | Expected result |
+|--------------------|-----------------|
+| `deep_routing`, `error_routing` | `PARTIAL`, exit 1; packaged blocked-content rows reach quarantine |
+| `fork_coalesce/settings_union_fail.yaml` | `FAILED`, non-zero exit; the first field collision aborts the run |
+| `row_union_ab_experiment/settings_screened.yaml` | `PARTIAL`, exit 0; screened pairs fail closed and remain audited |
+| ChaosLLM / ChaosWeb realistic fault profiles | Stochastic `COMPLETED`, `PARTIAL`, or preflight failure depending on injected faults; verify every ingested row reached a result or error sink |
+
 ## Resetting examples
 
 Examples write a local audit trail to `runs/audit.db`. ELSPETH is pre-1.0 and
@@ -136,6 +172,7 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Aggregation (N to 1)** | [`batch_aggregation`](batch_aggregation/) — count triggers, group-by stats; [`report_assemble`](report_assemble/) — paginated markdown reports |
 | **Statistical batch QA** | [`statistical_batch_plugins`](statistical_batch_plugins/) — prompt/model score comparisons, classifier metrics, drift, outlier annotation, data quality, top-k, thresholds, and effect sizes |
 | **Deaggregation (1 to N)** | [`deaggregation`](deaggregation/), [`json_explode`](json_explode/), or [`blob_transforms`](blob_transforms/) |
+| **Type normalization and derived fields** | [`transform_pipeline`](transform_pipeline/) — coerce CSV strings to typed values, then compute dependent fields |
 | **LLM integration (quick start)** | [`openrouter_sentiment`](openrouter_sentiment/) — simplest real LLM pipeline |
 | **LLM without API keys** | [`chaosllm_sentiment`](chaosllm_sentiment/) — same pipeline, local ChaosLLM server |
 | **Multi-query LLM matrices** | [`openrouter_multi_query_assessment`](openrouter_multi_query_assessment/) — case studies x criteria |
@@ -144,7 +181,7 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Schema contracts** | [`schema_contracts_demo`](schema_contracts_demo/) (pure data) or [`schema_contracts_llm_assessment`](schema_contracts_llm_assessment/) (with LLM) |
 | **Jinja2 templates** | [`template_lookups`](template_lookups/) — field extraction and template-driven prompts |
 | **Web scraping** | [`chaosweb`](chaosweb/) — fault-injected scraping with content gates |
-| **Database output** | [`database_sink`](database_sink/) — write to SQLite (or PostgreSQL/MySQL) |
+| **Database output** | [`database_sink`](database_sink/) — write to SQLite or PostgreSQL |
 | **Crash recovery / resume** | [`checkpoint_resume`](checkpoint_resume/) — checkpoint + Ctrl-C + `elspeth resume` |
 | **Graceful shutdown** | [`checkpoint_resume`](checkpoint_resume/) — covers Ctrl-C shutdown behaviour |
 | **Payload retention / blob refs** | [`retention_purge`](retention_purge/) — payload lifecycle and `elspeth purge`; [`blob_transforms`](blob_transforms/) — fetch/store blobs and expand CSV blobs |

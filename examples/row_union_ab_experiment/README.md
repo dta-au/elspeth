@@ -83,6 +83,9 @@ alone to contribute a half-group observation. The run ends `PARTIAL`:
 ⚠ Run PARTIAL: 8 rows processed | ✓4 succeeded | ✗3 failed | →3 routed (screened_out:3)
 ```
 
+This designed `PARTIAL` result returns process exit 0; Landscape records the
+run as `completed_with_failures`, retaining the three branch-loss adjudications.
+
 3 of 8 tickets are screened out, so the comparison is computed over the 5
 surviving tickets (`batch_size: 10`) — the correct answer, not a silently biased
 one. The barrier's own adjudication is in the audit trail: 10 completed node

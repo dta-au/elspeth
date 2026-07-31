@@ -19,7 +19,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 source "$PROJECT_ROOT/examples/chaosllm_env.sh"
 
-CHAOS_CONFIG="examples/multi_worker_showcase/chaos_config.yaml"
+CHAOS_CONFIG="${ELSPETH_MULTI_WORKER_SHOWCASE_CHAOS_CONFIG:-examples/multi_worker_showcase/chaos_config.yaml}"
 PIPELINE_CONFIG="examples/multi_worker_showcase/settings.yaml"
 DB="examples/multi_worker_showcase/runs/audit.db"
 CHAOS_PORT=8199
@@ -67,18 +67,22 @@ echo "    leader + $WORKERS follower(s) = $((WORKERS+1))-way pack"
 echo ""
 
 # --- Start ChaosLLM (errorworks bug: must use --workers 1) ---
+if { true >"/dev/tcp/127.0.0.1/$CHAOS_PORT"; } 2>/dev/null; then
+    echo "ERROR: port $CHAOS_PORT is already in use; refusing to attach to an unowned service." >&2
+    exit 1
+fi
 echo "Starting ChaosLLM server on port $CHAOS_PORT..."
 .venv/bin/chaosllm serve --config "$CHAOS_CONFIG" --port "$CHAOS_PORT" --workers 1 &
 CHAOS_PID=$!
 echo "Waiting for ChaosLLM to be ready..."
 for i in $(seq 1 30); do
+    if ! kill -0 "$CHAOS_PID" 2>/dev/null; then echo "ERROR: ChaosLLM failed to start."; exit 1; fi
     if curl -sf "http://127.0.0.1:$CHAOS_PORT/health" > /dev/null 2>&1; then
         echo "ChaosLLM is ready."; echo ""; break
     fi
-    if ! kill -0 "$CHAOS_PID" 2>/dev/null; then echo "ERROR: ChaosLLM failed to start."; exit 1; fi
     sleep 0.5
 done
-if ! curl -sf "http://127.0.0.1:$CHAOS_PORT/health" > /dev/null 2>&1; then
+if ! kill -0 "$CHAOS_PID" 2>/dev/null || ! curl -sf "http://127.0.0.1:$CHAOS_PORT/health" > /dev/null 2>&1; then
     echo "ERROR: ChaosLLM not responding after 15 seconds."; exit 1
 fi
 

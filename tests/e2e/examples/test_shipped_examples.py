@@ -71,6 +71,23 @@ _EXAMPLES_WITHOUT_SETTINGS: frozenset[str] = frozenset(
     }
 )
 
+# Top-level YAML files that configure support data/services rather than an
+# ELSPETH pipeline. Keep this explicit so a newly named pipeline cannot escape
+# validation merely because it is not called settings.yaml.
+_AUXILIARY_EXAMPLE_YAMLS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("chaosllm_endurance", "chaos_config.yaml"),
+        ("chaosllm_sentiment", "chaos_config.yaml"),
+        ("multi_query_assessment", "criteria_lookup.yaml"),
+        ("multi_worker", "chaos_config.yaml"),
+        ("multi_worker", "chaos_config_faults.yaml"),
+        ("multi_worker_showcase", "chaos_config.yaml"),
+        ("multi_worker_showcase", "chaos_config_faults.yaml"),
+        ("openrouter_multi_query_assessment", "criteria_lookup.yaml"),
+        ("schema_contracts_llm_assessment", "criteria_lookup.yaml"),
+    }
+)
+
 # Required top-level keys for any Elspeth settings file. Source roots may use
 # either the legacy singular ``source`` form or the canonical plural ``sources``
 # form for named multi-source examples.
@@ -88,9 +105,9 @@ class TestShippedExamples:
     def _find_example_settings(examples_dir: Path) -> list[tuple[str, Path]]:
         """Find all settings YAML files in examples.
 
-        Returns a list of (example_name, yaml_path) tuples. Only files
-        whose name contains "settings" are included; auxiliary YAML files
-        (chaos_config.yaml, criteria_lookup.yaml) are excluded.
+        Returns a list of (example_name, yaml_path) tuples. Every top-level
+        YAML file is treated as a pipeline unless it appears in the explicit
+        auxiliary-file allowlist.
         """
         results: list[tuple[str, Path]] = []
         for example_dir in sorted(examples_dir.iterdir()):
@@ -98,8 +115,9 @@ class TestShippedExamples:
                 continue
             if example_dir.name in _EXAMPLES_WITHOUT_SETTINGS:
                 continue
-            for yaml_file in sorted(example_dir.glob("*.yaml")):
-                if "settings" in yaml_file.name:
+            yaml_files = sorted((*example_dir.glob("*.yaml"), *example_dir.glob("*.yml")))
+            for yaml_file in yaml_files:
+                if (example_dir.name, yaml_file.name) not in _AUXILIARY_EXAMPLE_YAMLS:
                     results.append((example_dir.name, yaml_file))
         return results
 
@@ -199,18 +217,37 @@ class TestShippedExamples:
         """Every example directory has at least one settings file (or is excused)."""
         example_dirs = [d for d in sorted(example_pipeline_dir.iterdir()) if d.is_dir() and not d.name.startswith(".")]
         assert len(example_dirs) > 0, "No example directories found"
+        discovered_names = {name for name, _path in self._find_example_settings(example_pipeline_dir)}
 
         for d in example_dirs:
             if d.name in _EXAMPLES_WITHOUT_SETTINGS:
                 continue
-            yamls = list(d.glob("*.yaml")) + list(d.glob("*.yml"))
-            assert len(yamls) > 0, f"Example {d.name} has no YAML config files"
+            assert d.name in discovered_names, f"Example {d.name} has no pipeline config files"
 
     def test_discover_settings_files(self, example_pipeline_dir: Path) -> None:
         """Sanity check: discovery finds a reasonable number of settings files."""
         settings = self._find_example_settings(example_pipeline_dir)
         # We know there are 20+ example directories with settings
         assert len(settings) >= 20, f"Expected at least 20 settings files, found {len(settings)}"
+
+    def test_discovery_includes_named_pipeline_entrypoints(self, example_pipeline_dir: Path) -> None:
+        """Pipeline entry points need validation even when not named settings.yaml."""
+        discovered_paths = {path.relative_to(example_pipeline_dir) for _name, path in self._find_example_settings(example_pipeline_dir)}
+        expected_paths = {
+            Path("chroma_rag_indexed/index_pipeline.yaml"),
+            Path("chroma_rag_indexed/query_pipeline.yaml"),
+        }
+
+        assert expected_paths <= discovered_paths
+
+    def test_discovery_includes_new_top_level_pipeline_names(self, tmp_path: Path) -> None:
+        """A future pipeline name cannot silently escape shipped-config validation."""
+        example_dir = tmp_path / "named_pipeline"
+        example_dir.mkdir()
+        pipeline = example_dir / "workflow.yml"
+        pipeline.write_text("sources: {}\nsinks: {}\n", encoding="utf-8")
+
+        assert self._find_example_settings(tmp_path) == [("named_pipeline", pipeline)]
 
     def test_all_settings_are_valid_yaml(self, example_pipeline_dir: Path) -> None:
         """All example settings files are parseable YAML producing dicts."""
@@ -562,6 +599,48 @@ class TestShippedExamples:
         input_rows = [json.loads(line) for line in input_path.read_text().splitlines() if line.strip()]
         assert sum(len(row["items"]) for row in input_rows) == 200
 
+    def test_multi_worker_default_profiles_are_deterministic(self, example_pipeline_dir: Path) -> None:
+        """Self-verifying worker demos keep terminal faults opt-in."""
+        variants = {
+            "multi_worker": "ELSPETH_MULTI_WORKER_CHAOS_CONFIG",
+            "multi_worker_showcase": "ELSPETH_MULTI_WORKER_SHOWCASE_CHAOS_CONFIG",
+        }
+
+        for example_name, override_name in variants.items():
+            example_dir = example_pipeline_dir / example_name
+            default_config: dict[str, Any] = yaml.safe_load((example_dir / "chaos_config.yaml").read_text())
+            error_injection = default_config["error_injection"]
+            percentages = {key: value for key, value in error_injection.items() if key.endswith("_pct")}
+
+            assert percentages
+            assert all(value == 0.0 for value in percentages.values()), percentages
+
+            fault_config: dict[str, Any] = yaml.safe_load((example_dir / "chaos_config_faults.yaml").read_text())
+            fault_percentages = {key: value for key, value in fault_config["error_injection"].items() if key.endswith("_pct")}
+            assert any(value > 0.0 for value in fault_percentages.values())
+
+            launcher = (example_dir / "run.sh").read_text()
+            assert override_name in launcher
+
+    def test_multi_worker_launchers_reject_invalid_admission_setup(self, example_pipeline_dir: Path) -> None:
+        """Launchers reject invalid worker counts and occupied ChaosLLM ports."""
+        for example_name in ("multi_worker", "multi_worker_showcase"):
+            launcher = (example_pipeline_dir / example_name / "run.sh").read_text()
+
+            assert "WORKERS must be a positive integer" in launcher
+            assert "port $CHAOS_PORT is already in use" in launcher
+            readiness_loop = launcher.split("for i in $(seq 1 30); do", maxsplit=1)[1].split("done", maxsplit=1)[0]
+            assert readiness_loop.index('kill -0 "$CHAOS_PID"') < readiness_loop.index("curl -sf")
+
+    def test_multi_worker_summary_counts_terminal_row_outcomes(self, example_pipeline_dir: Path) -> None:
+        """The PASS summary excludes source/fan-out scheduler work items."""
+        launcher = (example_pipeline_dir / "multi_worker" / "run.sh").read_text()
+        total_rows_query = launcher.split('TOTAL_ROWS="', maxsplit=1)[1].split('"\n', maxsplit=1)[0]
+
+        assert "FROM token_outcomes" in total_rows_query
+        assert "completed=1" in total_rows_query
+        assert "outcome IN ('success','failure')" in total_rows_query
+
     def test_multi_worker_showcase_stats_use_completed_terminal_outcomes(self, example_pipeline_dir: Path, tmp_path: Path) -> None:
         """Showcase stats distinguish successful and failed terminal outcomes."""
         run_id = "run-under-test"
@@ -779,3 +858,35 @@ class TestShippedExamples:
         assert command in (example_pipeline_dir / "blob_transforms" / "README.md").read_text()
         assert command in (example_pipeline_dir / "README.md").read_text()
         assert command in (example_pipeline_dir / "AGENTS.md").read_text()
+
+    def test_blob_transform_hosted_launcher_repairs_payload_permissions(
+        self,
+        example_pipeline_dir: Path,
+        tmp_path: Path,
+    ) -> None:
+        """The hosted-fetch launcher makes its payload root safe before execution."""
+        source_example_dir = example_pipeline_dir / "blob_transforms"
+        copied_example_dir = tmp_path / "examples" / "blob_transforms"
+        shutil.copytree(source_example_dir, copied_example_dir)
+
+        payload_dir = copied_example_dir / "payloads"
+        payload_dir.chmod(0o775)
+        fake_cli = tmp_path / "verify-hosted-payload-mode"
+        fake_cli.write_text(
+            '#!/usr/bin/env bash\ntest "$(stat -c %a examples/blob_transforms/payloads)" = "700"\n',
+            encoding="utf-8",
+        )
+        fake_cli.chmod(0o755)
+
+        launcher = copied_example_dir / "run_hosted_fetch.sh"
+        result = subprocess.run(
+            ["bash", str(launcher)],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "ELSPETH_BLOB_TRANSFORMS_CLI_BIN": str(fake_cli)},
+        )
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert payload_dir.stat().st_mode & 0o077 == 0
