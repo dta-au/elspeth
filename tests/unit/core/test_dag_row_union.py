@@ -15,11 +15,15 @@ inside a branch chain discards every sibling branch's row too.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
+from elspeth.contracts import Checkpoint
+from elspeth.core.canonical import compute_full_topology_hash
+from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
 from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.graph import GraphValidationError
@@ -512,6 +516,305 @@ row_unions:
 """
         with pytest.raises(GraphValidationError, match="coalesce"):
             _build_graph(_yaml(tmp_path, row_unions=shared, tail=_PASSTHROUGH_TAIL))
+
+    def test_union_rejects_branches_from_unrelated_fork_gates(self, tmp_path: Path) -> None:
+        """Branches of one union must share one fork origin (elspeth-d560c5e649).
+
+        Two independent sources feed two unrelated fork gates; one branch from
+        each gate is mapped into the same row_union. Rows from different fork
+        origins never share a correlation identity, so no group can ever
+        complete — the graph must be rejected at build time, not discovered at
+        timeout/end-of-source.
+        """
+        input_a = tmp_path / "input_a.jsonl"
+        input_a.write_text('{"id": 1, "amount": 3}\n')
+        input_b = tmp_path / "input_b.jsonl"
+        input_b.write_text('{"id": 1, "amount": 5}\n')
+        yaml_text = f"""
+sources:
+  rows_a:
+    plugin: json
+    on_success: routed_a
+    options:
+      path: {input_a}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+  rows_b:
+    plugin: json
+    on_success: routed_b
+    options:
+      path: {input_b}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+gates:
+  - name: fork_alpha
+    input: routed_a
+    condition: "True"
+    routes:
+      'true': fork
+      'false': output
+    fork_to: [control_branch, aux_left]
+  - name: fork_beta
+    input: routed_b
+    condition: "True"
+    routes:
+      'true': fork
+      'false': output
+    fork_to: [treatment_branch, aux_right]
+row_unions:
+  - name: variant_union
+    branches: [control_branch, treatment_branch]
+    on_success: union_out
+transforms:
+  - name: after_union
+    plugin: passthrough
+    input: union_out
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+  aux_left:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "aux_left.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+  aux_right:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "aux_right.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+"""
+        with pytest.raises(GraphValidationError) as exc_info:
+            _build_graph(yaml_text)
+        message = str(exc_info.value)
+        assert "variant_union" in message
+        assert "fork_alpha" in message
+        assert "fork_beta" in message
+
+    def test_union_rejects_branch_input_not_descending_from_alias(self, tmp_path: Path) -> None:
+        """A mapped input must descend from its own branch alias (elspeth-d560c5e649).
+
+        One fork gate owns both aliases, but 'control_branch' maps an input
+        connection whose chain roots at a SECOND source — the alias itself is
+        consumed by an unrelated chain, defeating the dangling-connection
+        guard. Rows arriving from the imposter chain never traversed the fork,
+        so they carry no branch identity and the group can never complete.
+        """
+        input_a = tmp_path / "input_a.jsonl"
+        input_a.write_text('{"id": 1, "amount": 3}\n')
+        input_b = tmp_path / "input_b.jsonl"
+        input_b.write_text('{"id": 1, "amount": 5}\n')
+        yaml_text = f"""
+sources:
+  rows_a:
+    plugin: json
+    on_success: routed
+    options:
+      path: {input_a}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+  rows_b:
+    plugin: json
+    on_success: side_feed
+    options:
+      path: {input_b}
+      format: jsonl
+      on_validation_failure: discard
+      schema:
+        mode: observed
+gates:
+  - name: variant_fork
+    input: routed
+    condition: "True"
+    routes:
+      'true': fork
+      'false': output
+    fork_to: [control_branch, treatment_branch]
+transforms:
+  - name: alias_eater
+    plugin: passthrough
+    input: control_branch
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: imposter
+    plugin: passthrough
+    input: side_feed
+    on_success: imposter_out
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: real_treatment
+    plugin: passthrough
+    input: treatment_branch
+    on_success: treatment_scored
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+  - name: after_union
+    plugin: passthrough
+    input: union_out
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+row_unions:
+  - name: variant_union
+    branches:
+      control_branch: imposter_out
+      treatment_branch: treatment_scored
+    on_success: union_out
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: {tmp_path / "out.jsonl"}
+      format: jsonl
+      schema:
+        mode: observed
+"""
+        with pytest.raises(GraphValidationError) as exc_info:
+            _build_graph(yaml_text)
+        message = str(exc_info.value)
+        assert "control_branch" in message
+        assert "imposter_out" in message
+        assert "graph construction bug" not in message
+
+
+class TestBarrierBranchOrderIdentity:
+    """Declared branch order is executable topology semantics (elspeth-9c5789c4ad).
+
+    RowUnionExecutor releases groups in declaration order and coalesce merge
+    precedence (first_wins/last_wins, nested field order) follows declaration
+    order, but RFC 8785 canonical hashing sorts mapping keys — so order must be
+    bound into node identity explicitly or a reorder resumes old checkpoints
+    under different runtime semantics.
+    """
+
+    _REVERSED_UNION = """
+row_unions:
+  - name: variant_union
+    branches: [treatment_branch, control_branch]
+    on_success: union_out
+"""
+
+    def test_reordering_branches_changes_topology_hash_and_node_id(self, tmp_path: Path) -> None:
+        graph_declared = _build_graph(_yaml(tmp_path, row_unions=_IDENTITY_UNION, tail=_PASSTHROUGH_TAIL))
+        graph_reordered = _build_graph(_yaml(tmp_path, row_unions=self._REVERSED_UNION, tail=_PASSTHROUGH_TAIL))
+
+        assert graph_declared.get_row_union_id_map()["variant_union"] != graph_reordered.get_row_union_id_map()["variant_union"]
+        assert compute_full_topology_hash(graph_declared) != compute_full_topology_hash(graph_reordered)
+
+    _REVERSED_CHAIN_UNION = """
+row_unions:
+  - name: variant_union
+    branches:
+      treatment_branch: treatment_scored
+      control_branch: control_scored
+    on_success: union_out
+"""
+
+    def test_reordering_mapping_form_branches_changes_topology_hash(self, tmp_path: Path) -> None:
+        """Dict-form branches must bind declaration order into identity too.
+
+        Chain branches can only be declared in mapping form, and mapping-form
+        order survives settings validation only as long as the validators
+        preserve insertion order — this pins that path so a future
+        'sort-for-determinism' refactor cannot silently reintroduce the bug
+        for chain branches while the list-form tests stay green.
+        """
+        chain_transforms = _chain_branch_transforms(control_on_error="discard", treatment_on_error="discard")
+        graph_declared = _build_graph(_yaml(tmp_path, row_unions=_CHAIN_UNION, branch_transforms=chain_transforms, tail=""))
+        graph_reordered = _build_graph(_yaml(tmp_path, row_unions=self._REVERSED_CHAIN_UNION, branch_transforms=chain_transforms, tail=""))
+
+        assert graph_declared.get_row_union_id_map()["variant_union"] != graph_reordered.get_row_union_id_map()["variant_union"]
+        assert compute_full_topology_hash(graph_declared) != compute_full_topology_hash(graph_reordered)
+
+    def test_identical_declaration_hashes_identically(self, tmp_path: Path) -> None:
+        graph_one = _build_graph(_yaml(tmp_path, row_unions=_IDENTITY_UNION, tail=_PASSTHROUGH_TAIL))
+        graph_two = _build_graph(_yaml(tmp_path, row_unions=_IDENTITY_UNION, tail=_PASSTHROUGH_TAIL))
+
+        assert compute_full_topology_hash(graph_one) == compute_full_topology_hash(graph_two)
+
+    def test_reordered_branches_fail_checkpoint_resume_closed(self, tmp_path: Path) -> None:
+        graph_declared = _build_graph(_yaml(tmp_path, row_unions=_IDENTITY_UNION, tail=_PASSTHROUGH_TAIL))
+        graph_reordered = _build_graph(_yaml(tmp_path, row_unions=self._REVERSED_UNION, tail=_PASSTHROUGH_TAIL))
+
+        checkpoint = Checkpoint(
+            checkpoint_id="cp-branch-order",
+            run_id="run-branch-order",
+            sequence_number=1,
+            created_at=datetime.now(UTC),
+            upstream_topology_hash=compute_full_topology_hash(graph_declared),
+            format_version=Checkpoint.CURRENT_FORMAT_VERSION,
+        )
+        validator = CheckpointCompatibilityValidator()
+
+        same_order = validator.validate(checkpoint, graph_declared)
+        assert same_order.can_resume
+
+        reordered = validator.validate(checkpoint, graph_reordered)
+        assert not reordered.can_resume
+
+    def test_coalesce_branch_reorder_changes_topology_hash(self, tmp_path: Path) -> None:
+        """Coalesce parity: merge precedence follows declaration order too."""
+
+        def coalesce_yaml(branches: str) -> str:
+            return _yaml(
+                tmp_path,
+                row_unions=f"""
+coalesce:
+  - name: variant_merge
+    branches: {branches}
+    policy: require_all
+    merge: union
+    union_collision_policy: first_wins
+""",
+                tail="""
+transforms:
+  - name: after_merge
+    plugin: passthrough
+    input: variant_merge
+    on_success: output
+    on_error: discard
+    options:
+      schema:
+        mode: observed
+""",
+            )
+
+        graph_declared = _build_graph(coalesce_yaml("[control_branch, treatment_branch]"))
+        graph_reordered = _build_graph(coalesce_yaml("[treatment_branch, control_branch]"))
+
+        assert compute_full_topology_hash(graph_declared) != compute_full_topology_hash(graph_reordered)
 
 
 _CHAIN_UNION = """

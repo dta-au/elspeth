@@ -501,6 +501,13 @@ def build_execution_graph(
             # Note: Pydantic validates min_length=2 for branches field
             config_dict: NodeConfig = {
                 "branches": dict(coalesce_config.branches),
+                # Declared order drives merge precedence at runtime
+                # (first_wins/last_wins collisions, nested field order), but
+                # canonical hashing sorts mapping keys — carry the order
+                # explicitly so a reorder rotates node identity and topology
+                # hash instead of resuming checkpoints under different merge
+                # semantics (elspeth-9c5789c4ad parity).
+                "branch_order": list(coalesce_config.branches),
                 "policy": coalesce_config.policy,
                 "merge": coalesce_config.merge,
             }
@@ -576,6 +583,12 @@ def build_execution_graph(
                 )
             union_node_config: NodeConfig = {
                 "branches": dict(union_config.branches),
+                # Declared order is the group release order (RowUnionExecutor
+                # iterates it), but canonical hashing sorts mapping keys — an
+                # ordered projection must carry it or a branch reorder keeps
+                # the node id / topology hash and checkpoint resume replays
+                # different release semantics (elspeth-9c5789c4ad).
+                "branch_order": list(union_config.branches),
                 "on_success": union_config.on_success,
             }
             if union_config.timeout_seconds is not None:
@@ -1407,6 +1420,22 @@ def build_execution_graph(
                     component_id=str(union_name),
                     component_type="row_union",
                 )
+            # Ancestor/descendant pairs got their targeted diagnostic above;
+            # any other multi-gate union means UNRELATED fork origins (e.g.
+            # independent sources). Those rows never share a correlation
+            # identity, so a require-all group can never complete — it would
+            # only surface at timeout/end-of-source (elspeth-d560c5e649).
+            if len(union_fork_gate_node_ids) > 1:
+                origin_gate_names = sorted(configured_fork_gate_names[gate_id] for gate_id in union_fork_gate_node_ids)
+                raise GraphValidationError(
+                    f"row_union '{union_name}' declares branches produced by unrelated fork gates "
+                    f"{origin_gate_names}. Rows forked by different gates never share a correlation "
+                    f"identity, so a require-all union spanning them can never receive a complete "
+                    f"same-row group — every group would wait until timeout or end-of-source and "
+                    f"fail closed. Declare every branch of a row_union in ONE gate's fork_to list.",
+                    component_id=str(union_name),
+                    component_type="row_union",
+                )
             seen_upstream: set[NodeID] = set()
             upstream_frontier: list[NodeID] = [union_node_id]
             nested_fork_gate_names: set[str] = set()
@@ -1448,6 +1477,38 @@ def build_execution_graph(
                     component_id=str(union_name),
                     component_type="row_union",
                 )
+
+        # ===== VALIDATE ROW_UNION CHAIN BRANCHES ROOT AT THEIR OWN ALIAS =====
+        # The consumer registry proves each mapped input HAS a producer, not
+        # that the producing chain descends from THIS branch's fork alias. A
+        # mapped input rooted elsewhere (e.g. another source, with the alias
+        # connection consumed by an unrelated chain) delivers rows that never
+        # traversed the fork, so they carry no branch identity and the group
+        # can never complete. Left unchecked, the same trace only fires at
+        # orchestrator wiring, labelled as a graph construction bug the
+        # author cannot act on (elspeth-d560c5e649).
+        for chain_branch_name, ru_spec in row_union_branch_specs.items():
+            if not ru_spec.uses_transform_chain:
+                continue
+            chain_gate_name, chain_gate_node_id = row_union_branch_gates[chain_branch_name]
+            try:
+                graph._trace_branch_endpoints(
+                    ru_spec.row_union_node_id,
+                    str(chain_branch_name),
+                    fork_gate_nid=chain_gate_node_id,
+                )
+            except GraphValidationError:
+                raise GraphValidationError(
+                    f"row_union '{ru_spec.row_union_name}' branch '{chain_branch_name}' maps input "
+                    f"connection '{ru_spec.input_connection}', but no chain arriving at the union "
+                    f"descends from fork branch '{chain_branch_name}' of gate '{chain_gate_name}'. "
+                    f"Rows arriving on '{ru_spec.input_connection}' never traversed that fork "
+                    f"branch, so they carry no matching branch identity and the union group can "
+                    f"never complete. Map '{chain_branch_name}' to the output of the transform "
+                    f"chain that consumes connection '{chain_branch_name}'.",
+                    component_id=str(ru_spec.row_union_name),
+                    component_type="row_union",
+                ) from None
 
     # Step maps and node sequence support node_id-based processor traversal.
     graph.set_pipeline_nodes(pipeline_nodes)
