@@ -115,11 +115,11 @@ independent of `plugin_allowlist` — because their web-authored form would let
 an author redirect a server-held credential (see the
 [AWS S3 sink](#aws-s3-sink)'s source ban for a worked example). Allowlisting
 one of these does not enable it on the web: the entry still authorizes the
-plugin for CLI/batch runtime, but every web surface reports it as a
-*declined authorization* (`PluginUnavailableReason.WEB_SURFACE_PROHIBITED`),
-never a selectable plugin. Deleting the allowlist entry to "clear" that
-decline only narrows the CLI/batch runtime authorization — it does not
-change web availability, which the categorical ban already controls.
+plugin for CLI/batch runtime, but the web availability snapshot carries it
+as a *declined authorization* (`PluginUnavailableReason.WEB_SURFACE_PROHIBITED`),
+never as an offer. Deleting the allowlist entry to "clear" that decline
+only narrows the CLI/batch runtime authorization — it does not change web
+availability, which the categorical ban already controls.
 
 The required authorization set above is always authorized regardless of
 `plugin_allowlist`; the allowlist only adds optional plugins on top of it,
