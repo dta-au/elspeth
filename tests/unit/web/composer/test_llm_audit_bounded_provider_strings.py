@@ -54,6 +54,8 @@ from elspeth.web.composer.llm_response_parsing import (
 # the test agree with the implementation by construction.
 FINISH_REASON_LIMIT = 128
 MODEL_LIMIT = 256
+# ``provider_request_id`` shares the identifier bound with ``model_returned``.
+REQUEST_ID_LIMIT = 256
 
 # Termination tokens real providers emit. OpenAI-family (``stop``,
 # ``length``, ``tool_calls``, ``content_filter``), Anthropic (``end_turn``,
@@ -94,10 +96,15 @@ LONG_BUT_LEGITIMATE_MODELS = (
 )
 
 
-def _real_response(*, finish_reason: str = "stop", model: str = "returned-model") -> ModelResponse:
+def _real_response(
+    *,
+    finish_reason: str = "stop",
+    model: str = "returned-model",
+    response_id: str = "req-bounded-strings",
+) -> ModelResponse:
     """A genuine litellm response object (ADR-032: real objects at the boundary)."""
     return ModelResponse(
-        id="req-bounded-strings",
+        id=response_id,
         model=model,
         choices=[
             Choices(
@@ -211,6 +218,21 @@ class TestBoundaries:
 
         assert record.model_returned != value
         assert record.model_returned == f"{'m' * MODEL_LIMIT}<truncated:{MODEL_LIMIT + 1}>"
+
+    def test_request_id_exactly_at_the_limit_is_untouched(self) -> None:
+        value = "r" * REQUEST_ID_LIMIT
+
+        record = _record(_real_response(response_id=value))
+
+        assert record.provider_request_id == value
+
+    def test_request_id_one_over_the_limit_is_truncated(self) -> None:
+        value = "r" * (REQUEST_ID_LIMIT + 1)
+
+        record = _record(_real_response(response_id=value))
+
+        assert record.provider_request_id != value
+        assert record.provider_request_id == f"{'r' * REQUEST_ID_LIMIT}<truncated:{REQUEST_ID_LIMIT + 1}>"
 
 
 class TestOversizedValueDegradesGracefully:
@@ -334,3 +356,101 @@ class TestUnexpectedTypesDoNotCrashTheRecorder:
 
         assert record.finish_reason is None
         assert record.model_returned is None
+        assert record.provider_request_id is None
+
+
+class TestProviderRequestIdTruncatesRatherThanDisappears:
+    """An over-long correlation id must stay visible as an over-long id.
+
+    This bound used to be enforced by DROPPING the value, which made an
+    endpoint emitting a broken id indistinguishable from one emitting no id
+    at all — the same lost-evidence class already fixed for ``finish_reason``
+    and ``model_returned``. Truncate-and-signal keeps the distinction.
+    """
+
+    @pytest.mark.parametrize(
+        "request_id",
+        (
+            "chatcmpl-9x2Kf7QwLmNpRtVbYc3ZaHdEg",
+            "req_011CQ8vT5nYzKpMwRsXbLfGh",
+            "msg_01ABcDeFgHiJkLmNoPqRsTuV",
+            "01234567-89ab-cdef-0123-456789abcdef",
+        ),
+    )
+    def test_real_request_ids_are_recorded_verbatim(self, request_id: str) -> None:
+        record = _record(_real_response(response_id=request_id))
+
+        assert record.provider_request_id == request_id
+        assert PROVIDER_STRING_TRUNCATION_MARKER not in str(record.provider_request_id)
+
+    def test_an_absent_request_id_is_still_none(self) -> None:
+        """Absence must remain expressible — it is half of the distinction."""
+        record = _record({"choices": [], "model": "returned-model"})
+
+        assert record.provider_request_id is None
+
+    def test_an_oversized_request_id_is_not_mistaken_for_absence(self) -> None:
+        """The regression this closes: over-long used to read as "no id sent"."""
+        record = _record(_real_response(response_id="r" * 5_000))
+
+        assert record.provider_request_id is not None
+        assert PROVIDER_STRING_TRUNCATION_MARKER in record.provider_request_id
+
+    def test_the_original_length_is_recorded_in_the_marker(self) -> None:
+        record = _record(_real_response(response_id="r" * 5_000))
+
+        assert str(record.provider_request_id).endswith("<truncated:5000>")
+
+    def test_an_oversized_request_id_still_produces_an_audit_row(self) -> None:
+        record = _record(_real_response(response_id="r" * 50_000))
+
+        assert isinstance(record, ComposerLLMCall)
+        assert record.status is ComposerLLMCallStatus.SUCCESS
+        assert record.messages_hash
+
+    def test_an_oversized_request_id_does_not_fall_through_to_request_id(self) -> None:
+        """Load-bearing: selection happens BEFORE bounding, not through it.
+
+        ``id`` is preferred over ``request_id``, so the first non-empty
+        string wins and is then capped. If the length test were folded back
+        into the acceptance predicate, an over-long ``id`` would fall through
+        and the row would record a clean ``request_id`` from an endpoint that
+        had just emitted a broken id — the anomaly would vanish exactly as it
+        did before this fix.
+        """
+        record = _record({"id": "i" * 5_000, "request_id": "req-fallback", "choices": []})
+
+        assert record.provider_request_id is not None
+        assert record.provider_request_id.startswith("i" * REQUEST_ID_LIMIT)
+        assert record.provider_request_id.endswith("<truncated:5000>")
+
+    def test_request_id_is_still_the_fallback_when_id_is_absent(self) -> None:
+        """The preference order itself is unchanged by this fix."""
+        record = _record({"request_id": "req-fallback", "choices": []})
+
+        assert record.provider_request_id == "req-fallback"
+
+    def test_an_oversized_whitespace_request_id_does_not_destroy_the_row(self) -> None:
+        """Sibling of the model/finish_reason slice-to-blank hazard.
+
+        The value is truncated unstripped, so a mostly-blank id slices down
+        to pure whitespace; the record survives only because the non-blank
+        marker is appended after the slice. ``_require_non_empty_str`` would
+        otherwise raise and destroy the audit row.
+        """
+        record = _record({"id": " " * 300 + "x", "choices": []})
+
+        assert record.provider_request_id is not None
+        assert record.provider_request_id.strip()
+        assert record.provider_request_id.endswith("<truncated:301>")
+
+    def test_a_truncated_request_id_reaches_the_envelope_unchanged(self) -> None:
+        record = _record(_real_response(response_id="r" * 5_000))
+
+        assert _envelope_call(record)["provider_request_id"] == record.provider_request_id
+
+    @pytest.mark.parametrize("request_id", (7, 3.5, [], {}, None, ""))
+    def test_non_string_or_empty_request_id_is_absence_not_a_crash(self, request_id: Any) -> None:
+        record = _record({"id": request_id, "choices": []})
+
+        assert record.provider_request_id is None

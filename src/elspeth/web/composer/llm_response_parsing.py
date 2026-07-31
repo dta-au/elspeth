@@ -342,12 +342,11 @@ hardcoding the literal.
 # self-evidently not a termination token.
 _PROVIDER_TOKEN_MAX_CHARS: Final[int] = 128
 
-# A provider routing identifier (``model_returned``). These are legitimately
-# long: Bedrock inference-profile ARNs and Vertex resource paths run
-# ~100-140 characters. 256 clears those with room to spare and matches the
-# bound ``_safe_provider_request_id`` already applies to the sibling
-# provider identifier in this module, so there is one identifier bound to
-# justify rather than two.
+# A provider routing or correlation identifier (``model_returned``,
+# ``provider_request_id``). These are legitimately long: Bedrock
+# inference-profile ARNs and Vertex resource paths run ~100-140 characters.
+# 256 clears those with room to spare, and both identifiers share it so
+# there is one identifier bound to justify rather than two.
 _PROVIDER_IDENTIFIER_MAX_CHARS: Final[int] = 256
 
 
@@ -410,12 +409,32 @@ def safe_response_model(response: Any | None) -> str | None:
 
 
 def _safe_provider_request_id(response: Any | None) -> str | None:
+    """Return the provider's own correlation id (``id``, else ``request_id``), bounded.
+
+    Provider-authored: the endpoint chooses these bytes, and they reach the
+    stored ``provider_request_id`` column and the rendered audit summary, so
+    the same bound applies as to the sibling identifier
+    :func:`safe_response_model` — one identifier limit
+    (:data:`_PROVIDER_IDENTIFIER_MAX_CHARS`) to justify rather than two.
+
+    Selection and bounding are deliberately separate steps. The attribute
+    order is a *preference* — ``id`` is what OpenAI-compatible endpoints
+    populate, ``request_id`` the fallback some proxies use — so the first
+    non-empty string wins and is then capped. Folding the length test back
+    into the acceptance predicate would make an over-long ``id`` fall through
+    to ``request_id``, and the audit row would then record a perfectly clean
+    id from an endpoint that had just emitted a broken one: the anomaly
+    disappears, which is the exact failure this bound exists to prevent.
+
+    A legitimate id passes through unchanged; see
+    :func:`_bounded_provider_string` for the truncation signal.
+    """
     if response is None:
         return None
     for attr in ("id", "request_id"):
         value = _provider_field(response, attr)
-        if isinstance(value, str) and value and len(value) <= 256:
-            return value
+        if isinstance(value, str) and value:
+            return _bounded_provider_string(value, limit=_PROVIDER_IDENTIFIER_MAX_CHARS)
     return None
 
 
