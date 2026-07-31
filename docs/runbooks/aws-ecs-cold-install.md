@@ -196,8 +196,11 @@ separate customer-managed policies — their aggregate size exceeds IAM's
 inline-policy limit, so do not merge them — and attach
 `iam-lifecycle-policy.json` to the lifecycle principal through the account's
 trusted IAM administration path. Do not combine them into a wildcard
-administrator policy. The detailed authority split and its one account-level
-CloudWatch Logs limitation are documented in the
+administrator policy. Record all four policy ARNs in the operator change
+record: these policies exist outside every Terraform state, so teardown
+detaches and deletes them by recorded ARN rather than by tag or state. The
+detailed authority split and its one account-level CloudWatch Logs
+limitation are documented in the
 [Terraform package README](../../deploy/aws-ecs/terraform/README.md#installer-policy-and-task-role-boundary).
 
 ## 3. Bootstrap remote state and image repositories
@@ -732,6 +735,15 @@ terraform -chdir=bootstrap apply .terraform/bootstrap-destroy.tfplan
 test -z "$(terraform -chdir=bootstrap state list)"
 ```
 
+Both destroys run under the Step 2 policies, so those policies must outlive
+them. Only now, remove the four policies recorded in the operator change
+record: detach the three `installer-*` policies from the normal installer
+principal and delete them, and detach and delete the lifecycle policy through
+the account's trusted IAM administration path. Do not rely on the tag query
+below to find them — they were created outside Terraform and may carry no run
+tag. `aws iam delete-policy` refuses while any attachment or non-default
+policy version remains, so a successful delete confirms the detach.
+
 Finally, query the run tag:
 
 ```bash
@@ -747,5 +759,6 @@ before declaring a chargeable survivor. Do not delete an untagged or
 differently tagged resource merely because its name resembles this run.
 
 Completion requires empty Scenario A and bootstrap state, no live run-tagged
-resources, and no active ECS tasks, Aurora instances, ALBs, NAT gateways, EFS
+resources, none of the four Step 2 installer or lifecycle policies remaining,
+and no active ECS tasks, Aurora instances, ALBs, NAT gateways, EFS
 filesystems, Secrets Manager secrets, or retained ECR images owned by this run.
