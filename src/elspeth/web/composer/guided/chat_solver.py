@@ -350,10 +350,16 @@ class GuidedChatDeferredManagementOutcome:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Step1SourceResolvedOutcome:
     resolution: Step1SourceChatResolution
+    # Set when the reply PAIRED resolve_source with retain_deferred_intent:
+    # the source resolves at this stage and the future-stage instruction is
+    # retained in the same Send (elspeth-a96b2f1b0a / R2-F15).
+    deferred_action: DeferredIntentAction | None
 
     def __post_init__(self) -> None:
         if type(self.resolution) is not Step1SourceChatResolution:
             raise TypeError("Step1SourceResolvedOutcome.resolution must be exact")
+        if self.deferred_action is not None and type(self.deferred_action) is not DeferredIntentAction:
+            raise TypeError("Step1SourceResolvedOutcome.deferred_action must be exact or None")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1706,15 +1712,20 @@ async def maybe_resolve_step_1_source_chat(
                 retain_calls = [
                     call for call in terminal_calls if call.function is not None and call.function.name == "retain_deferred_intent"
                 ]
-                if len(terminal_calls) != 1 or len(tool_calls) != 1:
-                    raise _terminal_shape_error_type(terminal_calls)("step-1 chat must return exactly one terminal guided action")
-                function = terminal_calls[0].function
-                if function is None:  # pragma: no cover - filtered immediately above
-                    raise GuidedSolverResponseShapeError("step-1 terminal action has no function")
-                arguments = function.arguments
-                if function.name == "retain_deferred_intent":
+                source_calls = [call for call in terminal_calls if call.function is not None and call.function.name == "resolve_source"]
+                # A resolve_source + retain_deferred_intent PAIR is the one
+                # multi-call reply this stage accepts: a message mixing current-
+                # stage source values with a future-stage instruction must lose
+                # neither half (elspeth-a96b2f1b0a / R2-F15).
+                is_retained_pair = len(tool_calls) == 2 and len(terminal_calls) == 2 and len(retain_calls) == 1 and len(source_calls) == 1
+                if not is_retained_pair and (len(terminal_calls) != 1 or len(tool_calls) != 1):
+                    raise _terminal_shape_error_type(terminal_calls)(
+                        "step-1 chat must return exactly one terminal guided action, or one resolve_source + retain_deferred_intent pair"
+                    )
+                deferred: DeferredIntentAction | None = None
+                if retain_calls:
                     try:
-                        deferred = _parse_deferred_intent_tool_arguments(arguments)
+                        deferred = _parse_deferred_intent_tool_arguments(retain_calls[0].function.arguments)
                     except DeferredIntentActionShapeError as exc:
                         # Bounded self-repair (mirrors the step-2 config-invalid
                         # resolve_sink threading): thread the value-free shape
@@ -1735,8 +1746,13 @@ async def maybe_resolve_step_1_source_chat(
                         error_class = type(exc).__name__
                         error_message = "malformed_response"
                         continue
+                if deferred is not None and not is_retained_pair:
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredIntentOutcome(action=deferred)
+                function = source_calls[0].function if is_retained_pair else terminal_calls[0].function
+                if function is None:  # pragma: no cover - filtered immediately above
+                    raise GuidedSolverResponseShapeError("step-1 terminal action has no function")
+                arguments = function.arguments
                 if function.name == "manage_deferred_intent":
                     management = _parse_deferred_intent_management_tool_arguments(arguments)
                     status = ComposerLLMCallStatus.SUCCESS
@@ -1757,7 +1773,7 @@ async def maybe_resolve_step_1_source_chat(
                     )
                 result = _parse_step_1_source_tool_arguments(arguments, plugin_hint=plugin_hint)
                 status = ComposerLLMCallStatus.SUCCESS
-                return Step1SourceResolvedOutcome(resolution=result)
+                return Step1SourceResolvedOutcome(resolution=result, deferred_action=deferred)
             # No resolve_source call: the model judged the message doesn't carry
             # enough detail to act (or it's a plain question) and answered in
             # prose instead. Validate + return that prose directly — the SAME
@@ -2104,12 +2120,18 @@ direct callers bounded at the same default as :class:`WebSettings`.
 class Step2SinkResolvedOutcome:
     sink: SinkResolved
     assistant_message: str
+    # Set when the reply PAIRED resolve_sink with retain_deferred_intent:
+    # the sink resolves at this stage and the future-stage instruction is
+    # retained in the same Send (elspeth-a96b2f1b0a / R2-F15).
+    deferred_action: DeferredIntentAction | None
 
     def __post_init__(self) -> None:
         if type(self.sink) is not SinkResolved:
             raise TypeError("Step2SinkResolvedOutcome.sink must be exact")
         if type(self.assistant_message) is not str or not self.assistant_message:
             raise TypeError("Step2SinkResolvedOutcome.assistant_message must be a non-empty exact string")
+        if self.deferred_action is not None and type(self.deferred_action) is not DeferredIntentAction:
+            raise TypeError("Step2SinkResolvedOutcome.deferred_action must be exact or None")
 
 
 type Step2SinkChatOutcome = (
@@ -2266,15 +2288,20 @@ async def maybe_resolve_step_2_sink_chat(
                 retain_calls = [
                     call for call in terminal_calls if call.function is not None and call.function.name == "retain_deferred_intent"
                 ]
-                if len(terminal_calls) != 1 or len(tool_calls) != 1:
-                    raise _terminal_shape_error_type(terminal_calls)("step-2 chat must return exactly one terminal guided action")
-                function = terminal_calls[0].function
-                if function is None:  # pragma: no cover - filtered immediately above
-                    raise GuidedSolverResponseShapeError("step-2 terminal action has no function")
-                arguments = function.arguments
-                if function.name == "retain_deferred_intent":
+                sink_calls = [call for call in terminal_calls if call.function is not None and call.function.name == "resolve_sink"]
+                # A resolve_sink + retain_deferred_intent PAIR is the one
+                # multi-call reply this stage accepts: a message mixing current-
+                # stage output values with a future-stage instruction must lose
+                # neither half (elspeth-a96b2f1b0a / R2-F15).
+                is_retained_pair = len(tool_calls) == 2 and len(terminal_calls) == 2 and len(retain_calls) == 1 and len(sink_calls) == 1
+                if not is_retained_pair and (len(terminal_calls) != 1 or len(tool_calls) != 1):
+                    raise _terminal_shape_error_type(terminal_calls)(
+                        "step-2 chat must return exactly one terminal guided action, or one resolve_sink + retain_deferred_intent pair"
+                    )
+                deferred: DeferredIntentAction | None = None
+                if retain_calls:
                     try:
-                        deferred = _parse_deferred_intent_tool_arguments(arguments)
+                        deferred = _parse_deferred_intent_tool_arguments(retain_calls[0].function.arguments)
                     except DeferredIntentActionShapeError as exc:
                         # Bounded self-repair (mirrors the config-invalid
                         # resolve_sink threading below): thread the value-free
@@ -2297,8 +2324,13 @@ async def maybe_resolve_step_2_sink_chat(
                         error_class = type(exc).__name__
                         error_message = "malformed_response"
                         continue
+                if deferred is not None and not is_retained_pair:
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredIntentOutcome(action=deferred)
+                function = sink_calls[0].function if is_retained_pair else terminal_calls[0].function
+                if function is None:  # pragma: no cover - filtered immediately above
+                    raise GuidedSolverResponseShapeError("step-2 terminal action has no function")
+                arguments = function.arguments
                 if function.name == "manage_deferred_intent":
                     management = _parse_deferred_intent_management_tool_arguments(arguments)
                     status = ComposerLLMCallStatus.SUCCESS
@@ -2311,24 +2343,29 @@ async def maybe_resolve_step_2_sink_chat(
                 config_rejection = resolved_sink_config_error(sink)
                 if config_rejection is None:
                     status = ComposerLLMCallStatus.SUCCESS
-                    return Step2SinkResolvedOutcome(sink=sink, assistant_message=assistant)
+                    return Step2SinkResolvedOutcome(sink=sink, assistant_message=assistant, deferred_action=deferred)
                 # Config-invalid resolution: thread the rejection back as the
                 # tool result so the model can correct itself within the same
-                # Send. At the iteration cap the loop degrades to the advisory
-                # fallback below instead of staging prefill that would wedge
-                # every subsequent /guided/respond echo (elspeth-a88c07cd47).
+                # Send (answering EVERY call id — a paired retain is told it was
+                # withheld so the model resends the complete reply). At the
+                # iteration cap the loop degrades to the advisory fallback below
+                # instead of staging prefill that would wedge every subsequent
+                # /guided/respond echo (elspeth-a88c07cd47).
                 messages.append(_assistant_tool_calls_message(message, tool_calls))
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": terminal_calls[0].id,
-                        "content": (
+                rejected_sink_call = sink_calls[0] if is_retained_pair else terminal_calls[0]
+                for tool_call in tool_calls:
+                    if tool_call is rejected_sink_call:
+                        content = (
                             f"resolve_sink rejected: the options do not satisfy the {sink.outputs[0].plugin!r} "
                             f"sink's configuration contract: {config_rejection.repair_message} "
                             "Correct the options and call resolve_sink again."
-                        ),
-                    }
-                )
+                        )
+                    else:
+                        content = (
+                            "Not applied: the paired resolve_sink call was rejected. "
+                            "After correcting it, resend BOTH calls together in one reply."
+                        )
+                    messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": content})
                 status = ComposerLLMCallStatus.SUCCESS
                 continue
 

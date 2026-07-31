@@ -148,12 +148,17 @@ class GuidedStepDeferredManagementResult:
 class Step1SourceResolvedResult:
     chat: StepChatResult
     resolution: Step1SourceChatResolution
+    # Set when the reply PAIRED resolve_source with retain_deferred_intent
+    # (elspeth-a96b2f1b0a / R2-F15): both halves apply in the same settlement.
+    deferred_action: DeferredIntentAction | None
 
     def __post_init__(self) -> None:
         if type(self.chat) is not StepChatResult:
             raise TypeError("Step1SourceResolvedResult.chat must be exact")
         if type(self.resolution) is not Step1SourceChatResolution:
             raise TypeError("Step1SourceResolvedResult.resolution must be exact")
+        if self.deferred_action is not None and type(self.deferred_action) is not DeferredIntentAction:
+            raise TypeError("Step1SourceResolvedResult.deferred_action must be exact or None")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -172,12 +177,17 @@ class Step1SourcePluginReselectedResult:
 class Step2SinkResolvedResult:
     chat: StepChatResult
     sink: SinkResolved
+    # Set when the reply PAIRED resolve_sink with retain_deferred_intent
+    # (elspeth-a96b2f1b0a / R2-F15): both halves apply in the same settlement.
+    deferred_action: DeferredIntentAction | None
 
     def __post_init__(self) -> None:
         if type(self.chat) is not StepChatResult:
             raise TypeError("Step2SinkResolvedResult.chat must be exact")
         if type(self.sink) is not SinkResolved:
             raise TypeError("Step2SinkResolvedResult.sink must be exact")
+        if self.deferred_action is not None and type(self.deferred_action) is not DeferredIntentAction:
+            raise TypeError("Step2SinkResolvedResult.deferred_action must be exact or None")
 
 
 type Step1SourceChatResult = (
@@ -431,6 +441,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
                     error_class=None,
                 ),
                 resolution=outcome.resolution,
+                deferred_action=outcome.deferred_action,
             )
         if type(outcome) is Step1SourcePluginReselectedOutcome:
             return Step1SourcePluginReselectedResult(
@@ -643,6 +654,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
                     error_class=None,
                 ),
                 sink=outcome.sink,
+                deferred_action=outcome.deferred_action,
             )
         if type(outcome) is GuidedChatDeferredIntentOutcome:
             return GuidedStepDeferredIntentResult(

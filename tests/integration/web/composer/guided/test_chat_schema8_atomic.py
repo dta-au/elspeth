@@ -175,6 +175,7 @@ async def _resolved_source_provider(**_kwargs: object) -> GuidedChatProviderOutc
             error_class=None,
         ),
         resolution=resolution,
+        deferred_action=None,
     )
 
 
@@ -1230,6 +1231,7 @@ async def _resolved_sink_provider(**_kwargs: object) -> GuidedChatProviderOutcom
             error_class=None,
         ),
         sink=sink,
+        deferred_action=None,
     )
 
 
@@ -1339,6 +1341,7 @@ def test_invalid_sink_prefill_never_reaches_operator_logs(
                 error_class=None,
             ),
             sink=sink,
+            deferred_action=None,
         )
 
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", invalid_sink_provider, raising=False)
@@ -1408,6 +1411,7 @@ def test_inline_source_unencodable_content_settles_as_advisory_without_blob(
                 error_class=None,
             ),
             resolution=resolution,
+            deferred_action=None,
         )
 
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", surrogate_provider, raising=False)

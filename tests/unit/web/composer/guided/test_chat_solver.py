@@ -227,14 +227,14 @@ def test_solver_wrapper_and_atomic_provider_channels_are_closed_discriminated_un
         (chat_solver, "GuidedChatDeferredIntentOutcome", {"action"}),
         (chat_solver, "GuidedChatDeferredManagementOutcome", {"action"}),
         (chat_solver, "Step1SourcePluginReselectedOutcome", {"plugin", "assistant_message"}),
-        (chat_solver, "Step1SourceResolvedOutcome", {"resolution"}),
-        (chat_solver, "Step2SinkResolvedOutcome", {"sink", "assistant_message"}),
+        (chat_solver, "Step1SourceResolvedOutcome", {"resolution", "deferred_action"}),
+        (chat_solver, "Step2SinkResolvedOutcome", {"sink", "assistant_message", "deferred_action"}),
         (guided_step_chat_module, "GuidedStepChatOnlyResult", {"chat"}),
         (guided_step_chat_module, "GuidedStepDeferredIntentResult", {"chat", "action"}),
         (guided_step_chat_module, "GuidedStepDeferredManagementResult", {"chat", "action"}),
         (guided_step_chat_module, "Step1SourcePluginReselectedResult", {"chat", "plugin"}),
-        (guided_step_chat_module, "Step1SourceResolvedResult", {"chat", "resolution"}),
-        (guided_step_chat_module, "Step2SinkResolvedResult", {"chat", "sink"}),
+        (guided_step_chat_module, "Step1SourceResolvedResult", {"chat", "resolution", "deferred_action"}),
+        (guided_step_chat_module, "Step2SinkResolvedResult", {"chat", "sink", "deferred_action"}),
     ],
 )
 def test_closed_chat_variants_have_only_required_keyword_fields(
@@ -957,6 +957,160 @@ async def test_deferred_repair_is_bounded_to_one_turn(
         await _run_stage_solver(stage)
 
     assert len(calls) == 2
+
+
+_PAIR_SINK_ARGUMENTS: dict[str, Any] = {
+    "resolution": "sink",
+    "output": {
+        "name": "results",
+        "plugin": "json",
+        "options": {"path": "out.jsonl", "schema": {"mode": "observed"}},
+        "required_fields": [],
+        "schema_mode": "observed",
+        "on_write_failure": "discard",
+    },
+    "assistant_message": "Saved the results as a JSON Lines file.",
+}
+
+_PAIR_SOURCE_ARGUMENTS: dict[str, Any] = {
+    "resolution": "source",
+    "plugin": "json",
+    "filename": "rows.json",
+    "mime_type": "application/json",
+    "content": '[{"line": "alpha"}]',
+    "options": {"schema": {"mode": "observed", "guaranteed_fields": ["line"]}},
+    "observed_columns": ["line"],
+    "sample_rows": [{"line": "alpha"}],
+    "assistant_message": "Created the JSON rows as the source.",
+}
+
+
+@pytest.mark.asyncio
+async def test_step_2_pair_of_resolve_sink_and_retain_applies_both(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reply pairing resolve_sink with retain_deferred_intent loses neither."""
+
+    async def pair_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
+        calls = [
+            SimpleNamespace(id="c_sink", function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_SINK_ARGUMENTS))),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_acompletion)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save results as jsonl, and later add the passthrough transform.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.sink.outputs[0].plugin == "json"
+    assert outcome.assistant_message == "Saved the results as a JSON Lines file."
+    assert outcome.deferred_action == _EXPECTED_DEFERRED_ACTION
+
+
+@pytest.mark.asyncio
+async def test_step_1_pair_of_resolve_source_and_retain_applies_both(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def pair_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
+        calls = [
+            SimpleNamespace(id="c_source", function=SimpleNamespace(name="resolve_source", arguments=json.dumps(_PAIR_SOURCE_ARGUMENTS))),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_acompletion)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Use these JSON rows, and later add the passthrough transform.",
+        plugin_hint="json",
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step1SourceResolvedOutcome
+    assert outcome.resolution.plugin == "json"
+    assert outcome.deferred_action == _EXPECTED_DEFERRED_ACTION
+
+
+@pytest.mark.asyncio
+async def test_step_2_pair_with_malformed_retain_is_repaired_then_applies_both(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The retain half of a pair gets the bounded repair without losing the sink half."""
+    calls: list[dict[str, Any]] = []
+
+    async def repairing_pair(**kwargs: Any) -> _FakeLLMResponse:
+        calls.append(kwargs)
+        retain_arguments = json.dumps({"target_stage": "topology"}) if len(calls) == 1 else json.dumps(_VALID_DEFERRED_ARGUMENTS)
+        tool_calls = [
+            SimpleNamespace(
+                id=f"c_sink_{len(calls)}", function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_SINK_ARGUMENTS))
+            ),
+            SimpleNamespace(
+                id=f"c_retain_{len(calls)}", function=SimpleNamespace(name="retain_deferred_intent", arguments=retain_arguments)
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", repairing_pair)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save results as jsonl, and later add the passthrough transform.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.Step2SinkResolvedOutcome
+    assert outcome.deferred_action == _EXPECTED_DEFERRED_ACTION
+    assert len(calls) == 2
+    repair_messages = calls[1]["messages"]
+    tool_results = [entry for entry in repair_messages if entry.get("role") == "tool"]
+    assert {entry["tool_call_id"] for entry in tool_results} == {"c_sink_1", "c_retain_1"}
+    by_id = {entry["tool_call_id"]: entry["content"] for entry in tool_results}
+    assert "retain_deferred_intent rejected" in by_id["c_retain_1"]
+    assert "Not applied" in by_id["c_sink_1"]
+
+
+@pytest.mark.asyncio
+async def test_step_2_pair_wrapper_threads_deferred_action(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def pair_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
+        calls = [
+            SimpleNamespace(id="c_sink", function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_SINK_ARGUMENTS))),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_acompletion)
+    result = await resolve_step_2_sink_chat_with_auto_drop(
+        site="test",
+        session_id="session",
+        user_id="user",
+        model="test/model",
+        user_message="Save results as jsonl, and later add the passthrough transform.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(result) is guided_step_chat_module.Step2SinkResolvedResult
+    assert result.sink.outputs[0].plugin == "json"
+    assert result.deferred_action == _EXPECTED_DEFERRED_ACTION
 
 
 @pytest.mark.asyncio

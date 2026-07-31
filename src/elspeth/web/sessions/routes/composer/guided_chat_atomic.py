@@ -1021,7 +1021,17 @@ async def post_guided_chat_schema8(
                             provider_outcome.plugin if type(provider_outcome) is Step1SourcePluginReselectedResult else None
                         )
                         sink_resolution = provider_outcome.sink if type(provider_outcome) is Step2SinkResolvedResult else None
-                        deferred_action = provider_outcome.action if type(provider_outcome) is GuidedStepDeferredIntentResult else None
+                        if type(provider_outcome) is GuidedStepDeferredIntentResult:
+                            deferred_action = provider_outcome.action
+                        elif type(provider_outcome) is Step1SourceResolvedResult:
+                            # A resolve+retain PAIR: the resolution applies at
+                            # this stage AND the future-stage instruction is
+                            # retained in the same settlement (R2-F15).
+                            deferred_action = provider_outcome.deferred_action
+                        elif type(provider_outcome) is Step2SinkResolvedResult:
+                            deferred_action = provider_outcome.deferred_action
+                        else:
+                            deferred_action = None
                         deferred_management_action = (
                             provider_outcome.action if type(provider_outcome) is GuidedStepDeferredManagementResult else None
                         )
@@ -1067,6 +1077,14 @@ async def post_guided_chat_schema8(
                         raise AuditIntegrityError("Guided Chat turn custody changed after provider work")
 
                     occurrence_was_prospective = not (current_guided.history and current_guided.history[-1].response_hash is None)
+                    # On a resolve+retain pair, the disposition copy from
+                    # apply_deferred_request must not displace the resolution's
+                    # own assistant message — both applications stay visible.
+                    paired_resolution_message = (
+                        chat_result.assistant_message
+                        if deferred_action is not None and (source_resolution is not None or sink_resolution is not None)
+                        else None
+                    )
                     deferred = apply_deferred_request(
                         deferred_action,
                         deferred_management_action,
@@ -1080,6 +1098,11 @@ async def post_guided_chat_schema8(
                     )
                     prospective = deferred.guided
                     chat_result = deferred.chat
+                    if paired_resolution_message is not None:
+                        chat_result = _replace(
+                            chat_result,
+                            assistant_message=f"{paired_resolution_message} {chat_result.assistant_message}",
+                        )
                     retained_intent_id = deferred_request_retained_intent_id(deferred)
                     management = deferred_request_management(deferred)
                     settled_management_action = management.action if management is not None else None

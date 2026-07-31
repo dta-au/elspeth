@@ -55,7 +55,7 @@ from elspeth.web.sessions.routes.composer import guided as guided_route
 from elspeth.web.sessions.routes.composer import guided_chat_atomic
 from elspeth.web.sessions.routes.composer.guided_chat_atomic import GuidedChatProviderOutcome
 from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep
-from tests.integration.web.composer.guided.test_step_chat import TestStepChatCrossStep, _create_session
+from tests.integration.web.composer.guided.test_step_chat import TestStepChatCrossStep, _create_session, _outputs_path
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -1082,6 +1082,116 @@ def test_schema8_management_proposal_invalidation_fault_rolls_back_intent_propos
     assert operation["status"] == "failed"
     assert operation["originating_message_id"] is None
     assert operation["result_state_id"] is None
+
+
+def test_pair_of_sink_resolution_and_future_intent_applies_both_atomically(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A message mixing sink values and a future-stage instruction loses neither.
+
+    R2-F15's observed failure: the pair was rejected wholesale (both halves
+    discarded, `Path: Not set`). The pair must now stage the sink prefill AND
+    create the deferred intent in one atomic settlement.
+    """
+    client = composer_test_client
+    session_id = _create_session(client)
+    TestStepChatCrossStep._seed_csv_blob(client, session_id)
+    TestStepChatCrossStep._configure_csv_source(client, session_id)
+    before = client.get(f"/api/sessions/{session_id}/guided").json()
+    assert before["guided_session"]["step"] == "step_2_sink"
+    out_path = _outputs_path(client, "pair_out.jsonl")
+    private_message = "Save results as jsonl, and later add the passthrough transform with secret-pair-needle."
+    provider_calls = 0
+
+    async def pair_completion(**_kwargs: object) -> SimpleNamespace:
+        nonlocal provider_calls
+        provider_calls += 1
+        tool_calls = [
+            SimpleNamespace(
+                id="c_sink",
+                function=SimpleNamespace(
+                    name="resolve_sink",
+                    arguments=json.dumps(
+                        {
+                            "resolution": "sink",
+                            "output": {
+                                "name": "main",
+                                "plugin": "json",
+                                "options": {
+                                    "path": out_path,
+                                    "schema": {"mode": "observed"},
+                                    "mode": "write",
+                                    "collision_policy": "auto_increment",
+                                },
+                                "required_fields": [],
+                                "schema_mode": "observed",
+                                "on_write_failure": "discard",
+                            },
+                            "assistant_message": "Output set to JSON.",
+                        }
+                    ),
+                ),
+            ),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(
+                    name="retain_deferred_intent",
+                    arguments=json.dumps(
+                        {
+                            "target_stage": "topology",
+                            "catalog_kind": "transform",
+                            "catalog_name": "passthrough",
+                            "redacted_summary": "Include the named transform during topology authoring.",
+                            "constraints": [
+                                {
+                                    "kind": "component_count",
+                                    "component_kind": "node",
+                                    "plugin_kind": "transform",
+                                    "plugin_name": "passthrough",
+                                    "operator": "at_least",
+                                    "count": 1,
+                                }
+                            ],
+                        }
+                    ),
+                ),
+            ),
+        ]
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_completion)
+    response = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=before["next_turn"]["turn_token"],
+        message=private_message,
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert provider_calls == 1
+    assert body["assistant_message_kind"] == "assistant"
+    assert body["assistant_message"] == "Output set to JSON. I saved that instruction for the topology stage."
+    guided = _guided(client, session_id)
+    (intent,) = guided.deferred_intents
+    assert intent.receiving_stage == "output"
+    assert intent.target_stage == "topology"
+    assert intent.catalog_kind == "transform"
+    assert intent.catalog_name == "passthrough"
+    assert intent.message_content_hash == stable_hash(private_message)
+    # The sink half applied too: the plugin selection was answered and the
+    # projected sink schema form carries the resolved prefill.
+    next_turn = body["next_turn"]
+    assert next_turn is not None
+    assert next_turn["type"] == "schema_form"
+    assert next_turn["payload"]["prefilled"]["path"] == out_path
+    # The raw mixed message stays out of every non-user surface.
+    messages = asyncio.run(client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+    assert [content for _message_id, content in _non_root_user_rows(client, session_id)] == [private_message]
+    assert all(private_message not in message.content for message in messages if message.role != "user")
+    assert all(private_message not in repr(message.tool_calls) for message in messages if message.role != "user")
 
 
 @pytest.mark.parametrize(
