@@ -79,11 +79,18 @@ def test_dashboard_and_alarms_cover_truthful_candidate_and_rollback_identities()
     assert "dimensions  = metric_query.value" in source
 
 
-def test_export_failure_alarm_uses_positive_period_increments_and_can_recover() -> None:
+def test_export_failure_alarm_diffs_each_identity_before_summing() -> None:
     source = _observability()
-    expected = "IF(DIFF(SUM(METRICS())) > 0, DIFF(SUM(METRICS())), 0)"
 
-    assert f'expression  = "{expected}"' in source
+    # The inputs are cumulative per-task counters. Summing identities before
+    # DIFF lets a task replacement's counter reset produce one clamped
+    # negative delta that swallows the new task's first real failures, so
+    # each identity's series must be diffed and clamped alone, then summed.
+    assert "DIFF(SUM(METRICS()))" not in source
+    assert 'expression  = "IF(DIFF(failures_${metric_query.key}) > 0, DIFF(failures_${metric_query.key}), 0)"' in source
+    assert 'expression  = "IF(DIFF(drops_${metric_query.key}) > 0, DIFF(drops_${metric_query.key}), 0)"' in source
+    assert '"delta_failures_${id}"' in source
+    assert '"delta_drops_${id}"' in source
     assert 'expression  = "failures + drops"' not in source
     assert "operator.telemetry.export_failures" in source
     assert "operator.telemetry.queue_drops" in source
