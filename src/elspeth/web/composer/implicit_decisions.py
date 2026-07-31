@@ -13,6 +13,9 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Literal, TypedDict
 
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
+from elspeth.web.composer.guided_blob_refs import GUIDED_REVIEWED_BLOB_PATH_KEYS
+from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec
 
 DecisionCategory = Literal[
@@ -51,6 +54,12 @@ _ALLOWED_HOSTS_ALTERNATIVES = ["public_only", "same_site", "explicit_allowlist"]
 _COLLISION_POLICY_ALTERNATIVES = ["fail", "overwrite", "auto_increment"]
 _ROUTING_ALTERNATIVES = ["discard", "named_sink"]
 _MODEL_PROVIDER_ALTERNATIVES = ["openrouter", "azure_openai"]
+
+# The blob storage-path carriers, shared verbatim with the guided reviewed-source
+# reader and ``redact_source_storage_path``: blob ownership detection and the
+# fork rewrite treat ``path`` and ``file`` equivalently, so one carrier list has
+# to serve every surface or a source authored with the other shape leaks.
+_STORAGE_PATH_CARRIER_KEYS = GUIDED_REVIEWED_BLOB_PATH_KEYS
 
 
 def build_implicit_decisions_report(state: CompositionState) -> ImplicitDecisionsReport:
@@ -96,7 +105,10 @@ def _source_entries(source: SourceSpec) -> list[ImplicitDecisionEntry]:
             category="source",
             provenance=_provenance_for_path(f"source.{field_path}", value),
         )
-        for field_path, value in _flatten_options(source.options)
+        for field_path, value in _flatten_options(
+            source.options,
+            storage_path_sentinel=_blob_storage_path_sentinel(source.options),
+        )
     ]
     entries.append(
         _entry(
@@ -160,12 +172,56 @@ def _output_entries(output: OutputSpec) -> list[ImplicitDecisionEntry]:
     return entries
 
 
-def _flatten_options(options: Mapping[str, Any], prefix: str = "") -> list[tuple[str, object]]:
+def _blob_storage_path_sentinel(options: Mapping[str, Any]) -> str | None:
+    """Return the wire sentinel to record for a blob-backed source's path carriers.
+
+    ``None`` means "not blob-backed": the source's ``path``/``file`` is
+    operator-authored configuration (YAML, manual ``set_source``) and belongs in
+    the disclosure report verbatim. The trigger is the structural ``blob_ref``
+    marker, exactly as in the sibling
+    :func:`~elspeth.web.composer.redaction.redact_source_storage_path`.
+
+    ``options`` is composer/LLM-authored (Tier 3, ADR-032), so the marker's VALUE
+    is parsed rather than trusted: only a non-empty ``str`` is interpolated into
+    the ``blob:<blob_ref>`` sentinel. Any other shape would let an authored
+    ``blob_ref`` become a second value channel on the very surface this exists
+    to close, so it degrades to the generic redaction sentinel.
+    """
+    if "blob_ref" not in options:
+        return None
+    blob_ref = options["blob_ref"]
+    if type(blob_ref) is not str or not blob_ref:
+        return REDACTED_BLOB_SOURCE_PATH
+    return f"{BLOB_REF_PATH_PREFIX}{blob_ref}"
+
+
+def _flatten_options(
+    options: Mapping[str, Any],
+    prefix: str = "",
+    *,
+    storage_path_sentinel: str | None = None,
+) -> list[tuple[str, object]]:
+    """Flatten an option mapping into ``(dotted_path, value)`` disclosure pairs.
+
+    When ``storage_path_sentinel`` is set, the TOP-LEVEL blob storage-path
+    carriers are recorded as that sentinel instead of their filesystem value, so
+    an internal ``/var/lib/elspeth/blobs/...`` path never enters
+    ``composer_meta`` in the first place (elspeth-b5180a9630). Redacting at the
+    write boundary rather than in each outbound serializer is what makes this
+    can't-regress: there is no raw path left downstream to forget to mask.
+
+    Only ``prefix == ""`` keys are substituted. A nested ``<group>.path`` is an
+    unrelated plugin option, not a blob binding — the same top-level-only scope
+    the sibling ``redact_source_storage_path`` uses, and the scope the guided
+    projection's ``{"source.path", "source.file"}`` literals assume.
+    """
     flattened: list[tuple[str, object]] = []
     for key in sorted(options):
         value = options[key]
         path = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(value, Mapping):
+        if storage_path_sentinel is not None and not prefix and key in _STORAGE_PATH_CARRIER_KEYS:
+            flattened.append((path, storage_path_sentinel))
+        elif isinstance(value, Mapping):
             flattened.extend(_flatten_options(value, path))
         else:
             flattened.append((path, deep_thaw(value)))

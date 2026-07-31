@@ -5879,6 +5879,88 @@ class TestRecomposeConvergencePartialState:
         # The diagnostic field carries ONLY the exception class name.
         assert detail.get("partial_state_save_error") == "OperationalError"
 
+    def test_convergence_body_does_not_disclose_blob_storage_path(self, tmp_path) -> None:
+        """elspeth-b5180a9630 (R2-F11): the 422 body must not carry a blob's
+        internal storage path.
+
+        ``partial_state`` is ``_state_response(...)``, whose ``sources`` view is
+        redacted by ``redact_source_storage_path``. But the same absolute path
+        was ALSO flattened verbatim into
+        ``composer_meta.implicit_decisions.entries[].value`` at write time by
+        ``merge_implicit_decisions_meta``, downstream of that projection and
+        outside the guided-only ``private_path_projections`` pass. The leak is
+        not 422-specific — every state response for a freeform blob-backed
+        source carried it — but the 422 is the widest reachable surface, so it
+        is the regression anchor.
+
+        Canary: a synthetic segment inside a blobs-root-shaped path. Its
+        presence anywhere in the serialised body is the leak.
+        """
+        import asyncio
+
+        from elspeth.contracts.freeze import deep_freeze
+        from elspeth.web.composer.protocol import ComposerConvergenceError
+
+        blob_ref = "3c9f1e27-8a4d-4b6f-9e21-7d5c0a8b6f34"
+        path_canary = "__CANARY_BLOB_STORAGE_PATH_SEGMENT__"
+        storage_path = f"/var/lib/elspeth/blobs/{blob_ref}/{path_canary}.csv"
+
+        partial = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                options=deep_freeze(
+                    {
+                        "blob_ref": blob_ref,
+                        "path": storage_path,
+                        "schema": {"mode": "fixed", "fields": ["url: str"]},
+                    }
+                ),
+                on_success="rows",
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=2,
+        )
+
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerConvergenceError(
+                max_turns=5,
+                budget_exhausted="composition",
+                partial_state=partial,
+            ),
+        )
+
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post("/api/sessions", json={"title": "Blob leak"})
+        session_id = resp.json()["id"]
+
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(
+            service.add_message(uuid.UUID(session_id), "user", "Summarise my upload", writer_principal="route_user_message")
+        )
+        loop.close()
+
+        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose")
+
+        assert recompose_resp.status_code == 422, recompose_resp.text
+        body_text = json.dumps(recompose_resp.json())
+        assert path_canary not in body_text, "blob storage path leaked into the convergence 422 body"
+        assert "/var/lib/elspeth/blobs/" not in body_text, "blob storage root leaked into the convergence 422 body"
+
+        # Positive contract: the disclosure entry still exists and names the
+        # blob by its wire sentinel, so the report stays auditable.
+        entries = recompose_resp.json()["detail"]["partial_state"]["composer_meta"]["implicit_decisions"]["entries"]
+        by_path = {entry["path"]: entry for entry in entries}
+        assert by_path["source.path"]["value"] == f"blob:{blob_ref}"
+
     def test_send_message_convergence_threads_user_id_to_preflight(self, tmp_path) -> None:
         """I3 regression: _handle_convergence_error MUST pass the authenticated
         user_id to _state_data_from_composer_state so the runtime preflight
