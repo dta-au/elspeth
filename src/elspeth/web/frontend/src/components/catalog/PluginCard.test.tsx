@@ -504,10 +504,19 @@ describe("PluginCard — Phase 7B reshape", () => {
   });
 
   it("renders the example use as a code block preserving whitespace in details", async () => {
-    render(<PluginCard plugin={makePlugin({ example_use: "source:\n  plugin: csv" })} schema={null} onExpand={() => {}} />);
+    const exampleUse = "source:\n  plugin: csv\n  options:\n    path: data/input.csv";
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({ example_use: exampleUse })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
     await userEvent.click(screen.getByRole("button", { name: /reference details for example/i }));
-    const codeBlock = screen.getByText(/plugin: csv/);
-    expect(codeBlock.tagName.toLowerCase()).toBe("pre");
+    const codeBlock = container.querySelector(".plugin-card-example-code");
+    expect(codeBlock).not.toBeNull();
+    expect(codeBlock?.tagName.toLowerCase()).toBe("pre");
+    expect(codeBlock?.textContent).toBe(exampleUse);
   });
 
   it("preserves inline and fenced code formatting in details prose", async () => {
@@ -560,18 +569,140 @@ describe("PluginCard — Phase 7B reshape", () => {
     expect(within(list).getByText("when credentials would be embedded")).toBeInTheDocument();
   });
 
-  it("falls back to a generic message when prose fields are null in details", async () => {
-    render(
+  it.each(
+    (["usage_when_to_use", "usage_when_not_to_use", "example_use"] as const)
+      .flatMap((field) =>
+        ([null, "", "   ", "\n\t"] as const).map((value) => [field, value] as const),
+      ),
+  )("hides details when %s is %j and the other catalogue fields are empty", (field, value) => {
+    const { container } = render(
       <PluginCard
-        plugin={makePlugin({ usage_when_to_use: null, usage_when_not_to_use: null, example_use: null })}
+        plugin={makePlugin({ [field]: value })}
         schema={null}
         onExpand={() => {}}
       />,
     );
-    await userEvent.click(screen.getByRole("button", { name: /reference details for example/i }));
-    // Per design doc 08-§Risks: "Empty entries fall back to a generic
-    // 'see the technical description' message rather than blocking display."
-    expect(screen.getByText(/see the technical description/i)).toBeInTheDocument();
+
+    expect(
+      screen.queryByRole("button", { name: /reference details for example/i }),
+    ).not.toBeInTheDocument();
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+    expect(screen.queryByText(/see the technical description above/i)).not.toBeInTheDocument();
+  });
+
+  it("renders only meaningful catalogue sections when sibling fields are whitespace", async () => {
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({
+          usage_when_to_use: "   ",
+          usage_when_not_to_use: "Use a database sink for relational queries.",
+          example_use: "\n\t",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+
+    const detailsButton = screen.getByRole("button", {
+      name: /reference details for example/i,
+    });
+    await userEvent.click(detailsButton);
+
+    expect(screen.queryByText("Use when:")).not.toBeInTheDocument();
+    expect(screen.getByText("Avoid when:")).toBeInTheDocument();
+    expect(
+      screen.getByText("Use a database sink for relational queries."),
+    ).toBeInTheDocument();
+    expect(container.querySelector(".plugin-card-example")).not.toBeInTheDocument();
+    expect(screen.queryByText(/see the technical description above/i)).not.toBeInTheDocument();
+  });
+
+  it("keeps populated CSV details collapsed by default and supports close and reopen", async () => {
+    const user = userEvent.setup();
+    const csvPlugin = makePlugin({
+      name: "csv",
+      plugin_type: "source",
+      usage_when_to_use: "When the input is a bounded CSV file.",
+      usage_when_not_to_use: "When the rows are already structured.",
+      example_use: "source:\n  plugin: csv",
+    });
+    const { container } = render(
+      <PluginCard plugin={csvPlugin} schema={null} onExpand={() => {}} />,
+    );
+    const detailsButton = screen.getByRole("button", {
+      name: /reference details for csv/i,
+    });
+
+    expect(detailsButton).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+
+    await user.click(detailsButton);
+    expect(detailsButton).toHaveAttribute("aria-expanded", "true");
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    await user.click(detailsButton);
+    expect(detailsButton).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+
+    await user.click(detailsButton);
+    expect(detailsButton).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByText("When the input is a bounded CSV file.")).toBeInTheDocument();
+  });
+
+  it("operates the populated details disclosure from the keyboard", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <PluginCard
+        plugin={makePlugin({ usage_when_to_use: "When the input is tabular." })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    const detailsButton = screen.getByRole("button", {
+      name: /reference details for example/i,
+    });
+
+    detailsButton.focus();
+    await user.keyboard("{Enter}");
+    expect(detailsButton).toHaveAttribute("aria-expanded", "true");
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    await user.keyboard(" ");
+    expect(detailsButton).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
+  });
+
+  it("starts details collapsed when the card switches to another plugin", async () => {
+    const user = userEvent.setup();
+    const { container, rerender } = render(
+      <PluginCard
+        plugin={makePlugin({
+          name: "csv",
+          usage_when_to_use: "When the input is a bounded CSV file.",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: /reference details for csv/i }));
+    expect(container.querySelector(".plugin-card-details")).toBeInTheDocument();
+
+    rerender(
+      <PluginCard
+        plugin={makePlugin({
+          name: "json",
+          usage_when_to_use: "When the input is structured JSON.",
+        })}
+        schema={null}
+        onExpand={() => {}}
+      />,
+    );
+
+    const jsonDetails = screen.getByRole("button", {
+      name: /reference details for json/i,
+    });
+    expect(jsonDetails).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector(".plugin-card-details")).not.toBeInTheDocument();
   });
 
   it("does NOT render a 'Use in pipeline' button (toolkit affordance removed)", () => {
