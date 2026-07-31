@@ -23,7 +23,13 @@ from elspeth.web.composer.guided.planning import (
     verified_remaining_deferred_intents,
     verify_guided_proposal_projection,
 )
-from elspeth.web.composer.guided.protocol import GuidedStep, ProposePipelinePayload, proposal_structural_label
+from elspeth.web.composer.guided.protocol import (
+    GuidedStep,
+    ProposePipelinePayload,
+    TurnType,
+    proposal_structural_label,
+    validate_payload,
+)
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
 from elspeth.web.composer.guided.stage_subjects import EdgeRouteConstraint, OptionValueConstraint, PluginSubject, StableSubject
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
@@ -684,7 +690,12 @@ def _ab_coalesce_guided() -> GuidedSession:
     )
 
 
-def _ab_coalesce_proposal(guided: GuidedSession) -> PipelineProposal:
+def _ab_coalesce_proposal(
+    guided: GuidedSession,
+    *,
+    policy: str = "require_all",
+    timeout_seconds: float | None = None,
+) -> PipelineProposal:
     """A runnable fork -> llm x2 -> coalesce -> field_mapper A/B (session 30acb16e shape)."""
     return PipelineProposal.create(
         pipeline={
@@ -736,8 +747,9 @@ def _ab_coalesce_proposal(guided: GuidedSession) -> PipelineProposal:
                     "on_error": None,
                     "options": {},
                     "branches": {"a_rows": "a_out", "b_rows": "b_out"},
-                    "policy": "require_all",
+                    "policy": policy,
                     "merge": "union",
+                    "timeout_seconds": timeout_seconds,
                 },
                 {
                     "id": "cleanup",
@@ -808,6 +820,60 @@ def test_fork_coalesce_ab_projection_routes_every_branch_output_into_the_coalesc
     # The coalesce republishes its merged rows to the downstream field_mapper.
     coalesce_outgoing = [edge for edge in payload["graph"]["edges"] if edge["from_endpoint"].get("stable_id") == coalesce_id]
     assert [edge["flow"]["kind"] for edge in coalesce_outgoing] == ["coalesce_success"]
+
+
+@pytest.mark.parametrize(
+    ("policy", "timeout_seconds"),
+    [
+        ("best_effort", 12.5),
+        ("quorum", 30.0),
+        ("require_all", None),
+    ],
+)
+def test_coalesce_deadline_is_preserved_and_audit_rejects_lossy_projection(
+    policy: str,
+    timeout_seconds: float | None,
+) -> None:
+    guided = _ab_coalesce_guided()
+    proposal = _ab_coalesce_proposal(
+        guided,
+        policy=policy,
+        timeout_seconds=timeout_seconds,
+    )
+    catalog = {
+        "source": frozenset({"csv"}),
+        "transform": frozenset({"llm", "field_mapper"}),
+        "sink": frozenset({"json"}),
+    }
+
+    payload = build_guided_proposal_projection(
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog,
+    )
+
+    coalesce = next(node for node in payload["nodes"] if node["node_type"] == "coalesce")
+    assert coalesce["behavior"]["timeout_seconds"] == timeout_seconds
+    verify_guided_proposal_projection(
+        payload=payload,
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog,
+    )
+
+    lossy = deep_thaw(payload)
+    projected_coalesce = next(node for node in lossy["nodes"] if node["node_type"] == "coalesce")
+    del projected_coalesce["behavior"]["timeout_seconds"]
+    with pytest.raises(AuditIntegrityError, match="projection"):
+        verify_guided_proposal_projection(
+            payload=lossy,
+            proposal_id=PROPOSAL_ID,
+            proposal=proposal,
+            guided=guided,
+            catalog_plugin_ids=catalog,
+        )
 
 
 def _ab_row_union_proposal(guided: GuidedSession) -> PipelineProposal:
@@ -973,6 +1039,211 @@ def test_fork_row_union_projection_preserves_declared_branch_order_when_producer
     assert row_union["behavior"]["branch_aliases"] == ["branch-1", "branch-2"]
     incoming = [edge for edge in payload["graph"]["edges"] if edge["to_endpoint"].get("stable_id") == row_union["stable_id"]]
     assert [edge["flow"]["branch"] for edge in incoming] == ["branch-1", "branch-2"]
+
+
+def _nested_fork_outer_row_union_proposal(
+    guided: GuidedSession,
+) -> PipelineProposal:
+    """Outer arm may contain its own fork/barrier before the outer row_union."""
+
+    return PipelineProposal.create(
+        pipeline={
+            "sources": {
+                "source": {
+                    "plugin": "csv",
+                    "on_success": "rows",
+                    "options": {
+                        "path": "blob:00000000-0000-0000-0000-000000000001",
+                        "schema": {"mode": "observed"},
+                    },
+                    "on_validation_failure": "discard",
+                }
+            },
+            "nodes": [
+                {
+                    "id": "outer_gate",
+                    "node_type": "gate",
+                    "plugin": None,
+                    "input": "rows",
+                    "on_success": None,
+                    "on_error": None,
+                    "options": {},
+                    "condition": "True",
+                    "routes": {"true": "fork", "false": "fork"},
+                    "fork_to": ["outer_a", "outer_b"],
+                },
+                {
+                    "id": "nested_gate",
+                    "node_type": "gate",
+                    "plugin": None,
+                    "input": "outer_a",
+                    "on_success": None,
+                    "on_error": None,
+                    "options": {},
+                    "condition": "True",
+                    "routes": {"true": "fork", "false": "fork"},
+                    "fork_to": ["inner_a", "inner_b"],
+                },
+                {
+                    "id": "inner_a_step",
+                    "node_type": "transform",
+                    "plugin": "value_transform",
+                    "input": "inner_a",
+                    "on_success": "inner_a_done",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}, "operations": []},
+                },
+                {
+                    "id": "inner_b_step",
+                    "node_type": "transform",
+                    "plugin": "value_transform",
+                    "input": "inner_b",
+                    "on_success": "inner_b_done",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}, "operations": []},
+                },
+                {
+                    "id": "inner_join",
+                    "node_type": "coalesce",
+                    "plugin": None,
+                    "input": "inner_a_done",
+                    "on_success": None,
+                    "on_error": None,
+                    "options": {},
+                    "branches": {
+                        "inner_a": "inner_a_done",
+                        "inner_b": "inner_b_done",
+                    },
+                    "policy": "require_all",
+                    "merge": "union",
+                    "timeout_seconds": None,
+                },
+                {
+                    "id": "outer_a_step",
+                    "node_type": "transform",
+                    "plugin": "value_transform",
+                    "input": "inner_join",
+                    "on_success": "outer_a_done",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}, "operations": []},
+                },
+                {
+                    "id": "outer_b_step",
+                    "node_type": "transform",
+                    "plugin": "value_transform",
+                    "input": "outer_b",
+                    "on_success": "outer_b_done",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}, "operations": []},
+                },
+                {
+                    "id": "outer_union",
+                    "node_type": "row_union",
+                    "plugin": None,
+                    "input": "outer_a_done",
+                    "on_success": "union_rows",
+                    "on_error": None,
+                    "options": {},
+                    "branches": {
+                        "outer_a": "outer_a_done",
+                        "outer_b": "outer_b_done",
+                    },
+                    "policy": None,
+                    "merge": None,
+                    "timeout_seconds": None,
+                },
+                {
+                    "id": "after_union",
+                    "node_type": "transform",
+                    "plugin": "value_transform",
+                    "input": "union_rows",
+                    "on_success": "colour_ab_out",
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}, "operations": []},
+                },
+            ],
+            "edges": [],
+            "outputs": [
+                {
+                    "name": "colour_ab_out",
+                    "plugin": "json",
+                    "options": {
+                        "path": "out.json",
+                        "schema": {"mode": "observed"},
+                    },
+                    "on_write_failure": "discard",
+                }
+            ],
+        },
+        base=PresentBase(
+            state_id=CHECKPOINT_ID,
+            composition_content_hash="a" * 64,
+        ),
+        reviewed_facts=guided_private_reviewed_facts(guided),
+        surface=PlannerSurface.GUIDED_STAGED,
+        repair_count=0,
+        skill_hash=stable_hash("guided planner skill"),
+        covered_deferred_intent_ids=(),
+        supersedes_draft_hash=None,
+    )
+
+
+def test_projection_accepts_nested_descendant_fork_inside_outer_row_union_arm() -> None:
+    guided = _ab_coalesce_guided()
+    proposal = _nested_fork_outer_row_union_proposal(guided)
+    catalog = {
+        "source": frozenset({"csv"}),
+        "transform": frozenset({"value_transform"}),
+        "sink": frozenset({"json"}),
+    }
+    assert not guided_candidate_state(proposal).validate().errors
+
+    payload = build_guided_proposal_projection(
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog,
+    )
+
+    verify_guided_proposal_projection(
+        payload=payload,
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog,
+    )
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+
+
+def test_nested_fork_projection_rejects_outer_sibling_branch_contamination() -> None:
+    guided = _ab_coalesce_guided()
+    proposal = _nested_fork_outer_row_union_proposal(guided)
+    catalog = {
+        "source": frozenset({"csv"}),
+        "transform": frozenset({"value_transform"}),
+        "sink": frozenset({"json"}),
+    }
+    payload = build_guided_proposal_projection(
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog,
+    )
+    outer_union = next(node for node in payload["nodes"] if node["node_type"] == "row_union")
+    incoming = [edge for edge in payload["graph"]["edges"] if edge["to_endpoint"].get("stable_id") == outer_union["stable_id"]]
+    assert [edge["flow"]["branch"] for edge in incoming] == [
+        "branch-1",
+        "branch-2",
+    ]
+    incoming[0]["from_endpoint"], incoming[1]["from_endpoint"] = (
+        incoming[1]["from_endpoint"],
+        incoming[0]["from_endpoint"],
+    )
+
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, payload)
+
+    assert error is not None
+    assert "downstream" in error or "not connected" in error
 
 
 def _multi_stage_row_union_proposal(guided: GuidedSession) -> PipelineProposal:

@@ -116,12 +116,110 @@ describe("WireStageTurn", () => {
     expect(screen.getByText("not yet checked")).toBeInTheDocument();
     // Screen readers keep the status even though it left the visible prose:
     // the row's accessible name carries it (aria-label overrides li content).
+    const sourceRoute = screen.getByRole(
+      "listitem",
+      { name: "source-1 to node-1 (Output) — Source success — connected" },
+    );
+    expect(sourceRoute).toHaveAttribute("data-edge-id", EDGE_ID);
     expect(
-      screen.getByRole("listitem", { name: "source-1 to node-1 (Output) — connected" }),
+      screen.getByRole(
+        "listitem",
+        { name: "node-1 (Output) to output-1 — Node success — not yet checked" },
+      ),
     ).toBeInTheDocument();
-    expect(
-      screen.getByRole("listitem", { name: "node-1 (Output) to output-1 — not yet checked" }),
-    ).toBeInTheDocument();
+  });
+
+  it("keeps parallel gate forks uniquely identifiable by stable id and branch flow", () => {
+    const gateId = "00000000-0000-4000-8000-000000000024";
+    const rowUnionId = "00000000-0000-4000-8000-000000000025";
+    const controlEdgeId = "00000000-0000-4000-8000-000000000050";
+    const treatmentEdgeId = "00000000-0000-4000-8000-000000000051";
+    const nodes: WireStageData["nodes"] = [
+      {
+        stable_id: gateId,
+        label: "triage",
+        node_type: "gate",
+        plugin: null,
+        behavior: {
+          kind: "gate",
+          condition: "row['variant']",
+          route_aliases: ["route-1", "route-2"],
+          routes: [
+            { alias: "route-1", key: "control" },
+            { alias: "route-2", key: "treatment" },
+          ],
+          fork_branches: [
+            { routes: ["route-1"], branch: "branch-1" },
+            { routes: ["route-2"], branch: "branch-2" },
+          ],
+        },
+        required_fields: ["variant"],
+        guaranteed_fields: [],
+        row_cardinality: { input: "one", output: "one", expected_output_count: null },
+        structured_output_fields: [],
+      },
+      {
+        stable_id: rowUnionId,
+        label: "variant union",
+        node_type: "row_union",
+        plugin: null,
+        behavior: {
+          kind: "row_union",
+          branch_aliases: ["branch-1", "branch-2"],
+          policy: "require_all",
+          timeout_seconds: null,
+        },
+        required_fields: [],
+        guaranteed_fields: ["variant"],
+        row_cardinality: {
+          input: "branches",
+          output: "one_per_branch",
+          expected_output_count: null,
+        },
+        structured_output_fields: [],
+      },
+    ];
+    const connections: WireStageData["connections"] = [
+      {
+        stable_id: controlEdgeId,
+        from_endpoint: { kind: "node", stable_id: gateId },
+        to_endpoint: { kind: "node", stable_id: rowUnionId },
+        flow: { kind: "gate_fork", routes: ["route-1"], branch: "branch-1" },
+        schema_contract: null,
+      },
+      {
+        stable_id: treatmentEdgeId,
+        from_endpoint: { kind: "node", stable_id: gateId },
+        to_endpoint: { kind: "node", stable_id: rowUnionId },
+        flow: { kind: "gate_fork", routes: ["route-2"], branch: "branch-2" },
+        schema_contract: null,
+      },
+    ];
+
+    render(
+      <WireStageTurn
+        data={canonicalData({ nodes, connections })}
+        onConfirm={vi.fn()}
+        confirmDisabled={false}
+      />,
+    );
+
+    const rows = Array.from(
+      screen.getByRole("list", { name: "Wiring routes" }).querySelectorAll(":scope > li"),
+    );
+    const identities = rows.map((row) => row.getAttribute("data-edge-id"));
+    expect({
+      identities,
+      uniqueIdentityCount: new Set(identities).size,
+      accessibleNames: rows.map((row) => row.getAttribute("aria-label")),
+    }).toEqual({
+      identities: [controlEdgeId, treatmentEdgeId],
+      uniqueIdentityCount: 2,
+      accessibleNames: [
+        "triage (Gate) to variant union (Row Union) — Gate fork route-1 (when control) as branch-1 — not yet checked",
+        "triage (Gate) to variant union (Row Union) — Gate fork route-2 (when treatment) as branch-2 — not yet checked",
+      ],
+    });
   });
 
   it("labels the correction controls and styles them as the app's form idiom", () => {
@@ -213,6 +311,7 @@ describe("WireStageTurn", () => {
           branch_aliases: ["branch-1", "branch-2"],
           policy: "require_all",
           merge: "union",
+          timeout_seconds: 7.25,
         },
         required_fields: [],
         guaranteed_fields: ["count"],
@@ -255,6 +354,7 @@ describe("WireStageTurn", () => {
     expect(screen.getByText("Branches: branch-1, branch-2")).toBeInTheDocument();
     expect(screen.getByText("Policy: require all")).toBeInTheDocument();
     expect(screen.getByText("Merge: union")).toBeInTheDocument();
+    expect(screen.getByText("Timeout: 7.25 seconds")).toBeInTheDocument();
     expect(screen.getByText("Schema mode: fixed")).toBeInTheDocument();
     expect(screen.getByText("id: int — required, non-null")).toBeInTheDocument();
     expect(screen.getByText("email: str — optional, nullable")).toBeInTheDocument();

@@ -250,6 +250,7 @@ class _CoalesceBehavior(TypedDict):
     branch_aliases: Sequence[str]
     policy: Literal["require_all", "quorum", "best_effort", "first"]
     merge: Literal["union", "nested", "select"]
+    timeout_seconds: float | None
 
 
 class _RowUnionBehavior(TypedDict):
@@ -1504,7 +1505,7 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
         ):
             return error
         return None
-    expected = frozenset({"kind", "branch_aliases", "policy", "merge"})
+    expected = frozenset({"kind", "branch_aliases", "policy", "merge", "timeout_seconds"})
     if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
         return error
     _, error = _validate_alias_sequence(behavior["branch_aliases"], kind="branch", path=f"{behavior_path}.branch_aliases", minimum=2)
@@ -1514,6 +1515,18 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
         return f"{behavior_path}.policy is outside the closed vocabulary"
     if behavior["merge"] not in _COALESCE_MERGES:
         return f"{behavior_path}.merge is outside the closed vocabulary"
+    timeout_seconds = behavior["timeout_seconds"]
+    if (
+        timeout_seconds is not None
+        and (
+            error := _finite_positive_number_error(
+                timeout_seconds,
+                f"{behavior_path}.timeout_seconds",
+            )
+        )
+        is not None
+    ):
+        return error
     return None
 
 
@@ -1751,19 +1764,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     gate_forks: dict[str, list[tuple[tuple[str, ...], str]]] = {}
     branch_origins: dict[str, list[str]] = {}
     branch_origin_gates: dict[str, list[str]] = {}
-    branch_adjacency: dict[str, dict[str, set[str]]] = {}
     branch_uses: list[tuple[str, str, str, str]] = []
-    # Only two edges in a fork arm ever carry a branch alias: the authoritative
-    # ``gate_fork`` edge that opens the arm, and the final edge into the
-    # correlated barrier (planning.py stamps that one per barrier-bound
-    # destination). Every processing hop in between is untagged, so a branch's
-    # provenance walk must traverse untagged routing as well — otherwise any arm
-    # with more than one node is falsely rejected as "not downstream of its
-    # authoritative gate_fork origin". This mirrors the composer's own
-    # ``_runtime_connection_is_downstream`` (state.py), which decides the same
-    # question by expanding generic on_success / on_error / routes / fork_to
-    # routing rather than branch-tagged routing.
-    unbranched_adjacency: dict[str, set[str]] = {}
 
     for index, edge in enumerate(edges):
         path = f"payload.graph.edges[{index}]"
@@ -1837,31 +1838,67 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             branch_origins.setdefault(flow["branch"], []).append(to_stable_id)
             branch_origin_gates.setdefault(flow["branch"], []).append(from_stable_id)
         if branch is not None:
-            branch_graph = branch_adjacency.setdefault(branch, {})
-            branch_graph.setdefault(from_stable_id, set()).add(to_stable_id)
-            branch_graph.setdefault(to_stable_id, set())
             branch_uses.append((branch, from_stable_id, flow_kind, path))
-        else:
-            unbranched_adjacency.setdefault(from_stable_id, set()).add(to_stable_id)
 
     def branch_downstream_ids(branch: str) -> set[str]:
         """Components reachable from ``branch``'s authoritative gate_fork origin.
 
-        Walks the branch's own tagged edges plus every untagged routing edge, so
-        an arm of any length resolves. Another branch's tagged edges are never
-        traversed, so a producer wired in from a sibling arm stays unreachable.
+        The origin is already the branch-specific target of its gate_fork edge.
+        From there, follow all directed routing, including descendant forks.
+        Outer siblings remain excluded because their gate_fork edges leave the
+        shared parent gate and are not reachable backwards from this origin.
         """
 
-        branch_graph = branch_adjacency.get(branch, {})
         frontier = list(branch_origins.get(branch, ()))
         visited = set(frontier)
         while frontier:
             current = frontier.pop()
-            routed = branch_graph.get(current, frozenset()) | unbranched_adjacency.get(current, frozenset())
+            routed: set[str] = adjacency.get(current, set())
             for target_id in routed - visited:
                 visited.add(target_id)
                 frontier.append(target_id)
         return visited
+
+    def branch_producer_is_compatible(
+        branch: str,
+        producer_id: str,
+        *,
+        visiting: frozenset[str] = frozenset(),
+    ) -> bool:
+        """Return whether one projected producer is exclusively branch-derived.
+
+        Ordinary nodes have one authoritative input, so one compatible
+        predecessor proves lineage. Queues and correlated barriers are fan-in
+        boundaries: every predecessor must derive from the branch, recursively.
+        This mirrors state._runtime_connection_is_downstream() and prevents one
+        valid queue path from hiding unrelated traffic.
+        """
+
+        if producer_id in visiting:
+            return False
+        node = node_by_id.get(producer_id)
+        if node is None:
+            return False
+        predecessors = incoming_edges.get(producer_id, ())
+        if not predecessors:
+            return False
+        next_visiting = visiting | {producer_id}
+        origin_gates = branch_origin_gates.get(branch, ())
+        origins = branch_origins.get(branch, ())
+
+        def predecessor_is_compatible(predecessor_id: str, flow: Mapping[str, Any]) -> bool:
+            if flow["kind"] == "gate_fork" and flow["branch"] == branch and predecessor_id in origin_gates and producer_id in origins:
+                return True
+            return branch_producer_is_compatible(
+                branch,
+                predecessor_id,
+                visiting=next_visiting,
+            )
+
+        compatibility = (predecessor_is_compatible(predecessor_id, flow) for predecessor_id, flow in predecessors)
+        if node["node_type"] in ("queue", "coalesce", "row_union"):
+            return all(compatibility)
+        return any(compatibility)
 
     for node in nodes:
         behavior = node["behavior"]
@@ -1971,7 +2008,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             return f"{path}.flow branch alias has no unique authoritative gate_fork origin"
         if flow_kind == "gate_fork":
             continue
-        if from_stable_id not in branch_downstream_ids(branch):
+        if not branch_producer_is_compatible(branch, from_stable_id):
             return f"{path}.flow branch alias is not downstream of its authoritative gate_fork origin"
 
     for node in nodes:

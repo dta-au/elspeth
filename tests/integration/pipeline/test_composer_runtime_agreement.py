@@ -4513,7 +4513,20 @@ class TestComposerRuntimeRowUnionAgreement:
         state = composition_state_from_runtime_yaml(self._example_yaml())
         regenerated_doc = yaml.safe_load(composer_yaml_generator.generate_yaml(state))
         regenerated_doc["aggregations"][0]["trigger"] = {"count": 2}
-        settings = load_settings_from_yaml_string(yaml.safe_dump(regenerated_doc, sort_keys=False))
+        invalid_yaml = yaml.safe_dump(regenerated_doc, sort_keys=False)
+
+        composer_state = composition_state_from_runtime_yaml(invalid_yaml)
+        composer_result = composer_state.validate()
+        composer_error = next(
+            error
+            for error in composer_result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_downstream_group_invalid"
+            and "indivisible" in error.message
+        )
+        assert "count/timeout/condition trigger" in composer_error.message
+
+        settings = load_settings_from_yaml_string(invalid_yaml)
 
         with pytest.raises(GraphValidationError) as exc_info:
             self._build_runtime_graph_for_settings(settings)

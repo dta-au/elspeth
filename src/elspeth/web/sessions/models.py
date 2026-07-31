@@ -181,7 +181,12 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        rejects the row outright; SQLite cannot ALTER a CHECK in place, so
 #        pre-release policy remains delete-and-recreate for stale session
 #        databases (sessions.db only — auth.db is never touched).
-SESSION_SCHEMA_EPOCH = 39
+#   40 -> guided propose-pipeline payloads require an explicit coalesce
+#        ``timeout_seconds`` key, including ``None``. Epoch 39 sessions may
+#        reference persisted schema-10 payloads that omit it, so they are
+#        rejected at startup instead of failing lazily during guided replay.
+#        This is a semantic-only hard cut; guided checkpoint schema stays 10.
+SESSION_SCHEMA_EPOCH = 40
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"

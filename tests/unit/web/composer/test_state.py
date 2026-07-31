@@ -6800,6 +6800,189 @@ class TestCompositionStateRowUnion:
         # mutation preflight blocks on.
         assert "row_union_branch_invalid" not in {error.error_code for error in result.errors}
 
+    def test_row_union_rejects_queue_branch_with_unrelated_producer(self) -> None:
+        queue = NodeSpec(
+            id="control_done",
+            node_type="queue",
+            plugin=None,
+            input="control_done",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = self._state(extra_nodes=(queue,))
+        state = replace(
+            state,
+            sources={
+                "primary": self._source(),
+                "contaminant": self._source(on_success="control_done"),
+            },
+        )
+
+        result = state.validate()
+
+        lineage_error = next(error for error in result.errors if error.error_code == "row_union_branch_not_downstream")
+        assert "control_branch" in lineage_error.message
+        assert "control_done" in lineage_error.message
+
+    @pytest.mark.parametrize(
+        ("control_fields", "treatment_fields", "is_compatible"),
+        [
+            (["id: str", "score: float"], ["id: str", "score: float"], True),
+            (["id: str", "score: float"], ["id: str", "label: str"], False),
+        ],
+    )
+    def test_row_union_requires_compatible_known_fixed_branch_schemas(
+        self,
+        control_fields: list[str],
+        treatment_fields: list[str],
+        is_compatible: bool,
+    ) -> None:
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={"schema": {"mode": "fixed", "fields": control_fields}},
+            )
+            if node.id == "control"
+            else replace(
+                node,
+                options={"schema": {"mode": "fixed", "fields": treatment_fields}},
+            )
+            if node.id == "treatment"
+            else node
+            for node in state.nodes
+        )
+
+        result = replace(state, nodes=nodes).validate()
+        schema_errors = [
+            error
+            for error in result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_schema_incompatible"
+            and "incompatible" in error.message
+        ]
+
+        assert bool(schema_errors) is not is_compatible, result.errors
+        if not is_compatible:
+            detail = schema_errors[0].row_union_schema
+            assert detail is not None
+            assert detail.conflicting_fields == ("label", "score")
+            assert tuple(branch.branch for branch in detail.branches) == (
+                "control_branch",
+                "treatment_branch",
+            )
+
+    def test_row_union_observed_branch_abstains_against_fixed_branch(self) -> None:
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={"schema": {"mode": "fixed", "fields": ["id: str", "score: float"]}},
+            )
+            if node.id == "treatment"
+            else node
+            for node in state.nodes
+        )
+
+        result = replace(state, nodes=nodes).validate()
+
+        assert not any(
+            error.component == "node:variant_union"
+            and error.error_code == "row_union_schema_incompatible"
+            and "incompatible" in error.message
+            for error in result.errors
+        ), result.errors
+
+    def test_row_union_accepts_disjoint_flexible_branch_declarations(self) -> None:
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["score: float"] if node.id == "control" else ["label: str"],
+                    }
+                },
+            )
+            if node.id in {"control", "treatment"}
+            else node
+            for node in state.nodes
+        )
+
+        result = replace(state, nodes=nodes).validate()
+
+        assert not any(error.error_code == "row_union_schema_incompatible" for error in result.errors), result.errors
+
+    def test_row_union_flexible_shared_type_conflict_carries_repair_facts(self) -> None:
+        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
+        from elspeth.web.composer.tools import ToolResult
+
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["id: str"] if node.id == "control" else ["id: int"],
+                    }
+                },
+            )
+            if node.id in {"control", "treatment"}
+            else node
+            for node in state.nodes
+        )
+        candidate = replace(state, nodes=nodes)
+
+        result = candidate.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "row_union_schema_incompatible")
+        detail = entry.row_union_schema
+        assert detail is not None
+        assert detail.conflicting_fields == ("id",)
+        assert [
+            {
+                "branch": branch.branch,
+                "mode": branch.mode,
+                "fields": tuple((field.name, field.field_type) for field in branch.fields),
+            }
+            for branch in detail.branches
+        ] == [
+            {
+                "branch": "control_branch",
+                "mode": "flexible",
+                "fields": (("id", "str"),),
+            },
+            {
+                "branch": "treatment_branch",
+                "mode": "flexible",
+                "fields": (("id", "int"),),
+            },
+        ]
+
+        tool_result = ToolResult(
+            success=False,
+            updated_state=candidate,
+            validation=result,
+            affected_nodes=(),
+        )
+        projected = next(
+            error
+            for error in _allowlisted_candidate_feedback(tool_result)["validation"]["errors"]
+            if error["error_code"] == "row_union_schema_incompatible"
+        )
+        assert "message" not in projected
+        assert projected["row_union_schema"] == detail.to_dict()
+        assert projected["suggested_fix"]
+
     def _coalesce(self, **overrides: Any) -> NodeSpec:
         defaults: dict[str, Any] = {
             "id": "dup_merge",
@@ -6901,6 +7084,131 @@ class TestCompositionStateRowUnion:
 
         assert result.is_valid, result.errors
         assert not any(error.error_code == "duplicate_connection_consumer" for error in result.errors)
+
+    def test_identity_row_union_branch_does_not_consume_same_named_queue(self) -> None:
+        queue = NodeSpec(
+            id="control_branch",
+            node_type="queue",
+            plugin=None,
+            input="control_branch",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        row_union = self._row_union(
+            input="control_branch",
+            branches={
+                "control_branch": "control_branch",
+                "treatment_branch": "treatment_branch",
+            },
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._gate(),
+                queue,
+                row_union,
+                self._transform("after_union", "union_out", "output"),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert any(error.error_code == "queue_no_consumer" and error.component == "node:control_branch" for error in result.errors)
+
+    def test_row_union_rejects_downstream_aggregation_with_early_trigger(self) -> None:
+        aggregation = NodeSpec(
+            id="after_union",
+            node_type="aggregation",
+            plugin="batch_stats",
+            input="union_out",
+            on_success="output",
+            on_error="discard",
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+            trigger={"count": 2},
+            output_mode="transform",
+        )
+        state = self._state()
+        state = replace(
+            state,
+            nodes=tuple(aggregation if node.id == "after_union" else node for node in state.nodes),
+        )
+
+        result = state.validate()
+
+        group_error = next(
+            error
+            for error in result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_downstream_group_invalid"
+            and "indivisible" in error.message
+        )
+        assert "count/timeout/condition trigger" in group_error.message
+
+    @pytest.mark.parametrize("barrier_type", ["coalesce", "row_union"])
+    def test_row_union_rejects_downstream_correlated_barrier(self, barrier_type: str) -> None:
+        post_union_gate = self._gate(
+            id="post_union_fork",
+            input="union_out",
+            fork_to=("downstream_a", "downstream_b"),
+        )
+        if barrier_type == "coalesce":
+            downstream_barrier = self._coalesce(
+                id="downstream_barrier",
+                input="downstream_a",
+                branches=("downstream_a", "downstream_b"),
+            )
+            tail: tuple[NodeSpec, ...] = ()
+        else:
+            downstream_barrier = self._row_union(
+                id="downstream_barrier",
+                input="downstream_a",
+                branches={
+                    "downstream_a": "downstream_a",
+                    "downstream_b": "downstream_b",
+                },
+                on_success="downstream_out",
+            )
+            tail = (self._transform("after_downstream", "downstream_out", "output"),)
+
+        state = self._state()
+        state = replace(
+            state,
+            nodes=(
+                *(node for node in state.nodes if node.id != "after_union"),
+                post_union_gate,
+                downstream_barrier,
+                *tail,
+            ),
+        )
+
+        result = state.validate()
+
+        group_error = next(
+            error
+            for error in result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_downstream_group_invalid"
+            and "correlated barrier" in error.message
+        )
+        assert barrier_type in group_error.message
+        assert "downstream_barrier" in group_error.message
 
     @pytest.mark.parametrize("branches", [None, (), ("only_branch",), {"only_branch": "control_done"}])
     def test_row_union_requires_at_least_two_branches(self, branches: object) -> None:

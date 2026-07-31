@@ -318,6 +318,8 @@ class TestClosedCodeCatalogueInvariants:
             "row_union_branch_unreachable",
             "row_union_branch_origin_invalid",
             "row_union_branch_not_downstream",
+            "row_union_downstream_group_invalid",
+            "row_union_schema_incompatible",
             "row_union_on_success_must_be_connection",
             "row_union_on_success_dangling",
             "fork_branch_multiple_barriers",
@@ -349,6 +351,19 @@ class TestClosedCodeCatalogueInvariants:
         assert downstream != intrinsic
         assert downstream != origin
         assert "downstream" in downstream[0] or "downstream" in downstream[1]
+
+        downstream_group = explain_validation_code("row_union_downstream_group_invalid")
+        assert downstream_group is not None
+        assert downstream_group not in (intrinsic, origin, downstream)
+        assert "indivisible" in downstream_group[0] or "indivisible" in downstream_group[1]
+        assert "end_of_source" in downstream_group[1]
+        assert "branches" not in downstream_group[1]
+
+        schema_incompatible = explain_validation_code("row_union_schema_incompatible")
+        assert schema_incompatible is not None
+        assert schema_incompatible not in (intrinsic, origin, downstream, downstream_group)
+        assert "long-format" in schema_incompatible[0]
+        assert "row_union_schema" in schema_incompatible[1]
 
         # The cross-node barrier-ownership code sits in the same cluster and
         # must not fall through to any row_union node-shape entry either.

@@ -179,6 +179,7 @@ function payload(): ProposePipelinePayload {
           branch_aliases: ["branch-1", "branch-2"],
           policy: "quorum",
           merge: "nested",
+          timeout_seconds: 12.5,
         },
       },
     ],
@@ -235,7 +236,11 @@ describe("ProposePipelineTurn", () => {
     ).toBeVisible();
     expect(screen.getByText(/queue continues in sequence/i)).toBeVisible();
     expect(screen.getByText(/count 50 or timeout 10s/i)).toBeVisible();
-    expect(screen.getByText(/joins branch-1, branch-2/i)).toBeVisible();
+    expect(
+      screen.getByText(
+        /joins branch-1, branch-2 using quorum \/ nested; timeout 12.5s/i,
+      ),
+    ).toBeVisible();
     // F11: edge labels resolve route ordinals to "when <key>" while keeping
     // the ordinal alias visible.
     expect(screen.getAllByText(/when true \(route-1\) forks to branch-1/i).length).toBeGreaterThan(0);

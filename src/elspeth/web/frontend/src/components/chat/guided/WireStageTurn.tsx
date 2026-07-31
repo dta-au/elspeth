@@ -212,6 +212,7 @@ function behaviorDetails(
         `Branches: ${behavior.branch_aliases.join(", ")}`,
         `Policy: ${humanToken(behavior.policy)}`,
         `Merge: ${humanToken(behavior.merge)}`,
+        ...(behavior.timeout_seconds === null ? [] : [`Timeout: ${behavior.timeout_seconds} seconds`]),
       ];
     case "row_union":
       return [
@@ -471,7 +472,7 @@ export function WireStageTurn({
             className="wire-stage__edges"
             ariaLabel="Wiring routes"
             items={edges.map((edge) => ({
-              id: `${edge.from}\u0000${edge.label}\u0000${edge.to}`,
+              id: edge.stable_id,
               from: nameFor(edge.from),
               to: nameFor(edge.to),
               summary: flowText(edge.flow, routeKeys),
@@ -480,7 +481,7 @@ export function WireStageTurn({
                 edge.missing_fields.length > 0
                   ? `Missing fields: ${edge.missing_fields.join(", ")}`
                   : null,
-              ariaLabel: `${nameFor(edge.from)} to ${nameFor(edge.to)} — ${edgeStatus(edge)}`,
+              ariaLabel: `${nameFor(edge.from)} to ${nameFor(edge.to)} — ${flowText(edge.flow, routeKeys)} — ${edgeStatus(edge)}`,
             }))}
           />
           <details className="wire-stage__raw">

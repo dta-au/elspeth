@@ -121,7 +121,9 @@ function nonRowUnionNodeWithRowUnionCardinality(
     transform: { kind: "transform" },
     gate: {
       kind: "gate",
+      condition: "row['accepted']",
       route_aliases: ["route-1"],
+      routes: [{ alias: "route-1", key: "true" }],
       fork_branches: [],
     },
     queue: { kind: "queue" },
@@ -130,6 +132,7 @@ function nonRowUnionNodeWithRowUnionCardinality(
       branch_aliases: ["branch-1", "branch-2"],
       policy: "require_all",
       merge: "nested",
+      timeout_seconds: null,
     },
   } as const;
   return {
@@ -287,7 +290,9 @@ function rowUnionProposalWireResponse(): Record<string, unknown> {
             plugin: null,
             behavior: {
               kind: "gate",
+              condition: "row['group']",
               route_aliases: ["route-1"],
+              routes: [{ alias: "route-1", key: "true" }],
               fork_branches: [
                 { routes: ["route-1"], branch: "branch-1" },
                 { routes: ["route-1"], branch: "branch-2" },
@@ -386,6 +391,226 @@ function routeRowUnionThroughQueue(
   });
   counts.nodes += 1;
   counts.edges += 1;
+}
+
+function contaminateRowUnionBranchQueue(
+  response: Record<string, unknown>,
+): void {
+  const payload = (response.next_turn as {
+    payload: Record<string, unknown>;
+  }).payload;
+  const nodes = payload.nodes as Array<Record<string, unknown>>;
+  const graph = payload.graph as {
+    sources: Array<Record<string, unknown>>;
+    edges: Array<Record<string, unknown>>;
+  };
+  const counts = payload.component_counts as Record<string, number>;
+  const unionId = nodes[3].stable_id;
+  const contaminantSourceId = "00000000-0000-4000-8000-000000000408";
+  const queueId = "00000000-0000-4000-8000-000000000409";
+
+  graph.sources.push({
+    stable_id: contaminantSourceId,
+    label: "source-2",
+    plugin: { kind: "source", id: "csv" },
+  });
+  nodes.splice(3, 0, {
+    stable_id: queueId,
+    label: "node-4",
+    node_type: "queue",
+    plugin: null,
+    behavior: { kind: "queue" },
+  });
+  nodes.forEach((node, index) => {
+    node.label = `node-${index + 1}`;
+  });
+
+  graph.edges[4].to_endpoint = {
+    kind: "node",
+    stable_id: queueId,
+  };
+  graph.edges[4].flow = {
+    kind: "node_success",
+    branch: null,
+  };
+  graph.edges.splice(5, 0, {
+    stable_id: "00000000-0000-4000-8000-000000000512",
+    from_endpoint: { kind: "node", stable_id: queueId },
+    to_endpoint: { kind: "node", stable_id: unionId },
+    flow: { kind: "queue_continue", branch: "branch-1" },
+  });
+  graph.edges.push(
+    {
+      stable_id: "00000000-0000-4000-8000-000000000513",
+      from_endpoint: { kind: "source", stable_id: contaminantSourceId },
+      to_endpoint: { kind: "node", stable_id: queueId },
+      flow: { kind: "source_success", branch: null },
+    },
+    {
+      stable_id: "00000000-0000-4000-8000-000000000514",
+      from_endpoint: { kind: "source", stable_id: contaminantSourceId },
+      to_endpoint: { kind: "discard" },
+      flow: { kind: "source_validation_failure" },
+    },
+  );
+  counts.sources += 1;
+  counts.nodes += 1;
+  counts.edges += 3;
+}
+
+function coalesceProposalWireResponse(
+  policy: "require_all" | "quorum" | "best_effort",
+  timeoutSeconds: number | null,
+): Record<string, unknown> {
+  const response = rowUnionProposalWireResponse();
+  const payload = (response.next_turn as {
+    payload: Record<string, unknown>;
+  }).payload;
+  const nodes = payload.nodes as Array<Record<string, unknown>>;
+  const edges = (payload.graph as {
+    edges: Array<Record<string, unknown>>;
+  }).edges;
+  nodes[3].node_type = "coalesce";
+  nodes[3].behavior = {
+    kind: "coalesce",
+    branch_aliases: ["branch-1", "branch-2"],
+    policy,
+    merge: "nested",
+    timeout_seconds: timeoutSeconds,
+  };
+  edges[8].flow = { kind: "coalesce_success", branch: null };
+  return response;
+}
+
+function nestedForkOuterRowUnionProposalWireResponse(): Record<string, unknown> {
+  const response = rowUnionProposalWireResponse();
+  const payload = (response.next_turn as {
+    payload: Record<string, unknown>;
+  }).payload;
+  const nodes = payload.nodes as Array<Record<string, unknown>>;
+  const graph = payload.graph as {
+    edges: Array<Record<string, unknown>>;
+  };
+  const counts = payload.component_counts as Record<string, number>;
+  const outerAProducerId = nodes[1].stable_id;
+  const nestedGateId = "00000000-0000-4000-8000-000000000420";
+  const innerAId = "00000000-0000-4000-8000-000000000421";
+  const innerBId = "00000000-0000-4000-8000-000000000422";
+  const innerCoalesceId = "00000000-0000-4000-8000-000000000423";
+
+  // The already branch-specific outer origin is the nested gate, not its
+  // descendant child branches. The existing outer branch-1 producer remains
+  // after the inner coalesce so its final edge into the outer row_union keeps
+  // the outer alias.
+  graph.edges[2].to_endpoint = {
+    kind: "node",
+    stable_id: nestedGateId,
+  };
+  nodes.push(
+    {
+      stable_id: nestedGateId,
+      label: "node-6",
+      node_type: "gate",
+      plugin: null,
+      behavior: {
+        kind: "gate",
+        condition: "row['nested']",
+        route_aliases: ["route-2"],
+        routes: [{ alias: "route-2", key: "true" }],
+        fork_branches: [
+          { routes: ["route-2"], branch: "branch-3" },
+          { routes: ["route-2"], branch: "branch-4" },
+        ],
+      },
+    },
+    {
+      stable_id: innerAId,
+      label: "node-7",
+      node_type: "transform",
+      plugin: { kind: "transform", id: "passthrough" },
+      behavior: { kind: "transform" },
+    },
+    {
+      stable_id: innerBId,
+      label: "node-8",
+      node_type: "transform",
+      plugin: { kind: "transform", id: "passthrough" },
+      behavior: { kind: "transform" },
+    },
+    {
+      stable_id: innerCoalesceId,
+      label: "node-9",
+      node_type: "coalesce",
+      plugin: null,
+      behavior: {
+        kind: "coalesce",
+        branch_aliases: ["branch-3", "branch-4"],
+        policy: "require_all",
+        merge: "union",
+        timeout_seconds: null,
+      },
+    },
+  );
+  const edgeIds = Array.from(
+    { length: 7 },
+    (_, index) =>
+      `00000000-0000-4000-8000-${String(520 + index).padStart(12, "0")}`,
+  );
+  graph.edges.push(
+    {
+      stable_id: edgeIds[0],
+      from_endpoint: { kind: "node", stable_id: nestedGateId },
+      to_endpoint: { kind: "node", stable_id: innerAId },
+      flow: {
+        kind: "gate_fork",
+        routes: ["route-2"],
+        branch: "branch-3",
+      },
+    },
+    {
+      stable_id: edgeIds[1],
+      from_endpoint: { kind: "node", stable_id: nestedGateId },
+      to_endpoint: { kind: "node", stable_id: innerBId },
+      flow: {
+        kind: "gate_fork",
+        routes: ["route-2"],
+        branch: "branch-4",
+      },
+    },
+    {
+      stable_id: edgeIds[2],
+      from_endpoint: { kind: "node", stable_id: innerAId },
+      to_endpoint: { kind: "node", stable_id: innerCoalesceId },
+      flow: { kind: "node_success", branch: "branch-3" },
+    },
+    {
+      stable_id: edgeIds[3],
+      from_endpoint: { kind: "node", stable_id: innerBId },
+      to_endpoint: { kind: "node", stable_id: innerCoalesceId },
+      flow: { kind: "node_success", branch: "branch-4" },
+    },
+    {
+      stable_id: edgeIds[4],
+      from_endpoint: { kind: "node", stable_id: innerAId },
+      to_endpoint: { kind: "discard" },
+      flow: { kind: "node_error" },
+    },
+    {
+      stable_id: edgeIds[5],
+      from_endpoint: { kind: "node", stable_id: innerBId },
+      to_endpoint: { kind: "discard" },
+      flow: { kind: "node_error" },
+    },
+    {
+      stable_id: edgeIds[6],
+      from_endpoint: { kind: "node", stable_id: innerCoalesceId },
+      to_endpoint: { kind: "node", stable_id: outerAProducerId },
+      flow: { kind: "coalesce_success", branch: null },
+    },
+  );
+  counts.nodes += 4;
+  counts.edges += 7;
+  return response;
 }
 
 describe("guided schema-10 wire decoder", () => {
@@ -512,6 +737,98 @@ describe("guided schema-10 wire decoder", () => {
     });
   });
 
+  it.each([
+    ["best_effort", 12.5],
+    ["quorum", 30],
+    ["require_all", null],
+  ] as const)(
+    "decodes %s coalesce with its material timeout",
+    (policy, timeoutSeconds) => {
+      const decoded = decodeGetGuidedResponse(
+        coalesceProposalWireResponse(policy, timeoutSeconds),
+      );
+
+      expect(decoded.next_turn?.type).toBe("propose_pipeline");
+      if (decoded.next_turn?.type !== "propose_pipeline") {
+        throw new Error("coalesce fixture did not decode as a proposal");
+      }
+      expect(decoded.next_turn.payload.nodes[3]).toMatchObject({
+        node_type: "coalesce",
+        behavior: {
+          kind: "coalesce",
+          branch_aliases: ["branch-1", "branch-2"],
+          policy,
+          merge: "nested",
+          timeout_seconds: timeoutSeconds,
+        },
+      });
+    },
+  );
+
+  it("rejects a lossy coalesce behavior without the required timeout key", () => {
+    const response = coalesceProposalWireResponse("require_all", null);
+    const payload = (response.next_turn as {
+      payload: Record<string, unknown>;
+    }).payload;
+    const nodes = payload.nodes as Array<Record<string, unknown>>;
+    delete (nodes[3].behavior as Record<string, unknown>).timeout_seconds;
+
+    expect(() => decodeGetGuidedResponse(response)).toThrow("timeout_seconds");
+  });
+
+  it.each([true, 0, Number.POSITIVE_INFINITY])(
+    "rejects invalid coalesce timeout %s",
+    (timeoutSeconds) => {
+      expect(() => decodeGetGuidedResponse(
+        coalesceProposalWireResponse("quorum", timeoutSeconds as number),
+      )).toThrow("timeout_seconds");
+    },
+  );
+
+  it("accepts a nested descendant fork inside one outer row_union arm", () => {
+    const decoded = decodeGetGuidedResponse(
+      nestedForkOuterRowUnionProposalWireResponse(),
+    );
+
+    expect(decoded.next_turn?.type).toBe("propose_pipeline");
+    if (decoded.next_turn?.type !== "propose_pipeline") {
+      throw new Error("nested fork fixture did not decode as a proposal");
+    }
+    expect(
+      decoded.next_turn.payload.nodes.filter(
+        (node) => node.node_type === "gate",
+      ),
+    ).toHaveLength(2);
+    expect(
+      decoded.next_turn.payload.nodes.some(
+        (node) => node.node_type === "coalesce",
+      ),
+    ).toBe(true);
+  });
+
+  it("rejects outer row_union branch aliases sourced from a sibling arm", () => {
+    const response = nestedForkOuterRowUnionProposalWireResponse();
+    const payload = (response.next_turn as {
+      payload: Record<string, unknown>;
+    }).payload;
+    const nodes = payload.nodes as Array<Record<string, unknown>>;
+    const outerUnionId = nodes[3].stable_id;
+    const edges = (payload.graph as {
+      edges: Array<Record<string, unknown>>;
+    }).edges;
+    const incoming = edges.filter((edge) =>
+      (edge.to_endpoint as Record<string, unknown>).stable_id === outerUnionId
+    );
+    [incoming[0].from_endpoint, incoming[1].from_endpoint] = [
+      incoming[1].from_endpoint,
+      incoming[0].from_endpoint,
+    ];
+
+    expect(() => decodeGetGuidedResponse(response)).toThrow(
+      /downstream|not connected/i,
+    );
+  });
+
   it("decodes row_union_success targeting a queue before an ordinary processing node", () => {
     const response = rowUnionProposalWireResponse();
     routeRowUnionThroughQueue(response);
@@ -529,6 +846,13 @@ describe("guided schema-10 wire decoder", () => {
     expect(decoded.next_turn.payload.graph.edges.slice(8, 10).map(
       (edge) => edge.flow.kind,
     )).toEqual(["row_union_success", "queue_continue"]);
+  });
+
+  it("rejects a row_union queue branch with an unrelated source predecessor", () => {
+    const response = rowUnionProposalWireResponse();
+    contaminateRowUnionBranchQueue(response);
+
+    expect(() => decodeGetGuidedResponse(response)).toThrow(/downstream/i);
   });
 
   it.each([
@@ -593,6 +917,7 @@ describe("guided schema-10 wire decoder", () => {
             branch_aliases: ["branch-1", "branch-2"],
             policy: "require_all",
             merge: "nested",
+            timeout_seconds: null,
           }
         : {
             kind: "row_union",
@@ -633,7 +958,9 @@ describe("guided schema-10 wire decoder", () => {
       plugin: null,
       behavior: {
         kind: "gate",
+        condition: "row['variant']",
         route_aliases: ["route-2"],
+        routes: [{ alias: "route-2", key: "treatment" }],
         fork_branches: [
           { routes: ["route-2"], branch: "branch-2" },
         ],

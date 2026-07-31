@@ -2888,6 +2888,36 @@ class _SchemaContractDetailShadowModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class _RowUnionFieldSchemaDetailShadowModel(BaseModel):
+    """One declared field in a row-union schema repair fact."""
+
+    name: str
+    field_type: str
+    required: bool
+    nullable: bool
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _RowUnionBranchSchemaDetailShadowModel(BaseModel):
+    """One branch declaration in a row-union schema repair fact."""
+
+    branch: str
+    mode: Literal["fixed", "flexible"]
+    fields: list[_RowUnionFieldSchemaDetailShadowModel]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _RowUnionSchemaDetailShadowModel(BaseModel):
+    """Typed redaction shadow for safe row-union branch-schema facts."""
+
+    branches: list[_RowUnionBranchSchemaDetailShadowModel]
+    conflicting_fields: list[str]
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class _ValidationEntryShadowModel(BaseModel):
     """Redaction shadow for ``ValidationEntry.to_dict()`` (state.py).
 
@@ -2896,8 +2926,10 @@ class _ValidationEntryShadowModel(BaseModel):
     ``Severity`` literal alias to its string value); ``error_code`` is the
     closed machine-readable discriminant, emitted only when set, and
     ``contract`` the structured schema-contract facts, emitted only for the
-    schema-contract family. The response scalar projection preserves the
-    closed severity value and summarizes all free-form diagnostic text.
+    schema-contract family, and ``row_union_schema`` the branch declarations
+    emitted only for row-union incompatibility. The response scalar projection
+    preserves the closed severity value and summarizes all free-form
+    diagnostic text.
     """
 
     component: str
@@ -2905,6 +2937,7 @@ class _ValidationEntryShadowModel(BaseModel):
     severity: str
     error_code: str | None = None
     contract: _SchemaContractDetailShadowModel | None = None
+    row_union_schema: _RowUnionSchemaDetailShadowModel | None = None
 
     model_config = ConfigDict(extra="forbid")
 

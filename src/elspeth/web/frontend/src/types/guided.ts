@@ -597,6 +597,7 @@ export type ProposalNodeBehavior =
       branch_aliases: string[];
       policy: "require_all" | "quorum" | "best_effort" | "first";
       merge: "union" | "nested" | "select";
+      timeout_seconds: number | null;
     }
   | {
       kind: "row_union";

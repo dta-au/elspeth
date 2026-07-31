@@ -15679,7 +15679,12 @@ class TestRowUnionTopologyCodesDoNotBlockUnrelatedMutations:
             _ROW_UNION_INTRINSIC_ERROR_CODES,
         )
 
-        topology_codes = {"row_union_branch_origin_invalid", "row_union_branch_not_downstream"}
+        topology_codes = {
+            "row_union_branch_origin_invalid",
+            "row_union_branch_not_downstream",
+            "row_union_downstream_group_invalid",
+            "row_union_schema_incompatible",
+        }
         assert not topology_codes & _MUTATION_BLOCKING_INVARIANT_CODES
         assert not topology_codes & _ROW_UNION_INTRINSIC_ERROR_CODES
         # The intrinsic node-shape family must still gate mutations.

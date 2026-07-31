@@ -444,6 +444,23 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Wire each branches[alias] value through processing that starts at the matching gate fork branch.",
     ),
     (
+        r"row_union_downstream_group_invalid",
+        "A row_union release reaches a downstream early-trigger aggregation or correlated barrier that can split, "
+        "drop, or duplicate members of the indivisible N-to-N group.",
+        "For an aggregation, omit trigger or use trigger: {} so only end_of_source flushes, or move it upstream of "
+        "the fork. For a downstream coalesce or row_union, move that barrier upstream of the fork or terminate the "
+        "released group at a sink.",
+    ),
+    (
+        r"row_union_schema_incompatible",
+        "The row_union branch declarations cannot safely feed one long-format output stream. Fixed schemas must have "
+        "the same complete declared shape; flexible schemas may add branch-only fields but shared fields cannot "
+        "declare conflicting types.",
+        "Use the row_union_schema facts: align the complete declared field sets and types for fixed branches; for "
+        "flexible branches, change only the listed conflicting shared fields to compatible types. Keep disjoint "
+        "flexible-only fields; they do not need to be deleted.",
+    ),
+    (
         r"fork_branch_multiple_barriers",
         "One fork branch is declared by two barriers (coalesce and/or row_union). A fork branch delivers its arrival to "
         "exactly one barrier, so the engine rejects the second claim at graph build time.",
@@ -871,6 +888,8 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "row_union_branch_unreachable",
     "row_union_branch_origin_invalid",
     "row_union_branch_not_downstream",
+    "row_union_downstream_group_invalid",
+    "row_union_schema_incompatible",
     "row_union_on_success_must_be_connection",
     "row_union_on_success_dangling",
     # Cross-node barrier topology: mirrors the engine's "each fork branch can

@@ -873,6 +873,14 @@ def _allowlisted_candidate_feedback(result: ToolResult, *, repeated_fingerprint:
             # fields are missing. This stays inside the message-redaction
             # boundary this allowlist protects.
             projected["contract"] = entry.contract.to_dict()
+        if entry.row_union_schema is not None:
+            # Structured row-union branch declarations: branch aliases,
+            # schema modes, field names, and declared field properties from
+            # the REJECTED candidate the planner authored. These are the
+            # row-union equivalent of the safe contract facts above, never
+            # runtime row content, and make the incompatibility repairable
+            # without exposing the free-form validation message.
+            projected["row_union_schema"] = entry.row_union_schema.to_dict()
         errors.append(projected)
     feedback: dict[str, Any] = {
         "success": False,

@@ -466,6 +466,101 @@ class SchemaContractDetail:
         return result
 
 
+class RowUnionFieldSchemaDetailDict(TypedDict):
+    """One validated field declaration in row_union repair facts."""
+
+    name: str
+    field_type: str
+    required: bool
+    nullable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RowUnionFieldSchemaDetail:
+    """Redaction-safe field metadata from validated schema configuration."""
+
+    name: str
+    field_type: str
+    required: bool
+    nullable: bool
+
+    def to_dict(self) -> RowUnionFieldSchemaDetailDict:
+        return RowUnionFieldSchemaDetailDict(
+            name=self.name,
+            field_type=self.field_type,
+            required=self.required,
+            nullable=self.nullable,
+        )
+
+
+class RowUnionBranchSchemaDetailDict(TypedDict):
+    """One row_union branch's explicit schema declaration."""
+
+    branch: str
+    mode: Literal["fixed", "flexible"]
+    fields: list[RowUnionFieldSchemaDetailDict]
+
+
+@dataclass(frozen=True, slots=True)
+class RowUnionBranchSchemaDetail:
+    """Redaction-safe branch schema facts for planner repair."""
+
+    branch: str
+    mode: Literal["fixed", "flexible"]
+    fields: tuple[RowUnionFieldSchemaDetail, ...]
+
+    def to_dict(self) -> RowUnionBranchSchemaDetailDict:
+        return RowUnionBranchSchemaDetailDict(
+            branch=self.branch,
+            mode=self.mode,
+            fields=[field.to_dict() for field in self.fields],
+        )
+
+
+def _row_union_branch_schema_detail(
+    branch: str,
+    schema_config: SchemaConfig,
+) -> RowUnionBranchSchemaDetail:
+    """Project one already-proven explicit branch declaration."""
+    mode = schema_config.mode
+    assert mode in ("fixed", "flexible")
+    assert schema_config.fields is not None
+    return RowUnionBranchSchemaDetail(
+        branch=branch,
+        mode=mode,
+        fields=tuple(
+            RowUnionFieldSchemaDetail(
+                name=field.name,
+                field_type=field.field_type,
+                required=field.required,
+                nullable=field.nullable,
+            )
+            for field in schema_config.fields
+        ),
+    )
+
+
+class RowUnionSchemaDetailDict(TypedDict):
+    """Structured facts for a row_union schema incompatibility."""
+
+    branches: list[RowUnionBranchSchemaDetailDict]
+    conflicting_fields: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class RowUnionSchemaDetail:
+    """Exact validated branch declarations needed to repair a row_union."""
+
+    branches: tuple[RowUnionBranchSchemaDetail, ...]
+    conflicting_fields: tuple[str, ...]
+
+    def to_dict(self) -> RowUnionSchemaDetailDict:
+        return RowUnionSchemaDetailDict(
+            branches=[branch.to_dict() for branch in self.branches],
+            conflicting_fields=list(self.conflicting_fields),
+        )
+
+
 class ValidationEntryDict(TypedDict):
     """JSON representation of :class:`ValidationEntry`."""
 
@@ -474,6 +569,7 @@ class ValidationEntryDict(TypedDict):
     severity: Severity
     error_code: NotRequired[str]
     contract: NotRequired[SchemaContractDetailDict]
+    row_union_schema: NotRequired[RowUnionSchemaDetailDict]
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,6 +585,7 @@ class ValidationEntry:
     severity: Severity
     error_code: str | None = None
     contract: SchemaContractDetail | None = None
+    row_union_schema: RowUnionSchemaDetail | None = None
 
     def to_dict(self) -> ValidationEntryDict:
         """Serialize to a plain dict for JSON responses."""
@@ -497,6 +594,8 @@ class ValidationEntry:
             result["error_code"] = self.error_code
         if self.contract is not None:
             result["contract"] = self.contract.to_dict()
+        if self.row_union_schema is not None:
+            result["row_union_schema"] = self.row_union_schema.to_dict()
         return result
 
 
@@ -861,33 +960,107 @@ def _runtime_consumer_connections(nodes: tuple[NodeSpec, ...]) -> set[str]:
 def _runtime_connection_is_downstream(
     origin: str,
     target: str,
+    sources: Mapping[str, SourceSpec],
     nodes: tuple[NodeSpec, ...],
 ) -> bool:
-    """Return whether ``target`` is reachable through runtime routing from ``origin``."""
-    reachable = {origin}
-    while True:
-        expanded = set(reachable)
+    """Return whether ``target`` is exclusively derived from ``origin``.
+
+    Ordinary connections have one producer (the duplicate-producer check owns
+    ambiguity), so one proven predecessor establishes lineage. A queue is the
+    deliberate exception: it can have many producers, and every predecessor
+    must derive from the mapped fork alias. Otherwise one valid branch path
+    could hide unrelated queue traffic and bypass row_union correlation.
+    """
+    from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id
+
+    resolver = ProducerResolver.build(
+        source=None,
+        sources=sources,
+        nodes=nodes,
+        sink_names=frozenset(),
+    )
+
+    def _producer_is_compatible(
+        producer: ProducerEntry,
+        *,
+        visiting: frozenset[str],
+    ) -> bool:
+        if is_source_producer_id(producer.producer_id):
+            return False
+        producer_node = resolver.get_node(producer.producer_id)
+        if producer_node is None:
+            return False
+        if producer_node.node_type in ("coalesce", "row_union"):
+            dependencies = _coalesce_branch_connections(producer_node.branches)
+            return bool(dependencies) and all(_connection_is_compatible(dependency, visiting=visiting) for dependency in dependencies)
+        if producer_node.node_type == "queue":
+            # Queue compatibility is resolved through every registered
+            # predecessor in _connection_is_compatible(), never through the
+            # queue's structural input placeholder.
+            return _connection_is_compatible(producer_node.id, visiting=visiting)
+        return _connection_is_compatible(producer_node.input, visiting=visiting)
+
+    def _connection_is_compatible(
+        connection_name: str,
+        *,
+        visiting: frozenset[str],
+    ) -> bool:
+        if connection_name == origin:
+            return True
+        if connection_name in visiting:
+            return False
+        next_visiting = visiting | {connection_name}
+        producer = resolver.find_producer_for(connection_name)
+        if producer is None:
+            return False
+        producer_node = resolver.get_node(producer.producer_id)
+        if producer_node is not None and producer_node.node_type == "queue":
+            predecessors = resolver.queue_predecessors(producer_node.id)
+            return bool(predecessors) and all(_producer_is_compatible(predecessor, visiting=next_visiting) for predecessor in predecessors)
+        return _producer_is_compatible(producer, visiting=next_visiting)
+
+    return _connection_is_compatible(target, visiting=frozenset())
+
+
+def _runtime_nodes_downstream_of_connection(
+    connection_name: str,
+    nodes: tuple[NodeSpec, ...],
+) -> tuple[NodeSpec, ...]:
+    """Return processing nodes reachable from a runtime connection.
+
+    Mirrors the runtime builder's forward graph walk closely enough for the
+    row_union group-indivisibility guard: all success/error/route/fork outputs
+    are traversed, identity and mapped barrier inputs are both topology edges,
+    and structural queue placeholders are skipped.
+    """
+    reachable_connections = {connection_name}
+    reachable_node_ids: set[str] = set()
+    ordered_nodes: list[NodeSpec] = []
+    changed = True
+    while changed:
+        changed = False
         for node in nodes:
-            inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
-            if reachable.isdisjoint(inputs):
+            if node.id in reachable_node_ids or node.node_type == "queue":
                 continue
+            inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
+            if reachable_connections.isdisjoint(inputs):
+                continue
+            reachable_node_ids.add(node.id)
+            ordered_nodes.append(node)
+            changed = True
             if node.node_type == "coalesce" and node.on_success is None:
-                expanded.add(node.id)
+                reachable_connections.add(node.id)
             elif node.on_success is not None:
-                expanded.add(node.on_success)
-            if node.on_error is not None and node.on_error != "discard":
-                expanded.add(node.on_error)
+                reachable_connections.add(node.on_success)
+            if node.on_error is not None and node.on_error != _DISCARD_ROUTE_TARGET:
+                reachable_connections.add(node.on_error)
             if node.routes is not None:
-                expanded.update(
-                    route_target for route_target in node.routes.values() if route_target not in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET)
+                reachable_connections.update(
+                    target for target in node.routes.values() if target not in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET)
                 )
             if node.fork_to is not None:
-                expanded.update(node.fork_to)
-        if target in expanded:
-            return True
-        if expanded == reachable:
-            return False
-        reachable = expanded
+                reachable_connections.update(node.fork_to)
+    return tuple(ordered_nodes)
 
 
 def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, Any]]:
@@ -1635,9 +1808,8 @@ def _check_schema_contracts(
         )
 
     # Queue and row_union NodeSpec.input fields are structural placeholders,
-    # not consuming bindings. Coalesce identity branches are direct COPY edges;
-    # mapped branches claim their input connection. A row_union consumes every
-    # branch value, including identity branches.
+    # not consuming bindings. Coalesce/row_union identity branches are direct
+    # COPY edges; only mapped branches claim their input connection.
     consumer_claims: list[tuple[str, str, str]] = [
         (node.input, node.id, f"node '{node.id}'") for node in nodes if node.node_type not in ("coalesce", "queue", "row_union")
     ]
@@ -1649,8 +1821,8 @@ def _check_schema_contracts(
             )
         elif node.node_type == "row_union":
             consumer_claims.extend(
-                (connection_name, node.id, f"row_union '{node.id}' branch")
-                for connection_name in _coalesce_branch_connections(node.branches)
+                (connection_name, node.id, f"row_union '{node.id}' mapped branch")
+                for connection_name in _coalesce_mapped_branch_connections(node.branches)
             )
     consumer_counts = Counter(connection_name for connection_name, _node_id, _desc in consumer_claims)
     duplicate_consumers = sorted(name for name, count in consumer_counts.items() if count > 1)
@@ -1980,14 +2152,13 @@ def _check_schema_contracts(
         _participates, guarantees = _effective_producer_vote(producer)
         return guarantees
 
-    def _known_producer_schema_mode(producer: ProducerEntry) -> Literal["observed", "explicit"] | None:
-        """Return the runtime branch-schema mode when Composer can prove it.
+    def _known_producer_schema_config(producer: ProducerEntry) -> SchemaConfig | None:
+        """Return the runtime producer schema when Composer can prove it.
 
         The DAG builder assigns each transform/aggregation its computed output
         ``SchemaConfig`` and falls back to the raw declaration only when the
-        plugin has no computed output contract. Mirror that choice here. Draft
-        config/probe failures abstain: their existing validation paths own the
-        rejection, and a guessed mode must not create a false coalesce error.
+        plugin has no computed output contract. Draft config/probe failures
+        abstain: their existing validation paths own the rejection.
         """
         contract_options = producer.options
         contract_owner = _producer_owner(producer)
@@ -2021,6 +2192,13 @@ def _check_schema_contracts(
                 return None
             schema_config = computed_schema or raw_schema
 
+        if schema_config is None:
+            return None
+        return schema_config
+
+    def _known_producer_schema_mode(producer: ProducerEntry) -> Literal["observed", "explicit"] | None:
+        """Return the runtime branch-schema mode when Composer can prove it."""
+        schema_config = _known_producer_schema_config(producer)
         if schema_config is None:
             return None
         if schema_config.is_observed:
@@ -2060,6 +2238,32 @@ def _check_schema_contracts(
             return None
         return _known_producer_schema_mode(producer)
 
+    def _known_connection_schema_config(
+        connection_name: str,
+        *,
+        visited: frozenset[str] = frozenset(),
+    ) -> SchemaConfig | None:
+        """Resolve a branch's known schema through structural producers."""
+        if connection_name in visited:
+            return None
+        producer = resolver.find_producer_for(connection_name)
+        if producer is None:
+            return None
+        if is_source_producer_id(producer.producer_id):
+            return _known_producer_schema_config(producer)
+
+        producer_node = node_by_id[producer.producer_id]
+        if producer_node.node_type == "gate":
+            return _known_connection_schema_config(
+                producer_node.input,
+                visited=visited | {connection_name},
+            )
+        if producer_node.node_type in ("queue", "row_union"):
+            return SchemaConfig(mode="observed", fields=None)
+        if producer_node.node_type == "coalesce":
+            return None
+        return _known_producer_schema_config(producer)
+
     # Runtime rejects a union coalesce whose known branch schemas mix observed
     # and explicit modes. Composer has enough information to mirror that rule
     # for sources, gates, queues, transforms, and aggregations. Unresolved
@@ -2092,6 +2296,57 @@ def _check_schema_contracts(
                     "coalesce_schema_mode_mixed",
                 )
             )
+
+    # row_union publishes every branch row unchanged into one long-format
+    # stream. Exact fixed/fixed schemas need full mutual compatibility.
+    # Flexible declarations allow undeclared fields, so only conflicting types
+    # on fields both branches explicitly declare are provable. Observed/unknown
+    # branches abstain, but cannot hide a conflict between known declarations.
+    from itertools import combinations
+
+    from elspeth.core.dag.schema_validation import row_union_schema_configs_compatible
+
+    for row_union_node in nodes:
+        if row_union_node.node_type != "row_union" or not row_union_node.branches:
+            continue
+        explicit_branch_schemas: list[tuple[str, SchemaConfig]] = []
+        for branch_name, branch_connection in zip(
+            _coalesce_branch_names(row_union_node.branches),
+            _coalesce_branch_connections(row_union_node.branches),
+            strict=True,
+        ):
+            schema_config = _known_connection_schema_config(branch_connection)
+            if schema_config is None or schema_config.is_observed or schema_config.fields is None:
+                continue
+            explicit_branch_schemas.append((branch_name, schema_config))
+        if len(explicit_branch_schemas) < 2:
+            continue
+        for (first_branch, first_schema), (other_branch, other_schema) in combinations(explicit_branch_schemas, 2):
+            compatible, conflicting_fields, error_msg = row_union_schema_configs_compatible(first_schema, other_schema)
+            if compatible:
+                continue
+            branch_details = tuple(
+                _row_union_branch_schema_detail(branch_name, schema_config)
+                for branch_name, schema_config in (
+                    (first_branch, first_schema),
+                    (other_branch, other_schema),
+                )
+            )
+            errors.append(
+                _err(
+                    f"node:{row_union_node.id}",
+                    f"row_union '{row_union_node.id}' has incompatible branch schemas for its long-format stream: "
+                    f"branch '{first_branch}' and branch '{other_branch}'; "
+                    f"conflicting fields {list(conflicting_fields)}. {error_msg}",
+                    "high",
+                    "row_union_schema_incompatible",
+                    row_union_schema=RowUnionSchemaDetail(
+                        branches=branch_details,
+                        conflicting_fields=conflicting_fields,
+                    ),
+                )
+            )
+            break
 
     def _connection_propagation_vote(connection_name: str) -> tuple[bool, frozenset[str]]:
         """Resolve a connection's propagation vote across structural nodes.
@@ -3518,7 +3773,12 @@ class CompositionState:
                         )
                     else:
                         for branch_alias, branch_connection in zip(branch_aliases, branch_connections, strict=True):
-                            if _runtime_connection_is_downstream(branch_alias, branch_connection, self.nodes):
+                            if _runtime_connection_is_downstream(
+                                branch_alias,
+                                branch_connection,
+                                self.sources,
+                                self.nodes,
+                            ):
                                 continue
                             errors.append(
                                 _err(
@@ -3530,6 +3790,41 @@ class CompositionState:
                                     "row_union_branch_not_downstream",
                                 )
                             )
+                        for downstream in _runtime_nodes_downstream_of_connection(node.on_success or "", self.nodes):
+                            if downstream.node_type in ("coalesce", "row_union"):
+                                errors.append(
+                                    _err(
+                                        f"node:{node.id}",
+                                        f"{downstream.node_type} '{downstream.id}' is downstream of row_union '{node.id}' "
+                                        "with no intervening sink. row_union releases an indivisible N-to-N group, "
+                                        "and a correlated barrier cannot safely consume multiple tokens sharing one row_id. "
+                                        "Move the downstream barrier upstream of the fork or terminate the released group at a sink.",
+                                        "high",
+                                        "row_union_downstream_group_invalid",
+                                    )
+                                )
+                                break
+                            if downstream.node_type != "aggregation" or downstream.trigger is None:
+                                continue
+                            try:
+                                trigger = TriggerConfig.model_validate(deep_thaw(downstream.trigger))
+                            except PydanticValidationError:
+                                # The aggregation's intrinsic trigger validator
+                                # owns malformed external input.
+                                continue
+                            if trigger.has_count or trigger.has_timeout or trigger.has_condition:
+                                errors.append(
+                                    _err(
+                                        f"node:{node.id}",
+                                        f"Aggregation '{downstream.id}' is downstream of row_union '{node.id}' "
+                                        "but declares a count/timeout/condition trigger. Such triggers can fire "
+                                        "between variants of one source row, splitting an indivisible union group. "
+                                        "Use the implicit end_of_source trigger or move the aggregation upstream of the fork.",
+                                        "high",
+                                        "row_union_downstream_group_invalid",
+                                    )
+                                )
+                                break
                 continue
 
             if node.input not in runtime_connections:
@@ -3563,7 +3858,7 @@ class CompositionState:
                 n.id for n in self.nodes if n.node_type == "coalesce" and node.id in _coalesce_mapped_branch_connections(n.branches)
             )
             downstream_consumers.extend(
-                n.id for n in self.nodes if n.node_type == "row_union" and node.id in _coalesce_branch_connections(n.branches)
+                n.id for n in self.nodes if n.node_type == "row_union" and node.id in _coalesce_mapped_branch_connections(n.branches)
             )
             if not downstream_consumers:
                 errors.append(

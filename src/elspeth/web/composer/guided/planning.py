@@ -882,6 +882,7 @@ def _node_behavior(
             "branch_aliases": aliases,
             "policy": node.policy,
             "merge": node.merge,
+            "timeout_seconds": node.timeout_seconds,
         }
     assert node.node_type == "gate"
     routes = _ordered_gate_routes(node)

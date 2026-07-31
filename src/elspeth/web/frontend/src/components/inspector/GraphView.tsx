@@ -82,7 +82,13 @@ function inferredEdgeId(kind: string, ...parts: string[]): string {
   return `inferred-${kind}-${payload}`;
 }
 
-interface ParallelLaneEdgeData extends Record<string, unknown> {
+type EdgeFlowType = "success" | "error";
+
+interface PipelineEdgeData extends Record<string, unknown> {
+  flowType: EdgeFlowType;
+}
+
+interface ParallelLaneEdgeData extends PipelineEdgeData {
   laneOffset: number;
 }
 
@@ -102,10 +108,16 @@ type PipelineGraphNodeModel = Node<
   typeof PIPELINE_NODE_TYPE
 >;
 
+type PipelineGraphEdgeModel = Edge<PipelineEdgeData> & {
+  data: PipelineEdgeData;
+};
+
 type ParallelLaneEdgeModel = Edge<
   ParallelLaneEdgeData,
   typeof PARALLEL_EDGE_TYPE
->;
+> & {
+  data: ParallelLaneEdgeData;
+};
 
 function parallelLanePath(
   sourceX: number,
@@ -235,8 +247,8 @@ const NODE_TYPES: NodeTypes = {
 
 function assignParallelEdgeLanes(
   nodes: PipelineGraphNodeModel[],
-  edges: Edge[],
-): { nodes: PipelineGraphNodeModel[]; edges: Edge[] } {
+  edges: PipelineGraphEdgeModel[],
+): { nodes: PipelineGraphNodeModel[]; edges: PipelineGraphEdgeModel[] } {
   const indexesByEndpoints = new Map<string, number[]>();
   for (const [index, edge] of edges.entries()) {
     const key =
@@ -595,8 +607,8 @@ function NodeConfigPanel({
  */
 function layoutGraph(
   rfNodes: Node[],
-  rfEdges: Edge[],
-): { nodes: Node[]; edges: Edge[] } {
+  rfEdges: PipelineGraphEdgeModel[],
+): { nodes: Node[]; edges: PipelineGraphEdgeModel[] } {
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
   g.setGraph({ rankdir: "TB", nodesep: 60, ranksep: 100 });
@@ -771,7 +783,10 @@ export function GraphView() {
 
   const { nodes, edges } = useMemo(() => {
     if (!hasCompositionContent(compositionState)) {
-      return { nodes: [] as Node[], edges: [] as Edge[] };
+      return {
+        nodes: [] as Node[],
+        edges: [] as PipelineGraphEdgeModel[],
+      };
     }
 
     function makeRfNode(
@@ -920,11 +935,14 @@ export function GraphView() {
       sourceIds.has(id) ? sourceComponentId(id) : id;
 
     const explicitEdges = compositionState.edges;
-    const rfEdges: Edge[] = explicitEdges.map((edge, i) => ({
+    const rfEdges: PipelineGraphEdgeModel[] = explicitEdges.map((edge, i) => ({
       id: `e-${edge.from_node}-${edge.to_node}-${i}`,
       source: toGraphNodeId(edge.from_node),
       target: toGraphNodeId(edge.to_node),
       label: edge.label ?? EDGE_LABEL_MAP[edge.edge_type] ?? edge.edge_type,
+      data: {
+        flowType: edge.edge_type === "on_error" ? "error" : "success",
+      },
       animated: edge.edge_type === "on_error",
       style: {
         stroke: edge.edge_type === "on_error" ? EDGE_COLORS.error : EDGE_COLORS.normal,
@@ -932,6 +950,7 @@ export function GraphView() {
       },
       labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
     }));
+    const explicitRfEdgeIds = new Set(rfEdges.map((edge) => edge.id));
 
     // Build a set of existing edge connections to avoid duplicates
     const existingConnections = new Set(
@@ -948,6 +967,7 @@ export function GraphView() {
     function claimExplicitRowUnionAlias(
       connectionKey: string,
       alias: string,
+      edgeType: EdgeFlowType,
     ): boolean {
       const candidateIndexes =
         explicitEdgeIndexesByConnection.get(connectionKey) ?? [];
@@ -965,12 +985,20 @@ export function GraphView() {
       if (claimedIndex === undefined) return false;
 
       claimedExplicitRowUnionEdges.add(claimedIndex);
-      if (explicitEdges[claimedIndex]?.label === null) {
-        rfEdges[claimedIndex] = {
-          ...rfEdges[claimedIndex],
-          label: alias,
-        };
-      }
+      const isError = edgeType === "error";
+      rfEdges[claimedIndex] = {
+        ...rfEdges[claimedIndex],
+        label: alias,
+        data: {
+          ...rfEdges[claimedIndex]!.data,
+          flowType: edgeType,
+        },
+        animated: isError,
+        style: {
+          ...rfEdges[claimedIndex]!.style,
+          stroke: isError ? EDGE_COLORS.error : EDGE_COLORS.normal,
+        },
+      };
       return true;
     }
     const nodeIds = new Set(rfNodes.map(n => n.id));
@@ -992,7 +1020,11 @@ export function GraphView() {
     // declared queue node consumes it (structural fan-in, ADR-028). So this is a
     // MULTIMAP, not one-producer-per-connection: overwriting would silently drop
     // every producer but the last and misrender the intentional fan-in.
-    type ProducerInfo = { nodeId: string; edgeType: "success" | "error"; label: string };
+    type ProducerInfo = {
+      nodeId: string;
+      edgeType: EdgeFlowType;
+      label: string;
+    };
     const connectionProducers = new Map<string, ProducerInfo[]>();
     function registerProducer(connection: string, producer: ProducerInfo): void {
       const producers = connectionProducers.get(connection) ?? [];
@@ -1013,6 +1045,7 @@ export function GraphView() {
         .filter((node) => node.node_type === "row_union")
         .map((node) => node.id),
     );
+    const authoritativeRowUnionOutboundConnections = new Set<string>();
 
     // Each source produces on its on_success connection
     for (const [sourceName, source] of sortedSourceEntries(compositionState)) {
@@ -1102,7 +1135,13 @@ export function GraphView() {
           const connectionKey = `${producer.nodeId}->${rowUnion.id}`;
           const aliasKey = `${connectionKey}:${alias}`;
           if (inferredRowUnionAliases.has(aliasKey)) continue;
-          if (claimExplicitRowUnionAlias(connectionKey, alias)) {
+          if (
+            claimExplicitRowUnionAlias(
+              connectionKey,
+              alias,
+              producer.edgeType,
+            )
+          ) {
             inferredRowUnionAliases.add(aliasKey);
             continue;
           }
@@ -1117,6 +1156,7 @@ export function GraphView() {
             source: producer.nodeId,
             target: rowUnion.id,
             label: alias,
+            data: { flowType: producer.edgeType },
             animated: isError,
             style: {
               stroke: isError ? EDGE_COLORS.error : EDGE_COLORS.normal,
@@ -1168,13 +1208,18 @@ export function GraphView() {
       );
       for (const producer of producers) {
         if (producer.nodeId === queueId) continue; // no queue self-loop
-        if (existingConnections.has(`${producer.nodeId}->${queueId}`)) continue;
+        const connectionKey = `${producer.nodeId}->${queueId}`;
+        if (rowUnionIds.has(producer.nodeId)) {
+          authoritativeRowUnionOutboundConnections.add(connectionKey);
+        }
+        if (existingConnections.has(connectionKey)) continue;
         const isError = producer.edgeType === "error";
         rfEdges.push({
           id: inferredEdgeId("queue-in", producer.nodeId, queueId),
           source: producer.nodeId,
           target: queueId,
           label: producer.label,
+          data: { flowType: producer.edgeType },
           animated: isError,
           style: {
             stroke: isError ? EDGE_COLORS.error : EDGE_COLORS.normal,
@@ -1182,7 +1227,7 @@ export function GraphView() {
           },
           labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
         });
-        existingConnections.add(`${producer.nodeId}->${queueId}`);
+        existingConnections.add(connectionKey);
       }
     }
 
@@ -1202,6 +1247,7 @@ export function GraphView() {
             source: node.input,
             target: node.id,
             label: "success",
+            data: { flowType: "success" },
             style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
             labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
           });
@@ -1215,7 +1261,11 @@ export function GraphView() {
       );
       for (const producer of producers) {
         if (producer.nodeId === node.id) continue;
-        if (existingConnections.has(`${producer.nodeId}->${node.id}`)) continue;
+        const connectionKey = `${producer.nodeId}->${node.id}`;
+        if (rowUnionIds.has(producer.nodeId)) {
+          authoritativeRowUnionOutboundConnections.add(connectionKey);
+        }
+        if (existingConnections.has(connectionKey)) continue;
         const isError = producer.edgeType === "error";
         rfEdges.push({
           id: rowUnionIds.has(producer.nodeId)
@@ -1224,6 +1274,7 @@ export function GraphView() {
           source: producer.nodeId,
           target: node.id,
           label: producer.label,
+          data: { flowType: producer.edgeType },
           animated: isError,
           style: {
             stroke: isError ? EDGE_COLORS.error : EDGE_COLORS.normal,
@@ -1231,7 +1282,7 @@ export function GraphView() {
           },
           labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
         });
-        existingConnections.add(`${producer.nodeId}->${node.id}`);
+        existingConnections.add(connectionKey);
       }
     }
 
@@ -1248,6 +1299,7 @@ export function GraphView() {
           source: sourceId,
           target: source.on_success,
           label: "success",
+          data: { flowType: "success" },
           style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
           labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
         });
@@ -1259,56 +1311,100 @@ export function GraphView() {
     // Sinks are in nodeIds, so we can create edges directly to them
     for (const node of compositionState.nodes) {
       // on_success → sink (only if target is a sink, not a connection point)
+      const successConnectionKey = `${node.id}->${node.on_success}`;
+      if (
+        rowUnionIds.has(node.id)
+        && node.on_success
+        && nodeIds.has(node.on_success)
+      ) {
+        authoritativeRowUnionOutboundConnections.add(successConnectionKey);
+      }
       if (
         node.on_success &&
         nodeIds.has(node.on_success) &&
-        !existingConnections.has(`${node.id}->${node.on_success}`)
+        !existingConnections.has(successConnectionKey)
       ) {
         rfEdges.push({
           id: inferredEdgeId("sink", node.id, node.on_success),
           source: node.id,
           target: node.on_success,
           label: "success",
+          data: { flowType: "success" },
           style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
           labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
         });
-        existingConnections.add(`${node.id}->${node.on_success}`);
+        existingConnections.add(successConnectionKey);
       }
 
       // on_error → sink
+      const errorConnectionKey = `${node.id}->${node.on_error}`;
+      if (
+        rowUnionIds.has(node.id)
+        && node.on_error
+        && nodeIds.has(node.on_error)
+      ) {
+        authoritativeRowUnionOutboundConnections.add(errorConnectionKey);
+      }
       if (
         node.on_error &&
         nodeIds.has(node.on_error) &&
-        !existingConnections.has(`${node.id}->${node.on_error}`)
+        !existingConnections.has(errorConnectionKey)
       ) {
         rfEdges.push({
           id: inferredEdgeId("sink", node.id, node.on_error, "error"),
           source: node.id,
           target: node.on_error,
           label: "error",
+          data: { flowType: "error" },
           animated: true,
           style: { stroke: EDGE_COLORS.error, strokeWidth: 1.5 },
           labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
         });
-        existingConnections.add(`${node.id}->${node.on_error}`);
+        existingConnections.add(errorConnectionKey);
       }
 
       // Gate routes → sink
       if (node.routes) {
         for (const [routeLabel, targetId] of Object.entries(node.routes)) {
-          if (nodeIds.has(targetId) && !existingConnections.has(`${node.id}->${targetId}`)) {
+          const routeConnectionKey = `${node.id}->${targetId}`;
+          if (rowUnionIds.has(node.id) && nodeIds.has(targetId)) {
+            authoritativeRowUnionOutboundConnections.add(routeConnectionKey);
+          }
+          if (nodeIds.has(targetId) && !existingConnections.has(routeConnectionKey)) {
             rfEdges.push({
               id: inferredEdgeId("sink", node.id, targetId, routeLabel),
               source: node.id,
               target: targetId,
               label: routeLabel,
+              data: { flowType: "success" },
               style: { stroke: EDGE_COLORS.normal, strokeWidth: 1.5 },
               labelStyle: { fontSize: 10, fill: EDGE_LABEL_COLOR },
             });
-            existingConnections.add(`${node.id}->${targetId}`);
+            existingConnections.add(routeConnectionKey);
           }
         }
       }
+    }
+
+    // A row union's connection properties are authoritative for its outbound
+    // topology just as `branches` is authoritative for its inbound topology.
+    // Explicit row_union edges are materialized render hints and can survive a
+    // `with_node` repoint, so retain them only when an inference phase above
+    // observed the same live producer → consumer connection. Endpoint-matched
+    // parallel lanes remain intact, as do all unrelated explicit edges.
+    for (let index = rfEdges.length - 1; index >= 0; index -= 1) {
+      const edge = rfEdges[index]!;
+      if (!explicitRfEdgeIds.has(edge.id) || !rowUnionIds.has(edge.source)) {
+        continue;
+      }
+      if (
+        authoritativeRowUnionOutboundConnections.has(
+          `${edge.source}->${edge.target}`,
+        )
+      ) {
+        continue;
+      }
+      rfEdges.splice(index, 1);
     }
 
     const parallelGeometry = assignParallelEdgeLanes(rfNodes, rfEdges);
@@ -1366,7 +1462,7 @@ export function GraphView() {
         label:
           `${edge.source} to ${edge.target}: ${
             typeof edge.label === "string" ? edge.label : "connection"
-          }`,
+          } (${edge.data.flowType})`,
       })),
     [edges],
   );

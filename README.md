@@ -174,8 +174,10 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   ECS; provider and tool data remain bounded and redacted.
 
 **Operational:** 0.7.2 is a pre-1.0 database cutover. The session store moves
-from epoch 35 to 39; guided schema remains at 10, and Landscape moves from epoch
-29 to 30. Archive or export evidence as required, stop the old service, recreate
+from epoch 35 to 40; guided schema remains at 10, and Landscape moves from epoch
+29 to 30. Session epoch 40 makes the required coalesce timeout field an eager
+startup cutover instead of allowing epoch-39 guided payloads to fail during
+replay. Archive or export evidence as required, stop the old service, recreate
 a stale session store and a Landscape store left at epoch 29, and install 0.7.2.
 Do not roll older code back over the recreated databases.
 `data/auth.db` remains separate; recreating the session store does not remove

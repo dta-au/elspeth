@@ -1073,10 +1073,10 @@ describe("GraphView", () => {
         name: "Pipeline branch connections",
       });
       expect(within(connectionList).getByText(
-        "experiment_gate to variant_union: control",
+        "experiment_gate to variant_union: control (success)",
       )).toBeInTheDocument();
       expect(within(connectionList).getByText(
-        "experiment_gate to variant_union: treatment",
+        "experiment_gate to variant_union: treatment (success)",
       )).toBeInTheDocument();
     });
 
@@ -1264,12 +1264,12 @@ describe("GraphView", () => {
       });
       expect(
         within(branchConnections).getByText(
-          "experiment_gate to variant_union: control",
+          "experiment_gate to variant_union: control (success)",
         ),
       ).toBeInTheDocument();
       expect(
         within(branchConnections).getByText(
-          "experiment_gate to variant_union: treatment",
+          "experiment_gate to variant_union: treatment (success)",
         ),
       ).toBeInTheDocument();
       expect(
@@ -1328,6 +1328,256 @@ describe("GraphView", () => {
         ids.some((id) => id.includes("variant_union-variant_union")),
       ).toBe(false);
     });
+
+    it("keeps only the authoritative row union successor after its output is repointed", () => {
+      // Reachable `with_node` state: the union now publishes a new connection,
+      // the old consumer has been rewired, but the materialized explicit edge
+      // still names the old union → consumer topology.
+      const state = rowUnionState();
+      const union = state.nodes.find((node) => node.id === "variant_union");
+      const oldConsumer = state.nodes.find((node) => node.id === "compare");
+      expect(union).toBeDefined();
+      expect(oldConsumer).toBeDefined();
+      union!.on_success = "repointed_rows";
+      oldConsumer!.input = "control_done";
+      state.nodes.push(
+        makeNode({
+          id: "new_compare",
+          node_type: "aggregation",
+          plugin: "batch_experiment_compare",
+          input: "repointed_rows",
+          on_success: "results",
+        }),
+      );
+      state.edges = [
+        makeEdge({
+          id: "stale-union-successor",
+          from_node: "variant_union",
+          to_node: "compare",
+          edge_type: "on_success",
+          label: "success",
+        }),
+        makeEdge({
+          id: "unrelated-explicit-edge",
+          from_node: "control_score",
+          to_node: "compare",
+          edge_type: "on_success",
+          label: "success",
+        }),
+      ];
+      useSessionStore.setState({ compositionState: state });
+
+      const { container } = render(<GraphView />);
+
+      const unionOutbound = Array.from(
+        container.querySelectorAll('[data-edge-source="variant_union"]'),
+      );
+      expect(unionOutbound).toHaveLength(1);
+      expect(unionOutbound[0]).toHaveAttribute(
+        "data-edge-target",
+        "new_compare",
+      );
+      expect(unionOutbound[0]).toHaveTextContent("success");
+      expect(unionOutbound[0]).toHaveAttribute(
+        "data-testid",
+        "edge-inferred-row-union-out-variant_union-new_compare",
+      );
+      expect(
+        screen.getByTestId("edge-e-control_score-compare-1"),
+      ).toHaveTextContent("success");
+
+      const connections = screen.getByRole("list", {
+        name: "Pipeline branch connections",
+      });
+      expect(
+        within(connections).queryByText(
+          "variant_union to compare: success (success)",
+        ),
+      ).not.toBeInTheDocument();
+      expect(
+        within(connections).getByText(
+          "variant_union to new_compare: success (success)",
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it.each([
+      {
+        caseName: "an explicit queue edge",
+        target: "union_queue",
+        configure: (state: CompositionState) => {
+          const union = state.nodes.find(
+            (node) => node.id === "variant_union",
+          );
+          expect(union).toBeDefined();
+          union!.on_success = "union_queue";
+          state.nodes.push(
+            makeNode({
+              id: "union_queue",
+              node_type: "queue",
+              plugin: null,
+              input: "union_queue",
+              on_success: null,
+              on_error: null,
+            }),
+          );
+          state.edges = [
+            makeEdge({
+              id: "union-to-queue",
+              from_node: "variant_union",
+              to_node: "union_queue",
+              edge_type: "on_success",
+              label: "success",
+            }),
+          ];
+        },
+        expectedConnections: [
+          "variant_union to union_queue: success (success)",
+        ],
+      },
+      {
+        caseName: "an explicit direct-sink edge",
+        target: "results",
+        configure: (state: CompositionState) => {
+          const union = state.nodes.find(
+            (node) => node.id === "variant_union",
+          );
+          expect(union).toBeDefined();
+          union!.on_success = "results";
+          state.edges = [
+            makeEdge({
+              id: "union-to-sink",
+              from_node: "variant_union",
+              to_node: "results",
+              edge_type: "on_success",
+              label: "success",
+            }),
+          ];
+        },
+        expectedConnections: [
+          "variant_union to results: success (success)",
+        ],
+      },
+      {
+        caseName: "parallel explicit success and error lanes",
+        target: "compare",
+        configure: (state: CompositionState) => {
+          const union = state.nodes.find(
+            (node) => node.id === "variant_union",
+          );
+          const consumer = state.nodes.find((node) => node.id === "compare");
+          expect(union).toBeDefined();
+          expect(consumer).toBeDefined();
+          union!.on_success = "shared_rows";
+          union!.on_error = "shared_rows";
+          consumer!.input = "shared_rows";
+          state.edges = [
+            makeEdge({
+              id: "union-success-lane",
+              from_node: "variant_union",
+              to_node: "compare",
+              edge_type: "on_success",
+              label: "success",
+            }),
+            makeEdge({
+              id: "union-error-lane",
+              from_node: "variant_union",
+              to_node: "compare",
+              edge_type: "on_error",
+              label: "error",
+            }),
+          ];
+        },
+        expectedConnections: [
+          "variant_union to compare: success (success)",
+          "variant_union to compare: error (error)",
+        ],
+      },
+    ])(
+      "preserves live row union outbound topology for $caseName",
+      ({ target, configure, expectedConnections }) => {
+        const state = rowUnionState();
+        configure(state);
+        useSessionStore.setState({ compositionState: state });
+
+        render(<GraphView />);
+
+        const connections = screen.getByRole("list", {
+          name: "Pipeline branch connections",
+        });
+        expect(
+          within(connections).getAllByText(
+            new RegExp(`^variant_union to ${target}:`),
+          ),
+        ).toHaveLength(expectedConnections.length);
+        for (const expectedConnection of expectedConnections) {
+          expect(
+            within(connections).getByText(expectedConnection),
+          ).toBeInTheDocument();
+        }
+      },
+    );
+
+    it.each([
+      {
+        authoritativeRoute: "on_success",
+        explicitRoute: "on_error",
+        expectedAccessibleText:
+          "control_score to variant_union: control (success)",
+      },
+      {
+        authoritativeRoute: "on_error",
+        explicitRoute: "on_success",
+        expectedAccessibleText:
+          "control_score to variant_union: control (error)",
+      },
+    ] as const)(
+      "announces a claimed row union alias as its authoritative $authoritativeRoute route",
+      ({
+        authoritativeRoute,
+        explicitRoute,
+        expectedAccessibleText,
+      }) => {
+        const state = rowUnionState();
+        const producer = state.nodes.find(
+          (node) => node.id === "control_score",
+        );
+        expect(producer).toBeDefined();
+        producer!.on_success =
+          authoritativeRoute === "on_success" ? "control_done" : "unused";
+        producer!.on_error =
+          authoritativeRoute === "on_error" ? "control_done" : null;
+        state.edges = [
+          makeEdge({
+            id: "stale-route-type",
+            from_node: "control_score",
+            to_node: "variant_union",
+            edge_type: explicitRoute,
+            label: "control",
+          }),
+        ];
+        useSessionStore.setState({ compositionState: state });
+
+        const { container } = render(<GraphView />);
+
+        const claimedEdges = container.querySelectorAll(
+          '[data-edge-source="control_score"][data-edge-target="variant_union"]',
+        );
+        expect(claimedEdges).toHaveLength(1);
+        expect(claimedEdges[0]).toHaveAttribute(
+          "data-testid",
+          "edge-e-control_score-variant_union-0",
+        );
+        expect(claimedEdges[0]).toHaveTextContent("control");
+
+        const connections = screen.getByRole("list", {
+          name: "Pipeline branch connections",
+        });
+        expect(
+          within(connections).getByText(expectedAccessibleText),
+        ).toBeInTheDocument();
+      },
+    );
 
     it("drops a stale-label explicit edge into an alias-mapped row union", () => {
       // Reachable state: `with_node` (upsert_node) replaces a row_union in

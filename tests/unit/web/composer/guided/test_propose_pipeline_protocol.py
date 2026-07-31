@@ -203,6 +203,7 @@ def _fork_coalesce_payload() -> dict[str, Any]:
                 "branch_aliases": branches,
                 "policy": "quorum",
                 "merge": "nested",
+                "timeout_seconds": None,
             },
         },
     ]
@@ -262,7 +263,9 @@ def _fork_row_union_payload() -> dict[str, Any]:
             "plugin": None,
             "behavior": {
                 "kind": "gate",
+                "condition": "row['group']",
                 "route_aliases": [route],
+                "routes": [{"alias": route, "key": "true"}],
                 "fork_branches": [{"routes": [route], "branch": branch} for branch in branches],
             },
         },
@@ -405,6 +408,63 @@ def _route_row_union_through_queue(payload: dict[str, Any]) -> None:
     )
     payload["component_counts"]["nodes"] += 1
     payload["component_counts"]["edges"] += 1
+
+
+def _contaminate_row_union_branch_queue(payload: dict[str, Any]) -> None:
+    contaminant_source_id = "00000000-0000-4000-8000-000000000417"
+    queue_id = "00000000-0000-4000-8000-000000000418"
+    union_id = payload["nodes"][3]["stable_id"]
+    payload["graph"]["sources"].append(
+        {
+            "stable_id": contaminant_source_id,
+            "label": proposal_component_label("source", 1),
+            "plugin": {"kind": "source", "id": "csv"},
+        }
+    )
+    payload["nodes"].insert(
+        3,
+        {
+            "stable_id": queue_id,
+            "label": proposal_component_label("node", 3),
+            "node_type": "queue",
+            "plugin": None,
+            "behavior": {"kind": "queue"},
+        },
+    )
+    for index, node in enumerate(payload["nodes"]):
+        node["label"] = proposal_component_label("node", index)
+
+    control_success = payload["graph"]["edges"][4]
+    control_success["to_endpoint"] = {"kind": "node", "stable_id": queue_id}
+    control_success["flow"]["branch"] = None
+    payload["graph"]["edges"].insert(
+        5,
+        {
+            "stable_id": "00000000-0000-4000-8000-000000000612",
+            "from_endpoint": {"kind": "node", "stable_id": queue_id},
+            "to_endpoint": {"kind": "node", "stable_id": union_id},
+            "flow": {"kind": "queue_continue", "branch": "branch-1"},
+        },
+    )
+    payload["graph"]["edges"].extend(
+        [
+            {
+                "stable_id": "00000000-0000-4000-8000-000000000613",
+                "from_endpoint": {"kind": "source", "stable_id": contaminant_source_id},
+                "to_endpoint": {"kind": "node", "stable_id": queue_id},
+                "flow": {"kind": "source_success", "branch": None},
+            },
+            {
+                "stable_id": "00000000-0000-4000-8000-000000000614",
+                "from_endpoint": {"kind": "source", "stable_id": contaminant_source_id},
+                "to_endpoint": {"kind": "discard"},
+                "flow": {"kind": "source_validation_failure"},
+            },
+        ]
+    )
+    payload["component_counts"]["sources"] += 1
+    payload["component_counts"]["nodes"] += 1
+    payload["component_counts"]["edges"] += 3
 
 
 def _queue_payload() -> dict[str, Any]:
@@ -1232,6 +1292,49 @@ def test_propose_pipeline_represents_fork_and_coalesce_with_shared_branch_aliase
     assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
 
 
+@pytest.mark.parametrize(
+    ("policy", "timeout_seconds"),
+    [
+        ("best_effort", 12.5),
+        ("quorum", 30.0),
+        ("require_all", None),
+    ],
+)
+def test_propose_pipeline_preserves_closed_coalesce_timeout_shape(
+    policy: str,
+    timeout_seconds: float | None,
+) -> None:
+    payload = _fork_coalesce_payload()
+    behavior = payload["nodes"][1]["behavior"]
+    behavior["policy"] = policy
+    behavior["timeout_seconds"] = timeout_seconds
+
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+
+
+def test_propose_pipeline_rejects_coalesce_behavior_without_timeout_key() -> None:
+    payload = _fork_coalesce_payload()
+    del payload["nodes"][1]["behavior"]["timeout_seconds"]
+
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, payload)
+
+    assert error is not None
+    assert "timeout_seconds" in error
+
+
+@pytest.mark.parametrize("timeout_seconds", [True, 0, float("inf")])
+def test_propose_pipeline_rejects_invalid_coalesce_timeout(
+    timeout_seconds: object,
+) -> None:
+    payload = _fork_coalesce_payload()
+    payload["nodes"][1]["behavior"]["timeout_seconds"] = timeout_seconds
+
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, payload)
+
+    assert error is not None
+    assert "timeout_seconds" in error
+
+
 def test_propose_pipeline_represents_fork_and_row_union_with_distinct_n_to_n_success() -> None:
     payload = _fork_row_union_payload()
 
@@ -1243,6 +1346,16 @@ def test_propose_pipeline_accepts_row_union_success_targeting_queue_before_proce
     _route_row_union_through_queue(payload)
 
     assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+
+
+def test_propose_pipeline_rejects_row_union_queue_branch_with_unrelated_source() -> None:
+    payload = _fork_row_union_payload()
+    _contaminate_row_union_branch_queue(payload)
+
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, payload)
+
+    assert error is not None
+    assert "downstream" in error
 
 
 @pytest.mark.parametrize(
@@ -1277,7 +1390,9 @@ def test_propose_pipeline_rejects_row_union_branch_set_from_multiple_fork_gates(
             "plugin": None,
             "behavior": {
                 "kind": "gate",
+                "condition": "row['second']",
                 "route_aliases": [second_fork_route],
+                "routes": [{"alias": second_fork_route, "key": "fork"}],
                 "fork_branches": [{"routes": [second_fork_route], "branch": "branch-2"}],
             },
         },
@@ -1286,7 +1401,12 @@ def test_propose_pipeline_rejects_row_union_branch_set_from_multiple_fork_gates(
         node["label"] = proposal_component_label("node", index)
     payload["nodes"][0]["behavior"] = {
         "kind": "gate",
+        "condition": "row['first']",
         "route_aliases": [direct_route, "route-1"],
+        "routes": [
+            {"alias": direct_route, "key": "direct"},
+            {"alias": "route-1", "key": "fork"},
+        ],
         "fork_branches": [{"routes": ["route-1"], "branch": "branch-1"}],
     }
     payload["graph"]["edges"][3]["from_endpoint"]["stable_id"] = second_gate_id
@@ -1337,6 +1457,7 @@ def test_propose_pipeline_rejects_row_union_success_targeting_downstream_barrier
             "branch_aliases": ["branch-1", "branch-2"],
             "policy": "require_all",
             "merge": "nested",
+            "timeout_seconds": None,
         }
         if barrier_type == "coalesce"
         else {
@@ -1580,6 +1701,7 @@ def test_propose_pipeline_rejects_one_fork_branch_set_consumed_by_two_coalesces(
                     "branch_aliases": branches,
                     "policy": "require_all",
                     "merge": "union",
+                    "timeout_seconds": None,
                 },
             }
             for index, stable_id in ((3, coalesce_a_id), (4, coalesce_b_id))

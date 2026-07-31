@@ -142,8 +142,12 @@ function behaviorSummary(behavior: Exclude<ProposalNodeBehavior, { kind: "gate" 
     }
     case "queue":
       return "Queue continues in sequence without correlating records.";
-    case "coalesce":
-      return `Joins ${behavior.branch_aliases.join(", ")} using ${behavior.policy} / ${behavior.merge}.`;
+    case "coalesce": {
+      const timeout = behavior.timeout_seconds === null
+        ? ""
+        : `; timeout ${behavior.timeout_seconds}s`;
+      return `Joins ${behavior.branch_aliases.join(", ")} using ${behavior.policy} / ${behavior.merge}${timeout}.`;
+    }
     case "row_union": {
       const timeout = behavior.timeout_seconds === null
         ? ""

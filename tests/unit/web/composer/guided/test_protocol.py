@@ -65,7 +65,13 @@ def _wire_payload_for_cardinality(
         behavior = {"kind": "transform"}
         plugin = "passthrough"
     elif node_type == "gate":
-        behavior = {"kind": "gate", "route_aliases": ["route-1"], "fork_branches": []}
+        behavior = {
+            "kind": "gate",
+            "condition": "row['accepted']",
+            "route_aliases": ["route-1"],
+            "routes": [{"alias": "route-1", "key": "true"}],
+            "fork_branches": [],
+        }
     elif node_type == "aggregation":
         behavior = {
             "kind": "aggregation",
@@ -86,6 +92,7 @@ def _wire_payload_for_cardinality(
             "branch_aliases": ["branch-1", "branch-2"],
             "policy": "require_all",
             "merge": "union",
+            "timeout_seconds": None,
         }
         row_cardinality["input"] = "branches"
     else:

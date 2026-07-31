@@ -393,11 +393,17 @@ function validateProposalBehavior(value: unknown, nodeType: string, path: string
   const exact = exactRecord(
     behavior,
     behaviorPath,
-    ["kind", "branch_aliases", "policy", "merge"],
+    ["kind", "branch_aliases", "policy", "merge", "timeout_seconds"],
   );
   const branchAliases = aliasArray(exact.branch_aliases, "branch", `${behaviorPath}.branch_aliases`, 2);
   if (!COALESCE_POLICIES.has(stringValue(exact.policy, `${behaviorPath}.policy`))) invalid(`${behaviorPath}.policy`, "unknown policy");
   if (!COALESCE_MERGES.has(stringValue(exact.merge, `${behaviorPath}.merge`))) invalid(`${behaviorPath}.merge`, "unknown merge");
+  if (exact.timeout_seconds !== null) {
+    finitePositiveNumber(
+      exact.timeout_seconds,
+      `${behaviorPath}.timeout_seconds`,
+    );
+  }
   return { kind: nodeType, routeAliases: [], forkBranches: [], branchAliases };
 }
 
@@ -561,12 +567,6 @@ function validateProposalPayload(value: unknown, path: string): void {
   const gateForks = new Map<string, Array<{ routes: string[]; branch: string }>>();
   const branchOrigins = new Map<string, string[]>();
   const branchOriginGates = new Map<string, string[]>();
-  const branchAdjacency = new Map<string, Map<string, Set<string>>>();
-  // Only the authoritative gate_fork edge and the final edge into a correlated
-  // barrier carry a branch alias; every processing hop between them is untagged.
-  // A branch's provenance walk therefore traverses untagged routing too, or any
-  // arm longer than one node is falsely rejected. Mirrors protocol.py.
-  const unbranchedAdjacency = new Map<string, Set<string>>();
   const branchUses: Array<{ branch: string; from: string; flowKind: string; path: string }> = [];
   const legalNodeFlows: Record<string, ReadonlySet<string>> = {
     transform: new Set(["node_success", "node_error"]),
@@ -623,29 +623,65 @@ function validateProposalPayload(value: unknown, path: string): void {
       );
     }
     if (edge.flow.branch != null) {
-      const branchGraph = branchAdjacency.get(edge.flow.branch) ?? new Map<string, Set<string>>();
-      branchGraph.set(fromId, new Set([...(branchGraph.get(fromId) ?? []), toId]));
-      if (!branchGraph.has(toId)) branchGraph.set(toId, new Set());
-      branchAdjacency.set(edge.flow.branch, branchGraph);
       branchUses.push({ branch: edge.flow.branch, from: fromId, flowKind: edge.flow.kind, path: edge.path });
-    } else {
-      unbranchedAdjacency.set(fromId, new Set([...(unbranchedAdjacency.get(fromId) ?? []), toId]));
     }
   }
 
   const branchDownstreamIds = (branch: string): Set<string> => {
-    const branchGraph = branchAdjacency.get(branch);
     const origins = branchOrigins.get(branch) ?? [];
     const seen = new Set(origins);
     const frontier = [...origins];
     while (frontier.length > 0) {
       const current = frontier.pop()!;
-      const routed = [...(branchGraph?.get(current) ?? []), ...(unbranchedAdjacency.get(current) ?? [])];
+      // The origin is already branch-specific. Traverse every directed edge
+      // from there so descendant forks remain valid; outer siblings are not
+      // reachable because their fork edges leave the shared parent gate.
+      const routed = adjacency.get(current) ?? [];
       for (const target of routed) {
         if (!seen.has(target)) { seen.add(target); frontier.push(target); }
       }
     }
     return seen;
+  };
+
+  const branchProducerIsCompatible = (
+    branch: string,
+    producerId: string,
+    visiting: ReadonlySet<string> = new Set(),
+  ): boolean => {
+    if (visiting.has(producerId)) return false;
+    const node = nodeById.get(producerId);
+    if (node === undefined) return false;
+    const predecessors = incomingEdges.get(producerId) ?? [];
+    if (predecessors.length === 0) return false;
+    const nextVisiting = new Set([...visiting, producerId]);
+    const originGates = branchOriginGates.get(branch) ?? [];
+    const origins = branchOrigins.get(branch) ?? [];
+    const predecessorIsCompatible = ({
+      from,
+      flow,
+    }: {
+      from: string;
+      flow: DecodedProposalFlow;
+    }): boolean => {
+      if (
+        flow.kind === "gate_fork"
+        && flow.branch === branch
+        && originGates.includes(from)
+        && origins.includes(producerId)
+      ) {
+        return true;
+      }
+      return branchProducerIsCompatible(
+        branch,
+        from,
+        nextVisiting,
+      );
+    };
+    if (["queue", "coalesce", "row_union"].includes(node.nodeType)) {
+      return predecessors.every(predecessorIsCompatible);
+    }
+    return predecessors.some(predecessorIsCompatible);
   };
 
   for (const node of nodes) {
@@ -759,7 +795,7 @@ function validateProposalPayload(value: unknown, path: string): void {
     const origins = branchOrigins.get(use.branch);
     if (origins === undefined || origins.length !== 1) invalid(`${use.path}.flow`, "branch has no unique gate_fork origin");
     if (use.flowKind === "gate_fork") continue;
-    if (!branchDownstreamIds(use.branch).has(use.from)) invalid(`${use.path}.flow`, "branch use is not downstream of gate_fork origin");
+    if (!branchProducerIsCompatible(use.branch, use.from)) invalid(`${use.path}.flow`, "branch use is not downstream of gate_fork origin");
   }
   for (const node of nodes.filter(
     (item) => item.nodeType === "coalesce" || item.nodeType === "row_union",
@@ -1233,7 +1269,11 @@ function decodeProposalBehavior(
       };
     }
     case "coalesce": {
-      const exact = exactRecord(behavior, behaviorPath, ["kind", "branch_aliases", "policy", "merge"]);
+      const exact = exactRecord(
+        behavior,
+        behaviorPath,
+        ["kind", "branch_aliases", "policy", "merge", "timeout_seconds"],
+      );
       const policy = stringValue(exact.policy, `${behaviorPath}.policy`);
       if (policy !== "require_all" && policy !== "quorum" && policy !== "best_effort" && policy !== "first") {
         invalid(`${behaviorPath}.policy`, "unknown policy");
@@ -1242,11 +1282,18 @@ function decodeProposalBehavior(
       if (merge !== "union" && merge !== "nested" && merge !== "select") {
         invalid(`${behaviorPath}.merge`, "unknown merge");
       }
+      const timeoutSeconds = exact.timeout_seconds === null
+        ? null
+        : finitePositiveNumber(
+          exact.timeout_seconds,
+          `${behaviorPath}.timeout_seconds`,
+        );
       return {
         kind: "coalesce",
         branch_aliases: aliasArray(exact.branch_aliases, "branch", `${behaviorPath}.branch_aliases`, 2),
         policy,
         merge,
+        timeout_seconds: timeoutSeconds,
       };
     }
     case "row_union": {
