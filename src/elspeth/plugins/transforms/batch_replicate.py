@@ -42,7 +42,7 @@ class BatchReplicateConfig(TransformDataConfig):
         default=1,
         ge=1,
         le=10000,
-        description="Default number of copies if copies_field is missing or invalid",
+        description="Default number of copies when copies_field is absent",
     )
     max_copies: int = Field(
         default=10000,
@@ -98,7 +98,7 @@ class BatchReplicate(BaseTransform):
     name = "batch_replicate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8cdcf8ae08de148e"
+    source_file_hash: str | None = "sha256:03bc22d9f674bba6"
     config_model = BatchReplicateConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
     usage_when_to_use: str = (
