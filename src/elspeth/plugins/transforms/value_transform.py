@@ -138,14 +138,30 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:53f11fc53dbcb9c5"
+    source_file_hash: str | None = "sha256:698d5b9fe188c8fe"
     config_model = ValueTransformConfig
     passes_through_input = True
+    usage_when_to_use: str = (
+        "Use for ordered expression-based field calculation when every input row follows pass-through semantics "
+        "and each operation may read fields computed by an earlier operation."
+    )
     usage_when_not_to_use = (
         "Row filtering or routing — value_transform never drops rows; every row passes "
         "through with its computed fields. Use a gate node for conditional row filtering "
         "(or keyword_filter for regex pattern blocking)."
     )
+    example_use: str = """transform:
+  plugin: value_transform
+  options:
+    operations:
+      - target: total
+        expression: "row['price'] * row['quantity']"
+      - target: discounted_total
+        expression: "row['total'] * 0.9"
+    schema:
+      mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("expressions", "calculation", "fields")
 
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__(config)

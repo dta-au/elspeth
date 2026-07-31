@@ -102,8 +102,34 @@ class ReportAssemble(BaseTransform):
     name = "report_assemble"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b426d7331ebaacce"
+    source_file_hash: str | None = "sha256:54e8b0dc7490247f"
     config_model = ReportAssembleConfig
+    usage_when_to_use: str = (
+        "Use in an aggregations node to assemble each flushed batch into a page or section of a "
+        "plain-text, Markdown, or HTML-fragment report with pagination metadata."
+    )
+    usage_when_not_to_use: str = (
+        "Not a per-row transform or a whole-run document writer: use an ordinary transform for "
+        "independent rows and configure the aggregation trigger to define each report batch."
+    )
+    example_use: str = """aggregations:
+  - name: report_pages
+    plugin: report_assemble
+    input: report_lines
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 25
+    output_mode: transform
+    options:
+      text_field: line
+      output_field: report_body
+      format: markdown
+      title: Run report
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("report", "aggregation", "batch", "pagination")
     is_batch_aware = True
 
     @classmethod
