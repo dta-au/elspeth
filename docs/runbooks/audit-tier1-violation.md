@@ -51,7 +51,12 @@ quotable value sufficient to find the server-side record:
 
 - The `X-Request-ID` response header, stamped on **every** response by
   `RequestIdMiddleware`. This is the handle that always works.
-- The `request_id` field in the error body. It is always equal to the header.
+- The `request_id` field in the error body. When set it is always equal to the
+  header. A `null` value means no middleware stamped an id for that request —
+  it does not happen in a normally-configured deployment, and it is the signal
+  to check that `RequestIdMiddleware` is installed rather than to hunt for a
+  correlation that was never minted. The same applies to `request_id` in the
+  server log events below.
 
 `request_id` sits in one of two positions, and which one depends on how the
 error was rendered:
