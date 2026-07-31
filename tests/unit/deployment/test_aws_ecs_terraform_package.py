@@ -1031,6 +1031,56 @@ def test_fresh_machine_pulls_the_candidate_before_local_inspection() -> None:
     assert section.index('docker pull "$CANDIDATE_IMAGE"') < section.index("docker inspect")
 
 
+def test_private_candidate_pulls_use_isolated_ecr_credentials_for_registry_commands() -> None:
+    readme = _text("README.md")
+    acceptance_start = readme.index("### Source-free post-enable acceptance")
+    inspection_start = readme.index("Before promoting a candidate")
+    auth_blocks = (
+        (
+            readme[acceptance_start : readme.index("## Immutable RDS trust-root admission", acceptance_start)],
+            "candidate_pull_work",
+            ('docker pull "$CANDIDATE_IMAGE"',),
+        ),
+        (
+            readme[inspection_start : readme.index("### Upgrading an existing install", inspection_start)],
+            "candidate_inspection_work",
+            (
+                'docker pull "$CANDIDATE_IMAGE"',
+                'docker buildx imagetools inspect "$CANDIDATE_IMAGE"',
+            ),
+        ),
+    )
+
+    for section, work_variable, registry_commands in auth_blocks:
+        registry = "CANDIDATE_ECR_REGISTRY=${CANDIDATE_IMAGE%%/*}"
+        work_create = f"{work_variable}=$(mktemp -d -p /tmp "
+        docker_config = f'export DOCKER_CONFIG="${work_variable}/docker-config"'
+        cleanup = (
+            f"""trap 'docker logout "$CANDIDATE_ECR_REGISTRY" >/dev/null 2>&1 || true; """
+            f"""rm -rf -- "${work_variable}"' EXIT"""
+        )
+        login = 'docker login --username AWS --password-stdin "$CANDIDATE_ECR_REGISTRY"'
+
+        assert registry in section
+        assert work_create in section
+        subshell_start = section.index("(\n", section.index(work_create))
+        subshell_end = section.index("\n)", subshell_start)
+        block = section[subshell_start:subshell_end]
+
+        assert re.match(r"\(\n\s+set -e\n", block)
+        assert f'mkdir -m 700 "${work_variable}/docker-config"' in section
+        assert docker_config in block
+        assert cleanup in block
+        assert block.count("docker logout") == 1
+        assert "aws ecr get-login-password" in block
+        assert login in block
+        assert block.index(docker_config) < block.index(cleanup) < block.index("aws ecr get-login-password")
+        assert block.index("aws ecr get-login-password") < block.index(login)
+        for command in registry_commands:
+            assert command in block
+            assert block.index(login) < block.index(command)
+
+
 def test_inventory_v7_exactly_matches_the_runtime_validator_contract() -> None:
     locals = _text("modules/scenario/locals.tf")
     ecs = _text("modules/scenario/ecs.tf")

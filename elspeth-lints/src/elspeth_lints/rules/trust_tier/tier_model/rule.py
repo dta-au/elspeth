@@ -1215,33 +1215,91 @@ class TierModelVisitor(ast.NodeVisitor):
             return False
         return current_function.name in self._R5_NAMED_BOUNDARY_CONTEXTS.get(self.file_path, frozenset())
 
-    def _is_fail_loud_assert_test_isinstance(self, node: ast.Call) -> bool:
-        """Return True when ``node`` is a direct conjunct of an assert test.
-
-        The exemption follows only a direct chain of ``and`` nodes up to
-        ``Assert.test``. Any intervening wrapper, inversion, disjunction,
-        comprehension, lambda, or assert message keeps the R5 finding.
-        Descendants of the ``isinstance`` call are still visited normally, so
-        nested masking calls retain their own rule findings.
-        """
+    def _containing_direct_assert_test(self, node: ast.Call) -> ast.Assert | None:
+        """Return the assert whose direct test conjunct contains ``node``."""
         child: ast.AST = node
         depth = 1
         while True:
             parent = self._ancestor_node(depth)
             if isinstance(parent, ast.Assert):
-                return parent.test is child
+                return parent if parent.test is child else None
             if not isinstance(parent, ast.BoolOp) or not isinstance(parent.op, ast.And):
-                return False
-            if not any(value is child for value in parent.values):
-                return False
+                return None
+            if not parent.values or parent.values[0] is not child:
+                return None
             child = parent
             depth += 1
 
+    @staticmethod
+    def _is_matching_isinstance_call(candidate: ast.AST, node: ast.Call) -> bool:
+        """Match calls whose subject and type are stable name lookups."""
+        return (
+            isinstance(candidate, ast.Call)
+            and isinstance(candidate.func, ast.Name)
+            and candidate.func.id == "isinstance"
+            and len(candidate.args) == 2
+            and not candidate.keywords
+            and len(node.args) == 2
+            and not node.keywords
+            and isinstance(candidate.args[0], ast.Name)
+            and isinstance(candidate.args[1], ast.Name)
+            and isinstance(node.args[0], ast.Name)
+            and isinstance(node.args[1], ast.Name)
+            and candidate.args[0].id == node.args[0].id
+            and candidate.args[1].id == node.args[1].id
+        )
+
+    def _guard_rejects_isinstance_mismatch(self, test: ast.AST, node: ast.Call) -> bool:
+        """Return True when ``test`` identifies the inverse of ``node``."""
+        if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+            return self._is_matching_isinstance_call(test.operand, node)
+        return False
+
+    @staticmethod
+    def _statement_sequence_terminates(statements: Sequence[ast.stmt]) -> bool:
+        """Return True for a suite with an unconditional surviving exit."""
+        if not statements:
+            return False
+        final = statements[-1]
+        if isinstance(final, (ast.Raise, ast.Return, ast.Break, ast.Continue)):
+            return True
+        if isinstance(final, ast.If):
+            return TierModelVisitor._statement_sequence_terminates(final.body) and TierModelVisitor._statement_sequence_terminates(
+                final.orelse
+            )
+        return False
+
+    def _is_matching_runtime_guard(self, statement: ast.stmt, node: ast.Call) -> bool:
+        """Return True for ``if not isinstance(...): <surviving exit>``."""
+        return (
+            isinstance(statement, ast.If)
+            and not statement.orelse
+            and self._guard_rejects_isinstance_mismatch(statement.test, node)
+            and self._statement_sequence_terminates(statement.body)
+        )
+
+    def _is_runtime_guarded_assert_test_isinstance(self, node: ast.Call) -> bool:
+        """Return True when the immediately preceding statement is a stable guard."""
+        assertion = self._containing_direct_assert_test(node)
+        if assertion is None:
+            return False
+
+        assertion_index = self.node_stack.index(assertion)
+        container = self.node_stack[assertion_index - 1]
+        for _field_name, value in ast.iter_fields(container):
+            if not isinstance(value, list):
+                continue
+            for index, item in enumerate(value):
+                if item is assertion:
+                    return index > 0 and isinstance(value[index - 1], ast.stmt) and self._is_matching_runtime_guard(value[index - 1], node)
+        return False
+
     def _is_allowed_r5_context(self, node: ast.Call) -> bool:
         """Return True for R5a/R5b contexts where isinstance is the desired guard."""
+        if any(isinstance(ancestor, ast.Assert) for ancestor in self.node_stack[:-1]):
+            return self._is_runtime_guarded_assert_test_isinstance(node)
         return (
-            self._is_fail_loud_assert_test_isinstance(node)
-            or self._is_tier1_frozen_dataclass_post_init_guard(node)
+            self._is_tier1_frozen_dataclass_post_init_guard(node)
             or self._is_pydantic_before_validator()
             or self._is_fastapi_route_handler()
             or self._is_named_tier3_boundary_context()
