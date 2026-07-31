@@ -2101,6 +2101,9 @@ async def _plan_pipeline_inner(
                     raise PipelinePlannerError("planner composition turn budget exhausted", code="COMPOSITION_EXHAUSTED")
             call = terminal_calls[0]
             terminal_feedback: Mapping[str, Any] | None = None
+            # Only fingerprinted feedback kinds can repeat; schema and
+            # deferred-claim feedback carry no rejection identity to compare.
+            repeated_terminal_fingerprint = False
             pipeline: dict[str, Any] | None = None
             claimed_deferred_intent_ids: tuple[str, ...] = ()
             allowed_terminal_keys = {"pipeline", "claimed_deferred_intent_ids"}
@@ -2124,7 +2127,14 @@ async def _plan_pipeline_inner(
             if terminal_feedback is None:
                 assert pipeline is not None
                 if pipeline.get("source") is None and pipeline.get("sources") is None:
-                    terminal_feedback = _allowlisted_candidate_feedback(_missing_source_rejection(current_state))
+                    # Fingerprinted like every other candidate rejection: a
+                    # sourceless candidate re-emitted unchanged must still draw
+                    # the repeat notice rather than silently burning budget.
+                    missing_source = _missing_source_rejection(current_state)
+                    missing_source_fingerprint = _rejection_fingerprint(missing_source)
+                    repeated_terminal_fingerprint = missing_source_fingerprint in seen_rejection_fingerprints
+                    seen_rejection_fingerprints.add(missing_source_fingerprint)
+                    terminal_feedback = _allowlisted_candidate_feedback(missing_source, repeated_fingerprint=repeated_terminal_fingerprint)
                 else:
                     try:
                         finalizer_result = candidate_finalizer(pipeline)
@@ -2147,22 +2157,44 @@ async def _plan_pipeline_inner(
             if terminal_feedback is not None:
                 last_rejection_codes = _feedback_error_codes(terminal_feedback)
                 if is_hatch_turn:
-                    trail.log_attempt("hatch", "candidate_rejected", codes=last_rejection_codes, led_to="terminal")
+                    trail.log_attempt(
+                        "hatch",
+                        "candidate_rejected",
+                        codes=last_rejection_codes,
+                        led_to="terminal",
+                        repeated_fingerprint=repeated_terminal_fingerprint,
+                    )
                     assert hatch_error is not None
                     raise hatch_error from None
                 repair_count += 1
                 if repair_count > repair_budget:
                     if _hatch_available():
                         trail.log_attempt(
-                            attempt_phase, "candidate_rejected", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
+                            attempt_phase,
+                            "candidate_rejected",
+                            codes=last_rejection_codes,
+                            planner_code="REPAIR_EXHAUSTED",
+                            led_to="hatch",
+                            repeated_fingerprint=repeated_terminal_fingerprint,
                         )
                         _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=terminal_feedback)
                         continue
                     trail.log_attempt(
-                        attempt_phase, "candidate_rejected", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
+                        attempt_phase,
+                        "candidate_rejected",
+                        codes=last_rejection_codes,
+                        planner_code="REPAIR_EXHAUSTED",
+                        led_to="terminal",
+                        repeated_fingerprint=repeated_terminal_fingerprint,
                     )
                     raise _rejection_exhausted() from None
-                trail.log_attempt(attempt_phase, "candidate_rejected", codes=last_rejection_codes, led_to="repair")
+                trail.log_attempt(
+                    attempt_phase,
+                    "candidate_rejected",
+                    codes=last_rejection_codes,
+                    led_to="repair",
+                    repeated_fingerprint=repeated_terminal_fingerprint,
+                )
                 messages.append(_assistant_tool_calls_message(message, calls))
                 messages.append(
                     {

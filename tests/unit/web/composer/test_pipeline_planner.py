@@ -39,6 +39,7 @@ from elspeth.web.composer.guided.planning import guided_redacted_current_state_c
 from elspeth.web.composer.guided.prompts import load_step_planner_skill
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.pipeline_planner import (
+    _REPEAT_NOTICE,
     PLANNER_DISCOVERY_TOOL_NAMES,
     PipelinePlannerError,
     PlannerBudgetPolicy,
@@ -3233,6 +3234,48 @@ async def test_guided_sources_omitted_candidate_gets_bounded_repair_not_integrit
 
     assert proposal.proposal.repair_count == 1
     assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _missing_source_feedback()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "finalizer"),
+    [
+        (PlannerSurface.FREEFORM, None),
+        (PlannerSurface.GUIDED_STAGED, _binder_style_finalizer),
+    ],
+)
+async def test_repeated_sources_omitted_candidate_draws_the_repeat_notice(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    surface: PlannerSurface,
+    finalizer: Any,
+) -> None:
+    """A re-emitted sourceless candidate is told it changed nothing.
+
+    Rejecting the shape in the planner loop must not drop it out of rejection
+    fingerprinting: an identical rejection repeating across attempts is a
+    feedback-quality defect the loop has to name, not silently burn budget on.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=2,
+        surface=surface,
+        candidate_finalizer=finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 2
+    first = json.loads(completion.requests[1]["messages"][-1]["content"])
+    second = json.loads(completion.requests[2]["messages"][-1]["content"])
+    assert first == _missing_source_feedback()
+    assert second == {**_missing_source_feedback(), "repeat_notice": _REPEAT_NOTICE}
 
 
 @pytest.mark.asyncio
