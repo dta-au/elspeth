@@ -12,10 +12,9 @@ runtime boundary contracts that need a lower-layer role check.
 
 from __future__ import annotations
 
-from typing import Protocol, cast, runtime_checkable
+from typing import Protocol, cast
 
 
-@runtime_checkable
 class ContractablePlugin(Protocol):
     """Minimal plugin surface the declaration contracts depend on."""
 
@@ -23,12 +22,10 @@ class ContractablePlugin(Protocol):
     node_id: str | None
 
 
-@runtime_checkable
 class DeclaredOutputFieldsPlugin(ContractablePlugin, Protocol):
     declared_output_fields: frozenset[str]
 
 
-@runtime_checkable
 class DeclaredInputFieldsPlugin(ContractablePlugin, Protocol):
     declared_input_fields: frozenset[str]
     is_batch_aware: bool

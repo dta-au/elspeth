@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import ClassVar, Literal, Protocol, get_args, runtime_checkable
+from typing import ClassVar, Literal, Protocol, get_args
 from uuid import UUID, uuid5
 
 from elspeth.contracts.enums import CreationModality
@@ -412,7 +412,6 @@ class BlobForkCleanupResult:
         freeze_fields(self, "deleted_ids", "errors")
 
 
-@runtime_checkable
 class BlobServiceProtocol(Protocol):
     """Protocol for blob persistence and lifecycle operations."""
 
