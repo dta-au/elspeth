@@ -118,9 +118,35 @@ class BatchPairedPreference(BaseTransform):
     name = "batch_paired_preference"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:391b773d28aa4da1"
+    source_file_hash: str | None = "sha256:e5e5d9e957524267"
     config_model = BatchPairedPreferenceConfig
     is_batch_aware = True
+    usage_when_to_use: str = (
+        "Use when a pair ID identifies matched baseline and candidate rows in the same flushed window and you "
+        "need win, loss, tie, and score-delta summaries."
+    )
+    usage_when_not_to_use: str = (
+        "Not for unmatched cohorts or stateful reconciliation: split-window pairs never join later, so choose a "
+        "trigger that keeps each complete pair together."
+    )
+    example_use: str = """aggregations:
+  - name: paired_preference
+    plugin: batch_paired_preference
+    input: preference_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      pair_field: case_id
+      variant_field: variant
+      score_field: preference_score
+      baseline_variant: control
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "paired", "comparison")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

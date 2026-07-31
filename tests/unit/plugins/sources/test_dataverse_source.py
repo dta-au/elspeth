@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import urllib.parse
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
+import httpx
 import pytest
 
 from elspeth.contracts import CallStatus
+from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.dataverse import (
+    DataverseClient,
     DataverseClientError,
     DataversePageResponse,
 )
@@ -53,7 +57,7 @@ def _base_config(**overrides: Any) -> dict[str, Any]:
     config: dict[str, Any] = {
         "environment_url": VALID_ENV_URL,
         "auth": VALID_AUTH,
-        "entity": "contacts",
+        "entity": "contact",
         "schema": DYNAMIC_SCHEMA,
         "on_validation_failure": QUARANTINE_SINK,
     }
@@ -66,7 +70,7 @@ def _fetchxml_config(**overrides: Any) -> dict[str, Any]:
     config: dict[str, Any] = {
         "environment_url": VALID_ENV_URL,
         "auth": VALID_AUTH,
-        "fetch_xml": '<fetch><entity name="contacts"><attribute name="fullname"/></entity></fetch>',
+        "fetch_xml": '<fetch><entity name="contact"><attribute name="fullname"/></entity></fetch>',
         "schema": DYNAMIC_SCHEMA,
         "on_validation_failure": QUARANTINE_SINK,
     }
@@ -191,7 +195,7 @@ class _DataverseClientFake:
         odata_pages: list[DataversePageResponse] | None = None,
         fetchxml_pages: list[DataversePageResponse] | None = None,
     ) -> None:
-        self.get_page = _CallRecorder(return_value=metadata_page or _make_metadata_page("contacts"))
+        self.get_page = _CallRecorder(return_value=metadata_page or _make_metadata_page("contact"))
         self.paginate_odata = _CallRecorder(return_value=iter(odata_pages or []))
         self.paginate_fetchxml = _CallRecorder(return_value=iter(fetchxml_pages or []))
         self.get_auth_headers = _CallRecorder(return_value={"Authorization": "Bearer test"})
@@ -209,11 +213,17 @@ class _OperationLandscapeFake:
         )
 
 
-def _make_metadata_page(entity: str, url: str | None = None) -> DataversePageResponse:
-    request_url = url or f"{VALID_ENV_URL}/api/data/v9.2/EntityDefinitions(LogicalName='{entity}')?$select=LogicalName"
+def _make_metadata_page(
+    logical_name: str,
+    url: str | None = None,
+    *,
+    entity_set_name: str = "contacts",
+    rows: list[dict[str, Any]] | None = None,
+) -> DataversePageResponse:
+    request_url = url or f"{VALID_ENV_URL}/api/data/v9.2/EntityDefinitions(LogicalName='{logical_name}')?$select=LogicalName,EntitySetName"
     return DataversePageResponse(
         status_code=200,
-        rows=[{"LogicalName": entity}],
+        rows=rows if rows is not None else [{"LogicalName": logical_name, "EntitySetName": entity_set_name}],
         latency_ms=5.0,
         headers={"content-type": "application/json"},
         request_headers={"Authorization": "<fingerprint:test-fake>"},
@@ -261,6 +271,23 @@ def _client_secret_credential_factory(*_args: Any, **_kwargs: Any) -> _Credentia
     return _CredentialFake()
 
 
+def _make_ssrf_safe(url: str) -> SSRFSafeRequest:
+    parsed = urllib.parse.urlparse(url)
+    hostname = parsed.hostname or "localhost"
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    return SSRFSafeRequest(
+        original_url=url,
+        resolved_ip="127.0.0.1",
+        host_header=hostname,
+        port=parsed.port or 443,
+        path=path,
+        scheme=parsed.scheme,
+        bare_hostname=hostname,
+    )
+
+
 def _dataverse_client_factory(client: _DataverseClientFake) -> Callable[..., _DataverseClientFake]:
     def factory(*_args: Any, **_kwargs: Any) -> _DataverseClientFake:
         return client
@@ -302,7 +329,7 @@ def _make_source_for_load(
     if source._entity is not None:
         metadata_url = (
             f"{source._environment_url.rstrip('/')}/api/data/{source._api_version}/"
-            f"EntityDefinitions(LogicalName='{source._entity}')?$select=LogicalName"
+            f"EntityDefinitions(LogicalName='{source._entity}')?$select=LogicalName,EntitySetName"
         )
         client = _DataverseClientFake(
             metadata_page=_make_metadata_page(source._entity, metadata_url),
@@ -360,8 +387,79 @@ class TestDataverseSourceConfigValidation:
         from elspeth.plugins.sources.dataverse import DataverseSourceConfig
 
         cfg = DataverseSourceConfig.from_dict(_base_config())
-        assert cfg.entity == "contacts"
+        assert cfg.entity == "contact"
         assert cfg.fetch_xml is None
+
+    @pytest.mark.parametrize(
+        "entity",
+        ["contact name", "contact/path", "contact?query", "contact#fragment", "contact\x00name", "1contact", " contact", "contact "],
+    )
+    def test_entity_rejects_values_outside_dataverse_identifier_grammar(self, entity: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        with pytest.raises(PluginConfigError, match="ASCII identifier"):
+            DataverseSourceConfig.from_dict(_base_config(entity=entity))
+
+    @pytest.mark.parametrize(
+        "entity_set_name",
+        [
+            "contact sets",
+            "contacts/path",
+            "contacts?query",
+            "contacts#fragment",
+            "contacts\x00name",
+            "1contacts",
+            " contacts",
+            "contacts ",
+        ],
+    )
+    def test_entity_set_name_rejects_values_outside_dataverse_identifier_grammar(self, entity_set_name: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        with pytest.raises(PluginConfigError, match="ASCII identifier"):
+            DataverseSourceConfig.from_dict(_base_config(entity_set_name=entity_set_name))
+
+    @pytest.mark.parametrize("entity", ["contact", "_contact2", "contact_name2"])
+    def test_logical_names_accept_lowercase_ascii_identifiers(self, entity: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        cfg = DataverseSourceConfig.from_dict(_base_config(entity=entity))
+        assert cfg.entity == entity
+
+    @pytest.mark.parametrize("entity", ["Contact", "CONTACT", "contact_Name"])
+    def test_logical_names_reject_uppercase_ascii(self, entity: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        with pytest.raises(PluginConfigError, match="lowercase ASCII identifier"):
+            DataverseSourceConfig.from_dict(_base_config(entity=entity))
+
+    @pytest.mark.parametrize("entity_set_name", ["contacts", "_Contacts2", "Contact_Sets2"])
+    def test_entity_set_names_preserve_ascii_case(self, entity_set_name: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        cfg = DataverseSourceConfig.from_dict(_base_config(entity_set_name=entity_set_name))
+        assert cfg.entity_set_name == entity_set_name
+
+    @pytest.mark.parametrize("entity_set_name", ["", "   "])
+    def test_entity_set_name_rejects_blank_values(self, entity_set_name: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        with pytest.raises(PluginConfigError, match="entity_set_name"):
+            DataverseSourceConfig.from_dict(_base_config(entity_set_name=entity_set_name))
+
+    @pytest.mark.parametrize("entity_set_name", ["<OPERATOR_REQUIRED>", "operator required", "operator_required"])
+    def test_entity_set_name_rejects_placeholders(self, entity_set_name: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        with pytest.raises(PluginConfigError, match="placeholder"):
+            DataverseSourceConfig.from_dict(_base_config(entity_set_name=entity_set_name))
+
+    @pytest.mark.parametrize("config", [_base_config(entity_set_name="contacts"), _fetchxml_config(entity_set_name="contacts")])
+    def test_entity_set_name_is_available_in_both_query_modes(self, config: dict[str, Any]) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        cfg = DataverseSourceConfig.from_dict(config)
+        assert cfg.entity_set_name == "contacts"
 
     @pytest.mark.parametrize("entity", ["<OPERATOR_REQUIRED>", "operator required", "operator_required"])
     def test_entity_placeholder_rejected(self, entity: str) -> None:
@@ -370,7 +468,7 @@ class TestDataverseSourceConfigValidation:
         with pytest.raises(PluginConfigError, match="placeholder"):
             DataverseSourceConfig.from_dict(_base_config(entity=entity))
 
-    @pytest.mark.parametrize("entity", ["todo", "unknown", "unset", "required", "<literal>"])
+    @pytest.mark.parametrize("entity", ["todo", "unknown", "unset", "required"])
     def test_plain_placeholder_words_can_be_entity_names(self, entity: str) -> None:
         from elspeth.plugins.sources.dataverse import DataverseSourceConfig
 
@@ -399,12 +497,23 @@ class TestDataverseSourceConfigValidation:
         assert cfg.entity is None
         assert cfg.fetch_xml is not None
 
+    @pytest.mark.parametrize(
+        "logical_name",
+        ["Contact", "contact_Name", "contact name", "contact/path", "contact?query", "contact#fragment", "1contact"],
+    )
+    def test_fetchxml_entity_rejects_invalid_logical_name(self, logical_name: str) -> None:
+        from elspeth.plugins.sources.dataverse import DataverseSourceConfig
+
+        fetch_xml = f'<fetch><entity name="{logical_name}"><attribute name="fullname"/></entity></fetch>'
+        with pytest.raises(PluginConfigError, match="ASCII identifier"):
+            DataverseSourceConfig.from_dict(_fetchxml_config(fetch_xml=fetch_xml))
+
     def test_mutual_exclusion_both_present(self) -> None:
         """Reject config with both entity and fetch_xml."""
         from elspeth.plugins.sources.dataverse import DataverseSourceConfig
 
         config = _base_config(
-            fetch_xml='<fetch><entity name="contacts"/></fetch>',
+            fetch_xml='<fetch><entity name="contact"/></fetch>',
         )
         with pytest.raises(PluginConfigError, match="exactly one"):
             DataverseSourceConfig.from_dict(config)
@@ -518,7 +627,7 @@ class TestDataverseSourceConfigValidation:
         from elspeth.plugins.sources.dataverse import DataverseSourceConfig
 
         config = _fetchxml_config(
-            fetch_xml='<query><entity name="contacts"/></query>',
+            fetch_xml='<query><entity name="contact"/></query>',
         )
         with pytest.raises(PluginConfigError, match="root element must be <fetch>"):
             DataverseSourceConfig.from_dict(config)
@@ -738,7 +847,7 @@ class TestDataverseSourceConstruction:
         """DataverseSource can be constructed with structured query config."""
         source = _make_source(_base_config())
         assert source.name == "dataverse"
-        assert source._entity == "contacts"
+        assert source._entity == "contact"
         assert source._fetch_xml is None
 
     def test_construction_fetchxml_query(self) -> None:
@@ -791,7 +900,7 @@ class TestDataverseSourceConstruction:
         )
         ctx = _mock_source_context()
 
-        with pytest.raises(DataverseClientError, match="Entity 'contacts' not found"):
+        with pytest.raises(DataverseClientError, match="Entity 'contact' not found"):
             list(source.load(ctx))
 
         assert ctx.record_call.call_count == 1
@@ -799,8 +908,8 @@ class TestDataverseSourceConstruction:
         assert call_kwargs["status"] == CallStatus.ERROR
         assert call_kwargs["error"]["status_code"] == 404
 
-    def test_load_metadata_probe_403_records_error_and_continues(self) -> None:
-        """403 metadata probe is audited but remains non-fatal to the load."""
+    def test_load_metadata_probe_403_without_fallback_fails_closed(self) -> None:
+        """403 metadata probe is audited and cannot guess an entity-set path."""
         mock_client = _DataverseClientFake(odata_pages=[_make_page([{"contactid": "1", "fullname": "Alice"}])])
         mock_client.get_page.side_effect = DataverseClientError(
             "Forbidden",
@@ -813,13 +922,52 @@ class TestDataverseSourceConstruction:
         )
         ctx = _mock_source_context()
 
+        with pytest.raises(DataverseClientError, match="entity_set_name"):
+            list(source.load(ctx))
+
+        assert ctx.record_call.call_count == 1
+        metadata_call = ctx.record_call.call_args.kwargs
+        assert metadata_call["status"] == CallStatus.ERROR
+        assert metadata_call["error"]["status_code"] == 403
+        mock_client.paginate_odata.assert_not_called()
+
+    def test_load_metadata_probe_403_uses_explicit_entity_set_fallback(self) -> None:
+        """403 metadata probe may use an explicit, validated entity-set identity."""
+        mock_client = _DataverseClientFake(odata_pages=[_make_page([{"contactid": "1", "fullname": "Alice"}])])
+        mock_client.get_page.side_effect = DataverseClientError(
+            "Forbidden",
+            retryable=False,
+            status_code=403,
+        )
+        source = _make_source_for_start_and_load(
+            _base_config(entity_set_name="contacts"),
+            mock_client=mock_client,
+        )
+        ctx = _mock_source_context()
+
         rows = list(source.load(ctx))
 
         assert len(rows) == 1
         assert ctx.record_call.call_count == 2
-        metadata_call = ctx.record_call.call_args_list[0].kwargs
-        assert metadata_call["status"] == CallStatus.ERROR
-        assert metadata_call["error"]["status_code"] == 403
+        assert ctx.record_call.call_args_list[0].kwargs["status"] == CallStatus.ERROR
+        assert mock_client.paginate_odata.call_args.args[0].startswith(f"{VALID_ENV_URL}/api/data/v9.2/contacts")
+
+    def test_successful_metadata_conflicting_with_fallback_fails_closed(self) -> None:
+        mock_client = _DataverseClientFake(
+            metadata_page=_make_metadata_page("contact", entity_set_name="people"),
+            odata_pages=[_make_page([{"contactid": "1"}])],
+        )
+        source = _make_source_for_start_and_load(
+            _base_config(entity_set_name="contacts"),
+            mock_client=mock_client,
+        )
+        ctx = _mock_source_context()
+
+        with pytest.raises(DataverseClientError, match="does not match"):
+            list(source.load(ctx))
+
+        mock_client.paginate_odata.assert_not_called()
+        assert ctx.record_call.call_args.kwargs["status"] == CallStatus.ERROR
 
     def test_load_metadata_probe_5xx_reraises(self) -> None:
         """5xx metadata probe is audited and re-raises the original error."""
@@ -882,31 +1030,31 @@ class TestBuildQueryUrl:
     def test_entity_only(self) -> None:
         """URL with entity only, no query params."""
         source = _make_source(_base_config())
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         assert url == "https://myorg.crm.dynamics.com/api/data/v9.2/contacts"
 
     def test_with_select(self) -> None:
         """URL includes $select parameter."""
         source = _make_source(_base_config(select=["contactid", "fullname"]))
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         assert "$select=contactid,fullname" in url
 
     def test_with_filter(self) -> None:
         """URL includes $filter parameter (percent-encoded)."""
         source = _make_source(_base_config(filter="statecode eq 0"))
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         assert "$filter=statecode%20eq%200" in url
 
     def test_with_orderby(self) -> None:
         """URL includes $orderby parameter (percent-encoded)."""
         source = _make_source(_base_config(orderby="createdon desc"))
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         assert "$orderby=createdon%20desc" in url
 
     def test_with_top(self) -> None:
         """URL includes $top parameter."""
         source = _make_source(_base_config(top=50))
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         assert "$top=50" in url
 
     def test_with_all_params(self) -> None:
@@ -919,7 +1067,7 @@ class TestBuildQueryUrl:
                 top=10,
             )
         )
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         assert "$select=contactid" in url
         assert "$filter=statecode%20eq%200" in url
         assert "$orderby=createdon%20desc" in url
@@ -928,13 +1076,13 @@ class TestBuildQueryUrl:
     def test_custom_api_version(self) -> None:
         """URL uses configured API version."""
         source = _make_source(_base_config(api_version="v9.1"))
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         assert "/api/data/v9.1/" in url
 
     def test_trailing_slash_on_env_url(self) -> None:
         """Trailing slash on environment_url is stripped."""
         source = _make_source(_base_config(environment_url="https://myorg.crm.dynamics.com/"))
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         assert "//api" not in url
         assert "/api/data/" in url
 
@@ -946,6 +1094,137 @@ class TestBuildQueryUrl:
 
 class TestDataverseSourceLoadStructured:
     """Tests for load() with structured OData queries."""
+
+    def test_structured_load_resolves_logical_name_to_entity_set_before_pagination(self) -> None:
+        metadata_page = _make_metadata_page("contact", entity_set_name="contacts")
+        mock_client = _DataverseClientFake(
+            metadata_page=metadata_page,
+            odata_pages=[_make_page([{"contactid": "1"}])],
+        )
+        source = _make_source_for_start_and_load(
+            _base_config(
+                select=["contactid", "fullname"],
+                filter="statecode eq 0",
+                orderby="createdon desc",
+                top=25,
+            ),
+            mock_client=mock_client,
+        )
+
+        list(source.load(_mock_source_context()))
+
+        metadata_url = mock_client.get_page.call_args.args[0]
+        assert "EntityDefinitions(LogicalName='contact')" in metadata_url
+        assert metadata_url.endswith("?$select=LogicalName,EntitySetName")
+        data_url = mock_client.paginate_odata.call_args.args[0]
+        assert data_url == (
+            f"{VALID_ENV_URL}/api/data/v9.2/contacts"
+            "?$select=contactid,fullname&$filter=statecode%20eq%200&$orderby=createdon%20desc&$top=25"
+        )
+
+    def test_metadata_error_without_request_url_does_not_invent_audit_url(self) -> None:
+        mock_client = _DataverseClientFake()
+        mock_client.get_page.side_effect = DataverseClientError(
+            "metadata request rejected before URL binding",
+            retryable=False,
+            error_category="protocol_error",
+        )
+        source = _make_source_for_start_and_load(_base_config(), mock_client=mock_client)
+        ctx = _mock_source_context()
+
+        with pytest.raises(DataverseClientError, match="before URL binding"):
+            next(source.load(ctx))
+
+        mock_client.paginate_odata.assert_not_called()
+        ctx.record_call.assert_called_once()
+        assert ctx.record_call.call_args.kwargs["request_data"]["url"] is None
+
+    @pytest.mark.parametrize(
+        ("metadata_rows", "message", "expected_category"),
+        [
+            ([], "exactly one", "metadata_identity_invalid"),
+            (
+                [
+                    {"LogicalName": "contact", "EntitySetName": "contacts"},
+                    {"LogicalName": "contact", "EntitySetName": "people"},
+                ],
+                "exactly one",
+                "metadata_identity_invalid",
+            ),
+            ([{"LogicalName": "contact"}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": ""}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": "   "}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": None}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": 123}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "account", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_conflict"),
+            ([{"EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "   ", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": None, "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": 123, "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact/path", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact?query", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact#fragment", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact name", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact\x00name", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "Contact", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact_Name", "EntitySetName": "contacts"}], "LogicalName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": "contacts/path"}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": "contacts?query"}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": "contacts#fragment"}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": "contact sets"}], "EntitySetName", "metadata_identity_invalid"),
+            ([{"LogicalName": "contact", "EntitySetName": "contacts\x00name"}], "EntitySetName", "metadata_identity_invalid"),
+        ],
+        ids=[
+            "zero-rows",
+            "multiple-rows",
+            "missing-entity-set",
+            "blank-entity-set",
+            "whitespace-entity-set",
+            "none-entity-set",
+            "non-string-entity-set",
+            "mismatched-logical-name",
+            "missing-logical-name",
+            "blank-logical-name",
+            "whitespace-logical-name",
+            "none-logical-name",
+            "non-string-logical-name",
+            "logical-name-path-delimiter",
+            "logical-name-query-delimiter",
+            "logical-name-fragment-delimiter",
+            "logical-name-space-delimiter",
+            "logical-name-control-character",
+            "logical-name-uppercase-leading",
+            "logical-name-uppercase-interior",
+            "entity-set-path-delimiter",
+            "entity-set-query-delimiter",
+            "entity-set-fragment-delimiter",
+            "entity-set-space-delimiter",
+            "entity-set-control-character",
+        ],
+    )
+    def test_invalid_metadata_identity_fails_before_pagination(
+        self,
+        metadata_rows: list[dict[str, Any]],
+        message: str,
+        expected_category: str,
+    ) -> None:
+        metadata_page = _make_metadata_page("contact", rows=metadata_rows)
+        mock_client = _DataverseClientFake(
+            metadata_page=metadata_page,
+            odata_pages=[_make_page([{"contactid": "1"}])],
+        )
+        source = _make_source_for_start_and_load(_base_config(), mock_client=mock_client)
+        ctx = _mock_source_context()
+
+        with pytest.raises(DataverseClientError, match=message):
+            list(source.load(ctx))
+
+        mock_client.paginate_odata.assert_not_called()
+        assert ctx.record_call.call_count == 1
+        audit_call = ctx.record_call.call_args.kwargs
+        assert audit_call["status"] == CallStatus.ERROR
+        assert audit_call["error"]["reason"] == expected_category
 
     def test_load_single_page(self) -> None:
         """Load yields valid rows from a single page."""
@@ -1020,10 +1299,10 @@ class TestDataverseSourceLoadStructured:
 
     def test_load_records_entity_metadata_probe_before_structured_page_fetch(self) -> None:
         """Structured load records the startup entity metadata probe inside load()."""
-        metadata_url = f"{VALID_ENV_URL}/api/data/v9.2/EntityDefinitions(LogicalName='contacts')?$select=LogicalName"
+        metadata_url = f"{VALID_ENV_URL}/api/data/v9.2/EntityDefinitions(LogicalName='contact')?$select=LogicalName,EntitySetName"
         metadata_page = DataversePageResponse(
             status_code=200,
-            rows=[{"LogicalName": "contacts"}],
+            rows=[{"LogicalName": "contact", "EntitySetName": "contacts"}],
             latency_ms=5.0,
             headers={"content-type": "application/json"},
             request_headers={"Authorization": "<fingerprint:test-fake>"},
@@ -1049,7 +1328,7 @@ class TestDataverseSourceLoadStructured:
 
         assert len(rows) == 1
         assert ctx.record_call.call_count == 2
-        assert "EntityDefinitions(LogicalName='contacts')" in ctx.record_call.call_args_list[0].kwargs["request_data"]["url"]
+        assert "EntityDefinitions(LogicalName='contact')" in ctx.record_call.call_args_list[0].kwargs["request_data"]["url"]
 
     def test_load_quarantines_on_formatted_value_collision(self) -> None:
         """Formatted value collision quarantines the row."""
@@ -1293,14 +1572,147 @@ class TestDataverseSourceLoadFetchXML:
             list(source.load(ctx))
 
     def test_fetchxml_uses_paginate_fetchxml(self) -> None:
-        """FetchXML mode calls client.paginate_fetchxml, not paginate_odata."""
-        pages = [_make_page([{"contactid": "1"}])]
-        source = _make_source_for_load(pages, _fetchxml_config())
+        """FetchXML resolves its logical name and preserves the original XML."""
+        original_xml = '<fetch><entity name="contact"><attribute name="fullname"/></entity></fetch>'
+        mock_client = _DataverseClientFake(
+            metadata_page=_make_metadata_page("contact", entity_set_name="contacts"),
+            fetchxml_pages=[_make_page([{"contactid": "1"}])],
+        )
+        source = _make_source_for_start_and_load(
+            _fetchxml_config(fetch_xml=original_xml),
+            mock_client=mock_client,
+        )
         ctx = _mock_source_context()
 
         list(source.load(ctx))
+        assert "EntityDefinitions(LogicalName='contact')" in mock_client.get_page.call_args.args[0]
+        assert mock_client.get_page.call_args.args[0].endswith("?$select=LogicalName,EntitySetName")
         source._client.paginate_fetchxml.assert_called_once()
+        assert source._client.paginate_fetchxml.call_args.args == ("contacts", original_xml)
         source._client.paginate_odata.assert_not_called()
+
+    def test_fetchxml_pre_request_ssrf_rejection_audits_full_candidate_url(self) -> None:
+        """The composed source/client audit records the rejected FetchXML candidate."""
+        original_xml = '<fetch><entity name="contact"><attribute name="fullname"/></entity></fetch>'
+        source = _make_source(_fetchxml_config(fetch_xml=original_xml))
+        client = DataverseClient(
+            environment_url=VALID_ENV_URL,
+            credential=_CredentialFake(),  # type: ignore[arg-type]  # test fake
+        )
+        client._client.close()
+        transport_requests: list[httpx.Request] = []
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            transport_requests.append(request)
+            return httpx.Response(
+                status_code=200,
+                json={"value": [{"LogicalName": "contact", "EntitySetName": "contacts"}]},
+            )
+
+        client._client = httpx.Client(transport=httpx.MockTransport(handle_request), timeout=30.0)
+        source._client = client
+        ctx = _mock_source_context()
+        serialized_xml = '<fetch><entity name="contact"><attribute name="fullname" /></entity></fetch>'
+        expected_url = f"{VALID_ENV_URL}/api/data/v9.2/contacts?fetchXml={urllib.parse.quote(serialized_xml)}"
+
+        def validate_candidate(url: str, **_kwargs: Any) -> SSRFSafeRequest:
+            if "fetchXml=" in url:
+                raise SSRFBlockedError("candidate rejected")
+            return _make_ssrf_safe(url)
+
+        try:
+            with (
+                patch(
+                    "elspeth.plugins.infrastructure.clients.dataverse.validate_url_for_ssrf",
+                    side_effect=validate_candidate,
+                ),
+                pytest.raises(DataverseClientError) as exc_info,
+            ):
+                next(source.load(ctx))
+        finally:
+            client.close()
+
+        error = exc_info.value
+        assert error.error_category == "ssrf_rejected"
+        assert error.request_url == expected_url
+        assert len(transport_requests) == 1
+        assert ctx.record_call.call_count == 2
+        audit_call = ctx.record_call.call_args.kwargs
+        assert audit_call["status"] == CallStatus.ERROR
+        assert audit_call["request_data"]["url"] == expected_url
+        audit_headers = audit_call["request_data"]["headers"]
+        assert audit_headers["Accept"] == "application/json"
+        auth_value = audit_headers.get("Authorization")
+        if auth_value is not None:
+            assert auth_value.startswith("<fingerprint:")
+        assert audit_call["error"]["reason"] == "ssrf_rejected"
+
+    @pytest.mark.parametrize(
+        ("guard", "expected_reason", "expected_success_calls"),
+        [
+            ("odata_empty_guard", "empty_page_guard", 4),
+            ("fetchxml_missing_morerecords", "protocol_violation", 2),
+            ("fetchxml_missing_cookie", "protocol_violation", 2),
+        ],
+    )
+    def test_post_response_pagination_guard_audits_causal_page_context(
+        self,
+        guard: str,
+        expected_reason: str,
+        expected_success_calls: int,
+    ) -> None:
+        metadata_body = {"value": [{"LogicalName": "contact", "EntitySetName": "contacts"}]}
+        if guard == "odata_empty_guard":
+            config = _base_config()
+            data_bodies = [
+                {"value": [], "@odata.nextLink": f"{VALID_ENV_URL}/api/data/v9.2/contacts?page=2"},
+                {"value": [], "@odata.nextLink": f"{VALID_ENV_URL}/api/data/v9.2/contacts?page=3"},
+                {"value": [], "@odata.nextLink": f"{VALID_ENV_URL}/api/data/v9.2/contacts?page=4"},
+            ]
+        elif guard == "fetchxml_missing_morerecords":
+            config = _fetchxml_config()
+            data_bodies = [{"value": []}]
+        else:
+            config = _fetchxml_config()
+            data_bodies = [{"value": [], "@Microsoft.Dynamics.CRM.morerecords": True}]
+
+        response_bodies = iter([metadata_body, *data_bodies])
+
+        def handle_request(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(status_code=200, json=next(response_bodies))
+
+        source = _make_source(config)
+        client = DataverseClient(
+            environment_url=VALID_ENV_URL,
+            credential=_CredentialFake(),  # type: ignore[arg-type]  # test fake
+        )
+        client._client.close()
+        client._client = httpx.Client(transport=httpx.MockTransport(handle_request), timeout=30.0)
+        source._client = client
+        ctx = _mock_source_context()
+
+        try:
+            with (
+                patch(
+                    "elspeth.plugins.infrastructure.clients.dataverse.validate_url_for_ssrf",
+                    side_effect=lambda url, **_kwargs: _make_ssrf_safe(url),
+                ),
+                pytest.raises(DataverseClientError),
+            ):
+                next(source.load(ctx))
+        finally:
+            client.close()
+
+        assert ctx.record_call.call_count == expected_success_calls + 1
+        causal_page_audit = ctx.record_call.call_args_list[-2].kwargs
+        error_audit = ctx.record_call.call_args_list[-1].kwargs
+        assert causal_page_audit["status"] == CallStatus.SUCCESS
+        assert causal_page_audit["response_data"]["row_count"] == 0
+        assert error_audit["status"] == CallStatus.ERROR
+        assert error_audit["request_data"] == causal_page_audit["request_data"]
+        assert error_audit["error"]["reason"] == expected_reason
+        assert error_audit["error"]["status_code"] == causal_page_audit["response_data"]["status_code"]
+        assert error_audit["latency_ms"] == causal_page_audit["latency_ms"]
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -1778,7 +2190,7 @@ class TestUrlPercentEncoding:
     def test_filter_with_single_quote_encoded(self) -> None:
         """Single quotes in $filter are percent-encoded."""
         source = _make_source(_base_config(filter="name eq 'O''Brien'"))
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         # Single quotes should be encoded as %27
         assert "%27" in url
         assert "'" not in url.split("$filter=")[1]
@@ -1786,7 +2198,7 @@ class TestUrlPercentEncoding:
     def test_filter_with_ampersand_encoded(self) -> None:
         """Ampersand in $filter can't break URL structure."""
         source = _make_source(_base_config(filter="name eq 'A&B'"))
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         # The & inside the filter value must be encoded as %26
         filter_part = url.split("$filter=")[1]
         assert "&" not in filter_part  # No raw ampersand in filter value
@@ -1795,34 +2207,34 @@ class TestUrlPercentEncoding:
     def test_filter_with_hash_encoded(self) -> None:
         """Hash in $filter can't truncate URL as fragment."""
         source = _make_source(_base_config(filter="name eq 'test#1'"))
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         assert "%23" in url
         assert "#" not in url.split("$filter=")[1]
 
-    def test_entity_name_in_path_encoded(self) -> None:
-        """Entity name with special chars is percent-encoded in path segment."""
-        source = _make_source(_base_config(entity="my entity"))
-        url = source._build_query_url()
+    def test_entity_set_name_in_path_encoded(self) -> None:
+        """Resolved entity-set name with special chars is percent-encoded in the path."""
+        source = _make_source(_base_config())
+        url = source._build_query_url("my entity")
         assert "/my%20entity" in url  # Slash-anchored: confirms it's in the path
         assert "my entity" not in url
 
-    def test_normal_entity_unchanged(self) -> None:
-        """Normal entity names (alphanumeric) pass through unmodified."""
-        source = _make_source(_base_config(entity="contacts"))
-        url = source._build_query_url()
+    def test_normal_entity_set_unchanged(self) -> None:
+        """Normal entity-set names (alphanumeric) pass through unmodified."""
+        source = _make_source(_base_config())
+        url = source._build_query_url("contacts")
         assert "/contacts" in url
 
     def test_orderby_with_special_chars_encoded(self) -> None:
         """$orderby values with special characters are percent-encoded."""
         source = _make_source(_base_config(orderby="name desc, 'special'"))
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         assert "%27" in url  # single quote encoded
         assert "%20" in url  # space encoded
 
     def test_select_identifiers_not_encoded(self) -> None:
         """$select column names (Dataverse identifiers) are NOT encoded."""
         source = _make_source(_base_config(select=["contactid", "fullname"]))
-        url = source._build_query_url()
+        url = source._build_query_url("contacts")
         assert "$select=contactid,fullname" in url  # literal, no encoding
 
 

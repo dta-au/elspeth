@@ -42,7 +42,7 @@ class BatchReplicateConfig(TransformDataConfig):
         default=1,
         ge=1,
         le=10000,
-        description="Default number of copies if copies_field is missing or invalid",
+        description="Default number of copies when copies_field is absent",
     )
     max_copies: int = Field(
         default=10000,
@@ -98,9 +98,35 @@ class BatchReplicate(BaseTransform):
     name = "batch_replicate"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:afce27221f965067"
+    source_file_hash: str | None = "sha256:03bc22d9f674bba6"
     config_model = BatchReplicateConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
+    usage_when_to_use: str = (
+        "Use for bounded per-row copy expansion. A missing copies_field uses default_copies, while a valid integer "
+        "count controls the emitted copies and optional copy indexes."
+    )
+    usage_when_not_to_use: str = (
+        "Not for random sampling or unbounded fan-out. A present non-integer count raises TypeError; only integer "
+        "counts outside 1..max_copies are quarantined."
+    )
+    example_use: str = """aggregations:
+  - name: replicate_rows
+    plugin: batch_replicate
+    input: counted_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 50
+    output_mode: transform
+    options:
+      copies_field: copies
+      default_copies: 1
+      max_copies: 5
+      include_copy_index: true
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "deaggregation", "row-expansion")
 
     # Every emitted row deep-copies its originating input before adding
     # copy_index. Mixed-validity batches may quarantine inputs, but the

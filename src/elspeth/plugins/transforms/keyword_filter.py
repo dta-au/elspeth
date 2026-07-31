@@ -218,8 +218,27 @@ class KeywordFilter(BaseTransform):
     name = "keyword_filter"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:44530e78aa5b10c6"
+    source_file_hash: str | None = "sha256:2c4c436e73474e18"
     config_model = KeywordFilterConfig
+    usage_when_to_use: str = (
+        "Use for regex content screening when a pattern match must return an error for the node's "
+        "on_error route while clean rows continue through on_success."
+    )
+    usage_when_not_to_use: str = (
+        "Not a general expression engine or a silent row dropper: use a gate for arbitrary boolean "
+        "routing, or value_transform for calculated fields."
+    )
+    example_use: str = """transform:
+  plugin: keyword_filter
+  options:
+    fields: [notes]
+    blocked_patterns:
+      - "(?i)\\\\bsecret\\\\b"
+      - "(?i)\\\\bconfidential\\\\b"
+    schema:
+      mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("filtering", "regex", "content-screening")
     is_batch_aware = False
     creates_tokens = False
     passes_through_input = True

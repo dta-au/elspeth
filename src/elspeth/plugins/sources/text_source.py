@@ -74,9 +74,26 @@ class TextSource(BaseSource):
     name = "text"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:52f62dabd8bdef5e"
+    source_file_hash: str | None = "sha256:a83b0dfd9a83ac55"
     config_model = TextSourceConfig
     _on_validation_failure: str
+
+    usage_when_to_use: str = "Use for a bounded plain-text or Markdown file when each retained line should become one row in a named field."
+    usage_when_not_to_use: str = (
+        "Do not use for structured or multi-field records, or when preserving the whole document as one value is required."
+    )
+    example_use: str = """sources:
+  url_lines:
+    plugin: text
+    on_success: output
+    options:
+      path: data/urls.txt
+      column: url
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
+    capability_tags: tuple[str, ...] = ("text", "file", "line-oriented", "batch")
 
     def __init__(self, config: dict[str, Any]) -> None:
         cfg = TextSourceConfig.from_dict(config, plugin_name=self.name)

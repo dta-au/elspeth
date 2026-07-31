@@ -36,6 +36,28 @@ class TestCatalogService:
     def test_implements_protocol(self, catalog: CatalogServiceImpl) -> None:
         assert isinstance(catalog, CatalogService)
 
+    def test_all_builtin_reference_content_is_serialized_unchanged(
+        self,
+        catalog: CatalogServiceImpl,
+        plugin_manager: PluginManager,
+    ) -> None:
+        groups = (
+            ("source", catalog.list_sources(), plugin_manager.get_sources()),
+            ("transform", catalog.list_transforms(), plugin_manager.get_transforms()),
+            ("sink", catalog.list_sinks(), plugin_manager.get_sinks()),
+        )
+        assert sum(len(summaries) for _, summaries, _ in groups) == 47
+
+        for kind, summaries, plugin_classes in groups:
+            classes_by_name = {plugin_cls.name: plugin_cls for plugin_cls in plugin_classes}
+            assert {summary.name for summary in summaries} == set(classes_by_name), kind
+            for summary in summaries:
+                plugin_cls = classes_by_name[summary.name]
+                assert summary.usage_when_to_use == plugin_cls.usage_when_to_use
+                assert summary.usage_when_not_to_use == plugin_cls.usage_when_not_to_use
+                assert summary.example_use == plugin_cls.example_use
+                assert summary.capability_tags == plugin_cls.capability_tags
+
 
 class TestListSources:
     """list_sources() returns all registered source plugins."""

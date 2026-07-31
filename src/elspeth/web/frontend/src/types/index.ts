@@ -340,8 +340,9 @@ export interface ComposerProgressSnapshot {
 /** Plugin summary from the catalog listing endpoints.
  *
  * Phase 7A added reference-content fields populated by plugin authors.
- * Unfilled plugins return `null` / empty values; the catalog drawer
- * renders a "see the technical description" fallback for them.
+ * Blank or whitespace-only reference fields suppress their corresponding
+ * sections; when all three are blank, the catalog drawer suppresses the
+ * Details disclosure entirely.
  *
  * ``audit_characteristics`` is typed as the closed vocabulary union to
  * mirror the Python ``DerivedAuditCharacteristics = tuple[AuditCharacteristic, ...]``

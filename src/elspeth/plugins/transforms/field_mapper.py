@@ -117,8 +117,28 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3e400605d93e05c8"
+    source_file_hash: str | None = "sha256:a7516a8fa7616fd2"
     config_model = FieldMapperConfig
+    usage_when_to_use: str = (
+        "Use to rename, select, or drop known row fields into a stable downstream shape, including "
+        "selecting only the mapped fields when an explicit projection is required."
+    )
+    usage_when_not_to_use: str = (
+        "Not for expression evaluation or type coercion: use value_transform for calculated values "
+        "and type_coerce when field values need explicit type normalization."
+    )
+    example_use: str = """transform:
+  plugin: field_mapper
+  options:
+    mapping:
+      id: application_id
+      applicant: applicant_name
+      notes: notes
+    select_only: true
+    schema:
+      mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("fields", "mapping", "rename", "cleanup")
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:

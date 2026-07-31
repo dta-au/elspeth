@@ -97,9 +97,10 @@ class BatchStats(BaseTransform):
     when an aggregation trigger fires. Without group_by, it emits one
     aggregate row for the full batch. With group_by, it emits one aggregate
     row per distinct group value. It computes:
-    - count: Number of rows in the batch
-    - sum: Sum of the value_field across all rows
-    - mean: Average of value_field (if compute_mean=True)
+    - count: Number of finite, non-missing valid numeric values
+    - sum: Sum of those finite, non-missing valid numeric values
+    - mean: Average of those values (if compute_mean=True)
+    - batch_size: Number of input rows before missing or non-finite values are skipped
 
     Config options:
         schema: Required. Schema for input validation
@@ -124,9 +125,36 @@ class BatchStats(BaseTransform):
     name = "batch_stats"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:1e2bb450d2ce2c35"
+    source_file_hash: str | None = "sha256:aceb2827507cab8a"
     config_model = BatchStatsConfig
     is_batch_aware = True  # CRITICAL: Engine buffers rows for batch processing
+    usage_when_to_use: str = (
+        "Use to replace a window of rows with count, sum, and optional mean statistics over one numeric field. "
+        "Omit trigger or use trigger: {} for one bounded whole-source end-of-source aggregate; a count, timeout, "
+        "or condition trigger creates independent windows. "
+        "When configured, group_by partitions one flushed batch and never accumulates a group across windows."
+    )
+    usage_when_not_to_use: str = (
+        "Not for pass-through enrichment or unbounded whole-source buffering: original rows are replaced. Configure "
+        "an early trigger when the source cannot be safely held until end-of-source."
+    )
+    example_use: str = """aggregations:
+  - name: category_totals
+    plugin: batch_stats
+    input: sales_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      value_field: amount
+      group_by: category
+      compute_mean: true
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "aggregation", "statistics")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

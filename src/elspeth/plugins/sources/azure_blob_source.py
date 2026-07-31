@@ -374,8 +374,32 @@ class AzureBlobSource(BaseSource):
     name = "azure_blob"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:cd59e1e54f759177"
+    source_file_hash: str | None = "sha256:9bbee3ebeabe5b67"
     config_model = AzureBlobSourceConfig
+
+    usage_when_to_use: str = (
+        "Use for one real, operator-approved Azure blob containing CSV, JSON-array, or JSONL data with an approved "
+        "authentication method. The source preserves container and blob audit identity while normalizing and validating rows."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for Composer uploads, prefix or whole-container reads, event streams, or workloads requiring unbounded "
+        "whole-object materialization."
+    )
+    example_use: str = """sources:
+  azure_input:
+    plugin: azure_blob
+    on_success: output
+    options:
+      use_managed_identity: true
+      account_url: https://records.blob.core.windows.net
+      container: inbound
+      blob_path: data/customers.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
+    capability_tags: tuple[str, ...] = ("azure", "blob-storage", "object-storage", "batch")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

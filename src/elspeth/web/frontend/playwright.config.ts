@@ -52,6 +52,13 @@ const composerSettingsEnv: Record<string, string> = {
   ELSPETH_WEB__composer_rate_limit_per_minute: "60",
   ELSPETH_WEB__auth_rate_limit_per_minute: "120",
   ELSPETH_WEB__e2e_state_seed_enabled: "true",
+  // Catalog acceptance exercises representative user-configurable plugins
+  // outside the universal minimum. Authorize them only in this ephemeral
+  // Playwright deployment; production REQUIRED_WEB_PLUGIN_IDS is unchanged.
+  ELSPETH_WEB__plugin_allowlist: JSON.stringify([
+    "transform:value_transform",
+    "sink:database",
+  ]),
   // Keep the operator-profiled LLM catalog surface available without a
   // credential or network call. The E2E schema test verifies the public
   // alias-only contract; it never executes this Bedrock profile.

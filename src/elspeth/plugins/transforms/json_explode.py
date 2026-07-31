@@ -177,8 +177,26 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:6b8ffd45b12ab18f"
+    source_file_hash: str | None = "sha256:f6306457e6405ce6"
     config_model = JSONExplodeConfig
+    usage_when_to_use: str = (
+        "Use when one JSON array field in each row must become multiple rows, with the surrounding "
+        "row context copied to every emitted array item."
+    )
+    usage_when_not_to_use: str = (
+        "Not for object flattening or batch aggregation: map object fields explicitly with "
+        "field_mapper, or choose an aggregation plugin when many input rows must become one result."
+    )
+    example_use: str = """transform:
+  plugin: json_explode
+  options:
+    array_field: items
+    output_field: item
+    include_index: true
+    schema:
+      mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("json", "array", "fan-out", "deaggregation")
     creates_tokens = True  # CRITICAL: enables new token creation for deaggregation
 
     @classmethod

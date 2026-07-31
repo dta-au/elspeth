@@ -36,7 +36,7 @@
         "required": false
       },
       {
-        "description": "Target entity logical name",
+        "description": "Target Dataverse EntitySetName used in the OData collection path",
         "kind": "text",
         "label": "Entity",
         "name": "entity",

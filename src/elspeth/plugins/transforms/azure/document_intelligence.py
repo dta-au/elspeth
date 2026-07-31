@@ -287,7 +287,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:23016ee2bfd6ebf9"
+    source_file_hash: str | None = "sha256:0774b4a6f8d0f40f"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     creates_tokens = False
@@ -298,26 +298,27 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     capability_tags = ("azure", "document", "ocr", "enrichment", "http")
 
     usage_when_to_use = (
-        "Use to turn documents (PDFs, images, office files) referenced per row "
-        "into structured data — text/markdown content, tables, key-value pairs, "
-        "and the typed fields of prebuilt or custom Document Intelligence models."
+        "Use URL or base64 mode to extract text, tables, key-value pairs, and typed fields from documents. "
+        "Request audit retains the submitted URL or encoded body; extracted remote content is untrusted "
+        "before LLM consumption."
     )
     usage_when_not_to_use = (
-        "Not for moderation or injection screening (use azure_content_safety / "
-        "azure_prompt_shield), and not for plain web pages (use web_scrape). "
-        "Documents must be reachable by a URL or supplied as a base64 string."
+        "Not for plain web pages or safety screening. Never embed a credential in a document URL, and "
+        "account for the request audit's credential-exposure and data-retention implications; use web_scrape "
+        "for public HTML pages."
     )
     example_use = (
         "transform:\n"
         "  plugin: azure_document_intelligence\n"
         "  options:\n"
-        "    endpoint: https://my-di.cognitiveservices.azure.com\n"
-        "    api_key: ${AZURE_DOCUMENT_INTELLIGENCE_KEY}\n"
+        "    endpoint: https://catalogue-di.cognitiveservices.azure.com\n"
+        "    api_key: {secret_ref: AZURE_DOCUMENT_INTELLIGENCE_KEY}\n"
         "    model_id: prebuilt-layout\n"
         "    source_mode: url\n"
         "    source_field: document_url\n"
         "    content_field: di_content\n"
         "    output_content_format: markdown\n"
+        "    features: [keyValuePairs]\n"
         "    extract: {tables: di_tables, key_value_pairs: di_kv}\n"
         "    schema: {mode: observed}"
     )

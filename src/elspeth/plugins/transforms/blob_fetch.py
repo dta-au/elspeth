@@ -242,9 +242,33 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2c5a53cc0e54a008"
+    source_file_hash: str | None = "sha256:39777de60c1c1869"
     config_model = BlobFetchConfig
     passes_through_input = True
+    capability_tags: tuple[str, ...] = ("http", "network", "blob")
+
+    usage_when_to_use = (
+        "Use when each row contains an authorized HTTP(S) file URL and the run must preserve the "
+        "original response bytes in the payload store with MIME type, size, and SHA-256 metadata. "
+        "Fetched bytes and later parser output remain untrusted before LLM consumption."
+    )
+    usage_when_not_to_use = (
+        "Not for semantic extraction or authenticated origins: blob_fetch has no origin-auth option. "
+        "Use web_scrape for public HTML page extraction, then a format-specific parser for stored bytes."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: blob_fetch\n"
+        "  options:\n"
+        "    url_field: document_url\n"
+        "    blob_ref_field: document_blob_ref\n"
+        "    allowed_content_types: [text/csv, application/json]\n"
+        "    http:\n"
+        "      abuse_contact: catalogue-ops@example.org\n"
+        "      fetch_reason: Preserve approved public reference files\n"
+        "      allowed_hosts: public_only\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
@@ -305,7 +329,7 @@ class BlobFetch(BaseTransform):
                 summary="Fetch an HTTP(S) URL into the run payload store and emit a blob reference plus fetch metadata.",
                 composer_hints=(
                     "Use blob_fetch when rows contain document URLs and downstream parser transforms should consume blob_ref, not raw bytes.",
-                    "blob_fetch does not parse content; chain blob_csv_expand, future blob_json_expand, or another blob parser after it.",
+                    "blob_fetch does not parse content; chain the registered blob_csv_expand transform for CSV content or another registered parser after it.",
                     "allowed_content_types is a strict exact MIME allowlist; add operator-approved types explicitly.",
                     "http.abuse_contact and http.fetch_reason are mandatory and sent as wire-visible headers.",
                 ),

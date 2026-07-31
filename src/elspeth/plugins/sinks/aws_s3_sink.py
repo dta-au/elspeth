@@ -714,13 +714,34 @@ class AWSS3Sink(BaseSink, RestagingSinkEffectCapability):
     name = "aws_s3"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:316cf5a81607145a"
+    source_file_hash: str | None = "sha256:87b13a837e37cce9"
     config_model = AWSS3SinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.HTTP
     supported_effect_modes = frozenset({"write"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
     supports_resume = False
+
+    usage_when_to_use: str = (
+        "Use when one bounded run must publish its cumulative rows as one CSV, JSON, or JSONL S3 object through the "
+        "default AWS credential chain with run-scoped conditional publication."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for per-row objects, multipart or unbounded uploads, append/resume, credentials embedded in YAML, "
+        "or custom S3 endpoints in ordinary Web Composer."
+    )
+    example_use: str = """sinks:
+  results:
+    plugin: aws_s3
+    options:
+      bucket: audit-output
+      key: "runs/{{ run_id }}/results.csv"
+      format: csv
+      overwrite: false
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("aws", "s3", "cloud", "object-storage")
 
     @classmethod
     def _resolve_sink_effect_mode(

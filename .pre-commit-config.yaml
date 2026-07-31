@@ -253,9 +253,9 @@ repos:
 # to it and the commit was rejected ("files were modified by this hook", no
 # exit-code line). It also violated this file's header contract (whole-repo
 # gates belong to CI, triggered locally only by their own policy metadata)
-# and was inert: zero trust boundaries are bound in weft.toml, so a green
-# scan enforced nothing while blocking commits. The agent-level gate stands
-# unchanged — run `wardline scan . --fail-on ERROR` before handing back code
-# that touches external input (AGENTS.md / CLAUDE.md / the wardline-gate
-# skill). Reinstate enforcement in CI (not here) once wardline is installable
-# from the project's dependency graph AND boundaries are bound in weft.toml.
+# and was inert at removal time. The agent-level gate is now the canonical
+# project command `.venv/bin/python scripts/wardline_gate.py`; it loads the
+# declared ELSPETH vocabulary pack with explicit trust grants and rejects an
+# inert/zero-boundary result. Reinstate enforcement in CI (not here) only once
+# Wardline is installable from the project's dependency graph and the active
+# finding corpus is resolved without baselines or waivers.

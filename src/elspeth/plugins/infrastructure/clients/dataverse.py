@@ -341,6 +341,7 @@ class DataverseClient:
             raise DataverseClientError(
                 f"Cannot extract hostname from URL: {url!r}",
                 retryable=False,
+                request_url=url,
             )
 
         # Layer 1: Domain allowlist pre-filter
@@ -349,6 +350,7 @@ class DataverseClient:
                 f"URL hostname {hostname!r} rejected by domain allowlist. Possible SSRF attempt via @odata.nextLink redirection.",
                 retryable=False,
                 error_category="ssrf_rejected",
+                request_url=url,
             )
 
         # Layer 2: IP-pinning validation (prevents DNS rebinding)
@@ -359,6 +361,7 @@ class DataverseClient:
                 f"URL {url!r} failed IP-pinning SSRF validation: {exc}",
                 retryable=False,
                 error_category="ssrf_rejected",
+                request_url=url,
             ) from exc
 
     def _classify_error(
@@ -504,7 +507,12 @@ class DataverseClient:
         # URLs, because DNS rebinding can occur between __init__ domain check
         # and the actual TCP connect.
         if ssrf_safe is None:
-            ssrf_safe = self._validate_url_ssrf(url)
+            try:
+                ssrf_safe = self._validate_url_ssrf(url)
+            except DataverseClientError as exc:
+                if exc.request_headers is None:
+                    exc.request_headers = fingerprinted
+                raise
 
         # Connect to the pinned IP and set the Host header for virtual hosting.
         # The sni_hostname extension tells httpx/httpcore to use the original
@@ -789,6 +797,10 @@ class DataverseClient:
                         f"edge condition producing nextLink URLs with no data.",
                         retryable=False,
                         error_category="empty_page_guard",
+                        status_code=page.status_code,
+                        latency_ms=page.latency_ms,
+                        request_url=page.request_url,
+                        request_headers=page.request_headers,
                     )
             else:
                 consecutive_empty = 0
@@ -804,7 +816,7 @@ class DataverseClient:
             ssrf_safe = self._validate_url_ssrf(page.next_link)
             url = page.next_link
 
-    def paginate_fetchxml(self, entity: str, fetch_xml: str) -> Iterator[DataversePageResponse]:
+    def paginate_fetchxml(self, entity_set_name: str, fetch_xml: str) -> Iterator[DataversePageResponse]:
         """Paginate through FetchXML query results.
 
         Uses paging cookie mechanism: injects cookie and page number into
@@ -813,7 +825,7 @@ class DataverseClient:
         avoid re-parsing on every iteration.
 
         Args:
-            entity: Entity logical name for URL construction
+            entity_set_name: Dataverse EntitySetName for URL construction
             fetch_xml: FetchXML query string
 
         Yields:
@@ -843,7 +855,7 @@ class DataverseClient:
         while True:
             xml_str = ET.tostring(root, encoding="unicode")
             encoded_xml = urllib.parse.quote(xml_str)
-            url = f"{self._environment_url}/api/data/{self._api_version}/{entity}?fetchXml={encoded_xml}"
+            url = f"{self._environment_url}/api/data/{self._api_version}/{entity_set_name}?fetchXml={encoded_xml}"
 
             page = self.get_page(url)
             yield page
@@ -858,6 +870,10 @@ class DataverseClient:
                     "but FetchXML pagination requires this field.",
                     retryable=False,
                     error_category="protocol_violation",
+                    status_code=page.status_code,
+                    latency_ms=page.latency_ms,
+                    request_url=page.request_url,
+                    request_headers=page.request_headers,
                 )
             if not page.more_records:
                 break
@@ -872,6 +888,10 @@ class DataverseClient:
                     "Cannot retrieve remaining pages — refusing to silently truncate results.",
                     retryable=False,
                     error_category="protocol_violation",
+                    status_code=page.status_code,
+                    latency_ms=page.latency_ms,
+                    request_url=page.request_url,
+                    request_headers=page.request_headers,
                 )
 
             # Inject paging cookie into the existing ET root.

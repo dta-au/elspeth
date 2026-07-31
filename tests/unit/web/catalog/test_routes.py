@@ -6,6 +6,10 @@ import pytest
 from fastapi import FastAPI
 
 from elspeth.plugins.infrastructure.manager import PluginManager, get_shared_plugin_manager
+from elspeth.plugins.sinks.database_sink import DatabaseSink
+from elspeth.plugins.sources.csv_source import CSVSource
+from elspeth.plugins.transforms.report_assemble import ReportAssemble
+from elspeth.plugins.transforms.value_transform import ValueTransform
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.routes import catalog_router
@@ -40,6 +44,11 @@ def client(catalog: CatalogServiceImpl) -> TestClient:
             }
         },
         default_llm_profile="task-role",
+        plugin_allowlist=(
+            "transform:value_transform",
+            "transform:report_assemble",
+            "sink:database",
+        ),
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
@@ -108,6 +117,14 @@ class TestListSources:
         names = [e["name"] for e in resp.json()]
         assert "text" in names
 
+    def test_internal_null_source_is_not_listed(self, client: TestClient) -> None:
+        resp = client.get("/api/catalog/sources")
+        assert resp.status_code == 200
+        sources = resp.json()
+
+        assert "null" not in {source["name"] for source in sources}
+        assert "source:null" not in {f"{source['plugin_type']}:{source['name']}" for source in sources}
+
     def test_csv_source_summary_includes_reference_content(self, client: TestClient) -> None:
         """Wire-shape pin: catalog API returns canonical CSV reference content."""
         resp = client.get("/api/catalog/sources")
@@ -162,6 +179,31 @@ class TestListSinks:
         resp = client.get("/api/catalog/sinks")
         names = [e["name"] for e in resp.json()]
         assert "csv" in names
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "plugin_name", "plugin_cls"),
+    (
+        ("/api/catalog/sources", "csv", CSVSource),
+        ("/api/catalog/transforms", "value_transform", ValueTransform),
+        ("/api/catalog/transforms", "report_assemble", ReportAssemble),
+        ("/api/catalog/sinks", "database", DatabaseSink),
+    ),
+)
+def test_list_routes_preserve_reference_content(
+    client: TestClient,
+    endpoint: str,
+    plugin_name: str,
+    plugin_cls: type[CSVSource] | type[ValueTransform] | type[ReportAssemble] | type[DatabaseSink],
+) -> None:
+    response = client.get(endpoint)
+    assert response.status_code == 200
+    summary = next(item for item in response.json() if item["name"] == plugin_name)
+
+    assert summary["usage_when_to_use"] == plugin_cls.usage_when_to_use
+    assert summary["usage_when_not_to_use"] == plugin_cls.usage_when_not_to_use
+    assert summary["example_use"] == plugin_cls.example_use
+    assert summary["capability_tags"] == list(plugin_cls.capability_tags)
 
 
 class TestGetSchema:

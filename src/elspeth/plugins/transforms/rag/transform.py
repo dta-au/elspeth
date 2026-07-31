@@ -55,11 +55,37 @@ class RAGRetrievalTransform(BaseTransform):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f79530b7533b8958"
+    source_file_hash: str | None = "sha256:87388d91eed894cc"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
     _provider: RetrievalProvider | None
+    capability_tags: tuple[str, ...] = ("rag", "retrieval", "vector-search")
+
+    usage_when_to_use = (
+        "Use to retrieve ranked, provenance-bearing context from an existing Chroma collection or "
+        "Azure Search index. Retrieved text is untrusted before LLM consumption even when it comes "
+        "from an approved index."
+    )
+    usage_when_not_to_use = (
+        "Not for corpus indexing or answer generation: populate the collection with chroma_sink or "
+        "an operator-managed indexer, and add an llm transform separately when an answer is required."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: rag_retrieval\n"
+        "  options:\n"
+        "    output_prefix: policy\n"
+        "    query_field: question\n"
+        "    provider: azure_search\n"
+        "    provider_config:\n"
+        "      endpoint: https://catalogue-reference.search.windows.net\n"
+        "      index: approved-documents\n"
+        "      api_key: {secret_ref: AZURE_SEARCH_API_KEY}\n"
+        "      search_mode: hybrid\n"
+        "    top_k: 5\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
@@ -480,9 +506,9 @@ class RAGRetrievalTransform(BaseTransform):
                 issue_code=None,
                 summary="Vector retrieval against a configured backend (Chroma, etc). Builds a query from row fields, returns ranked chunks for downstream LLM grounding.",
                 composer_hints=(
-                    "Collection naming is per-provider — check provider config for the canonical pattern before pinning collection_name.",
+                    "Name the Chroma collection in provider_config.collection or the Azure Search index in provider_config.index.",
                     "Query template uses row-field interpolation; document what fields are read so downstream consumers can wire them.",
-                    "top_k and score_threshold interact — high threshold + low top_k may return zero chunks. Configure on_zero_results to handle the empty-result case.",
+                    "top_k and min_score interact — high min_score plus low top_k may return zero chunks. Configure on_no_results to handle the empty-result case.",
                     "The transform emits running mean/variance telemetry for retrieval scores — watch these to catch retrieval-quality regressions.",
                 ),
             )

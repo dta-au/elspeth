@@ -830,8 +830,30 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9ff5f20a6a942aab"
+    source_file_hash: str | None = "sha256:3395879a00e6c3e4"
     config_model = AWSS3SourceConfig
+
+    usage_when_to_use: str = (
+        "Use for trusted CLI or batch ingestion of one bounded CSV, JSON-array, or JSONL S3 object through the "
+        "default AWS credential chain. The read is ETag-pinned, normalized, and validated at the source boundary."
+    )
+    usage_when_not_to_use: str = (
+        "Ordinary Web Composer cannot use this source. Do not use it for streams, prefixes or multi-object reads, "
+        "or AWS credentials embedded in YAML."
+    )
+    example_use: str = """sources:
+  s3_input:
+    plugin: aws_s3
+    on_success: output
+    options:
+      bucket: audit-input
+      key: incoming/records.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
+    capability_tags: tuple[str, ...] = ("aws", "s3", "object-storage", "batch")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
