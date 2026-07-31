@@ -9,6 +9,7 @@ from typing import cast
 import pytest
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from structlog.testing import capture_logs
 
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.web.app import create_app
@@ -29,34 +30,71 @@ def _settings(tmp_path: Path) -> WebSettings:
     )
 
 
+_AUDIT_INTEGRITY_DETAIL = "ELSPETH stopped before replying because it could not verify this session's audit trail."
+
+
+def _audit_request(request_id: str = "req-audit-integrity-1") -> Request:
+    """Request double with the fields the handler reads.
+
+    ``RequestIdMiddleware`` guarantees ``request.state.request_id`` on
+    every request that reaches an app-level exception handler; the
+    handler additionally reads ``request.url.path`` and
+    ``request.method`` for the structured log event.
+    """
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/sessions/abc/messages",
+            "headers": [],
+            "query_string": b"",
+        }
+    )
+    request.state.request_id = request_id
+    return request
+
+
 @pytest.mark.asyncio
 async def test_audit_integrity_error_handler_returns_static_500(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
     handler = app.exception_handlers[AuditIntegrityError]
 
-    response = await handler(
-        cast(Request, object()),
-        AuditIntegrityError(
-            "hidden sql detail",
-            failed_turn=FailedTurnMetadata(
-                assistant_message_id=None,
-                tool_calls_attempted=2,
-                tool_responses_persisted=0,
+    with capture_logs() as logs:
+        response = await handler(
+            _audit_request("req-ft-1"),
+            AuditIntegrityError(
+                "hidden sql detail",
+                failed_turn=FailedTurnMetadata(
+                    assistant_message_id=None,
+                    tool_calls_attempted=2,
+                    tool_responses_persisted=0,
+                ),
             ),
-        ),
-    )
+        )
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 500
     body = json.loads(response.body)
     assert body["error_type"] == "audit_integrity_error"
+    assert body["detail"] == _AUDIT_INTEGRITY_DETAIL
+    assert body["request_id"] == "req-ft-1"
     assert body["failed_turn"] == {
         "assistant_message_id": None,
         "tool_calls_attempted": 2,
         "tool_responses_persisted": 0,
         "transcript_url": None,
     }
+    # The raise-site message reaches the SERVER log only — never the body.
     assert "hidden sql detail" not in response.body.decode()
+    events = [log for log in logs if log["event"] == "http_audit_integrity_error"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["path"] == "/api/sessions/abc/messages"
+    assert event["method"] == "POST"
+    assert event["request_id"] == "req-ft-1"
+    assert event["exc_class"] == "AuditIntegrityError"
+    assert event["message"] == "hidden sql detail"
+    assert event["failed_turn_present"] is True
 
 
 def test_create_app_wires_existing_session_service_into_composer(tmp_path: Path) -> None:
@@ -70,15 +108,53 @@ async def test_audit_integrity_error_handler_returns_degraded_body_without_faile
     app = create_app(_settings(tmp_path))
     handler = app.exception_handlers[AuditIntegrityError]
 
-    response = await handler(cast(Request, object()), AuditIntegrityError("outside compose loop"))
+    with capture_logs() as logs:
+        response = await handler(_audit_request("req-no-ft-1"), AuditIntegrityError("outside compose loop"))
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 500
     body = json.loads(response.body)
     assert body["error_type"] == "audit_integrity_error"
+    assert body["detail"] == _AUDIT_INTEGRITY_DETAIL
+    assert body["request_id"] == "req-no-ft-1"
     assert body["diagnostic"] == "no_failed_turn_metadata"
     assert body["reason"] == "originated outside compose-loop annotation scope"
     assert "failed_turn" not in body
+    events = [log for log in logs if log["event"] == "http_audit_integrity_error"]
+    assert len(events) == 1
+    event = events[0]
+    assert event["request_id"] == "req-no-ft-1"
+    assert event["exc_class"] == "AuditIntegrityError"
+    assert event["message"] == "outside compose loop"
+    assert event["failed_turn_present"] is False
+
+
+@pytest.mark.asyncio
+async def test_audit_integrity_log_distinguishes_snapshot_guard_from_cohort_poison(tmp_path: Path) -> None:
+    """The ~40 byte-identical fail-closed 500s are distinguishable in the LOG.
+
+    The response body is deliberately static, so the ONLY discriminator
+    between (a) the send_message transcript snapshot guard and (b) the
+    guided-failure cohort verifier refusing a poisoned session is the
+    server-authored exception message captured by the handler's
+    ``message`` field. Pin both raise-site phrasings so a refactor that
+    collapses them back into indistinguishable copy fails here.
+    """
+    app = create_app(_settings(tmp_path))
+    handler = app.exception_handlers[AuditIntegrityError]
+    snapshot_guard_message = (
+        "Tier 1 audit anomaly: send_message transcript snapshot for session s does not end at inserted user message m. "
+        "Refusing to compose against interleaved session history."
+    )
+    cohort_message = "guided failure audit cohort does not match the exact durable evidence rows"
+
+    with capture_logs() as logs:
+        await handler(_audit_request("req-a"), AuditIntegrityError(snapshot_guard_message))
+        await handler(_audit_request("req-b"), AuditIntegrityError(cohort_message))
+
+    messages = [log["message"] for log in logs if log["event"] == "http_audit_integrity_error"]
+    assert messages == [snapshot_guard_message, cohort_message]
+    assert messages[0] != messages[1]
 
 
 @pytest.mark.asyncio

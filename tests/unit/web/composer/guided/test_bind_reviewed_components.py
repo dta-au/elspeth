@@ -275,3 +275,123 @@ def test_bind_keeps_discard_routing_untouched() -> None:
 
     assert bound["nodes"][0]["on_error"] == "discard"
     assert bound["nodes"][0]["on_success"] == "output"
+
+
+def _guided_with_output(
+    *,
+    required_fields: tuple[str, ...],
+    output_options: dict[str, object],
+) -> GuidedSession:
+    from dataclasses import replace
+
+    guided = _guided()
+    reviewed = dict(guided.reviewed_outputs)
+    reviewed[OUTPUT_ID] = SinkOutputResolved(
+        name="output",
+        plugin="json",
+        options=output_options,
+        required_fields=required_fields,
+        schema_mode="observed",
+        on_write_failure="discard",
+    )
+    return replace(guided, reviewed_outputs=reviewed)
+
+
+def _linear_pipeline() -> dict[str, object]:
+    return {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "output",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+
+class TestBindDeclaredRequiredFields:
+    """F3 fix 3a: reviewed declared output fields become the sink's schema contract.
+
+    Step-2 field review captures ``SinkOutputResolved.required_fields``, but
+    both the composer sink-contract check and the runtime DAG validation key
+    off ``options.schema.required_fields`` — the binder is the one seam that
+    reaches candidate validation, the sealed proposal, committed state, YAML,
+    and runtime.
+    """
+
+    def test_declared_fields_materialize_as_the_sanctioned_schema_expression(self) -> None:
+        # No author schema block at all: the binder writes the sanctioned
+        # observed-mode contract expression (contracts/schema.py docs).
+        guided = _guided_with_output(
+            required_fields=("name", "score"),
+            output_options={"path": "outputs/colours.json"},
+        )
+
+        bound = bind_guided_reviewed_components(_linear_pipeline(), guided)
+
+        assert bound["outputs"][0]["options"] == {
+            "path": "outputs/colours.json",
+            "schema": {"mode": "observed", "required_fields": ["name", "score"]},
+        }
+
+    def test_empty_declared_fields_leave_reviewed_options_byte_identical(self) -> None:
+        options = {"path": "outputs/colours.json", "schema": {"mode": "observed"}}
+        guided = _guided_with_output(required_fields=(), output_options=dict(options))
+
+        bound = bind_guided_reviewed_components(_linear_pipeline(), guided)
+
+        assert bound["outputs"][0]["options"] == options
+        assert "required_fields" not in bound["outputs"][0]["options"]["schema"]
+
+    def test_author_typed_required_fields_merge_as_a_union_with_author_order_first(self) -> None:
+        # Author-typed schema.required_fields is never overwritten: the union
+        # keeps the author's entries and order, appending only the declared
+        # fields not already present.
+        guided = _guided_with_output(
+            required_fields=("name", "score"),
+            output_options={
+                "path": "outputs/colours.json",
+                "schema": {"mode": "observed", "required_fields": ["email", "name"]},
+            },
+        )
+
+        bound = bind_guided_reviewed_components(_linear_pipeline(), guided)
+
+        schema = bound["outputs"][0]["options"]["schema"]
+        assert schema == {"mode": "observed", "required_fields": ["email", "name", "score"]}
+
+    def test_declared_fields_merge_under_the_schema_config_alias_without_minting_schema(self) -> None:
+        guided = _guided_with_output(
+            required_fields=("name",),
+            output_options={"path": "outputs/colours.json", "schema_config": {"mode": "observed"}},
+        )
+
+        bound = bind_guided_reviewed_components(_linear_pipeline(), guided)
+
+        options = bound["outputs"][0]["options"]
+        assert "schema" not in options
+        assert options["schema_config"] == {"mode": "observed", "required_fields": ["name"]}
+
+    def test_author_schema_keys_beyond_required_fields_are_preserved(self) -> None:
+        guided = _guided_with_output(
+            required_fields=("email",),
+            output_options={
+                "path": "outputs/colours.json",
+                "schema": {"mode": "fixed", "fields": ["email: str"], "guaranteed_fields": ["email"]},
+            },
+        )
+
+        bound = bind_guided_reviewed_components(_linear_pipeline(), guided)
+
+        assert bound["outputs"][0]["options"]["schema"] == {
+            "mode": "fixed",
+            "fields": ["email: str"],
+            "guaranteed_fields": ["email"],
+            "required_fields": ["email"],
+        }

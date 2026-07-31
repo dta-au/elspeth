@@ -60,6 +60,17 @@ are the routing contract: a producer's `on_success`, `on_error`, `routes`, or
   by subscripting the row namespace — `row['field']`; a bare field name is
   not in scope and is rejected. `get_expression_grammar` is the full grammar
   authority.
+  Gate semantics are the user's, never invented: use the user's stated
+  thresholds and comparison values VERBATIM in `condition`; never invent a
+  category literal the user or a reviewed schema fact did not state; never
+  invert a stated route — each route must reach the destination the user
+  named for that criterion. State the gate's condition and every route's
+  destination in your stage reply. If you chose a threshold, cutoff, or
+  category yourself, stage a pending `pipeline_decision` interpretation
+  requirement on that gate node and call
+  `request_interpretation_review(kind="pipeline_decision", ...)` — a gate is
+  not an `llm` node, so every other review kind (including `vague_term`) is
+  dropped there and never surfaces.
 - [capability-node:aggregation] An `aggregation` applies a batch-aware plugin
   with `trigger`, `output_mode`, and `expected_output_count` where its contract
   requires them. Row expansion is supported by an appropriate discovered

@@ -253,7 +253,13 @@ def test_cli_diagnose_loads_authoritative_hmac_from_env_file(
         assert _HMAC_KEY not in captured.out
         assert "UNRELATED_SECRET" not in os.environ
     finally:
-        monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
+        # Plain ``pop``, NOT ``monkeypatch.delenv``: the loader hoisted the key
+        # into this process's ``os.environ``, and ``delenv`` records the value
+        # it removes so teardown *re-inserts* it — turning the cleanup into a
+        # guaranteed leak that makes every later key-free surface on this xdist
+        # worker fail closed (``stage_scan``, ``tier-model-corpus``). Same shape
+        # as the ``_run_sign`` env-file tests below.
+        os.environ.pop("ELSPETH_JUDGE_METADATA_HMAC_KEY", None)
 
 
 def test_standalone_diagnose_loads_authoritative_hmac_from_env_file(
@@ -279,7 +285,9 @@ def test_standalone_diagnose_loads_authoritative_hmac_from_env_file(
         assert key in captured.out
         assert _HMAC_KEY not in captured.out
     finally:
-        monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", raising=False)
+        # See the sibling test above: ``monkeypatch.delenv`` here would restore
+        # the hoisted key at teardown instead of removing it.
+        os.environ.pop("ELSPETH_JUDGE_METADATA_HMAC_KEY", None)
 
 
 def test_cli_diagnose_rejects_missing_env_file(

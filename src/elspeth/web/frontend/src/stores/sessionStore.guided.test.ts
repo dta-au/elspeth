@@ -821,6 +821,56 @@ describe("sessionStore — guided-mode fields and actions", () => {
     expect(respondMock.mock.calls[1]?.[1]).toEqual(originalRequest);
   });
 
+  it("respondGuided: a server_invariant_violated 500 releases custody so a different action still fires (F7b)", async () => {
+    // inv-f6 F7b: a deterministic pre-reservation invariant 500 used to be
+    // indistinguishable from transport ambiguity (bare 5xx), so the client
+    // retained retry custody and every DIFFERENT follow-up action conflicted
+    // for the rest of the page load — a permanent per-pageload wedge. The
+    // structured envelope must settle custody: the next different-body
+    // respond goes out over HTTP instead of dying on a custody conflict.
+    const { respondGuided } = await import("@/api/client");
+    const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+    respondMock
+      .mockRejectedValueOnce({
+        status: 500,
+        detail: "The server refused this request before staging it.",
+        error_type: "server_invariant_violated",
+      })
+      .mockResolvedValueOnce(sampleRespondResponse);
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: sampleGuidedSession,
+      guidedNextTurn: sampleNextTurn,
+    });
+    const original: GuidedRespondAction = {
+      chosen: null,
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: null,
+      draft_hash: null,
+      edit_target: null,
+      control_signal: null,
+      component_action: { action: "add", component_kind: "source" },
+    };
+    const different: GuidedRespondAction = {
+      ...original,
+      component_action: { action: "finish", component_kind: "source" },
+    };
+
+    const first = await useSessionStore.getState().respondGuided(original);
+    expect(first).toMatchObject({ status: "not_applied", reason: "rejected" });
+
+    const second = await useSessionStore.getState().respondGuided(different);
+
+    expect(second).toMatchObject({ status: "applied" });
+    expect(respondMock).toHaveBeenCalledTimes(2);
+    // A new operation id was allocated: the failed operation settled instead
+    // of being retained for replay.
+    const firstRequest = respondMock.mock.calls[0]?.[1] as { operation_id: string };
+    const secondRequest = respondMock.mock.calls[1]?.[1] as { operation_id: string };
+    expect(secondRequest.operation_id).not.toBe(firstRequest.operation_id);
+  });
+
   it("respondGuided: reconciles a reload-orphaned descriptor instead of blocking every different action", async () => {
     // Session 09cde460: Send on the step-3 prompt (2-min respond in flight),
     // reload mid-flight. The descriptor survives in sessionStorage by design,
@@ -1474,6 +1524,74 @@ describe("sessionStore — guided-mode fields and actions", () => {
       proposal_id: PROPOSAL_ID,
       draft_hash: PROPOSAL_HASH,
     });
+  });
+
+  it("respondGuided: a policy_blocked terminal failure settles custody and keeps the proposal controls live (F13-D)", async () => {
+    // ``policy_blocked`` is permanent by construction: the copy says "Change
+    // the highlighted component — retrying will fail the same way". The
+    // review must NOT lock into a non-retryable error (that disables the very
+    // revise controls the copy directs the user to), and no retry invitation
+    // may be retained — the next action allocates a fresh operation id.
+    const { respondGuided } = await import("@/api/client");
+    const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+    const policyDetail =
+      "This pipeline is blocked by a deployment policy and cannot be built as configured. " +
+      "Change the highlighted component — retrying will fail the same way.";
+    respondMock
+      .mockRejectedValueOnce({
+        status: 422,
+        error_type: "guided_operation_terminal_failure",
+        failure_code: "policy_blocked",
+        detail: policyDetail,
+      })
+      .mockResolvedValueOnce({
+        ...sampleRespondResponse,
+        guided_session: { ...sampleGuidedSession, step: "step_3_transforms" },
+        next_turn: sampleProposalTurn,
+      });
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: { ...sampleGuidedSession, step: "step_3_transforms" },
+      guidedNextTurn: sampleProposalTurn,
+      guidedProposalReview: {
+        status: "active",
+        proposal_id: PROPOSAL_ID,
+        draft_hash: PROPOSAL_HASH,
+      },
+    });
+    const action: GuidedRespondAction = {
+      chosen: ["review_wiring"],
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: PROPOSAL_ID,
+      draft_hash: PROPOSAL_HASH,
+      edit_target: null,
+      control_signal: null,
+    };
+
+    const outcome = await useSessionStore.getState().respondGuided(action);
+
+    expect(outcome).toMatchObject({ status: "not_applied", reason: "rejected" });
+    expect(useSessionStore.getState().error).toContain("blocked by a deployment policy");
+    // Controls stay live: the review returns to active, never a locked error.
+    expect(useSessionStore.getState().guidedProposalReview).toEqual({
+      status: "active",
+      proposal_id: PROPOSAL_ID,
+      draft_hash: PROPOSAL_HASH,
+    });
+
+    // Custody settled: a follow-up revise goes out with a NEW operation id.
+    const revise: GuidedRespondAction = {
+      ...action,
+      chosen: null,
+      edit_target: { kind: "node", stable_id: "00000000-0000-4000-8000-00000000aaaa" },
+    };
+    const second = await useSessionStore.getState().respondGuided(revise);
+    expect(second).toMatchObject({ status: "applied" });
+    expect(respondMock).toHaveBeenCalledTimes(2);
+    expect(respondMock.mock.calls[1]?.[1].operation_id).not.toBe(
+      respondMock.mock.calls[0]?.[1].operation_id,
+    );
   });
 
   it("respondGuided: resyncs a decoded proposal operation when local apply fails", async () => {

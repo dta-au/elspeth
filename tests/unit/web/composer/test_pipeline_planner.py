@@ -30,6 +30,7 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.capability_skill import load_pipeline_capability_core
@@ -54,6 +55,7 @@ from elspeth.web.composer.pipeline_planner import (
     _transform_node_count,
     plan_pipeline,
     planner_tool_definitions,
+    prepare_pipeline_plan,
 )
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
@@ -74,8 +76,10 @@ from elspeth.web.composer.state import (
     ValidationSummary,
 )
 from elspeth.web.composer.tools._common import ToolContext, ToolResult
+from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
+from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -83,7 +87,9 @@ from elspeth.web.interpretation_state import (
     RAW_HTML_CLEANUP_USER_TERM,
     pipeline_decision_artifact_hash,
 )
+from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, composition_proposals_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -1115,6 +1121,99 @@ async def test_plan_preserves_custom_review_identity_through_internal_reconcilia
         covered_deferred_intent_ids=proposal.proposal.covered_deferred_intent_ids,
         supersedes_draft_hash=proposal.proposal.supersedes_draft_hash,
     )
+
+
+def _web_authored_policy_pair() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """RESTRICTED (web-authored) authority over the FULL catalog availability.
+
+    Deliberately NOT the snapshot ``build_plugin_snapshot`` would produce for a
+    web principal: that one declines ``source:aws_s3`` up front, and the
+    plugin-visibility gate would then answer first. Keeping every installed
+    plugin available isolates the plumbing under test — the authoritative
+    aws_s3-source gate's own rejection code reaching the planner failure — from
+    the separate availability question. Do not "fix" this to match production
+    availability: that would silently stop pinning the plumbing.
+    """
+    full_catalog = create_catalog_service()
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(full_catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="web-authored-planner-policy",
+        principal_scope="local:planner-user",
+        available=unrestricted.available,
+        unavailable=(),
+        selected=unrestricted.selected,
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="web-authored-planner-generation",
+    )
+    settings = WebSettings.model_validate(
+        {
+            "composer_max_composition_turns": 4,
+            "composer_max_discovery_turns": 4,
+            "composer_timeout_seconds": 60,
+            "composer_rate_limit_per_minute": 20,
+            "shareable_link_signing_key": b"0123456789abcdef0123456789abcdef",
+        }
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    return PolicyCatalogView(full_catalog, snapshot, profiles), snapshot
+
+
+def _aws_s3_source_pipeline(data_dir: Path) -> dict[str, Any]:
+    pipeline = _pipeline(data_dir)
+    pipeline["source"] = {
+        "plugin": "aws_s3",
+        "on_success": "rows",
+        "options": {"bucket": "operator-bucket", "key": "input.csv", "schema": {"mode": "observed"}},
+        "on_validation_failure": "discard",
+    }
+    return pipeline
+
+
+@pytest.mark.asyncio
+async def test_server_derived_rejection_carries_its_closed_codes(tmp_path: Path) -> None:
+    """The server-derived gate must name WHY it refused, not just that it did.
+
+    ``prepare_pipeline_plan`` makes no provider call: the pipeline is
+    server-synthesized, so a candidate rejection here is the only signal the
+    route ever gets. Dropping ``detail_codes`` recorded VALIDATION_FAILED with
+    ``rejection_codes=[]`` while a coded policy refusal existed — the run looked
+    rejection-free exactly when the cause mattered, and the failure was
+    indistinguishable from a provider fault. The model-driven exhaustion path
+    (``_rejection_exhausted``) already carried these codes; this pins the two
+    paths symmetric.
+    """
+    policy_catalog, snapshot = _web_authored_policy_pair()
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await prepare_pipeline_plan(
+            pipeline=_aws_s3_source_pipeline(tmp_path),
+            current_state=_empty_state(),
+            reviewed_facts={"request": "Read the archive from S3."},
+            reviewed_planner_context={"request": "Read the archive from S3."},
+            supersedes_draft_hash=None,
+            surface=PlannerSurface.GUIDED_STAGED,
+            policy_catalog=policy_catalog,
+            plugin_snapshot=snapshot,
+            originating_message=_origin(),
+            base=AbsentBase(),
+            rendered_skill="server-derived pass-through plan",
+            tool_call_id=str(uuid4()),
+            model_identifier="server-derived",
+            model_version="server-derived",
+            provider="server-derived",
+            repair_count=0,
+            timeout_seconds=10.0,
+            custody_config=_custody(tmp_path),
+        )
+
+    assert caught.value.code == "VALIDATION_FAILED"
+    assert caught.value.detail_codes == ("aws_s3_source_not_allowed",)
+    # The code must resolve to actionable guidance, or the planner and the
+    # durable disposition both carry a bare token.
+    assert explain_validation_code("aws_s3_source_not_allowed") is not None
 
 
 @pytest.mark.asyncio

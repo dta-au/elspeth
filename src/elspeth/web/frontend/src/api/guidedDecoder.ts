@@ -276,6 +276,43 @@ function finitePositiveNumber(value: unknown, path: string): number {
   return value;
 }
 
+/** The authored gate predicate travels verbatim (F11): bounded non-empty
+ *  text and NOTHING MORE — no re-parsing or classification here (expression
+ *  validity and route/condition parity are validated server-side at
+ *  candidate validation). */
+function gateCondition(value: unknown, path: string): string {
+  const condition = stringValue(value, path);
+  if (condition.trim() === "") invalid(path, "expected non-empty gate condition");
+  return condition;
+}
+
+/** ``routes`` binds each ordinal alias to its author-visible route key,
+ *  bijective with ``route_aliases`` in the same order (fork gates included —
+ *  both lists derive from the backend's one ordered route walk). */
+function gateRouteBindings(
+  value: unknown,
+  routeAliases: readonly string[],
+  path: string,
+): Array<{ alias: string; key: string }> {
+  const bindings = arrayValue(value, path).map((item, index) => {
+    const itemPath = `${path}[${index}]`;
+    const binding = exactRecord(item, itemPath, ["alias", "key"]);
+    const key = stringValue(binding.key, `${itemPath}.key`);
+    if (key.trim() === "") invalid(`${itemPath}.key`, "expected non-empty route key");
+    return {
+      alias: structuralAlias(binding.alias, "route", `${itemPath}.alias`),
+      key,
+    };
+  });
+  if (
+    bindings.length !== routeAliases.length ||
+    bindings.some((binding, index) => binding.alias !== routeAliases[index])
+  ) {
+    invalid(path, "must bind route_aliases one-to-one in the same order");
+  }
+  return bindings;
+}
+
 function validateProposalBehavior(value: unknown, nodeType: string, path: string): DecodedProposalBehavior {
   const behaviorPath = `${path}.behavior`;
   const behavior = record(value, behaviorPath);
@@ -286,8 +323,10 @@ function validateProposalBehavior(value: unknown, nodeType: string, path: string
     return { kind: nodeType, routeAliases: [], forkBranches: [], branchAliases: [] };
   }
   if (nodeType === "gate") {
-    const exact = exactRecord(behavior, behaviorPath, ["kind", "route_aliases", "fork_branches"]);
+    const exact = exactRecord(behavior, behaviorPath, ["kind", "condition", "route_aliases", "routes", "fork_branches"]);
+    gateCondition(exact.condition, `${behaviorPath}.condition`);
     const routeAliases = aliasArray(exact.route_aliases, "route", `${behaviorPath}.route_aliases`, 1);
+    gateRouteBindings(exact.routes, routeAliases, `${behaviorPath}.routes`);
     const forkBranches = arrayValue(exact.fork_branches, `${behaviorPath}.fork_branches`).map((item, index) => {
       const itemPath = `${behaviorPath}.fork_branches[${index}]`;
       const pair = exactRecord(item, itemPath, ["routes", "branch"]);
@@ -926,7 +965,7 @@ function decodeSchemaPayload(value: unknown, path: string): SchemaFormPayload {
       item,
       fieldPath,
       ["name", "label", "kind", "required", "nullable"],
-      ["description", "tier", "default", "enum", "item_kind", "visible_when"],
+      ["description", "tier", "default", "enum", "item_kind", "visible_when", "placeholder"],
     );
     const tier = field.tier === undefined ? undefined : stringValue(field.tier, `${fieldPath}.tier`);
     if (tier !== undefined && tier !== "essential" && tier !== "common" && tier !== "advanced") {
@@ -950,6 +989,9 @@ function decodeSchemaPayload(value: unknown, path: string): SchemaFormPayload {
       ...(field.description === undefined
         ? {}
         : { description: stringValue(field.description, `${fieldPath}.description`) }),
+      ...(field.placeholder === undefined
+        ? {}
+        : { placeholder: stringValue(field.placeholder, `${fieldPath}.placeholder`) }),
       ...(tier === undefined ? {} : { tier }),
       ...(field.default === undefined ? {} : { default: jsonValue(field.default, `${fieldPath}.default`) }),
       ...(field.enum === undefined ? {} : { enum: stringArray(field.enum, `${fieldPath}.enum`) }),
@@ -1133,10 +1175,13 @@ function decodeProposalBehavior(
       exactRecord(behavior, behaviorPath, ["kind"]);
       return { kind: nodeType };
     case "gate": {
-      const exact = exactRecord(behavior, behaviorPath, ["kind", "route_aliases", "fork_branches"]);
+      const exact = exactRecord(behavior, behaviorPath, ["kind", "condition", "route_aliases", "routes", "fork_branches"]);
+      const routeAliases = aliasArray(exact.route_aliases, "route", `${behaviorPath}.route_aliases`, 1);
       return {
         kind: "gate",
-        route_aliases: aliasArray(exact.route_aliases, "route", `${behaviorPath}.route_aliases`, 1),
+        condition: gateCondition(exact.condition, `${behaviorPath}.condition`),
+        route_aliases: routeAliases,
+        routes: gateRouteBindings(exact.routes, routeAliases, `${behaviorPath}.routes`),
         fork_branches: arrayValue(exact.fork_branches, `${behaviorPath}.fork_branches`).map((item, index) => {
           const itemPath = `${behaviorPath}.fork_branches[${index}]`;
           const branch = exactRecord(item, itemPath, ["routes", "branch"]);
@@ -1593,7 +1638,7 @@ function decodeChatTurn(value: unknown, path: string): ChatTurn {
   if (role === "user" && (kind !== null || reason !== null)) invalid(path, "user chat turn carries assistant discriminator");
   if (role === "assistant" && kind !== "assistant" && kind !== "synthetic_failure") invalid(path, "assistant chat turn lacks closed discriminator");
   if ((kind === "synthetic_failure") !== (reason !== null)) invalid(path, "synthetic failure discriminator is inconsistent");
-  if (reason !== null && !["quality_guard", "unavailable", "not_applied"].includes(reason)) invalid(`${path}.synthetic_failure_reason`, "unknown reason");
+  if (reason !== null && !["quality_guard", "unavailable", "not_applied", "model_defect"].includes(reason)) invalid(`${path}.synthetic_failure_reason`, "unknown reason");
   if (role === "user") {
     return {
       role,
@@ -1617,7 +1662,7 @@ function decodeChatTurn(value: unknown, path: string): ChatTurn {
     };
   }
   if (kind !== "synthetic_failure") return invalid(path, "assistant chat turn lacks closed discriminator");
-  if (reason !== "quality_guard" && reason !== "unavailable" && reason !== "not_applied") {
+  if (reason !== "quality_guard" && reason !== "unavailable" && reason !== "not_applied" && reason !== "model_defect") {
     return invalid(`${path}.synthetic_failure_reason`, "unknown reason");
   }
   return {
@@ -1905,6 +1950,7 @@ export function decodeGuidedStartOperationReconciliation(
         case "provider_unavailable":
         case "provider_timeout":
         case "invalid_provider_response":
+        case "policy_blocked":
         case "stale_conflict":
         case "integrity_error":
         case "custody_error":

@@ -610,6 +610,86 @@ describe("sessionStore", () => {
       expect(state.error).toContain("couldn't complete the composition");
     });
 
+    it("threads failure_code onto the failed optimistic message for policy_blocked (S1)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      // policy_blocked is permanent by construction — a deployment policy
+      // refused the pipeline — so the failed row must carry the code for
+      // the Retry affordance to suppress itself (MessageBubble).
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 403,
+        detail: "This pipeline is not permitted by deployment policy.",
+        failure_code: "policy_blocked",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.isComposing).toBe(false);
+      expect(state.messages[0].local_status).toBe("failed");
+      expect(state.messages[0].local_failure_code).toBe("policy_blocked");
+    });
+
+    it("leaves local_failure_code unset when the send failure carries no failure_code (S1)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 500,
+        detail: "Something went wrong.",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.messages[0].local_status).toBe("failed");
+      expect(state.messages[0].local_failure_code).toBeUndefined();
+    });
+
+    it("renders the honest audit-integrity banner and keeps the saved user row un-failed (F-4b)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      // The fail-closed audit-integrity 500 is a READ-side verification
+      // refusal: the user row was committed before every raise site, so the
+      // banner must say "your message was saved" (with the request id as the
+      // support reference) and the optimistic row must NOT be marked failed —
+      // a failed marker invites re-sending a duplicate of a committed row.
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 500,
+        error_type: "audit_integrity_error",
+        detail:
+          "ELSPETH stopped before replying because it could not verify this session's audit trail.",
+        request_id: "req-0123456789ab",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.isComposing).toBe(false);
+      expect(state.error).toContain("ELSPETH stopped before replying");
+      expect(state.error).toContain("Your message was saved.");
+      expect(state.error).toContain("Reload the session");
+      expect(state.error).toContain("req-0123456789ab");
+      expect(state.messages[0].local_status).toBeUndefined();
+      expect(state.messages[0].local_error).toBeUndefined();
+    });
+
+    it("omits the request-id reference when the audit-integrity envelope carries none (F-4b)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 500,
+        error_type: "audit_integrity_error",
+        detail: "ignored",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.error).toContain("Your message was saved.");
+      expect(state.error).not.toContain("request ID");
+      expect(state.messages[0].local_status).toBeUndefined();
+    });
+
     it("maps a client-side AbortError to the compose-timeout copy, not the generic fallback", async () => {
       const { sendMessage: mockSendMessage } = await import("@/api/client");
       // AbortController.abort() rejects the in-flight fetch with a

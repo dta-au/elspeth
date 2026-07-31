@@ -301,6 +301,29 @@ describe("SchemaFormTurn", () => {
       expect(container.querySelector(".guided-schema-required-marker")).toBeNull();
     });
 
+    it("renders the knob placeholder on a JSON textarea (F5-5b)", async () => {
+      const user = userEvent.setup();
+      render(
+        <SchemaFormTurn
+          payload={pluginPayload([
+            field({
+              name: "schema",
+              label: "Schema",
+              kind: "json-value",
+              placeholder: '{"mode": "fixed", "fields": ["doc_id: str", "note: str?"]}',
+            }),
+          ])}
+          onSubmit={vi.fn()}
+        />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      expect(screen.getByRole("textbox", { name: "Schema" })).toHaveAttribute(
+        "placeholder",
+        '{"mode": "fixed", "fields": ["doc_id: str", "note: str?"]}',
+      );
+    });
+
     it("flags invalid JSON inline and blocks Continue until it parses", async () => {
       const user = userEvent.setup();
       const onSubmit = vi.fn();

@@ -875,3 +875,133 @@ def test_bedrock_required_coverage_fails_for_an_unshielded_input_or_output_path(
 
     assert control_coverage_findings(unshielded_input, PluginCapability.PROMPT_SHIELD)
     assert control_coverage_findings(unshielded_output, PluginCapability.CONTENT_SAFETY)
+
+
+# ── llm on_error vs a required output control ────────────────────────────────
+#
+# An llm node's on_error edge is an independent output path, so a quarantine
+# sink on it correctly fails required_control_coverage. These tests pin the
+# DIAGNOSIS (which reason and stream the finding carries) and — critically —
+# the fact that the only authorable repair is on_error='discard'. A coverage
+# assertion alone is not enough evidence here: the abstract stream graph
+# happily accepts `llm --on_error--> connection --> control --> sink`, while
+# the graph builder rejects that edge outright. Both halves are asserted.
+
+
+def _authorable_state(*nodes: NodeSpec, sinks: tuple[str, ...] = ("main",)) -> CompositionState:
+    """Like ``_state``, but with the llm node's prompt field guaranteed.
+
+    ``_state``'s source guarantees no fields, which is fine for the tests that
+    only call ``control_coverage_findings``. Declaring ``guaranteed_fields``
+    here clears the ``schema_contract_violation`` an ``_llm`` node would
+    otherwise raise, so asserting on ``validate().is_valid`` becomes meaningful.
+    """
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="llm_in",
+            options={"path": "rows.csv", "schema": {"mode": "observed", "guaranteed_fields": ["prompt"]}},
+            on_validation_failure="discard",
+        ),
+        nodes=nodes,
+        edges=(),
+        outputs=tuple(
+            OutputSpec(
+                name=name,
+                plugin="json",
+                options={"path": f"{name}.jsonl", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            )
+            for name in sinks
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def test_content_safety_llm_error_route_to_sink_names_the_offending_error_route() -> None:
+    state = _authorable_state(
+        replace(_llm(on_success="safe_in"), on_error="quarantine"),
+        _safety("safety", "safe_in", "main"),
+        sinks=("main", "quarantine"),
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.reason, finding.uncovered_stream) for finding in findings] == [
+        ("judge", "output_error_route_not_post_dominated", "quarantine"),
+    ]
+
+
+def test_content_safety_llm_error_route_discard_is_covered_and_authorable() -> None:
+    """The one repair the rejection message offers must actually validate."""
+    state = _authorable_state(
+        replace(_llm(on_success="safe_in"), on_error="discard"),
+        _safety("safety", "safe_in", "main"),
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
+    assert state.validate().is_valid
+
+
+def test_llm_error_route_through_the_control_is_not_authorable() -> None:
+    """Interposing a control on an error branch is NOT a repair — pin that.
+
+    Stream-level coverage accepts this shape, which makes it look like a
+    sanctioned pattern. It is not: on_error may only name a sink or 'discard'
+    (core/dag/builder.py:1108, mirrored in composer state validation), so the
+    graph rejects the edge. Any message or authoring aid that offers this
+    shape sends the planner between two rejections forever.
+    """
+    state = _authorable_state(
+        replace(_llm(on_success="safe_in"), on_error="quarantine_in"),
+        _safety("safety", "safe_in", "main"),
+        _safety("quarantine_safety", "quarantine_in", "quarantine"),
+        sinks=("main", "quarantine"),
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
+    assert "transform_on_error_unknown_sink" in {error.error_code for error in state.validate().errors}
+
+
+def test_llm_error_route_is_named_when_a_multi_hop_success_path_is_covered() -> None:
+    """The discriminating case: on_success covered through hops, on_error not.
+
+    This is the shape that must yield the error-route reason, and it is what
+    keeps the narrowing honest. Widening the condition to "any uncovered stream
+    that happens to be some node's on_error target" would still pass the
+    trivially-broken cases below while breaking
+    ``test_content_safety_error_route_to_sink_is_uncovered``, where the
+    uncovered on_error belongs to a DOWNSTREAM node, not the llm node.
+    """
+    state = _authorable_state(
+        replace(_llm(on_success="mid_in"), on_error="quarantine"),
+        _node("mid", "passthrough", "mid_in", "safe_in"),
+        _safety("safety", "safe_in", "main"),
+        sinks=("main", "quarantine"),
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.reason, finding.uncovered_stream) for finding in findings] == [
+        ("output_error_route_not_post_dominated", "quarantine"),
+    ]
+
+
+def test_llm_error_route_reason_stays_general_when_another_path_is_also_uncovered() -> None:
+    """The error-route diagnosis claims the SOLE uncovered stream, or nothing.
+
+    Here on_success writes straight to a sink, so both edges are uncovered and
+    naming only the error route would send the author on a repair that leaves
+    the pipeline rejected.
+    """
+    state = _authorable_state(
+        replace(_llm(on_success="main"), on_error="quarantine"),
+        sinks=("main", "quarantine"),
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.reason, finding.uncovered_stream) for finding in findings] == [
+        ("output_not_post_dominated", None),
+    ]

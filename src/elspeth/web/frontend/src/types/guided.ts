@@ -100,7 +100,10 @@ export interface ChatTurn {
   step: GuidedStep;
   ts_iso: string;
   assistant_message_kind: "assistant" | "synthetic_failure" | null;
-  synthetic_failure_reason: "quality_guard" | "unavailable" | "not_applied" | null;
+  /** Closed persisted reason. "model_defect": the provider answered but the
+   *  reply violated a tool contract — retry is the designed remedy, unlike
+   *  the deterministic "not_applied" causes (Retry is suppressed there). */
+  synthetic_failure_reason: "quality_guard" | "unavailable" | "not_applied" | "model_defect" | null;
 }
 
 /**
@@ -161,6 +164,9 @@ export type GuidedOperationFailureCode =
   | "provider_unavailable"
   | "provider_timeout"
   | "invalid_provider_response"
+  /** Permanent by construction: a deployment policy refused this pipeline.
+   *  Retry affordances must not invite a retry — only a revision can clear it. */
+  | "policy_blocked"
   | "stale_conflict"
   | "integrity_error"
   | "custody_error"
@@ -474,6 +480,9 @@ export interface KnobField {
   name: string;
   label: string;
   description?: string;
+  /** Form-input shape hint for a free-text knob whose value has internal
+   *  structure (e.g. the schema knob's compact JSON example). */
+  placeholder?: string;
   kind: FieldKind;
   tier?: FieldTier;
   required: boolean;
@@ -562,7 +571,14 @@ export type ProposalNodeBehavior =
   | { kind: "transform" }
   | {
       kind: "gate";
+      /** The authored predicate, verbatim (F11): without it the review
+       *  surfaces show only opaque route ordinals. */
+      condition: string;
       route_aliases: string[];
+      /** Binds each ordinal route alias to its author-visible route key
+       *  ("true"/"false" or an author label), bijective with route_aliases
+       *  in the same order (fork gates included). */
+      routes: Array<{ alias: string; key: string }>;
       fork_branches: Array<{ routes: string[]; branch: string }>;
     }
   | {

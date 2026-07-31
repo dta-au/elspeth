@@ -330,12 +330,26 @@ def _content_safety_rules(*, safety_plugin: str) -> list[str]:
     registered ``pipeline_decision`` term for an absent content-safety
     control, so a deployment without one gets no acknowledge card (unlike
     the shield). That asymmetry is a known gap, not a decision.
+
+    Coverage is checked over EVERY output edge of the llm node, not just
+    ``on_success``, so the on_success-only framing this used to carry was a
+    half-truth that produced an unrepairable rejection: an author who wired the
+    control exactly as told and quarantined failures to a sink was rejected for
+    an edge these rules never mentioned.
     """
     return [
         f"An authorized content-safety control is available in this deployment: {safety_plugin}. "
-        f"WIRE a {safety_plugin} transform on the llm node's output — its input is the llm node's "
-        "on_success connection, and its on_success carries the screened rows onward. This is "
-        "required, not advisory: model-generated content must be screened before it is written out.",
+        f"WIRE a {safety_plugin} transform on the llm node's on_success output — its input is the "
+        "llm node's on_success connection, and its on_success carries the screened rows onward. "
+        "This is required, not advisory: model-generated content must be screened before it is "
+        "written out.",
+        f"Screening is checked on EVERY output edge of the llm node, not just on_success. An "
+        f"on_error edge names a SINK (or 'discard') and nothing else, so it cannot pass through "
+        f"{safety_plugin} — set the llm node's on_error to 'discard', and likewise for any "
+        f"transform between the llm node and {safety_plugin}. Only downstream OF the "
+        f"{safety_plugin} transform may on_error name a quarantine sink. Keeping failed llm rows "
+        "in a quarantine sink is an operator decision (relax the control mode, or run under the "
+        "CLI/batch runtime), never something to author around.",
         "Load its schema and assistance through the capability catalog before authoring it, and configure it from that schema alone.",
     ]
 
@@ -439,6 +453,57 @@ _WEB_MULTI_QUERY_RETRY_RULE: Final[str] = (
     "or pool_size > 1."
 )
 
+# The on_error advice is control-mode conditional. Taught unconditionally, it
+# contradicted the required-output-control gate: it steered planners to route an
+# llm node's failures to a quarantine sink, which required_control_coverage then
+# (correctly) rejects as an uncontrolled write path. The two variants are
+# module constants so the gating is testable without asserting prose.
+_LLM_ON_ERROR_QUARANTINE_RULE: Final[str] = (
+    "on_error='discard' silently drops failed rows. When the user needs "
+    "failures retained or inspected, route on_error to a dedicated "
+    "quarantine sink instead of discard."
+)
+
+# Rendered with the deployment's selected output control. A quarantine sink is
+# genuinely unavailable to an llm node here: on_error may only name a sink or
+# 'discard' (core/dag/builder.py:1108), so no control transform can be
+# interposed on an error branch, and any sink it names is an uncontrolled write.
+_LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE: Final[str] = (
+    "This deployment REQUIRES the {control} control on every path carrying llm "
+    "output, so an llm node's on_error MUST be 'discard'. An on_error edge "
+    "names a SINK (or 'discard') and nothing else — no control transform can "
+    "sit on an error branch — so a quarantine sink for an llm node is an "
+    "uncontrolled write path and the pipeline is rejected. Do NOT try to wire "
+    "{control} onto the error branch; that connection has no producer and fails "
+    "graph construction. The same applies to any transform between the llm node "
+    "and the {control} transform; downstream OF that control, on_error may name "
+    "a quarantine sink normally, as may transforms that never carry llm output."
+)
+
+# The author cannot satisfy "retain the failed rows" here, so the rule names who
+# can. Without this the planner reads the requirement as a bug and burns its
+# repair budget re-attempting quarantine shapes.
+_LLM_ON_ERROR_CONTROLLED_TRADEOFF_TEMPLATE: Final[str] = (
+    "'discard' costs the failed row's CONTENT, not the record of it: nothing "
+    "reaches a sink to inspect later, while the audit trail still records the "
+    "row's terminal outcome and content hash. If the user needs failed llm rows "
+    "preserved in a quarantine sink, say plainly that this is an operator "
+    "decision, not something to author around — the operator relaxes the "
+    "{control} control mode to 'recommend', or the pipeline runs under the "
+    "CLI/batch runtime. Do not keep re-attempting quarantine shapes."
+)
+
+
+def _llm_on_error_rules(*, output_control: str | None) -> list[str]:
+    """Pick the on_error rules the deployment's control posture makes authorable."""
+    if output_control is None:
+        return [_LLM_ON_ERROR_QUARANTINE_RULE]
+    return [
+        _LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE.format(control=output_control),
+        _LLM_ON_ERROR_CONTROLLED_TRADEOFF_TEMPLATE.format(control=output_control),
+    ]
+
+
 _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "An llm node writes the model's reply as ONE raw string into the field "
     "named by options.response_field (default llm_response). Prompt text that "
@@ -490,11 +555,16 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "Sink hygiene: the auto-appended <response_field>_usage / _model audit "
     "fields ride the row automatically — do not map or require them into "
     "sinks unless the user asked for token/model reporting.",
-    "on_error='discard' silently drops failed rows. When the user needs "
-    "failures retained or inspected, route on_error to a dedicated "
-    "quarantine sink instead of discard.",
-    _WEB_MULTI_QUERY_RETRY_RULE,
 )
+
+
+def _llm_output_contract_rules(*, output_control: str | None) -> list[str]:
+    """The llm output contract with its control-mode-conditional on_error rule."""
+    return [
+        *_LLM_OUTPUT_CONTRACT_RULES,
+        *_llm_on_error_rules(output_control=output_control),
+        _WEB_MULTI_QUERY_RETRY_RULE,
+    ]
 
 
 _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
@@ -1245,11 +1315,20 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
             "rules": list(_FORK_ROW_UNION_RULES),
             "set_pipeline_exemplar": fork_row_union,
         }
+    # Resolved before the llm aids because the on_error rule they carry is
+    # control-mode conditional. ``_selected_control_profile`` returns None for
+    # recommend mode or no selection, so this is the same gate the
+    # content_safety aid uses. Memo safety: control_modes feeds
+    # PluginAvailabilitySnapshot's canonical payload and therefore
+    # snapshot_hash, which keys _AIDS_MEMO — one deployment's posture can never
+    # be served to another.
+    required_safety = _selected_control_profile(catalog, PluginCapability.CONTENT_SAFETY)
+    required_output_control = required_safety[0] if required_safety is not None else None
     if "llm" in visible["transform"]:
         aids["model_custody"] = {
             "rules": _model_custody_rules(_usable_llm_profile_alias(catalog)),
         }
-        aids["llm_output_contract"] = {"rules": list(_LLM_OUTPUT_CONTRACT_RULES)}
+        aids["llm_output_contract"] = {"rules": _llm_output_contract_rules(output_control=required_output_control)}
     aids["review_registry"] = {
         # Imported from interpretation_state so the taught vocabulary can
         # never drift from the resolve-time registry (52322ebe1 discipline).
@@ -1272,12 +1351,8 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
                 untrusted_producers=visible_untrusted_producers,
             ),
         }
-    if (
-        "llm" in visible["transform"]
-        and (selected_safety := dict(catalog.snapshot.selected).get(PluginCapability.CONTENT_SAFETY)) is not None
-        and control_modes.get(PluginCapability.CONTENT_SAFETY, ControlMode.RECOMMEND) is ControlMode.REQUIRED
-    ):
-        aids["content_safety"] = {"rules": _content_safety_rules(safety_plugin=selected_safety.name)}
+    if "llm" in visible["transform"] and required_output_control is not None:
+        aids["content_safety"] = {"rules": _content_safety_rules(safety_plugin=required_output_control)}
     if visible_untrusted_producers and "field_mapper" in visible["transform"]:
         aids["raw_html_cleanup"] = {"rules": _raw_html_cleanup_rules(untrusted_producers=visible_untrusted_producers)}
     if "web_scrape" in visible["transform"]:

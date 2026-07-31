@@ -374,10 +374,13 @@ def _prepare_schema8_management_rewind(
     )
     invalidated_proposal = None
     if invalidated_active_proposal is not None:
+        # A real supersession: the deferred-intent rewind displaces the
+        # pending proposal with a re-planned successor.
         invalidated_proposal = GuidedPendingProposalInvalidation(
             proposal_id=invalidated_active_proposal.proposal_id,
             draft_hash=invalidated_active_proposal.draft_hash,
             reviewed_facts=guided_private_reviewed_facts(authority.current_guided),
+            reason="superseded",
         )
     rewound_guided = replace(
         authority.prospective,

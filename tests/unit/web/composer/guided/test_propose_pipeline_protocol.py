@@ -123,6 +123,9 @@ def _payload() -> dict[str, Any]:
     }
 
 
+GATE_ROUTE_KEYS = ("low", "medium", "high")
+
+
 def _gate_payload() -> dict[str, Any]:
     payload = _payload()
     route_aliases = [proposal_structural_label("route", index) for index in range(3)]
@@ -131,7 +134,13 @@ def _gate_payload() -> dict[str, Any]:
         "label": proposal_component_label("node", 0),
         "node_type": "gate",
         "plugin": None,
-        "behavior": {"kind": "gate", "route_aliases": route_aliases, "fork_branches": []},
+        "behavior": {
+            "kind": "gate",
+            "condition": "row['tier']",
+            "route_aliases": route_aliases,
+            "routes": [{"alias": alias, "key": key} for alias, key in zip(route_aliases, GATE_ROUTE_KEYS, strict=True)],
+            "fork_branches": [],
+        },
     }
     payload["graph"]["edges"] = [
         {
@@ -178,7 +187,9 @@ def _fork_coalesce_payload() -> dict[str, Any]:
             "plugin": None,
             "behavior": {
                 "kind": "gate",
+                "condition": "row['group']",
                 "route_aliases": [route],
+                "routes": [{"alias": route, "key": "true"}],
                 "fork_branches": [{"routes": [route], "branch": branch} for branch in branches],
             },
         },
@@ -821,10 +832,143 @@ def test_propose_pipeline_gate_represents_arbitrary_multiple_routes_structurally
     assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
 
 
+def test_propose_pipeline_gate_condition_is_required_bounded_nonempty_text() -> None:
+    missing = _gate_payload()
+    del missing["nodes"][0]["behavior"]["condition"]
+
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, missing)
+
+    assert error is not None
+    assert "missing required keys" in error
+
+    for bad in ("", None, 7, "x" * 65_537):
+        payload = _gate_payload()
+        payload["nodes"][0]["behavior"]["condition"] = bad
+        error = validate_payload(TurnType.PROPOSE_PIPELINE, payload)
+        assert error is not None
+        assert "condition" in error
+
+
+def test_propose_pipeline_gate_route_bindings_are_bijective_with_route_aliases_in_order() -> None:
+    reordered = _gate_payload()
+    reordered["nodes"][0]["behavior"]["routes"].reverse()
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, reordered)
+    assert error is not None
+    assert "one-to-one" in error
+
+    mismatched = _gate_payload()
+    mismatched["nodes"][0]["behavior"]["routes"][0]["alias"] = proposal_structural_label("route", 7)
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, mismatched)
+    assert error is not None
+    assert "one-to-one" in error
+
+    short = _gate_payload()
+    del short["nodes"][0]["behavior"]["routes"][2]
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, short)
+    assert error is not None
+    assert "one-to-one" in error
+
+
+def test_propose_pipeline_gate_route_binding_key_is_a_bounded_label_and_nothing_more() -> None:
+    # The key carries the author-visible route label verbatim; the contract
+    # bounds it as non-empty text and never re-parses or classifies it —
+    # route/condition parity is validated upstream at candidate validation.
+    for bad in ("", None, 7):
+        payload = _gate_payload()
+        payload["nodes"][0]["behavior"]["routes"][0]["key"] = bad
+        error = validate_payload(TurnType.PROPOSE_PIPELINE, payload)
+        assert error is not None
+        assert "key" in error
+
+    extra = _gate_payload()
+    extra["nodes"][0]["behavior"]["routes"][0]["destination"] = "output-1"
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, extra)
+    assert error is not None
+    assert "unexpected keys" in error
+
+
+def _wire_payload_with_gate(behavior: dict[str, Any]) -> dict[str, Any]:
+    """Minimal CONFIRM_WIRING payload carrying one gate node behavior."""
+    return {
+        "proposal_id": PROPOSAL_ID,
+        "draft_hash": DRAFT_HASH,
+        "sources": [
+            {
+                "stable_id": SOURCE_ID,
+                "label": "source-1",
+                "plugin": "csv",
+                "on_validation_failure": "discard",
+                "guaranteed_fields": [],
+                "row_cardinality": {"input": "none", "output": "zero_or_many", "expected_output_count": None},
+            }
+        ],
+        "nodes": [
+            {
+                "stable_id": NODE_ID,
+                "label": "node-1",
+                "node_type": "gate",
+                "plugin": None,
+                "behavior": behavior,
+                "required_fields": [],
+                "guaranteed_fields": [],
+                "row_cardinality": {"input": "one", "output": "one", "expected_output_count": None},
+                "structured_output_fields": [],
+            }
+        ],
+        "outputs": [
+            {
+                "stable_id": OUTPUT_ID,
+                "label": "output-1",
+                "plugin": "json",
+                "on_write_failure": "discard",
+                "required_fields": [],
+                "business_schema": {"mode": "observed", "fields": [], "guaranteed_fields": [], "required_fields": []},
+            }
+        ],
+        "connections": [],
+        "semantic_contracts": [],
+        "warnings": [],
+        "blockers": [],
+        "can_confirm": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutate", "valid"),
+    [
+        pytest.param(lambda behavior: None, True, id="canonical-gate-accepted"),
+        pytest.param(lambda behavior: behavior.pop("condition"), False, id="missing-condition"),
+        pytest.param(lambda behavior: behavior.__setitem__("condition", ""), False, id="empty-condition"),
+        pytest.param(lambda behavior: behavior["routes"].reverse(), False, id="reordered-route-bindings"),
+        pytest.param(lambda behavior: behavior["routes"][0].__setitem__("key", 7), False, id="malformed-route-key"),
+    ],
+)
+def test_gate_behavior_contract_is_shared_between_proposal_and_wire_turns(mutate: Any, valid: bool) -> None:
+    """PROPOSE_PIPELINE and CONFIRM_WIRING accept/reject gate behavior identically.
+
+    Both validators route node behavior through the shared
+    ``_validate_node_behavior`` (protocol.py); this pins that the wire stage
+    cannot drift to a weaker (or different) gate contract than the proposal.
+    """
+    proposal = _gate_payload()
+    mutate(proposal["nodes"][0]["behavior"])
+    wire = _wire_payload_with_gate(deepcopy(proposal["nodes"][0]["behavior"]))
+
+    proposal_error = validate_payload(TurnType.PROPOSE_PIPELINE, proposal)
+    wire_error = validate_payload(TurnType.CONFIRM_WIRING, wire)
+
+    assert (proposal_error is None) is valid
+    assert wire_error == proposal_error
+
+
 def test_propose_pipeline_gate_represents_multiple_routes_selecting_one_fanout() -> None:
     payload = _fork_coalesce_payload()
     routes = [proposal_structural_label("route", index) for index in range(2)]
     payload["nodes"][0]["behavior"]["route_aliases"] = routes
+    payload["nodes"][0]["behavior"]["routes"] = [
+        {"alias": routes[0], "key": "true"},
+        {"alias": routes[1], "key": "false"},
+    ]
     for branch in payload["nodes"][0]["behavior"]["fork_branches"]:
         branch["routes"] = routes
     for edge in payload["graph"]["edges"]:
@@ -838,6 +982,10 @@ def test_propose_pipeline_rejects_per_route_split_fanout_that_canonical_gate_can
     payload = _fork_coalesce_payload()
     routes = [proposal_structural_label("route", index) for index in range(2)]
     payload["nodes"][0]["behavior"]["route_aliases"] = routes
+    payload["nodes"][0]["behavior"]["routes"] = [
+        {"alias": routes[0], "key": "true"},
+        {"alias": routes[1], "key": "false"},
+    ]
     for index, branch in enumerate(payload["nodes"][0]["behavior"]["fork_branches"]):
         branch["routes"] = [routes[index]]
     fork_edges = [edge for edge in payload["graph"]["edges"] if edge["flow"]["kind"] == "gate_fork"]
@@ -872,14 +1020,29 @@ def test_propose_pipeline_rejects_route_alias_reused_by_two_gates() -> None:
             "label": proposal_component_label("node", 0),
             "node_type": "gate",
             "plugin": None,
-            "behavior": {"kind": "gate", "route_aliases": routes, "fork_branches": []},
+            "behavior": {
+                "kind": "gate",
+                "condition": "row['first']",
+                "route_aliases": routes,
+                "routes": [
+                    {"alias": routes[0], "key": "true"},
+                    {"alias": routes[1], "key": "false"},
+                ],
+                "fork_branches": [],
+            },
         },
         {
             "stable_id": NODE_2_ID,
             "label": proposal_component_label("node", 1),
             "node_type": "gate",
             "plugin": None,
-            "behavior": {"kind": "gate", "route_aliases": [routes[0]], "fork_branches": []},
+            "behavior": {
+                "kind": "gate",
+                "condition": "row['second']",
+                "route_aliases": [routes[0]],
+                "routes": [{"alias": routes[0], "key": "true"}],
+                "fork_branches": [],
+            },
         },
     ]
     payload["graph"]["edges"] = [
@@ -1365,7 +1528,9 @@ def test_propose_pipeline_rejects_one_fork_branch_set_consumed_by_two_coalesces(
             "plugin": None,
             "behavior": {
                 "kind": "gate",
+                "condition": "row['fan_out']",
                 "route_aliases": [routes[0]],
+                "routes": [{"alias": routes[0], "key": "true"}],
                 "fork_branches": [
                     {"routes": [routes[0]], "branch": branches[0]},
                     {"routes": [routes[0]], "branch": branches[1]},
@@ -1377,14 +1542,32 @@ def test_propose_pipeline_rejects_one_fork_branch_set_consumed_by_two_coalesces(
             "label": proposal_component_label("node", 1),
             "node_type": "gate",
             "plugin": None,
-            "behavior": {"kind": "gate", "route_aliases": routes[1:3], "fork_branches": []},
+            "behavior": {
+                "kind": "gate",
+                "condition": "row['left']",
+                "route_aliases": routes[1:3],
+                "routes": [
+                    {"alias": routes[1], "key": "true"},
+                    {"alias": routes[2], "key": "false"},
+                ],
+                "fork_branches": [],
+            },
         },
         {
             "stable_id": gate_c_id,
             "label": proposal_component_label("node", 2),
             "node_type": "gate",
             "plugin": None,
-            "behavior": {"kind": "gate", "route_aliases": routes[3:5], "fork_branches": []},
+            "behavior": {
+                "kind": "gate",
+                "condition": "row['right']",
+                "route_aliases": routes[3:5],
+                "routes": [
+                    {"alias": routes[3], "key": "true"},
+                    {"alias": routes[4], "key": "false"},
+                ],
+                "fork_branches": [],
+            },
         },
         *(
             {

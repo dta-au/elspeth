@@ -52,7 +52,15 @@ function sameRetryAction(
   );
 }
 
-function flowLabel(flow: ProposalFlow): string {
+/** Human name for one gate route: "when true (route-1)". The ordinal alias
+ *  stays visible — it is the revise-target / integrity token — while the
+ *  author-visible key says which branch this actually is (F11). */
+function routeName(alias: string, routeKeys: ReadonlyMap<string, string>): string {
+  const key = routeKeys.get(alias);
+  return key === undefined ? alias : `when ${key} (${alias})`;
+}
+
+function flowLabel(flow: ProposalFlow, routeKeys: ReadonlyMap<string, string>): string {
   switch (flow.kind) {
     case "source_success":
       return flow.branch === null ? "on source success" : `on source success in ${flow.branch}`;
@@ -62,12 +70,12 @@ function flowLabel(flow: ProposalFlow): string {
       return flow.branch === null ? "on success" : `on success in ${flow.branch}`;
     case "node_error":
       return "on error";
-    case "gate_route":
-      return flow.branch === null
-        ? `${flow.route} route`
-        : `${flow.route} route in ${flow.branch}`;
+    case "gate_route": {
+      const label = routeName(flow.route, routeKeys);
+      return flow.branch === null ? label : `${label} in ${flow.branch}`;
+    }
     case "gate_fork":
-      return `${flow.routes.join(" + ")} forks to ${flow.branch}`;
+      return `${flow.routes.map((route) => routeName(route, routeKeys)).join(" + ")} forks to ${flow.branch}`;
     case "queue_continue":
       return flow.branch === null ? "queue continues" : `queue continues in ${flow.branch}`;
     case "coalesce_success":
@@ -81,12 +89,50 @@ function flowLabel(flow: ProposalFlow): string {
   }
 }
 
-function behaviorSummary(behavior: ProposalNodeBehavior): string {
+/** "When <condition> — true → <dest>, false → <dest>" (F11): the authored
+ *  predicate verbatim, with each author-visible route key resolved to the
+ *  destination the proposal actually wires. Ordinal aliases stay visible in
+ *  parentheses (they are the revise-target labels). */
+function gateSummary(
+  behavior: Extract<ProposalNodeBehavior, { kind: "gate" }>,
+  gateId: string,
+  edges: ProposePipelinePayload["graph"]["edges"],
+  labelById: ReadonlyMap<string, string>,
+): string {
+  const targetLabel = (edge: ProposePipelinePayload["graph"]["edges"][number]): string =>
+    edge.to_endpoint.kind === "discard"
+      ? "discard"
+      : (labelById.get(edge.to_endpoint.stable_id) ?? edge.to_endpoint.stable_id);
+  const destination = (alias: string): string | null => {
+    const direct = edges.find(
+      (edge) =>
+        edge.from_endpoint.stable_id === gateId &&
+        edge.flow.kind === "gate_route" &&
+        edge.flow.route === alias,
+    );
+    if (direct !== undefined) return targetLabel(direct);
+    const forks = edges.filter(
+      (edge) =>
+        edge.from_endpoint.stable_id === gateId &&
+        edge.flow.kind === "gate_fork" &&
+        edge.flow.routes.includes(alias),
+    );
+    if (forks.length === 0) return null;
+    return forks.map(targetLabel).join(" + ");
+  };
+  const arms = behavior.routes.map(({ alias, key }) => {
+    const dest = destination(alias);
+    return dest === null ? `${key} (${alias})` : `${key} → ${dest} (${alias})`;
+  });
+  const forkNote =
+    behavior.fork_branches.length > 0 ? ` ${behavior.fork_branches.length} fork branches.` : "";
+  return `When ${behavior.condition} — ${arms.join(", ")}.${forkNote}`;
+}
+
+function behaviorSummary(behavior: Exclude<ProposalNodeBehavior, { kind: "gate" }>): string {
   switch (behavior.kind) {
     case "transform":
       return "Transforms each incoming item.";
-    case "gate":
-      return `Routes ${behavior.route_aliases.join(", ")}; ${behavior.fork_branches.length} fork branches.`;
     case "aggregation": {
       const triggers: string[] = [];
       if (behavior.count !== null) triggers.push(`count ${behavior.count}`);
@@ -149,6 +195,17 @@ export function ProposePipelineTurn({
     for (const output of payload.outputs) labels.set(output.stable_id, output.label);
     return labels;
   }, [payload]);
+  // Alias → author-visible route key, from each gate's behavior bindings
+  // (bijective with route_aliases; aliases are globally unique ordinals, so
+  // one flat map covers every gate).
+  const routeKeyByAlias = useMemo(() => {
+    const keys = new Map<string, string>();
+    for (const node of payload.nodes) {
+      if (node.behavior.kind !== "gate") continue;
+      for (const { alias, key } of node.behavior.routes) keys.set(alias, key);
+    }
+    return keys;
+  }, [payload.nodes]);
   const hasDiscard = payload.graph.edges.some((edge) => edge.to_endpoint.kind === "discard");
   const graphNodes = useMemo<ReadOnlyPipelineGraphNode[]>(() => [
     ...payload.graph.sources.map((source) => ({
@@ -186,10 +243,10 @@ export function ProposePipelineTurn({
         id: edge.stable_id,
         source: edge.from_endpoint.stable_id,
         target: targetId,
-        label: `${from} ${flowLabel(edge.flow)} → ${to}`,
+        label: `${from} ${flowLabel(edge.flow, routeKeyByAlias)} → ${to}`,
         isError: ["source_validation_failure", "node_error", "output_write_failure"].includes(edge.flow.kind),
       };
-    }), [labelById, payload.graph.edges]);
+    }), [labelById, payload.graph.edges, routeKeyByAlias]);
   const routeItems = useMemo<WireReviewItem[]>(() =>
     payload.graph.edges.map((edge) => ({
       id: edge.stable_id,
@@ -197,8 +254,8 @@ export function ProposePipelineTurn({
       to: edge.to_endpoint.kind === "discard"
         ? "discard"
         : (labelById.get(edge.to_endpoint.stable_id) ?? edge.to_endpoint.stable_id),
-      summary: flowLabel(edge.flow),
-    })), [labelById, payload.graph.edges]);
+      summary: flowLabel(edge.flow, routeKeyByAlias),
+    })), [labelById, payload.graph.edges, routeKeyByAlias]);
   const currentBinding = proposalBindingMatches(payload, reviewState);
   const status = reviewStatusCopy(reviewState, currentBinding);
   const controlsLocked =
@@ -285,7 +342,12 @@ export function ProposePipelineTurn({
           {payload.nodes.map((node) => (
             <li key={node.stable_id}>
               <strong>{node.label} · {node.node_type}{node.plugin === null ? "" : ` · ${node.plugin.id}`}</strong>
-              <span> {behaviorSummary(node.behavior)}</span>
+              <span>
+                {" "}
+                {node.behavior.kind === "gate"
+                  ? gateSummary(node.behavior, node.stable_id, payload.graph.edges, labelById)
+                  : behaviorSummary(node.behavior)}
+              </span>
             </li>
           ))}
           {payload.outputs.map((output) => (

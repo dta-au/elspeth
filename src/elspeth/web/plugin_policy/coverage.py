@@ -43,10 +43,26 @@ class OutputStreamGraph:
 
 @dataclass(frozen=True, slots=True)
 class ControlCoverageFinding:
+    """One uncovered required-control site, with enough detail to explain it.
+
+    ``reason`` discriminates the diagnosis only — every variant is the same
+    rejection with the same severity. ``output_error_route_not_post_dominated``
+    is the narrow, fully-diagnosable output case: the node's own ``on_error``
+    edge is the single uncovered stream, so the message can name the one
+    authorable repair instead of a generic "not covered". ``uncovered_stream``
+    is populated only for that case and carries the offending ``on_error``
+    target.
+    """
+
     component_id: str
     capability: PluginCapability
     role: ControlRole
-    reason: Literal["input_not_dominated", "output_not_post_dominated"]
+    reason: Literal[
+        "input_not_dominated",
+        "output_not_post_dominated",
+        "output_error_route_not_post_dominated",
+    ]
+    uncovered_stream: str | None = None
 
 
 def build_output_stream_graph(nodes: Sequence[NodeSpec]) -> OutputStreamGraph:
@@ -247,23 +263,41 @@ def control_coverage_findings(
         else:
             protected_fields = _llm_output_fields(node)
             outputs = _node_output_streams(node)
-            covered = bool(outputs) and all(
-                _stream_proves_output_control(
+            # Same predicate as before, evaluated per stream instead of through
+            # a short-circuiting all(): ``covered`` is still "every authored
+            # output stream is post-dominated by the control". The helpers are
+            # pure, so dropping the short circuit changes cost on the failing
+            # path only — never the verdict.
+            uncovered = tuple(
+                stream
+                for stream in outputs
+                if not _stream_proves_output_control(
                     stream,
                     graph,
                     sink_streams=sink_streams,
                     visited=frozenset({node.id}),
                     protected_fields=protected_fields,
                 )
-                for stream in outputs
             )
-            if not covered:
+            if not outputs or uncovered:
+                # Diagnosis only. The node's own on_error edge is singled out
+                # when it is the SOLE uncovered stream, because that case has
+                # exactly one authorable repair (on_error must name a sink or
+                # 'discard' — engine invariant, core/dag/builder.py:1108 — so
+                # no control can be interposed on an error branch). An
+                # on_error of 'discard' is exempt in
+                # ``_NON_PRODUCED_ROUTE_TARGETS`` and therefore never lands in
+                # ``uncovered``, so a failure elsewhere in the graph keeps the
+                # general reason even when on_error is set.
+                error_route = node.on_error if node.on_error and node.on_error != node.on_success else None
+                names_error_route = error_route is not None and uncovered == (error_route,)
                 findings.append(
                     ControlCoverageFinding(
                         component_id=node.id,
                         capability=capability,
                         role=ControlRole.OUTPUT,
-                        reason="output_not_post_dominated",
+                        reason=("output_error_route_not_post_dominated" if names_error_route else "output_not_post_dominated"),
+                        uncovered_stream=error_route if names_error_route else None,
                     )
                 )
     return tuple(findings)

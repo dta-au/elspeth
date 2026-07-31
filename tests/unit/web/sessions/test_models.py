@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
+from typing import get_args
 
 import pytest
 from sqlalchemy import insert, inspect, select, text
@@ -13,11 +15,13 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
     chat_messages_table,
     composition_states_table,
+    guided_operations_table,
     run_events_table,
     runs_table,
     sessions_table,
     user_secrets_table,
 )
+from elspeth.web.sessions.protocol import GUIDED_OPERATION_FAILURE_CODE_VALUES, GuidedOperationFailureCode
 from elspeth.web.sessions.schema import initialize_session_schema
 
 
@@ -242,6 +246,33 @@ class TestSessionForeignKeys:
 
 class TestCheckConstraints:
     """Verify CHECK constraints reject invalid values."""
+
+    def test_guided_operation_failure_code_check_mirrors_the_python_literal(self) -> None:
+        """``GuidedOperationFailureCode`` and its CHECK are ONE paired contract.
+
+        Extending either side alone is silently half-broken in opposite
+        directions: a Python-only addition passes every writer guard and then
+        dies on the DB CHECK at settlement time (the failure the operation
+        exists to record is itself unrecordable), while a CHECK-only addition
+        admits a value no writer can produce and no reader can classify. The
+        pairing is only enforceable here, so this test is the enforcement — and
+        because SQLite cannot ALTER a CHECK in place, a change to either side
+        also requires the ``SESSION_SCHEMA_EPOCH`` bump pinned separately.
+
+        Order is compared too: ``protocol.py`` documents that the Literal
+        mirrors the CHECK declaration order for diff clarity.
+        """
+        constraint = next(
+            item for item in guided_operations_table.constraints if getattr(item, "name", None) == "ck_guided_operations_failure_code"
+        )
+        declared = re.findall(r"'([a-z_]+)'", str(constraint.sqltext))
+
+        assert declared == list(get_args(GuidedOperationFailureCode))
+        assert set(declared) == GUIDED_OPERATION_FAILURE_CODE_VALUES
+        # The permanent-refusal member the split introduced: pinned explicitly so
+        # a revert of either side fails loudly rather than shrinking a vocabulary
+        # that persisted rows already use.
+        assert "policy_blocked" in declared
 
     def test_auth_provider_type_constraints_exist(self, engine) -> None:
         inspector = inspect(engine)

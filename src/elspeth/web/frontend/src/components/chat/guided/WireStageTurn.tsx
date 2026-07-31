@@ -129,7 +129,25 @@ function fieldsText(label: "Required" | "Guaranteed", fields: string[]): string 
   return `${label} fields: ${fields.length > 0 ? fields.join(", ") : "none"}`;
 }
 
-function flowText(flow: ProposalFlow): string {
+/** Alias → author-visible route key, from each gate's behavior bindings
+ *  (aliases are globally unique ordinals, so one flat map covers all gates). */
+export function buildRouteKeys(data: WireStageData): Map<string, string> {
+  const keys = new Map<string, string>();
+  for (const node of data.nodes) {
+    if (node.behavior.kind !== "gate") continue;
+    for (const { alias, key } of node.behavior.routes) keys.set(alias, key);
+  }
+  return keys;
+}
+
+function flowText(flow: ProposalFlow, routeKeys: ReadonlyMap<string, string>): string {
+  // "(when <key>)" resolves the ordinal to the author-visible route key so a
+  // route row reads as the branch it actually is (F11); the ordinal alias
+  // stays visible — it is the correction-target / integrity token.
+  const keyed = (alias: string): string => {
+    const key = routeKeys.get(alias);
+    return key === undefined ? alias : `${alias} (when ${key})`;
+  };
   switch (flow.kind) {
     case "source_success":
       return flow.branch === null ? "Source success" : `Source success on ${flow.branch}`;
@@ -140,9 +158,11 @@ function flowText(flow: ProposalFlow): string {
     case "node_error":
       return "Node failure";
     case "gate_route":
-      return flow.branch === null ? `Gate route ${flow.route}` : `Gate route ${flow.route} on ${flow.branch}`;
+      return flow.branch === null
+        ? `Gate route ${keyed(flow.route)}`
+        : `Gate route ${keyed(flow.route)} on ${flow.branch}`;
     case "gate_fork":
-      return `Gate fork ${flow.routes.join(", ")} as ${flow.branch}`;
+      return `Gate fork ${flow.routes.map(keyed).join(", ")} as ${flow.branch}`;
     case "queue_continue":
       return flow.branch === null ? "Queue continuation" : `Queue continuation on ${flow.branch}`;
     case "coalesce_success":
@@ -156,7 +176,10 @@ function flowText(flow: ProposalFlow): string {
   }
 }
 
-function behaviorDetails(behavior: ProposalNodeBehavior): string[] {
+function behaviorDetails(
+  behavior: ProposalNodeBehavior,
+  routeDestination: (alias: string) => string | null = () => null,
+): string[] {
   switch (behavior.kind) {
     case "transform":
       return ["Policy: transform each input row"];
@@ -164,6 +187,15 @@ function behaviorDetails(behavior: ProposalNodeBehavior): string[] {
       return ["Policy: continue queued items individually"];
     case "gate":
       return [
+        // The authored predicate, verbatim (F11) — followed by each
+        // author-visible route key resolved to the entity it feeds.
+        `When ${behavior.condition}`,
+        ...behavior.routes.map(({ alias, key }) => {
+          const destination = routeDestination(alias);
+          return destination === null
+            ? `When ${key} (${alias})`
+            : `When ${key} → ${destination} (${alias})`;
+        }),
         `Routes: ${behavior.route_aliases.join(", ")}`,
         ...behavior.fork_branches.map((fork) => `Fork branch ${fork.branch}: ${fork.routes.join(", ")}`),
       ];
@@ -194,7 +226,7 @@ function behaviorDetails(behavior: ProposalNodeBehavior): string[] {
 
 /** The verbatim engineer-grade row, preserved behind the Technical details
  *  expander for operators (same idiom as the validation summary's raw dump). */
-function rawEdgeRow(edge: WireEdge): string {
+function rawEdgeRow(edge: WireEdge, routeKeys: ReadonlyMap<string, string>): string {
   const status =
     edge.satisfied === true
       ? "(connected)"
@@ -205,7 +237,7 @@ function rawEdgeRow(edge: WireEdge): string {
     edge.missing_fields.length > 0
       ? ` Missing fields: ${edge.missing_fields.join(", ")}`
       : "";
-  return `[${edge.stable_id}] ${edge.from} -> ${edge.to} via ${flowText(edge.flow)} ${status}${missing}`;
+  return `[${edge.stable_id}] ${edge.from} -> ${edge.to} via ${flowText(edge.flow, routeKeys)} ${status}${missing}`;
 }
 
 function warningText(warning: Record<string, unknown>): string {
@@ -226,6 +258,23 @@ export function WireStageTurn({
   const edges = reconstructWireEdges(data);
   const entityNames = buildEntityNames(data);
   const nameFor = (id: string): string => entityNames.get(id) ?? id;
+  const routeKeys = buildRouteKeys(data);
+  // Resolve one gate route alias to the human name of the entity it feeds
+  // ("When high → review output (route-1)"): a direct gate_route edge names
+  // its target; a fork route names every branch target it fans out to.
+  const routeDestinationFor = (gateId: string) => (alias: string): string | null => {
+    const targets = data.connections
+      .filter(
+        (connection) =>
+          connection.from_endpoint.stable_id === gateId &&
+          ((connection.flow.kind === "gate_route" && connection.flow.route === alias) ||
+            (connection.flow.kind === "gate_fork" && connection.flow.routes.includes(alias))),
+      )
+      .map((connection) =>
+        connection.to_endpoint.kind === "discard" ? nameFor("discard") : nameFor(connection.to_endpoint.stable_id),
+      );
+    return targets.length === 0 ? null : targets.join(" + ");
+  };
   const blockersId = useId();
   const routesHeadingId = useId();
   const correctionSelectId = useId();
@@ -357,7 +406,7 @@ export function WireStageTurn({
                   <p>{cardinalityText(node.row_cardinality)}</p>
                   <p>{fieldsText("Required", node.required_fields)}</p>
                   <p>{fieldsText("Guaranteed", node.guaranteed_fields)}</p>
-                  {behaviorDetails(node.behavior).map((detail) => <p key={detail}>{detail}</p>)}
+                  {behaviorDetails(node.behavior, routeDestinationFor(node.stable_id)).map((detail) => <p key={detail}>{detail}</p>)}
                   {node.structured_output_fields.length > 0 ? (
                     <ul aria-label={`${node.label} structured output fields`}>
                       {node.structured_output_fields.map((field) => (
@@ -425,7 +474,7 @@ export function WireStageTurn({
               id: `${edge.from}\u0000${edge.label}\u0000${edge.to}`,
               from: nameFor(edge.from),
               to: nameFor(edge.to),
-              summary: flowText(edge.flow),
+              summary: flowText(edge.flow, routeKeys),
               status: edgeStatusKind(edge),
               detail:
                 edge.missing_fields.length > 0
@@ -437,7 +486,7 @@ export function WireStageTurn({
           <details className="wire-stage__raw">
             <summary>Technical details</summary>
             <pre className="wire-stage__raw-text">
-              {edges.map(rawEdgeRow).join("\n")}
+              {edges.map((edge) => rawEdgeRow(edge, routeKeys)).join("\n")}
             </pre>
           </details>
         </section>

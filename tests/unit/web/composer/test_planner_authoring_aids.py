@@ -1472,3 +1472,56 @@ class TestRun5PackEdits:
         digest = discovery_digest(view)
         llm_entry = next(e for e in digest["transforms"] if e["name"] == "llm")
         assert set(llm_entry["required_options"]) == {"schema", "provider", "prompt_template"}
+
+
+class TestLlmOnErrorRuleGating:
+    """The on_error advice must match what the deployment's controls permit.
+
+    Taught unconditionally, "route on_error to a dedicated quarantine sink"
+    contradicted required_control_coverage: an llm node's on_error edge is an
+    independent output path, so a quarantine sink on it is rejected, and no
+    control transform can be interposed there (on_error may only name a sink
+    or 'discard'). Only the GATING is asserted here — which of the two module
+    constants is served — never the prose, per project convention.
+    """
+
+    def test_recommend_mode_keeps_the_quarantine_sink_advice(self, tmp_path: Path) -> None:
+        view, _snapshot = _guardrail_profile_view(tmp_path, control_mode="recommend")
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE in rules
+        assert not any(rule.startswith("This deployment REQUIRES the") for rule in rules)
+
+    def test_required_mode_serves_the_discard_only_rule(self, tmp_path: Path) -> None:
+        view, _snapshot = _guardrail_profile_view(tmp_path, control_mode="required")
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE not in rules
+        assert planner_authoring_aids._LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE.format(control="aws_bedrock_content_safety") in rules
+        assert planner_authoring_aids._LLM_ON_ERROR_CONTROLLED_TRADEOFF_TEMPLATE.format(control="aws_bedrock_content_safety") in rules
+
+    def test_recommend_mode_carries_no_operator_escalation_rule(self, tmp_path: Path) -> None:
+        """The operator escalation only makes sense when the gate is required."""
+        view, _snapshot = _guardrail_profile_view(tmp_path, control_mode="recommend")
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert not any("operator decision" in rule for rule in rules)
+
+    def test_alias_less_required_control_also_gates_the_rule(self, tmp_path: Path) -> None:
+        """Gating follows the control MODE, not how the control is configured."""
+        view, _snapshot = _direct_control_view(tmp_path, control_mode="required")
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE not in rules
+        assert planner_authoring_aids._LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE.format(control="azure_content_safety") in rules
+
+    def test_deployment_without_a_selected_control_keeps_the_quarantine_advice(self) -> None:
+        view, _snapshot = _trained_view()
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE in rules

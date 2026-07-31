@@ -136,7 +136,12 @@ function payload(): ProposePipelinePayload {
         plugin: null,
         behavior: {
           kind: "gate",
+          condition: "row['amount'] > 500",
           route_aliases: ["route-1", "route-2"],
+          routes: [
+            { alias: "route-1", key: "true" },
+            { alias: "route-2", key: "false" },
+          ],
           fork_branches: [
             { routes: ["route-1"], branch: "branch-1" },
             { routes: ["route-1"], branch: "branch-2" },
@@ -220,11 +225,21 @@ describe("ProposePipelineTurn", () => {
     expect(container.querySelector(`[data-edge-id="${edgeId(6)}"]`)).not.toBeNull();
     expect(container.querySelector('[data-node-kind="discard"]')).not.toBeNull();
     expect(screen.getByText("2 sources · 4 nodes · 13 routes · 2 outputs")).toBeVisible();
-    expect(screen.getByText(/routes route-1, route-2/i)).toBeVisible();
+    // F11: the gate summary carries the authored predicate verbatim plus each
+    // author-visible route key resolved to its destination — with the ordinal
+    // aliases still visible (they are the revise-target / integrity tokens).
+    expect(
+      screen.getByText(
+        /When row\['amount'\] > 500 — true → node-3 \+ node-4 \(route-1\), false → output-2 \(route-2\)\. 2 fork branches\./,
+      ),
+    ).toBeVisible();
     expect(screen.getByText(/queue continues in sequence/i)).toBeVisible();
     expect(screen.getByText(/count 50 or timeout 10s/i)).toBeVisible();
     expect(screen.getByText(/joins branch-1, branch-2/i)).toBeVisible();
-    expect(screen.getAllByText(/route-1 forks to branch-1/i).length).toBeGreaterThan(0);
+    // F11: edge labels resolve route ordinals to "when <key>" while keeping
+    // the ordinal alias visible.
+    expect(screen.getAllByText(/when true \(route-1\) forks to branch-1/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/when false \(route-2\)/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/on error → discard/i).length).toBeGreaterThan(0);
     expect(screen.getByText("source-2 · json")).toBeVisible();
     expect(screen.getByText("output-2 · csv")).toBeVisible();

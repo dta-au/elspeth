@@ -71,6 +71,51 @@ describe("ModeSwitchButton", () => {
     ).toHaveAccessibleDescription(/version history/i);
   });
 
+  it("target=guided, with work, exited-guided session: the confirm says it RESUMES the saved wizard (F10b)", () => {
+    // enterGuided branches on guidedSession.terminal.kind ===
+    // "exited_to_freeform": those sessions re-enter their saved wizard
+    // (reenterGuided) — nothing is discarded. Showing the fresh-wizard
+    // warning for that safe resume made users refuse a safe action.
+    const enterGuided = vi.fn().mockResolvedValue(undefined);
+    useSessionStore.setState({
+      enterGuided,
+      guidedSession: {
+        step: "step_3_transforms",
+        history: [],
+        terminal: { kind: "exited_to_freeform" },
+        chat_history: [],
+        chat_turn_seq: 0,
+        profile: null,
+      } as never,
+    });
+
+    render(<ModeSwitchButton target="guided" hasWork />);
+    fireEvent.click(screen.getByRole("button", { name: "Switch to guided" }));
+
+    expect(screen.getByText(/pick up your guided setup where you left it/i)).toBeInTheDocument();
+    expect(screen.getByText(/nothing is discarded/i)).toBeInTheDocument();
+    expect(screen.queryByText(/fresh/i)).toBeNull();
+    expect(screen.queryByText(/version history/i)).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Confirm switch to guided" }),
+    ).toHaveAccessibleDescription(/where you left it/i);
+
+    fireEvent.click(screen.getByRole("button", { name: "Confirm switch to guided" }));
+    expect(enterGuided).toHaveBeenCalledTimes(1);
+  });
+
+  it("target=guided, with work, no prior guided exit: the fresh-wizard warning stays (F10b)", () => {
+    const enterGuided = vi.fn().mockResolvedValue(undefined);
+    useSessionStore.setState({ enterGuided, guidedSession: null });
+
+    render(<ModeSwitchButton target="guided" hasWork />);
+    fireEvent.click(screen.getByRole("button", { name: "Switch to guided" }));
+
+    expect(screen.getByText(/fresh/i)).toBeInTheDocument();
+    expect(screen.getByText(/version history/i)).toBeInTheDocument();
+    expect(screen.queryByText(/where you left it/i)).toBeNull();
+  });
+
   it("target=freeform, with work: the confirm does NOT carry the fresh-wizard note", () => {
     // The disclosure is guided-direction only; exiting to freeform is a
     // genuinely lossless in-place switch and must keep its terse confirm.

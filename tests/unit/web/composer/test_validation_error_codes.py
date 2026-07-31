@@ -40,10 +40,13 @@ from elspeth.web.composer.state import (
     ValidationEntry,
     ValidationSummary,
 )
+from elspeth.web.composer.tools._common import _PLUGIN_UNAVAILABLE_EXPLANATIONS
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
+    _PLUGIN_UNAVAILABLE_FIXES,
     explain_validation_code,
 )
+from elspeth.web.plugin_policy.models import PluginUnavailableReason
 
 
 def _empty_state() -> CompositionState:
@@ -726,6 +729,80 @@ class TestCoalesceReachabilityFacts:
         )
         feedback = _allowlisted_candidate_feedback(result)
         assert "connectivity" not in feedback["validation"]["errors"][0]
+
+
+class TestPluginUnavailabilityFamilyIsExplainable:
+    """Every plugin-unavailability reason must resolve to actionable guidance.
+
+    ``_plugin_policy_failure`` emits each ``PluginUnavailableReason`` value as a
+    tool ``error_code``, so any of them can reach the planner's redacted repair
+    feedback — where the code is the ONLY surviving signal. Until this sweep the
+    whole family resolved to nothing through ``explain_validation_code``: the
+    model saw a bare token like ``credential_unavailable`` with no way to learn
+    whether to pick a different plugin, wait for an operator, or stop trying, and
+    so re-emitted the same rejected selection until its budget ran out. Same
+    failure shape as the coded-but-unexplained rejections the rest of this module
+    pins, one layer up.
+    """
+
+    def test_every_reason_is_in_the_closed_catalogue_and_resolves(self) -> None:
+        for reason in PluginUnavailableReason:
+            assert reason.value in _CLOSED_VALIDATION_ERROR_CODES, reason
+            guidance = explain_validation_code(reason.value)
+            assert guidance is not None, f"{reason.value} does not resolve to catalogue guidance"
+            explanation, fix = guidance
+            assert explanation and fix
+
+    def test_explanations_are_reused_from_the_tool_copy_not_restated(self) -> None:
+        """One source of truth: the tool failure and the explain entry cannot drift.
+
+        The tool's own message already carries a plain-language cause per reason
+        (``_PLUGIN_UNAVAILABLE_EXPLANATIONS``). Transcribing it into the explain
+        catalogue would let the two answers to "why can't I use this plugin?"
+        diverge silently, which is how a model ends up told to repair something
+        an operator must fix (or vice versa).
+        """
+        for reason in PluginUnavailableReason:
+            guidance = explain_validation_code(reason.value)
+            assert guidance is not None
+            explanation, _fix = guidance
+            assert _PLUGIN_UNAVAILABLE_EXPLANATIONS[reason] in explanation, reason
+
+    def test_fix_table_is_total_over_the_enum(self) -> None:
+        """A new reason joins both halves or fails at import, never half-wired."""
+        assert set(_PLUGIN_UNAVAILABLE_FIXES) == set(PluginUnavailableReason)
+        assert all(_PLUGIN_UNAVAILABLE_FIXES[reason].strip() for reason in PluginUnavailableReason)
+
+    def test_web_surface_prohibition_tells_the_planner_the_refusal_is_categorical(self) -> None:
+        """The one reason with NO repair must say so, or the budget burns.
+
+        Every other reason names something an operator could change.
+        ``WEB_SURFACE_PROHIBITED`` names something nothing can change, so the fix
+        must forbid re-emission outright rather than suggest another attempt.
+        """
+        guidance = explain_validation_code(PluginUnavailableReason.WEB_SURFACE_PROHIBITED.value)
+        assert guidance is not None
+        _explanation, fix = guidance
+        lowered = fix.lower()
+
+        assert "categorical" in lowered
+        assert "do not re-emit" in lowered
+
+    def test_reason_codes_do_not_shadow_an_unrelated_catalogue_entry(self) -> None:
+        """Exact-code patterns only: these codes are short and generic.
+
+        A loose alternation here would make an unrelated full validation message
+        resolve to a plugin-policy explanation. Every other closed code must keep
+        resolving to its own guidance with the family added.
+        """
+        family = {reason.value for reason in PluginUnavailableReason}
+        for code in _CLOSED_VALIDATION_ERROR_CODES:
+            if code in family:
+                continue
+            guidance = explain_validation_code(code)
+            assert guidance is not None, code
+            explanation, _fix = guidance
+            assert "cannot be used in this deployment" not in explanation, code
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -613,6 +613,36 @@ class TestPayloadValidation:
         assert "payload.knobs" in err
         assert "fields" in err
 
+    def test_schema_form_knob_placeholder_is_in_the_closed_vocabulary(self) -> None:
+        # F5-5b atomic set: ``placeholder`` is a legal optional knob-field key
+        # (46/47 data plugins emit it on the ``schema`` knob), validated as
+        # bounded text like ``description``.
+        from elspeth.web.composer.guided.protocol import validate_payload
+
+        def payload(placeholder: object) -> dict[str, object]:
+            return {
+                "mode": "plugin_options",
+                "plugin": "csv",
+                "knobs": {
+                    "fields": [
+                        {
+                            "name": "schema",
+                            "label": "Schema",
+                            "kind": "json-value",
+                            "required": True,
+                            "nullable": False,
+                            "placeholder": placeholder,
+                        }
+                    ]
+                },
+                "prefilled": {},
+            }
+
+        assert validate_payload(TurnType.SCHEMA_FORM, payload('{"mode": "observed"}')) is None
+        err = validate_payload(TurnType.SCHEMA_FORM, payload(42))
+        assert err is not None
+        assert "placeholder" in err
+
     def test_confirm_wiring_minimal_wire_payload_validates(self) -> None:
         payload = {
             "proposal_id": "00000000-0000-4000-8000-000000000001",

@@ -421,6 +421,35 @@ class _ProgressRouteSessionService:
         self.messages.append(message)
         return message
 
+    async def add_message_with_transcript(
+        self,
+        session_id: uuid.UUID,
+        role: ChatMessageRole,
+        content: str,
+        *,
+        writer_principal: str,
+        tool_calls=None,
+        composition_state_id: uuid.UUID | None = None,
+        raw_content: str | None = None,
+        tool_call_id: str | None = None,
+        parent_assistant_id: uuid.UUID | None = None,
+    ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
+        # In-memory double: append + snapshot are trivially one atomic
+        # step, mirroring the production single-transaction contract
+        # (transcript ends at the inserted record by construction).
+        record = await self.add_message(
+            session_id,
+            role,
+            content,
+            writer_principal=writer_principal,
+            tool_calls=tool_calls,
+            composition_state_id=composition_state_id,
+            raw_content=raw_content,
+            tool_call_id=tool_call_id,
+            parent_assistant_id=parent_assistant_id,
+        )
+        return record, list(self.messages)
+
     async def get_messages(
         self,
         session_id: uuid.UUID,
@@ -11969,3 +11998,135 @@ def test_composition_state_provenance_python_and_sql_enums_agree() -> None:
     assert sql_values == COMPOSITION_STATE_PROVENANCE_VALUES, (
         f"CHECK enum {sorted(sql_values)} drifted from CompositionStateProvenance Literal {sorted(COMPOSITION_STATE_PROVENANCE_VALUES)}"
     )
+
+
+class TestSendMessageTranscriptSnapshot:
+    """F-1: the send_message snapshot never consults a second connection.
+
+    The freeform-500 defect: ``add_message`` committed the user row on
+    one pooled connection while the follow-up ``get_messages`` snapshot
+    read on another; a stale reader returned a pre-insert transcript and
+    the Tier-1 guard 500'd every send. Post-fix the route consumes the
+    transcript returned by ``add_message_with_transcript`` (single
+    write-locked transaction) and never re-calls ``get_messages`` on
+    that path.
+    """
+
+    def test_send_message_proceeds_when_get_messages_returns_stale_pre_insert_snapshot(self, tmp_path) -> None:
+        """T2 (structural): a stale get_messages cannot 500 the send path.
+
+        The wrapper simulates the worst structural case — every
+        ``get_messages`` call returns the pre-insert snapshot (empty).
+        Pre-fix the route's guard read through it and raised
+        ``AuditIntegrityError``; post-fix the route never consults it.
+        """
+        mock_composer = _make_composer_mock(response_text="Got it!")
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+
+        class _StaleGetMessagesService:
+            def __init__(self, inner: SessionServiceImpl) -> None:
+                self._inner = inner
+                self.get_messages_calls = 0
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            async def get_messages(self, session_id, limit=100, offset=0):
+                self.get_messages_calls += 1
+                return []
+
+        wrapper = _StaleGetMessagesService(service)
+        app.state.session_service = wrapper
+        client = TestClient(app)
+        session_id = client.post("/api/sessions", json={"title": "Stale snapshot"}).json()["id"]
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "hello"},
+        )
+
+        assert resp.status_code == 200, (
+            f"send_message must not consult get_messages for its transcript snapshot; got {resp.status_code}: {resp.text!r}"
+        )
+        assert resp.json()["message"]["content"] == "Got it!"
+        # Structural pin: the send path issued ZERO get_messages calls.
+        assert wrapper.get_messages_calls == 0
+
+    def test_trailing_audit_row_does_not_trip_send_message_guard(self, tmp_path) -> None:
+        """T-scoping: audit rows share the sequence range (Reading B).
+
+        The guard comparison is conversation-scoped (parity with
+        /recompose): an audit sidecar row trailing the inserted user
+        message is not interleaved conversation history and must not
+        produce a Tier-1 refusal. Constructed via a service wrapper
+        because the real combined method cannot return a trailing row —
+        its snapshot is taken inside the insert's own transaction.
+        """
+        mock_composer = _make_composer_mock(response_text="Still fine")
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+
+        class _TrailingAuditRowService:
+            def __init__(self, inner: SessionServiceImpl) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            async def add_message_with_transcript(self, *args: Any, **kwargs: Any):
+                record, transcript = await self._inner.add_message_with_transcript(*args, **kwargs)
+                assert record.sequence_no is not None
+                trailing_audit_row = ChatMessageRecord(
+                    id=uuid.uuid4(),
+                    session_id=record.session_id,
+                    role="audit",
+                    content=json.dumps({"_kind": "llm_call_audit"}),
+                    raw_content=None,
+                    tool_calls=[{"_kind": "llm_call_audit", "call": {}}],
+                    created_at=record.created_at,
+                    sequence_no=record.sequence_no + 1,
+                    composition_state_id=None,
+                    writer_principal="compose_loop",
+                    tool_call_id=None,
+                    parent_assistant_id=None,
+                )
+                return record, [*transcript, trailing_audit_row]
+
+        app.state.session_service = _TrailingAuditRowService(service)
+        client = TestClient(app)
+        session_id = client.post("/api/sessions", json={"title": "Trailing audit"}).json()["id"]
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "hello"},
+        )
+
+        assert resp.status_code == 200, (
+            f"a trailing audit row must not trip the conversation-scoped snapshot guard; got {resp.status_code}: {resp.text!r}"
+        )
+        assert resp.json()["message"]["content"] == "Still fine"
+
+    def test_send_message_transcript_snapshot_contains_prior_turns(self, tmp_path) -> None:
+        """The combined method feeds real history to the composer.
+
+        Two sends: the second compose call must receive the first turn's
+        user+assistant messages as chat history (minus the just-inserted
+        user message, which travels separately as ``body.content``).
+        """
+        mock_composer = _make_composer_mock(response_text="Reply")
+        app, _service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app)
+        session_id = client.post("/api/sessions", json={"title": "History"}).json()["id"]
+
+        first = client.post(f"/api/sessions/{session_id}/messages", json={"content": "first turn"})
+        assert first.status_code == 200
+        second = client.post(f"/api/sessions/{session_id}/messages", json={"content": "second turn"})
+        assert second.status_code == 200
+
+        second_call_history = mock_composer.compose.call_args_list[1].args[1]
+        assert [(m["role"], m["content"]) for m in second_call_history] == [
+            ("user", "first turn"),
+            ("assistant", "Reply"),
+        ]

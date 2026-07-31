@@ -49,6 +49,14 @@ class PluginUnavailableReason(StrEnum):
     LOCAL_REQUIREMENT_MISSING = "plugin_unavailable"
     CREDENTIAL_MISSING = "credential_unavailable"
     PROFILE_UNAVAILABLE = "profile_unavailable"
+    # Installed AND authorized for this deployment, but categorically prohibited
+    # on the WEB authoring surface by security policy: no operator credential,
+    # profile, or allowlist entry can clear it. Distinct from every other reason
+    # precisely because there is nothing to repair — the declared authorization
+    # stays visible as a *declined* authorization carrying this reason instead of
+    # the plugin appearing selectable everywhere and only failing at the far end
+    # of the authoring flow.
+    WEB_SURFACE_PROHIBITED = "plugin_not_allowed_on_web"
 
 
 class PluginSnapshotAuthority(StrEnum):

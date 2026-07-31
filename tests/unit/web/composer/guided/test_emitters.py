@@ -5,6 +5,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.emitters import (
     _node_cardinality,
     _step_index,
@@ -27,6 +29,12 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.config import WebSettings
+from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 
 
 class _Catalog:
@@ -114,6 +122,50 @@ def _queue_state() -> CompositionState:
             ),
         ),
         metadata=PipelineMetadata(name="Queue fan-in", description=""),
+        version=1,
+    )
+
+
+def _gate_state() -> CompositionState:
+    """One source feeding a boolean gate that routes to the reviewed output."""
+
+    return CompositionState(
+        source=None,
+        sources={
+            "rows": SourceSpec(
+                plugin="csv",
+                on_success="triage",
+                options={"schema": {"mode": "observed"}},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="triage",
+                node_type="gate",
+                plugin=None,
+                input="triage",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="row['score'] >= 7",
+                routes={"true": "combined", "false": "discard"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="combined",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(name="Gate wire review", description=""),
         version=1,
     )
 
@@ -549,6 +601,203 @@ class TestStep4WireEmitter:
             "expected_output_count": None,
         }
 
+    @staticmethod
+    def _gate_node(*, condition: str, routes: dict[str, str], fork_to: tuple[str, ...] | None = None) -> NodeSpec:
+        return NodeSpec(
+            id="triage",
+            node_type="gate",
+            plugin=None,
+            input="triage",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=condition,
+            routes=routes,
+            fork_to=fork_to,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def test_boolean_gate_projection_binds_condition_and_ordered_route_keys(self) -> None:
+        # F11: the authored predicate travels verbatim and each ordinal route
+        # alias is bound 1:1, in route_aliases order, to its boolean route key
+        # ("false" sorts before "true" in the canonical route walk).
+        node = self._gate_node(condition="row['amount'] > 500", routes={"true": "primary", "false": "review"})
+
+        assert _node_behavior(node, route_aliases={"false": "route-1", "true": "route-2"}, branch_aliases={}) == {
+            "kind": "gate",
+            "condition": "row['amount'] > 500",
+            "route_aliases": ["route-1", "route-2"],
+            "routes": [{"alias": "route-1", "key": "false"}, {"alias": "route-2", "key": "true"}],
+            "fork_branches": [],
+        }
+
+    def test_author_labeled_string_gate_projection_preserves_the_authored_route_keys(self) -> None:
+        node = self._gate_node(condition="row['tier']", routes={"high": "escalate", "low": "archive"})
+
+        assert _node_behavior(node, route_aliases={"high": "route-1", "low": "route-2"}, branch_aliases={}) == {
+            "kind": "gate",
+            "condition": "row['tier']",
+            "route_aliases": ["route-1", "route-2"],
+            "routes": [{"alias": "route-1", "key": "high"}, {"alias": "route-2", "key": "low"}],
+            "fork_branches": [],
+        }
+
+    def test_fork_gate_projection_binds_fork_routes_and_keeps_fork_branches_unchanged(self) -> None:
+        # Fork gates are NOT rejected by the new bindings: route_aliases and
+        # fork_branches keep their exact pre-F11 shape, and the added routes
+        # list covers the fork routes too (all derive from the same ordered
+        # route walk).
+        node = self._gate_node(
+            condition="row['ok']",
+            routes={"true": "fork", "false": "fork"},
+            fork_to=("branch_a", "branch_b"),
+        )
+
+        assert _node_behavior(
+            node,
+            route_aliases={"false": "route-1", "true": "route-2"},
+            branch_aliases={"branch_a": "branch-1", "branch_b": "branch-2"},
+        ) == {
+            "kind": "gate",
+            "condition": "row['ok']",
+            "route_aliases": ["route-1", "route-2"],
+            "routes": [{"alias": "route-1", "key": "false"}, {"alias": "route-2", "key": "true"}],
+            "fork_branches": [
+                {"routes": ["route-1", "route-2"], "branch": "branch-1"},
+                {"routes": ["route-1", "route-2"], "branch": "branch-2"},
+            ],
+        }
+
+    def test_wire_turn_forwards_the_projected_gate_behavior_verbatim(self) -> None:
+        # The wire stage must FORWARD the proposal projection's gate behavior,
+        # never re-derive it from candidate state: the projected condition here
+        # deliberately differs from the state's authored condition, and the
+        # projected value is the one that must reach the wire payload.
+        state = _gate_state()
+        projection, guided = _wire_authority(state)
+        gate_behavior = {
+            "kind": "gate",
+            "condition": "row['score'] >= 9",
+            "route_aliases": ["route-1", "route-2"],
+            "routes": [{"alias": "route-1", "key": "false"}, {"alias": "route-2", "key": "true"}],
+            "fork_branches": [],
+        }
+        projection["nodes"][0]["behavior"] = gate_behavior
+
+        turn = build_step_4_wire_turn(state, proposal_projection=projection, guided=guided)
+
+        wire_gate = next(node for node in turn["payload"]["nodes"] if node["node_type"] == "gate")
+        assert wire_gate["behavior"] == gate_behavior
+        assert wire_gate["behavior"]["condition"] == "row['score'] >= 9"
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+
+    def test_profile_bound_authored_fallback_renders_degraded_cardinality_without_raising(self) -> None:
+        # inv-f6 F6 hardening: an authored-only validation_state (operator
+        # profile options never lowered because authored validation already
+        # errs) must render a degraded wire review — the row-cardinality
+        # probe must not crash on the plugin's runtime config rejection.
+        state = CompositionState(
+            source=None,
+            sources={
+                "rows": SourceSpec(
+                    plugin="csv",
+                    on_success="summarize",
+                    options={"schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            },
+            nodes=(
+                NodeSpec(
+                    id="summarize",
+                    node_type="transform",
+                    plugin="llm",
+                    input="summarize",
+                    on_success="results",
+                    on_error="discard",
+                    options={
+                        "schema": {"mode": "observed"},
+                        "profile": "task-role",
+                        "prompt_template": "Summarise this row in one short sentence.",
+                        "response_field": "summary",
+                    },
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                ),
+            ),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="results",
+                    plugin="json",
+                    options={"schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(name="Profile-bound wire review", description=""),
+            version=1,
+        )
+
+        turn = _wire_turn(state)
+
+        assert turn["type"] == TurnType.CONFIRM_WIRING.value
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+        llm = next(node for node in turn["payload"]["nodes"] if node["plugin"] == "llm")
+        assert llm["row_cardinality"] == {
+            "input": "one",
+            "output": "zero_or_many",
+            "expected_output_count": None,
+        }
+
+
+def _policy_catalog(*, plugin_allowlist: tuple[str, ...] = ()) -> PolicyCatalogView:
+    """One request's real catalog projection, built from a real snapshot."""
+
+    class _NoSecrets:
+        def has_server_ref(self, name: str) -> bool:
+            return False
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def server_generation(self, name: str) -> str | None:
+            return None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    settings = WebSettings.model_validate(
+        {
+            "composer_max_composition_turns": 4,
+            "composer_max_discovery_turns": 4,
+            "composer_timeout_seconds": 60,
+            "composer_rate_limit_per_minute": 20,
+            "shareable_link_signing_key": b"0123456789abcdef0123456789abcdef",
+            "plugin_allowlist": plugin_allowlist,
+        }
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    catalog = create_catalog_service()
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=catalog,
+        profiles=profiles,
+        principal_scope="local:alice",
+        secret_inventory=_NoSecrets(),
+        generation_key=b"emitter-test-generation-key",
+    )
+    return PolicyCatalogView(catalog, snapshot, profiles)
+
 
 class _SourceCatalog:
     """Catalog stub exposing list_sources for the step-1 single_select path."""
@@ -570,6 +819,32 @@ class TestStep1SourcePicker:
         assert "null" not in option_ids
         assert option_ids == ["csv", "json"]
         assert turn["payload"]["source_blob_compatible_option_ids"] == ["csv", "json"]
+
+    def test_picker_never_offers_a_source_the_web_surface_prohibits(self) -> None:
+        """The first step must not offer a guaranteed dead end.
+
+        The picker lists whatever its catalog projection lists, so the exclusion
+        has to come from the request's availability snapshot rather than a
+        second hardcoded hide-list. With ``source:aws_s3`` authorized for the
+        deployment, a restricted (web) session must not see it, while the local
+        trained-operator projection still does.
+        """
+        restricted = _policy_catalog(plugin_allowlist=("source:aws_s3", "sink:aws_s3"))
+
+        turn = build_initial_step_1_turn(_empty_state(), blob_inspection=None, catalog=restricted)
+
+        option_ids = [opt["id"] for opt in turn["payload"]["options"]]
+        assert "aws_s3" not in option_ids
+        assert "csv" in option_ids
+        assert "aws_s3" not in turn["payload"]["source_blob_compatible_option_ids"]
+
+        catalog = create_catalog_service()
+        trained_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        trained = PolicyCatalogView.for_trained_operator(catalog, trained_snapshot)
+
+        trained_turn = build_initial_step_1_turn(_empty_state(), blob_inspection=None, catalog=trained)
+
+        assert "aws_s3" in [opt["id"] for opt in trained_turn["payload"]["options"]]
 
 
 class _SinkCatalog:
