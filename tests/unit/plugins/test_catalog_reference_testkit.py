@@ -12,6 +12,7 @@ import pytest
 from elspeth.contracts import Determinism
 from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfig, PluginConfigError
+from elspeth.plugins.sinks.database_sink import DatabaseSink
 
 
 class _ReferenceConfig(PluginConfig):
@@ -217,6 +218,22 @@ def test_parse_and_validate_example_rejects_deleted_singular_source_shape(
         )
 
 
+def test_parse_and_validate_example_rejects_nested_source_wrapper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    testkit = _testkit()
+    example = "sources:\n  wrapper:\n    nested:\n      plugin: reference_source\n      options:\n        path: data/orders.json\n"
+
+    with pytest.raises(AssertionError, match="direct"):
+        _parse_example(
+            testkit,
+            monkeypatch,
+            kind="source",
+            plugin_cls=_ReferenceSource,
+            example=example,
+        )
+
+
 def test_parse_and_validate_example_accepts_ordinary_transform_fragment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -358,6 +375,54 @@ def test_parse_and_validate_example_normalizes_allowed_secret_ref_for_config_onl
         example=example,
     )
     assert "secret_ref: EXAMPLE_API_KEY" in example
+
+
+def test_parse_and_validate_example_accepts_database_url_secret_ref(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    testkit = _testkit()
+    example = (
+        "sinks:\n"
+        "  records:\n"
+        "    plugin: database\n"
+        "    options:\n"
+        "      url:\n"
+        "        secret_ref: DATABASE_URL\n"
+        "      table: catalogue_records\n"
+        "      schema: {mode: observed}\n"
+    )
+
+    _parse_example(
+        testkit,
+        monkeypatch,
+        kind="sink",
+        plugin_cls=DatabaseSink,
+        example=example,
+    )
+
+
+def test_parse_and_validate_example_rejects_literal_database_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    testkit = _testkit()
+    example = (
+        "sinks:\n"
+        "  records:\n"
+        "    plugin: database\n"
+        "    options:\n"
+        "      url: postgresql://catalogue.invalid/reference\n"
+        "      table: catalogue_records\n"
+        "      schema: {mode: observed}\n"
+    )
+
+    with pytest.raises(AssertionError, match="credential"):
+        _parse_example(
+            testkit,
+            monkeypatch,
+            kind="sink",
+            plugin_cls=DatabaseSink,
+            example=example,
+        )
 
 
 def test_parse_and_validate_example_rejects_secret_ref_in_disallowed_field(

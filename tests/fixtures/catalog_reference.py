@@ -14,6 +14,7 @@ from elspeth.core.secrets import (
 )
 from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 
 BuiltinPluginClass = type[BaseSource] | type[BaseTransform] | type[BaseSink]
 
@@ -105,13 +106,11 @@ def _find_declaring_plugin_nodes(
     return nodes
 
 
-def _contains_mapping_identity(value: object, target: Mapping[str, Any]) -> bool:
-    if value is target:
-        return True
+def _contains_direct_collection_item(value: object, target: Mapping[str, Any]) -> bool:
     if isinstance(value, Mapping):
-        return any(_contains_mapping_identity(child, target) for child in value.values())
+        return any(child is target for child in value.values())
     if isinstance(value, list):
-        return any(_contains_mapping_identity(child, target) for child in value)
+        return any(child is target for child in value)
     return False
 
 
@@ -132,7 +131,7 @@ def _expected_section(reference: BuiltinReference) -> str:
         return "sources"
     if reference.kind == "sink":
         return "sinks"
-    if reference.plugin_cls.is_batch_aware:
+    if bool(getattr(reference.plugin_cls, "is_batch_aware", False)):
         return "aggregations"
     return "transform"
 
@@ -164,18 +163,28 @@ def parse_and_validate_example(reference: BuiltinReference) -> None:
         )
     else:
         assert isinstance(section, (Mapping, list)), f"{plugin_cls.name}.example_use {section_name!r} must be a mapping or list"
-        assert _contains_mapping_identity(section, declaring_node), (
-            f"{plugin_cls.name}.example_use must declare the plugin under top-level {section_name!r}"
+        assert _contains_direct_collection_item(section, declaring_node), (
+            f"{plugin_cls.name}.example_use must declare the plugin as a direct mapping value or list item under top-level {section_name!r}"
         )
 
     options = declaring_node.get("options", {})
     assert isinstance(options, Mapping), f"{plugin_cls.name}.example_use options must be a mapping"
 
-    credential_violations = collect_credential_field_violations(options)
+    plugin_specific_credential_fields = allowed_secret_ref_fields(
+        reference.kind,
+        plugin_cls.name,
+    )
+    credential_violations = collect_credential_field_violations(
+        options,
+        additional_credential_fields=plugin_specific_credential_fields,
+    )
     assert not credential_violations, (
         f"{plugin_cls.name}.example_use contains literal credential fields: {sorted(set(credential_violations))!r}"
     )
-    secret_ref_violations = collect_disallowed_secret_ref_markers(options)
+    secret_ref_violations = collect_disallowed_secret_ref_markers(
+        options,
+        additional_allowed_fields=plugin_specific_credential_fields,
+    )
     assert not secret_ref_violations, (
         f"{plugin_cls.name}.example_use contains secret refs in disallowed fields: "
         f"{sorted({violation.field_path for violation in secret_ref_violations})!r}"

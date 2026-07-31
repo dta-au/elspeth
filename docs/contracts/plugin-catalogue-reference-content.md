@@ -169,7 +169,7 @@ For plugin-module edits, also run the hash rule:
 
 ```bash
 PYTHONPATH=elspeth-lints/src .venv/bin/python -m elspeth_lints.core.cli check \
-  --rules plugin_contract.plugin_hashes src/elspeth
+  --rules plugin_contract.plugin_hashes --root src/elspeth
 ```
 
 ## Future-author checklist
