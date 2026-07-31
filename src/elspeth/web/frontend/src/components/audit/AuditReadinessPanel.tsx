@@ -421,7 +421,10 @@ export function AuditReadinessPanel() {
           aria-expanded={false}
           aria-label="Audit ready. Show details."
         >
-          <span aria-hidden="true">{"✓"}</span> Audit ready
+          <span className="audit-readiness-summary-status">
+            <span aria-hidden="true">{"✓"}</span>
+            Audit ready
+          </span>
           {/* No aria-label here: on a role-less span it is never exposed
               (elspeth-37293a3b7c), and the parent button's aria-label wins
               the name computation anyway. The freshness detail is the

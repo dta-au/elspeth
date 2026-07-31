@@ -83,6 +83,12 @@
   background-color: var(--color-surface-hover);
 }
 
+.audit-readiness-summary-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+}
+
 .audit-readiness-summary-meta {
   display: block;
   font-size: var(--font-size-xs);

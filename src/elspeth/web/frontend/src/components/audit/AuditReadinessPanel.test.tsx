@@ -193,6 +193,9 @@ describe("AuditReadinessPanel", () => {
     // collapsed, so pointing at a missing id would be incorrect.
     const summary = screen.getByRole("button", { name: /Audit ready/i });
     expect(summary).toHaveAttribute("aria-expanded", "false");
+    expect(
+      summary.querySelector(".audit-readiness-summary-status"),
+    ).toHaveTextContent("✓Audit ready");
   });
 
   it("expands to all rows when the summary is clicked", async () => {
