@@ -95,17 +95,17 @@
     "shape": "declarative"
   },
   "list_sinks": {
-    "hash": "8e9c0b39e5c09e4f02de92e94198ef00f8e39ba4cef1a964a3af16c811cfb078",
+    "hash": "0bdd814c8d3f79fb7f13eaa2ea1d83706df1bec6d490bb4e1560d2ec2cc6a73d",
     "sensitive_path_count": 0,
     "shape": "declarative"
   },
   "list_sources": {
-    "hash": "309327086d2299ed97296f7a2af4e0a89a908e6c7216754715250551176aebc8",
+    "hash": "f1d4a4345856b1fb40deed2d8f578903e077c6ee1e4dcc87f13663eb7b89ab7f",
     "sensitive_path_count": 0,
     "shape": "declarative"
   },
   "list_transforms": {
-    "hash": "6d080cb9400198a1bd91774f73e7c2dc0f0c45c2b7ba12b4e0c66e4fc7f64226",
+    "hash": "6e7e86d72b733a689774ef1aea1a45d14847536a8a28fdf2fb40dee1006c5d88",
     "sensitive_path_count": 0,
     "shape": "declarative"
   },

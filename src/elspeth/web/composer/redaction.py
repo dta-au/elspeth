@@ -2379,9 +2379,13 @@ _LIST_SOURCES_REASON = HandlesNoSensitiveDataReason(
         "value on this surface; the handler reads zero keys from the arguments dict."
     ),
     why_responses_safe=(
-        "Response is the cached source-plugin descriptor list (name + summary per plugin) "
-        "produced by CatalogService.list_sources; it is registry metadata composed at "
-        "module import time, carries no user payload, and never references credentials."
+        "Response is {available, prohibited}: available is the cached source-plugin "
+        "descriptor list (name + summary per plugin) produced by CatalogService.list_sources; "
+        "it is registry metadata composed at module import time, carries no user payload, and "
+        "never references credentials. prohibited names any source categorically banned from "
+        "the web authoring surface (PolicyCatalogView.list_prohibited_sources), carrying only "
+        "its name and the same static, non-sensitive policy explanation already shown on a "
+        "rejected set_source attempt (R2-F18)."
     ),
 )
 
@@ -2394,9 +2398,13 @@ _LIST_TRANSFORMS_REASON = HandlesNoSensitiveDataReason(
         "reach the dispatch site; the handler reads zero keys from the arguments dict."
     ),
     why_responses_safe=(
-        "Response is the cached transform-plugin descriptor list (name + summary per plugin) "
-        "produced by CatalogService.list_transforms; it is registry metadata composed at "
-        "module import time, carries no operator data, and never references row content."
+        "Response is {available, prohibited}: available is the cached transform-plugin "
+        "descriptor list (name + summary per plugin) produced by CatalogService.list_transforms; "
+        "it is registry metadata composed at module import time, carries no operator data, and "
+        "never references row content. prohibited names any transform categorically banned from "
+        "the web authoring surface (PolicyCatalogView.list_prohibited_transforms), carrying only "
+        "its name and the same static, non-sensitive policy explanation already shown on a "
+        "rejected set_source attempt (R2-F18)."
     ),
 )
 
@@ -2409,9 +2417,13 @@ _LIST_SINKS_REASON = HandlesNoSensitiveDataReason(
         "on this surface; the handler reads zero keys from the arguments dict."
     ),
     why_responses_safe=(
-        "Response is the cached sink-plugin descriptor list (name + summary per plugin) "
-        "produced by CatalogService.list_sinks; it is registry metadata composed at "
-        "module import time, carries no destination credentials, and never references payload."
+        "Response is {available, prohibited}: available is the cached sink-plugin descriptor "
+        "list (name + summary per plugin) produced by CatalogService.list_sinks; it is registry "
+        "metadata composed at module import time, carries no destination credentials, and never "
+        "references payload. prohibited names any sink categorically banned from the web "
+        "authoring surface (PolicyCatalogView.list_prohibited_sinks), carrying only its name and "
+        "the same static, non-sensitive policy explanation already shown on a rejected "
+        "set_source attempt (R2-F18)."
     ),
 )
 
