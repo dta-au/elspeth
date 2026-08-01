@@ -11,14 +11,29 @@ import json
 from typing import Any, Literal
 
 from jinja2 import TemplateSyntaxError
+from jinja2.meta import find_undeclared_variables
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts.hashing import stable_hash
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
-from elspeth.plugins.infrastructure.templates import TemplateError
+from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment
 from elspeth.plugins.transforms.llm.multi_query import QueryDefinition, resolve_queries
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
+
+# The names PromptTemplate.render actually supplies (templates.py builds the
+# context as exactly {"row": ..., "lookup": ...} in both single- and
+# multi-query mode) plus the Jinja2 environment globals (range, namespace,
+# ...) that resolve at render time. Any other top-level template name hits
+# StrictUndefined and raises TemplateError live. Mirrors the composer-side
+# constants in web/composer/state.py.
+_PROMPT_CONTEXT_NAMES: frozenset[str] = frozenset({"row", "lookup"})
+_PROMPT_GLOBAL_NAMES: frozenset[str] = frozenset(create_sandboxed_environment().globals)
+
+# The one name build_template_context injects beside the query's own
+# input_fields variables (multi_query.py): the full source row, reachable as
+# row.source_row.<column> inside a query template.
+_MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({"source_row"})
 
 
 class LLMConfig(TransformDataConfig):
@@ -378,3 +393,108 @@ class LLMConfig(TransformDataConfig):
             f'{{"prompt_template": "<...includes {example_interpolations}...>"}}}})\n\n'
             f"Declared fields: {declared_json}. Template row.* references: []."
         )
+
+    @model_validator(mode="after")
+    def _validate_template_variable_bindings(self) -> LLMConfig:
+        """Reject templates whose interpolations can never bind at render.
+
+        ``PromptTemplate.render`` supplies exactly ``{row, lookup}`` under
+        StrictUndefined in BOTH modes — multi-query rendering wraps the
+        query's synthetic context (its ``input_fields`` variables plus
+        ``source_row``) under ``row`` (``_execute_one_query`` →
+        ``render_with_metadata``). Two config-time-provable defects:
+
+        * a top-level name outside ``{row, lookup}`` + environment globals
+          never binds in any mode (covers the legacy positional
+          ``{{ input_N }}`` idiom, which is such a bare name);
+        * in multi-query mode, a ``row.<name>`` reference outside that
+          query's ``input_fields`` keys + ``{source_row}`` raises
+          ``Undefined variable`` when that query renders.
+
+        Each query's effective template is its ``template`` override when
+        present, else the node-level ``prompt_template``; a node-level
+        template no query falls back to never renders and is not checked
+        (the shipped multi-query examples carry exactly that dead slot).
+        YAML-authoring twin of the composer guards emitting
+        ``prompt_template_unbound_variables`` /
+        ``query_template_unbound_row_fields`` — the wording here mirrors
+        those messages so the planner's repair patterns match both layers.
+
+        Defined LAST deliberately: the dynamic-access and required-fields
+        validators above carry their own opt-out guidance and must keep
+        primacy over a plain binding error (after-validators run in
+        definition order).
+        """
+        from elspeth.core.templates import extract_jinja2_field_usage
+
+        env = create_sandboxed_environment()
+
+        def unbound_top_level(template: str) -> list[str]:
+            # Field validators already compile-checked both template slots,
+            # so parse cannot fail here; no TemplateSyntaxError handling.
+            names = find_undeclared_variables(env.parse(template))
+            return sorted(names - _PROMPT_CONTEXT_NAMES - _PROMPT_GLOBAL_NAMES)
+
+        if self.queries is None:
+            unbound = unbound_top_level(self.prompt_template)
+            if unbound:
+                names = ", ".join(f"'{name}'" for name in unbound)
+                raise ValueError(
+                    f"LLM prompt_template references {names}, which the prompt render context does not "
+                    "define — row data is only available as 'row.<field>' and lookup data as "
+                    "'lookup.<key>', so rendering fails with 'Undefined variable' at runtime and none of "
+                    "the row's data reaches the model. Rewrite each name as '{{ row.<field> }}' or "
+                    "'{{ lookup.<key> }}', or remove the reference."
+                )
+            return self
+
+        node_template_specs: list[str] = []
+        for spec in resolve_queries(self.queries):
+            if spec.template is not None:
+                template = spec.template
+                source_desc = f"query '{spec.name}' template"
+                unbound = unbound_top_level(template)
+                if unbound:
+                    names = ", ".join(f"'{name}'" for name in unbound)
+                    raise ValueError(
+                        f"Query '{spec.name}' template references {names}, which the multi-query render "
+                        "context does not define — a query template sees only 'row' (this query's "
+                        "input_fields variables plus 'row.source_row') and 'lookup', so rendering fails "
+                        "with 'Undefined variable' at runtime. Rewrite each name as '{{ row.<variable> }}' "
+                        "where <variable> is one of this query's input_fields keys, or bind it in "
+                        "input_fields first."
+                    )
+            else:
+                template = self.prompt_template
+                source_desc = "the node-level prompt_template"
+                node_template_specs.append(spec.name)
+
+            bound = frozenset(spec.input_fields)
+            unbound_fields = sorted(extract_jinja2_field_usage(template).fields - bound - _MULTI_QUERY_IMPLICIT_ROW_NAMES)
+            if unbound_fields:
+                fields = ", ".join(f"'{name}'" for name in unbound_fields)
+                bound_names = ", ".join(f"'{name}'" for name in sorted(bound))
+                raise ValueError(
+                    f"Query '{spec.name}' renders {source_desc}, which references {fields} under 'row', "
+                    f"but this query's input_fields binds only {bound_names} (plus 'source_row'). At "
+                    "render the query context contains exactly its input_fields variables, so each "
+                    "unbound reference fails with 'Undefined variable' and the query errors for every "
+                    "row. Add the missing variables to input_fields (template variable → row column), "
+                    "rename the reference to a bound variable, or use 'row.source_row.<column>' for "
+                    "direct row access."
+                )
+
+        if node_template_specs:
+            unbound = unbound_top_level(self.prompt_template)
+            if unbound:
+                names = ", ".join(f"'{name}'" for name in unbound)
+                users = ", ".join(f"'{name}'" for name in node_template_specs)
+                raise ValueError(
+                    f"prompt_template references {names}, which the multi-query render context does not "
+                    f"define — queries without a template override ({users}) render it with 'row' bound "
+                    "to their input_fields variables (plus 'row.source_row') and 'lookup', so rendering "
+                    "fails with 'Undefined variable' at runtime. Rewrite each name as "
+                    "'{{ row.<variable> }}' with <variable> an input_fields key of every query that uses "
+                    "this template, or give those queries template overrides."
+                )
+        return self

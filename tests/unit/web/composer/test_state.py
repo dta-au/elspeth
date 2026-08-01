@@ -2901,18 +2901,24 @@ class TestPromptTemplateUnboundVariables:
         )
         assert not self._unbound_errors(state)
 
-    def test_skips_multi_query_nodes(self) -> None:
-        """Multi-query mode renders with a different context: each query's
-        ``input_fields`` maps template variables to row columns directly
-        (``build_template_context`` in multi_query.py), so bare names are the
-        documented idiom there. Mirrors the ``queries is None`` scoping of
-        ``LLMConfig._validate_required_input_fields_appear_in_template``."""
+    def test_multi_query_nodes_are_owned_by_the_multi_query_rule(self) -> None:
+        """With ``queries`` present the multi-query sibling rule owns the node.
+
+        A bare ``{{ text }}`` is unbound in multi-query mode too —
+        ``PromptTemplate.render`` wraps the per-query context under ``row``
+        (transform.py ``_execute_one_query`` → templates.py ``render``), so the
+        binding idiom is ``{{ row.text }}`` with ``text`` an ``input_fields``
+        key. The error must therefore still surface, emitted by
+        ``_validate_multi_query_template_variable_bindings`` (see
+        ``TestMultiQueryTemplateVariableBindings``)."""
         state = self._state_with_llm("Classify {{ text }}.")
         options = dict(state.nodes[0].options)
         options["queries"] = [{"name": "classify", "input_fields": {"text": "body"}}]
         node = replace(state.nodes[0], options=options)
         state = replace(state, nodes=(node,))
-        assert not self._unbound_errors(state)
+        errors = self._unbound_errors(state)
+        assert errors, "Bare names crash multi-query renders too — the sibling rule must flag them"
+        assert "'text'" in errors[0].message
 
     def test_skips_non_string_prompt_template(self) -> None:
         """A mistyped prompt_template is the plugin schema's problem — this
@@ -2923,6 +2929,249 @@ class TestPromptTemplateUnboundVariables:
         node = replace(state.nodes[0], options=options)
         state = replace(state, nodes=(node,))
         assert not self._unbound_errors(state)
+
+
+class TestMultiQueryTemplateVariableBindings:
+    """Multi-query LLM templates render with ``row`` bound to the query's
+    synthetic context (``build_template_context``: input_fields variables plus
+    ``source_row``) and ``lookup`` — under StrictUndefined. Two distinct
+    defects must be caught at compose time (elspeth-bea314a89b follow-up):
+
+    * a top-level name outside ``{row, lookup}`` + environment globals never
+      binds (same failure as single-prompt; code
+      ``prompt_template_unbound_variables``);
+    * a ``row.<name>`` reference outside that query's ``input_fields`` keys +
+      ``{source_row}`` raises ``Undefined variable`` when that query renders
+      (new code ``query_template_unbound_row_fields``).
+
+    Each query's effective template is its ``template`` override when present,
+    else the node-level ``prompt_template`` — a node-level template used by no
+    well-formed query never renders and must not be flagged.
+    """
+
+    def _state(self, prompt_template: str, queries: Any) -> CompositionState:
+        node = NodeSpec(
+            id="assess",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="assessed",
+            on_error="discard",
+            options={"prompt_template": prompt_template, "model": "test-model", "queries": queries},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _errors(self, state: CompositionState, code: str) -> list[ValidationEntry]:
+        return [e for e in state.validate().errors if e.error_code == code]
+
+    def test_bare_name_in_query_override_is_rejected(self) -> None:
+        """The task-shaped defect: an override interpolating a bare input_fields
+        variable — the binding idiom is ``{{ row.text }}``, never ``{{ text }}``."""
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [{"name": "classify", "input_fields": {"text": "body", "input_1": "body"}, "template": "Classify {{ text }}"}],
+        )
+        errors = self._errors(state, "prompt_template_unbound_variables")
+        assert errors, "Expected prompt_template_unbound_variables for bare {{ text }} in a query override"
+        entry = errors[0]
+        assert entry.component == "node:assess"
+        assert entry.severity == "high"
+        assert "'classify'" in entry.message
+        assert "'text'" in entry.message
+        assert "input_fields" in entry.message
+
+    def test_legacy_positional_bare_name_in_node_template_flagged_once(self) -> None:
+        """The legacy positional idiom ``{{ input_1 }}`` is a bare top-level
+        name; a shared node-level template must yield ONE entry, not one per
+        query that falls back to it."""
+        state = self._state(
+            "Assess: {{ input_1 }}",
+            {
+                "q1": {"input_fields": {"input_1": "col_a"}},
+                "q2": {"input_fields": {"input_1": "col_b"}},
+            },
+        )
+        errors = self._errors(state, "prompt_template_unbound_variables")
+        assert len(errors) == 1
+        assert "'input_1'" in errors[0].message
+
+    def test_node_template_used_by_no_query_is_not_flagged(self) -> None:
+        """When every query overrides the template, the node-level
+        prompt_template never renders — flagging it would be a false positive
+        (the shipped multi-query examples carry exactly this dead slot)."""
+        state = self._state(
+            "Assess: {{ input_1 }}",
+            [{"name": "q1", "input_fields": {"text": "body"}, "template": "Classify {{ row.text }}"}],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_unbound_row_field_in_override_is_rejected(self) -> None:
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [
+                {
+                    "name": "diagnose",
+                    "input_fields": {"input_1": "background"},
+                    "template": "Background: {{ row.input_1 }} Symptoms: {{ row.input_2 }}",
+                }
+            ],
+        )
+        errors = self._errors(state, "query_template_unbound_row_fields")
+        assert errors, "Expected query_template_unbound_row_fields for row.input_2 outside input_fields"
+        entry = errors[0]
+        assert entry.component == "node:assess"
+        assert entry.severity == "high"
+        assert "'diagnose'" in entry.message
+        assert "'input_2'" in entry.message
+        assert "'input_1'" in entry.message  # names the bound set so the repair is obvious
+        assert "source_row" in entry.message
+
+    def test_bound_variables_source_row_lookup_and_globals_accepted(self) -> None:
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [
+                {
+                    "name": "q1",
+                    "input_fields": {"input_1": "background", "input-2": "symptoms"},
+                    "template": (
+                        "{{ row.input_1 }} / {{ row['input-2'] }} / {{ row.source_row.raw_column }} "
+                        "/ {{ lookup.rubric }} / {{ range(3) | join(', ') }}"
+                    ),
+                }
+            ],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_shared_node_template_checked_against_each_querys_bindings(self) -> None:
+        """The same node-level template can be fine for one query and broken
+        for another — the row-field check is per query."""
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            {
+                "ok_query": {"input_fields": {"input_1": "col_a"}},
+                "broken_query": {"input_fields": {"text": "col_b"}},
+            },
+        )
+        errors = self._errors(state, "query_template_unbound_row_fields")
+        assert len(errors) == 1
+        assert "'broken_query'" in errors[0].message
+        assert "'ok_query'" not in errors[0].message
+
+    def test_mapping_form_query_override_is_checked(self) -> None:
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            {"classify": {"input_fields": {"input_1": "body"}, "template": "{{ row.nope }}"}},
+        )
+        errors = self._errors(state, "query_template_unbound_row_fields")
+        assert errors
+        assert "'classify'" in errors[0].message
+        assert "'nope'" in errors[0].message
+
+    def test_malformed_query_entries_are_skipped(self) -> None:
+        """Entry shape is QueryDefinition's contract; this rule stays silent on
+        malformed entries rather than double-reporting them."""
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [
+                "not-a-mapping",
+                {"name": "bad_fields", "input_fields": "oops", "template": "{{ row.x }}"},
+                {"name": "no_fields", "template": "{{ row.y }}"},
+            ],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_queries_of_unexpected_shape_are_skipped(self) -> None:
+        state = self._state("Assess: {{ row.input_1 }}", "not-a-collection")
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_syntax_error_override_is_not_this_rules_business(self) -> None:
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [{"name": "q1", "input_fields": {"input_1": "body"}, "template": "Classify {{ row.input_1"}],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_non_string_override_skips_the_query(self) -> None:
+        """A mistyped ``template`` is QueryDefinition's problem; the query is
+        skipped outright — guessing that it falls back to the node template
+        would flag a template the (invalid) config never declared it to use."""
+        state = self._state(
+            "Assess: {{ input_1 }}",
+            [{"name": "q1", "input_fields": {"input_1": "body"}, "template": 42}],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_interpretation_placeholder_masked_in_node_template(self) -> None:
+        """``{{interpretation:...}}`` placeholders are resolved upstream of
+        rendering and must not parse as Jinja2 names — but real defects beside
+        them must still be caught."""
+        state = self._state(
+            "Rate how {{interpretation:severe}} this is: {{ row.input_1 }} vs {{ row.missing }}",
+            {"q1": {"input_fields": {"input_1": "body"}}},
+        )
+        errors = self._errors(state, "query_template_unbound_row_fields")
+        assert errors
+        assert "'missing'" in errors[0].message
+        assert "interpretation" not in errors[0].message
+
+    def test_dynamic_row_access_is_not_flagged(self) -> None:
+        """``row[expr]`` cannot be proven unbound at parse time — only the
+        concrete names feeding it are checked (here ``selector`` is bound)."""
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [{"name": "q1", "input_fields": {"input_1": "body", "selector": "kind"}, "template": "{{ row[row.selector] }}"}],
+        )
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_single_prompt_nodes_are_not_this_rules_business(self) -> None:
+        """Without ``queries`` the single-prompt sibling rule owns the node —
+        this rule must not double-report."""
+        node_options = {"prompt_template": "Classify {{ text }}", "model": "test-model"}
+        node = NodeSpec(
+            id="classify",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="out",
+            on_error="discard",
+            options=node_options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        errors = self._errors(state, "prompt_template_unbound_variables")
+        assert len(errors) == 1  # from the single-prompt rule, exactly once
+        assert not self._errors(state, "query_template_unbound_row_fields")
 
 
 class TestSchemaContractValidation:
