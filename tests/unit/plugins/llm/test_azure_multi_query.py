@@ -17,7 +17,7 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.batching.ports import CollectorOutputPort
-from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult
+from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMQueryResult
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
@@ -168,8 +168,7 @@ def _make_provider(
             model: str,
             temperature: float,
             max_tokens: int | None,
-            state_id: str,
-            token_id: str,
+            audit_parent: LLMAuditParent,
             response_format: dict[str, Any] | None = None,
         ) -> LLMQueryResult:
             return LLMQueryResult(
@@ -183,7 +182,7 @@ def _make_provider(
     else:
         cycle = itertools.cycle(responses)
 
-        def execute_from_list(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def execute_from_list(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             payload = next(cycle)
             if isinstance(payload, str):
                 content = payload
@@ -258,7 +257,7 @@ class TestSingleQueryProcessing:
         # Track what messages were sent
         captured_messages: list[list[dict[str, str]]] = []
 
-        def capture_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def capture_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             captured_messages.append(messages)
             return LLMQueryResult(
                 content='{"score": 85, "rationale": "Good diagnosis"}',
@@ -593,7 +592,7 @@ class TestRowProcessingWithPipelining:
         # 3 good JSON + 1 invalid
         call_count = [0]
 
-        def fail_on_fourth(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def fail_on_fourth(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 4:
                 return LLMQueryResult(

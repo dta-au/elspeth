@@ -29,6 +29,7 @@ from elspeth.contracts import Call, CallStatus, CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.events import ExternalCallCompleted
 from elspeth.core.rate_limit.registry import NoOpLimiter
+from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.testing import make_pipeline_row
 
 
@@ -304,8 +305,10 @@ class TestBedrockProviderTelemetryWiring:
                     model="bedrock/anthropic.test-model-v1:0",
                     temperature=0.0,
                     max_tokens=16,
-                    state_id="state-001",
-                    token_id="token-001",
+                    audit_parent=LLMAuditParent.for_row(
+                        state_id="state-001",
+                        token_id="token-001",
+                    ),
                 )
         finally:
             provider.close()
@@ -374,8 +377,10 @@ class TestGatewayProviderTelemetryWiring:
                     model="standard",
                     temperature=0.0,
                     max_tokens=16,
-                    state_id="state-001",
-                    token_id="token-001",
+                    audit_parent=LLMAuditParent.for_row(
+                        state_id="state-001",
+                        token_id="token-001",
+                    ),
                 )
         finally:
             provider.close()

@@ -20,7 +20,13 @@ from elspeth.plugins.infrastructure.clients.llm import (
     ServerError,
 )
 from elspeth.plugins.transforms.llm.base import LLMConfig
-from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult, UnrecognizedFinishReason, parse_finish_reason
+from elspeth.plugins.transforms.llm.provider import (
+    FinishReason,
+    LLMAuditParent,
+    LLMQueryResult,
+    UnrecognizedFinishReason,
+    parse_finish_reason,
+)
 
 if TYPE_CHECKING:
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
@@ -129,16 +135,15 @@ class BedrockLLMProvider:
         model: str,
         temperature: float,
         max_tokens: int | None,
-        state_id: str,
-        token_id: str,
+        audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
     ) -> LLMQueryResult:
         """Execute one Bedrock request through the authoritative audit client."""
-        snapshot_state_id = state_id
+        cache_key = audit_parent.cache_key
         redacted_error: LLMClientError | None = None
         response = None
         try:
-            client = self._get_llm_client(snapshot_state_id, token_id=token_id)
+            client = self._get_llm_client(audit_parent)
             try:
                 response = client.chat_completion(
                     model=model,
@@ -152,7 +157,7 @@ class BedrockLLMProvider:
                 redacted_error = _redacted_bedrock_error(error)
         finally:
             with self._llm_clients_lock:
-                self._llm_clients.pop(snapshot_state_id, None)
+                self._llm_clients.pop(cache_key, None)
 
         if redacted_error is not None:
             raise redacted_error from None
@@ -214,20 +219,20 @@ class BedrockLLMProvider:
                 self._underlying_client = _LiteLLMSDKAdapter(region_name=self._region_name)
             return self._underlying_client
 
-    def _get_llm_client(self, state_id: str, *, token_id: str | None = None) -> AuditedLLMClient:
+    def _get_llm_client(self, audit_parent: LLMAuditParent) -> AuditedLLMClient:
+        cache_key = audit_parent.cache_key
         with self._llm_clients_lock:
-            if state_id not in self._llm_clients:
-                self._llm_clients[state_id] = AuditedLLMClient(
+            if cache_key not in self._llm_clients:
+                self._llm_clients[cache_key] = AuditedLLMClient(
                     execution=self._recorder,
-                    state_id=state_id,
                     run_id=self._run_id,
                     telemetry_emit=self._telemetry_emit,
                     underlying_client=self._get_underlying_client(),
                     provider="bedrock",
                     limiter=self._limiter,
-                    token_id=token_id,
+                    **audit_parent.client_kwargs(),
                 )
-            return self._llm_clients[state_id]
+            return self._llm_clients[cache_key]
 
     def close(self) -> None:
         """Release cached audited clients and the stateless adapter."""

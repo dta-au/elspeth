@@ -5,8 +5,8 @@ LLMQueryResult. All audit recording, telemetry, and error classification
 happen inside AuditedLLMClient — this provider just manages client lifecycle
 and response normalization.
 
-Client caching is per-state_id with a threading lock. The state_id is
-snapshot at method entry (not read from a mutable context) to prevent
+Client caching is per-audit-parent with a threading lock. The cache identity
+is snapshotted at method entry (not read from a mutable context) to prevent
 evicting the wrong cache entry during retry races.
 """
 
@@ -24,7 +24,7 @@ from elspeth.contracts.value_source import DerivedFromSiblingValueSource, ValueS
 from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError
 from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.transforms.llm.base import LLMConfig
-from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult, parse_finish_reason
+from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMQueryResult, parse_finish_reason
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig
 
 if TYPE_CHECKING:
@@ -102,7 +102,7 @@ class AzureLLMProvider:
     """Azure OpenAI provider — wraps AuditedLLMClient.
 
     Responsibilities:
-    1. Create/cache AuditedLLMClient per state_id (thread-safe)
+    1. Create/cache AuditedLLMClient per audit parent (thread-safe)
     2. Create/cache underlying AzureOpenAI SDK client (thread-safe)
     3. Map LLMResponse → LLMQueryResult (content, usage, model, finish_reason)
     4. Let LLMClientError subclasses propagate unchanged
@@ -153,8 +153,7 @@ class AzureLLMProvider:
         model: str,
         temperature: float,
         max_tokens: int | None,
-        state_id: str,
-        token_id: str,
+        audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
     ) -> LLMQueryResult:
         """Execute LLM query via Azure OpenAI SDK.
@@ -164,8 +163,7 @@ class AzureLLMProvider:
             model: Model/deployment name
             temperature: Sampling temperature
             max_tokens: Max response tokens (None = provider default)
-            state_id: Snapshot of state_id for client caching
-            token_id: Token identity for audit correlation
+            audit_parent: Validated row or operation audit parent
             response_format: OpenAI response_format dict (e.g., {"type": "json_object"})
 
         Returns:
@@ -175,13 +173,13 @@ class AzureLLMProvider:
             RateLimitError, NetworkError, ServerError: Retryable
             ContentPolicyError, ContextLengthError, LLMClientError: Not retryable
         """
-        # Snapshot state_id — do not read from mutable ctx later.
+        # Snapshot cache identity — do not read from mutable ctx later.
         # This prevents the openrouter.py bug where ctx.state_id was read
         # in the finally block, evicting the wrong cache entry during retries.
-        snapshot_state_id = state_id
+        cache_key = audit_parent.cache_key
 
         try:
-            client = self._get_llm_client(snapshot_state_id, token_id=token_id)
+            client = self._get_llm_client(audit_parent)
 
             response = client.chat_completion(
                 model=model,
@@ -226,10 +224,10 @@ class AzureLLMProvider:
                 finish_reason=finish_reason,
             )
         finally:
-            # Clean up cached client for this state_id to prevent unbounded growth.
-            # Uses snapshot (not state_id parameter) to avoid evicting wrong entry.
+            # Clean up cached client for this audit parent to prevent unbounded growth.
+            # Uses the snapshotted key to avoid evicting the wrong entry.
             with self._llm_clients_lock:
-                self._llm_clients.pop(snapshot_state_id, None)
+                self._llm_clients.pop(cache_key, None)
 
     def runtime_preflight(self, *, operation_id: str, model: str) -> None:
         """Run a minimal audited Azure OpenAI call under an operation parent."""
@@ -273,21 +271,21 @@ class AzureLLMProvider:
                 self._api_key = None
             return self._underlying_client
 
-    def _get_llm_client(self, state_id: str, *, token_id: str | None = None) -> AuditedLLMClient:
-        """Get or create AuditedLLMClient for a state_id (thread-safe)."""
+    def _get_llm_client(self, audit_parent: LLMAuditParent) -> AuditedLLMClient:
+        """Get or create AuditedLLMClient for an audit parent (thread-safe)."""
+        cache_key = audit_parent.cache_key
         with self._llm_clients_lock:
-            if state_id not in self._llm_clients:
-                self._llm_clients[state_id] = AuditedLLMClient(
+            if cache_key not in self._llm_clients:
+                self._llm_clients[cache_key] = AuditedLLMClient(
                     execution=self._recorder,
-                    state_id=state_id,
                     run_id=self._run_id,
                     telemetry_emit=self._telemetry_emit,
                     underlying_client=self._get_underlying_client(),
                     provider="azure",
                     limiter=self._limiter,
-                    token_id=token_id,
+                    **audit_parent.client_kwargs(),
                 )
-            return self._llm_clients[state_id]
+            return self._llm_clients[cache_key]
 
     def close(self) -> None:
         """Release all cached clients."""

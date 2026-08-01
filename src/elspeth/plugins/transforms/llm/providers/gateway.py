@@ -61,7 +61,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
 )
 from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.transforms.llm.base import LLMConfig
-from elspeth.plugins.transforms.llm.provider import LLMQueryResult, ParsedFinishReason, parse_finish_reason
+from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResult, ParsedFinishReason, parse_finish_reason
 from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant
 
 if TYPE_CHECKING:
@@ -475,8 +475,7 @@ class GatewayLLMProvider:
         model: str,
         temperature: float,
         max_tokens: int | None,
-        state_id: str,
-        token_id: str,
+        audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
     ) -> LLMQueryResult:
         """Execute one gateway chat-completion request.
@@ -489,7 +488,7 @@ class GatewayLLMProvider:
             ContextLengthError: gateway ``context_length_exceeded`` (not retryable)
             LLMClientError: every other failure (not retryable)
         """
-        snapshot_state_id = state_id
+        cache_key = audit_parent.cache_key
         llm_request_payload = self._build_llm_request_payload(
             model=model,
             messages=messages,
@@ -499,7 +498,7 @@ class GatewayLLMProvider:
         )
         logical_start = time.perf_counter()
 
-        http_client = self._get_http_client(snapshot_state_id, token_id=token_id)
+        http_client = self._get_http_client(audit_parent)
         try:
             request_body: dict[str, Any] = {
                 "model": model,
@@ -524,7 +523,7 @@ class GatewayLLMProvider:
                 finish_reason=finish_reason,
             )
             self._record_logical_llm_success(
-                state_id=snapshot_state_id,
+                audit_parent=audit_parent,
                 started_at=logical_start,
                 request_payload=llm_request_payload,
                 content=content,
@@ -535,14 +534,14 @@ class GatewayLLMProvider:
             return result
         except LLMClientError as exc:
             self._record_logical_llm_error(
-                state_id=snapshot_state_id,
+                audit_parent=audit_parent,
                 started_at=logical_start,
                 request_payload=llm_request_payload,
                 exc=exc,
             )
             raise
         finally:
-            self._release_http_client(snapshot_state_id)
+            self._release_http_client(cache_key)
 
     def _post_chat_completion(self, http_client: AuditedHTTPClient, request_body: dict[str, Any]) -> httpx.Response:
         """POST one request, mapping transport and gateway-envelope failures.
@@ -602,7 +601,7 @@ class GatewayLLMProvider:
     def _record_logical_llm_success(
         self,
         *,
-        state_id: str,
+        audit_parent: LLMAuditParent,
         started_at: float,
         request_payload: LLMCallRequest,
         content: str,
@@ -611,9 +610,9 @@ class GatewayLLMProvider:
         raw_response: dict[str, Any],
     ) -> None:
         """Record the semantic LLM call that the HTTP transport fulfilled."""
-        call_index = self._recorder.allocate_call_index(state_id)
-        self._recorder.record_call(
-            state_id=state_id,
+        call_index = audit_parent.allocate_call_index(self._recorder)
+        audit_parent.record_call(
+            self._recorder,
             call_index=call_index,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -631,15 +630,15 @@ class GatewayLLMProvider:
     def _record_logical_llm_error(
         self,
         *,
-        state_id: str,
+        audit_parent: LLMAuditParent,
         started_at: float,
         request_payload: LLMCallRequest,
         exc: LLMClientError,
     ) -> None:
-        call_index = self._recorder.allocate_call_index(state_id)
+        call_index = audit_parent.allocate_call_index(self._recorder)
         message = str(exc) or type(exc).__name__
-        self._recorder.record_call(
-            state_id=state_id,
+        audit_parent.record_call(
+            self._recorder,
             call_index=call_index,
             call_type=CallType.LLM,
             status=CallStatus.ERROR,
@@ -757,44 +756,44 @@ class GatewayLLMProvider:
         finally:
             http_client.close()
 
-    def _get_http_client(self, state_id: str, *, token_id: str | None = None) -> AuditedHTTPClient:
-        """Get or create AuditedHTTPClient for a state_id (thread-safe).
+    def _get_http_client(self, audit_parent: LLMAuditParent) -> AuditedHTTPClient:
+        """Get or create AuditedHTTPClient for an audit parent (thread-safe).
 
-        Increments reference count so parallel queries sharing a state_id
+        Increments reference count so parallel queries sharing an audit parent
         keep the client alive until the last query releases it.
         """
+        cache_key = audit_parent.cache_key
         with self._http_clients_lock:
-            if state_id not in self._http_clients:
-                self._http_clients[state_id] = AuditedHTTPClient(
+            if cache_key not in self._http_clients:
+                self._http_clients[cache_key] = AuditedHTTPClient(
                     execution=self._recorder,
-                    state_id=state_id,
                     run_id=self._run_id,
                     telemetry_emit=self._telemetry_emit,
                     timeout=self._timeout,
                     base_url=self._base_url,
                     headers=self._request_headers,
                     limiter=self._limiter,
-                    token_id=token_id,
+                    **audit_parent.client_kwargs(),
                 )
-                self._http_client_refs[state_id] = 0
-            self._http_client_refs[state_id] += 1
-            return self._http_clients[state_id]
+                self._http_client_refs[cache_key] = 0
+            self._http_client_refs[cache_key] += 1
+            return self._http_clients[cache_key]
 
-    def _release_http_client(self, state_id: str) -> None:
+    def _release_http_client(self, cache_key: str) -> None:
         """Decrement reference count and close client when last user releases it."""
         client_to_close: AuditedHTTPClient | None = None
         with self._http_clients_lock:
-            if state_id not in self._http_client_refs:
+            if cache_key not in self._http_client_refs:
                 raise RuntimeError(
-                    f"_release_http_client called for unknown state_id={state_id!r}. "
+                    f"_release_http_client called for unknown cache_key={cache_key!r}. "
                     f"This is a refcount underflow — _get_http_client() was never called "
-                    f"for this state_id, or it was already fully released."
+                    f"for this audit parent, or it was already fully released."
                 )
-            count = self._http_client_refs[state_id] - 1
-            self._http_client_refs[state_id] = count
+            count = self._http_client_refs[cache_key] - 1
+            self._http_client_refs[cache_key] = count
             if count <= 0:
-                client_to_close = self._http_clients.pop(state_id, None)
-                self._http_client_refs.pop(state_id, None)
+                client_to_close = self._http_clients.pop(cache_key, None)
+                self._http_client_refs.pop(cache_key, None)
         if client_to_close is not None:
             client_to_close.close()
 

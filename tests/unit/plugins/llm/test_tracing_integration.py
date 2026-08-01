@@ -22,7 +22,7 @@ import pytest
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.transforms.llm.langfuse import ActiveLangfuseTracer, NoOpLangfuseTracer
-from elspeth.plugins.transforms.llm.provider import LLMQueryResult
+from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResult
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row
 
@@ -131,11 +131,10 @@ class _ErroringProvider:
         model: str,
         temperature: float,
         max_tokens: int | None,
-        state_id: str,
-        token_id: str,
+        audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
     ) -> LLMQueryResult:
-        del messages, model, temperature, max_tokens, state_id, token_id, response_format
+        del messages, model, temperature, max_tokens, audit_parent, response_format
         raise self.error
 
     def runtime_preflight(self, *, operation_id: str, model: str) -> None:

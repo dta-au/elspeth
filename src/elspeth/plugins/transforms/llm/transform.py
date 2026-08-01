@@ -60,10 +60,12 @@ from elspeth.plugins.transforms.llm.langfuse import LangfuseTracer, create_langf
 from elspeth.plugins.transforms.llm.multi_query import QuerySpec, ResponseFormat, resolve_queries
 from elspeth.plugins.transforms.llm.provider import (
     FinishReason,
+    LLMAuditParent,
     LLMProvider,
     LLMQueryResult,
     ParsedFinishReason,
     UnrecognizedFinishReason,
+    classify_finish_reason_failure,
 )
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider, AzureOpenAIConfig, _configure_azure_monitor
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockLLMProvider
@@ -81,11 +83,6 @@ if TYPE_CHECKING:
 
 _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
 
-
-_FINISH_REASON_ERRORS: dict[FinishReason, tuple[str, str]] = {
-    FinishReason.LENGTH: ("response_truncated", "Response truncated (finish_reason=length)"),
-    FinishReason.CONTENT_FILTER: ("content_filtered", "Response blocked by provider content filter"),
-}
 
 # Bounded local retry constants for sequential multi-query transient errors.
 # Mirrors transforms/azure/base.py _CAPACITY_RETRY_* constants.
@@ -189,55 +186,18 @@ def _finish_reason_error(
             reason["content_length"] = content_length
         return reason
 
-    # Allowlist: explicit STOP is a known-good completion.
-    if finish_reason == FinishReason.STOP:
+    failure = classify_finish_reason_failure(finish_reason)
+    if failure is None:
         return None
-
-    # Absent finish_reason (None) is a valid response shape for some providers
-    # (e.g. Azure SDK omits raw_response or choices in certain configurations).
-    # This is provider-normal behavior, not a defect. The provider already
-    # validated content is non-empty via LLMQueryResult, and logged a warning
-    # about "truncation undetectable".
-    #
-    # Callers record finish_reason in success_reason.metadata so the audit
-    # trail distinguishes None (absent) from STOP (confirmed completion).
-    # This is queryable via MCP diagnose() for operational visibility.
-    if finish_reason is None:
-        return None
-
-    # Known-bad reasons with specific error messages.
-    if isinstance(finish_reason, FinishReason):
-        entry = _FINISH_REASON_ERRORS.get(finish_reason)
-        if entry is not None:
-            reason_key, error_message = entry
-            return _FinishReasonError(
-                result=TransformResult.error(
-                    cast(
-                        TransformErrorReason,
-                        _build_reason(reason=reason_key, finish_reason=finish_reason.value),
-                    ),
-                    retryable=False,
-                ),
-                error_message=error_message,
-            )
-        # entry is None: this FinishReason is not in the error dict but is also
-        # not STOP — fall through to the catch-all so it is rejected.
-
-    # Catch-all: any finish reason not explicitly allowlisted (including
-    # known enum members not in STOP or error dict, and unrecognized values)
-    # is an error. Uses _serialize_finish_reason as the single source of truth
-    # for string conversion. None was handled above; raw_value is always str.
-    raw_value = _serialize_finish_reason(finish_reason)
-    assert raw_value is not None, "finish_reason=None was handled above — unreachable"
     return _FinishReasonError(
         result=TransformResult.error(
             cast(
                 TransformErrorReason,
-                _build_reason(reason="unexpected_finish_reason", finish_reason=raw_value),
+                _build_reason(reason=failure.reason, finish_reason=failure.finish_reason),
             ),
             retryable=False,
         ),
-        error_message=f"Unexpected finish reason: {raw_value}",
+        error_message=failure.error_message,
     )
 
 
@@ -338,8 +298,10 @@ class SingleQueryStrategy:
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
-                state_id=state_id,
-                token_id=token_id,
+                audit_parent=LLMAuditParent.for_row(
+                    state_id=state_id,
+                    token_id=token_id,
+                ),
             )
         except ContextLengthError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
@@ -637,8 +599,10 @@ class MultiQueryStrategy:
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=query_max_tokens,
-                state_id=state_id,
-                token_id=token_id,
+                audit_parent=LLMAuditParent.for_row(
+                    state_id=state_id,
+                    token_id=token_id,
+                ),
                 response_format=response_format,
             )
         except ContextLengthError as e:
@@ -1155,7 +1119,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:acc31f06c294a33c"
+    source_file_hash: str | None = "sha256:961feb6d3c35fbc2"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1310,11 +1274,10 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 model: str,
                 temperature: float,
                 max_tokens: int | None,
-                state_id: str,
-                token_id: str,
+                audit_parent: LLMAuditParent,
                 response_format: object | None = None,
             ) -> LLMQueryResult:
-                del messages, model, temperature, max_tokens, state_id, token_id, response_format
+                del messages, model, temperature, max_tokens, audit_parent, response_format
                 return LLMQueryResult(
                     content="probe response",
                     usage=TokenUsage.known(1, 1),

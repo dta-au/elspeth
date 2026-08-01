@@ -64,6 +64,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import calls_table
 from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient
+from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
@@ -485,8 +486,10 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
         model="openrouter/test-model",
         temperature=0.0,
         max_tokens=100,
-        state_id=node_state.state_id,
-        token_id=token.token_id,
+        audit_parent=LLMAuditParent.for_row(
+            state_id=node_state.state_id,
+            token_id=token.token_id,
+        ),
     )
 
     assert result.content == "7 / 10"

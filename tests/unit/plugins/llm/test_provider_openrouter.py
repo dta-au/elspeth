@@ -15,6 +15,7 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from elspeth.contracts import CallType
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
@@ -23,7 +24,13 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
-from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult, UnrecognizedFinishReason
+from elspeth.plugins.transforms.llm.provider import (
+    FinishReason,
+    LLMAuditParent,
+    LLMProvider,
+    LLMQueryResult,
+    UnrecognizedFinishReason,
+)
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
 
 if TYPE_CHECKING:
@@ -103,12 +110,12 @@ def _provider_http_client(provider: OpenRouterLLMProvider, http_client: FakeHTTP
     original_get = provider._get_http_client
     original_release = provider._release_http_client
 
-    def get_http_client(state_id: str, *, token_id: str | None = None) -> FakeHTTPClient:
-        _ = state_id, token_id
+    def get_http_client(audit_parent: LLMAuditParent) -> FakeHTTPClient:
+        _ = audit_parent
         return http_client
 
-    def release_http_client(state_id: str) -> None:
-        _ = state_id
+    def release_http_client(cache_key: str) -> None:
+        _ = cache_key
 
     provider._get_http_client = get_http_client  # type: ignore[method-assign]
     provider._release_http_client = release_http_client  # type: ignore[method-assign]
@@ -239,8 +246,10 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
         assert isinstance(result, LLMQueryResult)
@@ -249,6 +258,28 @@ class TestExecuteQuery:
         assert result.usage.is_known
         assert result.usage.prompt_tokens == 10
         assert result.usage.completion_tokens == 5
+
+    def test_operation_parent_keeps_transport_and_logical_calls_together(
+        self,
+        provider: OpenRouterLLMProvider,
+        audit_recorder: FakeAuditRecorder,
+    ) -> None:
+        http_client = FakeHTTPClient(response=_make_http_response())
+        with patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", autospec=True) as client_class:
+            client_class.return_value = http_client
+
+            provider.execute_query(
+                messages=[{"role": "user", "content": "hi"}],
+                model="gpt-4o",
+                temperature=0.0,
+                max_tokens=100,
+                audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+            )
+
+        assert audit_recorder.calls == []
+        assert len(audit_recorder.operation_calls) == 2
+        assert {call["call_type"] for call in audit_recorder.operation_calls} == {CallType.HTTP, CallType.LLM}
+        assert all(call["operation_id"] == "operation-1" for call in audit_recorder.operation_calls)
 
     def test_max_tokens_none_omitted_from_request_body(self, provider: OpenRouterLLMProvider) -> None:
         """When max_tokens=None, it should NOT appear in the request body."""
@@ -259,8 +290,10 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=None,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
             # Verify the POST body does NOT contain max_tokens
@@ -282,8 +315,10 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_rejects_null_content(self, provider: OpenRouterLLMProvider) -> None:
@@ -306,8 +341,10 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_rejects_non_string_content(self, provider: OpenRouterLLMProvider) -> None:
@@ -330,8 +367,10 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_validates_usage_non_finite_via_json_parse(self, provider: OpenRouterLLMProvider) -> None:
@@ -351,8 +390,10 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_validates_usage_non_finite_float(self, provider: OpenRouterLLMProvider) -> None:
@@ -380,8 +421,10 @@ class TestExecuteQuery:
                     model="gpt-4o",
                     temperature=0.0,
                     max_tokens=100,
-                    state_id="state-1",
-                    token_id="tok-1",
+                    audit_parent=LLMAuditParent.for_row(
+                        state_id="state-1",
+                        token_id="tok-1",
+                    ),
                 )
 
     def test_empty_string_content_raises_content_policy_error(self, provider: OpenRouterLLMProvider) -> None:
@@ -407,8 +450,10 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_whitespace_only_content_raises_content_policy_error(self, provider: OpenRouterLLMProvider) -> None:
@@ -433,8 +478,10 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_unknown_finish_reason(self, provider: OpenRouterLLMProvider) -> None:
@@ -445,8 +492,10 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
         assert isinstance(result.finish_reason, UnrecognizedFinishReason)
@@ -460,8 +509,10 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
         assert result.finish_reason is FinishReason.STOP
@@ -489,8 +540,10 @@ class TestExecuteQuery:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
         request_headers = http_client.last_post.kwargs["headers"]
@@ -510,8 +563,10 @@ class TestHTTPErrorMapping:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_500_raises_server_error(self, provider: OpenRouterLLMProvider) -> None:
@@ -522,8 +577,10 @@ class TestHTTPErrorMapping:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_502_raises_server_error(self, provider: OpenRouterLLMProvider) -> None:
@@ -535,8 +592,10 @@ class TestHTTPErrorMapping:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_503_raises_server_error(self, provider: OpenRouterLLMProvider) -> None:
@@ -548,8 +607,10 @@ class TestHTTPErrorMapping:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_network_error_raises_network_error(self, provider: OpenRouterLLMProvider) -> None:
@@ -560,8 +621,10 @@ class TestHTTPErrorMapping:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_timeout_raises_network_error(self, provider: OpenRouterLLMProvider) -> None:
@@ -572,8 +635,10 @@ class TestHTTPErrorMapping:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_4xx_raises_llm_client_error(self, provider: OpenRouterLLMProvider) -> None:
@@ -584,8 +649,10 @@ class TestHTTPErrorMapping:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_400_context_length_raises_context_length_error(self, provider: OpenRouterLLMProvider) -> None:
@@ -600,8 +667,10 @@ class TestHTTPErrorMapping:
                     model="gpt-4o",
                     temperature=0.0,
                     max_tokens=100,
-                    state_id="state-1",
-                    token_id="tok-1",
+                    audit_parent=LLMAuditParent.for_row(
+                        state_id="state-1",
+                        token_id="tok-1",
+                    ),
                 )
 
             message = str(exc_info.value)
@@ -626,8 +695,10 @@ class TestHTTPErrorMapping:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_400_anthropic_prompt_too_long_pattern(self, provider: OpenRouterLLMProvider) -> None:
@@ -648,8 +719,10 @@ class TestHTTPErrorMapping:
                 model="anthropic/claude-sonnet-4",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
     def test_empty_choices_raises(self, provider: OpenRouterLLMProvider) -> None:
@@ -667,8 +740,10 @@ class TestHTTPErrorMapping:
                 model="gpt-4o",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-1",
-                token_id="tok-1",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-1",
+                    token_id="tok-1",
+                ),
             )
 
 
@@ -687,9 +762,9 @@ class TestClientCaching:
             telemetry_emit=telemetry_emit,
         )
 
-        client1 = provider._get_http_client("state-a", token_id="tok-1")
-        client2 = provider._get_http_client("state-a", token_id="tok-1")
-        client3 = provider._get_http_client("state-b", token_id="tok-2")
+        client1 = provider._get_http_client(LLMAuditParent.for_row(state_id="state-a", token_id="tok-1"))
+        client2 = provider._get_http_client(LLMAuditParent.for_row(state_id="state-a", token_id="tok-1"))
+        client3 = provider._get_http_client(LLMAuditParent.for_row(state_id="state-b", token_id="tok-2"))
 
         assert client1 is client2
         assert client1 is not client3
@@ -712,7 +787,7 @@ class TestClientCaching:
 
         def create_client() -> None:
             barrier.wait()
-            c = provider._get_http_client("state-race", token_id="tok-1")
+            c = provider._get_http_client(LLMAuditParent.for_row(state_id="state-race", token_id="tok-1"))
             with collect_lock:
                 clients.append(c)
 
@@ -737,7 +812,7 @@ class TestClientCaching:
             telemetry_emit=telemetry_emit,
         )
 
-        provider._get_http_client("state-1", token_id="tok-1")
+        provider._get_http_client(LLMAuditParent.for_row(state_id="state-1", token_id="tok-1"))
         assert len(provider._http_clients) == 1
 
         provider.close()
@@ -863,8 +938,10 @@ class TestRuntimePreflight:
                     model="gpt-5-mini",
                     temperature=0.0,
                     max_tokens=100,
-                    state_id="state-1",
-                    token_id="tok-1",
+                    audit_parent=LLMAuditParent.for_row(
+                        state_id="state-1",
+                        token_id="tok-1",
+                    ),
                 )
 
             message = str(exc_info.value)

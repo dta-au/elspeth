@@ -30,7 +30,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     ServerError,
 )
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
-from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider
+from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMProvider
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockLLMProvider
 
 MODEL = "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0"
@@ -118,8 +118,10 @@ def _execute(provider: BedrockLLMProvider) -> Any:
         model=MODEL,
         temperature=0.25,
         max_tokens=64,
-        state_id="state-1",
-        token_id="token-1",
+        audit_parent=LLMAuditParent.for_row(
+            state_id="state-1",
+            token_id="token-1",
+        ),
     )
 
 
