@@ -267,8 +267,10 @@ async def test_early_checkpoint_fences_and_caps_findings_before_reinjection(make
     assert _ADVISOR_FINDINGS_UNTRUSTED_END in injected
     # Bind against the cap constant, not against len(oversized): the fixture
     # is only ~3x the cap, so a threshold derived from the INPUT length would
-    # still pass even if truncation silently stopped happening.
-    assert len(injected) <= _ADVISOR_FINDINGS_MAX_CHARS + 300  # fence markers + wrapper prose overhead
+    # still pass even if truncation silently stopped happening. 500 (was 300
+    # pre-R2-F12): the wrapper prose now also carries
+    # ``_ADVISOR_OUTPUT_CONTRACT_CLAUSE`` (~188 chars, elspeth-bff8fe6864).
+    assert len(injected) <= _ADVISOR_FINDINGS_MAX_CHARS + 500  # fence markers + wrapper prose overhead
     assert len(injected) < len(oversized)  # actually shorter than the untruncated input
 
 
@@ -727,7 +729,15 @@ async def test_end_gate_repair_message_carries_user_facing_output_contract(make_
     its final reply — the one the user WILL see — must state only the
     outcome, never reference/quote/rebut the advisor. Without this contract
     the model's next no-tool reply (persisted as the genuine answer row)
-    can read as a rebuttal of an exchange the real user never witnessed."""
+    can read as a rebuttal of an exchange the real user never witnessed.
+
+    Both advisor-injection sites (this END gate and the EARLY advisory
+    transition message, see the sibling test below) share the SAME
+    ``_ADVISOR_OUTPUT_CONTRACT_CLAUSE`` constant — the model can rebut
+    findings the user never saw via either channel, so both must carry the
+    contract (review finding 2)."""
+    from elspeth.web.composer.service import _ADVISOR_OUTPUT_CONTRACT_CLAUSE
+
     service = make_service()
     service._run_advisor_checkpoint = _AsyncRecorder(
         return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating")
@@ -736,11 +746,34 @@ async def test_end_gate_repair_message_carries_user_facing_output_contract(make_
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0, llm_messages=llm_messages)
     assert outcome.action == "continue"
     content = next(m["content"] for m in llm_messages if m["role"] == "user")
-    assert (
-        "Fix the findings via tool calls. The end user has NOT seen these findings; "
-        "your final reply is shown to them and must state only the outcome — "
-        "never reference, quote, or rebut the advisor."
-    ) in content
+    assert _ADVISOR_OUTPUT_CONTRACT_CLAUSE in content
+
+
+@pytest.mark.asyncio
+async def test_early_checkpoint_message_carries_user_facing_output_contract(make_service, empty_state, nonempty_state):
+    """R2-F12 (elspeth-bff8fe6864, review finding 2): the EARLY advisory
+    checkpoint injects the same synthetic user-role shape as the END gate,
+    with no elision (it fires once, before the model's mutations, so there
+    is no repair-tool-call turn to hook) — the output contract clause is
+    its only defense against the model rebutting findings the user never
+    saw through this channel."""
+    from elspeth.web.composer.service import _ADVISOR_OUTPUT_CONTRACT_CLAUSE
+
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="Consider a field_mapper before the sink")
+    )
+    llm_messages: list[dict[str, object]] = []
+    ran = await service._maybe_run_early_checkpoint(
+        state=nonempty_state,
+        prev_state=empty_state,
+        session_id="s1",
+        llm_messages=llm_messages,
+        recorder=make_recorder(),
+    )
+    assert ran is True
+    content = next(m["content"] for m in llm_messages if m["role"] == "user")
+    assert _ADVISOR_OUTPUT_CONTRACT_CLAUSE in content
 
 
 @pytest.mark.asyncio

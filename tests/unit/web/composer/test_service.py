@@ -1503,6 +1503,80 @@ class TestComposerMultiTurnToolCalls:
         assert captured_messages[2][: len(turn2_minus_advisor)] == turn2_minus_advisor
 
     @pytest.mark.asyncio
+    async def test_flagged_discovery_only_tool_call_does_not_elide_advisor_message(self) -> None:
+        """R2-F12 Step 3 non-regression (review finding 1): a discovery-only
+        tool call (list_sources — no mutation) following a FLAGGED advisor
+        pass must NOT drain the injected advisor message. If it did, the
+        model's NEXT no-tool reply would be asked to "fix" findings it can
+        no longer see, the END gate would re-flag on unchanged state, and
+        the run would needlessly block. The advisor message must survive
+        into the discovery turn's own context and into whatever follows it,
+        right up until a turn that actually mutates state."""
+        catalog = _mock_catalog()
+        settings = _make_settings()
+        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "input.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        turn1 = _make_llm_response(content="Looks ready to me.")
+        # Turn 2: discovery only — no mutation. Must NOT drain.
+        turn2 = _make_llm_response(tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}])
+        # Turn 3: the genuine repair — this mutates. Drain fires HERE.
+        turn3 = _make_llm_response(
+            tool_calls=[{"id": "c2", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
+        )
+        # Turn 4: no tool calls -> END advisor gate re-runs, CLEAN -> finalize.
+        turn4 = _make_llm_response(content="Pipeline is ready.")
+
+        verdicts = iter(
+            [
+                AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating"),
+                AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
+            ]
+        )
+
+        async def _fake_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
+            return next(verdicts)
+
+        responses = iter([turn1, turn2, turn3, turn4])
+        captured_messages: list[list[dict[str, Any]]] = []
+
+        async def _fake_call_llm(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> Any:
+            captured_messages.append(list(messages))
+            return next(responses)
+
+        passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
+        ):
+            mock_llm.side_effect = _fake_call_llm
+            result = await service.compose("Review this pipeline", [], state)
+
+        assert result.message == "Pipeline is ready."
+        assert len(captured_messages) == 4
+        # Turn 2 (discovery-only) still sees it — not drained by a non-mutating turn.
+        assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[1])
+        # Turn 3 (the mutating repair call) STILL sees it — the discovery
+        # turn must not have consumed it early.
+        assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[2])
+        # Turn 4 (the finalize call, after the mutating repair) must NOT —
+        # drained only once a real mutation landed.
+        assert not any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[3])
+
+    @pytest.mark.asyncio
     async def test_flagged_still_flagged_after_elided_repair_blocks_on_fresh_findings(self) -> None:
         """R2-F12 Step 3 non-regression: eliding the pass-1 advisor message
         after a repair attempt must not make the SECOND (last-pass) advisor
@@ -1545,8 +1619,10 @@ class TestComposerMultiTurnToolCalls:
             return next(verdicts)
 
         responses = iter([turn1, turn2, turn3])
+        captured_messages: list[list[dict[str, Any]]] = []
 
         async def _fake_call_llm(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> Any:
+            captured_messages.append(list(messages))
             return next(responses)
 
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
@@ -1566,6 +1642,15 @@ class TestComposerMultiTurnToolCalls:
         # ...never pass 1's — proving the blocked surface is not stale even
         # though pass 1's injected message was elided one turn earlier.
         assert "PASS_ONE_SINK_ISSUE" not in result.message
+
+        # Freshness alone is structural (the advisor re-evaluates ``state``
+        # regardless of ``llm_messages``) and would hold even if the drain
+        # never fired — assert the drain actually fired too (review finding
+        # 4): turn 2 (the repair call) saw the pass-1 injection, turn 3 (the
+        # last-pass call that produces the blocked result) must not.
+        assert len(captured_messages) == 3
+        assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[1])
+        assert not any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[2])
 
 
 class TestComposerConvergence:
