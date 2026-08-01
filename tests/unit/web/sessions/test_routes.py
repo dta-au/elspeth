@@ -10208,8 +10208,9 @@ def _advisor_blocked_preflight(state: CompositionState) -> ValidationResultModel
 
 async def _state_data_with_preflight(
     state: CompositionState,
-    runtime_preflight: ValidationResultModel,
+    runtime_preflight: ValidationResultModel | None,
     composer_meta: Mapping[str, Any] | None = None,
+    prior_completion_gates: Mapping[str, Any] | None = None,
 ):
     from elspeth.web.sessions.routes import _state_data_from_composer_state
 
@@ -10227,6 +10228,7 @@ async def _state_data_with_preflight(
         initial_version=None,
         telemetry_source="compose",
         composer_meta=composer_meta,
+        prior_completion_gates=prior_completion_gates,
     )
     return state_data
 
@@ -10275,6 +10277,46 @@ async def test_state_data_overwrites_carried_forward_gate() -> None:
     assert state_data.composer_meta["completion_gates"] == {}
     # Unrelated envelope keys are carried forward untouched.
     assert state_data.composer_meta["repair_turns_used"] == 2
+
+
+@pytest.mark.asyncio
+async def test_state_data_preserves_prior_gate_on_non_adjudicating_save(monkeypatch) -> None:
+    """A recovery persist (runtime_preflight=None, plain preflight re-derived
+    internally) carries a durable blocked advisor fact forward instead of
+    erasing it — the re-derived preflight can never adjudicate the advisor,
+    so its empty gate envelope is absence of evidence, not a clean verdict."""
+    from elspeth.web.sessions.routes import _helpers as routes
+
+    state = _make_authoring_valid_partial("gate-preserve")
+    prior_gates = {"advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64}}
+
+    async def fake_preflight(*args: Any, **kwargs: Any) -> ValidationResult:
+        del args, kwargs
+        return ValidationResult(is_valid=True, checks=[], errors=[])
+
+    monkeypatch.setattr(routes, "_runtime_preflight_for_state", fake_preflight)
+
+    state_data = await _state_data_with_preflight(state, None, prior_completion_gates=prior_gates)
+
+    assert state_data.composer_meta is not None
+    assert state_data.composer_meta["completion_gates"] == prior_gates
+
+
+@pytest.mark.asyncio
+async def test_state_data_adjudicated_clean_save_still_clears_prior_gate() -> None:
+    """An adjudicated clean compose result overwrites: offering a prior fact
+    must not make a blocked verdict sticky across a clean advisor turn."""
+    state = _make_authoring_valid_partial("gate-clear-adjudicated")
+    prior_gates = {"advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64}}
+
+    state_data = await _state_data_with_preflight(
+        state,
+        ValidationResult(is_valid=True, checks=[], errors=[]),
+        prior_completion_gates=prior_gates,
+    )
+
+    assert state_data.composer_meta is not None
+    assert state_data.composer_meta["completion_gates"] == {}
 
 
 @pytest.mark.asyncio

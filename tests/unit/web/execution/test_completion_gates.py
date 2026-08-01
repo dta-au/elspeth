@@ -25,6 +25,7 @@ from elspeth.web.execution.completion_gates import (
     AdvisorSignoffGateFact,
     CompletionGateFacts,
     completion_gate_fingerprint,
+    completion_gates_meta_from_facts,
     completion_gates_meta_value,
     merge_completion_gates,
     parse_completion_gates,
@@ -271,6 +272,34 @@ class TestParse:
     def test_malformed_raises(self, raw: object) -> None:
         with pytest.raises(ValueError, match="Tier 1"):
             parse_completion_gates({COMPLETION_GATES_META_KEY: raw})
+
+
+# ── Carry-forward serialization ─────────────────────────────────────────
+
+
+class TestMetaFromFacts:
+    def test_round_trips_a_blocked_fact_verbatim(self) -> None:
+        """parse → serialize → parse is the identity for a persisted fact —
+        the property the recovery-save carry-forward relies on."""
+        envelope = {
+            COMPLETION_GATES_META_KEY: {
+                "advisor_signoff": {
+                    "status": "blocked",
+                    "detail": "The advisor sign-off could not be obtained.",
+                    "for_graph": "fingerprint-abc",
+                }
+            }
+        }
+        facts = parse_completion_gates(envelope)
+        serialized = completion_gates_meta_from_facts(facts)
+        assert serialized == envelope[COMPLETION_GATES_META_KEY]
+        assert parse_completion_gates({COMPLETION_GATES_META_KEY: serialized}) == facts
+
+    def test_none_facts_serialize_empty(self) -> None:
+        assert completion_gates_meta_from_facts(None) == {}
+
+    def test_no_signoff_fact_serializes_empty(self) -> None:
+        assert completion_gates_meta_from_facts(CompletionGateFacts(advisor_signoff=None)) == {}
 
 
 # ── Read-side merge ─────────────────────────────────────────────────────

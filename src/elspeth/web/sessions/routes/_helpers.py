@@ -123,7 +123,13 @@ from elspeth.web.composer.telemetry_phase8 import (
 from elspeth.web.composer.tools import _DATA_ERROR_KEY, ToolResult, execute_tool
 from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
-from elspeth.web.execution.completion_gates import COMPLETION_GATES_META_KEY, completion_gates_meta_value
+from elspeth.web.execution.completion_gates import (
+    COMPLETION_GATES_META_KEY,
+    CompletionGatesDict,
+    completion_gates_meta_from_facts,
+    completion_gates_meta_value,
+    parse_completion_gates,
+)
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.execution.validation import validate_pipeline
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter, get_rate_limiter
@@ -679,6 +685,26 @@ def _plugin_policy_findings(
                 )
             )
     return findings
+
+
+async def _durable_completion_gates(
+    service: SessionServiceProtocol,
+    session_id: UUID,
+) -> CompletionGatesDict:
+    """Fetch the prior row's completion-gate envelope for carry-forward.
+
+    Recovery persists (convergence / plugin-crash / runtime-preflight
+    failure) re-save a graph without any advisor adjudication of their own;
+    handing this envelope to :func:`_state_data_from_composer_state` keeps a
+    durable blocked advisor fact from being erased by those saves. Parsing
+    validates (Tier 1: corruption raises); re-serialization is verbatim, and
+    the fact's ``for_graph`` fingerprint downgrades it to pending wording on
+    read if the persisted graph moved.
+    """
+    record = await service.get_current_state(session_id)
+    if record is None:
+        return {}
+    return completion_gates_meta_from_facts(parse_completion_gates(record.composer_meta))
 
 
 def merge_composer_meta_updates(
@@ -1739,6 +1765,7 @@ async def _state_data_from_composer_state(
     initial_version: int | None,
     telemetry_source: _ComposerPreflightTelemetrySource,
     composer_meta: Mapping[str, Any] | None = None,
+    prior_completion_gates: CompletionGatesDict | None = None,
 ) -> tuple[CompositionStateData, ValidationSummary]:
     try:
         authoring = validate_authored_composition_state(
@@ -1826,18 +1853,30 @@ async def _state_data_from_composer_state(
         surface_meta["guided_session"] = state.guided_session.to_dict()
     persisted_composer_meta = merge_implicit_decisions_meta(surface_meta, state)
     # Completion-gate facts (advisor sign-off first) are durable only here:
-    # the key is OVERWRITTEN on every compose-preflight save — populated when
-    # the preflight withheld completion, empty when it did not — so a stale
-    # blocked fact cannot survive a clean turn. Exact-type dispatch mirrors
-    # the ``_RuntimePreflightOutcome`` convention above: a captured
-    # ``_RuntimePreflightFailed`` persists ``is_valid=False`` and carries no
-    # gate verdict.
+    # the key is OVERWRITTEN on every ADJUDICATING compose-preflight save —
+    # populated when the preflight withheld completion, empty when it did
+    # not — so a stale blocked fact cannot survive a clean compose turn.
+    # Exact-type dispatch mirrors the ``_RuntimePreflightOutcome``
+    # convention above: a captured ``_RuntimePreflightFailed`` persists
+    # ``is_valid=False`` and carries no gate verdict.
+    #
+    # Saves whose caller passed no adjudicated result (``runtime_preflight``
+    # argument was not a ``ValidationResult`` — the recovery persists and
+    # seeds) re-derive a plain preflight that can NEVER emit the advisor
+    # blocker, so overwriting would silently erase a durable advisor fact.
+    # Those callers hand in ``prior_completion_gates`` and the fact is
+    # carried forward verbatim; ``merge_completion_gates``' ``for_graph``
+    # fingerprint check downgrades it to pending wording on read if the
+    # graph moved, so the verdict is never re-attributed.
+    completion_gates_value = completion_gates_meta_value(
+        runtime if type(runtime) is ValidationResult else None,
+        state,
+    )
+    if not completion_gates_value and prior_completion_gates and type(runtime_preflight) is not ValidationResult:
+        completion_gates_value = prior_completion_gates
     persisted_composer_meta = {
         **persisted_composer_meta,
-        COMPLETION_GATES_META_KEY: completion_gates_meta_value(
-            runtime if type(runtime) is ValidationResult else None,
-            state,
-        ),
+        COMPLETION_GATES_META_KEY: completion_gates_value,
     }
     normalized_persisted_errors = validation_errors_for_composer_surface(
         composer_meta=persisted_composer_meta,
@@ -2179,6 +2218,7 @@ async def _handle_convergence_error(
                 preflight_exception_policy="persist_invalid",
                 initial_version=None,
                 telemetry_source="convergence",
+                prior_completion_gates=await _durable_completion_gates(service, session_id),
             )
             partial_record = await service.save_composition_state(
                 session_id,
@@ -2329,6 +2369,7 @@ async def _handle_plugin_crash(
                 preflight_exception_policy="persist_invalid",
                 initial_version=None,
                 telemetry_source="plugin_crash",
+                prior_completion_gates=await _durable_completion_gates(service, session_id),
             )
             partial_record = await service.save_composition_state(
                 session_id,
@@ -2570,6 +2611,7 @@ async def _handle_runtime_preflight_failure(
                 preflight_exception_policy="persist_invalid",
                 initial_version=None,
                 telemetry_source="runtime_preflight",
+                prior_completion_gates=await _durable_completion_gates(service, session_id),
             )
             partial_record = await service.save_composition_state(
                 session_id,
