@@ -720,6 +720,8 @@ test "$(aws sts get-caller-identity \
   --profile "$IAM_LIFECYCLE_AWS_PROFILE" --region "$AWS_REGION" \
   --query Account --output text)" = "$AWS_ACCOUNT_ID"
 
+ECS_CLUSTER=$(terraform -chdir=scenario-a output -raw cluster_name)
+
 terraform -chdir=scenario-a plan -destroy \
   -var-file=../examples/scenario-a.tfvars \
   -out=.terraform/scenario-a-destroy.tfplan
@@ -744,6 +746,31 @@ below to find them — they were created outside Terraform and may carry no run
 tag. `aws iam delete-policy` refuses while any attachment or non-default
 policy version remains, so a successful delete confirms the detach.
 
+### Container Insights log-group orphan (R2-D3, elspeth-a229c247a1)
+
+ECS's service-linked role re-creates
+`/aws/ecs/containerinsights/${ECS_CLUSTER}/performance` a few minutes after
+the cluster goes INACTIVE — a final Container Insights metrics flush. That
+recreated log group is untagged and lives outside every Terraform state, so
+the tag query below cannot see it, and a same-namespace redeploy retry can
+hit `ResourceAlreadyExistsException` on `CreateLogGroup`. Give the flush a
+few minutes, then delete it; the command is idempotent and safe to re-run:
+
+```bash
+aws logs delete-log-group \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --log-group-name "/aws/ecs/containerinsights/${ECS_CLUSTER}/performance" \
+  || true
+```
+
+`aws logs delete-log-group` fails with `ResourceNotFoundException` when the
+group has not been re-created yet, or was already deleted — expected outcomes
+this teardown tolerates with `|| true`. If a later same-namespace redeploy
+still hits `ResourceAlreadyExistsException` despite this step (the flush can
+lag), re-run the command above, or set
+`-var=adopt_container_insights_log_group=true` on that apply to import the
+orphan back into Terraform state instead of deleting it.
+
 Finally, query the run tag:
 
 ```bash
@@ -759,6 +786,10 @@ before declaring a chargeable survivor. Do not delete an untagged or
 differently tagged resource merely because its name resembles this run.
 
 Completion requires empty Scenario A and bootstrap state, no live run-tagged
-resources, none of the four Step 2 installer or lifecycle policies remaining,
-and no active ECS tasks, Aurora instances, ALBs, NAT gateways, EFS
+resources, no matching Container Insights log group (the tag query above
+cannot see it — confirm separately with `aws logs describe-log-groups
+--profile "$AWS_PROFILE" --region "$AWS_REGION" --log-group-name-prefix
+"/aws/ecs/containerinsights/${ECS_CLUSTER}"` and expect an empty
+`logGroups` list), none of the four Step 2 installer or lifecycle policies
+remaining, and no active ECS tasks, Aurora instances, ALBs, NAT gateways, EFS
 filesystems, Secrets Manager secrets, or retained ECR images owned by this run.
