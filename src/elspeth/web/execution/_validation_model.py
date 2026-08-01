@@ -28,6 +28,9 @@ class PhaseReport[T]:
     artifact: T
     checks: tuple[ValidationCheck, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "checks", tuple(check.model_copy(deep=True) for check in self.checks))
+
 
 @dataclass(frozen=True, slots=True)
 class PhaseFailure:
@@ -38,6 +41,17 @@ class PhaseFailure:
     errors: tuple[ValidationError, ...]
     readiness: ValidationReadiness
     semantic_contracts: tuple[SemanticEdgeContractResponse, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "passed_checks", tuple(check.model_copy(deep=True) for check in self.passed_checks))
+        object.__setattr__(self, "failed_check", self.failed_check.model_copy(deep=True))
+        object.__setattr__(self, "errors", tuple(error.model_copy(deep=True) for error in self.errors))
+        object.__setattr__(self, "readiness", self.readiness.model_copy(deep=True))
+        object.__setattr__(
+            self,
+            "semantic_contracts",
+            tuple(contract.model_copy(deep=True) for contract in self.semantic_contracts),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +70,13 @@ class AuthoredValidatedState:
     all_secret_refs: tuple[tuple[str, SecretScope | None], ...]
     env_ref_names: frozenset[str]
     semantic_contracts: tuple[SemanticEdgeContractResponse, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "semantic_contracts",
+            tuple(contract.model_copy(deep=True) for contract in self.semantic_contracts),
+        )
 
 
 @dataclass(frozen=True, slots=True)

@@ -98,8 +98,8 @@ class ValidationLedger:
         self._errors.extend(error.model_copy(deep=True) for error in errors)
         result = ValidationResult(
             is_valid=False,
-            checks=list(self._checks),
-            errors=list(self._errors),
+            checks=[check.model_copy(deep=True) for check in self._checks],
+            errors=[error.model_copy(deep=True) for error in self._errors],
             readiness=readiness_snapshot,
             semantic_contracts=semantic_contract_snapshots,
         )
@@ -121,7 +121,7 @@ class ValidationLedger:
             raise RuntimeError("successful readiness requires all readiness axes true and no blockers")
         result = ValidationResult(
             is_valid=True,
-            checks=list(self._checks),
+            checks=[check.model_copy(deep=True) for check in self._checks],
             errors=[],
             warnings=[warning.model_copy(deep=True) for warning in warnings],
             readiness=readiness.model_copy(deep=True),

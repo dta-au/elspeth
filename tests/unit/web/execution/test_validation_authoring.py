@@ -172,6 +172,30 @@ def test_policy_lowering_returns_typed_state_and_four_canonical_checks() -> None
     assert all(check.passed for check in report.checks)
 
 
+def test_policy_artifact_composition_state_is_deeply_frozen_and_detached() -> None:
+    caller_options: dict[str, object] = {"nested": {"values": ["original"]}}
+    state = _state(source=_source(caller_options))
+    report = PhaseReport(artifact=_policy(state), checks=())
+
+    nested = cast(dict[str, object], caller_options["nested"])
+    values = cast(list[str], nested["values"])
+    values.append("mutated")
+
+    frozen_nested = cast(dict[str, object], report.artifact.state.sources["source"].options["nested"])
+    assert frozen_nested["values"] == ("original",)
+    with pytest.raises(TypeError):
+        report.artifact.state.sources["source"].options["nested"] = {"values": ()}
+
+
+def test_authored_artifact_snapshots_semantic_contract_evidence() -> None:
+    contract = _contract()
+
+    authored = _authored(_state(), contracts=(contract,))
+    contract.outcome = "conflict"
+
+    assert authored.semantic_contracts[0].outcome == "satisfied"
+
+
 @pytest.mark.parametrize(
     ("state", "detail", "affected_nodes", "component_id", "component_type"),
     [
