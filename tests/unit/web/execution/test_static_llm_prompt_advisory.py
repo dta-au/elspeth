@@ -378,8 +378,29 @@ def test_validate_pipeline_emits_advisory_and_does_not_block(
     assert len(advisories) == 1
     advisory = advisories[0]
     assert advisory.passed is True, "Advisory entries are passed=True (informational)"
-    assert "classify" in advisory.detail
     assert advisory.affected_nodes == ("classify",)
+
+    detail = advisory.detail
+    # 1. Observation: names the node, states the consequence (unchanged by
+    # the wording revision).
+    assert "'classify'" in detail
+    assert "identical prompt" in detail
+    # 2. Redirect question, not an availability assertion — an LLM source
+    # plugin is in development elsewhere (as of this wording) but does not
+    # exist yet, so the advisory must ask rather than promise. Exact phrasing
+    # from operator direction (2026-08-01 follow-up on elspeth-6bdb7e7736).
+    assert "did you mean to use an LLM source instead?" in detail
+    assert detail.rstrip().endswith("?"), "must end as a question, not an assertion of availability"
+    # No specific plugin id is verifiable yet (no ticket, no branch, no
+    # registration) — the advisory must not promise one. Guards against a
+    # future edit re-introducing an unverified id like 'source:llm'.
+    assert "source:llm" not in detail
+    assert "llm_source" not in detail
+    # Old assertion-style wording ("cannot express today") must be gone.
+    assert "cannot express" not in detail
+    # 3. Concrete remedy retained for the transform case.
+    assert "row.*" in detail
+    assert "per-row transformation" in detail
 
 
 @patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config")

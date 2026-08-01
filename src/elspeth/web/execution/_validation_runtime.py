@@ -588,8 +588,12 @@ def build_static_llm_prompt_advisory_checks(
     Same happy-path-only contract as the identity and gate fan-out advisories.
     Operator direction (elspeth-6bdb7e7736): a static-prompt llm transform is
     essentially a *source* shape (generating rows) mis-declared as a
-    transform, and an llm source plugin kind may exist in future — so this
-    never escalates to a rejection, now or later.
+    transform — so this never escalates to a rejection, now or later. Wording
+    deliberately asks rather than asserts ("did you mean...?") because an LLM
+    source plugin is in development elsewhere but does not exist yet: naming a
+    specific plugin id here would promise a capability that may not be
+    installed or allowlisted on a given deployment even once it lands. Revisit
+    this string once that plugin ships and its id is verifiable.
     """
     policy_state = graphed.instantiated.loaded.materialized.authored.policy.state
     checks: list[ValidationCheck] = []
@@ -601,10 +605,9 @@ def build_static_llm_prompt_advisory_checks(
                 detail=(
                     f"Node '{finding.node_id}' has a prompt_template that interpolates no row "
                     "data, so every row receives an identical prompt to the model — one call would do the "
-                    "same work as looping over every row. If the intent is transformation, add a 'row.*' "
-                    "reference so each row's prompt reflects its own data. If the intent is generation "
-                    "(producing rows from a fixed prompt, not transforming existing ones), that is a "
-                    "source-shaped need the 'llm' transform kind cannot express today."
+                    "same work as looping over every row. If per-row transformation was intended, add a "
+                    "'row.*' reference so each row's prompt reflects its own data. If the intent is "
+                    "generation rather than transformation, did you mean to use an LLM source instead?"
                 ),
                 affected_nodes=(finding.node_id,),
             )
