@@ -601,6 +601,7 @@ async def _plan(
     rendered_skill: str | None = None,
     supersedes_draft_hash: str | None = None,
     candidate_finalizer: Any = None,
+    unproducible_output_fields: tuple[str, ...] = (),
 ) -> Any:
     # Candidate validation needs the real plugin contracts.  ``tool_context``
     # remains in the test signature so the standard composer fixture proves
@@ -618,7 +619,7 @@ async def _plan(
         ),
         reviewed_facts={"request": "Build the requested pipeline."},
         reviewed_planner_context={"request": "Build the requested pipeline."},
-        unproducible_output_fields=(),
+        unproducible_output_fields=unproducible_output_fields,
         eligible_deferred_intent_ids=eligible_deferred_intent_ids,
         claim_evaluator=claim_evaluator,
         supersedes_draft_hash=supersedes_draft_hash,
@@ -1847,7 +1848,9 @@ async def test_list_sources_disclosure_closes_authoritative_validation_envelope(
         assert payload["data"]["success"] is False
         assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
     else:
-        assert isinstance(payload["data"], list)
+        assert isinstance(payload["data"], dict)
+        assert isinstance(payload["data"]["available"], list)
+        assert isinstance(payload["data"]["prohibited"], list)
     if restricted:
         assert all(canary not in tool_message["content"] for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
         for entries in (
@@ -2577,6 +2580,55 @@ async def test_nodeless_revision_candidate_gets_one_coded_nudge_then_valve(
     assert codes == ["proposal_missing_requested_transforms"]
     assert feedback["validation"]["errors"][0]["explanation"]
     assert feedback["validation"]["errors"][0]["suggested_fix"]
+
+
+@pytest.mark.asyncio
+async def test_two_defect_nodeless_unproducible_revision_gets_one_coherent_rejection(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """T1xT3 (acceptance-r2 final review, must-fix 2): one instruction, not two.
+
+    A guided revision candidate can carry BOTH defects at once: zero
+    transform/aggregation nodes AND reviewed output fields no source declares
+    or observes. The nodeless nudge's omit-valve ("re-emit the same pipeline
+    unchanged ... the confirmation will be accepted") and the satisfiability
+    guard ("re-emitting ... will be rejected again") are contradictory repair
+    instructions; against the default repair budget of 2 the pair is a
+    guaranteed unrepairable path. The satisfiability guard must fire FIRST —
+    its feedback names the missing fields, adding a transform clears both
+    guards in one turn, and the omit-valve promise is only ever made when it
+    is true.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_short_form_llm_review(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        supersedes_draft_hash=stable_hash("superseded-draft"),
+        unproducible_output_fields=("rating",),
+        repair_budget=2,  # the production default (composer_planner_repair_budget)
+    )
+
+    # One rejection, then the transformful re-emit lands: the contradictory
+    # pair cannot exhaust the budget because only ONE guard ever speaks.
+    assert proposal.proposal.repair_count == 1
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    assert feedback["success"] is False
+    codes = [error["error_code"] for error in feedback["validation"]["errors"]]
+    assert codes == ["passthrough_cannot_produce_declared_fields"]
+    # The surviving message names the missing fields ...
+    assert "rating" in feedback["validation"]["errors"][0]["detail"]
+    # ... and the contradictory omit-valve never reaches the model: no error
+    # carries the nodeless-nudge code, and nothing in the feedback promises
+    # that an unchanged re-emit will be accepted.
+    assert "proposal_missing_requested_transforms" not in codes
+    assert "will be accepted" not in json.dumps(feedback)
 
 
 @pytest.mark.asyncio

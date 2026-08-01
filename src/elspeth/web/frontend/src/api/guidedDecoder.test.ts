@@ -143,6 +143,7 @@ function aggregationNode(
       expected_output_count: "1",
       ...behaviorOverrides,
     },
+    node_options_summary: [],
     required_fields: [],
     guaranteed_fields: [],
     row_cardinality: {
@@ -188,6 +189,7 @@ function nonRowUnionNodeWithRowUnionCardinality(
     node_type: nodeType,
     plugin: nodeType === "transform" ? "passthrough" : null,
     behavior: behaviorByType[nodeType],
+    node_options_summary: [],
     required_fields: [],
     guaranteed_fields: [],
     row_cardinality: {
@@ -345,6 +347,7 @@ function rowUnionProposalWireResponse(): Record<string, unknown> {
                 { routes: ["route-1"], branch: "branch-2" },
               ],
             },
+            node_options_summary: [],
           },
           {
             stable_id: controlId,
@@ -352,6 +355,7 @@ function rowUnionProposalWireResponse(): Record<string, unknown> {
             node_type: "transform",
             plugin: { kind: "transform", id: "passthrough" },
             behavior: { kind: "transform" },
+            node_options_summary: [],
           },
           {
             stable_id: treatmentId,
@@ -359,6 +363,7 @@ function rowUnionProposalWireResponse(): Record<string, unknown> {
             node_type: "transform",
             plugin: { kind: "transform", id: "passthrough" },
             behavior: { kind: "transform" },
+            node_options_summary: [],
           },
           {
             stable_id: unionId,
@@ -371,6 +376,7 @@ function rowUnionProposalWireResponse(): Record<string, unknown> {
               policy: "require_all",
               timeout_seconds: 12.5,
             },
+            node_options_summary: [],
           },
           {
             stable_id: aggregateId,
@@ -388,6 +394,7 @@ function rowUnionProposalWireResponse(): Record<string, unknown> {
               output_mode: "transform",
               expected_output_count: null,
             },
+            node_options_summary: [],
           },
         ],
         outputs: [
@@ -425,6 +432,7 @@ function routeRowUnionThroughQueue(
     node_type: "queue",
     plugin: null,
     behavior: { kind: "queue" },
+    node_options_summary: [],
   });
   graph.edges[8].to_endpoint = {
     kind: "node",
@@ -467,6 +475,7 @@ function contaminateRowUnionBranchQueue(
     node_type: "queue",
     plugin: null,
     behavior: { kind: "queue" },
+    node_options_summary: [],
   });
   nodes.forEach((node, index) => {
     node.label = `node-${index + 1}`;
@@ -569,6 +578,7 @@ function nestedForkOuterRowUnionProposalWireResponse(): Record<string, unknown> 
           { routes: ["route-2"], branch: "branch-4" },
         ],
       },
+      node_options_summary: [],
     },
     {
       stable_id: innerAId,
@@ -576,6 +586,7 @@ function nestedForkOuterRowUnionProposalWireResponse(): Record<string, unknown> 
       node_type: "transform",
       plugin: { kind: "transform", id: "passthrough" },
       behavior: { kind: "transform" },
+      node_options_summary: [],
     },
     {
       stable_id: innerBId,
@@ -583,6 +594,7 @@ function nestedForkOuterRowUnionProposalWireResponse(): Record<string, unknown> 
       node_type: "transform",
       plugin: { kind: "transform", id: "passthrough" },
       behavior: { kind: "transform" },
+      node_options_summary: [],
     },
     {
       stable_id: innerCoalesceId,
@@ -596,6 +608,7 @@ function nestedForkOuterRowUnionProposalWireResponse(): Record<string, unknown> 
         merge: "union",
         timeout_seconds: null,
       },
+      node_options_summary: [],
     },
   );
   const edgeIds = Array.from(
@@ -680,6 +693,65 @@ describe("guided schema-10 wire decoder", () => {
       expect(decoded.next_turn.payload.proposal_id).toBe("00000000-0000-4000-8000-000000000001");
       expect(decoded.next_turn.payload.draft_hash).toBe("d".repeat(64));
     }
+  });
+
+  it("decodes the projected key transform options on a wire node", () => {
+    // R2-F3 decode seam: node_options_summary is a closed {key, value} pair
+    // list, so the decoder must admit it positively — not merely tolerate it.
+    const decoded = decodeGetGuidedResponse(
+      wireResponse({
+        nodes: [
+          {
+            stable_id: "00000000-0000-4000-8000-000000000009",
+            label: "rename",
+            node_type: "transform",
+            plugin: "field_mapper",
+            behavior: { kind: "transform" },
+            required_fields: [],
+            guaranteed_fields: [],
+            row_cardinality: { input: "one", output: "one", expected_output_count: null },
+            structured_output_fields: [],
+            node_options_summary: [
+              { key: "mapping", value: "given_name → first_name" },
+              { key: "select_only", value: "only the mapped fields are kept" },
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(decoded.next_turn?.type).toBe("confirm_wiring");
+    if (decoded.next_turn?.type === "confirm_wiring") {
+      expect(decoded.next_turn.payload.nodes[0].node_options_summary).toEqual([
+        { key: "mapping", value: "given_name → first_name" },
+        { key: "select_only", value: "only the mapped fields are kept" },
+      ]);
+    }
+  });
+
+  it.each([
+    ["missing pair value", [{ key: "mapping" }]],
+    ["non-string pair value", [{ key: "mapping", value: 7 }]],
+    ["extra pair key", [{ key: "mapping", value: "a → b", raw: { a: "b" } }]],
+  ])("rejects a wire node options summary with a %s", (_label, summary) => {
+    expect(() => decodeGetGuidedResponse(
+      wireResponse({
+        nodes: [
+          {
+            stable_id: "00000000-0000-4000-8000-000000000009",
+            label: "rename",
+            node_type: "transform",
+            plugin: "field_mapper",
+            behavior: { kind: "transform" },
+            required_fields: [],
+            guaranteed_fields: [],
+            row_cardinality: { input: "one", output: "one", expected_output_count: null },
+            structured_output_fields: [],
+            node_options_summary: summary,
+          },
+        ],
+      }),
+    )).toThrow(/node_options_summary/);
   });
 
   it.each(["proposal_id", "draft_hash"])("rejects a wire turn missing %s", (missing) => {
@@ -777,6 +849,7 @@ describe("guided schema-10 wire decoder", () => {
         policy: "require_all",
         timeout_seconds: 12.5,
       },
+      node_options_summary: [],
     });
     expect(decoded.next_turn.payload.graph.edges[8].flow).toEqual({
       kind: "row_union_success",
@@ -808,6 +881,7 @@ describe("guided schema-10 wire decoder", () => {
           merge: "nested",
           timeout_seconds: timeoutSeconds,
         },
+        node_options_summary: [],
       });
     },
   );
@@ -889,6 +963,7 @@ describe("guided schema-10 wire decoder", () => {
     expect(decoded.next_turn.payload.nodes[4]).toMatchObject({
       node_type: "queue",
       behavior: { kind: "queue" },
+      node_options_summary: [],
     });
     expect(decoded.next_turn.payload.graph.edges.slice(8, 10).map(
       (edge) => edge.flow.kind,
@@ -1012,6 +1087,7 @@ describe("guided schema-10 wire decoder", () => {
           { routes: ["route-2"], branch: "branch-2" },
         ],
       },
+      node_options_summary: [],
     });
     // The treatment remains downstream of the first gate's branch-2 fork,
     // then a second gate re-forks the same alias before row_union.
@@ -1129,6 +1205,7 @@ describe("guided schema-10 wire decoder", () => {
         node_type: "transform",
         plugin: { kind: "transform", id: "passthrough" },
         behavior: { kind: "transform" },
+        node_options_summary: [],
       });
       edges[edgeIndex].to_endpoint = { kind: "node", stable_id: stageId };
       (edges[edgeIndex].flow as { branch: string | null }).branch = null;
@@ -1168,6 +1245,7 @@ describe("guided schema-10 wire decoder", () => {
               policy: "require_all",
               timeout_seconds: null,
             },
+            node_options_summary: [],
             required_fields: [],
             guaranteed_fields: [],
             row_cardinality: {
@@ -1206,6 +1284,7 @@ describe("guided schema-10 wire decoder", () => {
               policy: "require_all",
               timeout_seconds: null,
             },
+            node_options_summary: [],
             required_fields: [],
             guaranteed_fields: [],
             row_cardinality: {
@@ -1287,6 +1366,7 @@ describe("guided schema-10 wire decoder", () => {
               policy: "require_all",
               timeout_seconds: null,
             },
+            node_options_summary: [],
             required_fields: [],
             guaranteed_fields: [],
             row_cardinality: rowCardinality,

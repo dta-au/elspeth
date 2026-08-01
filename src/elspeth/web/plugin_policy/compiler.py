@@ -6,12 +6,17 @@ import re
 from collections.abc import Iterable, Sequence
 from typing import NoReturn, Protocol, cast
 
+import structlog
+
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlMode, PluginCapability
 from elspeth.web.plugin_policy.models import PluginId, WebPluginPolicy
 from elspeth.web.plugin_policy.profiles import RuntimeWebPluginConfig
+from elspeth.web.provider_config_policy import web_aws_s3_source_policy_error
 
 _VERSION = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?\Z")
 _SOURCE_HASH = re.compile(r"sha256:[0-9a-f]{16}\Z")
+
+_slog = structlog.get_logger(__name__)
 
 REQUIRED_WEB_PLUGIN_IDS = frozenset(
     {
@@ -77,11 +82,33 @@ def _validate_identity(plugin_cls: type[_PluginClass]) -> tuple[str, str]:
     return version, source_hash
 
 
+def _categorically_prohibited(plugin_id: PluginId) -> bool:
+    """True when the web authoring surface bans this plugin outright.
+
+    Name-static: the ban never depends on a principal, credential, or profile
+    state, so it can be evaluated at compile time. ``availability.py``
+    declines the same plugins per-principal at snapshot time
+    (``PluginUnavailableReason.WEB_SURFACE_PROHIBITED``); this predicate is
+    kept in lockstep with that one so the two surfaces cannot drift.
+    """
+    return plugin_id.kind == "source" and web_aws_s3_source_policy_error(plugin_id.name) is not None
+
+
 def compile_web_plugin_policy(*, registry: PluginRegistry, settings: RuntimeWebPluginConfig) -> WebPluginPolicy:
     """Compile settings against the complete installed registry without I/O."""
     installed = _registry_map(registry)
     allowlist = _parse_unique(settings.plugin_allowlist)
     optional = frozenset(allowlist)
+    prohibited = sorted((plugin_id for plugin_id in optional if _categorically_prohibited(plugin_id)), key=str)
+    if prohibited:
+        # Allowlisting authorizes; it cannot un-ban a categorically-prohibited
+        # plugin (R2-F1). Warn once at boot so the entry reads as a deliberate,
+        # legible carve-out (e.g. an S3-source runtime authorization the web
+        # surface declines) rather than dead or mistaken config.
+        _slog.warning(
+            "web_plugin_policy_allowlist_contains_categorical_prohibition",
+            plugin_ids=[str(plugin_id) for plugin_id in prohibited],
+        )
     authorized = REQUIRED_WEB_PLUGIN_IDS | optional
     if not authorized <= installed.keys():
         _fail("plugin_not_installed")

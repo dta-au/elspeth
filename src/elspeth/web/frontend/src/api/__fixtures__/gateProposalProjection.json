@@ -190,6 +190,7 @@
         ]
       },
       "label": "node-1",
+      "node_options_summary": [],
       "node_type": "gate",
       "plugin": null,
       "stable_id": "00000000-0000-4000-8000-000000000400"
@@ -199,6 +200,7 @@
         "kind": "transform"
       },
       "label": "node-2",
+      "node_options_summary": [],
       "node_type": "transform",
       "plugin": {
         "id": "passthrough",

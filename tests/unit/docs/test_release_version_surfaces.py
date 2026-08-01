@@ -36,6 +36,19 @@ def test_current_release_indexes_name_release_072() -> None:
     assert "`release/0.7.2`" in roadmap
 
 
+def test_current_state_names_the_live_session_epoch() -> None:
+    """Bind the product resume brief's epoch claim to the live constant.
+
+    Every other release surface (README, CHANGELOG, website, both runbooks,
+    sharing guide) is already pinned to ``SESSION_SCHEMA_EPOCH``.
+    ``current-state.md`` stated the number in prose with nothing checking it,
+    so an epoch bump could — and did — leave it a whole epoch behind.
+    """
+    current_state = _text("docs/product/current-state.md")
+
+    assert f"`SESSION_SCHEMA_EPOCH` is {SESSION_SCHEMA_EPOCH}, guided checkpoint schema is 10" in current_state
+
+
 def test_current_container_examples_require_a_confirmed_published_tag() -> None:
     for relative_path in (
         "README.md",

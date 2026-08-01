@@ -29,10 +29,7 @@ import { useMemo } from "react";
 
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
-import {
-  resolveNodePlugin,
-  stepLabelForPlugin,
-} from "../interpretationStepLabel";
+import { stepLabelForNodeId } from "../interpretationStepLabel";
 import {
   formatFindingBody,
   humaniseValidationMessage,
@@ -71,15 +68,14 @@ export function PipelineValidationSummary({
     );
   }
 
-  // Step labels for the pending-review headline reuse the acknowledgement
-  // cards' mapping (stepLabelForPlugin → "Summarise" / "Output" …) so the
-  // problems strip names the step exactly as the card it points at. Null when
-  // the component id cannot be resolved — the humaniser then uses a generic
-  // phrase instead of echoing the internal id.
-  const stepLabelFor = (componentId: string): string | null => {
-    const plugin = resolveNodePlugin(compositionState, componentId);
-    return plugin === null ? null : stepLabelForPlugin(plugin);
-  };
+  // Step labels for the pending-review headline reuse the SAME resolver the
+  // acknowledgement cards use (stepLabelForNodeId — the node's own name when
+  // it has one, else the plugin verb: "Summarise" / "Output" / …) so the
+  // problems strip names the step exactly as the card it points at (R2-F8b).
+  // Null when the component id cannot be resolved — the humaniser then uses a
+  // generic phrase instead of echoing the internal id.
+  const stepLabelFor = (componentId: string): string | null =>
+    stepLabelForNodeId(compositionState, componentId);
 
   const errors = validationResult.errors ?? [];
   const warnings = validationResult.warnings ?? [];

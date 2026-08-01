@@ -55,3 +55,20 @@ module "scenario" {
   aurora_engine_major_version        = var.aurora_engine_major_version
   aurora_engine_version              = var.aurora_engine_version
 }
+
+# R2-D3 (elspeth-a229c247a1): ECS's service-linked role re-creates the
+# Container Insights performance log group minutes after the cluster goes
+# INACTIVE (a final Container Insights flush), leaving an untagged, unmanaged
+# orphan carrying the exact name this module wants to create. The next apply
+# on the same namespace then fails CreateLogGroup with
+# ResourceAlreadyExistsException. A depends_on ordering fix cannot help — the
+# collision happens after destroy completes, not during create. Set
+# -var=adopt_container_insights_log_group=true on the documented
+# redeploy-retry path to formally import that orphan back into state instead
+# of trying to create it; the default (false) is a no-op so fresh accounts,
+# where no orphan exists, are unaffected.
+import {
+  for_each = var.adopt_container_insights_log_group ? [1] : []
+  to       = module.scenario.aws_cloudwatch_log_group.container_insights
+  id       = "/aws/ecs/containerinsights/acceptance-${module.scenario.namespace}-cluster/performance"
+}

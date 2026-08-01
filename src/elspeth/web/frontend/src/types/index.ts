@@ -442,7 +442,11 @@ export type ValidationCheckOutcomeCode = (typeof VALIDATION_CHECK_OUTCOME_CODE_V
  * removal/repair guidance in `detail` that the UI must not hide behind a
  * collapsed "Validation passed" banner.
  */
-export const VALIDATION_ADVISORY_CHECK_NAMES = ["identity_node_advisory", "gate_fan_out_advisory"] as const;
+export const VALIDATION_ADVISORY_CHECK_NAMES = [
+  "identity_node_advisory",
+  "gate_fan_out_advisory",
+  "static_llm_prompt_advisory",
+] as const;
 
 export interface ValidationCheck {
   name: string;
@@ -994,6 +998,28 @@ export interface ApiError {
   failure_code?: string;
   component_id?: string;
   plugin_id?: string;
+  /**
+   * Public convergence taxonomy from a 422 body — the same closed vocabulary
+   * as `ComposerProgressReason`, kept as a plain string because ApiError is
+   * the shared envelope for every route, not just the composer.
+   * Branch on this, never on `detail` text.
+   */
+  reason?: string;
+  /**
+   * Actionable next-step copy the backend derived for this failure (mirrors
+   * the composer-progress `likely_next`), so the chat error can name the next
+   * practical action without the SPA re-deriving it.
+   */
+  recovery_text?: string | null;
+  /**
+   * The deployment's configured compose wall clock, in seconds. Present only
+   * on `convergence_wall_clock_timeout` 422s. Server-authoritative on
+   * purpose: the client's own abort ceiling is this value plus a grace
+   * constant and falls back to a checked-in default before the boot
+   * /api/system/status fetch lands, so it must never be used to tell the user
+   * how long ELSPETH actually ran.
+   */
+  timeout_seconds?: number;
   partial_state?: CompositionState | null;
   failed_turn?: FailedTurn | null;
   partial_state_save_failed?: boolean;

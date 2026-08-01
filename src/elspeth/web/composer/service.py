@@ -144,6 +144,7 @@ from elspeth.web.composer.recipes import (
 )
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.skills import assert_skill_hash_unchanged_on_disk
 from elspeth.web.composer.state import CompositionState, NodeSpec, ValidationSummary
 from elspeth.web.composer.tools import (
@@ -349,10 +350,28 @@ _LLM_API_MAX_ATTEMPTS = 3
 _LLM_API_RETRY_BASE_DELAY_SECONDS = 1.0
 
 
-def _identity_pipeline_candidate(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return the canonical planner candidate unchanged."""
+def _required_controls_candidate_finalizer(
+    *,
+    policy_catalog: PolicyCatalogView,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    inner: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+) -> Callable[[Mapping[str, Any]], Mapping[str, Any]]:
+    """Planner candidate finalizer that auto-wires deployment-REQUIRED controls.
 
-    return candidate
+    R2-F10 (elspeth-f99655f540): every planner surface runs the
+    ``wire_required_controls`` pass on its terminal candidate so uncovered
+    graphs are repaired server-side (with acknowledgeable disclosure) instead
+    of shipping into the execution-time required-control block. ``inner``
+    composes a surface-specific finalizer (the guided reviewed-component
+    binder) BEFORE the pass, so wiring always sees the bound candidate. The
+    pass is idempotent, so re-finalizing a covered candidate is a no-op.
+    """
+
+    def finalize(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        staged = inner(candidate) if inner is not None else candidate
+        return wire_required_controls(staged, plugin_snapshot, policy_catalog)
+
+    return finalize
 
 
 _ADVISOR_ARGUMENT_KEYS: Final[frozenset[str]] = frozenset(
@@ -2543,7 +2562,10 @@ class ComposerServiceImpl:
             ),
             lifecycle=self._planner_request_lifecycle(progress),
             recorder=recorder,
-            candidate_finalizer=_identity_pipeline_candidate,
+            candidate_finalizer=_required_controls_candidate_finalizer(
+                policy_catalog=policy_catalog,
+                plugin_snapshot=plugin_snapshot,
+            ),
         )
         try:
             plan = await guided_full_planner_call
@@ -2851,7 +2873,11 @@ class ComposerServiceImpl:
             custody_config=custody_config,
             lifecycle=self._planner_request_lifecycle(progress),
             recorder=recorder,
-            candidate_finalizer=lambda candidate: bind_guided_reviewed_components(candidate, guided),
+            candidate_finalizer=_required_controls_candidate_finalizer(
+                policy_catalog=policy_catalog,
+                plugin_snapshot=plugin_snapshot,
+                inner=lambda candidate: bind_guided_reviewed_components(candidate, guided),
+            ),
         )
         try:
             plan = await guided_planner_call
@@ -3141,7 +3167,10 @@ class ComposerServiceImpl:
                     custody_config=custody_config,
                     lifecycle=self._planner_request_lifecycle(progress),
                     recorder=recorder,
-                    candidate_finalizer=lambda candidate: candidate,
+                    candidate_finalizer=_required_controls_candidate_finalizer(
+                        policy_catalog=policy_catalog,
+                        plugin_snapshot=plugin_snapshot,
+                    ),
                 )
             except PlannerDeclined as declined:
                 # Honest decline from the escape-hatch advisor turn: a
@@ -3204,6 +3233,7 @@ class ComposerServiceImpl:
         message: str,
         composition_turns_used: int,
         discovery_turns_used: int,
+        failed_turn: FailedTurnMetadata | None,
     ) -> _CallModelOutcome:
         """Phase P1 of the compose loop — one LLM call with cap enforcement.
 
@@ -3212,6 +3242,12 @@ class ComposerServiceImpl:
         A cap breach raises :class:`ComposerConvergenceError` with the
         ``tool_call_cap_exceeded`` reason directly; no carrier is returned
         in that case.
+
+        ``failed_turn`` is the driver's running metadata for the LAST
+        persisted tool-call turn — carried here only so a wall-clock timeout
+        on this call can report it (R2-F9). It is ``None`` on the first loop
+        iteration and whenever the loop runs without a session, because no
+        turn has been persisted yet.
         """
         await emit_progress(progress, model_call_progress_event(message))
         response = await self._call_llm_before_deadline(
@@ -3221,6 +3257,9 @@ class ComposerServiceImpl:
             initial_version,
             deadline,
             recorder=recorder,
+            composition_turns_used=composition_turns_used,
+            discovery_turns_used=discovery_turns_used,
+            failed_turn=failed_turn,
         )
         assistant_message = response.choices[0].message
         raw_assistant_content = assistant_message.content
@@ -3554,6 +3593,12 @@ class ComposerServiceImpl:
                     initial_version,
                     deadline,
                     recorder=recorder,
+                    # The composition counter has already been charged for
+                    # this turn (``new_composition_turns_used``); a timeout on
+                    # the B-4D-3 bonus call must report that same total.
+                    composition_turns_used=new_composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    failed_turn=failed_turn,
                 )
                 assistant_message = response.choices[0].message
                 if not assistant_message.tool_calls:
@@ -4422,6 +4467,7 @@ class ComposerServiceImpl:
                 message=message,
                 composition_turns_used=composition_turns_used,
                 discovery_turns_used=discovery_turns_used,
+                failed_turn=failed_turn,
             )
             # If no tool calls, the LLM is done — apply the final gate and return
             if not call_model.has_tool_calls:
@@ -6037,6 +6083,10 @@ class ComposerServiceImpl:
         initial_version: int,
         deadline: float,
         recorder: BufferingRecorder | None = None,
+        *,
+        composition_turns_used: int,
+        discovery_turns_used: int,
+        failed_turn: FailedTurnMetadata | None,
     ) -> Any:
         """Call the LLM with a per-call timeout derived from the deadline.
 
@@ -6052,6 +6102,21 @@ class ComposerServiceImpl:
         persistence has the per-call decision trail even when the
         budget exhaustion was a wall-clock timeout (no LLM mutation
         in this final call).
+
+        The turn counters and ``failed_turn`` are owned by the caller, so
+        both are required keyword arguments rather than defaulted ones
+        (R2-F9, elspeth-114dd261bc). The two wall-clock raises below used to
+        hardcode ``max_turns=0`` and omit ``failed_turn``, which told the
+        user the composer gave up "within 0 turns" after a multi-turn build
+        and — because the SPA's RecoveryPanel gates on ``failed_turn !=
+        null`` — hid the salvaged partial pipeline the route handler had
+        already persisted. Defaulting them would let a future call site
+        silently reintroduce exactly that.
+
+        Unlike the two budget raises in :meth:`_classify_and_charge_turn`,
+        the count reported here is the plain sum of turns already spent: a
+        wall-clock timeout does not trip (and so does not charge) either
+        turn budget.
         """
         from litellm.exceptions import APIError as LiteLLMAPIError
         from litellm.exceptions import AuthenticationError as LiteLLMAuthError
@@ -6067,12 +6132,13 @@ class ComposerServiceImpl:
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
                 raise ComposerConvergenceError.capture(
-                    max_turns=0,
+                    max_turns=composition_turns_used + discovery_turns_used,
                     budget_exhausted="timeout",
                     state=state,
                     initial_version=initial_version,
                     tool_invocations=_captured_invocations(),
                     llm_calls=_captured_llm_calls(),
+                    failed_turn=failed_turn,
                 )
             try:
                 return await self._call_llm_with_audit(
@@ -6083,12 +6149,13 @@ class ComposerServiceImpl:
                 )
             except TimeoutError:
                 raise ComposerConvergenceError.capture(
-                    max_turns=0,
+                    max_turns=composition_turns_used + discovery_turns_used,
                     budget_exhausted="timeout",
                     state=state,
                     initial_version=initial_version,
                     tool_invocations=_captured_invocations(),
                     llm_calls=_captured_llm_calls(),
+                    failed_turn=failed_turn,
                 ) from None
             except LiteLLMAuthError:
                 raise
@@ -6162,17 +6229,25 @@ _ADVISOR_UNTRUSTED_USER_MESSAGE_HEADER: Final[str] = (
     "pipeline above satisfies it):"
 )
 # R2-F14 (elspeth-5403f346c0): the verdict marker scan is deliberately
-# case-SENSITIVE. The advisor prompt asks for a literal ``CLEAN``/``FLAGGED``
-# token, and a case-insensitive scan across a whole line fails OPEN on ordinary
-# adjectival prose ("the extracted data looks clean and consistent"), which
-# would silently mint a sign-off. A reply written in the natural lowercase
-# register is still accepted, but ONLY through the LINE-START-ANCHORED
-# ``_ADVISOR_VERDICT_LINE_RE`` fallback below. That arm is anchored, so a
-# lowercase token behind a label ("Verdict: clean") is NOT accepted and is
-# re-prompted instead — deliberately fail-closed, since widening the
-# any-register surface is how adjectival prose gets back in. The uppercase
-# ``Verdict: CLEAN`` parses via the cased arm; only the lowercase variant
-# costs a retry round trip.
+# case-SENSITIVE for CLEAN. The advisor prompt asks for a literal
+# ``CLEAN``/``FLAGGED`` token, and a case-insensitive scan across a whole line
+# fails OPEN on ordinary adjectival prose ("the extracted data looks clean and
+# consistent"), which would silently mint a sign-off. A CLEAN reply written in
+# the natural lowercase register is still accepted, but ONLY through the
+# LINE-START-ANCHORED ``_ADVISOR_VERDICT_LINE_RE`` fallback below. That arm is
+# anchored, so a lowercase CLEAN behind a label ("Verdict: clean") is NOT
+# accepted and is re-prompted instead — deliberately fail-closed, since
+# widening the any-register CLEAN surface is how adjectival prose gets back
+# in. The uppercase ``Verdict: CLEAN`` parses via the cased arm; only the
+# lowercase variant costs a retry round trip.
+#
+# FLAGGED is different (acceptance-r2 final review, parked T8 residual): it is
+# ADDITIONALLY matched any-register anywhere in a line via
+# ``_ADVISOR_FLAGGED_ANYCASE_RE`` (defined with the R2-F14 EOF block below),
+# terminator-guarded so adjectival prose ("flagged records are routed to the
+# reject sink") still does not match. Widening FLAGGED is the fail-CLOSED
+# direction — a false FLAGGED costs a repair turn; it can never mint a
+# sign-off — so the asymmetry with CLEAN is deliberate, not an oversight.
 _ADVISOR_VERDICT_MARKER_RE: Final[re.Pattern[str]] = re.compile(r"\b(CLEAN|FLAGGED)\b")
 # The anchored arm requires the marker to be the WHOLE leading token, closed by
 # a verdict-shaped terminator (``:``, ``.``, a dash, or end-of-line). The
@@ -6389,7 +6464,9 @@ class AdvisorCheckpointVerdict:
     # failure (MUST fail closed) from a transport outage (MAY take the audited
     # escape at budget exhaustion). Only the EXACT value ``"unavailable"`` is
     # escapable; ``"none"`` (default; never read on CLEAN/FLAGGED), ``"malformed"``,
-    # or any unrecognised value fails closed. See ``classify_signoff_verdict``.
+    # or any unrecognised value fails closed. The classification is applied
+    # inline by ``_run_advisor_checkpoint``'s exception handling and read by
+    # ``_evaluate_terminal_no_tool_advisor_gate``.
     failure_class: Literal["none", "unavailable", "malformed"] = "none"
 
 
@@ -6404,20 +6481,28 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
     those used to be declared MALFORMED and fail the build closed, which is a
     formatting quibble presented to the user as a build failure.
 
-    So: strip markdown emphasis and scan the first
-    :data:`_ADVISOR_VERDICT_SCAN_MAX_LINES` non-empty lines. The old "reply
-    mentions both words => malformed" tripwire is gone; a genuinely
+    So: strip markdown emphasis and scan. CLEAN acceptance is bounded to the
+    first :data:`_ADVISOR_VERDICT_SCAN_MAX_LINES` non-empty lines. The old
+    "reply mentions both words => malformed" tripwire is gone; a genuinely
     verdict-less reply is still MALFORMED, and the caller now spends a retry
     re-asking for the format rather than terminating the build.
 
-    **FLAGGED dominates within the scan window.** Position does NOT decide.
+    **FLAGGED dominates across the WHOLE reply.** Position does NOT decide.
     A positional rule ("first marker wins") is a fail-OPEN here, because an
     uppercase ``CLEAN`` token occurs naturally inside well-formed NEGATIONS —
     "Not CLEAN. FLAGGED: …", "I cannot mark this CLEAN.", "Verdict: not CLEAN
     — FLAGGED" — every one of which is a refusal to sign off that a positional
-    rule reads AS a sign-off. So a ``CLEAN`` that coexists with a ``FLAGGED``
-    anywhere in the window is never a sign-off; only a window carrying CLEAN
-    and no FLAGGED passes. This still resolves each shape the fix exists to
+    rule reads AS a sign-off. And bounding the FLAGGED scan to the CLEAN
+    window was itself a fail-OPEN (acceptance-r2 final review, T9xT8): the
+    END rubric instructs the advisor to QUOTE the user's explicit constraints,
+    so a quoted bare ``CLEAN`` can land inside the window while the advisor's
+    real ``FLAGGED`` verdict sits below it — under a window-bounded rule that
+    parsed as a silent sign-off with no format re-prompt. So a ``CLEAN`` that
+    coexists with a ``FLAGGED`` ANYWHERE in the reply is never a sign-off;
+    only a reply carrying an in-window CLEAN and no FLAGGED at all passes.
+    The CLEAN window stays bounded (a sign-off buried under preamble is still
+    re-prompted — widening acceptance is the fail-open direction; widening
+    blocking is not). This still resolves each shape the fix exists to
     handle (``**CLEAN**`` -> CLEAN, ``Verdict: FLAGGED`` -> FLAGGED,
     preamble-then-verdict -> that verdict, FLAGGED-mentioning-CLEAN ->
     FLAGGED) and errs toward blocking, the safe direction for a sign-off gate.
@@ -6430,8 +6515,6 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
         if not line:
             continue
         scanned += 1
-        if scanned > _ADVISOR_VERDICT_SCAN_MAX_LINES:
-            break
         # Cased scan anywhere in the line (``**CLEAN**``, ``Verdict: FLAGGED``,
         # "<preamble> FLAGGED"), then the any-register ANCHORED fallback for a
         # bare leading token written in lowercase.
@@ -6440,10 +6523,14 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
             anchored = _ADVISOR_VERDICT_LINE_RE.match(line)
             if anchored is not None:
                 markers = [anchored.group(1).upper()]
-        if "FLAGGED" in markers:
-            # Dominance: nothing later in the window can un-flag a FLAGGED.
+        if "FLAGGED" in markers or _ADVISOR_FLAGGED_ANYCASE_RE.search(line) is not None:
+            # Dominance: nothing anywhere else in the reply can un-flag a
+            # FLAGGED, and the scan is unbounded in this direction only —
+            # blocking is the safe direction. The second arm is the widened
+            # any-register FLAGGED (terminator-guarded; see its definition).
             return AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=text)
-        saw_clean = saw_clean or bool(markers)
+        if scanned <= _ADVISOR_VERDICT_SCAN_MAX_LINES:
+            saw_clean = saw_clean or bool(markers)
 
     if saw_clean:
         return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text=text)
@@ -7000,11 +7087,28 @@ def _fence_advisor_findings(findings_text: str) -> str:
 # time, so the forward references from ``_parse_advisor_checkpoint_guidance``
 # and ``_run_advisor_checkpoint`` (both defined earlier) are safe.
 # ---------------------------------------------------------------------------
-# How many leading non-empty lines the verdict scan inspects. Bounded so a
-# rambling advisor reply cannot bury a verdict token under arbitrary prose and
-# still be accepted: past this window the reply is not a compliant sign-off and
-# is re-prompted instead.
+# How many leading non-empty lines CLEAN ACCEPTANCE inspects. Bounded so a
+# rambling advisor reply cannot bury a sign-off token under arbitrary prose and
+# still be accepted: past this window a CLEAN is not a compliant sign-off and
+# is re-prompted instead. FLAGGED detection is deliberately NOT bounded by
+# this window (acceptance-r2 final review, T9xT8): the END rubric makes the
+# advisor quote the user's constraints, so a quoted CLEAN can occupy the
+# window while the real FLAGGED verdict sits below it — blocking must win from
+# anywhere in the reply.
 _ADVISOR_VERDICT_SCAN_MAX_LINES: Final[int] = 5
+# Any-register FLAGGED arm (parked T8 residual, folded into the T9xT8 fix).
+# Requires the token to be closed by a verdict-shaped terminator — the same
+# ``:`` / ``.`` / dash / end-of-line set as the anchored arm — so adjectival
+# prose ("flagged records are routed to the reject sink") stays unmatched. A
+# match can only BLOCK, never sign off, so unlike CLEAN this widening cannot
+# reopen the adjectival fail-open.
+_ADVISOR_FLAGGED_ANYCASE_RE: Final[re.Pattern[str]] = re.compile(
+    # \u2013 / \u2014 are the en/em dashes models actually type; spelled as
+    # escapes so the literal cannot be confused with an ASCII hyphen on review
+    # (same convention as ``_ADVISOR_VERDICT_LINE_RE``).
+    r"\bFLAGGED\b\s*(?:[:.\-\u2013\u2014]|$)",
+    re.IGNORECASE,
+)
 # Markdown emphasis / code-span punctuation stripped before the verdict scan.
 # ``*`` and backtick are already non-word characters (so ``**CLEAN**`` matches
 # ``\bCLEAN\b`` regardless), but ``_`` is a WORD character — without stripping

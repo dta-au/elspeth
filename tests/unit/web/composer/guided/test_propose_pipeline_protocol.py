@@ -101,6 +101,7 @@ def _payload() -> dict[str, Any]:
                 "node_type": "transform",
                 "plugin": {"kind": "transform", "id": "schema_guard"},
                 "behavior": {"kind": "transform"},
+                "node_options_summary": [],
             }
         ],
         "outputs": [
@@ -141,6 +142,7 @@ def _gate_payload() -> dict[str, Any]:
             "routes": [{"alias": alias, "key": key} for alias, key in zip(route_aliases, GATE_ROUTE_KEYS, strict=True)],
             "fork_branches": [],
         },
+        "node_options_summary": [],
     }
     payload["graph"]["edges"] = [
         {
@@ -192,6 +194,7 @@ def _fork_coalesce_payload() -> dict[str, Any]:
                 "routes": [{"alias": route, "key": "true"}],
                 "fork_branches": [{"routes": [route], "branch": branch} for branch in branches],
             },
+            "node_options_summary": [],
         },
         {
             "stable_id": NODE_2_ID,
@@ -205,6 +208,7 @@ def _fork_coalesce_payload() -> dict[str, Any]:
                 "merge": "nested",
                 "timeout_seconds": None,
             },
+            "node_options_summary": [],
         },
     ]
     payload["graph"]["edges"] = [
@@ -268,6 +272,7 @@ def _fork_row_union_payload() -> dict[str, Any]:
                 "routes": [{"alias": route, "key": "true"}],
                 "fork_branches": [{"routes": [route], "branch": branch} for branch in branches],
             },
+            "node_options_summary": [],
         },
         *(
             {
@@ -276,6 +281,7 @@ def _fork_row_union_payload() -> dict[str, Any]:
                 "node_type": "transform",
                 "plugin": {"kind": "transform", "id": "passthrough"},
                 "behavior": {"kind": "transform"},
+                "node_options_summary": [],
             }
             for index, stable_id in ((1, control_id), (2, treatment_id))
         ),
@@ -290,6 +296,7 @@ def _fork_row_union_payload() -> dict[str, Any]:
                 "policy": "require_all",
                 "timeout_seconds": 12.5,
             },
+            "node_options_summary": [],
         },
         {
             "stable_id": aggregate_id,
@@ -304,6 +311,7 @@ def _fork_row_union_payload() -> dict[str, Any]:
                 "output_mode": "transform",
                 "expected_output_count": None,
             },
+            "node_options_summary": [],
         },
     ]
     edge_ids = [f"00000000-0000-4000-8000-{index:012d}" for index in range(600, 612)]
@@ -391,6 +399,7 @@ def _route_row_union_through_queue(payload: dict[str, Any]) -> None:
             "node_type": "queue",
             "plugin": None,
             "behavior": {"kind": "queue"},
+            "node_options_summary": [],
         },
     )
     payload["graph"]["edges"][8]["to_endpoint"] = {
@@ -429,6 +438,7 @@ def _contaminate_row_union_branch_queue(payload: dict[str, Any]) -> None:
             "node_type": "queue",
             "plugin": None,
             "behavior": {"kind": "queue"},
+            "node_options_summary": [],
         },
     )
     for index, node in enumerate(payload["nodes"]):
@@ -476,6 +486,7 @@ def _queue_payload() -> dict[str, Any]:
             "node_type": "queue",
             "plugin": None,
             "behavior": {"kind": "queue"},
+            "node_options_summary": [],
         },
         {
             "stable_id": NODE_2_ID,
@@ -483,6 +494,7 @@ def _queue_payload() -> dict[str, Any]:
             "node_type": "transform",
             "plugin": {"kind": "transform", "id": "schema_guard"},
             "behavior": {"kind": "transform"},
+            "node_options_summary": [],
         },
     ]
     payload["graph"]["edges"] = [
@@ -554,6 +566,40 @@ def test_propose_pipeline_accepts_the_exact_redacted_projection() -> None:
         "outputs",
         "edit_targets",
     }
+
+
+def test_propose_pipeline_node_options_summary_is_a_server_owned_allowlist() -> None:
+    """R2-F3: key transform knobs are projected, but only the allowlisted ones.
+
+    The projected keys are a CLOSED server-owned vocabulary keyed by plugin —
+    the validator, not the projector, is what makes "we never publish a
+    path/secret-adjacent option" checkable at the wire boundary.
+    """
+    payload = _payload()
+    payload["nodes"][0]["plugin"] = {"kind": "transform", "id": "field_mapper"}
+    payload["nodes"][0]["node_options_summary"] = [{"key": "mapping", "value": "given_name → first_name"}]
+
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, payload) is None
+
+    leaked = _payload()
+    leaked["nodes"][0]["plugin"] = {"kind": "transform", "id": "field_mapper"}
+    leaked["nodes"][0]["node_options_summary"] = [{"key": "path", "value": "/private/rows.csv"}]
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, leaked)
+    assert error is not None
+    assert "allowlist" in error
+
+    unlisted_plugin = _payload()
+    unlisted_plugin["nodes"][0]["node_options_summary"] = [{"key": "mapping", "value": "given_name → first_name"}]
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, unlisted_plugin)
+    assert error is not None
+    assert "allowlist" in error
+
+    malformed = _payload()
+    malformed["nodes"][0]["plugin"] = {"kind": "transform", "id": "field_mapper"}
+    malformed["nodes"][0]["node_options_summary"] = [{"key": "mapping", "value": {"given_name": "first_name"}}]
+    error = validate_payload(TurnType.PROPOSE_PIPELINE, malformed)
+    assert error is not None
+    assert "must be a string" in error
 
 
 def test_propose_pipeline_supersedes_draft_hash_is_null_or_exact_hash() -> None:
@@ -803,6 +849,7 @@ def test_propose_pipeline_rejects_multi_node_cycle() -> None:
             "node_type": "transform",
             "plugin": {"kind": "transform", "id": "schema_guard"},
             "behavior": {"kind": "transform"},
+            "node_options_summary": [],
         }
     )
     payload["graph"]["edges"][2]["to_endpoint"] = {"kind": "node", "stable_id": NODE_2_ID}
@@ -841,6 +888,7 @@ def test_propose_pipeline_rejects_unreachable_components(orphan_kind: str) -> No
                 "node_type": "transform",
                 "plugin": {"kind": "transform", "id": "schema_guard"},
                 "behavior": {"kind": "transform"},
+                "node_options_summary": [],
             }
         )
         payload["component_counts"]["nodes"] = 2
@@ -969,6 +1017,7 @@ def _wire_payload_with_gate(behavior: dict[str, Any]) -> dict[str, Any]:
                 "node_type": "gate",
                 "plugin": None,
                 "behavior": behavior,
+                "node_options_summary": [],
                 "required_fields": [],
                 "guaranteed_fields": [],
                 "row_cardinality": {"input": "one", "output": "one", "expected_output_count": None},
@@ -1090,6 +1139,7 @@ def test_propose_pipeline_rejects_route_alias_reused_by_two_gates() -> None:
                 ],
                 "fork_branches": [],
             },
+            "node_options_summary": [],
         },
         {
             "stable_id": NODE_2_ID,
@@ -1103,6 +1153,7 @@ def test_propose_pipeline_rejects_route_alias_reused_by_two_gates() -> None:
                 "routes": [{"alias": routes[0], "key": "true"}],
                 "fork_branches": [],
             },
+            "node_options_summary": [],
         },
     ]
     payload["graph"]["edges"] = [
@@ -1395,6 +1446,7 @@ def test_propose_pipeline_rejects_row_union_branch_set_from_multiple_fork_gates(
                 "routes": [{"alias": second_fork_route, "key": "fork"}],
                 "fork_branches": [{"routes": [second_fork_route], "branch": "branch-2"}],
             },
+            "node_options_summary": [],
         },
     )
     for index, node in enumerate(payload["nodes"]):
@@ -1505,6 +1557,7 @@ def _lengthen_barrier_arms(payload: dict[str, Any], *, barrier_index: int) -> No
                 "node_type": "transform",
                 "plugin": {"kind": "transform", "id": "passthrough"},
                 "behavior": {"kind": "transform"},
+                "node_options_summary": [],
             }
         )
         branch = edge["flow"]["branch"]
@@ -1657,6 +1710,7 @@ def test_propose_pipeline_rejects_one_fork_branch_set_consumed_by_two_coalesces(
                     {"routes": [routes[0]], "branch": branches[1]},
                 ],
             },
+            "node_options_summary": [],
         },
         {
             "stable_id": gate_b_id,
@@ -1673,6 +1727,7 @@ def test_propose_pipeline_rejects_one_fork_branch_set_consumed_by_two_coalesces(
                 ],
                 "fork_branches": [],
             },
+            "node_options_summary": [],
         },
         {
             "stable_id": gate_c_id,
@@ -1689,6 +1744,7 @@ def test_propose_pipeline_rejects_one_fork_branch_set_consumed_by_two_coalesces(
                 ],
                 "fork_branches": [],
             },
+            "node_options_summary": [],
         },
         *(
             {
@@ -1703,6 +1759,7 @@ def test_propose_pipeline_rejects_one_fork_branch_set_consumed_by_two_coalesces(
                     "merge": "union",
                     "timeout_seconds": None,
                 },
+                "node_options_summary": [],
             }
             for index, stable_id in ((3, coalesce_a_id), (4, coalesce_b_id))
         ),

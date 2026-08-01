@@ -389,3 +389,22 @@ class TestClosedFailureEnvelope:
 
         assert copy.endswith("Retry the request.")
         assert "operation id" not in copy.lower()
+
+    def test_the_raise_site_leaves_request_id_to_the_app_boundary(self) -> None:
+        """The correlation id is injected once, at the app-level handler.
+
+        ``raise_guided_operation_failure`` has no ``Request`` and must not
+        acquire one: the id is stamped by ``RequestIdMiddleware`` and folded
+        into every dict-shaped detail by ``create_app``'s ``HTTPException``
+        handler (see ``tests/unit/web/test_composer_exception_handlers.py``).
+        Sourcing it here as well would give the envelope two authorities for
+        one field — and would silently diverge the moment a route composed the
+        envelope outside a request scope. Pin the closed key set so that
+        second source cannot be added here by accident.
+        """
+        for code in sorted(GUIDED_OPERATION_FAILURE_CODE_VALUES):
+            with pytest.raises(HTTPException) as caught:
+                raise_guided_operation_failure(GuidedOperationFailed(failure_code=code))
+            detail = caught.value.detail
+            assert isinstance(detail, dict)
+            assert set(detail) == {"error_type", "failure_code", "detail"}, code

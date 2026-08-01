@@ -2818,12 +2818,16 @@ class TestDiscoveryCache:
 
         # Should NOT have raised — second list_sources was a cache hit
         assert result.message == "Found sources."
-        # Catalog list_sources is called once by snapshot construction,
-        # twice by build_messages (visible list + capability grouping),
-        # and once by execute_tool (first discovery call).
-        # The second discovery call is a cache hit — no catalog call.
-        # Total: 4, not 5.
-        assert catalog.list_sources.call_count == 4
+        # Catalog list_sources is called once by snapshot construction
+        # (before any PolicyCatalogView exists) and once more by the
+        # PolicyCatalogView itself, which memoizes its unrestricted listing
+        # per instance (PolicyCatalogView._full_items) — build_messages's own
+        # list_sources() + capability_groups() call and execute_tool's first
+        # discovery dispatch all reuse that single cached fetch instead of
+        # re-deriving every PluginSummary three times over.
+        # The second discovery call is a composer tool-cache hit — no catalog call.
+        # Total: 2, not 4.
+        assert catalog.list_sources.call_count == 2
 
     @pytest.mark.asyncio
     async def test_cache_hit_rebuilds_result_envelope_from_current_state(self) -> None:
@@ -2877,7 +2881,11 @@ class TestDiscoveryCache:
             affected_nodes=(),
         ).to_dict()["validation"]
         assert cached_payload["validation"] == expected_validation
-        assert catalog.list_sources.call_count == 4
+        # See test_cacheable_tool_returns_cached_result: PolicyCatalogView
+        # memoizes its unrestricted listing per instance, so repeated
+        # internal list_sources()/capability_groups() reads within one
+        # compose() collapse into a single real catalog call.
+        assert catalog.list_sources.call_count == 2
 
     @pytest.mark.asyncio
     async def test_cache_key_includes_arguments(self) -> None:

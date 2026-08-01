@@ -32,6 +32,7 @@ function canonicalData(overrides: Partial<WireStageData> = {}): WireStageData {
       guaranteed_fields: ["mapped"],
       row_cardinality: { input: "one", output: "one", expected_output_count: null },
       structured_output_fields: [],
+      node_options_summary: [],
     }],
     outputs: [{
       stable_id: OUTPUT_ID,
@@ -155,6 +156,7 @@ describe("WireStageTurn", () => {
             { routes: ["route-2"], branch: "branch-2" },
           ],
         },
+        node_options_summary: [],
         required_fields: ["variant"],
         guaranteed_fields: [],
         row_cardinality: { input: "one", output: "one", expected_output_count: null },
@@ -171,6 +173,7 @@ describe("WireStageTurn", () => {
           policy: "require_all",
           timeout_seconds: null,
         },
+        node_options_summary: [],
         required_fields: [],
         guaranteed_fields: ["variant"],
         row_cardinality: {
@@ -271,6 +274,75 @@ describe("WireStageTurn", () => {
     expect(screen.getByText("Technical details")).toBeInTheDocument();
   });
 
+  it("renders the key transform options a behavior discriminant alone cannot show", () => {
+    // R2-F3: "Policy: transform each input row" was the whole story a
+    // field_mapper told, so the operator could not see which fields it renames
+    // or that unmapped fields are dropped.
+    const data = canonicalData({
+      nodes: canonicalData().nodes.map((node) => ({
+        ...node,
+        node_options_summary: [
+          { key: "mapping", value: "given_name → first_name, meta.source → origin" },
+          { key: "select_only", value: "only the mapped fields are kept" },
+        ],
+      })),
+    });
+    render(<WireStageTurn data={data} onConfirm={vi.fn()} confirmDisabled={false} />);
+
+    expect(
+      screen.getByText("Mapping: given_name → first_name, meta.source → origin"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Select only: only the mapped fields are kept")).toBeInTheDocument();
+  });
+
+  it("reports a missing contract without asserting why it is missing", async () => {
+    // A null schema_contract is cause-free on the wire: it can mean nothing was
+    // required, but equally an ADR-007 producer abstention, an error-continue
+    // skip, or a discard edge. "(contract unchecked)" implied a pending check;
+    // naming any single cause would be worse — it would assert a fact the
+    // payload does not carry.
+    const data = canonicalData({
+      connections: canonicalData().connections.map((connection, index) => index === 0
+        ? { ...connection, schema_contract: null }
+        : connection),
+    });
+    render(<WireStageTurn data={data} onConfirm={vi.fn()} confirmDisabled={false} />);
+    await userEvent.click(screen.getByText("Technical details"));
+
+    expect(screen.queryByText(/\(contract unchecked\)/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/\(contract not statically checked\)/),
+    ).toBeInTheDocument();
+  });
+
+  it("never claims 'no required fields' when a sink DOES require fields and the producer abstains", async () => {
+    // ADR-007 abstention (composer/state.py:2846-2874): sink_required is
+    // NON-empty, but a producer with neither guarantees nor participation — a
+    // select_only field_mapper on an observed schema — makes no static claim,
+    // so the validator emits no EdgeContract and defers to per-row runtime
+    // enforcement. The code comment there prescribes the "not yet checked"
+    // reading; a row claiming "no required fields" would be flatly false.
+    const base = canonicalData();
+    const data = canonicalData({
+      outputs: base.outputs.map((output) => ({ ...output, required_fields: ["mapped", "body"] })),
+      connections: base.connections.map((connection) =>
+        connection.to_endpoint.kind === "output"
+          ? { ...connection, schema_contract: null }
+          : connection),
+    });
+    render(<WireStageTurn data={data} onConfirm={vi.fn()} confirmDisabled={false} />);
+    await userEvent.click(screen.getByText("Technical details"));
+
+    const rawRows = screen.getByText(/00000000-0000-4000-8000-000000000041/).textContent ?? "";
+    expect(rawRows).toContain("(contract not statically checked)");
+    expect(rawRows).not.toContain("no required fields");
+    expect(rawRows).not.toContain("not applicable");
+    // The sink genuinely requires those fields — the surface must still say so.
+    expect(screen.getByText("Required fields: mapped, body")).toBeInTheDocument();
+    // …and the plain-language sibling keeps its own unchanged register.
+    expect(screen.getAllByText(/not yet checked/).length).toBeGreaterThan(0);
+  });
+
   it("renders the authoritative node policies, cardinality, fields, structured outputs, and business schema", () => {
     const nodes: WireStageData["nodes"] = [
       {
@@ -301,6 +373,7 @@ describe("WireStageTurn", () => {
           ],
           fork_branches: [{ routes: ["route-2"], branch: "branch-1" }],
         },
+        node_options_summary: [],
         required_fields: ["classification"],
         guaranteed_fields: [],
         row_cardinality: { input: "one", output: "one", expected_output_count: null },
@@ -319,6 +392,7 @@ describe("WireStageTurn", () => {
           output_mode: "transform",
           expected_output_count: "1",
         },
+        node_options_summary: [],
         required_fields: ["classification"],
         guaranteed_fields: ["count"],
         row_cardinality: { input: "batch", output: "expected_count", expected_output_count: "1" },
@@ -336,6 +410,7 @@ describe("WireStageTurn", () => {
           merge: "union",
           timeout_seconds: 7.25,
         },
+        node_options_summary: [],
         required_fields: [],
         guaranteed_fields: ["count"],
         row_cardinality: { input: "branches", output: "one_per_branch_set", expected_output_count: null },
@@ -399,6 +474,7 @@ describe("WireStageTurn", () => {
           policy: "require_all",
           timeout_seconds: 12.5,
         },
+        node_options_summary: [],
         required_fields: [],
         guaranteed_fields: ["variant"],
         row_cardinality: {
@@ -461,6 +537,7 @@ describe("WireStageTurn", () => {
           ],
           fork_branches: [{ routes: ["route-2"], branch: "branch-1" }],
         },
+        node_options_summary: [],
         required_fields: [],
         guaranteed_fields: [],
         row_cardinality: { input: "one", output: "one", expected_output_count: null },

@@ -71,6 +71,7 @@ from elspeth.web.composer.progress import (
 )
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
 from elspeth.web.composer.state import (
     CompositionState,
@@ -1590,6 +1591,15 @@ async def prepare_pipeline_plan(
 
     if policy_catalog.snapshot is not plugin_snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
+    # R2-F10: server-derived proposals (recipe router, guided sketch) never
+    # pass through a planner candidate_finalizer, so the required-control
+    # auto-wire pass runs here — BEFORE the pipeline is sealed into a proposal
+    # and its authority hash is computed. It cannot run any later: the commit
+    # path (pipeline_commit.prepare_pipeline_proposal_commit) re-executes the
+    # exact sealed arguments under the proposal's authority-hash binding, so a
+    # commit-time mutation would be an integrity violation by construction.
+    # The pass is idempotent — a covered pipeline passes through unchanged.
+    pipeline = wire_required_controls(pipeline, plugin_snapshot, policy_catalog)
     # Server-derived plans do not send this context to a provider, but accept
     # the same explicit authority split as the model-driven entry point.
     canonical_json(reviewed_planner_context)
@@ -2427,27 +2437,6 @@ async def _plan_pipeline_inner(
                 composer_provider=effective_provider,
             )
             try:
-                if (
-                    not is_hatch_turn
-                    and not nodeless_nudge_given
-                    and surface in (PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE)
-                    and supersedes_draft_hash is not None
-                    and _transform_node_count(finalized_pipeline) == 0
-                ):
-                    # Revision turn (a rejected draft is superseded — the
-                    # operator explicitly asked for changes) with zero
-                    # transform/aggregation nodes: tutorial op 1152d7e3
-                    # (2026-07-22) "converged" on exactly this shape after
-                    # blind repairs — a bare passthrough whose metadata still
-                    # claimed to scrape/summarize/clean. One coded nudge;
-                    # re-emitting the same nodeless pipeline is the escape
-                    # valve confirming deliberate pass-through intent (the
-                    # 9137456ad omit-valve pattern; bounded like
-                    # prose_nudges). Never fired on the hatch turn — the
-                    # hatch is one clean proposal or terminal, and a nudge
-                    # there guarantees failure.
-                    nodeless_nudge_given = True
-                    raise _PipelineCandidateRejected(_nodeless_revision_rejection(current_state))
                 if unproducible_output_fields and _transform_node_count(finalized_pipeline) == 0:
                     # R2-F4 (elspeth-6e311df389). The reviewed outputs declare
                     # fields no reviewed source declares or observes, and this
@@ -2466,9 +2455,46 @@ async def _plan_pipeline_inner(
                     # clears it in one turn. An identical re-emit draws the
                     # ordinary repeat notice through the shared fingerprint
                     # path rather than being waved through.
+                    #
+                    # ORDERING IS LOAD-BEARING (T1xT3, acceptance-r2 final
+                    # review): this guard must precede the nodeless-revision
+                    # nudge below. Both trigger on the same zero-transform
+                    # shape, but the nudge's omit-valve promises that an
+                    # unchanged re-emit "will be accepted" while this guard
+                    # rejects exactly that re-emit — two contradictory repair
+                    # instructions against a repair budget of 2 is a
+                    # guaranteed unrepairable path. Firing this guard first
+                    # gives the model ONE coherent instruction that names the
+                    # missing fields, and adding a transform clears both
+                    # guards' trigger in the same turn; the nudge's promise is
+                    # then only ever made when it is true.
                     raise _PipelineCandidateRejected(
                         _unproducible_output_fields_rejection(current_state, fields=unproducible_output_fields)
                     )
+                if (
+                    not is_hatch_turn
+                    and not nodeless_nudge_given
+                    and surface in (PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE)
+                    and supersedes_draft_hash is not None
+                    and _transform_node_count(finalized_pipeline) == 0
+                ):
+                    # Revision turn (a rejected draft is superseded — the
+                    # operator explicitly asked for changes) with zero
+                    # transform/aggregation nodes: tutorial op 1152d7e3
+                    # (2026-07-22) "converged" on exactly this shape after
+                    # blind repairs — a bare passthrough whose metadata still
+                    # claimed to scrape/summarize/clean. One coded nudge;
+                    # re-emitting the same nodeless pipeline is the escape
+                    # valve confirming deliberate pass-through intent (the
+                    # 9137456ad omit-valve pattern; bounded like
+                    # prose_nudges). Never fired on the hatch turn — the
+                    # hatch is one clean proposal or terminal, and a nudge
+                    # there guarantees failure. Only reachable when
+                    # ``unproducible_output_fields`` is empty — the
+                    # satisfiability guard above owns the zero-transform shape
+                    # otherwise (see its ordering note).
+                    nodeless_nudge_given = True
+                    raise _PipelineCandidateRejected(_nodeless_revision_rejection(current_state))
                 if not is_hatch_turn and not threshold_nudge_given and stated_threshold is not None:
                     # Stated-threshold fidelity (R2-F17, elspeth-5c0c09db31).
                     # The instruction named a comparison and no gate in the

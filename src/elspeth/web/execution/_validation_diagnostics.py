@@ -22,6 +22,7 @@ from elspeth.web.composer.state import (
     CompositionState,
     _coalesce_branch_connections,
     _coalesce_branch_names,
+    _parse_template_names,
     gate_condition_is_constant,
     gate_route_destinations,
 )
@@ -486,4 +487,74 @@ def _find_gate_fan_out_advisories(state: CompositionState) -> list[_GateFanOutFi
                 destinations=tuple(sorted(destinations)),
             )
         )
+    return findings
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticLLMPromptFinding:
+    """One llm transform node whose prompt_template interpolates no row data.
+
+    Attributes:
+        node_id: ID of the offending node.
+    """
+
+    node_id: str
+
+
+@observation_boundary(
+    tier=3,
+    source="composer-authored CompositionState node options (Tier-3, operator/LLM-supplied prompt_template)",
+    source_param="state",
+    suppresses=("R1",),
+    invariant="returns advisory findings; unparseable or absent templates are skipped, never raised on",
+)
+def _find_static_llm_prompt_advisories(state: CompositionState) -> list[_StaticLLMPromptFinding]:
+    """Detect llm transform nodes whose prompt_template references no row data.
+
+    A node is flagged iff ALL of the following hold:
+
+    1. ``node_type == "transform"`` and ``plugin == "llm"``.
+    2. ``options["queries"]`` is absent (single-prompt mode). Multi-query
+       nodes render each query's own per-query context
+       (``build_template_context`` in multi_query.py), so the node-level
+       ``prompt_template`` is out of scope here — the same ``queries is
+       None`` boundary ``_validate_prompt_template_variable_bindings`` uses.
+    3. ``options["prompt_template"]`` is a string that parses (after masking
+       ``{{interpretation:...}}`` placeholders, which resolve to
+       operator-accepted text upstream of rendering and are not Jinja2
+       names — same masking the sibling unbound-variable guard applies).
+    4. The parsed template's top-level names (``_parse_template_names``,
+       reused from ``composer/state.py`` rather than re-parsing) do not
+       include ``"row"``. This catches every access shape — ``row.field``,
+       ``row["field"]``, ``row[expr]``, and ``{% for x in row %}`` — because
+       any reference to ``row`` makes it an undeclared top-level name,
+       whether or not it resolves to a concrete field. A template with no
+       ``row`` reference renders byte-identical for every input row.
+
+    ``lookup.*``-only templates ARE flagged: ``PromptTemplate`` binds
+    ``lookup`` once at construction from static YAML data (see
+    ``plugins/transforms/llm/templates.py`` — "Static lookup data from YAML
+    file") and never re-binds it per row, so a lookup-only template is just
+    as static as a template with no interpolation at all.
+
+    Returns:
+        List of :class:`_StaticLLMPromptFinding`, one per detected node.
+        Empty when nothing was detected.
+    """
+    findings: list[_StaticLLMPromptFinding] = []
+    for node in state.nodes:
+        if node.node_type != "transform" or node.plugin != "llm":
+            continue
+        if node.options.get("queries") is not None:
+            continue
+        template = node.options.get("prompt_template")
+        if not isinstance(template, str):
+            continue
+        parsed = _parse_template_names(template)
+        if parsed is None:
+            continue
+        top_level_names, _row_fields = parsed
+        if "row" in top_level_names:
+            continue
+        findings.append(_StaticLLMPromptFinding(node_id=node.id))
     return findings

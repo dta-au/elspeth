@@ -3,9 +3,10 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
+import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
-import type { CompositionState } from "@/types/index";
+import type { CompositionState, NodeSpec, PluginSummary } from "@/types/index";
 import type { ReadinessRowId } from "@/types/api";
 
 /**
@@ -18,9 +19,16 @@ export const INTERPRETATION_PENDING_RUN_BLOCK_TITLE =
   "Resolve pending interpretation first.";
 
 /**
- * Transform plugins that reach the network during a run (page fetches and
- * external analysis services). Used only to phrase the pre-run disclosure —
- * which nodes appear is always derived from the actual pipeline config.
+ * Fallback transform plugins treated as network-reaching when the plugin
+ * catalog hasn't loaded yet (so `PluginSummary.audit_characteristics` isn't
+ * available to classify by). This set predates the catalog-driven check
+ * below and is Azure-only by history, not by design — it under-discloses
+ * the AWS externals (aws_textract_document_analysis,
+ * aws_bedrock_content_safety, aws_bedrock_prompt_shield, all backend-side
+ * `Determinism.EXTERNAL_CALL`) once R2-F7 (elspeth-27bc704359) surfaced the
+ * gap. Kept ONLY as the no-catalog fallback; whenever the catalog has
+ * loaded, `audit_characteristics` (below) is the sole source of truth so
+ * this list can never drift from the backend's own classification again.
  */
 const NETWORK_FETCH_PLUGINS = new Set([
   "web_scrape",
@@ -29,15 +37,83 @@ const NETWORK_FETCH_PLUGINS = new Set([
   "azure_document_intelligence",
 ]);
 
+/** True if `pluginName` is classified as reaching the network, per the
+ *  catalog's `audit_characteristics` for that transform.
+ *
+ *  Fail-open by design for a plugin name absent from a *loaded* catalog
+ *  (e.g. a saved composition referencing a plugin since renamed or
+ *  policy-revoked): `.some()` over no match returns `false`, so an
+ *  unrecognised plugin is silently treated as non-network rather than
+ *  flagged. This differs from the catalog-*failed-to-load* case in
+ *  `buildRunEgressSummary`, which surfaces an explicit uncertainty line
+ *  instead of guessing. A stale-but-present catalog entry is assumed
+ *  accurate; if that assumption stops holding (e.g. plugin renames
+ *  routinely leave orphaned references in saved compositions) this should
+ *  fail closed the same way the load-failure path does. */
+function catalogFlagsExternalCall(
+  pluginName: string,
+  catalogTransforms: readonly PluginSummary[],
+): boolean {
+  return catalogTransforms.some(
+    (summary) =>
+      summary.name === pluginName &&
+      summary.audit_characteristics.includes("external_call"),
+  );
+}
+
+/** True if `node` is already disclosed via the "Sends rows to the
+ *  configured LLM" line in `buildRunEgressSummary`. Used there to keep the
+ *  network-egress classification (and its catalog-load-failure uncertainty
+ *  note) from re-listing the same node under a second line.
+ *
+ *  Assumption this depends on: no `Determinism.EXTERNAL_CALL` transform
+ *  today declares a `model` option or has "llm" in its plugin name, so LLM
+ *  nodes and network-reaching transforms are disjoint sets. If a future
+ *  plugin is both (e.g. a hosted LLM-gateway transform also flagged
+ *  `external_call`), it would only ever appear on the LLM line, not the
+ *  network line or the load-failure uncertainty line below — revisit this
+ *  helper if that happens. */
+function isLlmNode(node: NodeSpec): boolean {
+  return (
+    typeof node.options?.model === "string" ||
+    (node.plugin ?? "").includes("llm")
+  );
+}
+
 /**
  * Derive the pre-run egress disclosure lines from the actual composition
  * (elspeth-c18ad229cc). Nothing here is hardcoded pipeline content: each
  * line names the configured components (sources, LLM nodes and their model
  * option, network-fetching transforms, output sinks) from the live
- * CompositionState. Exported for tests.
+ * CompositionState.
+ *
+ * `catalogTransforms` is the plugin catalog's transform list
+ * (`usePluginCatalogStore((s) => s.transforms)`), the same source of truth
+ * the audit-readiness `plugin_trust` row and
+ * `tests/unit/web/audit_readiness/test_boundary_predicate_parity.py` are
+ * pinned against (R2-F7, elspeth-27bc704359) — a transform is network-
+ * reaching here iff its backend-declared `audit_characteristics` contains
+ * `"external_call"`. `catalogTransforms === null` is ambiguous by itself —
+ * it means either "hasn't loaded yet" (transient; `catalogLoadFailed`
+ * false) or "failed to load" (`catalogLoadFailed` true, from
+ * `pluginCatalogStore.error`) — because the store resets `transforms` to
+ * `null` in both cases and only `error`/`isLoading` carry the
+ * discriminator. The two are handled differently:
+ *   - not yet loaded: silently fall back to the hardcoded
+ *     `NETWORK_FETCH_PLUGINS` set, same as before catalog-driven
+ *     classification existed — expected to resolve before the user reaches
+ *     this dialog.
+ *   - failed to load: still use the hardcoded set for the confident line,
+ *     but any other configured transform cannot be verified either way, so
+ *     it is named in an explicit uncertainty line rather than silently
+ *     assumed safe — the exact under-disclosure R2-F7 fixed must not
+ *     reappear whenever a catalog fetch errors.
+ * Exported for tests.
  */
 export function buildRunEgressSummary(
   compositionState: CompositionState | null,
+  catalogTransforms: readonly PluginSummary[] | null = null,
+  catalogLoadFailed = false,
 ): string[] {
   if (!compositionState) return [];
   const lines: string[] = [];
@@ -53,11 +129,7 @@ export function buildRunEgressSummary(
   // `?.` on options: display-only derivation that must tolerate partially
   // formed compositions mid-authoring rather than crash the Run button.
   const llmNodes = compositionState.nodes
-    .filter(
-      (node) =>
-        typeof node.options?.model === "string" ||
-        (node.plugin ?? "").includes("llm"),
-    )
+    .filter(isLlmNode)
     .map((node) =>
       typeof node.options?.model === "string"
         ? `${node.id} (model ${node.options.model})`
@@ -67,11 +139,51 @@ export function buildRunEgressSummary(
     lines.push(`Sends rows to the configured LLM: ${llmNodes.join(", ")}.`);
   }
 
-  const networkNodes = compositionState.nodes
-    .filter((node) => node.plugin !== null && NETWORK_FETCH_PLUGINS.has(node.plugin))
-    .map((node) => `${node.id} (${node.plugin})`);
+  let networkNodes: string[];
+  let unverifiableNodes: string[] = [];
+
+  if (catalogTransforms !== null) {
+    // Catalog loaded — audit_characteristics is authoritative.
+    networkNodes = compositionState.nodes
+      .filter(
+        (node) =>
+          node.plugin !== null &&
+          catalogFlagsExternalCall(node.plugin, catalogTransforms),
+      )
+      .map((node) => `${node.id} (${node.plugin})`);
+  } else if (catalogLoadFailed) {
+    // Catalog failed to load — the hardcoded set still yields a confident
+    // (if incomplete) line, but every other configured, non-LLM transform
+    // is genuinely unverifiable: silently omitting it here would reproduce
+    // R2-F7's under-disclosure, so it is named explicitly instead.
+    const nonLlmTransforms = compositionState.nodes.filter(
+      (node) => node.plugin !== null && !isLlmNode(node),
+    );
+    networkNodes = nonLlmTransforms
+      .filter((node) => NETWORK_FETCH_PLUGINS.has(node.plugin as string))
+      .map((node) => `${node.id} (${node.plugin})`);
+    unverifiableNodes = nonLlmTransforms
+      .filter((node) => !NETWORK_FETCH_PLUGINS.has(node.plugin as string))
+      .map((node) => `${node.id} (${node.plugin})`);
+  } else {
+    // Not loaded yet (transient) — same fallback behaviour as before
+    // catalog-driven classification existed.
+    networkNodes = compositionState.nodes
+      .filter(
+        (node) =>
+          node.plugin !== null && NETWORK_FETCH_PLUGINS.has(node.plugin),
+      )
+      .map((node) => `${node.id} (${node.plugin})`);
+  }
+
   if (networkNodes.length > 0) {
     lines.push(`Fetches over the network: ${networkNodes.join(", ")}.`);
+  }
+  if (unverifiableNodes.length > 0) {
+    lines.push(
+      `Plugin catalog unavailable — external-service effects could not be ` +
+        `fully enumerated for: ${unverifiableNodes.join(", ")}.`,
+    );
   }
 
   const outputs = compositionState.outputs.map(
@@ -242,6 +354,18 @@ export function ExecuteButton(): JSX.Element | null {
     return cached?.composition_version === compositionVersion ? cached : undefined;
   });
 
+  // R2-F7 (elspeth-27bc704359): the same catalog transforms list the
+  // audit-readiness panel reads, used below to classify network-egress
+  // lines in the pre-run disclosure by `audit_characteristics` rather than
+  // the Azure-only hardcoded fallback. `error` is read too: the store
+  // resets `transforms` to `null` on BOTH "not loaded yet" and "load
+  // failed", and only `error` distinguishes them — collapsing that
+  // distinction previously meant a catalog fetch failure silently and
+  // permanently fell back to the same under-disclosing hardcoded set R2-F7
+  // exists to fix (finding elspeth-27bc704359 follow-up).
+  const catalogTransforms = usePluginCatalogStore((s) => s.transforms);
+  const catalogLoadFailed = usePluginCatalogStore((s) => s.error !== null);
+
   const reactId = useId();
   const describedById = `${reactId}-run-block-reason`;
   const [showRunDisclosure, setShowRunDisclosure] = useState(false);
@@ -297,7 +421,11 @@ export function ExecuteButton(): JSX.Element | null {
     void execute(activeSessionId);
   }
 
-  const egressLines = buildRunEgressSummary(compositionState);
+  const egressLines = buildRunEgressSummary(
+    compositionState,
+    catalogTransforms,
+    catalogLoadFailed,
+  );
 
   return (
     <>

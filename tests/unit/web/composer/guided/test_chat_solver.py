@@ -425,7 +425,11 @@ async def test_management_solver_rejects_non_string_prose_without_private_repr_e
 
     assert private_canary not in str(raised.value)
     assert recorder.llm_calls[-1].status is ComposerLLMCallStatus.MALFORMED_RESPONSE
-    assert recorder.llm_calls[-1].error_class == "ValueError"
+    # GuidedToolArgumentShapeError since the R2-F15 pair-salvage fix (it IS a
+    # ValueError; the pytest.raises above still matches): the model replied
+    # and violated the argument contract — the precise class the shape-error
+    # channels already carry. The egress guarantees are unchanged.
+    assert recorder.llm_calls[-1].error_class == "GuidedToolArgumentShapeError"
     assert private_canary not in repr(recorder.llm_calls)
 
 
@@ -1193,6 +1197,126 @@ async def test_step_1_pair_with_shape_invalid_source_returns_retain_alone(monkey
         plugin_hint="json",
         current_source=None,
         available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
+
+
+@pytest.mark.asyncio
+async def test_step_1_pair_with_mistyped_on_validation_failure_returns_retain_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """R2-F15 residual (acceptance-r2 final review, must-fix 3): a pair whose
+    source half is valid EXCEPT for a non-string ``on_validation_failure``
+    must keep the parsed-valid retain. The mistyped-knob check used to raise a
+    bare ``ValueError`` where every sibling check raises
+    ``GuidedToolArgumentShapeError``, so the retain-alone salvage catch never
+    saw it: the intent was silently discarded and the turn mislabeled
+    SYNTHETIC_UNAVAILABLE instead of the scoped not-applied signal."""
+
+    async def mistyped_pair(**_kwargs: Any) -> _FakeLLMResponse:
+        tool_calls = [
+            SimpleNamespace(
+                id="c_source",
+                function=SimpleNamespace(
+                    name="resolve_source",
+                    arguments=json.dumps({**_PAIR_SOURCE_ARGUMENTS, "on_validation_failure": 5}),
+                ),
+            ),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", mistyped_pair)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Use these JSON rows, and later add the passthrough transform.",
+        plugin_hint="json",
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
+
+
+@pytest.mark.asyncio
+async def test_step_1_pair_with_non_string_assistant_message_returns_retain_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same salvage guarantee for the prose-assistant path: a non-string
+    ``assistant_message`` reaches ``_require_prose_assistant_message`` inside
+    the source parser and must surface as the shape-error type the retain-
+    alone catch handles, not a bare ``ValueError`` that discards the pair."""
+
+    async def mistyped_pair(**_kwargs: Any) -> _FakeLLMResponse:
+        tool_calls = [
+            SimpleNamespace(
+                id="c_source",
+                function=SimpleNamespace(
+                    name="resolve_source",
+                    arguments=json.dumps({**_PAIR_SOURCE_ARGUMENTS, "assistant_message": 42}),
+                ),
+            ),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", mistyped_pair)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Use these JSON rows, and later add the passthrough transform.",
+        plugin_hint="json",
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
+
+
+@pytest.mark.asyncio
+async def test_step_2_pair_with_non_string_assistant_message_returns_retain_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Step-2 mirror of the prose-assistant salvage: the sink parser's
+    ``assistant_message`` guard must raise the shape-error type so the pair's
+    valid retain survives a non-string value."""
+
+    async def mistyped_pair(**_kwargs: Any) -> _FakeLLMResponse:
+        tool_calls = [
+            SimpleNamespace(
+                id="c_sink",
+                function=SimpleNamespace(
+                    name="resolve_sink",
+                    arguments=json.dumps({**_PAIR_SINK_ARGUMENTS, "assistant_message": 42}),
+                ),
+            ),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", mistyped_pair)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save results as jsonl, and later add the passthrough transform.",
+        current_sink=None,
         temperature=None,
         seed=None,
         timeout_seconds=30.0,
@@ -2532,8 +2656,12 @@ def test_parse_empty_on_validation_failure_defaults_to_discard() -> None:
 
 
 def test_parse_non_string_on_validation_failure_raises() -> None:
-    """When the model sends a non-string value, reject at the Tier-3 boundary."""
-    with pytest.raises(ValueError, match="on_validation_failure must be a string"):
+    """When the model sends a non-string value, reject at the Tier-3 boundary.
+
+    The raise type is load-bearing (R2-F15 residual): it must be the shape-
+    error class the pair-salvage catches — a bare ValueError bypasses the
+    retain-alone path and discards a parsed-valid retained intent."""
+    with pytest.raises(chat_solver.GuidedToolArgumentShapeError, match="on_validation_failure must be a string"):
         _parse_step_1_source_tool_arguments(_source_tool_args(on_validation_failure=123), plugin_hint="json")
 
 

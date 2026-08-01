@@ -714,6 +714,33 @@ acceptance bucket, because without it S3 cannot distinguish a missing object
 from a forbidden one and returns `403` instead of `404`; the boundary grants
 the matching bucket-level resource.
 
+### Composer wall-clock budget
+
+The module pins `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` to `120` in
+`modules/scenario/locals.tf`. That is enough for the acceptance soak's
+single-source-and-sink request, but a real multi-node authoring turn (a dozen
+or more tool calls, each with validation and a runtime preflight) routinely
+runs past it. When the budget elapses the composer returns a discriminated
+`422` (`reason: convergence_wall_clock_timeout`); the pipeline built so far is
+saved as a new composition-state version and the next turn resumes from it, so
+nothing is lost — but the author pays a wasted turn.
+
+For deployments where operators author multi-node pipelines, raise the value in
+`modules/scenario/locals.tf` to `240`:
+
+```hcl
+{ name = "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS", value = "240" },
+```
+
+`270` is the hard ceiling — `WebSettings._validate_composer_timeout_transport_headroom`
+rejects anything above `composer_transport_idle_ceiling_seconds` (300s) minus
+`composer_transport_headroom_seconds` (30s), so the backend's own timeout always
+fires before a browser or proxy aborts the connection. The SPA derives its
+client abort ceiling from whatever value you set (via
+`GET /api/system/status`), so no frontend change is needed. Do not raise it
+above `240` without also confirming the ALB and any intermediary idle timeouts
+exceed the new value plus its headroom.
+
 Aurora creates one administrative database first, then the database bootstrap
 task creates independent `elspeth_session` and `elspeth_landscape` databases.
 Schema and runtime roles are separate; the runtime role does not own schemas.
@@ -924,3 +951,23 @@ bootstrap live outside every Terraform state, so no destroy removes them.
 After the bootstrap destroy succeeds — both destroys still need those
 policies — detach and delete all four through the same paths used to attach
 them.
+
+### Container Insights log-group orphan on redeploy (R2-D3, elspeth-a229c247a1)
+
+`module.scenario.aws_cloudwatch_log_group.container_insights` shares the
+exact name ECS's service-linked role auto-creates for the cluster's
+Container Insights performance metrics. That role re-creates the log group a
+few minutes after the cluster goes `INACTIVE` — its final flush — leaving an
+untagged orphan outside Terraform state. A same-namespace redeploy retry
+after a destroy can then hit `ResourceAlreadyExistsException` on
+`CreateLogGroup`. A `depends_on` ordering fix cannot help; the collision
+happens after destroy completes, not during create.
+
+Delete the orphan once the flush has had time to land
+(`aws logs delete-log-group --log-group-name
+/aws/ecs/containerinsights/<cluster-name>/performance`, tolerant of
+`ResourceNotFoundException`) — see the cold-install runbook's Teardown
+section. If a retry still collides, set `-var=adopt_container_insights_log_group=true`
+on that apply instead: both roots declare the variable (default `false`) and
+gate an `import` block on it that formally adopts the orphan into state
+rather than deleting it.

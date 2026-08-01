@@ -349,21 +349,36 @@ class TestStep3DiscoveryTierMigration:
     def test_list_sources(self) -> None:
         assert self._get("list_sources") == {
             "name": "list_sources",
-            "description": "List available source plugins with name and summary.",
+            "description": (
+                "List available source plugins with name and summary. The result's "
+                "`prohibited` array names any source categorically banned from the web "
+                "authoring surface by security policy, with its closed reason and "
+                "explanation — cite it when a user asks why a specific plugin is unavailable."
+            ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
     def test_list_transforms(self) -> None:
         assert self._get("list_transforms") == {
             "name": "list_transforms",
-            "description": "List available transform plugins with name and summary.",
+            "description": (
+                "List available transform plugins with name and summary. The result's "
+                "`prohibited` array names any transform categorically banned from the web "
+                "authoring surface by security policy, with its closed reason and "
+                "explanation — cite it when a user asks why a specific plugin is unavailable."
+            ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 
     def test_list_sinks(self) -> None:
         assert self._get("list_sinks") == {
             "name": "list_sinks",
-            "description": "List available sink plugins with name and summary.",
+            "description": (
+                "List available sink plugins with name and summary. The result's "
+                "`prohibited` array names any sink categorically banned from the web "
+                "authoring surface by security policy, with its closed reason and "
+                "explanation — cite it when a user asks why a specific plugin is unavailable."
+            ),
             "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
         }
 

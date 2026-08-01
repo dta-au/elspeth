@@ -58,6 +58,7 @@ from elspeth.web.execution._validation_diagnostics import (
     _edge_patch_target_for_node_id,
     _find_gate_fan_out_advisories,
     _find_identity_node_advisories,
+    _find_static_llm_prompt_advisories,
     _format_edge_contract_message,
     _graph_warning_to_validation_warning,
     _reframe_settings_missing_parts,
@@ -80,6 +81,7 @@ from elspeth.web.execution._validation_pipeline import ValidationDependencies, V
 from elspeth.web.execution._validation_runtime import (
     build_gate_fan_out_advisory_checks,
     build_identity_advisory_checks,
+    build_static_llm_prompt_advisory_checks,
     load_runtime_settings,
     validate_graph_structure,
     validate_route_targets,
@@ -100,6 +102,7 @@ from elspeth.web.execution.schemas import (
     CHECK_GATE_FAN_OUT_ADVISORY,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
     CHECK_SETTINGS,
+    CHECK_STATIC_LLM_PROMPT_ADVISORY,
     CHECK_VALUE_SOURCE_COMPLIANCE,
     VALIDATION_BLOCKING_CHECK_NAMES,
     ValidationCheck,
@@ -121,6 +124,10 @@ assert RUNTIME_GRAPH_VALIDATION_CHECKS == (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_
 # Non-blocking, happy-path-only advisory. It deliberately stays outside the
 # canonical blocking list and is retained here as a compatibility import seam.
 _CHECK_GATE_FAN_OUT_ADVISORY = CHECK_GATE_FAN_OUT_ADVISORY
+
+# Third advisory, same non-blocking contract as the two above: flags an llm
+# transform node whose prompt_template interpolates no row data (elspeth-6bdb7e7736).
+_CHECK_STATIC_LLM_PROMPT_ADVISORY = CHECK_STATIC_LLM_PROMPT_ADVISORY
 
 
 def _execution_ready() -> ValidationReadiness:
@@ -498,6 +505,11 @@ def _validate_pipeline_impl(
     for advisory in build_gate_fan_out_advisory_checks(
         schema_validated,
         find_gate_fan_out_advisories=_find_gate_fan_out_advisories,
+    ):
+        ledger.record_advisory(advisory)
+    for advisory in build_static_llm_prompt_advisory_checks(
+        schema_validated,
+        find_static_llm_prompt_advisories=_find_static_llm_prompt_advisories,
     ):
         ledger.record_advisory(advisory)
 

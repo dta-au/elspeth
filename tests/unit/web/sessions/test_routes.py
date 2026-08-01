@@ -5651,6 +5651,90 @@ class TestRecomposeConvergencePartialState:
                 "re-introduce the elspeth-5030f7373d split-brain symptom at a different layer."
             )
 
+    def test_wall_clock_timeout_body_carries_turn_context_and_the_elapsed_budget(self, tmp_path) -> None:
+        """R2-F9 (elspeth-114dd261bc): the timeout 422 must be self-sufficient.
+
+        The handler already persists the salvaged partial pipeline, but the
+        body used to describe the failure as "within 0 turns" with no
+        ``failed_turn`` (which is what the SPA's RecoveryPanel gates on) and
+        no way for the SPA to name the budget that actually elapsed. All
+        three now ride the same body.
+        """
+        from elspeth.contracts.errors import FailedTurnMetadata
+        from elspeth.web.composer.protocol import ComposerConvergenceError
+
+        partial = CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=2,
+        )
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerConvergenceError(
+                max_turns=4,
+                budget_exhausted="timeout",
+                partial_state=partial,
+                failed_turn=FailedTurnMetadata(
+                    assistant_message_id=None,
+                    tool_calls_attempted=3,
+                    tool_responses_persisted=3,
+                ),
+            ),
+        )
+
+        app, _service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        session_id = client.post("/api/sessions", json={"title": "timeout"}).json()["id"]
+        response = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "Build me a pipeline"},
+        )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert detail["reason"] == "convergence_wall_clock_timeout"
+        assert detail["turns_used"] == 4, "the body must report the turns actually spent, not 0"
+        assert detail["failed_turn"]["tool_calls_attempted"] == 3
+        # _make_app pins composer_timeout_seconds=85.0; the SPA needs the
+        # server-authoritative budget to name it honestly in the error copy.
+        assert detail["timeout_seconds"] == 85.0
+        assert "partial_state" in detail
+
+    def test_budget_convergence_body_omits_the_timeout_budget(self, tmp_path) -> None:
+        """``timeout_seconds`` is meaningless for the two turn-budget causes."""
+        from elspeth.web.composer.protocol import ComposerConvergenceError
+
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerConvergenceError(
+                max_turns=15,
+                budget_exhausted="composition",
+                partial_state=None,
+            ),
+        )
+
+        app, _service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        session_id = client.post("/api/sessions", json={"title": "budget"}).json()["id"]
+        response = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "Build me a pipeline"},
+        )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert detail["reason"] == "convergence_composition_budget"
+        assert "timeout_seconds" not in detail
+
     def test_convergence_redacts_blob_path_from_response_but_preserves_in_db(self, tmp_path) -> None:
         """When partial_state has a blob-backed source, the HTTP response must
         redact the internal storage path while the DB copy retains it."""
@@ -5879,6 +5963,88 @@ class TestRecomposeConvergencePartialState:
         assert detail["partial_state_save_failed"] is True
         # The diagnostic field carries ONLY the exception class name.
         assert detail.get("partial_state_save_error") == "OperationalError"
+
+    def test_convergence_body_does_not_disclose_blob_storage_path(self, tmp_path) -> None:
+        """elspeth-b5180a9630 (R2-F11): the 422 body must not carry a blob's
+        internal storage path.
+
+        ``partial_state`` is ``_state_response(...)``, whose ``sources`` view is
+        redacted by ``redact_source_storage_path``. But the same absolute path
+        was ALSO flattened verbatim into
+        ``composer_meta.implicit_decisions.entries[].value`` at write time by
+        ``merge_implicit_decisions_meta``, downstream of that projection and
+        outside the guided-only ``private_path_projections`` pass. The leak is
+        not 422-specific — every state response for a freeform blob-backed
+        source carried it — but the 422 is the widest reachable surface, so it
+        is the regression anchor.
+
+        Canary: a synthetic segment inside a blobs-root-shaped path. Its
+        presence anywhere in the serialised body is the leak.
+        """
+        import asyncio
+
+        from elspeth.contracts.freeze import deep_freeze
+        from elspeth.web.composer.protocol import ComposerConvergenceError
+
+        blob_ref = "3c9f1e27-8a4d-4b6f-9e21-7d5c0a8b6f34"
+        path_canary = "__CANARY_BLOB_STORAGE_PATH_SEGMENT__"
+        storage_path = f"/var/lib/elspeth/blobs/{blob_ref}/{path_canary}.csv"
+
+        partial = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                options=deep_freeze(
+                    {
+                        "blob_ref": blob_ref,
+                        "path": storage_path,
+                        "schema": {"mode": "fixed", "fields": ["url: str"]},
+                    }
+                ),
+                on_success="rows",
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=2,
+        )
+
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerConvergenceError(
+                max_turns=5,
+                budget_exhausted="composition",
+                partial_state=partial,
+            ),
+        )
+
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post("/api/sessions", json={"title": "Blob leak"})
+        session_id = resp.json()["id"]
+
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(
+            service.add_message(uuid.UUID(session_id), "user", "Summarise my upload", writer_principal="route_user_message")
+        )
+        loop.close()
+
+        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose")
+
+        assert recompose_resp.status_code == 422, recompose_resp.text
+        body_text = json.dumps(recompose_resp.json())
+        assert path_canary not in body_text, "blob storage path leaked into the convergence 422 body"
+        assert "/var/lib/elspeth/blobs/" not in body_text, "blob storage root leaked into the convergence 422 body"
+
+        # Positive contract: the disclosure entry still exists and names the
+        # blob by its wire sentinel, so the report stays auditable.
+        entries = recompose_resp.json()["detail"]["partial_state"]["composer_meta"]["implicit_decisions"]["entries"]
+        by_path = {entry["path"]: entry for entry in entries}
+        assert by_path["source.path"]["value"] == f"blob:{blob_ref}"
 
     def test_send_message_convergence_threads_user_id_to_preflight(self, tmp_path) -> None:
         """I3 regression: _handle_convergence_error MUST pass the authenticated
@@ -8563,9 +8729,14 @@ class TestRunAlreadyActiveError:
             request,
             exc: RunAlreadyActiveError,
         ) -> JSONResponse:
+            # Mirrors ``create_app``'s handler, including ``request_id``.
             return JSONResponse(
                 status_code=409,
-                content={"detail": str(exc), "error_type": "run_already_active"},
+                content={
+                    "detail": str(exc),
+                    "error_type": "run_already_active",
+                    "request_id": getattr(getattr(request, "state", None), "request_id", None),
+                },
             )
 
         # Add a test endpoint that triggers the error
@@ -8579,6 +8750,8 @@ class TestRunAlreadyActiveError:
         body = resp.json()
         assert body["error_type"] == "run_already_active"
         assert "detail" in body
+        # R2-F16b: the envelope correlates to the response's X-Request-ID.
+        assert "request_id" in body
 
 
 class TestNewStateHasNoLineage:

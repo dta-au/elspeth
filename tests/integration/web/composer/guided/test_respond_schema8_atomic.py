@@ -1690,6 +1690,9 @@ def test_settlement_failure_rolls_back_state_and_evidence_and_returns_only_safe_
     assert failure_log["exc_class"] == failure_type.__name__
     assert failure_log["site"] == "post_guided_respond"
     assert failure_log["frames"]
+    # R2-F16b: the correlation field is always emitted (None here — this app
+    # carries no RequestIdMiddleware).
+    assert "request_id" in failure_log
     assert secret_canary not in repr(logs)
     assert asyncio.run(service.get_state_versions(UUID(session_id))) == []
     assert asyncio.run(service.get_messages(UUID(session_id), limit=None)) == []

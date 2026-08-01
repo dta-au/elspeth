@@ -147,6 +147,7 @@ function payload(): ProposePipelinePayload {
             { routes: ["route-1"], branch: "branch-2" },
           ],
         },
+        node_options_summary: [],
       },
       {
         stable_id: IDS.queue,
@@ -154,6 +155,7 @@ function payload(): ProposePipelinePayload {
         node_type: "queue",
         plugin: null,
         behavior: { kind: "queue" },
+        node_options_summary: [],
       },
       {
         stable_id: IDS.aggregation,
@@ -168,6 +170,7 @@ function payload(): ProposePipelinePayload {
           output_mode: "passthrough",
           expected_output_count: "2",
         },
+        node_options_summary: [],
       },
       {
         stable_id: IDS.coalesce,
@@ -181,6 +184,7 @@ function payload(): ProposePipelinePayload {
           merge: "nested",
           timeout_seconds: 12.5,
         },
+        node_options_summary: [],
       },
     ],
     outputs: [
@@ -250,6 +254,47 @@ describe("ProposePipelineTurn", () => {
     expect(screen.getByText("output-2 · csv")).toBeVisible();
   });
 
+  it("renders the key transform options beside the behavior discriminant", () => {
+    // R2-F3: every transform read as "Transforms each incoming item.", so a
+    // field_mapper's renames and its drop-the-rest projection were invisible
+    // on the card the operator accepts.
+    const base = payload();
+    const mapperPayload: ProposePipelinePayload = {
+      ...base,
+      component_counts: { sources: 0, nodes: 1, edges: 0, outputs: 0 },
+      graph: { sources: [], edges: [] },
+      nodes: [
+        {
+          stable_id: IDS.aggregation,
+          label: "node-1",
+          node_type: "transform",
+          plugin: { kind: "transform", id: "field_mapper" },
+          behavior: { kind: "transform" },
+          node_options_summary: [
+            { key: "mapping", value: "given_name → first_name, meta.source → origin" },
+            { key: "select_only", value: "only the mapped fields are kept" },
+          ],
+        },
+      ],
+      outputs: [],
+      edit_targets: [],
+    };
+
+    render(
+      <ProposePipelineTurn
+        payload={mapperPayload}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/Transforms each incoming item\./)).toBeVisible();
+    expect(
+      screen.getByText("Mapping: given_name → first_name, meta.source → origin"),
+    ).toBeVisible();
+    expect(screen.getByText("Select only: only the mapped fields are kept")).toBeVisible();
+  });
+
   it("renders row_union as a distinct N-to-N barrier with its own success flow and honest copy", () => {
     const rowUnionPayload = payload();
     rowUnionPayload.nodes[3] = {
@@ -261,6 +306,7 @@ describe("ProposePipelineTurn", () => {
         policy: "require_all",
         timeout_seconds: 12.5,
       },
+      node_options_summary: [],
     };
     rowUnionPayload.graph.edges[10] = {
       ...rowUnionPayload.graph.edges[10],
@@ -306,6 +352,7 @@ describe("ProposePipelineTurn", () => {
         policy: "require_all",
         timeout_seconds: null,
       },
+      node_options_summary: [],
     };
     rowUnionPayload.graph.edges[5] = {
       ...rowUnionPayload.graph.edges[5],

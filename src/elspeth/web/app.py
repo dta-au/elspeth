@@ -19,7 +19,8 @@ from uuid import UUID
 
 import httpx
 import structlog
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler as fastapi_http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -30,6 +31,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
@@ -985,7 +987,7 @@ def _create_app(
         )
 
     @app.exception_handler(CorruptPreferencesError)
-    async def _corrupt_preferences_error_handler(_request: Request, exc: CorruptPreferencesError) -> JSONResponse:
+    async def _corrupt_preferences_error_handler(request: Request, exc: CorruptPreferencesError) -> JSONResponse:
         # Named Tier-1 read-guard exception from
         # ``preferences/service.py`` — a stored composer-preferences row
         # violates a closed-list invariant (default_composer_mode outside
@@ -1007,6 +1009,12 @@ def _create_app(
         # and must not echo to the client. Same redaction pattern as
         # ``_audit_integrity_error_handler`` and
         # ``_audit_access_log_write_error_handler``.
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
         return JSONResponse(
             status_code=500,
             content={
@@ -1014,11 +1022,12 @@ def _create_app(
                 "detail": "Saved preferences are corrupt; the composer is using defaults.",
                 "field_name": exc.field_name,
                 "user_id": exc.user_id,
+                "request_id": _correlation_id(request),
             },
         )
 
     @app.exception_handler(AuditStoryIntegrityError)
-    async def _audit_story_integrity_error_handler(_request: Request, exc: AuditStoryIntegrityError) -> JSONResponse:
+    async def _audit_story_integrity_error_handler(request: Request, exc: AuditStoryIntegrityError) -> JSONResponse:
         # Sibling shape to ``_audit_integrity_error_handler`` above. The
         # named-type discriminator was getting flattened to bare
         # ``RuntimeError`` at the route boundary (sessions/routes.py),
@@ -1027,16 +1036,23 @@ def _create_app(
         # code switches on. The route's wrap was removed in the same
         # change that registered this handler; both halves of the fix are
         # load-bearing.
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
         return JSONResponse(
             status_code=500,
             content={
                 "error_type": "audit_story_integrity_error",
                 "detail": str(exc),
+                "request_id": _correlation_id(request),
             },
         )
 
     @app.exception_handler(AuditStoryNotRecordedError)
-    async def _audit_story_not_recorded_error_handler(_request: Request, _exc: AuditStoryNotRecordedError) -> JSONResponse:
+    async def _audit_story_not_recorded_error_handler(request: Request, _exc: AuditStoryNotRecordedError) -> JSONResponse:
         # Absent-state sibling of ``_audit_story_integrity_error_handler``
         # above: the run exists but no audit story was ever recorded for it
         # (today only the tutorial projection writes the audit-story columns,
@@ -1044,31 +1060,52 @@ def _create_app(
         # 404 with a stable machine code; the detail is fixed plain language —
         # the internal exception text (which names Landscape run ids) is
         # deliberately not echoed.
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
         return JSONResponse(
             status_code=404,
             content={
                 "error_type": "audit_story_not_recorded",
                 "detail": "No audit story was recorded for this run.",
+                "request_id": _correlation_id(request),
             },
         )
 
     @app.exception_handler(StaleComposeStateError)
-    async def _stale_compose_state_error_handler(_request: Request, _exc: StaleComposeStateError) -> JSONResponse:
+    async def _stale_compose_state_error_handler(request: Request, _exc: StaleComposeStateError) -> JSONResponse:
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
         return JSONResponse(
             status_code=409,
             content={
                 "error_type": "stale_compose_state",
                 "detail": "The session changed while the compose turn was running.",
+                "request_id": _correlation_id(request),
             },
         )
 
     @app.exception_handler(AuditAccessLogWriteError)
-    async def _audit_access_log_write_error_handler(_request: Request, _exc: AuditAccessLogWriteError) -> JSONResponse:
+    async def _audit_access_log_write_error_handler(request: Request, _exc: AuditAccessLogWriteError) -> JSONResponse:
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
         return JSONResponse(
             status_code=500,
             content={
                 "error_type": "audit_access_log_write_failed",
                 "detail": "Audit-grade transcript access could not be recorded; no audit-grade data returned.",
+                "request_id": _correlation_id(request),
             },
         )
 
@@ -1368,9 +1405,15 @@ def _create_app(
         request: Request,
         exc: RunAlreadyActiveError,
     ) -> JSONResponse:
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
         return JSONResponse(
             status_code=409,
-            content={"detail": str(exc), "error_type": "run_already_active"},
+            content={"detail": str(exc), "error_type": "run_already_active", "request_id": _correlation_id(request)},
         )
 
     # --- Secret-subsystem typed error translation ---
@@ -1410,6 +1453,22 @@ def _create_app(
         sentinel. Mirrors the direct read in ``web/auth/audit.py``.
         """
         request_id: str = request.state.request_id
+        return request_id
+
+    def _correlation_id(request: Request) -> str | None:
+        """Lenient sibling of :func:`_request_id` for the direct-render handlers.
+
+        Same value, weaker contract. ``_request_id`` is used where a missing
+        id would mean the middleware contract is broken *on a path that
+        already reached a route*. The handlers that call this one render a
+        ``JSONResponse`` directly and are the last line of defence for a
+        request that has already failed: raising ``AttributeError`` while
+        gathering a correlation field would replace a well-classified,
+        redacted error body with an uncorrelated bare 500 — strictly worse
+        for the operator this field exists to serve. A None here is honest
+        ("no middleware stamped an id"), not fabricated.
+        """
+        request_id: str | None = getattr(getattr(request, "state", None), "request_id", None)
         return request_id
 
     @app.exception_handler(FingerprintKeyMissingError)
@@ -1529,6 +1588,45 @@ def _create_app(
     ) -> JSONResponse:
         safe_errors = [{k: v for k, v in error.items() if k in _SAFE_VALIDATION_ERROR_KEYS} for error in exc.errors()]
         return JSONResponse(status_code=422, content={"detail": safe_errors})
+
+    # --- request_id on every structured error envelope (all routes) ---
+    # ``RequestIdMiddleware`` stamps ``X-Request-ID`` on every response and
+    # the named-exception handlers above put the same id in their bodies —
+    # but the guided routes consume their terminal exception in-route
+    # (settling the operation first) and re-raise a CLOSED ``HTTPException``
+    # via ``raise_guided_operation_failure``. Those envelopes reached the
+    # client through FastAPI's default renderer, which knows nothing about
+    # the correlation id, so the header a user could quote back correlated
+    # to nothing (R2-F16b).
+    #
+    # Fixing that at the ~40 dict-detail raise sites would regress the first
+    # time a new one is added, so the injection lives at the ONE boundary
+    # every ``HTTPException`` already passes through. It is registered
+    # against ``starlette.exceptions.HTTPException`` — the same key FastAPI's
+    # ``setup()`` uses — so this REPLACES the default renderer rather than
+    # forking the boundary in two; registering against ``fastapi``'s
+    # subclass instead would leave router-raised 404s on the old path.
+    # Rendering itself is still delegated to FastAPI's handler, which owns
+    # the bodiless-status (204/304) and ``headers`` behaviour.
+    #
+    # Only dict details are touched. A bare ``detail="..."`` string is a
+    # plain-language message, not an envelope; wrapping it would change the
+    # response contract of every string raise site in the app.
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
+        # Starlette narrows ``detail`` to ``str``; FastAPI's subclass widens it
+        # to ``Any`` and every structured envelope in this app is a dict raised
+        # through that subclass. Read it as ``object`` so the discrimination
+        # below is a real runtime check rather than statically dead code.
+        detail: object = exc.detail
+        if not isinstance(detail, dict) or "request_id" in detail:
+            return await fastapi_http_exception_handler(request, exc)
+        correlated = HTTPException(
+            status_code=exc.status_code,
+            detail={**detail, "request_id": _request_id(request)},
+            headers=exc.headers,
+        )
+        return await fastapi_http_exception_handler(request, correlated)
 
     @app.get("/api/health")
     async def health() -> dict[str, str]:

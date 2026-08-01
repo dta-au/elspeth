@@ -33,6 +33,7 @@ from elspeth.web.execution.schemas import (
     CHECK_IDENTITY_NODE_ADVISORY,
     CHECK_ROUTE_TARGETS,
     CHECK_SETTINGS,
+    CHECK_STATIC_LLM_PROMPT_ADVISORY,
     CHECK_VALUE_SOURCE_COMPLIANCE,
     RUNTIME_CHECK_GRAPH_STRUCTURE,
     RUNTIME_CHECK_PLUGIN_INSTANTIATION,
@@ -48,7 +49,12 @@ from elspeth.web.execution.schemas import (
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 if TYPE_CHECKING:
-    from elspeth.web.execution._validation_diagnostics import _EdgePatchTarget, _GateFanOutFinding, _IdentityFinding
+    from elspeth.web.execution._validation_diagnostics import (
+        _EdgePatchTarget,
+        _GateFanOutFinding,
+        _IdentityFinding,
+        _StaticLLMPromptFinding,
+    )
 
 
 class _YamlLoader(Protocol):
@@ -111,6 +117,10 @@ class _IdentityFinder(Protocol):
 
 class _GateFanOutFinder(Protocol):
     def __call__(self, state: CompositionState) -> Sequence[_GateFanOutFinding]: ...
+
+
+class _StaticLLMPromptFinder(Protocol):
+    def __call__(self, state: CompositionState) -> Sequence[_StaticLLMPromptFinding]: ...
 
 
 def _blocked_readiness(
@@ -561,6 +571,40 @@ def build_gate_fan_out_advisory_checks(
                     "replace the condition with the rule that decides between them (for example "
                     "\"row['amount'] > 500\") and point the 'true' and 'false' routes at "
                     "different destinations."
+                ),
+                affected_nodes=(finding.node_id,),
+            )
+        )
+    return tuple(checks)
+
+
+def build_static_llm_prompt_advisory_checks(
+    graphed: GraphedRuntime,
+    *,
+    find_static_llm_prompt_advisories: _StaticLLMPromptFinder,
+) -> tuple[ValidationCheck, ...]:
+    """Build non-blocking static-prompt llm advisories after validation.
+
+    Same happy-path-only contract as the identity and gate fan-out advisories.
+    Operator direction (elspeth-6bdb7e7736): a static-prompt llm transform is
+    essentially a *source* shape (generating rows) mis-declared as a
+    transform, and an llm source plugin kind may exist in future — so this
+    never escalates to a rejection, now or later.
+    """
+    policy_state = graphed.instantiated.loaded.materialized.authored.policy.state
+    checks: list[ValidationCheck] = []
+    for finding in find_static_llm_prompt_advisories(policy_state):
+        checks.append(
+            _check(
+                CHECK_STATIC_LLM_PROMPT_ADVISORY,
+                passed=True,
+                detail=(
+                    f"Node '{finding.node_id}' has a prompt_template that interpolates no row "
+                    "data, so every row receives an identical prompt to the model — one call would do the "
+                    "same work as looping over every row. If the intent is transformation, add a 'row.*' "
+                    "reference so each row's prompt reflects its own data. If the intent is generation "
+                    "(producing rows from a fixed prompt, not transforming existing ones), that is a "
+                    "source-shaped need the 'llm' transform kind cannot express today."
                 ),
                 affected_nodes=(finding.node_id,),
             )

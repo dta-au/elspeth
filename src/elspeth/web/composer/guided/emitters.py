@@ -52,6 +52,7 @@ from elspeth.web.composer.guided.protocol import (
     _WireSchemaField,
     _WireSourceReview,
     _WireStructuredOutputField,
+    node_options_summary,
 )
 from elspeth.web.composer.guided.stage_transitions import source_plugin_accepts_blob_inspection
 from elspeth.web.composer.tools._common import _semantic_contracts_payload
@@ -711,6 +712,10 @@ def _build_wire_projection(
             "guaranteed_fields": fields_for(public["stable_id"], produced=True),
             "row_cardinality": _node_cardinality(node, executable_nodes[node.id]),
             "structured_output_fields": _structured_output_fields(node.options) if node.plugin == "llm" else [],
+            # Derived from the same authored options the proposal projection
+            # reads, so the two review surfaces cannot disagree about what a
+            # node does (R2-F3).
+            "node_options_summary": node_options_summary(node.plugin, node.options),
         }
         for public, node in zip(public_nodes, state.nodes, strict=True)
     ]

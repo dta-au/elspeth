@@ -170,11 +170,18 @@ export function ProgressView() {
         />
       )}
 
-      {/* Progress bar -- indeterminate mode (no percentage, animated stripe) */}
+      {/* Progress bar -- indeterminate mode (no percentage, animated stripe).
+          R2-F5 (elspeth-139a345050): role="progressbar" and the "in
+          progress" label previously stayed on this element in EVERY state,
+          including terminal ones, so a finished run still claimed (visually
+          and to assistive tech) to be in progress. The colored strip below
+          stays for terminal states (intentional per the colour mapping
+          comment) but the progressbar semantics only apply while the run is
+          actually running. */}
       <div
         className="progress-bar progress-bar-outer"
-        role="progressbar"
-        aria-label="Pipeline execution in progress"
+        role={isTerminal ? undefined : "progressbar"}
+        aria-label={isTerminal ? undefined : "Pipeline execution in progress"}
       >
         <div
           className={isTerminal ? "progress-bar-complete" : "progress-bar-stripe"}
@@ -202,6 +209,13 @@ export function ProgressView() {
           }
         />
       </div>
+
+      {/* R2-F5: mid-run counters read as a settled final tally without an
+          in-progress affordance — this caption makes clear the numbers
+          below are a running total, not a finished result. */}
+      {!isTerminal && (
+        <div className="progress-counters-caption">Running — counts so far</div>
+      )}
 
       {/* Source/token counters -- large and prominent */}
       <div className="progress-counters">

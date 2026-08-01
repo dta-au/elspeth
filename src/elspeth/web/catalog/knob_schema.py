@@ -51,6 +51,9 @@ class VisibilityPredicate(TypedDict):
     equals: Any
 
 
+_PREDICATE_KEYS: frozenset[str] = frozenset({"field", "equals"})
+
+
 class KnobField(TypedDict):
     name: str
     label: str
@@ -65,6 +68,18 @@ class KnobField(TypedDict):
     item_kind: NotRequired[Literal["text", "number-int", "number-float"]]
     item_schema: NotRequired[KnobSchema]
     visible_when: NotRequired[VisibilityPredicate]
+    # Conditional requiredness. ``required`` carries pydantic's field-level
+    # requiredness, which is the only requiredness the model itself knows.
+    # Some fields are additionally required by a rule the COMPOSER owns and the
+    # model does not: a local file sink's ``collision_policy`` is
+    # ``default=None`` (YAML may omit it) yet
+    # ``validate_composer_file_sink_collision_policy`` rejects a runnable file
+    # sink that omits it under ``mode='write'``. Without this predicate the form
+    # reports the knob optional and lets the user press Continue into a
+    # guaranteed rejection (R2-F2). ``required_when`` is additive: a field is
+    # required when ``required`` is true OR the predicate holds against current
+    # form state.
+    required_when: NotRequired[VisibilityPredicate]
 
 
 class KnobSchema(TypedDict):
@@ -184,6 +199,7 @@ def _base_field(
         field["placeholder"] = placeholder
     _attach_default(field, info)
     _attach_tier(field, info)
+    _attach_required_when(field, info)
     return field
 
 
@@ -341,6 +357,31 @@ def _attach_tier(field: KnobField, info: FieldInfo) -> None:
     tier = extra["composer_tier"]
     if tier in ("essential", "common", "advanced"):
         field["tier"] = cast(FieldTier, tier)
+
+
+def _attach_required_when(field: KnobField, info: FieldInfo) -> None:
+    """Attach the composer-owned conditional-requiredness predicate, if declared.
+
+    Absence is the no-op. A present-but-malformed value is a mistake in a plugin
+    model we author (``KnobSchema`` is Tier 1), so it raises at catalog load
+    rather than silently shipping a form that under-gates a knob the composer
+    will reject — the exact failure this predicate exists to prevent. The
+    membership-then-index shape mirrors ``_attach_tier`` / ``_is_composer_hidden``.
+    """
+    extra = info.json_schema_extra
+    if type(extra) is not dict:
+        return
+    if "composer_required_when" not in extra:
+        return
+    predicate = extra["composer_required_when"]
+    if not isinstance(predicate, Mapping) or frozenset(predicate) != _PREDICATE_KEYS:
+        raise TypeError(
+            f"json_schema_extra['composer_required_when'] must be a mapping with keys {sorted(_PREDICATE_KEYS)}, got {predicate!r}"
+        )
+    target = predicate["field"]
+    if type(target) is not str or not target:
+        raise TypeError(f"json_schema_extra['composer_required_when']['field'] must be a non-empty str, got {target!r}")
+    field["required_when"] = {"field": target, "equals": predicate["equals"]}
 
 
 def lower_model_to_knob_schema(
@@ -516,9 +557,6 @@ def lower_discriminated_to_knob_schema(
     return {"fields": fields}
 
 
-_PREDICATE_KEYS: frozenset[str] = frozenset({"field", "equals"})
-
-
 def validate_knob_schema(
     schema: KnobSchema,
     *,
@@ -531,6 +569,7 @@ def validate_knob_schema(
     visibility_gated: set[str] = set()
 
     for field in schema["fields"]:
+        _validate_required_when(field, all_names, plugin_kind=plugin_kind, plugin_name=plugin_name)
         if "visible_when" not in field:
             seen_so_far.add(field["name"])
             continue
@@ -575,3 +614,60 @@ def validate_knob_schema(
 
         visibility_gated.add(field["name"])
         seen_so_far.add(field["name"])
+
+
+def _validate_required_when(
+    field: KnobField,
+    all_names: list[str],
+    *,
+    plugin_kind: str,
+    plugin_name: str,
+) -> None:
+    """Validate a ``required_when`` predicate.
+
+    Deliberately WEAKER than the ``visible_when`` rules above, and the
+    difference is load-bearing. ``visible_when`` gates RENDERING, so its target
+    must be decided before the gated field is reached — hence the
+    earlier-field and no-nesting rules. ``required_when`` gates only whether an
+    always-rendered field must be filled; the form reads sibling state, which
+    exists for every field regardless of declaration order. Forcing the
+    visible_when ordering rule here would reject the one case this exists for:
+    ``collision_policy`` lives on ``LocalFileSinkConfig`` and its target
+    ``mode`` on the concrete sink subclass, so the target lowers LATER.
+
+    A target naming no field at all is still a lowering bug — the predicate
+    would silently never fire and the knob would under-gate exactly as it did
+    before R2-F2 — so membership in ``all_names`` is checked.
+    """
+    if "required_when" not in field:
+        return
+
+    pred = field["required_when"]
+    keys = frozenset(pred)
+    if keys != _PREDICATE_KEYS:
+        raise KnobSchemaLoweringError(
+            plugin_kind=plugin_kind,
+            plugin_name=plugin_name,
+            field_path=field["name"],
+            constraint=f"required_when has keys {sorted(keys)}; only 'field' and 'equals' permitted",
+            remediation="Remove extra keys; AND/OR predicates are out of scope",
+        )
+
+    target = pred["field"]
+    if target not in all_names:
+        raise KnobSchemaLoweringError(
+            plugin_kind=plugin_kind,
+            plugin_name=plugin_name,
+            field_path=field["name"],
+            constraint=f"required_when references unknown field {target!r}",
+            remediation="Check the field name; the target must be another KnobField on the same schema (forward references are legal)",
+        )
+
+    if target == field["name"]:
+        raise KnobSchemaLoweringError(
+            plugin_kind=plugin_kind,
+            plugin_name=plugin_name,
+            field_path=field["name"],
+            constraint="required_when references itself",
+            remediation="Point the predicate at a different field",
+        )

@@ -171,6 +171,7 @@ function makeProposalResponse(): GetGuidedResponse {
             node_type: "transform",
             plugin: { kind: "transform", id: "schema_guard" },
             behavior: { kind: "transform" },
+            node_options_summary: [],
           },
         ],
         outputs: [
@@ -477,6 +478,7 @@ describe("api/client guided functions", () => {
               routes: [{ alias: "Bearer-credential", key: "true" }],
               fork_branches: [],
             },
+            node_options_summary: [],
           };
           body.next_turn.payload.graph.edges[2].flow = {
             kind: "gate_route",

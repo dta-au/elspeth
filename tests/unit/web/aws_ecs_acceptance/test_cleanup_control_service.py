@@ -123,7 +123,7 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
                 f"session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}"
                 "_blob_cleanup_guided_decline_and_row_union_barrier"
             ),
-            "semantics_only_changes": "guided_coalesce_timeout_seconds_required",
+            "semantics_only_changes": "guided_coalesce_timeout_seconds_and_node_options_summary_required",
             "archive_export_decision": "required_before_forward_migration",
             "destructive_reset_required": False,
         },

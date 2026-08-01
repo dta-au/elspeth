@@ -757,7 +757,13 @@ def test_management_non_string_provider_content_is_bounded_without_private_egres
     assert response.status_code == 200, response.json()
     body = response.json()
     assert body["assistant_message_kind"] == "synthetic_failure"
-    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "unavailable"
+    # "model_defect", not "unavailable", since the R2-F15 pair-salvage fix:
+    # the non-string content now classifies as GuidedToolArgumentShapeError —
+    # the provider ANSWERED and the reply violated the contract, which is
+    # exactly the mislabel the model_defect mapping exists to correct
+    # (inv-f1 D4). The turn is still synthetic and the egress bounds below
+    # are unchanged.
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "model_defect"
     assert private_canary not in response.text
     assert private_canary not in repr(logs)
 

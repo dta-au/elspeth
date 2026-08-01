@@ -26,6 +26,7 @@ from elspeth.web.composer.guided.protocol import (
     PROPOSAL_SUMMARY_TEMPLATE,
     ProposePipelinePayload,
     TurnType,
+    node_options_summary,
     proposal_component_label,
     proposal_structural_label,
     validate_payload,
@@ -1232,6 +1233,10 @@ def _build_projection(
                     barrier_incoming_branch_aliases.get(node_ids[node.id]) if node.node_type in ("coalesce", "row_union") else None
                 ),
             ),
+            # Allowlisted key options as display text (R2-F3). Same closed
+            # server-owned vocabulary the wire review projects, so the proposal
+            # card and the wiring card describe a node identically.
+            "node_options_summary": node_options_summary(node.plugin, node.options),
         }
         for index, node in enumerate(state.nodes)
     ]
@@ -1307,10 +1312,12 @@ def _projection_kind_summary(payload: Mapping[str, Any]) -> _ProjectionKindSumma
     """Structural (Tier-3-safe) node/edge kind summary for projection failure logs.
 
     The PROPOSE_PIPELINE projection is already the closed, redacted wire shape —
-    it carries no options, prompts, or draft content, only catalog plugin ids,
-    node/flow kinds, and structural aliases. Project just those so a projection
-    failure names the offending shape (e.g. a coalesce whose branch aliases do
-    not match its incoming flow order) without touching private authored values.
+    it carries no prompts or draft content, and no options beyond the closed
+    ``_NODE_OPTION_SUMMARY_ALLOWLIST`` display pairs, only catalog plugin ids,
+    node/flow kinds, and structural aliases. Project just the kinds and aliases
+    (never the option summary) so a projection failure names the offending
+    shape (e.g. a coalesce whose branch aliases do not match its incoming flow
+    order) without touching private authored values.
     """
     nodes = payload["nodes"] if isinstance(payload.get("nodes"), list) else []
     graph = payload["graph"] if isinstance(payload.get("graph"), Mapping) else {}
