@@ -573,6 +573,7 @@ def _validate_pending_source_publish(
             # the bundle claims against that base while the signed candidate is
             # active, so source drift cannot hide behind its own new entries.
             allowlist_dir=Path(manifest["candidate_dir"]),
+            bundle_allowlist_dir=args.allowlist_dir,
         )
     except ValueError:
         rollback_pending_publish(tx_path, manifest)

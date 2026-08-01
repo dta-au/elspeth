@@ -101,7 +101,7 @@ present in the environment.
 | Tool | Key-free? | LLM? | What it does |
 | --- | --- | --- | --- |
 | `verify_signatures` | yes | no | Read-only, **always shape-only** signature diagnosis of the tier_model allowlist. The authoritative HMAC recompute is the operator CLI `diagnose`, not this tool. |
-| `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment`. Args: optional `bundle_id`, `staged_by`. |
+| `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment` — and report the raw empty-allowlist target census split into exact-covered, per-file-covered, and uncovered targets. Roots are recorded as absolute paths, and ambiguous non-judge target groups fail staging. Args: optional `bundle_id`, `staged_by`. |
 | `stage_status` | yes | no | Summarise a staged bundle (per-lane/kind counts, preview outcomes) and emit the paste-ready operator `sign-bundle` command. Arg: `bundle_id` (required). |
 | `stage_preview` | yes | yes (read-only Codex CLI judge) | Run the sealed read-only Codex judge over each `new_judgment` action and record a **non-authoritative** preview verdict (`authoritative=False`); surfaces BLOCKED reasons. Never signs. Arg: `bundle_id` (required). Needs installed/authenticated Codex CLI plus `[mcp]`. |
 | `stage_rekey` | yes | no | Enumerate currently-valid judge-gated entries and flag broken ones into a rekey bundle, recording env-var **names** only — never key bytes. Args: `old_key_env`, `new_key_env` (required), optional `bundle_id`, `staged_by`. |
@@ -127,8 +127,17 @@ elspeth-lints sign-bundle <bundle.json> --owner <operator-id> \
 ```
 
 This is the **only** place a judge signature is minted from a bundle. The verify
-phase (re-check the whole bundle against the tree) is the all-or-nothing gate; on
-any mismatch it aborts before creating a transaction. Execution happens in a
+phase first binds the CLI roots to the roots recorded in the bundle, then runs a
+full empty-allowlist census over every scannable Python file. Every uncovered
+target must have a staged `new_judgment` action, and every live signed-entry
+drift or orphan and every non-judge rotation must have its corresponding
+repair/delete/rotation action. This catches an incomplete or deliberately
+narrowed bundle even when every action it did include is individually valid.
+Bundles carrying legacy relative root paths are rejected and must be re-staged;
+otherwise changing the operator's working directory could silently retarget the
+census.
+The whole-bundle re-check is the all-or-nothing gate; on any mismatch it aborts
+before creating a transaction. Execution happens in a
 private same-filesystem copy under a sibling `.sign-bundle-transactions/`
 directory. `stale_delete` and safe `rotation` actions run before paid judge
 calls. Each accepted authoritative decision is journalled, but the configured

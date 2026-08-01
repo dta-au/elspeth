@@ -199,8 +199,8 @@ RULES: dict[str, dict[str, Any]] = {
         "remediation": "Access dict keys directly (dict[key]) and fix the schema/contract if KeyError occurs",
     },
     "R2": {
-        "name": "getattr",
-        "description": "getattr() with default can hide missing attribute bugs",
+        "name": "attribute-default",
+        "description": "getattr() or inspect.getattr_static() with a default can hide missing attribute bugs",
         "remediation": "Access attributes directly (obj.attr) and fix the type/contract if AttributeError occurs",
     },
     "R3": {
@@ -1782,7 +1782,7 @@ class TierModelVisitor(ast.NodeVisitor):
             self._restore_comprehension_targets(original_names, target_names)
 
     def visit_Call(self, node: ast.Call) -> None:
-        """Detect R1 (dict.get), R2 (getattr), R3 (hasattr), R5 (isinstance), R8/R9 defaults."""
+        """Detect R1, R2 attribute defaults, R3, R5, and R8/R9 mapping defaults."""
         # R1: dict.get() - Call(func=Attribute(attr="get"))
         if isinstance(node.func, ast.Attribute) and node.func.attr == "get" and not self._is_likely_non_dict_get(node):
             self._add_finding(
@@ -1811,13 +1811,18 @@ class TierModelVisitor(ast.NodeVisitor):
                 f"dict.pop() with default hides missing keys: {self._get_code_snippet(node.lineno)}",
             )
 
-        # R2: getattr() - Call(func=Name("getattr"))
-        # Only flag if there's a default argument (3 args)
-        if isinstance(node.func, ast.Name) and node.func.id == "getattr" and (len(node.args) >= 3 or node.keywords):
+        # R2: builtin getattr() or import-resolved inspect.getattr_static().
+        # Only flag calls that supply the fallback default.
+        lookup_name: str | None = None
+        if isinstance(node.func, ast.Name) and node.func.id == "getattr":
+            lookup_name = "getattr"
+        elif self._qualified_import_name(node.func) == "inspect.getattr_static":
+            lookup_name = "inspect.getattr_static"
+        if lookup_name is not None and (len(node.args) >= 3 or any(keyword.arg == "default" for keyword in node.keywords)):
             self._add_finding(
                 "R2",
                 node,
-                f"getattr() with default hides AttributeError: {self._get_code_snippet(node.lineno)}",
+                f"{lookup_name}() with default hides AttributeError: {self._get_code_snippet(node.lineno)}",
             )
 
         # R3: hasattr() - Call(func=Name("hasattr"))

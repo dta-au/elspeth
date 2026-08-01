@@ -468,7 +468,7 @@ class TestR1SourceRegressions:
 
 
 class TestR2Getattr:
-    """Tests for R2: getattr() with default detection."""
+    """Tests for R2: attribute lookup with a fallback default."""
 
     def test_detects_getattr_with_default(self) -> None:
         """getattr() with 3 args (including default) should be flagged."""
@@ -507,6 +507,39 @@ class TestR2Getattr:
 
         r2_findings = [f for f in findings if f.rule_id == "R2"]
         assert len(r2_findings) == 1
+
+    @pytest.mark.parametrize(
+        "source",
+        (
+            "import inspect\nvalue = inspect.getattr_static(obj, 'attr', None)\n",
+            "import inspect as reflector\nvalue = reflector.getattr_static(obj, 'attr', None)\n",
+            "from inspect import getattr_static as static_attr\nvalue = static_attr(obj, 'attr', None)\n",
+            "import inspect\nvalue = inspect.getattr_static(obj, 'attr', default=None)\n",
+        ),
+    )
+    def test_detects_qualified_or_import_aliased_getattr_static_with_default(self, source: str) -> None:
+        findings = parse_and_visit(source)
+
+        r2_findings = [finding for finding in findings if finding.rule_id == "R2"]
+        assert len(r2_findings) == 1
+        assert "getattr_static" in r2_findings[0].message
+
+    @pytest.mark.parametrize(
+        "source",
+        (
+            "import inspect\nvalue = inspect.getattr_static(obj, 'attr')\n",
+            "import vendor as inspect\nvalue = inspect.getattr_static(obj, 'attr', None)\n",
+            "from vendor import getattr_static as static_attr\nvalue = static_attr(obj, 'attr', None)\n",
+            "value = getattr_static(obj, 'attr', None)\n",
+            "value = obj.getattr_static('attr', None)\n",
+            "import inspect as reflector\nreflector = object()\nvalue = reflector.getattr_static(obj, 'attr', None)\n",
+        ),
+    )
+    def test_ignores_non_inspect_or_non_default_getattr_static_calls(self, source: str) -> None:
+        findings = parse_and_visit(source)
+
+        r2_findings = [finding for finding in findings if finding.rule_id == "R2"]
+        assert r2_findings == []
 
 
 # =============================================================================
