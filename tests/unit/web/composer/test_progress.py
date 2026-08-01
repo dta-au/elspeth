@@ -261,6 +261,21 @@ class TestComposerProgressRegistry:
         assert enriched.inflight_requests == 1
         registry.end_request("session-1")
 
+    def test_end_request_rejects_unmatched_teardown(self) -> None:
+        """A missing begin_request is an owned lifecycle-contract defect."""
+        registry = ComposerProgressRegistry()
+
+        with pytest.raises(KeyError, match="session-1"):
+            registry.end_request("session-1")
+
+    def test_end_request_rejects_double_teardown(self) -> None:
+        registry = ComposerProgressRegistry()
+        registry.begin_request("session-1")
+        registry.end_request("session-1")
+
+        with pytest.raises(KeyError, match="session-1"):
+            registry.end_request("session-1")
+
     @pytest.mark.asyncio
     async def test_list_active_snapshots_carry_live_inflight_count(self) -> None:
         """The operator /_active view reports the LIVE count, not publish-time zero.

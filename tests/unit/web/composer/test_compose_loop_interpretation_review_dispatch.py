@@ -753,10 +753,9 @@ async def test_compose_loop_dispatches_request_interpretation_review(
     # ``model_version`` was sourced from ``response.model``; with the
     # fixed fake response model this is a deterministic string.
     assert event.model_version == "anthropic/claude-opus-4-7-20260101"
-    # The skill hash matches the in-memory cached value from prompts.py.
-    from elspeth.web.composer.prompts import PIPELINE_COMPOSER_SKILL_HASH
-
-    assert event.composer_skill_hash == PIPELINE_COMPOSER_SKILL_HASH
+    # The event carries the exact prompt bytes used by this no-overlay service.
+    expected_hash = hashlib.sha256(render_system_prompt(None).encode("utf-8")).hexdigest()
+    assert event.composer_skill_hash == expected_hash
 
 
 @pytest.mark.asyncio
@@ -2280,9 +2279,7 @@ async def test_f5c_skill_markdown_history_upsert_idempotent(
         rows = conn.execute(select(skill_markdown_history_table)).fetchall()
     assert len(rows) == 1
     row = rows[0]
-    from elspeth.web.composer.prompts import PIPELINE_COMPOSER_SKILL_HASH
-
-    assert row.hash == PIPELINE_COMPOSER_SKILL_HASH
+    assert row.hash == hashlib.sha256(row.content.encode("utf-8")).hexdigest()
     assert row.filename == "pipeline_composer.md"
     assert row.content.startswith("#") or row.content  # non-empty markdown
     assert len(row.content) > 100  # the real skill is ~24KB

@@ -822,7 +822,7 @@ class GuidedChatResponse(_StrictResponse):
 # All field caps are documented in spec lines 1428-1459.
 
 
-class InterpretationEventResponse(BaseModel):
+class InterpretationEventResponse(_StrictResponse):
     """Wire mirror of :class:`InterpretationEventRecord`.
 
     Read-side wire schema for a single row of the
@@ -959,7 +959,7 @@ class InterpretationResolveRequest(BaseModel):
         return v
 
 
-class InterpretationResolveResponse(BaseModel):
+class InterpretationResolveResponse(_StrictResponse):
     """Response for POST /api/sessions/{id}/interpretations/{event_id}/resolve.
 
     The resolved event row PLUS the new composition state produced by
@@ -977,7 +977,7 @@ class InterpretationResolveResponse(BaseModel):
     new_state: CompositionStateResponse
 
 
-class InterpretationOptOutResponse(BaseModel):
+class InterpretationOptOutResponse(_StrictResponse):
     """Response for POST /api/sessions/{id}/interpretations/opt_out.
 
     The opt-out route has no body fields beyond the implicit actor
@@ -1000,7 +1000,7 @@ class InterpretationOptOutResponse(BaseModel):
     opted_out_at: datetime
 
 
-class ListInterpretationEventsResponse(BaseModel):
+class ListInterpretationEventsResponse(_StrictResponse):
     """Response for GET /api/sessions/{id}/interpretations.
 
     Wraps the list in an envelope object rather than returning a bare
@@ -1014,7 +1014,7 @@ class ListInterpretationEventsResponse(BaseModel):
     events: list[InterpretationEventResponse]
 
 
-class OptOutSummaryResponse(BaseModel):
+class OptOutSummaryResponse(_StrictResponse):
     """Response for GET /api/sessions/{id}/interpretations/opt_out_summary.
 
     Per F-22 of the Phase 5b backend spec: after a session has opted out

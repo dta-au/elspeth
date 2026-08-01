@@ -653,9 +653,15 @@ def _node_cardinality(node: Any, executable_node: Any) -> _WireRowCardinality:
             output = "zero_or_one"
         else:
             output = "one"
-        return {"input": "one", "output": output, "expected_output_count": None}
-    finally:
+    except BaseException as primary_exc:
+        try:
+            transform.close()
+        except BaseException as cleanup_exc:
+            primary_exc.add_note(f"transform.close failed during cardinality inspection: {type(cleanup_exc).__name__}")
+        raise
+    else:
         transform.close()
+        return {"input": "one", "output": output, "expected_output_count": None}
 
 
 def _build_wire_projection(

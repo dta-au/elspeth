@@ -1050,15 +1050,7 @@ def _result_to_audit_payload(result: Any) -> Mapping[str, Any]:
     return payload
 
 
-# ---------------------------------------------------------------------------
-# F2 (spec §4.2.6): Pydantic ``__cause__`` canonicalization for ARG_ERROR.
-#
-# Placed at module tail to keep the AST body-index ordering of the existing
-# functions stable — the tier-model enforcer fingerprints findings by AST
-# path (``body[N]``), so inserting a new module-level def in the middle of
-# the file would rotate every downstream fingerprint and force a churn of
-# allowlist re-keying that has nothing to do with this change.
-# ---------------------------------------------------------------------------
+# Pydantic ``__cause__`` canonicalization for ARG_ERROR (spec §4.2.6).
 
 
 _MAX_PYDANTIC_CAUSE_ERRORS = 8

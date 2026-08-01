@@ -32,8 +32,7 @@ class WorkflowProfile:
     bookends: bool
 
     def __post_init__(self) -> None:
-        for field_name in ("coaching", "bookends"):
-            value = getattr(self, field_name)
+        for field_name, value in (("coaching", self.coaching), ("bookends", self.bookends)):
             if type(value) is not bool:
                 raise TypeError(f"{field_name} must be bool, got {type(value).__name__}")
 

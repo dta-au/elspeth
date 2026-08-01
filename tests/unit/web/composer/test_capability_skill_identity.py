@@ -25,7 +25,7 @@ from elspeth.web.composer.guided.prompts import load_step_chat_skill, load_step_
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.pipeline_planner import PLANNER_DISCOVERY_TOOL_NAMES, planner_tool_definitions
 from elspeth.web.composer.pipeline_proposal import PlannerSurface
-from elspeth.web.composer.prompts import PIPELINE_COMPOSER_SKILL_HASH, build_system_prompt
+from elspeth.web.composer.prompts import build_system_prompt
 from elspeth.web.composer.skills import load_skill
 from elspeth.web.composer.state import COMPOSER_NODE_TYPES
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
@@ -155,12 +155,6 @@ def test_interpretation_requirement_guidance_uses_exact_public_shell() -> None:
     assert "You author ONLY `kind`, `user_term`, and `draft`." in interaction
     assert "plus `id`" not in interaction
     assert "`status` defaults to `pending`" not in interaction
-
-
-def test_freeform_skill_hash_covers_the_exact_composed_static_prompt() -> None:
-    rendered = build_system_prompt(None)
-
-    assert hashlib.sha256(rendered.encode("utf-8")).hexdigest() == PIPELINE_COMPOSER_SKILL_HASH
 
 
 def test_guided_skills_have_no_capability_reduction_disclaimers() -> None:

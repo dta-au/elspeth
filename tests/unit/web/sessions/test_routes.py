@@ -21,7 +21,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 
-from elspeth.contracts.blobs import BlobNotFoundError, BlobServiceProtocol
+from elspeth.contracts.blobs import BlobNotFoundError, BlobRecord, BlobServiceProtocol, BlobStatus
 from elspeth.contracts.composer_audit import (
     ComposerToolInvocation,
     ComposerToolStatus,
@@ -135,6 +135,36 @@ def _async_return(value: Any):
         return value
 
     return _return_value
+
+
+def _ready_blob_record(
+    *,
+    blob_id: uuid.UUID,
+    session_id: uuid.UUID,
+    storage_path: str,
+    status: BlobStatus = "ready",
+) -> BlobRecord:
+    """Build the concrete owned blob carrier used by custody-route tests."""
+    return BlobRecord(
+        id=blob_id,
+        session_id=session_id,
+        filename=Path(storage_path).name,
+        mime_type="text/csv",
+        size_bytes=0,
+        content_hash=None,
+        storage_path=storage_path,
+        created_at=datetime.now(UTC),
+        created_by="user",
+        source_description=None,
+        status=status,
+        creation_modality=CreationModality.VERBATIM,
+        created_from_message_id=None,
+        creating_model_identifier=None,
+        creating_model_version=None,
+        creating_provider=None,
+        creating_composer_skill_hash=None,
+        creating_arguments_hash=None,
+    )
 
 
 def _guided_chat_body(guided_response: Mapping[str, Any], message: str) -> dict[str, Any]:
@@ -7528,11 +7558,10 @@ sinks:
         app.state.blob_service = SimpleNamespace(
             get_blob=AsyncMock(
                 spec=BlobServiceProtocol.get_blob,
-                return_value=SimpleNamespace(
-                    id=uuid.UUID(blob_id),
+                return_value=_ready_blob_record(
+                    blob_id=uuid.UUID(blob_id),
                     session_id=session.id,
                     storage_path="/data/blobs/session/contact_form_submissions.csv",
-                    status="ready",
                 ),
             )
         )
@@ -7590,11 +7619,10 @@ sinks:
         storage_path = str(tmp_path / "blobs" / str(session.id) / f"{blob_id}_input.csv")
         get_blob = AsyncMock(
             spec=BlobServiceProtocol.get_blob,
-            return_value=SimpleNamespace(
-                id=blob_id,
+            return_value=_ready_blob_record(
+                blob_id=blob_id,
                 session_id=session.id,
                 storage_path=storage_path,
-                status="ready",
             ),
         )
         app.state.blob_service = SimpleNamespace(get_blob=get_blob)
@@ -7661,11 +7689,10 @@ sinks:
         app.state.blob_service = SimpleNamespace(
             get_blob=AsyncMock(
                 spec=BlobServiceProtocol.get_blob,
-                return_value=SimpleNamespace(
-                    id=current_blob_id,
+                return_value=_ready_blob_record(
+                    blob_id=current_blob_id,
                     session_id=session.id,
                     storage_path=current_storage_path,
-                    status="ready",
                 ),
             )
         )
@@ -7750,8 +7777,8 @@ sinks:
         storage_path = "/data/blobs/foreign/private.csv"
         get_blob = AsyncMock(
             spec=BlobServiceProtocol.get_blob,
-            return_value=SimpleNamespace(
-                id=uuid.uuid4() if custody_failure == "wrong_id" else blob_id,
+            return_value=_ready_blob_record(
+                blob_id=uuid.uuid4() if custody_failure == "wrong_id" else blob_id,
                 session_id=foreign_session_id if custody_failure == "foreign_session" else session.id,
                 storage_path="/data/blobs/same-session/wrong.csv" if custody_failure == "wrong_path" else storage_path,
                 status="pending" if custody_failure == "non_ready" else "ready",
@@ -7982,11 +8009,10 @@ sinks:
         session = await service.create_session("alice", "Pipeline", "local")
         get_blob = AsyncMock(
             spec=BlobServiceProtocol.get_blob,
-            return_value=SimpleNamespace(
-                id=uuid.UUID(stable_id),
+            return_value=_ready_blob_record(
+                blob_id=uuid.UUID(stable_id),
                 session_id=session.id,
                 storage_path="/data/blobs/foreign/live.csv",
-                status="ready",
             ),
         )
         app.state.blob_service = SimpleNamespace(get_blob=get_blob)

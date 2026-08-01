@@ -711,13 +711,16 @@ review cards from the repaired state. Pending review entries can remain pending
 across repair mutations; copy them forward unchanged unless the implementing
 node's actual behavior changes.
 
-If the current pipeline has multiple pending review requirements, call
-`request_interpretation_review` once for each requirement before stopping. These
-calls may be in the same assistant turn. Do not surface one review card and then
-stop while other pending requirements remain.
+If the current pipeline has multiple pending review requirements that the
+authoritative matrix assigns YOU to surface, call
+`request_interpretation_review` once for each before stopping. These calls may
+be in the same assistant turn. Do not surface one review card and then stop
+while other caller-owned pending requirements remain. Never surface the
+backend-owned `llm_prompt_template` rows.
 
 Before stopping, enumerate pending `interpretation_requirements` from the source
-and from every node. For each pending requirement, call
+and from every node. For each pending requirement except backend-owned
+`llm_prompt_template` rows, call
 `request_interpretation_review` with the same `kind`, `user_term`, implementing
 component, and exact `draft`. Use `affected_node_id="source"` for requirements
 stored on `source.options.interpretation_requirements`; do not look for the
@@ -746,7 +749,7 @@ on records you READ back but are owned by the backend.
 | --- | --- | --- |
 | `kind="vague_term"` | You author operational semantics for a user criterion: scoring scale, rubric, category meaning, threshold, cutoff, ranking rule, or subjective definition. | `affected_node_id`, stable `user_term`, exact drafted definition in `llm_draft`. |
 | `kind="invented_source"` | You create source rows, URLs, or inline source content the user did not provide verbatim. | Bind the source first; use the exact generated content as `llm_draft`. |
-| `kind="llm_prompt_template"` | You author any LLM `prompt_template`. | `user_term="llm_prompt_template:<node_id>"`; `llm_draft` is the raw template. |
+| `kind="llm_prompt_template"` | Backend auto-stages and surfaces this row. Do not call the review tool for it. | Backend-owned; no caller-authored shape. |
 | `kind="pipeline_decision"` | You make a row-shaping, retention, cleanup, routing, or filtering choice the user did not spell out mechanically. | Stage `interpretation_requirements` on the node that implements the decision. |
 | `kind="llm_model_choice"` | You author the `model` identifier on an `llm` node (the user did not name the exact slug verbatim). | `user_term="llm_model_choice:<node_id>"`; `llm_draft` is the exact `options.model` string. The mutation pipeline auto-stages this requirement when `options.model` is set; resolve it before stopping. A profile-bound node (`options.profile`) has no model-choice card. |
 
@@ -769,7 +772,7 @@ Before you stop, copy this checklist and confirm each item:
 - [ ] For each LLM node I authored: prompt_template_parts wired; vague_term staged+wired+surfaced IF I authored judgement semantics; llm_model_choice surfaced IF I chose the slug. (llm_prompt_template is backend-owned — I did NOT surface it.)
 - [ ] invented_source surfaced IF I generated source rows.
 - [ ] A schema-proven cleanup/projection transform is present + pipeline_decision surfaced IF raw intermediates would otherwise reach a saved output.
-- [ ] Every pending interpretation_requirement has a matching request_interpretation_review call.
+- [ ] Every caller-owned pending interpretation_requirement has a matching request_interpretation_review call; backend-owned llm_prompt_template rows were not surfaced by me.
 - [ ] I am ending in exactly one terminal state below.
 ```
 
@@ -855,7 +858,7 @@ These are common one-shot mappings:
 Before any `set_pipeline` call containing interpretation requirements, check:
 
 - Every `interpretation_requirements` value is an array.
-- Every requirement object has `id`, `kind`, `user_term`, `status`, and `draft`.
+- Every requirement object has exactly `kind`, `user_term`, and `draft`.
 - If a requirement says raw fields are dropped, the cleanup node actually drops
   them.
 - The selected cleanup plugin's schema-defined projection/removal option is enabled.

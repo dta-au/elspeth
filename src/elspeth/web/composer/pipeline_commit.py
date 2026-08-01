@@ -106,8 +106,7 @@ class PipelineDispatchAuditBinding:
             raise AuditIntegrityError("pipeline dispatch tool_name must be set_pipeline")
         if type(self.status) is not ComposerToolStatus or self.status is not ComposerToolStatus.SUCCESS:
             raise AuditIntegrityError("pipeline dispatch binding requires a successful dispatch")
-        for name in ("arguments_hash", "result_hash"):
-            value = getattr(self, name)
+        for name, value in (("arguments_hash", self.arguments_hash), ("result_hash", self.result_hash)):
             if type(value) is not str or _SHA256_HEX.fullmatch(value) is None:
                 raise AuditIntegrityError(f"pipeline dispatch {name} must be a SHA-256 hash")
 
@@ -256,8 +255,10 @@ class PreparedPipelineCommit:
             raise TypeError("invocation must be an exact ComposerToolInvocation")
         if type(self.dispatch) is not PipelineDispatchAuditBinding:
             raise TypeError("dispatch must be an exact PipelineDispatchAuditBinding")
-        for name in ("candidate_content_hash", "executor_content_hash"):
-            value = getattr(self, name)
+        for name, value in (
+            ("candidate_content_hash", self.candidate_content_hash),
+            ("executor_content_hash", self.executor_content_hash),
+        ):
             if type(value) is not str or _SHA256_HEX.fullmatch(value) is None:
                 raise AuditIntegrityError(f"{name} must be a SHA-256 hash")
 

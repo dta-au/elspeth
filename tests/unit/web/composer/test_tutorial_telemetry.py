@@ -19,6 +19,11 @@ class _RecordingCounter:
         self.calls.append((amount, dict(attributes)))
 
 
+class _FailingCounter:
+    def add(self, amount: int, *, attributes: dict[str, object]) -> None:
+        raise RuntimeError("exporter unavailable")
+
+
 def test_record_tutorial_completed_rejects_unknown_path() -> None:
     try:
         tutorial_telemetry_module.record_tutorial_completed_path("made_up")  # type: ignore[arg-type]
@@ -45,3 +50,15 @@ def test_abandon_route_increments_counter(monkeypatch) -> None:
 
     assert response.status_code == 204
     assert counter.calls == [(1, {})]
+
+
+def test_completed_telemetry_does_not_replace_committed_outcome(monkeypatch) -> None:
+    monkeypatch.setattr(tutorial_telemetry_module, "_TUTORIAL_COMPLETED_COUNTER", _FailingCounter())
+
+    assert tutorial_telemetry_module.record_tutorial_completed_path("first_time") is None
+
+
+def test_abandon_telemetry_is_best_effort(monkeypatch) -> None:
+    monkeypatch.setattr(tutorial_telemetry_module, "_TUTORIAL_ABANDON_COUNTER", _FailingCounter())
+
+    assert tutorial_telemetry_module.record_tutorial_abandoned() is None

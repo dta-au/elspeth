@@ -21,7 +21,15 @@ from elspeth.web.composer.guided.deferred_intents import (
     validate_deferred_intent_action,
 )
 from elspeth.web.composer.guided.protocol import GuidedStep
-from elspeth.web.composer.guided.stage_subjects import OptionValueConstraint, StageName
+from elspeth.web.composer.guided.stage_subjects import (
+    ComponentCountConstraint,
+    DeferredConstraint,
+    EdgeRouteConstraint,
+    FailureRouteConstraint,
+    OptionValueConstraint,
+    StageName,
+    SubjectPresenceConstraint,
+)
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
 
 
@@ -69,8 +77,17 @@ class DeferredIntentManagementOption:
         }
 
 
-def _provider_safe_constraint(constraint: object) -> dict[str, object]:
-    if not hasattr(constraint, "to_dict"):
+def _provider_safe_constraint(constraint: DeferredConstraint) -> dict[str, object]:
+    if not isinstance(
+        constraint,
+        (
+            SubjectPresenceConstraint,
+            OptionValueConstraint,
+            ComponentCountConstraint,
+            EdgeRouteConstraint,
+            FailureRouteConstraint,
+        ),
+    ):
         raise AuditIntegrityError("deferred intent contains a constraint without a closed projection")
     projected = cast(dict[str, Any], constraint.to_dict())
     if type(constraint) is OptionValueConstraint:

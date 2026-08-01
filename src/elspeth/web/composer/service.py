@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from elspeth.web.sessions.telemetry import _SessionsTelemetry
 
 import structlog
+from jinja2 import TemplateSyntaxError
 from opentelemetry import metrics
 from sqlalchemy import Engine, update
 from sqlalchemy.exc import SQLAlchemyError
@@ -6434,16 +6435,8 @@ class ComposeLoopTestResult:
         return self.tool_outcomes
 
 
-# ---------------------------------------------------------------------------
-# Deterministic advisor checkpoint primitives (Task 4).
-#
-# AdvisorCheckpointVerdict and _summarize_pipeline_for_advisor live at module
-# scope (the methods that produce/consume them are on ComposerServiceImpl).
-# They are appended at end-of-file rather than spliced near the imports for the
-# same fingerprint-stability reason as the earlier end-of-file helper block:
-# inserting a module-level def mid-file would rotate every downstream symbol's
-# AST fingerprint. The verdict is also imported directly by the unit tests.
-# ---------------------------------------------------------------------------
+# Deterministic advisor checkpoint primitives. The verdict is module-level
+# because both service methods and focused unit tests consume it.
 
 
 @dataclass(frozen=True, slots=True)
@@ -6863,11 +6856,6 @@ def _interpolated_row_fields(prompt_template: str) -> list[str]:
     such as a non-str ``prompt_template`` (TypeError) or an engine refactor — is
     allowed to surface rather than be silently swallowed into ``[]``.
     """
-    # Imported locally: a module-level jinja2 import would shift the module body
-    # indices and rotate the fingerprints of the signed allowlist entries below
-    # this function.
-    from jinja2 import TemplateSyntaxError
-
     try:
         return sorted(extract_jinja2_fields(prompt_template))
     except TemplateSyntaxError:
@@ -6891,16 +6879,8 @@ def _render_interpolated_row_fields(node: NodeSpec) -> str:
     return "interpolates row fields: [" + ", ".join(fields) + "]"
 
 
-# ---------------------------------------------------------------------------
-# END authoritative advisor gate (Task 6).
-#
-# ``_advisor_signoff_blocked_validation`` and its code constant live at module
-# scope (appended at EOF for the same AST-fingerprint-stability reason as the
-# Task-4 primitives above) because the synthetic ValidationResult it builds is
-# pure data with no ``self`` dependency — it mirrors
-# ``_orphaned_interpretation_review_validation``. The method that consumes it
-# (``ComposerServiceImpl._advisor_blocked_result``) lives in the class body.
-# ---------------------------------------------------------------------------
+# END authoritative advisor gate. The synthetic ValidationResult builder is
+# module-level because it is pure data with no service-instance dependency.
 _ADVISOR_SIGNOFF_BLOCKED_CODE: Final[str] = ADVISOR_SIGNOFF_BLOCKED_CODE
 # Mirrors the orphan gate's check-name convention so the synthetic fail-closed
 # result names a stable check the UI/audit can key on.
@@ -6998,12 +6978,6 @@ def _advisor_signoff_blocked_validation(*, reason: str, findings: str) -> Valida
 # backend-controlled). A prompt-injection payload smuggled into an
 # operator-authored pipeline option value (Tier-3 at the read site) can
 # survive into the advisor's own response and get parroted back here. This
-# helper is appended at EOF rather than spliced near its callers for the same
-# AST-fingerprint-stability reason documented at the Task-4 primitives above
-# (inserting a module-level def mid-file rotates every downstream symbol's
-# fingerprint); Python resolves the name at call time so the forward
-# reference from earlier call sites is safe.
-#
 # R2-F13 (elspeth-e8872dfbbe): the BEGIN/END sentinels are meaningful ONLY on
 # the LLM re-injection path (:func:`_fence_advisor_findings`, consumed by a
 # downstream LLM re-reading the transcript) — never on the human-facing wire
@@ -7078,15 +7052,7 @@ def _fence_advisor_findings(findings_text: str) -> str:
     return f"{_ADVISOR_FINDINGS_UNTRUSTED_BEGIN}\n{text}\n{_ADVISOR_FINDINGS_UNTRUSTED_END}"
 
 
-# ---------------------------------------------------------------------------
 # R2-F14 (elspeth-5403f346c0): tolerant verdict parsing + budgeted format retry.
-#
-# Appended at EOF for the same AST-fingerprint-stability reason documented at
-# the Task-4 primitives above: inserting a module-level symbol mid-file rotates
-# every downstream symbol's fingerprint. Python resolves these names at call
-# time, so the forward references from ``_parse_advisor_checkpoint_guidance``
-# and ``_run_advisor_checkpoint`` (both defined earlier) are safe.
-# ---------------------------------------------------------------------------
 # How many leading non-empty lines CLEAN ACCEPTANCE inspects. Bounded so a
 # rambling advisor reply cannot bury a sign-off token under arbitrary prose and
 # still be accepted: past this window a CLEAN is not a compliant sign-off and
