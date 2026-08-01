@@ -329,6 +329,7 @@ async def _await_pipeline_staging_write_with_deferred_cancellation[T](
 
 
 _blocking_result_from_tool_invocations = _no_tool_policy.blocking_result_from_tool_invocations
+_compose_advisor_signoff_pending_message = _no_tool_policy.compose_advisor_signoff_pending_message
 _compose_empty_state_message = _no_tool_policy.compose_empty_state_message
 _compose_preflight_failure_message = _no_tool_policy.compose_preflight_failure_message
 _enforce_augmentation_prefix_invariant = _no_tool_policy.enforce_augmentation_prefix_invariant
@@ -2057,6 +2058,48 @@ class ComposerServiceImpl:
             persisted_tool_call_turn=persisted_tool_call_turn,
         )
 
+    async def _turn_runtime_preflight(
+        self,
+        *,
+        state: CompositionState,
+        user_id: str | None,
+        session_id: str | None,
+        last_runtime_preflight: ValidationResult | None,
+        runtime_preflight_cache: _RuntimePreflightCache,
+        initial_version: int,
+        session_scope: str,
+        recorder: BufferingRecorder,
+        plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+    ) -> ValidationResult | None:
+        """This turn's deterministic runtime preflight, or ``None``.
+
+        Single source of the "reuse ``last_runtime_preflight``; recompute via
+        ``_cached_runtime_preflight`` only when the state mutated this turn"
+        rule, so every gate that consults the preflight observes the SAME
+        result. The per-turn cache (keyed on ``state.version``) makes repeated
+        calls within one turn free.
+
+        Returns ``None`` for a structurally empty pipeline (nothing to
+        validate — the empty-state finalize branch owns that) and when no prior
+        result exists for an unmutated state. May raise
+        ``ComposerRuntimePreflightError`` exactly as the finalize path does;
+        every caller sits under the same shared handler.
+        """
+        if _state_is_structurally_empty(state):
+            return None
+        if state.version > initial_version:
+            return await self._cached_runtime_preflight(
+                state,
+                user_id=user_id,
+                session_id=session_id,
+                cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                llm_calls=recorder.llm_calls,
+                plugin_snapshot=plugin_snapshot,
+            )
+        return last_runtime_preflight
+
     async def _attempt_preflight_repair(
         self,
         *,
@@ -2109,18 +2152,17 @@ class ComposerServiceImpl:
         if _state_is_structurally_empty(state):
             return False
 
-        runtime_result: ValidationResult | None = last_runtime_preflight
-        if state.version > initial_version:
-            runtime_result = await self._cached_runtime_preflight(
-                state,
-                user_id=user_id,
-                session_id=session_id,
-                cache=runtime_preflight_cache,
-                initial_version=initial_version,
-                session_scope=session_scope,
-                llm_calls=recorder.llm_calls,
-                plugin_snapshot=plugin_snapshot,
-            )
+        runtime_result = await self._turn_runtime_preflight(
+            state=state,
+            user_id=user_id,
+            session_id=session_id,
+            last_runtime_preflight=last_runtime_preflight,
+            runtime_preflight_cache=runtime_preflight_cache,
+            initial_version=initial_version,
+            session_scope=session_scope,
+            recorder=recorder,
+            plugin_snapshot=plugin_snapshot,
+        )
 
         if runtime_result is None or runtime_result.is_valid or _is_pending_interpretation_handoff(runtime_result):
             return False
@@ -3519,6 +3561,17 @@ class ComposerServiceImpl:
                         persisted_assistant_message_id=persisted_assistant_message_id,
                         persisted_tool_call_turn=persisted_tool_call_turn,
                         allow_repair_continue=False,
+                        runtime_preflight=await self._turn_runtime_preflight(
+                            state=state,
+                            user_id=user_id,
+                            session_id=session_id,
+                            last_runtime_preflight=last_runtime_preflight,
+                            runtime_preflight_cache=runtime_preflight_cache,
+                            initial_version=initial_version,
+                            session_scope=session_scope,
+                            recorder=recorder,
+                            plugin_snapshot=plugin_snapshot,
+                        ),
                     )
                     if advisor_gate.action == "return":
                         return _ClassifyOutcome(
@@ -3765,6 +3818,17 @@ class ComposerServiceImpl:
             persisted_assistant_message_id=persisted_assistant_message_id,
             persisted_tool_call_turn=persisted_tool_call_turn,
             allow_repair_continue=True,
+            runtime_preflight=await self._turn_runtime_preflight(
+                state=state,
+                user_id=user_id,
+                session_id=session_id,
+                last_runtime_preflight=last_runtime_preflight,
+                runtime_preflight_cache=runtime_preflight_cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                recorder=recorder,
+                plugin_snapshot=plugin_snapshot,
+            ),
         )
         if advisor_gate.action == "return":
             return _TerminateOutcome(
@@ -4025,8 +4089,17 @@ class ComposerServiceImpl:
         persisted_assistant_message_id: str | None,
         persisted_tool_call_turn: bool,
         allow_repair_continue: bool,
+        runtime_preflight: ValidationResult | None,
     ) -> _TerminalNoToolAdvisorGateOutcome:
-        """Run the shared terminal no-tool END advisor gate for P2 and P5."""
+        """Run the shared terminal no-tool END advisor gate for P2 and P5.
+
+        ``runtime_preflight`` is this turn's deterministic validation result
+        (see :meth:`_turn_runtime_preflight`), threaded so a blocked sign-off
+        can tell "the build is broken" from "the build validates but was never
+        signed off" — R2-F14 (elspeth-5403f346c0). ``None`` means the preflight
+        is unknown for this turn and the gate fails closed to the fully
+        blocking shape.
+        """
         max_passes = self._settings.composer_advisor_checkpoint_max_passes
         if _state_is_structurally_empty(state) or advisor_checkpoint_passes_used >= max_passes:
             return _TerminalNoToolAdvisorGateOutcome(action="fall_through")
@@ -4042,15 +4115,35 @@ class ComposerServiceImpl:
         if genuine_orphans:
             return _TerminalNoToolAdvisorGateOutcome(action="fall_through")
 
-        verdict = await self._run_advisor_checkpoint(
-            phase="end",
-            state=state,
-            session_id=session_id,
-            recorder=recorder,
-            progress=progress,
-        )
-        is_last_pass = (advisor_checkpoint_passes_used + 1) >= max_passes
-        terminal_block = (not verdict.ok) or (verdict.blocking and (is_last_pass or not allow_repair_continue))
+        # R2-F14 (elspeth-5403f346c0): a checkpoint that could not render a
+        # verdict (unavailable/malformed) used to terminal-block on the FIRST
+        # ``ok=False``, discarding whatever checkpoint budget remained — the
+        # gate had a re-review budget and refused to spend it on the one
+        # failure mode a re-ask can actually fix. It now re-asks while budget
+        # remains, and only blocks once the budget is genuinely spent.
+        #
+        # Single call site on purpose (the AST guard in
+        # ``test_advisor_checkpoint`` pins terminal no-tool paths to exactly one
+        # ``_run_advisor_checkpoint`` call in this method).
+        passes_delta = 0
+        while True:
+            verdict = await self._run_advisor_checkpoint(
+                phase="end",
+                state=state,
+                session_id=session_id,
+                recorder=recorder,
+                progress=progress,
+            )
+            passes_delta += 1
+            if verdict.ok or (advisor_checkpoint_passes_used + passes_delta) >= max_passes:
+                break
+
+        is_last_pass = (advisor_checkpoint_passes_used + passes_delta) >= max_passes
+        # ``not verdict.ok`` can only survive the loop above with the budget
+        # spent, so ``is_last_pass`` is True there and the gate always
+        # terminates blocked — it can never fall through to a silent finalize
+        # with no sign-off at all.
+        terminal_block = (verdict.blocking or not verdict.ok) and (is_last_pass or not allow_repair_continue)
         if terminal_block:
             orphan_result = await self._surface_pt_and_gate_orphans_or_none(
                 state=state,
@@ -4069,12 +4162,18 @@ class ComposerServiceImpl:
                         persisted_assistant_message_id=persisted_assistant_message_id,
                         persisted_tool_call_turn=persisted_tool_call_turn,
                     ),
-                    advisor_passes_delta=1,
+                    advisor_passes_delta=passes_delta,
                 )
+            # R2-F14: ``failure_class`` is READ here rather than every
+            # ``ok=False`` being labelled "unavailable". Only the EXACT value
+            # ``"unavailable"`` maps to the outage wording; ``"malformed"``,
+            # the ``"none"`` default, and any unrecognised value fall through
+            # to the fail-closed malformed wording (same asymmetry as the
+            # classification comment in ``_run_advisor_checkpoint``).
             return _TerminalNoToolAdvisorGateOutcome(
                 action="return",
                 result=self._advisor_blocked_result(
-                    reason="unavailable" if not verdict.ok else "exhausted",
+                    reason="exhausted" if verdict.ok else ("unavailable" if verdict.failure_class == "unavailable" else "malformed"),
                     verdict=verdict,
                     state=state,
                     assistant_message=assistant_message,
@@ -4082,8 +4181,9 @@ class ComposerServiceImpl:
                     repair_turns_used=repair_turns_used,
                     persisted_assistant_message_id=persisted_assistant_message_id,
                     persisted_tool_call_turn=persisted_tool_call_turn,
+                    runtime_preflight=runtime_preflight,
                 ),
-                advisor_passes_delta=1,
+                advisor_passes_delta=passes_delta,
             )
 
         if verdict.blocking:
@@ -4109,10 +4209,12 @@ class ComposerServiceImpl:
             )
             return _TerminalNoToolAdvisorGateOutcome(
                 action="continue",
-                advisor_passes_delta=1,
+                advisor_passes_delta=passes_delta,
                 advisor_injection_index=injection_index,
             )
 
+        # Fall-through terminates the turn (the caller finalizes and returns),
+        # so the consumed passes need not be charged forward.
         return _TerminalNoToolAdvisorGateOutcome(action="fall_through")
 
     async def _compose_loop(
@@ -5426,22 +5528,47 @@ class ComposerServiceImpl:
         repair_turns_used: int,
         persisted_assistant_message_id: str | None,
         persisted_tool_call_turn: bool,
+        runtime_preflight: ValidationResult | None,
     ) -> ComposerResult:
-        """Build the fail-closed end-gate ``ComposerResult`` (Task 6).
+        """Build the end-gate ``ComposerResult`` for a sign-off that did not pass.
 
-        Mirrors the orphan-gate finalize shape (the
-        ``_surface_and_finalize_no_tools`` orphan branch): a non-runnable
-        ``ValidationResult`` (every readiness axis False) carried on
-        ``runtime_preflight``, the advisor's findings folded into a
-        system-attributed augmented message, and the result threaded with
-        ``repair_turns_used`` plus the persisted ids so the route handler can
-        persist composer_meta uniformly. ``reason`` is ``"unavailable"`` (the
-        advisor could not be reached after bounded retry) or ``"exhausted"`` (it
-        flagged the pipeline on the last budgeted pass with no repair left).
+        ``reason`` is ``"unavailable"`` (transport outage after bounded retry),
+        ``"malformed"`` (the advisor was reachable but returned no usable
+        verdict even after the format re-prompt), or ``"exhausted"`` (it FLAGGED
+        the pipeline on the last budgeted pass with no repair left). The result
+        is threaded with ``repair_turns_used`` plus the persisted ids so the
+        route handler can persist composer_meta uniformly.
+
+        R2-F14 (elspeth-5403f346c0) — two shapes, chosen honestly:
+
+        * ``"exhausted"``, or a pipeline whose own validation failed: the
+          fail-closed shape (every readiness axis False, carried under the
+          "Runtime preflight failed…" notice). The pipeline really is not
+          finishable, and for ``"exhausted"`` the advisor named the defect.
+        * a GREEN ``runtime_preflight`` whose sign-off merely could not be
+          obtained: the build validated, so the validated result is carried
+          through with only ``completion_ready`` withheld, under a distinct
+          sign-off-pending notice. Reusing the runtime-preflight header here
+          told the user their preflight failed while the side rail showed it
+          green — the observed R2-F14 contradiction.
+
+        ``runtime_preflight is None`` (this turn's validation is unknown) fails
+        closed to the first shape.
         """
         raw_content = assistant_message.content or ""
-        runtime_result = _advisor_signoff_blocked_validation(reason=reason, findings=verdict.findings_text)
-        augmented = _compose_preflight_failure_message(raw_content, runtime_result=runtime_result)
+        validated_base = (
+            runtime_preflight if (reason != "exhausted" and runtime_preflight is not None and runtime_preflight.is_valid) else None
+        )
+        if validated_base is not None:
+            runtime_result = _advisor_signoff_pending_validation(
+                validated_base,
+                reason=reason,
+                findings=verdict.findings_text,
+            )
+            augmented = _compose_advisor_signoff_pending_message(raw_content)
+        else:
+            runtime_result = _advisor_signoff_blocked_validation(reason=reason, findings=verdict.findings_text)
+            augmented = _compose_preflight_failure_message(raw_content, runtime_result=runtime_result)
         _enforce_augmentation_prefix_invariant(
             branch="advisor_signoff_blocked_augmentation",
             content=raw_content,
@@ -5522,9 +5649,11 @@ class ComposerServiceImpl:
         arguments = self._build_checkpoint_arguments(phase=phase, state=state)
         attempts = 2  # bounded retry; the underlying call wraps its own timeout
         last_exc: Exception | None = None
+        last_response_unparseable = False
+        call_arguments: dict[str, Any] = arguments
         for _ in range(attempts):
             try:
-                guidance, _meta = await self._call_advisor_with_audit(arguments, recorder=recorder)
+                guidance, _meta = await self._call_advisor_with_audit(call_arguments, recorder=recorder)
             except Exception as exc:
                 # Convert-to-verdict (non-raising): the call core re-raises
                 # typed LLM errors (timeout, auth, transport, malformed); a
@@ -5532,8 +5661,32 @@ class ComposerServiceImpl:
                 # The raw exception is retained only to CLASSIFY the failure
                 # below (transport vs malformed) — never to render user text.
                 last_exc = exc
+                last_response_unparseable = False
+                call_arguments = arguments
                 continue
-            return _parse_advisor_checkpoint_guidance(guidance)
+            verdict = _parse_advisor_checkpoint_guidance(guidance)
+            if verdict.ok:
+                return verdict
+            # R2-F14 (elspeth-5403f346c0): a transport-SUCCESSFUL reply that
+            # simply did not state a verdict used to be terminal here — the
+            # bounded retry covered exceptions only, so one formatting slip by
+            # the advisor model failed the user's build closed. It now CONSUMES
+            # a retry and re-asks with an explicit one-line format re-prompt,
+            # through the same backend-produced arguments contract (no bypass
+            # channel, no second prompt path).
+            last_exc = None
+            last_response_unparseable = True
+            call_arguments = _advisor_arguments_with_format_reprompt(arguments)
+        if last_response_unparseable:
+            # The advisor was REACHABLE on the final attempt and still returned
+            # no verdict. That is MALFORMED, not unavailable — the distinction
+            # the END gate reads to pick honest user-facing wording.
+            return AdvisorCheckpointVerdict(
+                ok=False,
+                blocking=False,
+                failure_class="malformed",
+                findings_text=_ADVISOR_MALFORMED_USER_DETAIL,
+            )
         # Bounded retry exhausted. The call core re-raises typed LLM errors, so
         # classify the LAST exception into a failure CLASS the END gate can act
         # on differently (D13/P5.3): a timeout/transport/auth/rate-limit outage
@@ -5950,7 +6103,14 @@ _ADVISOR_UNTRUSTED_SUMMARY_HEADER: Final[str] = (
 )
 _ADVISOR_UNTRUSTED_SUMMARY_BEGIN: Final[str] = "BEGIN_UNTRUSTED_PIPELINE_SUMMARY"
 _ADVISOR_UNTRUSTED_SUMMARY_END: Final[str] = "END_UNTRUSTED_PIPELINE_SUMMARY"
-_ADVISOR_VERDICT_MARKER_RE: Final[re.Pattern[str]] = re.compile(r"\b(CLEAN|FLAGGED)\b", re.IGNORECASE)
+# R2-F14 (elspeth-5403f346c0): the verdict marker scan is deliberately
+# case-SENSITIVE. The advisor prompt asks for a literal ``CLEAN``/``FLAGGED``
+# token, and a case-insensitive scan across a whole line fails OPEN on ordinary
+# adjectival prose ("the extracted data looks clean and consistent"), which
+# would silently mint a sign-off. Case-any-register replies are still accepted,
+# but only through the ANCHORED ``_ADVISOR_VERDICT_LINE_RE`` fallback below,
+# where a leading bare "clean"/"flagged" token is unambiguous.
+_ADVISOR_VERDICT_MARKER_RE: Final[re.Pattern[str]] = re.compile(r"\b(CLEAN|FLAGGED)\b")
 _ADVISOR_VERDICT_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^(CLEAN|FLAGGED)\b(?:\s*[:.\-]\s*|\s+|$)", re.IGNORECASE)
 # Each family below trips the scan ALONE (elspeth-4f7377f99d/C2): a template
 # author does not need both an "ignore/override" verb-phrase AND a
@@ -6104,18 +6264,41 @@ class AdvisorCheckpointVerdict:
 
 
 def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdict:
+    """Map an advisor reply to a verdict, tolerating real model formatting.
+
+    R2-F14 (elspeth-5403f346c0). The prompt asks only "Start your reply with
+    CLEAN or FLAGGED", and live advisor models comply in spirit while breaking
+    a strict first-line-anchored match: ``**CLEAN**``, ``Verdict: FLAGGED``, a
+    one-line preamble before the verdict, or a FLAGGED verdict whose prose
+    mentions CLEAN ("FLAGGED — ... otherwise this would be CLEAN"). Each of
+    those used to be declared MALFORMED and fail the build closed, which is a
+    formatting quibble presented to the user as a build failure.
+
+    So: strip markdown emphasis, scan the first
+    :data:`_ADVISOR_VERDICT_SCAN_MAX_LINES` non-empty lines, and take the FIRST
+    verdict marker found. The old "reply mentions both words => malformed"
+    tripwire is gone (first-marker-wins); a genuinely verdict-less reply is
+    still MALFORMED, and the caller now spends a retry re-asking for the
+    format rather than terminating the build.
+    """
     text = guidance.strip()
-    markers = [match.group(1).upper() for match in _ADVISOR_VERDICT_MARKER_RE.finditer(text)]
-    if not text or not markers or ("CLEAN" in markers and "FLAGGED" in markers):
-        return AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text=_ADVISOR_MALFORMED_USER_DETAIL, failure_class="malformed")
+    scanned = 0
+    for raw_line in text.splitlines():
+        line = _ADVISOR_MARKDOWN_EMPHASIS_RE.sub("", raw_line).strip()
+        if not line:
+            continue
+        scanned += 1
+        if scanned > _ADVISOR_VERDICT_SCAN_MAX_LINES:
+            break
+        # Cased search anywhere in the line first (``**CLEAN**``, ``Verdict:
+        # FLAGGED``, "<preamble> FLAGGED"), then the any-register ANCHORED
+        # fallback for a bare leading token written in lowercase.
+        marker = _ADVISOR_VERDICT_MARKER_RE.search(line) or _ADVISOR_VERDICT_LINE_RE.match(line)
+        if marker is None:
+            continue
+        return AdvisorCheckpointVerdict(ok=True, blocking=marker.group(1).upper() == "FLAGGED", findings_text=text)
 
-    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
-    first_marker = _ADVISOR_VERDICT_LINE_RE.match(first_line)
-    if first_marker is None:
-        return AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text=_ADVISOR_MALFORMED_USER_DETAIL, failure_class="malformed")
-
-    blocking = first_marker.group(1).upper() == "FLAGGED"
-    return AdvisorCheckpointVerdict(ok=True, blocking=blocking, findings_text=text)
+    return AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text=_ADVISOR_MALFORMED_USER_DETAIL, failure_class="malformed")
 
 
 def _looks_like_advisor_prompt_injection(value: str) -> bool:
@@ -6484,11 +6667,17 @@ def _advisor_signoff_blocked_validation(*, reason: str, findings: str) -> Valida
     """Build the synthetic, fail-closed end-gate result for a blocked sign-off.
 
     Returned (not raised) by the END authoritative advisor gate
-    (:meth:`ComposerServiceImpl._advisor_blocked_result`) when the advisor is
-    either *unavailable* after bounded retry (``reason="unavailable"``) or has
-    FLAGGED the pipeline on the last budgeted pass with no further repair
-    possible (``reason="exhausted"``). The advisor is the mandatory final
-    authority, so both outcomes fail closed.
+    (:meth:`ComposerServiceImpl._advisor_blocked_result`) when the advisor
+    could not render a verdict after bounded retry (``reason="unavailable"``
+    or ``"malformed"``) or has FLAGGED the pipeline on the last budgeted pass
+    with no further repair possible (``reason="exhausted"``). The advisor is
+    the mandatory final authority, so all outcomes fail closed.
+
+    R2-F14: this fully-blocking shape is now used only when the pipeline's own
+    validation ALSO failed, or when the advisor genuinely flagged a defect
+    (``"exhausted"``). A green build whose sign-off merely could not be
+    obtained takes :func:`_advisor_signoff_pending_validation` instead, which
+    gates completion without lying about validation.
 
     Mirrors :func:`_orphaned_interpretation_review_validation`'s shape: every
     readiness axis is blocking (``authoring_valid`` / ``execution_ready`` /
@@ -6513,17 +6702,7 @@ def _advisor_signoff_blocked_validation(*, reason: str, findings: str) -> Valida
     deliberately NOT truncated, so its wording stays literal for the Tier-3
     egress contract.
     """
-    detail = (
-        f"The advisor sign-off did not pass ({reason}); the pipeline cannot complete.\n\n"
-        f"Advisor findings (untrusted, quoted):\n{_truncate_advisor_findings(findings)}"
-        if reason == "exhausted"
-        else f"The advisor sign-off could not be obtained ({reason}); the pipeline cannot complete. {findings}"
-    )
-    suggestion = (
-        "Resolve the advisor's flagged concern and re-run the composer."
-        if reason == "exhausted"
-        else "The advisor model was unavailable after retry; retry the request, or check the advisor model configuration."
-    )
+    detail, suggestion = _advisor_signoff_blocked_wording(reason=reason, findings=findings)
     return ValidationResult(
         is_valid=False,
         checks=[
@@ -6647,3 +6826,126 @@ def _fence_advisor_findings(findings_text: str) -> str:
         _ADVISOR_FINDINGS_UNTRUSTED_END[0] + "\\" + _ADVISOR_FINDINGS_UNTRUSTED_END[1:],
     )
     return f"{_ADVISOR_FINDINGS_UNTRUSTED_BEGIN}\n{text}\n{_ADVISOR_FINDINGS_UNTRUSTED_END}"
+
+
+# ---------------------------------------------------------------------------
+# R2-F14 (elspeth-5403f346c0): tolerant verdict parsing + budgeted format retry.
+#
+# Appended at EOF for the same AST-fingerprint-stability reason documented at
+# the Task-4 primitives above: inserting a module-level symbol mid-file rotates
+# every downstream symbol's fingerprint. Python resolves these names at call
+# time, so the forward references from ``_parse_advisor_checkpoint_guidance``
+# and ``_run_advisor_checkpoint`` (both defined earlier) are safe.
+# ---------------------------------------------------------------------------
+# How many leading non-empty lines the verdict scan inspects. Bounded so a
+# rambling advisor reply cannot bury a verdict token under arbitrary prose and
+# still be accepted: past this window the reply is not a compliant sign-off and
+# is re-prompted instead.
+_ADVISOR_VERDICT_SCAN_MAX_LINES: Final[int] = 5
+# Markdown emphasis / code-span punctuation stripped before the verdict scan.
+# ``*`` and backtick are already non-word characters (so ``**CLEAN**`` matches
+# ``\bCLEAN\b`` regardless), but ``_`` is a WORD character — without stripping
+# it, ``__CLEAN__`` never matches. Applied only to the scanned copy of the
+# line; ``findings_text`` keeps the advisor's original text verbatim.
+_ADVISOR_MARKDOWN_EMPHASIS_RE: Final[re.Pattern[str]] = re.compile(r"[*_`~]")
+# The one-line re-prompt appended to the (Tier-1, backend-produced) checkpoint
+# ``problem_summary`` when a transport-successful reply could not be parsed as
+# a verdict. It travels the SAME contracted advisor-arguments channel as the
+# first attempt — there is no second, unaudited prompt path.
+_ADVISOR_VERDICT_FORMAT_REPROMPT: Final[str] = "Reply with exactly CLEAN or FLAGGED on line 1."
+
+
+def _advisor_arguments_with_format_reprompt(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a copy of the checkpoint arguments carrying the format re-prompt.
+
+    The retry must not lose the original problem summary (the rubric, the
+    degeneracy directive, the pipeline excerpt) — it only adds an explicit
+    restatement of the output format the previous reply failed to honour.
+    """
+    retry = dict(arguments)
+    retry["problem_summary"] = f"{arguments['problem_summary']} {_ADVISOR_VERDICT_FORMAT_REPROMPT}"
+    return retry
+
+
+def _advisor_signoff_blocked_wording(*, reason: str, findings: str) -> tuple[str, str]:
+    """Return the (detail, suggestion) pair for one blocked-sign-off reason.
+
+    Shared by the fully-blocking result (:func:`_advisor_signoff_blocked_validation`)
+    and the validated-but-unsigned result (:func:`_advisor_signoff_pending_validation`)
+    so the two surfaces cannot drift.
+
+    R2-F14: ``reason`` is now the RESOLVED failure class, not a fixed literal.
+    The old text interpolated ``(unavailable)`` unconditionally and then
+    appended a ``findings`` constant that could say "advisor response was
+    malformed" — a note that contradicted itself in the same sentence. The
+    reason parenthetical is dropped from the could-not-be-obtained branches
+    entirely: ``findings`` already names the class in plain language.
+    """
+    if reason == "exhausted":
+        return (
+            f"The advisor sign-off did not pass ({reason}); the pipeline cannot complete.\n\n"
+            f"Advisor findings (untrusted, quoted):\n{_truncate_advisor_findings(findings)}",
+            "Resolve the advisor's flagged concern and re-run the composer.",
+        )
+    if reason == "unavailable":
+        return (
+            f"The advisor sign-off could not be obtained; the pipeline cannot complete. {findings}",
+            "The advisor model was unavailable after retry; retry the request, or check the advisor model configuration.",
+        )
+    return (
+        f"The advisor sign-off could not be obtained; the pipeline cannot complete. {findings}",
+        "The advisor returned no usable verdict after a format retry; retry the request, or check the advisor model configuration.",
+    )
+
+
+def _advisor_signoff_pending_validation(base: ValidationResult, *, reason: str, findings: str) -> ValidationResult:
+    """Gate COMPLETION only, on a pipeline whose validation genuinely passed.
+
+    R2-F14 (elspeth-5403f346c0). ``_advisor_signoff_blocked_validation`` zeroes
+    every readiness axis, which is right when the pipeline is actually broken
+    and wrong when it is not: an advisor that never rendered a verdict says
+    nothing about whether the build validates. Reporting a green build as
+    authoring-invalid AND execution-unready (under a "Runtime preflight
+    failed" header) is a false statement about the user's pipeline.
+
+    So when ``validate_pipeline`` is green and only the sign-off is missing,
+    the validated result is carried through unchanged — ``is_valid``,
+    ``errors``, ``authoring_valid`` and ``execution_ready`` all stay as
+    validation found them — and ONLY ``completion_ready`` is withheld, with an
+    ``advisor_signoff_blocked`` blocker and a failed ``advisor_signoff`` check
+    naming why. The turn is still not "complete"; it is simply no longer
+    mislabelled as a validation failure.
+
+    Applies to the could-not-be-obtained classes only. A FLAGGED sign-off on
+    the last budgeted pass (``reason="exhausted"``) is a real defect the
+    advisor named, so it keeps the fully-blocking result.
+    """
+    detail, _suggestion = _advisor_signoff_blocked_wording(reason=reason, findings=findings)
+    return base.model_copy(
+        update={
+            "checks": [
+                *base.checks,
+                ValidationCheck(
+                    name=_ADVISOR_SIGNOFF_BLOCKED_CHECK_NAME,
+                    passed=False,
+                    detail=detail,
+                    affected_nodes=(),
+                    outcome_code=None,
+                ),
+            ],
+            "readiness": ValidationReadiness(
+                authoring_valid=base.readiness.authoring_valid,
+                execution_ready=base.readiness.execution_ready,
+                completion_ready=False,
+                blockers=[
+                    *base.readiness.blockers,
+                    ValidationReadinessBlocker(
+                        code=_ADVISOR_SIGNOFF_BLOCKED_CODE,
+                        component_id="pipeline",
+                        component_type="pipeline",
+                        detail=detail,
+                    ),
+                ],
+            ),
+        }
+    )

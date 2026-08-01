@@ -67,6 +67,18 @@ _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE = (
     _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _PREFLIGHT_NOTICE_HEADER + "\n\n" + _PREFLIGHT_NOTICE_FOOTER
 )
 
+# R2-F14 (elspeth-5403f346c0): the advisor end gate used to borrow
+# ``_PREFLIGHT_NOTICE_HEADER`` for a sign-off that never rendered, telling the
+# user "Runtime preflight failed" on a build whose preflight had just PASSED
+# (green side rail, contradictory note). This notice is the honest alternative:
+# it states what actually happened and what to do, and — unlike the preflight
+# wrapper — carries no interpolated diagnostic, so the whole suffix is fixed
+# operator-authored prose.
+_ADVISOR_SIGNOFF_PENDING_NOTICE: Final = (
+    "Advisor sign-off could not be completed — built and validated; final sign-off pending. Retry to complete."
+)
+_ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_NOTICE
+
 _MAX_INTENT_CLASSIFICATION_CHARS: Final = 4_096
 _MUTATION_ACTION_PATTERN: Final = (
     r"(?:set\s+(?:this|it)\s+up|set\s+up|setup|build|create|make|wire|add|update|modify|change|run|execute|process|route|split|save)"
@@ -318,6 +330,8 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
     )
     if empty_with_blocker is not None:
         return empty_with_blocker
+    if suffix == _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_NOTICE),)
     if suffix == _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE:
         return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_PREFLIGHT_NOTICE_FOOTER}"),)
     preflight_with_diagnostic = _split_wrapped_diagnostic(
@@ -421,6 +435,20 @@ def compose_preflight_failure_message(content: str, *, runtime_result: Validatio
     if not content:
         return suffix.lstrip("\n").lstrip("-").lstrip()
     return content + suffix
+
+
+def compose_advisor_signoff_pending_message(content: str) -> str:
+    """Build the user-facing message for a validated-but-unsigned build.
+
+    Deliberately NOT ``compose_preflight_failure_message``: the runtime
+    preflight passed, so a "Runtime preflight failed" header would be a false
+    statement about the user's pipeline (R2-F14, elspeth-5403f346c0). The
+    suffix is entirely fixed prose — no validator detail is interpolated,
+    because there is no validator objection to report.
+    """
+    if not content:
+        return _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
+    return content + _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX
 
 
 def _strip_quoted_text(message: str) -> tuple[str, bool, bool]:

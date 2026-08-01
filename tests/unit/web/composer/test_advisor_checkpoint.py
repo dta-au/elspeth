@@ -40,7 +40,7 @@ from elspeth.web.composer.state import (
     SourceSpec,
 )
 from elspeth.web.config import WebSettings
-from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
+from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult
 
 _ROOT = Path(__file__).resolve().parents[4]
 
@@ -514,17 +514,133 @@ async def test_run_advisor_checkpoint_clean_verdict(make_service, simple_state):
     assert verdict.ok is True and verdict.blocking is False
 
 
-@pytest.mark.asyncio
-async def test_run_advisor_checkpoint_rejects_conflicting_verdict_markers(make_service, simple_state):
-    service = make_service()
-    service._call_advisor_with_audit = _AsyncRecorder(return_value=("CLEAN: intent satisfied\nFLAGGED: sink drops the rating field", {}))
+# ---------------------------------------------------------------------------
+# R2-F14 (elspeth-5403f346c0): tolerant verdict parsing.
+#
+# The prompt asks only "Start your reply with CLEAN or FLAGGED". Live advisor
+# models routinely comply in spirit while breaking the old strict
+# first-line-anchored regex: markdown emphasis, a ``Verdict:`` label, a short
+# preamble line, or a FLAGGED verdict whose prose mentions CLEAN. Every one of
+# those used to be declared MALFORMED and fail the build closed. Parsing now
+# strips markdown emphasis, scans the first
+# ``_ADVISOR_VERDICT_SCAN_MAX_LINES`` non-empty lines, and takes the FIRST
+# verdict marker it finds.
+# ---------------------------------------------------------------------------
 
-    verdict = await service._run_advisor_checkpoint(phase="end", state=simple_state, session_id="s1", recorder=make_recorder())
+
+@pytest.mark.parametrize(
+    ("guidance", "expected_blocking"),
+    [
+        ("**CLEAN**", False),
+        ("**FLAGGED** — the sink drops the rating field", True),
+        ("__CLEAN__ - intent satisfied", False),
+        ("`CLEAN`", False),
+        ("Verdict: FLAGGED\nThe sink drops the rating field.", True),
+        ("Verdict: CLEAN", False),
+        ("**Verdict:** **FLAGGED**", True),
+        ("I reviewed the pipeline and its field contracts.\nFLAGGED: the sink drops the rating field.", True),
+        ("Here is my review.\n\nCLEAN — intent satisfied, contracts consistent.", False),
+        ("FLAGGED — the sink drops the rating field; otherwise this would be CLEAN.", True),
+        ("CLEAN — nothing to flag here.", False),
+    ],
+)
+def test_parse_advisor_verdict_tolerates_real_model_formatting(guidance: str, expected_blocking: bool) -> None:
+    """R2-F14: markdown emphasis, ``Verdict:`` labels, preambles and a FLAGGED
+    verdict that merely mentions CLEAN must all parse to a real verdict."""
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance(guidance)
+
+    assert verdict.ok is True, f"declared malformed: {guidance!r}"
+    assert verdict.blocking is expected_blocking
+    assert verdict.failure_class == "none"
+    assert verdict.findings_text == guidance.strip()
+
+
+def test_parse_advisor_verdict_first_marker_wins() -> None:
+    """R2-F14: the both-words tripwire is gone — the FIRST marker decides.
+
+    (The old rule declared any reply containing both words MALFORMED, which
+    fail-closed-blocked the common ``FLAGGED ... would otherwise be CLEAN``
+    shape. See the report's concern note on the CLEAN-then-FLAGGED ordering.)
+    """
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    clean_first = _parse_advisor_checkpoint_guidance("CLEAN: intent satisfied\nFLAGGED: sink drops the rating field")
+    assert clean_first.ok is True and clean_first.blocking is False
+
+    flagged_first = _parse_advisor_checkpoint_guidance("FLAGGED: sink drops the rating field\nCLEAN otherwise")
+    assert flagged_first.ok is True and flagged_first.blocking is True
+
+
+@pytest.mark.parametrize(
+    "guidance",
+    [
+        "",
+        "   \n\n  ",
+        "The pipeline looks fine to me.",
+        # Beyond the bounded scan window: a verdict buried under five lines of
+        # preamble is not a compliant reply and must still be re-prompted.
+        "one\ntwo\nthree\nfour\nfive\nsix\nCLEAN",
+        # Adjectival lowercase prose must NOT be mistaken for a verdict marker
+        # (fail-OPEN risk: "the data looks clean" is not a sign-off).
+        "The extracted data looks clean and the contracts are consistent.",
+    ],
+)
+def test_parse_advisor_verdict_still_declares_malformed(guidance: str) -> None:
+    from elspeth.web.composer.service import _ADVISOR_MALFORMED_USER_DETAIL, _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance(guidance)
 
     assert verdict.ok is False
     assert verdict.blocking is False
     assert verdict.failure_class == "malformed"
-    assert verdict.findings_text == "advisor response was malformed"
+    assert verdict.findings_text == _ADVISOR_MALFORMED_USER_DETAIL
+
+
+# ---------------------------------------------------------------------------
+# R2-F14: a parse-malformed response CONSUMES a retry.
+#
+# Before the fix, ``attempts=2`` covered only EXCEPTIONS: a transport-successful
+# but format-nonconforming response was terminal on the first pass. Now a
+# malformed parse re-asks through the SAME contracted/fenced advisor-arguments
+# channel with an explicit format re-prompt.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_malformed_response_consumes_retry_with_format_reprompt(make_service, simple_state):
+    from elspeth.web.composer.service import _ADVISOR_VERDICT_FORMAT_REPROMPT
+
+    service = make_service()
+    replies = iter([("I have no opinion.", {}), ("CLEAN — intent satisfied", {})])
+    service._call_advisor_with_audit = _AsyncRecorder(side_effect=lambda *a, **k: next(replies))
+
+    verdict = await service._run_advisor_checkpoint(phase="end", state=simple_state, session_id="s1", recorder=make_recorder())
+
+    assert verdict.ok is True and verdict.blocking is False
+    assert service._call_advisor_with_audit.await_count == 2
+    # The retry goes through the ordinary (Tier-1, backend-produced) advisor
+    # arguments contract — problem_summary — never a bypass channel.
+    retry_arguments = service._call_advisor_with_audit.calls[1].args[0]
+    assert _ADVISOR_VERDICT_FORMAT_REPROMPT in retry_arguments["problem_summary"]
+    first_arguments = service._call_advisor_with_audit.calls[0].args[0]
+    assert _ADVISOR_VERDICT_FORMAT_REPROMPT not in first_arguments["problem_summary"]
+
+
+@pytest.mark.asyncio
+async def test_persistently_malformed_response_exhausts_retry_as_malformed(make_service, simple_state):
+    from elspeth.web.composer.service import _ADVISOR_MALFORMED_USER_DETAIL
+
+    service = make_service()
+    service._call_advisor_with_audit = _AsyncRecorder(return_value=("I have no opinion.", {}))
+
+    verdict = await service._run_advisor_checkpoint(phase="end", state=simple_state, session_id="s1", recorder=make_recorder())
+
+    assert service._call_advisor_with_audit.await_count == 2
+    assert verdict.ok is False
+    assert verdict.failure_class == "malformed"
+    assert verdict.findings_text == _ADVISOR_MALFORMED_USER_DETAIL
 
 
 @pytest.mark.asyncio
@@ -647,6 +763,8 @@ async def drive_try_terminate(
     *,
     advisor_checkpoint_passes_used: int,
     llm_messages: list[dict[str, object]] | None = None,
+    repair_turns_used: int = 0,
+    runtime_preflight_valid: bool = True,
 ):
     """Drive ``_try_terminate_no_tools`` with the full kwarg set.
 
@@ -672,11 +790,32 @@ async def drive_try_terminate(
     # preflight-repair gate runs BEFORE it and would intercept a preflight-invalid
     # state. These tests exercise the ADVISOR, so stub the runtime preflight valid
     # to establish that precondition (the preflight gate is covered separately).
-    service._runtime_preflight = lambda candidate, user_id=None, session_id=None: ValidationResult(
-        is_valid=True,
-        checks=[],
-        errors=[],
-        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    service._runtime_preflight = (
+        (
+            lambda candidate, user_id=None, session_id=None: ValidationResult(
+                is_valid=True,
+                checks=[],
+                errors=[],
+                readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+            )
+        )
+        if runtime_preflight_valid
+        else (
+            lambda candidate, user_id=None, session_id=None: ValidationResult(
+                is_valid=False,
+                checks=[],
+                errors=[
+                    ValidationError(
+                        component_id="rate",
+                        component_type="transform",
+                        message="node 'rate' requires field 'url' which no upstream emits",
+                        suggestion=None,
+                        error_code=None,
+                    )
+                ],
+                readiness=ValidationReadiness(authoring_valid=False, execution_ready=False, completion_ready=False, blockers=[]),
+            )
+        )
     )
     return await service._try_terminate_no_tools(
         assistant_message=_AssistantMessage(),
@@ -693,7 +832,7 @@ async def drive_try_terminate(
         mutation_success_seen=True,
         recorder=make_recorder(),
         progress=None,
-        repair_turns_used=0,
+        repair_turns_used=repair_turns_used,
         persisted_assistant_message_id=None,
         persisted_tool_call_turn=False,
         advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
@@ -892,24 +1031,180 @@ async def test_end_gate_unavailable_wire_payload_stays_fixed_language(make_servi
 
     service = make_service()
     service._run_advisor_checkpoint = _AsyncRecorder(
-        return_value=AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text=_ADVISOR_UNAVAILABLE_USER_DETAIL)
+        return_value=AdvisorCheckpointVerdict(
+            ok=False, blocking=False, findings_text=_ADVISOR_UNAVAILABLE_USER_DETAIL, failure_class="unavailable"
+        )
     )
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
     assert outcome.action == "return"
-    detail = outcome.result.runtime_preflight.errors[0].message
+    # Validation is green here, so the detail rides the sign-off-pending
+    # blocker rather than a (nonexistent) validation error — the fixed-language
+    # requirement is unchanged.
+    detail = outcome.result.runtime_preflight.readiness.blockers[0].detail
     assert _ADVISOR_UNAVAILABLE_USER_DETAIL in detail
     assert _ADVISOR_FINDINGS_UNTRUSTED_BEGIN not in detail
 
 
 @pytest.mark.asyncio
 async def test_end_gate_unavailable_fails_closed(make_service, clean_runnable_state):
+    """A sign-off that never rendered still gates completion — but honestly.
+
+    R2-F14: the pipeline WAS built and validated (the preflight-repair gate
+    ahead of this one is green), so the rail must not be reddened. Only
+    ``completion_ready`` is gated, and the blocker names the advisor sign-off.
+    """
     service = make_service()
     service._run_advisor_checkpoint = _AsyncRecorder(
-        return_value=AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text="unavailable")
+        return_value=AdvisorCheckpointVerdict(
+            ok=False, blocking=False, findings_text=_ADVISOR_UNAVAILABLE_USER_DETAIL, failure_class="unavailable"
+        )
     )
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
     assert outcome.action == "return"
+    preflight = outcome.result.runtime_preflight
+    assert preflight.is_valid is True  # validation genuinely passed
+    assert preflight.readiness.authoring_valid is True
+    assert preflight.readiness.completion_ready is False  # only "complete" is gated
+    assert [b.code for b in preflight.readiness.blockers] == ["advisor_signoff_blocked"]
+
+
+@pytest.mark.asyncio
+async def test_end_gate_signoff_pending_note_is_not_the_preflight_header(make_service, clean_runnable_state):
+    """R2-F14: with validation green, the system note must NOT claim runtime
+    preflight failed — it says the build passed and only sign-off is pending."""
+    from elspeth.web.composer.no_tool_policy import _ADVISOR_SIGNOFF_PENDING_NOTICE, _PREFLIGHT_NOTICE_HEADER
+
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(
+            ok=False, blocking=False, findings_text=_ADVISOR_UNAVAILABLE_USER_DETAIL, failure_class="unavailable"
+        )
+    )
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
+
+    message = outcome.result.message
+    assert _ADVISOR_SIGNOFF_PENDING_NOTICE in message
+    assert _PREFLIGHT_NOTICE_HEADER not in message
+    assert message.startswith(outcome.result.raw_assistant_content or "")
+
+
+def test_signoff_pending_note_mints_trusted_chrome() -> None:
+    """The new note must be in the CLOSED canonical-suffix set, or it renders
+    as ordinary (untrusted) assistant text with no system attribution."""
+    from elspeth.web.composer.no_tool_policy import (
+        _ADVISOR_SIGNOFF_PENDING_NOTICE,
+        TrustedSystemNoticeSegment,
+        compose_advisor_signoff_pending_message,
+        visible_message_segments,
+    )
+
+    raw = "Done — the pipeline is ready."
+    content = compose_advisor_signoff_pending_message(raw)
+    segments = visible_message_segments(content=content, raw_content=raw)
+
+    assert segments[-1] == TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_NOTICE)
+
+
+@pytest.mark.asyncio
+async def test_end_gate_keeps_preflight_header_when_validation_is_red(make_service, clean_runnable_state):
+    """R2-F14 scope guard: when validation genuinely failed, the existing
+    runtime-preflight header stays correct and the result stays fully red."""
+    from elspeth.web.composer.no_tool_policy import _ADVISOR_SIGNOFF_PENDING_NOTICE, _PREFLIGHT_NOTICE_HEADER
+
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(
+            ok=False, blocking=False, findings_text=_ADVISOR_UNAVAILABLE_USER_DETAIL, failure_class="unavailable"
+        )
+    )
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        repair_turns_used=2,  # repair budget exhausted -> the preflight gate cannot intercept
+        runtime_preflight_valid=False,
+    )
+
+    assert outcome.action == "return"
     assert outcome.result.runtime_preflight.is_valid is False
+    assert outcome.result.runtime_preflight.readiness.execution_ready is False
+    assert _PREFLIGHT_NOTICE_HEADER in outcome.result.message
+    assert _ADVISOR_SIGNOFF_PENDING_NOTICE not in outcome.result.message
+
+
+@pytest.mark.asyncio
+async def test_end_gate_not_ok_first_pass_spends_remaining_checkpoint_budget(make_service, clean_runnable_state):
+    """R2-F14: a first-pass ``ok=False`` no longer terminal-blocks while
+    checkpoint budget remains — the gate re-asks the advisor."""
+    service = make_service()
+    verdicts = iter(
+        [
+            AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text=_ADVISOR_UNAVAILABLE_USER_DETAIL, failure_class="unavailable"),
+            AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
+        ]
+    )
+    service._run_advisor_checkpoint = _AsyncRecorder(side_effect=lambda *a, **k: next(verdicts))
+
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
+
+    assert service._run_advisor_checkpoint.await_count == 2
+    assert outcome.action == "return"
+    # Fell through to the ordinary finalize tail (the canned runnable result):
+    # the second pass produced a real CLEAN sign-off, so the turn completes.
+    assert outcome.result.runtime_preflight is None or outcome.result.runtime_preflight.is_valid
+
+
+@pytest.mark.asyncio
+async def test_end_gate_persistently_not_ok_terminal_blocks_once_budget_is_spent(make_service, clean_runnable_state):
+    """The relaxed budget rule must not open a fall-through hole: a
+    persistently unresolvable sign-off still terminates the turn blocked, and
+    it must charge every pass it consumed so the budget actually converges."""
+    service = make_service()  # composer_advisor_checkpoint_max_passes default 2
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(
+            ok=False, blocking=False, findings_text=_ADVISOR_UNAVAILABLE_USER_DETAIL, failure_class="unavailable"
+        )
+    )
+
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
+
+    assert service._run_advisor_checkpoint.await_count == 2
+    assert outcome.action == "return"
+    assert outcome.advisor_passes_delta == 2
+    assert outcome.result.runtime_preflight.readiness.completion_ready is False
+
+
+@pytest.mark.asyncio
+async def test_end_gate_malformed_is_not_labelled_unavailable(make_service, clean_runnable_state):
+    """R2-F14: ``failure_class`` is now READ. A malformed sign-off must not be
+    surfaced with the "(unavailable)" reason and the unavailable suggestion —
+    the self-contradicting "could not be obtained (unavailable)... advisor
+    response was malformed" pair was the reported symptom."""
+    from elspeth.web.composer.service import _ADVISOR_MALFORMED_USER_DETAIL
+
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(
+            ok=False, blocking=False, findings_text=_ADVISOR_MALFORMED_USER_DETAIL, failure_class="malformed"
+        )
+    )
+
+    outcome = await drive_try_terminate(
+        service,
+        clean_runnable_state,
+        advisor_checkpoint_passes_used=0,
+        repair_turns_used=2,
+        runtime_preflight_valid=False,  # red -> the structured wire payload is exercised
+    )
+
+    detail = outcome.result.runtime_preflight.errors[0].message
+    suggestion = outcome.result.runtime_preflight.errors[0].suggestion or ""
+    assert "unavailable" not in detail
+    assert "unavailable" not in suggestion
+    # The detail names the class once, in plain language — no "(unavailable)"
+    # parenthetical contradicting a "response was malformed" tail.
+    assert _ADVISOR_MALFORMED_USER_DETAIL in detail
+    assert "(malformed)" not in detail
 
 
 @pytest.mark.asyncio
@@ -922,21 +1217,24 @@ async def test_end_gate_unavailable_redacts_raw_provider_exception(make_service,
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
 
     assert outcome.action == "return"
-    assert outcome.result.runtime_preflight.is_valid is False
+    preflight = outcome.result.runtime_preflight
+    assert preflight.readiness.completion_ready is False
     exposed_surfaces = [
         outcome.result.message,
-        outcome.result.runtime_preflight.errors[0].message,
-        outcome.result.runtime_preflight.errors[0].suggestion or "",
-        outcome.result.runtime_preflight.checks[0].detail,
-        outcome.result.runtime_preflight.readiness.blockers[0].detail,
-        outcome.result.runtime_preflight.model_dump_json(),
+        *(error.message for error in preflight.errors),
+        *((error.suggestion or "") for error in preflight.errors),
+        *(check.detail for check in preflight.checks),
+        *(blocker.detail for blocker in preflight.readiness.blockers),
+        preflight.model_dump_json(),
     ]
     for text in exposed_surfaces:
         assert "sk-live-secret" not in text
         assert "internal-provider.example" not in text
         assert "request_id=req-secret" not in text
         assert "RuntimeError" not in text
-    assert "advisor model was unavailable after retry" in outcome.result.message
+    # A RuntimeError is NOT on the transport allowlist -> it fails closed as
+    # MALFORMED, and must no longer be mislabelled "unavailable" (R2-F14).
+    assert "unavailable" not in preflight.model_dump_json()
     assert service._call_advisor_with_audit.await_count >= 2
 
 
