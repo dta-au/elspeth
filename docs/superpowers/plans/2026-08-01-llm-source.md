@@ -1,905 +1,457 @@
 # Source-Native Single-Prompt LLM Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** Use `superpowers:subagent-driven-development` or `superpowers:executing-plans`, and test-drive each unfinished task. Work only in `/home/john/elspeth/.claude/worktrees/llm-source` on `codex/llm-source`.
 
-**Goal:** Add a source-only `llm` plugin that makes one static-prompt provider call and emits one response/usage/model row, while closing every required-control and external-egress parity gap for source-kind LLMs.
+**Goal:** Add a pluggable source-only `llm` plugin that takes one authored prompt, makes one provider call without input rows, and emits exactly one row whose configurable response, usage, and model fields match the LLM transform contract, while closing every source-kind required-control, audit, runtime, discovery, and authoring parity gap.
 
-**Architecture:** The source implements `BaseSource` directly and owns source lifecycle, schema validation, and a single emitted `SourceRow`; it shares provider adapters and pure LLM helpers without constructing a transform or fake row. Provider calls receive a discriminated `LLMAuditParent`, allowing transforms to retain state/token audit parentage and the source to use its real `source_load` operation. Web capability coverage and auto-wiring gain source-aware Content Safety post-domination, while Prompt Shield remains transform-input-only by explicit test.
+**Architecture:** `LLMSource` implements `BaseSource` directly. It never constructs a transform or synthetic input row. Provider calls share neutral LLM validation, catalogue, finish-reason, operational-field, tracing, and provider-adapter primitives. The real `source_load` operation is the audit parent; no state or token exists before a row is yielded. Content Safety must post-dominate generated output, including alternate source exits; Prompt Shield remains deliberately transform-input-only because this source prompt is author-authored static/lookup configuration.
 
-**Tech Stack:** Python 3.13, Pydantic v2, Jinja2 sandboxing, pytest, ELSPETH plugin/runtime contracts, React 18, TypeScript, Vitest.
+**Output contract:** If `response_field: answer`, the source emits `answer`, `answer_usage`, and `answer_model`. `populate_llm_operational_fields()` is authoritative: usage is reported-provider data only. Preserve known, partial, unknown, and internally inconsistent totals exactly; never synthesize `total_tokens` from prompt and completion counts.
+
+**Ordering invariant:** Treat production built-in discovery as public exposure because it feeds catalogue and authoring surfaces. Do not enable it, web-authorize the source, or make the source Composer-authorable until required-control coverage, execution-time fail-closed validation, auto-wire behavior, backend execution policy, audit-readiness, runtime profile/value-source/availability behavior, and authored-prompt consent enumeration are complete. Task 9 uses isolated test registration only; Task 10 publishes compiler/catalogue support, frontend consent, and built-in discovery atomically. There must be no commit where the source is Composer-expressible but absent from outbound-LLM consent.
+
+**Constraints:** Preserve transform behavior, source routing, profile provenance, and cleanup primacy. Do not add a provider preflight request. Do not hand-invent plugin hashes or catalogue goldens. Do not refactor bounded provider-factory/schema duplication in this feature. Do not edit or sign trust-tier judge metadata. Do not push, merge, open a PR, or alter the shared checkout without a new request.
 
 ---
 
 ## File map
 
-### New files
+### Implemented in Tasks 1-3
 
-- `src/elspeth/plugins/sources/llm/__init__.py` — source package exports.
-- `src/elspeth/plugins/sources/llm/config.py` — source-specific common and provider-discriminated config models.
-- `src/elspeth/plugins/sources/llm/source.py` — source lifecycle, provider construction, prompt call, output validation, catalogue metadata.
-- `tests/unit/plugins/sources/llm/{__init__,conftest,test_config,test_source}.py` — source configuration/runtime tests and fakes.
-- `tests/integration/plugins/llm/test_source_pipeline.py` — real engine operation-parent/lineage proof.
-- `examples/llm_source/{settings.yaml,README.md}` — bounded ChaosLLM-compatible example.
-- `tests/golden/web/catalog/knob_schema/source__llm.json` — source catalogue schema pin.
-- `tests/golden/web/catalog/policy_view/source__llm.json` — profiled web schema pin.
+- `src/elspeth/plugins/llm/{__init__.py,config_validation.py,model_catalog.py}` — component-neutral validation and model catalogue.
+- `src/elspeth/plugins/sources/llm/{__init__.py,config.py,source.py}` — source config, lifecycle, provider construction, schema handling, assistance, and reference prose.
+- `src/elspeth/plugins/transforms/llm/{provider.py,templates.py,transform.py,langfuse.py,model_catalog.py,__init__.py}` and `providers/{azure.py,bedrock.py,gateway.py,openrouter.py}` — shared audit parent, rendering, tracing, usage, provider, and compatibility seams.
+- `src/elspeth/contracts/{contexts.py,events.py,__init__.py}`, `src/elspeth/plugins/infrastructure/{clients/base.py,telemetry.py}`, `src/elspeth/telemetry/{__init__.py,filtering.py}`, and `src/elspeth/engine/orchestrator/source_iteration.py` — lifecycle context, cleanup telemetry, bounded telemetry filtering, and source shutdown classification.
+- `config/cicd/contracts-whitelist.yaml` and focused source/provider/contract/telemetry tests changed by the three commits.
 
-### Modified files
+### Remaining production surfaces, in dependency order
 
-- `src/elspeth/plugins/transforms/llm/provider.py` and `providers/*.py` — state/operation-neutral provider calls.
-- `src/elspeth/plugins/transforms/llm/{transform,templates,__init__}.py` — row-parent construction and shared pure helpers.
-- `src/elspeth/core/config.py` — profile lowering for transform and source LLM components.
-- `src/elspeth/web/plugin_policy/{compiler,profiles,coverage}.py` — source admission/profile and coverage.
-- `src/elspeth/web/composer/required_controls.py` — source-output Content Safety splice.
-- `src/elspeth/web/execution/validation.py` — source base-URL/tracing/profile policy parity.
-- `src/elspeth/web/audit_readiness/{boundary_expectations,explain,service}.py` — source boundary and interpretation ruling.
-- `src/elspeth/web/frontend/src/components/sidebar/{ExecuteButton.tsx,ExecuteButton.test.tsx}` — source LLM consent.
-- Existing provider, catalogue, coverage, auto-wire, execution, and audit-readiness tests named below.
+- Task 4: `src/elspeth/plugins/sources/llm/source.py`, source iteration, cleanup telemetry/tests.
+- Tasks 5-6: `src/elspeth/web/plugin_policy/{coverage.py,validation.py}` and `src/elspeth/web/composer/required_controls.py`.
+- Task 7: `src/elspeth/web/execution/validation.py` and `src/elspeth/web/audit_readiness/{boundary_expectations.py,explain.py,service.py}`.
+- Task 8: `src/elspeth/core/config.py`, `src/elspeth/plugins/infrastructure/runtime_factory.py`, `src/elspeth/engine/orchestrator/preflight.py`, `src/elspeth/web/execution/preflight.py`, and `src/elspeth/web/plugin_policy/{availability.py,profiles.py}`.
+- Task 9: isolated-registration real-engine integration tests only.
+- Task 10: `src/elspeth/web/plugin_policy/{compiler.py,profiles.py}`, `src/elspeth/web/composer/planner_authoring_aids.py`, catalogue consumers, frontend consent, production discovery, plugin-hash inventory/declarations, and generated source goldens.
+- Task 11: `examples/llm_source/`, example indexes, and shipped-example tests.
 
-## Task 1: Add an operation-capable LLM audit parent
+---
 
-**Files:**
+## Task 1: Add an operation-capable LLM audit parent — complete
 
-- Modify: `src/elspeth/plugins/transforms/llm/provider.py`
-- Modify: `src/elspeth/plugins/transforms/llm/providers/{azure,bedrock,openrouter,gateway}.py`
-- Modify: `src/elspeth/plugins/transforms/llm/transform.py`
-- Test: `tests/unit/plugins/llm/test_provider_protocol.py`
-- Test: `tests/unit/plugins/llm/test_provider_{azure,bedrock,openrouter,gateway}.py`
-- Test: `tests/unit/plugins/llm/test_transform.py`
-- Test: `tests/integration/plugins/llm/test_gateway_provider_e2e.py`
+**Commit:** `cc3d24899` (`refactor: support operation-parented LLM provider calls`)
 
-- [ ] **Step 1: Write failing audit-parent invariant tests**
+- [x] Add an owned, exactly-one-of row/operation `LLMAuditParent` with exact built-in string validation.
+- [x] Convert Azure, Bedrock, OpenRouter, Gateway, and transform callers to the explicit parent.
+- [x] Keep transform calls state/token-parented and make logical plus transport records share their parent.
+- [x] Extract pure finish-reason classification without changing transform result semantics.
+- [x] Preserve provider cleanup primacy and refcount/cache-key behavior.
+- [x] Pass focused provider, transform, tracing, telemetry, and Gateway integration regressions and commit hooks.
 
-```python
-def test_llm_audit_parent_accepts_row_and_operation_forms() -> None:
-    row = LLMAuditParent.for_row(state_id="state-1", token_id="token-1")
-    operation = LLMAuditParent.for_operation(operation_id="operation-1")
+## Task 2: Add source-specific config and static prompt rendering — complete
 
-    assert row.client_kwargs() == {
-        "state_id": "state-1",
-        "token_id": "token-1",
-        "operation_id": None,
-    }
-    assert operation.client_kwargs() == {
-        "state_id": None,
-        "token_id": None,
-        "operation_id": "operation-1",
-    }
+**Commit:** `79377065c` (`feat: define single-prompt LLM source configuration`)
 
+- [x] Add source-rooted Azure, OpenRouter, Bedrock, and Gateway discriminated configs without inheriting transform config.
+- [x] Reject transform-only options and row-bound templates; allow static prompt context, including `lookup`.
+- [x] Add static rendering while keeping transform rendering byte-compatible.
+- [x] Add neutral provider validators and model catalogue modules, retaining the transform import compatibility shim.
+- [x] Add the source output-schema helper for configurable `<field>`, `<field>_usage`, and `<field>_model` fields.
+- [x] Verify isolated registration/import behavior and 1,170 focused configuration, template, schema, catalogue, and provider-validation tests.
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {},
-        {"state_id": "state-1"},
-        {"token_id": "token-1"},
-        {"operation_id": "operation-1", "state_id": "state-1", "token_id": "token-1"},
-        {"operation_id": " "},
-    ],
-)
-def test_llm_audit_parent_rejects_invalid_parentage(kwargs: dict[str, str]) -> None:
-    with pytest.raises((TypeError, ValueError)):
-        LLMAuditParent(**kwargs)
-```
+## Task 3: Implement the source-native one-call, one-row plugin — complete, subject to Task 4
 
-- [ ] **Step 2: Run the focused protocol tests and confirm red**
+**Commit:** `1994bf969` (`feat: add source-native single-prompt LLM plugin`)
 
-```bash
-.venv/bin/python -m pytest tests/unit/plugins/llm/test_provider_protocol.py -q
-```
+- [x] Implement `LLMSource(BaseSource)` directly with one admitted load, one provider call, and at most one row at `source_row_index == 0`.
+- [x] Implement four provider constructors, operation-aware Langfuse tracing, finish-reason failure, fence stripping, schema validation, and managed iterator closure.
+- [x] Use `populate_llm_operational_fields()` exactly. Known, partial, unknown, and inconsistent provider totals remain reported values; no omitted total is computed.
+- [x] Add cleanup-failure telemetry, provider cleanup primacy, pre-egress shutdown handling, and narrow engine `INTERRUPTED` classification.
+- [x] Add source assistance/reference/output semantics and contract tests without public built-in discovery.
+- [x] Verify the 1,350-test regression slice, full mypy over 710 source files, Ruff and formatting, `elspeth-lints check`, and the exact non-inert Wardline gate (710 files, 59 boundaries, zero active ERROR findings).
 
-Expected: collection/import failure because `LLMAuditParent` does not exist.
+Task 4 reopens two lifecycle invariants found by review; do not advance around it.
 
-- [ ] **Step 3: Implement the owned discriminated parent and protocol signature**
-
-Add this value object to `provider.py` and change `LLMProvider.execute_query()` to require `audit_parent`:
-
-```python
-@dataclass(frozen=True, slots=True)
-class LLMAuditParent:
-    state_id: str | None = None
-    token_id: str | None = None
-    operation_id: str | None = None
-
-    def __post_init__(self) -> None:
-        row_parent = self.state_id is not None or self.token_id is not None
-        operation_parent = self.operation_id is not None
-        if row_parent == operation_parent:
-            raise ValueError("LLMAuditParent requires exactly one row or operation parent")
-        if row_parent and (not self.state_id or not self.state_id.strip() or not self.token_id or not self.token_id.strip()):
-            raise ValueError("row audit parent requires non-empty state_id and token_id")
-        if operation_parent and (not self.operation_id or not self.operation_id.strip()):
-            raise ValueError("operation audit parent requires a non-empty operation_id")
-
-    @classmethod
-    def for_row(cls, *, state_id: str, token_id: str) -> LLMAuditParent:
-        return cls(state_id=state_id, token_id=token_id)
-
-    @classmethod
-    def for_operation(cls, *, operation_id: str) -> LLMAuditParent:
-        return cls(operation_id=operation_id)
-
-    @property
-    def cache_key(self) -> str:
-        if self.operation_id is not None:
-            return f"operation:{self.operation_id}"
-        if self.state_id is None:
-            raise RuntimeError("validated row parent lost state_id")
-        return f"state:{self.state_id}"
-
-    def client_kwargs(self) -> dict[str, str | None]:
-        return {"state_id": self.state_id, "token_id": self.token_id, "operation_id": self.operation_id}
-```
-
-For OpenRouter/Gateway semantic call rows, add parent-owned allocation/record helpers selecting `allocate_operation_call_index` + `record_operation_call` for operations and existing state methods for rows. Keep transport and logical records under the same parent.
-
-Move the transform's current finish-reason classification into a pure helper in `provider.py` that returns a bounded failure description or `None`. Keep the transform's existing `TransformResult` mapping around that helper; the source will use the same verdict and fail its source load.
-
-- [ ] **Step 4: Convert every transform/provider call site to explicit row parents**
-
-Replace `state_id=` and `token_id=` keywords with:
-
-```python
-audit_parent=LLMAuditParent.for_row(
-    state_id=state_id,
-    token_id=token_id,
-),
-```
-
-Update all test fakes to accept `audit_parent: LLMAuditParent`. Do not retain a legacy optional signature: test/type failures must expose every caller.
-
-- [ ] **Step 5: Make all four providers parent-neutral**
-
-Use `audit_parent.cache_key` only for cache/refcount identity and construct audited clients with `**audit_parent.client_kwargs()`. OpenRouter/Gateway logical recorders accept the parent rather than `state_id`. Preserve cleanup and underflow checks.
-
-- [ ] **Step 6: Run provider/transform regressions**
-
-```bash
-.venv/bin/python -m pytest \
-  tests/unit/plugins/llm/test_provider_protocol.py \
-  tests/unit/plugins/llm/test_provider_azure.py \
-  tests/unit/plugins/llm/test_provider_bedrock.py \
-  tests/unit/plugins/llm/test_provider_openrouter.py \
-  tests/unit/plugins/llm/test_provider_gateway.py \
-  tests/unit/plugins/llm/test_transform.py \
-  tests/integration/plugins/llm/test_gateway_provider_e2e.py -q
-```
-
-Expected: all pass and existing state/token assertions are unchanged.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/elspeth/plugins/transforms/llm tests/unit/plugins/llm tests/integration/plugins/llm/test_gateway_provider_e2e.py
-git commit -m "refactor: support operation-parented LLM provider calls"
-```
-
-## Task 2: Add source-specific config and static prompt rendering
+## Task 4: Repair real lifecycle shutdown primacy and telemetry correlation
 
 **Files:**
 
-- Create: `src/elspeth/plugins/sources/llm/{__init__,config}.py`
-- Create: `tests/unit/plugins/sources/llm/{__init__,conftest,test_config}.py`
-- Modify: `src/elspeth/plugins/transforms/llm/templates.py`
-- Modify: `src/elspeth/plugins/transforms/llm/__init__.py`
-- Test: `tests/unit/plugins/llm/test_templates.py`
+- Modify: `src/elspeth/plugins/sources/llm/source.py`
+- Modify if required: `src/elspeth/engine/orchestrator/source_iteration.py`
+- Test: `tests/unit/plugins/sources/llm/test_source.py`
+- Test: `tests/unit/engine/orchestrator/test_source_iteration_quarantine_sweep.py`
+- Test: `tests/unit/telemetry/exporters/test_console.py`
 
-- [ ] **Step 1: Write failing source-config tests**
-
-```python
-TRANSFORM_ONLY_FIELDS = {
-    "required_input_fields",
-    "queries",
-    "pool_size",
-    "min_dispatch_delay_ms",
-    "max_dispatch_delay_ms",
-    "backoff_multiplier",
-    "recovery_step_ms",
-    "max_capacity_retry_seconds",
-    "resolved_prompt_template_hash",
-}
-
-
-@pytest.mark.parametrize("provider", ["azure", "openrouter", "bedrock", "gateway"])
-def test_source_variants_publish_only_single_request_fields(provider: str) -> None:
-    model = SOURCE_PROVIDER_CONFIGS[provider]
-    assert {"prompt_template", "system_prompt", "temperature", "max_tokens", "response_field", "schema_config", "on_validation_failure"} <= set(model.model_fields)
-    assert TRANSFORM_ONLY_FIELDS.isdisjoint(model.model_fields)
-
-
-def test_source_prompt_rejects_row_access_but_accepts_lookup() -> None:
-    with pytest.raises(PluginConfigError, match="row"):
-        OpenRouterLLMSourceConfig.from_dict(openrouter_config(prompt_template="{{ row.text }}"), plugin_name="llm")
-
-    cfg = OpenRouterLLMSourceConfig.from_dict(
-        openrouter_config(prompt_template="Summarise {{ lookup.topic }}", lookup={"topic": "audit"}),
-        plugin_name="llm",
-    )
-    assert cfg.prompt_template == "Summarise {{ lookup.topic }}"
-```
-
-Also test invalid provider, blank/invalid response fields, transform-only option rejection, and contradictory response/model/usage schema types.
-
-- [ ] **Step 2: Run tests and confirm red**
-
-```bash
-.venv/bin/python -m pytest tests/unit/plugins/sources/llm/test_config.py -q
-```
-
-Expected: import failure because source config is absent.
-
-- [ ] **Step 3: Implement source-rooted provider models**
-
-Define `LLMSourceConfig(DataPluginConfig)` with `_plugin_component_type = "source"`, common request fields, explicit `on_validation_failure`, lookup/source metadata, syntax validation, and undeclared-name rejection allowing only `lookup` and Jinja globals. Define:
-
-```python
-SOURCE_PROVIDER_CONFIGS: dict[str, type[LLMSourceConfig]] = {
-    "azure": AzureOpenAILLMSourceConfig,
-    "openrouter": OpenRouterLLMSourceConfig,
-    "bedrock": BedrockLLMSourceConfig,
-    "gateway": GatewayLLMSourceConfig,
-}
-```
-
-Mirror each transform provider's applicable model, endpoint, authentication, timeout, tracing, and `VALUE_SOURCES` fields while reusing pure validators. Do not inherit `LLMConfig` or transform provider config classes.
-
-- [ ] **Step 4: Add static rendering without a row binding**
-
-Refactor `PromptTemplate` around a private context renderer and add:
-
-```python
-def render_static_with_metadata(self) -> RenderedPrompt:
-    prompt = self._render_context(
-        {"lookup": self._lookup_data if self._lookup_data is not None else {}},
-    )
-    return RenderedPrompt(
-        prompt=prompt,
-        template_hash=self._template_hash,
-        variables_hash=_sha256(canonical_json({})),
-        rendered_hash=_sha256(prompt),
-        template_source=self._template_source,
-        lookup_hash=self._lookup_hash,
-        lookup_source=self._lookup_source,
-        contract_hash=None,
-    )
-```
-
-Keep transform rendering byte-compatible and test that static rendering never injects `row`.
-
-- [ ] **Step 5: Add a public source-output schema helper**
-
-Add a helper that augments `SchemaConfig` with required response `str`, usage `any`, and model `str` fields, preserves the authored mode, merges guaranteed fields, and rejects contradictory authored definitions. Reuse `LLM_GUARANTEED_SUFFIXES` and `_SUFFIX_SCHEMA_TYPES`.
-
-- [ ] **Step 6: Run tests**
-
-```bash
-.venv/bin/python -m pytest \
-  tests/unit/plugins/sources/llm/test_config.py \
-  tests/unit/plugins/llm/test_templates.py \
-  tests/unit/plugins/llm/test_config_schema.py -q
-```
-
-Expected: all pass and transform schema output is unchanged.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/elspeth/plugins/sources/llm src/elspeth/plugins/transforms/llm tests/unit/plugins/sources/llm tests/unit/plugins/llm/test_templates.py tests/unit/plugins/llm/test_config_schema.py
-git commit -m "feat: define single-prompt LLM source configuration"
-```
-
-## Task 3: Implement the one-call, one-row source
-
-**Files:**
-
-- Create: `src/elspeth/plugins/sources/llm/source.py`
-- Modify: `src/elspeth/plugins/sources/llm/__init__.py`
-- Create: `tests/unit/plugins/sources/llm/test_source.py`
-- Modify: `tests/unit/plugins/sources/llm/conftest.py`
-- Modify: `tests/unit/contracts/source_contracts/test_source_protocol.py`
-
-- [ ] **Step 1: Write failing lifecycle/output tests**
-
-```python
-def test_load_calls_provider_once_and_emits_one_transform_compatible_row(
-    source: LLMSource,
-    source_context: FakeSourceContext,
-) -> None:
-    provider = FakeProvider(
-        LLMQueryResult(
-            content="```text\nA careful answer\n```",
-            usage=TokenUsage.known(prompt_tokens=7, completion_tokens=3),
-            model="served-model",
-            finish_reason=FinishReason.STOP,
-        )
-    )
-    source._provider = provider
-
-    rows = list(source.load(source_context))
-
-    assert provider.calls == 1
-    assert provider.audit_parents == [LLMAuditParent.for_operation(operation_id="source-load-1")]
-    assert len(rows) == 1
-    assert rows[0].source_row_index == 0
-    assert rows[0].row == {
-        "answer": "A careful answer",
-        "answer_usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
-        "answer_model": "served-model",
-    }
-```
-
-Add missing-operation, provider-not-started, double-load, provider-error, finish-reason, empty-content, generator cancellation, closure, and schema quarantine/discard tests.
-
-- [ ] **Step 2: Run tests and confirm red**
-
-```bash
-.venv/bin/python -m pytest tests/unit/plugins/sources/llm/test_source.py -q
-```
-
-Expected: import failure because `LLMSource` is absent.
-
-- [ ] **Step 3: Implement direct `BaseSource` lifecycle**
-
-```python
-class LLMSource(BaseSource):
-    name = "llm"
-    determinism = Determinism.NON_DETERMINISTIC
-    plugin_version = "1.0.0"
-    web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
-    policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
-    capability_tags = ("llm", "generation", "single-row")
-```
-
-In `__init__`, dispatch config, build the static prompt, effective schema/contract, and guaranteed fields. In `on_start`, call `super()`, require a Landscape recorder, capture telemetry/rate limiter/run identity, construct one provider, and initialize tracing. In `load`, require an operation ID, render, build messages, call with an operation parent, enforce success finish reason, strip fences, populate output fields, validate, then yield `SourceRow.valid(validated_row, contract=contract, source_row_index=0)` or one configured quarantine outcome. Guard against a second load.
-
-- [ ] **Step 4: Implement closure and catalogue hooks**
-
-Close/clear the provider exactly once. Add catalogue prose, named-source example, output semantics, discriminated config methods, probe config, agent assistance, and secret requirements. Do not add runtime preflight: the one real request is authoritative.
-
-- [ ] **Step 5: Run source contract tests**
+- [ ] Write a real-order lifecycle regression: `on_start()` precedes the engine's `source_load` operation and sees no operation ID; `load()` receives and stores the real operation ID for teardown correlation.
+- [ ] Test shutdown set before first iteration with provider close, tracer flush, and dual cleanup failures. The primary result remains shutdown/`INTERRUPTED`; cleanup never replaces it, and provider/tracing egress remains zero.
+- [ ] Assert post-load `ResourceCleanupFailed` events carry real run ID, `source_load` operation ID, resource, and suppression status, with no invented state/token IDs.
+- [ ] Keep initialization failure before `load()` bounded and honest: without a real operation, emit no fabricated correlation.
+- [ ] At load admission, store the validated operation ID. Ensure the managed session establishes primary-outcome suppression before testing shutdown, detaches resources before closure, and attempts both provider and tracer cleanup.
+- [ ] Run and commit:
 
 ```bash
 .venv/bin/python -m pytest \
   tests/unit/plugins/sources/llm/test_source.py \
-  tests/unit/plugins/sources/test_declared_guaranteed_fields.py \
-  tests/unit/contracts/source_contracts/test_source_protocol.py -q
+  tests/unit/engine/orchestrator/test_source_iteration_quarantine_sweep.py \
+  tests/unit/telemetry/exporters/test_console.py -q
+git add src/elspeth/plugins/sources/llm/source.py src/elspeth/engine/orchestrator/source_iteration.py tests/unit/plugins/sources/llm/test_source.py tests/unit/engine/orchestrator/test_source_iteration_quarantine_sweep.py tests/unit/telemetry/exporters/test_console.py
+git commit -m "fix: preserve LLM source shutdown primacy"
 ```
 
-Expected: all pass.
+## Task 5: Make required-control coverage component-typed and fail closed at execution
 
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/elspeth/plugins/sources/llm tests/unit/plugins/sources/llm tests/unit/plugins/sources/test_declared_guaranteed_fields.py tests/unit/contracts/source_contracts/test_source_protocol.py
-git commit -m "feat: add source-native single-prompt LLM plugin"
-```
-
-## Task 4: Register the source and add profile/catalogue parity
+Public discovery remains off. Tests may register `LLMSource` explicitly in an isolated manager before exercising policy.
 
 **Files:**
 
-- Modify: `src/elspeth/core/config.py`
-- Modify: `src/elspeth/web/plugin_policy/{compiler,profiles}.py`
-- Modify: `tests/unit/core/test_llm_profile_catalog.py`
-- Modify: `tests/unit/web/plugin_policy/{test_compiler,test_profiles}.py`
-- Modify: `tests/unit/plugins/sources/test_source_catalogue_metadata.py`
-- Modify: `tests/unit/plugins/llm/test_plugin_registration.py`
-- Modify: `tests/unit/web/catalog/{test_service,test_knob_schema_golden,test_policy_view_golden}.py`
-- Create: `tests/golden/web/catalog/knob_schema/source__llm.json`
-- Create: `tests/golden/web/catalog/policy_view/source__llm.json`
+- Modify: `src/elspeth/web/plugin_policy/{coverage.py,validation.py}`
+- Modify: `src/elspeth/web/execution/validation.py`
+- Test: `tests/unit/web/plugin_policy/{test_coverage.py,test_validation.py}`
+- Test: relevant required-control cases in `tests/unit/web/execution/test_validation.py`
+- Test: `tests/integration/web/test_execute_pipeline.py`
 
-- [ ] **Step 1: Write failing discovery/profile tests**
-
-```python
-def test_llm_is_registered_for_both_component_kinds() -> None:
-    manager = get_shared_plugin_manager()
-    assert manager.get_source_by_name("llm").name == "llm"
-    assert manager.get_transform_by_name("llm").name == "llm"
-
-
-def test_profile_registry_serves_source_and_transform_llm() -> None:
-    registry = OperatorProfileRegistry(policy=policy, settings=runtime_settings)
-    source_schema = registry.public_schema(
-        PluginId("source", "llm"),
-        source_full_schema,
-        available_aliases=("tutorial",),
-    )
-    transform_schema = registry.public_schema(
-        PluginId("transform", "llm"),
-        transform_full_schema,
-        available_aliases=("tutorial",),
-    )
-    assert source_schema.json_schema["properties"]["profile"]["enum"] == ["tutorial"]
-    assert transform_schema.json_schema["properties"]["profile"]["enum"] == ["tutorial"]
-```
-
-Also assert source and transform selectors lower to identical provider/model/credential bindings, while source public schema omits transform-only options and all private endpoint/credential fields.
-
-- [ ] **Step 2: Run tests and confirm red**
-
-```bash
-.venv/bin/python -m pytest \
-  tests/unit/plugins/llm/test_plugin_registration.py \
-  tests/unit/web/plugin_policy/test_compiler.py \
-  tests/unit/web/plugin_policy/test_profiles.py -q
-```
-
-Expected: source `llm` is absent.
-
-- [ ] **Step 3: Extend profile lowering to source components**
-
-Keep `_lower_llm_profile_node_options()` as the one profile-to-provider function. Expand `_lower_llm_profile_nodes()` to visit `transforms[index]` and `sources[name]`, issue component-specific errors, retain `profile_alias`, and preserve idempotence and server/user credential-scope rules for both.
-
-- [ ] **Step 4: Register source policy/profile authority**
-
-Add `PluginId("source", "llm")` to required web IDs and attach a second `_LLMProfileResolver`. Refactor public-schema filtering to derive provider definition names from the schema discriminator mapping, so source and transform config class names both work without importing `LLMTransform`.
-
-- [ ] **Step 5: Update catalogue expectations and generated goldens**
-
-Add `llm` to built-in source names/determinism expectations. Serialize live `CatalogServiceImpl` output using the golden tests' sorted/indented format; do not hand-invent JSON. Add a source-profile golden built with `PluginId("source", "llm")`.
-
-- [ ] **Step 6: Run catalogue/profile tests**
-
-```bash
-.venv/bin/python -m pytest \
-  tests/unit/core/test_llm_profile_catalog.py \
-  tests/unit/plugins/sources/test_source_catalogue_metadata.py \
-  tests/unit/plugins/llm/test_plugin_registration.py \
-  tests/unit/web/plugin_policy/test_compiler.py \
-  tests/unit/web/plugin_policy/test_profiles.py \
-  tests/unit/web/catalog/test_service.py \
-  tests/unit/web/catalog/test_knob_schema_golden.py \
-  tests/unit/web/catalog/test_policy_view_golden.py -q
-```
-
-Expected: all pass and the live catalogue file set matches the golden directory.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/elspeth/core/config.py src/elspeth/web/plugin_policy tests/unit/core/test_llm_profile_catalog.py tests/unit/plugins tests/unit/web/plugin_policy tests/unit/web/catalog tests/golden/web/catalog
-git commit -m "feat: expose LLM source through profiles and catalogue"
-```
-
-## Task 5: Prove real engine parentage and one-row lineage
-
-**Files:**
-
-- Create: `tests/integration/plugins/llm/test_source_pipeline.py`
-- Modify if required: `tests/integration/plugins/llm/conftest.py`
-
-- [ ] **Step 1: Write failing engine integration tests**
-
-Build `llm` source -> JSON sink through the real orchestrator, replace provider construction with a bounded fake, and assert:
-
-```python
-assert run.status is RunStatus.COMPLETED
-assert output_rows == [
-    {
-        "generated_text": "engine result",
-        "generated_text_usage": {"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4},
-        "generated_text_model": "fake-model",
-    }
-]
-assert source_calls[0].operation_id is not None
-assert source_calls[0].state_id is None
-assert emitted_tokens[0].source_row_index == 0
-```
-
-Add the failure counterpart: provider raises after an audited operation call, the run fails, no row state/token is fabricated, and the ERROR operation call remains recorded.
-
-- [ ] **Step 2: Run and confirm red**
-
-```bash
-.venv/bin/python -m pytest tests/integration/plugins/llm/test_source_pipeline.py -q
-```
-
-Expected: failure until discovery, provider injection, and operation recording are connected.
-
-- [ ] **Step 3: Make only runtime corrections exposed by the test**
-
-Preserve this order: `source_load` operation opens, provider call records, source yields, then engine creates state/token. Do not move token creation before `load()` and do not add a preflight request.
-
-- [ ] **Step 4: Re-run and commit**
-
-```bash
-.venv/bin/python -m pytest tests/integration/plugins/llm/test_source_pipeline.py -q
-git add tests/integration/plugins/llm/test_source_pipeline.py src/elspeth/plugins/sources/llm
-git commit -m "test: prove LLM source audit parentage and lineage"
-```
-
-Expected: success and failure cases pass.
-
-## Task 6: Extend required-control coverage to LLM sources
-
-**Files:**
-
-- Modify: `src/elspeth/web/plugin_policy/coverage.py`
-- Modify: `tests/unit/web/plugin_policy/test_coverage.py`
-- Modify: `tests/unit/web/plugin_policy/test_validation.py`
-
-- [ ] **Step 1: Write failing source coverage tests**
-
-```python
-def test_llm_source_requires_content_safety_on_every_downstream_path() -> None:
-    state = llm_source_state(response_field="generated_text", branched=True, cover_one_branch=True)
-
-    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
-
-    assert [(f.component_id, f.role, f.reason) for f in findings] == [
-        ("source:generator", ControlRole.OUTPUT, "output_not_post_dominated"),
-    ]
-
-
-def test_llm_source_does_not_require_prompt_shield() -> None:
-    state = llm_source_state(response_field="generated_text")
-    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
-```
-
-Also pin singular source ID `source`, named ID `source:<name>`, response-field-only scope, full coverage, multiple sources, and stable mixed source/transform ordering.
-
-- [ ] **Step 2: Run and confirm red**
-
-```bash
-.venv/bin/python -m pytest tests/unit/web/plugin_policy/test_coverage.py -q
-```
-
-Expected: source-only Content Safety produces no finding.
-
-- [ ] **Step 3: Implement component-appropriate capability lookup**
-
-Keep transform lookup nominal and add source lookup through `get_source_by_name`. Add:
-
-```python
-def _llm_source_output_fields(source: SourceSpec) -> frozenset[str]:
-    response_field = source.options.get("response_field", "llm_response")
-    if not isinstance(response_field, str) or not response_field.strip():
-        return frozenset()
-    return frozenset({response_field})
-```
-
-For Content Safety, start `_stream_proves_output_control()` at capable sources' `on_success` streams and use the stable source component ID in `visited`. Do not check sources for Prompt Shield. Preserve node behavior and stable order.
-
-- [ ] **Step 4: Run coverage/policy tests**
+- [ ] Add red tests proving every finding carries stable `component_id` and `component_type` (`source` or `transform`) through policy and execution validation.
+- [ ] For Content Safety, treat only the configured LLM response field as generated output and require downstream post-domination on every success path.
+- [ ] The current graph cannot safely control a source `on_validation_failure` alternate route. Under `ControlMode.REQUIRED`, every non-`discard` LLM source validation-failure destination is therefore unrepairable and rejected without exception, even if the success route is covered. `discard` is accepted.
+- [ ] Cover direct-to-sink rejection, branched and mixed graphs, singular policy-state IDs, named/multiple sources, custom response fields, stable order, covered success with discard, and execution-time fail-closed rejection.
+- [ ] Keep Prompt Shield transform-only and pin that explicit ruling.
+- [ ] Run and commit:
 
 ```bash
 .venv/bin/python -m pytest \
   tests/unit/web/plugin_policy/test_coverage.py \
-  tests/unit/web/plugin_policy/test_validation.py -q
+  tests/unit/web/plugin_policy/test_validation.py \
+  tests/unit/web/execution/test_validation.py \
+  tests/integration/web/test_execute_pipeline.py -q
+git add src/elspeth/web/plugin_policy/coverage.py src/elspeth/web/plugin_policy/validation.py src/elspeth/web/execution/validation.py tests/unit/web/plugin_policy/test_coverage.py tests/unit/web/plugin_policy/test_validation.py tests/unit/web/execution/test_validation.py tests/integration/web/test_execute_pipeline.py
+git commit -m "fix: require content safety for LLM sources"
 ```
 
-Expected: all pass and generic policy validation blocks an uncovered required LLM source.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/elspeth/web/plugin_policy/coverage.py tests/unit/web/plugin_policy/test_coverage.py tests/unit/web/plugin_policy/test_validation.py
-git commit -m "fix: require content safety coverage for LLM sources"
-```
-
-## Task 7: Auto-wire Content Safety after LLM sources
+## Task 6: Auto-wire only repairable source success routes
 
 **Files:**
 
 - Modify: `src/elspeth/web/composer/required_controls.py`
-- Modify: `tests/unit/web/composer/test_required_control_autowire.py`
-- Modify: `tests/integration/web/composer/guided/test_shared_planner_surfaces.py`
+- Test: `tests/unit/web/composer/test_required_control_autowire.py`
+- Test: `tests/integration/web/composer/guided/test_shared_planner_surfaces.py`
 
-- [ ] **Step 1: Write failing source splice tests**
-
-```python
-def test_content_safety_is_spliced_after_named_llm_source(tmp_path: Path) -> None:
-    view, snapshot = _guardrail_profile_view(tmp_path)
-    candidate = bare_llm_source_candidate(source_name="generator", response_field="draft")
-    original = copy.deepcopy(candidate)
-
-    wired = wire_required_controls(candidate, snapshot, view)
-
-    assert candidate == original
-    source = wired["sources"]["generator"]
-    safety = next(node for node in wired["nodes"] if node["plugin"] == "aws_bedrock_content_safety")
-    assert source["on_success"] == safety["input"]
-    assert safety["on_success"] == original["sources"]["generator"]["on_success"]
-    assert safety["options"]["fields"] == ["draft"]
-    assert safety["options"]["source"] == "OUTPUT"
-```
-
-Add singular-source, multi-source, covered/no-op, second-pass identity, malformed no-op, mixed source/transform, reserved-name collision, and no-Prompt-Shield tests.
-
-- [ ] **Step 2: Run and confirm red**
-
-```bash
-.venv/bin/python -m pytest tests/unit/web/composer/test_required_control_autowire.py -q
-```
-
-Expected: source candidate remains uncovered.
-
-- [ ] **Step 3: Implement source splice ownership**
-
-Maintain mutable copies of authored source shape(s) and nodes. `_splice_source_output_control()` allocates an intermediate stream, rewrites only the target source's `on_success`, inserts a creditable Content Safety node whose success destination is the preserved stream, and stages source-specific disclosure. Resolve `source`/`source:<name>` IDs without treating them as nodes.
-
-Use budget `2 * llm_transform_count + llm_source_count`; reparse combined working candidate after every splice. Return the input object by identity on every no-op path.
-
-- [ ] **Step 4: Run auto-wire/finalizer regressions**
+- [ ] Add red splice tests for the Composer's legacy singular `source` candidate and plural `sources` candidate. Runtime YAML remains the plural `sources` mapping only; cover its conventional key `source` and arbitrary source names.
+- [ ] Preserve the authored singular/plural container provenance. If both legacy singular and plural forms appear, treat the candidate as ambiguous and return it unchanged by identity.
+- [ ] Splice only a repairable LLM source with `on_validation_failure: discard`: source -> new intermediate stream -> Content Safety -> original success stream. Preserve the old success destination exactly.
+- [ ] Leave every non-discard validation-failure candidate unchanged by identity for Task 5's fail-closed validator to reject; never partially certify it.
+- [ ] Cover already-covered/no-op identity, second-pass idempotence, multiple sources, mixed source/transform graphs, reserved stream/node collisions, malformed candidates, no Prompt Shield, and bounded splice budget.
+- [ ] Reparse after each splice and preserve stable disclosure/provenance data.
+- [ ] Run and commit:
 
 ```bash
 .venv/bin/python -m pytest \
   tests/unit/web/composer/test_required_control_autowire.py \
   tests/integration/web/composer/guided/test_shared_planner_surfaces.py -q
-```
-
-Expected: all pass, including candidate identity assertions.
-
-- [ ] **Step 5: Commit**
-
-```bash
 git add src/elspeth/web/composer/required_controls.py tests/unit/web/composer/test_required_control_autowire.py tests/integration/web/composer/guided/test_shared_planner_surfaces.py
 git commit -m "fix: auto-wire content safety after LLM sources"
 ```
 
-## Task 8: Enforce source LLM web execution policies
+Do not close the P1 here; closure is Task 12 only.
+
+## Task 7: Enforce backend execution policy and explain audit readiness
 
 **Files:**
 
 - Modify: `src/elspeth/web/execution/validation.py`
-- Modify: `tests/unit/web/execution/test_static_llm_prompt_advisory.py`
-- Modify: existing `tests/unit/web/execution/` base-URL/tracing/profile policy tests
-- Modify: `tests/integration/web/test_execute_pipeline.py`
+- Modify: `src/elspeth/web/audit_readiness/{boundary_expectations.py,explain.py,service.py}`
+- Test: `tests/unit/web/execution/`
+- Test: `tests/integration/web/test_execute_pipeline.py`
+- Test: `tests/unit/web/audit_readiness/`
 
-- [ ] **Step 1: Write failing source policy tests**
-
-```python
-def test_web_validation_rejects_llm_source_base_url_override(
-    validation_harness: ValidationHarness,
-) -> None:
-    state = validation_harness.llm_source_state(
-        options={"profile": "tutorial", "base_url": "https://author.example/v1"},
-    )
-    result = validation_harness.validate(state)
-    assert result.is_valid is False
-    assert result.errors[0].component_id == "source:generator"
-    assert result.errors[0].component_type == "source"
-    assert result.errors[0].error_code == "llm_base_url_not_allowed"
-
-
-def test_static_prompt_advisory_does_not_fire_for_llm_source() -> None:
-    state = llm_source_state(prompt_template="Generate one row")
-    assert _find_static_llm_prompt_advisories(state) == []
-```
-
-Also test tracing rejection, source profile capture, uncovered/covered Content Safety, and retry-budget non-applicability because source config has no pool/query retry fields.
-
-- [ ] **Step 2: Run and confirm red**
+- [ ] Apply LLM base-URL, tracing, selected-profile attribution, and required-control gates to source components with source IDs/types. Keep sequential multi-query retry policy transform-only.
+- [ ] Keep static-row-prompt and interpretation review checks transform-only; a rowless source does not create row interpretation events.
+- [ ] Add `llm` as a non-deterministic external source boundary. Describe one authored prompt, one generated row, served model, reported usage, timestamp, and operation record.
+- [ ] Make `llm_interpretations` explicitly not applicable when only the source exists, with source-specific narrative rather than transform prose.
+- [ ] Run and commit as a backend-only slice:
 
 ```bash
-.venv/bin/python -m pytest tests/unit/web/execution -q
+.venv/bin/python -m pytest \
+  tests/unit/web/execution \
+  tests/integration/web/test_execute_pipeline.py \
+  tests/unit/web/audit_readiness -q
+git add src/elspeth/web/execution/validation.py src/elspeth/web/audit_readiness tests/unit/web/execution tests/integration/web/test_execute_pipeline.py tests/unit/web/audit_readiness
+git commit -m "fix: enforce and explain LLM source boundaries"
 ```
 
-Expected: base URL/tracing checks ignore sources.
+## Task 8: Admit runtime profiles, value sources, and provider-aware availability
 
-- [ ] **Step 3: Generalize applicable policy iteration**
-
-Add a local projection yielding `(component_id, component_type, plugin, options)` for sources and transform nodes. Apply base-URL and tracing policies to both. Keep sequential multi-query retry checks transform-only with an explicit test. Include source profile aliases in operator-resolved model bookkeeping without creating interpretation requirements.
-
-- [ ] **Step 4: Run execution tests**
-
-```bash
-.venv/bin/python -m pytest tests/unit/web/execution tests/integration/web/test_execute_pipeline.py -q
-```
-
-Expected: all pass.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/elspeth/web/execution/validation.py tests/unit/web/execution tests/integration/web/test_execute_pipeline.py
-git commit -m "fix: enforce LLM policies for source components"
-```
-
-## Task 9: Explain LLM source audit readiness accurately
+Register the source's internal operator-profile resolver in this task because provider-aware availability depends on it. Do not yet add the source to `REQUIRED_WEB_PLUGIN_IDS`, publish its public schema projection, expose it through the catalogue, or enable built-in discovery.
 
 **Files:**
 
-- Modify: `src/elspeth/web/audit_readiness/{boundary_expectations,explain,service}.py`
-- Modify: `tests/unit/web/audit_readiness/{test_boundary_predicate_parity,test_explain,test_service}.py`
+- Modify: `src/elspeth/core/config.py`
+- Modify: `src/elspeth/plugins/infrastructure/runtime_factory.py`
+- Modify: `src/elspeth/engine/orchestrator/preflight.py`
+- Modify: `src/elspeth/web/execution/preflight.py`
+- Modify: `src/elspeth/web/plugin_policy/availability.py`
+- Modify: `src/elspeth/web/plugin_policy/profiles.py`
+- Modify: `src/elspeth/plugins/sources/llm/source.py`
+- Test: `tests/unit/core/test_llm_profile_catalog.py`
+- Test: `tests/unit/web/plugin_policy/test_availability.py`
+- Test: `tests/unit/web/plugin_policy/test_profiles.py`
+- Test: `tests/unit/web/execution/{test_preflight_side_effects.py,test_validation_value_source.py}`
+- Test: source config/runtime tests under `tests/unit/plugins/sources/llm/`
 
-- [ ] **Step 1: Write failing boundary/narrative tests**
-
-```python
-def test_llm_source_narrative_describes_one_prompt_and_response() -> None:
-    narrative = build_narrative(llm_source_state(), retention_days=30)
-    assert "one authored prompt" in narrative
-    assert "one generated row" in narrative
-    assert "model and token usage" in narrative
-    assert "each row from the llm source" not in narrative
-
-
-def test_llm_source_does_not_make_interpretation_review_applicable() -> None:
-    snapshot = build_snapshot(llm_source_state())
-    row = next(row for row in snapshot.rows if row.id == "llm_interpretations")
-    assert row.status == "not_applicable"
-    assert row.summary == "No row-transform LLM interpretations in this composition"
-```
-
-- [ ] **Step 2: Run and confirm red**
-
-```bash
-.venv/bin/python -m pytest tests/unit/web/audit_readiness -q
-```
-
-Expected: source map lacks `llm` and generic prose is emitted.
-
-- [ ] **Step 3: Add boundary/prose and explicit interpretation ruling**
-
-Add `"llm": Determinism.NON_DETERMINISTIC` to source expectations. Give `_describe_source()` an LLM branch describing one prompt, full response, served model, usage, timestamp, and operation record. Rename the private predicate to `_composition_has_llm_interpretation_transform`, keep it transform-only, and document that interpretation events resolve row semantics unavailable to a rowless source.
-
-- [ ] **Step 4: Run and commit**
+- [ ] Extend CLI/runtime lowering only over the plural `sources` mapping. Cover the conventional mapping key `source` and arbitrary names; there is no top-level singular runtime source contract.
+- [ ] Lower source profiles even when `transforms` is absent/non-list. Preserve source `on_success` and `on_validation_failure`, reject unknown alias and ambiguous profile/provider, reject user-scoped CLI credentials, and accept server-scoped plus scope-less Bedrock profiles.
+- [ ] Preserve the authored alias as `source.options.profile` in audit-safe settings. Retain executable `profile_alias` in `BaseSource.config` for runtime attribution, stripping only `profile_alias` immediately before strict source provider-config validation. A second lowering pass is identity-equivalent.
+- [ ] Extend runtime factory and preflight value-source walks to source components with `source`/`source:<name>` attribution and `component_type == "source"`.
+- [ ] Reject invalid OpenRouter catalogue model and Azure model/deployment pairing. Bedrock and Gateway declare no value sources and pass without fabricated checks.
+- [ ] Remove the flat source `api_key` discovery requirement. Provider/profile-aware availability accepts keyless Bedrock with empty inventory and requires exactly the Azure, OpenRouter, or Gateway credential for those profiles; cover server/user inventory and unknown aliases without exposing values.
+- [ ] Register the internal source `llm` profile resolver so `OPERATOR_PROFILED` availability can enumerate only usable source aliases. Cover configured aliases, no usable alias, wrong component kind, and fail-closed missing-profile behavior. Keep public source-schema projection and compiler admission deferred to Task 10.
+- [ ] Keep source constructors network-free in preflight.
+- [ ] Explicitly defer source/transform provider-factory and discriminated-schema duplication as bounded debt. Paired four-provider config, construction, and schema-parity tests protect it; do not refactor it now.
+- [ ] Run and commit:
 
 ```bash
-.venv/bin/python -m pytest tests/unit/web/audit_readiness -q
-git add src/elspeth/web/audit_readiness tests/unit/web/audit_readiness
-git commit -m "feat: explain LLM source audit boundaries"
+.venv/bin/python -m pytest \
+  tests/unit/core/test_llm_profile_catalog.py \
+  tests/unit/plugins/sources/llm \
+  tests/unit/web/plugin_policy/test_availability.py \
+  tests/unit/web/plugin_policy/test_profiles.py \
+  tests/unit/web/execution/test_preflight_side_effects.py \
+  tests/unit/web/execution/test_validation_value_source.py -q
+git add src/elspeth/core/config.py src/elspeth/plugins/infrastructure/runtime_factory.py src/elspeth/engine/orchestrator/preflight.py src/elspeth/web/execution/preflight.py src/elspeth/web/plugin_policy/availability.py src/elspeth/web/plugin_policy/profiles.py src/elspeth/plugins/sources/llm/source.py tests/unit/core/test_llm_profile_catalog.py tests/unit/plugins/sources/llm tests/unit/web/plugin_policy/test_availability.py tests/unit/web/plugin_policy/test_profiles.py tests/unit/web/execution/test_preflight_side_effects.py tests/unit/web/execution/test_validation_value_source.py
+git commit -m "feat: admit LLM source runtime profiles"
 ```
 
-Expected: all pass.
+## Task 9: Prove the real engine through isolated registration
 
-## Task 10: Disclose source LLM egress before Run
+Production built-in discovery remains off. Register `LLMSource` explicitly in a fresh isolated plugin manager for these tests so the engine contract is proved without creating a catalogue-visible public path.
 
 **Files:**
 
+- Create: `tests/integration/plugins/llm/test_source_pipeline.py`
+- Modify if required: `tests/integration/plugins/llm/conftest.py`
+- Modify only if a red integration test exposes a defect: runtime source/provider/orchestrator files already owned by Tasks 1-8.
+
+- [ ] Through the real orchestrator and Landscape, prove this exact provider row matrix under one `source_load` operation ID:
+  - Azure: one logical LLM external-call row.
+  - Bedrock: one logical LLM external-call row.
+  - OpenRouter: one HTTP transport row plus one logical LLM row.
+  - Gateway: one HTTP transport row plus one logical LLM row.
+- [ ] On provider failures, the applicable rows are `ERROR`, share the same real operation ID, and have no state/token IDs. On success, exactly one source row at index 0 is emitted and state/token allocation occurs only after yield.
+- [ ] Cover known/partial/unknown/inconsistent usage parity, output lineage to a persisted sink, exhausted source not reopened on resume, and interrupted-before-exhaustion resume refusal.
+- [ ] Assert the isolated registration is scoped to the test manager and does not mutate the process-global shared manager or production discovery map.
+- [ ] Run and commit the integration proof only:
+
+```bash
+.venv/bin/python -m pytest tests/integration/plugins/llm/test_source_pipeline.py -q
+git add tests/integration/plugins/llm/test_source_pipeline.py tests/integration/plugins/llm/conftest.py
+git commit -m "test: prove LLM source operation lineage"
+```
+
+## Task 10: Publish compiler, catalogue, consent, and discovery atomically
+
+**Files:**
+
+- Modify: `src/elspeth/web/plugin_policy/{compiler.py,profiles.py}`
+- Modify: `src/elspeth/web/composer/planner_authoring_aids.py`
+- Modify: catalogue consumers under `src/elspeth/web/catalog/`
 - Modify: `src/elspeth/web/frontend/src/components/sidebar/ExecuteButton.tsx`
-- Modify: `src/elspeth/web/frontend/src/components/sidebar/ExecuteButton.test.tsx`
+- Modify: `src/elspeth/plugins/infrastructure/discovery.py`
+- Modify: `elspeth-lints/src/elspeth_lints/rules/plugin_contract/plugin_hashes/rule.py`
+- Modify at the end only: `src/elspeth/plugins/sources/llm/source.py`
+- Modify mechanically at the end only: `src/elspeth/plugins/transforms/llm/transform.py`
+- Test: `tests/unit/web/plugin_policy/{test_compiler.py,test_profiles.py}`
+- Test: `tests/unit/web/composer/test_planner_authoring_aids.py`
+- Test: `tests/unit/plugins/sources/test_source_catalogue_metadata.py`
+- Test: `tests/unit/web/catalog/{test_service.py,test_knob_schema_golden.py,test_policy_view_golden.py}`
+- Test: `src/elspeth/web/frontend/src/components/sidebar/ExecuteButton.test.tsx`
+- Test: `tests/unit/plugins/{test_discovery.py,test_builtin_plugin_metadata.py}`
+- Test: `tests/unit/plugins/llm/test_plugin_registration.py`
+- Test: `tests/unit/elspeth_lints/test_plugin_contract_rules.py`
+- Create mechanically: `tests/golden/web/catalog/knob_schema/source__llm.json`
+- Create mechanically: `tests/golden/web/catalog/policy_view/source__llm.json`
 
-- [ ] **Step 1: Write failing source consent tests**
-
-```typescript
-it("discloses an authored prompt for an LLM source without claiming row egress", () => {
-  const lines = buildRunEgressSummary(
-    llmSourceComposition("generator", "approved-model"),
-    transformCatalog,
-    sourceCatalog,
-    false,
-  );
-
-  expect(lines).toContain(
-    "Sends an authored prompt to the configured LLM: source:generator (model approved-model).",
-  );
-  expect(lines.join("\n")).not.toContain("Reads source data: source:generator");
-  expect(lines.join("\n")).not.toContain("Sends rows to the configured LLM: source:generator");
-});
-```
-
-Add loaded-catalog classification, failed-catalog uncertainty, ordinary-source unchanged, transform-LLM unchanged, and mixed source/transform tests.
-
-- [ ] **Step 2: Run and confirm red**
+- [ ] Add public `PluginId("source", "llm")` compiler requirement only now that Tasks 5-9 are green. Publish the source resolver registered in Task 8 through a component-aware public schema; do not create a second resolver or change its availability semantics.
+- [ ] Resolve provider variants from schema discriminator mappings, not transform class names. Preserve source `on_validation_failure`; exclude transform-only and private endpoint/credential/resolved-model fields. Re-run Task 8 profile/availability tests before enabling discovery.
+- [ ] Add source-only planner aids, reference prose, value-source hints, and stale-catalog advisory text. Do not suggest an LLM transform for a requested generation-first topology.
+- [ ] While production discovery is still off, test compiler, profile, catalogue, and authoring behavior with explicit isolated source registration.
+- [ ] In the same pre-discovery phase, update `ExecuteButton` consent using a synthetic source catalogue. Cover current, failed, stale, not-yet-loaded, and unknown catalogue states. An LLM source sends one authored prompt—not source rows—and appears exactly once; ordinary-source and LLM-transform wording remains unchanged.
+- [ ] Resolve the display alias only from authored `source.options.profile`, never a deployment default. Otherwise use a safe authored model, then generic `configured LLM`. Never reveal a private resolved model, endpoint, credential, or secret reference.
+- [ ] Run the focused frontend test, typecheck, and lint before enabling discovery:
 
 ```bash
-cd src/elspeth/web/frontend
-npm test -- src/components/sidebar/ExecuteButton.test.tsx
+(cd src/elspeth/web/frontend && npm test -- src/components/sidebar/ExecuteButton.test.tsx && npm run typecheck && npm run lint)
 ```
 
-Expected: source LLM appears only as generic source data.
-
-- [ ] **Step 3: Separate source generation from source reads**
-
-Accept source catalogue summaries in `buildRunEgressSummary`. Partition LLM and non-LLM sources; keep ordinary sources on `Reads source data`, add authored-prompt disclosure, avoid duplicate network lines, and name unverifiable sources when catalogue loading fails. Pass both source and transform catalogues from the store.
-
-- [ ] **Step 4: Run frontend gates**
+- [ ] Only after those tests are green, add `sources/llm` to `PLUGIN_SCAN_CONFIG`; add `plugins/sources/llm` to the hash rule's `PLUGIN_DIRS`; update its expected built-in count from 37 to 38; and add nested-directory, fresh-process, canonical identity, repeated-discovery, built-in metadata, and shared-manager regressions.
+- [ ] Add the helper-recognized placeholder declaration `source_file_hash: str | None = "sha256:0000000000000000"` to `LLMSource` with `apply_patch`, then mechanically compute/apply both the new source hash and the already-stale `LLMTransform` hash. Never guess a final hash or touch judge signatures.
+- [ ] Generate goldens from live sorted `CatalogServiceImpl` output only after production discovery is enabled; never hand-author JSON.
+- [ ] Run the whole exposure slice together:
 
 ```bash
-cd src/elspeth/web/frontend
-npm test -- src/components/sidebar/ExecuteButton.test.tsx
-npm run typecheck
-npm run lint
+.venv/bin/python - <<'PY'
+from pathlib import Path
+from scripts.cicd.plugin_hash import compute_source_file_hash, fix_source_file_hash
+
+targets = (
+    (Path("src/elspeth/plugins/sources/llm/source.py"), "LLMSource"),
+    (Path("src/elspeth/plugins/transforms/llm/transform.py"), "LLMTransform"),
+)
+for path, class_name in targets:
+    fix_source_file_hash(path, class_name, compute_source_file_hash(path))
+PY
+.venv/bin/python -m pytest \
+  tests/unit/core/test_llm_profile_catalog.py \
+  tests/unit/web/plugin_policy/test_compiler.py \
+  tests/unit/web/plugin_policy/test_profiles.py \
+  tests/unit/web/plugin_policy/test_availability.py \
+  tests/unit/web/composer/test_planner_authoring_aids.py \
+  tests/unit/plugins/sources/test_source_catalogue_metadata.py \
+  tests/unit/plugins/test_discovery.py \
+  tests/unit/plugins/test_builtin_plugin_metadata.py \
+  tests/unit/plugins/llm/test_plugin_registration.py \
+  tests/unit/web/catalog/test_service.py \
+  tests/unit/web/catalog/test_knob_schema_golden.py \
+  tests/unit/web/catalog/test_policy_view_golden.py \
+  tests/unit/elspeth_lints/test_plugin_contract_rules.py -q
+PYTHONPATH=src:elspeth-lints/src .venv/bin/elspeth-lints check --rules plugin_contract.plugin_hashes
+git add src/elspeth/web/plugin_policy/compiler.py src/elspeth/web/plugin_policy/profiles.py src/elspeth/web/composer/planner_authoring_aids.py src/elspeth/web/catalog src/elspeth/web/frontend/src/components/sidebar/ExecuteButton.tsx src/elspeth/web/frontend/src/components/sidebar/ExecuteButton.test.tsx src/elspeth/plugins/infrastructure/discovery.py elspeth-lints/src/elspeth_lints/rules/plugin_contract/plugin_hashes/rule.py src/elspeth/plugins/sources/llm/source.py src/elspeth/plugins/transforms/llm/transform.py tests/unit/core/test_llm_profile_catalog.py tests/unit/web/plugin_policy/test_compiler.py tests/unit/web/plugin_policy/test_profiles.py tests/unit/web/plugin_policy/test_availability.py tests/unit/web/composer/test_planner_authoring_aids.py tests/unit/plugins/sources/test_source_catalogue_metadata.py tests/unit/plugins/test_discovery.py tests/unit/plugins/test_builtin_plugin_metadata.py tests/unit/plugins/llm/test_plugin_registration.py tests/unit/web/catalog tests/unit/elspeth_lints/test_plugin_contract_rules.py tests/golden/web/catalog
+git commit -m "feat: publish LLM source authoring support"
 ```
 
-Expected: all pass.
+This commit is the first production built-in discovery/catalogue exposure and must be atomic with every compiler, profile, authoring, consent, metadata, golden, lint-inventory, and hash change above.
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/elspeth/web/frontend/src/components/sidebar/ExecuteButton.tsx src/elspeth/web/frontend/src/components/sidebar/ExecuteButton.test.tsx
-git commit -m "fix: disclose LLM source prompt egress before runs"
-```
-
-## Task 11: Add a bounded example
+## Task 11: Add a bounded shipped example
 
 **Files:**
 
-- Create: `examples/llm_source/settings.yaml`
-- Create: `examples/llm_source/README.md`
-- Modify: `examples/AGENTS.md`
-- Modify: `examples/README.md`
+- Create: `examples/llm_source/{settings.yaml,README.md}`
+- Modify: `examples/{AGENTS.md,README.md}`
 - Modify: `tests/e2e/examples/test_shipped_examples.py`
 - Modify: `tests/unit/docs/test_examples_readme_index.py`
 
-- [ ] **Step 1: Write a failing example inventory test**
-
-Add `llm_source` to the ChaosLLM inventory and assert one LLM source, no LLM transform, custom response field, explicit validation-failure policy, and a JSON sink.
-
-- [ ] **Step 2: Run and confirm red**
-
-```bash
-.venv/bin/python -m pytest tests/e2e/examples/test_shipped_examples.py tests/unit/docs/test_examples_readme_index.py -q
-```
-
-Expected: inventory or missing-file failure.
-
-- [ ] **Step 3: Add the ChaosLLM example**
-
-Use the OpenRouter-compatible loopback provider, one static prompt, `response_field: generated_text`, observed schema, explicit discard, and JSON sink. Document one-row output and the existing ChaosLLM launch command. If required Content Safety is unavailable locally, document that this CLI example assumes recommend mode; do not add a fake control.
-
-- [ ] **Step 4: Validate and commit**
+- [ ] Add a red inventory test requiring one `llm` source, no LLM transform, custom response field, explicit discard, and a JSON sink.
+- [ ] Use the OpenRouter-compatible ChaosLLM loopback, one static prompt, observed schema, and one-row response/usage/model documentation. State that usage mirrors reported provider data.
+- [ ] If local required Content Safety is unavailable, say the CLI example assumes recommend mode; do not add a fake control.
+- [ ] Run and commit:
 
 ```bash
 .venv/bin/python -m pytest tests/e2e/examples/test_shipped_examples.py tests/unit/docs/test_examples_readme_index.py -q
-.venv/bin/elspeth validate --settings examples/llm_source/settings.yaml
+PYTHONPATH=src:elspeth-lints/src .venv/bin/elspeth validate --settings examples/llm_source/settings.yaml
 git add examples/llm_source examples/AGENTS.md examples/README.md tests/e2e/examples/test_shipped_examples.py tests/unit/docs/test_examples_readme_index.py
 git commit -m "docs: add single-row LLM source example"
 ```
 
-Expected: tests and validation pass without making a provider request.
+Validation must make no provider request.
 
-## Task 12: Run the parity scan and full verification
+## Task 12: Classify every discriminator and run full closeout
 
-**Files:**
-
-- Modify only files exposed by the checks below; do not broaden into unrelated existing findings.
-
-- [ ] **Step 1: Scan every live LLM discriminator**
+Run these bounded production searches separately; for every production result, record one of: source parity implemented, deliberately transform-only with a focused test, or unrelated type/import reference. The focused suites below are evidence; do not manually classify every test reference. First syntax-check this exact command block with `bash -n`, then execute it:
 
 ```bash
-rg -n 'PluginId\("transform", "llm"\)|plugin == "llm"|plugin != "llm"|get_transform_by_name\(.*llm|LLMTransform|llm_node|llm transform|LLM transform' src tests
+bash -n <<'BASH'
+rg -n -U "PluginId\(\s*['\"](?:source|transform)['\"]\s*,\s*['\"]llm['\"]\s*\)" src/elspeth
+rg -n "PluginCapability\.LLM" src/elspeth
+rg -n "get_source_by_name\([^\n]*llm|get_transform_by_name\([^\n]*llm" src/elspeth
+rg -n "LLMSource|LLMTransform" src/elspeth
+rg -n "composition_has_llm" src/elspeth
+rg -n "llm_source|llm_node|llm_transform" src/elspeth
+rg -n "(plugin\s*(==|!=)\s*['\"]llm['\"]|['\"]llm['\"]\s*(==|!=)\s*plugin)" src/elspeth --glob '*.py'
+rg -n "(plugin\s*(===|!==)\s*['\"]llm['\"]|['\"]llm['\"]\s*(===|!==)\s*plugin)" src/elspeth/web/frontend/src --glob '*.ts' --glob '*.tsx'
+rg -n "isLlmNode|isLlmSource" src/elspeth/web/frontend/src --glob '*.ts' --glob '*.tsx'
+BASH
+rg -n -U "PluginId\(\s*['\"](?:source|transform)['\"]\s*,\s*['\"]llm['\"]\s*\)" src/elspeth
+rg -n "PluginCapability\.LLM" src/elspeth
+rg -n "get_source_by_name\([^\n]*llm|get_transform_by_name\([^\n]*llm" src/elspeth
+rg -n "LLMSource|LLMTransform" src/elspeth
+rg -n "composition_has_llm" src/elspeth
+rg -n "llm_source|llm_node|llm_transform" src/elspeth
+rg -n "(plugin\s*(==|!=)\s*['\"]llm['\"]|['\"]llm['\"]\s*(==|!=)\s*plugin)" src/elspeth --glob '*.py'
+rg -n "(plugin\s*(===|!==)\s*['\"]llm['\"]|['\"]llm['\"]\s*(===|!==)\s*plugin)" src/elspeth/web/frontend/src --glob '*.ts' --glob '*.tsx'
+rg -n "isLlmNode|isLlmSource" src/elspeth/web/frontend/src --glob '*.ts' --glob '*.tsx'
 ```
 
-Classify every result as source parity added, deliberately transform-only with focused evidence, or unrelated type/import reference. Recheck profile lowering, capability walks, execution gates, interpretation handling, semantic validation, implicit decisions, recipes/tutorials, catalogue, audit readiness, and consent.
+- [ ] **Discovery/identity:** fresh-process discovery, nested scan, shared-manager identity, no duplicates, plugin-hash directory inventory 38.
+- [ ] **Profiles/runtime/value sources:** plural sources only, key `source` plus arbitrary names, second-pass idempotence, audit alias provenance, strict-config stripping, server/user/scope-less credentials, invalid OpenRouter/Azure, declaration-free Bedrock/Gateway.
+- [ ] **Coverage/alternate exits/auto-wire:** component type, direct-sink rejection, success post-domination, every non-discard validation exit rejected under REQUIRED, discard accepted, transform-only Prompt Shield, singular/plural Composer provenance, ambiguous dual no-op, collision/budget/mixed/idempotence.
+- [ ] **Execution/readiness/catalogue/authoring:** base URL, tracing, profile and control gates, transform-only retry/interpretation, source boundary prose, public source schema, source-only planner aids, stale advisory, live goldens, all provider availability modes.
+- [ ] **Consent:** current/failed/stale/not-yet-loaded/unknown catalogue states; authored alias only, safe authored model fallback, generic fallback, no private resolved model, ordinary sources unchanged.
+- [ ] **Provider/Landscape exact matrix:** Azure and Bedrock each one logical LLM row; OpenRouter and Gateway each one HTTP transport plus one logical LLM row; same real operation ID, `ERROR` on failures, no pre-yield state/token, exactly one source row at index 0.
+- [ ] **Resume/usage/cleanup:** exhausted not reopened, interrupted resume refused, known/partial/unknown/inconsistent usage exact, cleanup cannot replace the primary outcome, cleanup telemetry is operation-correlated after load.
+- [ ] **Telemetry/log sentinel capture:** inject unique prompt, response, provider-body, credential, and secret-reference sentinels; assert none appears in `ResourceCleanupFailed`, console telemetry, or captured logs. Keep cleanup output bounded to resource/error type/correlation metadata.
 
-- [ ] **Step 2: Run focused Python and frontend tests**
+Run focused Python suites, including the integration surfaces omitted by narrower tasks:
 
 ```bash
 .venv/bin/python -m pytest \
   tests/unit/plugins/sources/llm \
   tests/unit/plugins/llm \
   tests/integration/plugins/llm \
+  tests/unit/plugins/test_discovery.py \
+  tests/unit/plugins/test_builtin_plugin_metadata.py \
+  tests/unit/core/test_llm_profile_catalog.py \
   tests/unit/web/plugin_policy \
   tests/unit/web/composer/test_required_control_autowire.py \
+  tests/integration/web/composer/guided/test_shared_planner_surfaces.py \
   tests/unit/web/execution \
+  tests/integration/web/test_execute_pipeline.py \
   tests/unit/web/audit_readiness \
-  tests/unit/web/catalog -q
-cd src/elspeth/web/frontend
-npm test -- src/components/sidebar/ExecuteButton.test.tsx
-npm run typecheck
-npm run lint
+  tests/unit/web/catalog \
+  tests/unit/web/composer/test_planner_authoring_aids.py \
+  tests/e2e/examples/test_shipped_examples.py -q
 ```
 
-Expected: all pass.
+Run the focused frontend test and the complete Vitest suite, restoring cwd each time:
 
-- [ ] **Step 3: Run the complete repository suite**
+```bash
+(cd src/elspeth/web/frontend && npm test -- src/components/sidebar/ExecuteButton.test.tsx)
+(cd src/elspeth/web/frontend && npm test)
+(cd src/elspeth/web/frontend && npm run typecheck && npm run lint)
+```
+
+- [ ] Run complete Python/static checks up to, but not including, the full lint:
 
 ```bash
 .venv/bin/python -m pytest tests/
+.venv/bin/python -m mypy src/elspeth
+.venv/bin/python -m ruff check src tests
+.venv/bin/python -m ruff format --check src tests
+PYTHONPATH=src:elspeth-lints/src .venv/bin/python scripts/wardline_gate.py
 ```
 
-Expected: no failures. Compare with the clean pre-change baseline: 35,589 passed, 66 skipped, 1 xfailed.
+Wardline must exit 0 and be non-inert.
 
-- [ ] **Step 4: Run static/trust-boundary gates**
+- [ ] As the final source-file modification, mechanically recompute/apply both plugin hashes, then independently verify both declarations match recomputation before running the full lint:
 
 ```bash
-.venv/bin/elspeth-lints check
-.venv/bin/python scripts/wardline_gate.py
+.venv/bin/python - <<'PY'
+from pathlib import Path
+from scripts.cicd.plugin_hash import compute_source_file_hash, extract_plugin_attributes, fix_source_file_hash
+
+targets = (
+    (Path("src/elspeth/plugins/sources/llm/source.py"), "LLMSource"),
+    (Path("src/elspeth/plugins/transforms/llm/transform.py"), "LLMTransform"),
+)
+for path, class_name in targets:
+    fix_source_file_hash(path, class_name, compute_source_file_hash(path))
+for path, class_name in targets:
+    expected = compute_source_file_hash(path)
+    declared = {item.class_name: item.source_file_hash for item in extract_plugin_attributes(path)}[class_name]
+    if declared != expected:
+        raise SystemExit(f"hash mismatch for {class_name}: declared={declared} expected={expected}")
+PY
+PYTHONPATH=src:elspeth-lints/src .venv/bin/elspeth-lints check --rules plugin_contract.plugin_hashes
+PYTHONPATH=src:elspeth-lints/src .venv/bin/elspeth-lints check
 ```
 
-Expected: Wardline exit 0 and non-inert. The documented package-wide signed trust-tier allowlist may remain fail-closed, but this branch must add no tier-model defects or drift.
+Preferred full-lint result is exit 0. If and only if its sole failure is the pre-existing operator-held judge-signature condition, prove the branch adds no signature drift and no other lint finding, record that evidence, and allow feature closeout without forbidden signing. Never stage, sign, rotate, rekey, or hand-edit judge metadata.
 
-- [ ] **Step 5: Inspect branch and update tracker evidence**
+- [ ] Inspect final state:
 
 ```bash
+git diff --check
 git status --short
 git diff release/0.7.2...HEAD --stat
 git log --oneline release/0.7.2..HEAD
 ```
 
-Expected: clean feature-only worktree. Add exact evidence to `elspeth-0b075bdf2b` and `elspeth-b35b10722c`; close the P1 only after coverage, auto-wire, execution, readiness, and consent tests pass.
-
-- [ ] **Step 6: Close verification without scope drift**
-
-If verification exposes a defect, return to the numbered task that owns that file, add the failing regression there, and commit that exact task's source/test paths with its stated commit message. If verification is clean, create no empty closeout commit. Do not push, merge, or alter the shared checkout without a new user request.
+- [ ] Commit a final mechanical hash-only refresh if Task 12 changed either declaration; create no empty closeout commit.
+- [ ] Record exact evidence on `elspeth-b35b10722c` and `elspeth-0b075bdf2b`. Only now, after every focused/full check and required-control parity surface passes, close the P1 and then the feature.
+- [ ] Leave the worktree clean. Do not push or merge.
