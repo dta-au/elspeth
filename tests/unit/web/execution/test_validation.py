@@ -688,20 +688,21 @@ def test_validation_pipeline_delegates_to_injected_impl_with_its_dependencies() 
         build_graph=validation_module.build_runtime_graph,
         validate_routes=validation_module.assemble_and_validate_pipeline_config,
     )
-    sentinel_result = MagicMock(name="validation_result")
+    sentinel_result = MagicMock(spec=ValidationResult)
     seen: dict[str, Any] = {}
 
     def run_impl(*args: Any, **kwargs: Any) -> Any:
         seen["dependencies"] = kwargs["dependencies"]
         raise PhaseTermination(sentinel_result)
 
+    catalog = create_catalog_service()
     result = ValidationPipeline(dependencies, run_impl=run_impl).run(
-        MagicMock(name="state"),
-        MagicMock(name="settings"),
-        MagicMock(name="yaml_generator"),
-        plugin_snapshot=MagicMock(name="plugin_snapshot"),
+        _make_state(),
+        _make_settings(),
+        MagicMock(spec=YamlGenerator),
+        plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(catalog),
         profile_registry=None,
-        catalog=MagicMock(name="catalog"),
+        catalog=catalog,
     )
 
     assert seen["dependencies"] is dependencies

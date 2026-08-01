@@ -20,7 +20,12 @@ from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
-from elspeth.web.execution._validation_diagnostics import _EdgePatchTarget, _IdentityFinding
+from elspeth.web.execution._validation_diagnostics import (
+    _EdgePatchTarget,
+    _GateFanOutFinding,
+    _IdentityFinding,
+    _StaticLLMPromptFinding,
+)
 from elspeth.web.execution._validation_model import (
     AuthoredValidatedState,
     GraphedRuntime,
@@ -32,7 +37,9 @@ from elspeth.web.execution._validation_model import (
     PolicyLoweredState,
 )
 from elspeth.web.execution._validation_runtime import (
+    build_gate_fan_out_advisory_checks,
     build_identity_advisory_checks,
+    build_static_llm_prompt_advisory_checks,
     load_runtime_settings,
     validate_graph_structure,
     validate_route_targets,
@@ -556,6 +563,59 @@ def test_identity_advisory_checks_use_policy_state_and_preserve_exact_prose() ->
     assert checks[0].affected_nodes == ("passthrough",)
     assert "between 'producer' and sink 'primary', which uses schema.mode: observed" in checks[0].detail
     assert "Consider removing it" in checks[0].detail
+
+
+def test_gate_fan_out_advisory_checks_use_policy_state_and_preserve_exact_prose() -> None:
+    # Same authored-vs-materialized discrimination as the identity sibling:
+    # value-distinct states plus an identity assertion, so a silent switch to
+    # the masked materialized state fails here rather than nowhere.
+    policy_state = _state()
+    graphed = GraphedRuntime(
+        instantiated=_instantiated(_loaded(_materialized(policy_state=policy_state, materialized_state=_state(version=2)))),
+        graph=_graph(),
+        graph_warnings=(),
+    )
+    finding = _GateFanOutFinding(node_id="fanout", condition="True", destinations=("archive", "primary"))
+    seen: list[CompositionState] = []
+
+    def finder(state: CompositionState) -> list[_GateFanOutFinding]:
+        seen.append(state)
+        return [finding]
+
+    checks = build_gate_fan_out_advisory_checks(graphed, find_gate_fan_out_advisories=finder)
+
+    assert seen == [policy_state]
+    assert seen[0] is policy_state
+    assert len(checks) == 1
+    assert checks[0].name == "gate_fan_out_advisory"
+    assert checks[0].affected_nodes == ("fanout",)
+    assert "constant condition 'True'" in checks[0].detail
+    assert "both of its routes deliver to the same destinations ('archive', 'primary')" in checks[0].detail
+
+
+def test_static_llm_prompt_advisory_checks_use_policy_state_and_preserve_exact_prose() -> None:
+    policy_state = _state()
+    graphed = GraphedRuntime(
+        instantiated=_instantiated(_loaded(_materialized(policy_state=policy_state, materialized_state=_state(version=2)))),
+        graph=_graph(),
+        graph_warnings=(),
+    )
+    finding = _StaticLLMPromptFinding(node_id="classify")
+    seen: list[CompositionState] = []
+
+    def finder(state: CompositionState) -> list[_StaticLLMPromptFinding]:
+        seen.append(state)
+        return [finding]
+
+    checks = build_static_llm_prompt_advisory_checks(graphed, find_static_llm_prompt_advisories=finder)
+
+    assert seen == [policy_state]
+    assert seen[0] is policy_state
+    assert len(checks) == 1
+    assert checks[0].name == "static_llm_prompt_advisory"
+    assert checks[0].affected_nodes == ("classify",)
+    assert "has a prompt_template that interpolates no row" in checks[0].detail
+    assert "did you mean to use an LLM source instead?" in checks[0].detail
 
 
 def test_runtime_carriers_snapshot_envelopes_but_preserve_executable_identities() -> None:
