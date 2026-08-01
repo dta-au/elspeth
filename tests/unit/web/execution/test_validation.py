@@ -811,6 +811,28 @@ class TestValidatePipelineEmptyComposition:
         assert "Field required" not in err.message
         assert err.suggestion is not None
 
+    def test_empty_pipeline_is_the_only_partial_ledger_shape(self) -> None:
+        """The empty-composition result is deliberately EXEMPT from the
+        complete-failure-ledger invariant: the 18 checks canonically before
+        settings_load never ran, and recording them as passed would
+        fabricate evidence. This pin makes the exemption explicit so the
+        shape is never mistaken for a ValidationLedger bug — and so a
+        future route through the ledger is a conscious contract change."""
+        from elspeth.web.execution.schemas import VALIDATION_BLOCKING_CHECK_NAMES
+
+        state = _make_state(source_options=None)
+
+        result = validate_pipeline_for_trained_operator(state, _make_settings(), _FakeYamlGenerator())
+
+        names = [check.name for check in result.checks]
+        settings_rank = VALIDATION_BLOCKING_CHECK_NAMES.index("settings_load")
+        # Starts AT settings_load — the unrun canonical prefix is absent.
+        assert names == list(VALIDATION_BLOCKING_CHECK_NAMES[settings_rank:])
+        assert result.checks[0].passed is False
+        for skipped in result.checks[1:]:
+            assert skipped.passed is False
+            assert skipped.outcome_code == CHECK_OUTCOME_SKIPPED_AFTER_FAILURE
+
     def test_empty_pipeline_skips_pydantic_invocation(self) -> None:
         """The short-circuit returns before any of the engine code paths
         the mocks would intercept — confirms we are NOT relying on

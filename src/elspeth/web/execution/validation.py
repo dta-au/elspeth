@@ -301,6 +301,14 @@ def _validate_pipeline_impl(
     # Empty compositions have a deliberate legacy producer shape rather than
     # entering the ordered core ledger: no authored phase can make them
     # executable, and engine settings diagnostics would leak internal names.
+    #
+    # This is the ONE result exempt from the complete-failure-ledger
+    # invariant every other path satisfies (a full VALIDATION_BLOCKING_CHECK
+    # sequence with a single failure and a skipped tail): the 18 checks that
+    # canonically precede settings_load never ran here, and recording them
+    # as passed would fabricate evidence. Consumers indexing by canonical
+    # rank must tolerate this shape; pinned by
+    # test_empty_pipeline_is_the_only_partial_ledger_shape.
     if not state.sources and not state.nodes and not state.outputs:
         return ValidationResult(
             is_valid=False,
