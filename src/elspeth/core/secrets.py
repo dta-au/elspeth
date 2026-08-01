@@ -10,7 +10,13 @@ from collections.abc import Collection, Mapping
 from copy import deepcopy
 from typing import Any
 
-from elspeth.contracts.secrets import ResolvedSecret, ScopedWebSecretResolver, SecretRefPlacementViolation, SecretScope, WebSecretResolver
+from elspeth.contracts.secrets import (
+    ResolvedSecret,
+    ScopedSecretResolverContract,
+    SecretRefPlacementViolation,
+    SecretScope,
+    WebSecretResolver,
+)
 
 _EXACT_ENV_VAR_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}")
 
@@ -381,6 +387,8 @@ def _resolve_marker(
 ) -> ResolvedSecret | None:
     if scope is None:
         return resolver.resolve(user_id, name)
-    if not isinstance(resolver, ScopedWebSecretResolver):
-        raise TypeError("Scoped secret marker requires a ScopedWebSecretResolver")
+    # ADR-032: nominal admission against the owned ABC, never the
+    # runtime_checkable Protocol (structural — an impostor would pass).
+    if not isinstance(resolver, ScopedSecretResolverContract):
+        raise TypeError("Scoped secret marker requires a resolver inheriting ScopedSecretResolverContract")
     return resolver.resolve_scoped(user_id, name, scope)

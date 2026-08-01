@@ -12,6 +12,7 @@ from elspeth.contracts.secrets import (
     CreateSecretResult,
     FingerprintKeyMissingError,
     ResolvedSecret,
+    ScopedSecretResolverContract,
     SecretDecryptionError,
     SecretInventoryItem,
     SecretScope,
@@ -319,7 +320,7 @@ class WebSecretService:
         return self._user_store.delete_secret(name, user_id=user_id, auth_provider_type=auth_provider_type)
 
 
-class ScopedSecretResolver:
+class ScopedSecretResolver(ScopedSecretResolverContract):
     """Binds auth_provider_type into the WebSecretResolver protocol.
 
     The ``WebSecretResolver`` protocol (L0) uses ``(user_id, name)`` as
