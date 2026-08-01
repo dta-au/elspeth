@@ -123,6 +123,7 @@ from elspeth.web.composer.telemetry_phase8 import (
 from elspeth.web.composer.tools import _DATA_ERROR_KEY, ToolResult, execute_tool
 from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
+from elspeth.web.execution.completion_gates import COMPLETION_GATES_META_KEY, completion_gates_meta_value
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.execution.validation import validate_pipeline
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter, get_rate_limiter
@@ -1815,6 +1816,20 @@ async def _state_data_from_composer_state(
     if state.guided_session is not None and "guided_session" not in surface_meta:
         surface_meta["guided_session"] = state.guided_session.to_dict()
     persisted_composer_meta = merge_implicit_decisions_meta(surface_meta, state)
+    # Completion-gate facts (advisor sign-off first) are durable only here:
+    # the key is OVERWRITTEN on every compose-preflight save — populated when
+    # the preflight withheld completion, empty when it did not — so a stale
+    # blocked fact cannot survive a clean turn. Exact-type dispatch mirrors
+    # the ``_RuntimePreflightOutcome`` convention above: a captured
+    # ``_RuntimePreflightFailed`` persists ``is_valid=False`` and carries no
+    # gate verdict.
+    persisted_composer_meta = {
+        **persisted_composer_meta,
+        COMPLETION_GATES_META_KEY: completion_gates_meta_value(
+            runtime if type(runtime) is ValidationResult else None,
+            state,
+        ),
+    }
     normalized_persisted_errors = validation_errors_for_composer_surface(
         composer_meta=persisted_composer_meta,
         is_valid=persisted_is_valid,

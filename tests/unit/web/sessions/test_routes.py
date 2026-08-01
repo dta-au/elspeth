@@ -10001,6 +10001,109 @@ def test_state_data_carries_structured_errors_before_save_for_atomicity() -> Non
     assert any(e.startswith("frame=") for e in errors)
 
 
+# ---------------------------------------------------------------------------
+# Completion-gate persistence: every compose-preflight save writes the
+# ``completion_gates`` key so a withheld advisor sign-off survives reload.
+# Spec: docs-archive/specs/2026-08-01-composer-completion-gate-persistence-design.md
+# ---------------------------------------------------------------------------
+
+
+def _advisor_blocked_preflight(state: CompositionState) -> ValidationResultModel:
+    """Green build whose completion is withheld by the advisor gate (R2-F14 shape)."""
+    from elspeth.web.execution.schemas import ADVISOR_SIGNOFF_BLOCKED_CODE, ValidationReadinessBlocker
+
+    del state  # fingerprint is derived by the writer, not baked in here
+    return ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=True,
+            completion_ready=False,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code=ADVISOR_SIGNOFF_BLOCKED_CODE,
+                    component_id="pipeline",
+                    component_type="pipeline",
+                    detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                )
+            ],
+        ),
+    )
+
+
+async def _state_data_with_preflight(
+    state: CompositionState,
+    runtime_preflight: ValidationResultModel,
+    composer_meta: Mapping[str, Any] | None = None,
+):
+    from elspeth.web.sessions.routes import _state_data_from_composer_state
+
+    state_data, _validation = await _state_data_from_composer_state(
+        state,
+        settings=object(),
+        secret_service=None,
+        user_id="alice",
+        session_id="session-123",
+        plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service()),
+        profile_registry=MagicMock(spec=OperatorProfileRegistry),
+        catalog=create_catalog_service(),
+        runtime_preflight=runtime_preflight,
+        preflight_exception_policy="raise",
+        initial_version=None,
+        telemetry_source="compose",
+        composer_meta=composer_meta,
+    )
+    return state_data
+
+
+@pytest.mark.asyncio
+async def test_state_data_writes_blocked_completion_gate() -> None:
+    from elspeth.web.execution.completion_gates import completion_gate_fingerprint
+
+    state = _make_authoring_valid_partial("gate-blocked")
+    state_data = await _state_data_with_preflight(state, _advisor_blocked_preflight(state))
+
+    assert state_data.composer_meta is not None
+    gates = state_data.composer_meta["completion_gates"]
+    assert gates["advisor_signoff"]["status"] == "blocked"
+    assert gates["advisor_signoff"]["detail"] == ("The advisor sign-off could not be obtained; the pipeline cannot complete.")
+    assert gates["advisor_signoff"]["for_graph"] == completion_gate_fingerprint(state)
+    # The blocked sign-off gates COMPLETION only — the persisted validity
+    # stays graph-truth (R2-F14 honest-surfacing posture).
+    assert state_data.is_valid is True
+
+
+@pytest.mark.asyncio
+async def test_state_data_writes_empty_gates_on_clean_preflight() -> None:
+    state = _make_authoring_valid_partial("gate-clean")
+    state_data = await _state_data_with_preflight(state, ValidationResult(is_valid=True, checks=[], errors=[]))
+
+    assert state_data.composer_meta is not None
+    assert state_data.composer_meta["completion_gates"] == {}
+
+
+@pytest.mark.asyncio
+async def test_state_data_overwrites_carried_forward_gate() -> None:
+    """A clean compose turn must clear a stale blocked fact riding composer_meta."""
+    state = _make_authoring_valid_partial("gate-overwrite")
+    stale_meta = {
+        "repair_turns_used": 2,
+        "completion_gates": {"advisor_signoff": {"status": "blocked", "detail": "stale verdict", "for_graph": "0" * 64}},
+    }
+    state_data = await _state_data_with_preflight(
+        state,
+        ValidationResult(is_valid=True, checks=[], errors=[]),
+        composer_meta=stale_meta,
+    )
+
+    assert state_data.composer_meta is not None
+    assert state_data.composer_meta["completion_gates"] == {}
+    # Unrelated envelope keys are carried forward untouched.
+    assert state_data.composer_meta["repair_turns_used"] == 2
+
+
 @pytest.mark.asyncio
 async def test_runtime_preflight_for_state_threads_session_id_to_validate_pipeline(monkeypatch) -> None:
     """The runtime wrapper must preserve the session-scoped sink allowlist."""
