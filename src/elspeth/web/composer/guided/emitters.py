@@ -761,8 +761,10 @@ def _build_inspect_and_confirm_turn(
     ``samples`` is intentionally empty: ``SourceInspectionFacts`` carries
     ``sample_row_count`` (a count) but not the actual row payloads — the
     inspection layer deliberately redacts row content to avoid passing
-    user data through the audit trail.  The UI renders the count + column
-    list; full row previews are handled by the blob preview endpoint.
+    user data through the audit trail.  The wire payload carries only the
+    column list (no count field); the UI renders the column headers with an
+    explanatory row-content note.  Full row previews are handled by the
+    blob preview endpoint.
     """
     observed: _Observed = {
         "columns": list(inspection.observed_headers or ()),

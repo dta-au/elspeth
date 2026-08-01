@@ -1169,6 +1169,14 @@
   vertical-align: top;
 }
 
+/* Empty-samples note — production payloads redact row content, so the table
+   renders headers only; this line keeps that from reading as a broken table */
+.guided-inspect-empty-note {
+  margin: var(--space-xs) 0 var(--space-md);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+}
+
 /* Warnings aside — announced to screen readers via aria-label */
 .guided-inspect-warnings {
   background-color: var(--color-surface-elevated);

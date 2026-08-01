@@ -67,6 +67,19 @@ const PAYLOAD_SPARSE: InspectAndConfirmPayload = {
   },
 };
 
+// Empty samples: the production shape — the backend intentionally redacts row
+// content from inspection facts (see composer/guided/emitters.py,
+// _build_inspect_and_confirm_turn), so live payloads always arrive with
+// samples: []. The sample-rendering path above stays for wire-schema
+// compatibility, but the empty shape must not look like a broken table.
+const PAYLOAD_EMPTY_SAMPLES: InspectAndConfirmPayload = {
+  observed: {
+    columns: ["url"],
+    samples: [],
+    warnings: [],
+  },
+};
+
 // ── Inspect view: column headers ──────────────────────────────────────────────
 
 describe("InspectAndConfirmTurn — column headers", () => {
@@ -112,6 +125,30 @@ describe("InspectAndConfirmTurn — sample rows", () => {
     const cells = secondRow.querySelectorAll("td");
     expect(cells[0].textContent).toBe("x2");
     expect(cells[1].textContent).toBe(""); // missing key → empty string
+  });
+});
+
+// ── Inspect view: empty samples (production shape) ────────────────────────────
+
+describe("InspectAndConfirmTurn — empty samples", () => {
+  it("renders an explanatory note instead of a bare header-only table", () => {
+    render(<InspectAndConfirmTurn payload={PAYLOAD_EMPTY_SAMPLES} onSubmit={vi.fn()} />);
+    expect(
+      screen.getByText("Row contents aren't previewed here — confirm the column names."),
+    ).toBeTruthy();
+  });
+
+  it("does not render the note when samples are present", () => {
+    render(<InspectAndConfirmTurn payload={PAYLOAD_WITH_WARNINGS} onSubmit={vi.fn()} />);
+    expect(
+      screen.queryByText("Row contents aren't previewed here — confirm the column names."),
+    ).toBeNull();
+  });
+
+  it("still renders every column header when samples are empty", () => {
+    render(<InspectAndConfirmTurn payload={PAYLOAD_EMPTY_SAMPLES} onSubmit={vi.fn()} />);
+    const headers = screen.getAllByRole("columnheader");
+    expect(headers.map((h) => h.textContent)).toEqual(["url"]);
   });
 });
 
