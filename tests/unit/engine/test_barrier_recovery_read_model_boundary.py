@@ -9,10 +9,14 @@ RESTORE_READ_METHODS = {
     "get_live_buffered_outcomes",
 }
 RESTORE_NODE_STATE_READ_METHODS = {
+    "find_released_node_state_token_ids",
     "get_completed_row_ids_for_nodes",
     "get_max_node_state_attempts",
     "get_open_node_state_ids",
+    "get_released_row_ids_for_nodes",
+    "has_branch_loss_for_group",
     "has_completed_row_for_node",
+    "has_released_row_for_node",
 }
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -54,6 +58,10 @@ def test_restore_and_coalesce_node_state_reads_do_not_use_execution_facade() -> 
         (
             REPO_ROOT / "src/elspeth/engine/journal_restore.py",
             {"CoalesceJournalRestorer"},
+        ),
+        (
+            REPO_ROOT / "src/elspeth/engine/row_union_executor.py",
+            {"RowUnionExecutor"},
         ),
     ]
     execution_restore_reads: list[tuple[str, str, str]] = []

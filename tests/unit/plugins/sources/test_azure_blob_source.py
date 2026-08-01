@@ -9,8 +9,8 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from azure.core.exceptions import AzureError
 
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from tests.fixtures.factories import make_operation_context
@@ -78,21 +78,25 @@ class _SourceContextFake:
 
 @dataclass(slots=True)
 class _BlobDownloadFake:
-    data: bytes
+    data: object
 
-    def readall(self) -> bytes:
+    def readall(self) -> object:
         return self.data
 
 
 @dataclass(slots=True)
 class _BlobClientFake:
-    data: bytes = b""
+    data: object = b""
     download_error: BaseException | None = None
+    closed: int = 0
 
     def download_blob(self) -> _BlobDownloadFake:
         if self.download_error is not None:
             raise self.download_error
         return _BlobDownloadFake(self.data)
+
+    def close(self) -> None:
+        self.closed += 1
 
 
 @dataclass(slots=True)
@@ -111,7 +115,7 @@ class _BlobServiceClientFake:
         return self.container_client
 
 
-def _fake_blob_service(data: bytes = b"", *, download_error: BaseException | None = None) -> _BlobServiceClientFake:
+def _fake_blob_service(data: object = b"", *, download_error: BaseException | None = None) -> _BlobServiceClientFake:
     return _BlobServiceClientFake(_BlobContainerClientFake(_BlobClientFake(data=data, download_error=download_error)))
 
 
@@ -493,11 +497,15 @@ class TestAzureBlobSourceCSV:
         assert "display_name" in rows[0].row
 
     def test_close_nulls_client(self, ctx: PluginContext) -> None:
-        """close() sets _blob_client to None."""
+        """close() releases the owned blob client and clears it."""
         source = _make_source(_base_config())
-        source._blob_client = _BlobClientFake()
+        client = _BlobClientFake()
+        source._blob_client = client
         source.close()
         assert source._blob_client is None
+        assert client.closed == 1
+        source.close()
+        assert client.closed == 1
 
     def test_close_idempotent(self, ctx: PluginContext) -> None:
         """close() can be called multiple times without error."""
@@ -1010,7 +1018,7 @@ class TestAzureBlobSourceAuditAndErrors:
     def test_download_failure_raises_runtime_error(self, ctx: PluginContext) -> None:
         """Azure download failure raises RuntimeError."""
         source = _make_source(_base_config())
-        fake_service = _fake_blob_service(download_error=Exception("connection refused"))
+        fake_service = _fake_blob_service(download_error=AzureError("connection refused"))
 
         with (
             patch(PATCH_AUTH, return_value=fake_service),
@@ -1028,35 +1036,52 @@ class TestAzureBlobSourceAuditAndErrors:
         ):
             list(source.load(ctx))
 
-    def test_programming_errors_crash_directly(self, ctx: PluginContext) -> None:
-        """Programming errors (TypeError) crash through, not caught."""
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            TypeError("bad argument"),
+            AssertionError("our bug"),
+            NotImplementedError("our bug"),
+            GeneratorExit(),
+        ],
+    )
+    def test_programming_and_process_control_errors_crash_directly(
+        self,
+        ctx: PluginContext,
+        failure: BaseException,
+    ) -> None:
         source = _make_source(_base_config())
-        fake_service = _fake_blob_service(download_error=TypeError("bad argument"))
+        fake_service = _fake_blob_service(download_error=failure)
 
         with (
             patch(PATCH_AUTH, return_value=fake_service),
-            pytest.raises(TypeError, match="bad argument"),
+            pytest.raises(type(failure)),
         ):
             list(source.load(ctx))
 
-    def test_audit_integrity_error_on_record_call_failure(self, ctx: PluginContext) -> None:
-        """AuditIntegrityError when record_call fails after successful download."""
+    def test_audit_programmer_failure_escapes_unchanged(self, ctx: PluginContext) -> None:
         source = _make_source(_base_config())
 
         blob_bytes = b"id,name\n1,alice\n"
         fake_service = _fake_blob_service(blob_bytes)
+        failure = RuntimeError("db write failed")
 
-        # Make record_call raise to simulate audit failure
         def failing_record_call(*_args: Any, **_kwargs: Any) -> Any:
-            raise Exception("db write failed")
+            raise failure
 
         ctx.record_call = failing_record_call  # type: ignore[method-assign,assignment]
 
-        with (
-            patch(PATCH_AUTH, return_value=fake_service),
-            pytest.raises(AuditIntegrityError, match="audit trail"),
-        ):
+        with patch(PATCH_AUTH, return_value=fake_service), pytest.raises(RuntimeError) as exc_info:
             list(source.load(ctx))
+        assert exc_info.value is failure
+
+    def test_non_bytes_download_never_records_success(self) -> None:
+        source = _make_source(_base_config())
+        ctx = _SourceContextFake()
+
+        with patch(PATCH_AUTH, return_value=_fake_blob_service(0)), pytest.raises(TypeError, match="bytes"):
+            list(source.load(ctx))
+        assert ctx.record_call.call_count == 0
 
     @pytest.mark.parametrize(
         ("blob_format", "blob_path", "blob_bytes"),

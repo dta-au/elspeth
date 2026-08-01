@@ -184,30 +184,23 @@ def sanitize_evidence(kind: str, payload: object, *, plan_sha256: str | None = N
 
 
 def _verify_stored_receipts(manifest_path: Path, manifest: Mapping[str, object]) -> tuple[int, str]:
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, dict)
-    receipts = evidence["receipts"]
-    assert isinstance(receipts, list)
-    candidate_sha = manifest["candidate_sha"]
-    assert isinstance(candidate_sha, str)
+    evidence = cast(dict[str, object], manifest["evidence"])
+    receipts = cast(list[object], evidence["receipts"])
+    candidate_sha = cast(str, manifest["candidate_sha"])
     receipt_directory = manifest_path.parent / f"{manifest_path.name}.receipts"
-    for record in receipts:
-        assert isinstance(record, dict)
-        receipt_hash = record["receipt_sha256"]
-        scenario_id = record["scenario_id"]
-        kind = record["kind"]
-        subject_sha256 = record["subject_sha256"]
-        assert isinstance(receipt_hash, str)
-        assert isinstance(scenario_id, str) and isinstance(kind, str) and isinstance(subject_sha256, str)
+    for item in receipts:
+        record = cast(dict[str, object], item)
+        receipt_hash = cast(str, record["receipt_sha256"])
+        scenario_id = cast(str, record["scenario_id"])
+        kind = cast(str, record["kind"])
+        subject_sha256 = cast(str, record["subject_sha256"])
         expected_acceptance_run_id_sha256: str | None = None
         expected_cluster_id_sha256: str | None = None
         if kind == "connection-budget":
             inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
-            values = inventory["values"]
-            acceptance_run_id = manifest["acceptance_run_id"]
-            assert isinstance(values, dict) and isinstance(acceptance_run_id, str)
-            cluster_id = values["DB_CLUSTER_IDENTIFIER"]
-            assert isinstance(cluster_id, str)
+            values = cast(dict[str, object], inventory["values"])
+            acceptance_run_id = cast(str, manifest["acceptance_run_id"])
+            cluster_id = cast(str, values["DB_CLUSTER_IDENTIFIER"])
             expected_acceptance_run_id_sha256 = _sha256(acceptance_run_id.encode("utf-8"))
             expected_cluster_id_sha256 = _sha256(cluster_id.encode("utf-8"))
         document = _validate_stored_receipt(
@@ -222,8 +215,7 @@ def _verify_stored_receipts(manifest_path: Path, manifest: Mapping[str, object])
         canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if _sha256(canonical) != receipt_hash:
             raise AcceptanceCheckError("cleanup_finalize_receipt")
-    approvals = evidence["approvals"]
-    assert isinstance(approvals, list)
+    approvals = cast(list[object], evidence["approvals"])
     evidence_records = {"receipts": receipts, "approvals": approvals}
     return len(receipts) + len(approvals), _sha256(json.dumps(evidence_records, sort_keys=True, separators=(",", ":")).encode("utf-8"))
 
@@ -247,8 +239,7 @@ def _validate_evidence_export_receipt(
         "verified",
     }:
         raise AcceptanceCheckError("evidence_export_schema")
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, Mapping)
+    evidence = cast(Mapping[str, object], manifest["evidence"])
     if (
         receipt["schema"] != "elspeth.aws-ecs-evidence-export.v1"
         or receipt["acceptance_run_id"] != manifest["acceptance_run_id"]
@@ -305,7 +296,7 @@ def create_evidence_export_receipt(
         raise AcceptanceCheckError("evidence_export_schema")
     manifest = _read_control_manifest(manifest_path)
     ledger = _read_gate_ledger(ledger_path)
-    if ledger.get("candidate_sha") != manifest["candidate_sha"]:
+    if ledger["candidate_sha"] != manifest["candidate_sha"]:
         raise AcceptanceCheckError("evidence_export_binding")
     evidence_record_count, receipts_sha256 = _verify_stored_receipts(manifest_path, manifest)
     if artifact_count < max(1, evidence_record_count):
@@ -357,12 +348,15 @@ def _final_cleanup_receipt_document(
 
 def _verify_final_cleanup_receipt(manifest_path: Path, manifest: Mapping[str, object]) -> None:
     final_evidence = manifest["final_evidence"]
-    if not isinstance(final_evidence, Mapping) or final_evidence.get("phase") != "committed":
+    if final_evidence is None:
+        raise AcceptanceCheckError("cleanup_finalize_receipt")
+    final_evidence_record = cast(Mapping[str, object], final_evidence)
+    if final_evidence_record["phase"] != "committed":
         raise AcceptanceCheckError("cleanup_finalize_receipt")
     ledger = _read_gate_ledger(Path(cast(str, manifest["gate_ledger_path"])))
     ledger_sha256 = _gate_ledger_records_hash(ledger)
     _receipt_count, receipts_sha256 = _verify_stored_receipts(manifest_path, manifest)
-    committed_at = final_evidence["committed_at"]
+    committed_at = final_evidence_record["committed_at"]
     if type(committed_at) is not str:
         raise AcceptanceCheckError("cleanup_finalize_receipt")
     expected = _final_cleanup_receipt_document(

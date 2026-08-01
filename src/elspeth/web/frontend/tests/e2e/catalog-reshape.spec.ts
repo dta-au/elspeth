@@ -115,4 +115,69 @@ test.describe("catalog-reshape — Phase 7 demo path", () => {
     // "Use in pipeline" button must NOT be present.
     await expect(page.getByRole("button", { name: /use in pipeline/i })).not.toBeVisible();
   });
+
+  test("8: Reference details preserve source, transform, and sink guidance", async ({ page }) => {
+    const composer = new ComposerPage(page);
+    await composer.goto();
+    await page.keyboard.press("Control+Shift+P");
+
+    const drawer = page.getByRole("dialog", { name: /plugin catalog/i });
+    await expect(drawer).toBeVisible();
+    await expect(
+      page.getByText("See the technical description above.", { exact: true }),
+    ).toHaveCount(0);
+
+    const sourcePanel = drawer.getByRole("tabpanel", { name: /sources/i });
+    await expect(
+      sourcePanel.getByRole("article", { name: "Resume Placeholder" }),
+    ).toHaveCount(0);
+    const csvSource = sourcePanel.getByRole("article", { name: "CSV" });
+    const csvDetails = csvSource.getByRole("button", {
+      name: /reference details for csv/i,
+    });
+    await expect(csvDetails).toHaveAttribute("aria-expanded", "false");
+    await csvDetails.click();
+    await expect(csvSource.getByText("Use when:", { exact: true })).toBeVisible();
+    await expect(csvSource.getByText("Avoid when:", { exact: true })).toBeVisible();
+    await expect(csvSource.getByText("Example", { exact: true })).toBeVisible();
+    await expect(csvSource.getByText(/finite tabular file/i)).toBeVisible();
+    await expect(csvSource.getByText(/path: data\/input\.csv/i)).toBeVisible();
+    await csvDetails.click();
+    await expect(csvDetails).toHaveAttribute("aria-expanded", "false");
+    await expect(csvSource.getByText("Use when:", { exact: true })).toHaveCount(0);
+    await csvDetails.click();
+    await expect(csvSource.getByText("Use when:", { exact: true })).toBeVisible();
+
+    await drawer.getByRole("tab", { name: /transforms/i }).click();
+    const transformPanel = drawer.getByRole("tabpanel", { name: /transforms/i });
+    const valueTransform = transformPanel.getByRole("article", {
+      name: "Value Transform",
+    });
+    await valueTransform
+      .getByRole("button", { name: /reference details for value transform/i })
+      .click();
+    await expect(valueTransform.getByText("Use when:", { exact: true })).toBeVisible();
+    await expect(valueTransform.getByText("Avoid when:", { exact: true })).toBeVisible();
+    await expect(valueTransform.getByText("Example", { exact: true })).toBeVisible();
+    await expect(
+      valueTransform.getByText(/ordered expression-based field calculation/i),
+    ).toBeVisible();
+    await expect(valueTransform.getByText(/plugin: value_transform/i)).toBeVisible();
+
+    await drawer.getByRole("tab", { name: /sinks/i }).click();
+    const sinkPanel = drawer.getByRole("tabpanel", { name: /sinks/i });
+    const databaseSink = sinkPanel.getByRole("article", { name: "Database" });
+    await databaseSink
+      .getByRole("button", { name: /reference details for database/i })
+      .click();
+    await expect(databaseSink.getByText("Use when:", { exact: true })).toBeVisible();
+    await expect(databaseSink.getByText("Avoid when:", { exact: true })).toBeVisible();
+    await expect(databaseSink.getByText("Example", { exact: true })).toBeVisible();
+    await expect(databaseSink.getByText(/transactional append/i)).toBeVisible();
+    await expect(databaseSink.getByText(/plugin: database/i)).toBeVisible();
+
+    await expect(
+      page.getByText("See the technical description above.", { exact: true }),
+    ).toHaveCount(0);
+  });
 });

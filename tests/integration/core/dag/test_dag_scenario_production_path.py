@@ -421,6 +421,57 @@ def test_b2_composed_coalesces_register_semantic_runtime_oracles(
     assert isinstance(case.expected, SemanticRunExpectation)
 
 
+def test_row_union_two_variant_ab_preserves_complete_declared_groups_and_statistics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scenario, case = _declared_case("row-union-interleave", "two-variant-ab")
+    assert isinstance(case.expected, SemanticRunExpectation)
+    install_corpus_plugin_manager(monkeypatch)
+
+    evidence = run_scenario_case(scenario, case, tmp_path)
+    _assert_declared_run_evidence(scenario, case, evidence)
+
+    assert evidence.graph.node_count == 7
+    assert evidence.graph.edge_count == 7
+    assert evidence.graph.node_type_counts is not None
+    assert {item.node_type: item.count for item in evidence.graph.node_type_counts} == {
+        "aggregation": 1,
+        "gate": 1,
+        "row_union": 1,
+        "sink": 1,
+        "source": 1,
+        "transform": 2,
+    }
+
+    assert len(evidence.runtime.sink_outputs) == 1
+    [output_row] = evidence.runtime.sink_outputs[0].rows
+    comparison = json.loads(output_row)
+    assert {
+        key: comparison[key]
+        for key in ("baseline_variant", "variant", "baseline_count", "variant_count", "baseline_mean", "variant_mean", "mean_delta")
+    } == {
+        "baseline_variant": "control",
+        "variant": "treatment",
+        "baseline_count": 4,
+        "variant_count": 4,
+        "baseline_mean": 25.0,
+        "variant_mean": 37.5,
+        "mean_delta": 12.5,
+    }
+
+    projection = evidence.runtime.durable_projection
+    assert projection is not None
+    [batch] = projection.batches
+    assert (batch.status, batch.trigger_type, len(batch.members)) == ("completed", "end_of_source", 8)
+    tokens = {token.key: token for token in projection.tokens}
+    member_groups = tuple((tokens[member.token_key].row_key, tokens[member.token_key].branch_name) for member in batch.members)
+    assert member_groups == tuple(
+        (f"primary:{row_index}", branch) for row_index in range(4) for branch in ("control_branch", "treatment_branch")
+    )
+    assert all(work.final_status == "terminal" for work in projection.scheduler_work)
+
+
 @pytest.mark.parametrize(("scenario_id", "case_id"), B2_COMPOSED_COALESCE_CASES)
 def test_b2_composed_coalesces_execute_exact_semantic_production_oracles(
     scenario_id: str,

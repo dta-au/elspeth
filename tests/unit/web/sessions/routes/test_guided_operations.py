@@ -18,6 +18,7 @@ from elspeth.web.coordination.contracts import (
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.protocol import (
+    GUIDED_OPERATION_FAILURE_CODE_VALUES,
     GuidedCompositionStateResult,
     GuidedOperationActive,
     GuidedOperationClaimed,
@@ -28,9 +29,11 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.routes import guided_operations as guided_operations_module
 from elspeth.web.sessions.routes.guided_operations import (
+    _SAFE_FAILURES,
     GuidedOperationExpired,
     GuidedOperationLease,
     guided_response_hash,
+    raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
 from elspeth.web.sessions.schemas import ReenterGuidedRequest
@@ -621,3 +624,81 @@ async def _response(value: str) -> _Response:
 
 async def _never() -> _Response:
     raise AssertionError("replay callback must not run")
+
+
+class TestClosedFailureEnvelope:
+    """``_SAFE_FAILURES`` is the HTTP face of the closed failure vocabulary.
+
+    ``raise_guided_operation_failure`` refuses an unmapped code with an
+    ``AuditIntegrityError`` — a raw 500 — so a code added to
+    ``GuidedOperationFailureCode`` without an entry here turns a well-classified
+    failure back into the generic crash it was classified out of.
+    """
+
+    def test_every_closed_failure_code_has_an_http_envelope(self) -> None:
+        assert set(_SAFE_FAILURES) == GUIDED_OPERATION_FAILURE_CODE_VALUES
+
+    def test_policy_blocked_answers_422_without_provider_blame_or_a_retry_offer(self) -> None:
+        """The permanent half of the split must not read as a transient fault.
+
+        The observed failure (guided S3, 2026-07-31) reached the user as
+        "The provider returned an invalid response. Retry with a new operation
+        id." for a refusal that had ZERO provider calls and could never succeed
+        on retry. The replacement copy must blame neither the provider nor the
+        client's operation id, and must not invite a retry.
+        """
+        with pytest.raises(HTTPException) as caught:
+            raise_guided_operation_failure(GuidedOperationFailed(failure_code="policy_blocked"))
+
+        assert caught.value.status_code == 422
+        detail = caught.value.detail
+        assert isinstance(detail, dict)
+        assert detail["error_type"] == "guided_operation_terminal_failure"
+        assert detail["failure_code"] == "policy_blocked"
+        copy = str(detail["detail"])
+        lowered = copy.lower()
+        assert "provider" not in lowered
+        assert "operation id" not in lowered
+        assert "deployment policy" in lowered
+        # Names the permanence explicitly rather than offering a retry.
+        assert "retrying will fail the same way" in lowered
+
+    def test_permanent_and_transient_codes_are_partitioned_by_status_class(self) -> None:
+        """A 5xx says "our side broke, try again"; a policy refusal is neither."""
+        transient = ("provider_unavailable", "provider_timeout", "invalid_provider_response")
+        for code in transient:
+            status, copy = _SAFE_FAILURES[code]
+            assert status >= 500, code
+            assert "retry" in copy.lower(), code
+        status, _copy = _SAFE_FAILURES["policy_blocked"]
+        assert 400 <= status < 500
+
+    def test_invalid_provider_response_copy_drops_the_operation_id_jargon(self) -> None:
+        """The client mints a fresh operation id on every re-click by itself.
+
+        Naming the id taught the reader an internal protocol detail they cannot
+        act on; "Retry the request." is the whole actionable instruction.
+        """
+        _status, copy = _SAFE_FAILURES["invalid_provider_response"]
+
+        assert copy.endswith("Retry the request.")
+        assert "operation id" not in copy.lower()
+
+    def test_the_raise_site_leaves_request_id_to_the_app_boundary(self) -> None:
+        """The correlation id is injected once, at the app-level handler.
+
+        ``raise_guided_operation_failure`` has no ``Request`` and must not
+        acquire one: the id is stamped by ``RequestIdMiddleware`` and folded
+        into every dict-shaped detail by ``create_app``'s ``HTTPException``
+        handler (see ``tests/unit/web/test_composer_exception_handlers.py``).
+        Sourcing it here as well would give the envelope two authorities for
+        one field — and would silently diverge the moment a route composed the
+        envelope outside a request scope. Pin the closed key set so that
+        second source cannot be added here by accident.
+        """
+        for code in sorted(GUIDED_OPERATION_FAILURE_CODE_VALUES):
+            with pytest.raises(HTTPException) as caught:
+                raise_guided_operation_failure(GuidedOperationFailed(failure_code=code))
+            detail = caught.value.detail
+            assert isinstance(detail, dict)
+            assert set(detail) == {"error_type", "failure_code", "detail"}, code

@@ -277,4 +277,63 @@ describe("ProgressView", () => {
     expect(region).toHaveTextContent("Pipeline execution was cancelled.");
     expect(screen.getAllByText("Pipeline execution was cancelled.")).toHaveLength(2);
   });
+
+  // R2-F5 (elspeth-139a345050): the striped bar carried role="progressbar"
+  // with a hardcoded "in progress" label in EVERY state, including terminal
+  // ones — so a finished run still visually and semantically claimed to be
+  // in progress. The colored strip itself stays (intentional per the Phase
+  // 2.2 colour mapping above), but a terminal run must not expose
+  // role="progressbar" or the "in progress" label.
+  it("does not expose role=progressbar once the run reaches a terminal state", () => {
+    (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: false,
+      progress: progressFixture({ status: "completed" }),
+    });
+
+    render(<ProgressView />);
+
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Pipeline execution in progress")).not.toBeInTheDocument();
+  });
+
+  it("keeps role=progressbar with the in-progress label while the run is running", () => {
+    (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: false,
+      progress: progressFixture({ status: "running" }),
+    });
+
+    render(<ProgressView />);
+
+    expect(
+      screen.getByRole("progressbar", { name: "Pipeline execution in progress" }),
+    ).toBeInTheDocument();
+  });
+
+  // Mid-run counters need an "in progress" affordance so the numbers don't
+  // read as a settled final tally while the run is still going.
+  it("shows a running affordance near the counters while the run is in progress", () => {
+    (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: false,
+      progress: progressFixture({ status: "running" }),
+    });
+
+    render(<ProgressView />);
+
+    expect(screen.getByText("Running — counts so far")).toBeInTheDocument();
+  });
+
+  it("hides the running affordance once the run is terminal", () => {
+    (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: false,
+      progress: progressFixture({ status: "completed" }),
+    });
+
+    render(<ProgressView />);
+
+    expect(screen.queryByText("Running — counts so far")).not.toBeInTheDocument();
+  });
 });

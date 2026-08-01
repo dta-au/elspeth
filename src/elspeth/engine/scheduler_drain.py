@@ -56,7 +56,7 @@ if TYPE_CHECKING:
 
     from elspeth.contracts.coordination import CoordinationToken
     from elspeth.contracts.plugin_context import PluginContext
-    from elspeth.contracts.types import CoalesceName, NodeID
+    from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
     from elspeth.core.landscape.execution_repository import ExecutionRepository
     from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
     from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
@@ -247,6 +247,8 @@ class SchedulerDrainHost(Protocol):
         coalesce_name: CoalesceName | None = None,
         on_success_sink: str | None = None,
         attempt_offset: int = 0,
+        row_union_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
     ) -> tuple[RowResult | tuple[RowResult, ...] | None, list[WorkItem]]: ...
 
     def _run_barrier_intake_pass(self, ctx: PluginContext) -> tuple[list[RowResult], list[WorkItem]]: ...
@@ -592,6 +594,8 @@ class SchedulerDrainCoordinator:
                             coalesce_name=item.coalesce_name,
                             on_success_sink=item.on_success_sink,
                             attempt_offset=max(claimed.attempt - 1, 0),
+                            row_union_node_id=item.row_union_node_id,
+                            row_union_name=item.row_union_name,
                         )
                     except (SchedulerLeaseLostError, RunWorkerEvictedError):
                         # A traversal-boundary heartbeat already classified
@@ -1107,6 +1111,7 @@ class SchedulerDrainCoordinator:
                 expand_group_id=fields.expand_group_id,
                 coalesce_node_id=fields.coalesce_node_id,
                 coalesce_name=fields.coalesce_name,
+                row_union_name=fields.row_union_name,
                 lease_owner=self._scheduler_lease_owner,
                 lease_seconds=self._scheduler_lease_seconds,
                 now=available_at,
@@ -1130,6 +1135,7 @@ class SchedulerDrainCoordinator:
                 expand_group_id=fields.expand_group_id,
                 coalesce_node_id=fields.coalesce_node_id,
                 coalesce_name=fields.coalesce_name,
+                row_union_name=fields.row_union_name,
                 # Membership fence (ADR-030 §G, slice 5): thread the registered
                 # worker identity so an evicted RowProcessor cannot enqueue READY
                 # items that no active worker will claim. The fence is active only

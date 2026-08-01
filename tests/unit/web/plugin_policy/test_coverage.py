@@ -7,7 +7,14 @@ from dataclasses import replace
 import pytest
 
 from elspeth.contracts.plugin_capabilities import PluginCapability
-from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import (
+    CompositionState,
+    NodeSpec,
+    OutputSpec,
+    PipelineMetadata,
+    SourceSpec,
+    _validate_prompt_template_variable_bindings,
+)
 from elspeth.web.plugin_policy.coverage import (
     _translate_protected_fields_through_mapper,
     build_output_stream_graph,
@@ -45,6 +52,17 @@ def _node(
 
 def _queue(queue_id: str) -> NodeSpec:
     return _node(queue_id, None, queue_id, None, node_type="queue")
+
+
+def _row_union(
+    *,
+    branches: dict[str, str],
+    on_success: str = "unioned_rows",
+) -> NodeSpec:
+    return replace(
+        _node("variant_union", None, next(iter(branches.values())), on_success, node_type="row_union"),
+        branches=branches,
+    )
 
 
 def _state(*nodes: NodeSpec, source_target: str = "llm_in", sinks: tuple[str, ...] = ("main",)) -> CompositionState:
@@ -200,6 +218,110 @@ def test_prompt_shield_input_coverage_uses_actual_template_fields() -> None:
             prompt_fields=("untrusted_prompt",),
             declared_prompt_fields=("benign_label",),
         ),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+
+def _value_transform(
+    node_id: str,
+    input_stream: str,
+    on_success: str,
+    operations: object,
+) -> NodeSpec:
+    return _node(
+        node_id,
+        "value_transform",
+        input_stream,
+        on_success,
+        options={"schema": {"mode": "observed"}, "operations": operations},
+    )
+
+
+def test_prompt_shield_input_coverage_rejects_value_transform_overwrite_below_shield() -> None:
+    state = _state(
+        _shield("shield", "raw", "rewrite_in"),
+        _value_transform(
+            "rewrite",
+            "rewrite_in",
+            "llm_in",
+            [{"target": "prompt", "expression": "row['untrusted']"}],
+        ),
+        _llm(),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_not_dominated"),
+    ]
+
+
+def test_prompt_shield_input_coverage_allows_value_transform_writing_unshielded_fields() -> None:
+    state = _state(
+        _shield("shield", "raw", "rewrite_in"),
+        _value_transform(
+            "rewrite",
+            "rewrite_in",
+            "llm_in",
+            [{"target": "derived_score", "expression": "1"}],
+        ),
+        _llm(),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+@pytest.mark.parametrize(
+    "operations",
+    [
+        "not a list",
+        [{"expression": "1"}],
+        [{"target": 7, "expression": "1"}],
+        [{"target": "  ", "expression": "1"}],
+        ["not a mapping"],
+    ],
+)
+def test_prompt_shield_input_coverage_fails_closed_for_unprovable_value_transform(
+    operations: object,
+) -> None:
+    state = _state(
+        _shield("shield", "raw", "rewrite_in"),
+        _value_transform("rewrite", "rewrite_in", "llm_in", operations),
+        _llm(),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+
+def test_prompt_shield_input_coverage_passes_through_passthrough() -> None:
+    state = _state(
+        _shield("shield", "raw", "pass_in"),
+        _node("relay", "passthrough", "pass_in", "llm_in"),
+        _llm(),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+def test_prompt_shield_input_coverage_fails_closed_for_unknown_write_set_transform() -> None:
+    # json_explode writes parsed fields into the row; coverage cannot prove the
+    # shielded prompt survives, so the path must fail closed.
+    state = _state(
+        _shield("shield", "raw", "explode_in"),
+        _node(
+            "explode",
+            "json_explode",
+            "explode_in",
+            "llm_in",
+            options={"schema": {"mode": "observed"}, "source_field": "payload", "fields": ["prompt"]},
+        ),
+        _llm(),
         source_target="raw",
     )
 
@@ -396,6 +518,84 @@ def test_prompt_shield_queue_fan_in_passes_when_every_path_is_shielded() -> None
     assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
 
 
+def _branch_llm(node_id: str, input_stream: str) -> NodeSpec:
+    return _node(
+        node_id,
+        "llm",
+        input_stream,
+        "main",
+        options={
+            "prompt_template": "{{ row.prompt }}",
+            "required_input_fields": ["prompt"],
+            "response_field": f"{node_id}_response",
+        },
+    )
+
+
+def _fork_gate(gate_id: str, input_stream: str, branches: tuple[str, ...]) -> NodeSpec:
+    return _node(
+        gate_id,
+        None,
+        input_stream,
+        None,
+        node_type="gate",
+        routes={"true": "fork", "false": "fork"},
+        fork_to=branches,
+    )
+
+
+def test_prompt_shield_dominates_every_branch_through_fork_gate() -> None:
+    # Config gates route rows without modifying them, so one shield above the
+    # fork dominates both LLM branches.
+    state = _state(
+        _shield("shield", "raw", "shielded"),
+        _fork_gate("fan_out", "shielded", ("branch_a", "branch_b")),
+        _branch_llm("llm_a", "branch_a"),
+        _branch_llm("llm_b", "branch_b"),
+        source_target="raw",
+    )
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+def test_prompt_shield_dominates_through_routing_gate() -> None:
+    state = _state(
+        _shield("shield", "raw", "shielded"),
+        _node("router", None, "shielded", None, node_type="gate", routes={"hot": "llm_in", "cold": "discard"}),
+        _llm(),
+        source_target="raw",
+    )
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+def test_fork_gate_without_upstream_shield_reports_every_branch() -> None:
+    state = _state(
+        _fork_gate("fan_out", "raw", ("branch_a", "branch_b")),
+        _branch_llm("llm_a", "branch_a"),
+        _branch_llm("llm_b", "branch_b"),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert {finding.component_id for finding in findings} == {"llm_a", "llm_b"}
+
+
+def test_fork_gate_pass_through_keeps_per_branch_shielding_exact() -> None:
+    # A shield inside one branch covers that branch only; the gate pass-through
+    # must not leak its credit to the sibling.
+    state = _state(
+        _fork_gate("fan_out", "raw", ("branch_a", "branch_b")),
+        _shield("branch_shield", "branch_a", "shielded_a"),
+        _branch_llm("llm_a", "shielded_a"),
+        _branch_llm("llm_b", "branch_b"),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert {finding.component_id for finding in findings} == {"llm_b"}
+
+
 def test_prompt_shield_cycle_fails_safe() -> None:
     state = _state(
         _node("cycle_a", "passthrough", "cycle_b_out", "cycle_a_out"),
@@ -577,6 +777,41 @@ def test_content_safety_post_dominates_valid_coalesce_chain() -> None:
     assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
 
 
+def test_prompt_shield_must_dominate_every_row_union_branch() -> None:
+    union = _row_union(branches={"left": "left_done", "right": "right_done"})
+    state = _state(
+        _shield("left_shield", "raw", "left_done"),
+        _node("right_path", "passthrough", "raw", "right_done"),
+        union,
+        _llm(input_stream="unioned_rows"),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+
+def test_content_safety_post_dominates_row_union_release() -> None:
+    union = _row_union(branches={"left": "left_done", "right": "right_done"})
+    state = _state(
+        _llm(on_success="fanout_in"),
+        _node(
+            "fanout",
+            None,
+            "fanout_in",
+            None,
+            node_type="gate",
+            routes={"all": "fork"},
+            fork_to=("left", "right"),
+        ),
+        _node("left_path", "passthrough", "left", "left_done"),
+        _node("right_path", "passthrough", "right", "right_done"),
+        union,
+        _safety("safety", "unioned_rows", "main"),
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
+
+
 def test_content_safety_unknown_downstream_fails_safe() -> None:
     assert control_coverage_findings(_state(_llm(on_success="missing")), PluginCapability.CONTENT_SAFETY)
 
@@ -647,3 +882,297 @@ def test_bedrock_required_coverage_fails_for_an_unshielded_input_or_output_path(
 
     assert control_coverage_findings(unshielded_input, PluginCapability.PROMPT_SHIELD)
     assert control_coverage_findings(unshielded_output, PluginCapability.CONTENT_SAFETY)
+
+
+# ── llm on_error vs a required output control ────────────────────────────────
+#
+# An llm node's on_error edge is an independent output path, so a quarantine
+# sink on it correctly fails required_control_coverage. These tests pin the
+# DIAGNOSIS (which reason and stream the finding carries) and — critically —
+# the fact that the only authorable repair is on_error='discard'. A coverage
+# assertion alone is not enough evidence here: the abstract stream graph
+# happily accepts `llm --on_error--> connection --> control --> sink`, while
+# the graph builder rejects that edge outright. Both halves are asserted.
+
+
+def _authorable_state(*nodes: NodeSpec, sinks: tuple[str, ...] = ("main",)) -> CompositionState:
+    """Like ``_state``, but with the llm node's prompt field guaranteed.
+
+    ``_state``'s source guarantees no fields, which is fine for the tests that
+    only call ``control_coverage_findings``. Declaring ``guaranteed_fields``
+    here clears the ``schema_contract_violation`` an ``_llm`` node would
+    otherwise raise, so asserting on ``validate().is_valid`` becomes meaningful.
+    """
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="llm_in",
+            options={"path": "rows.csv", "schema": {"mode": "observed", "guaranteed_fields": ["prompt"]}},
+            on_validation_failure="discard",
+        ),
+        nodes=nodes,
+        edges=(),
+        outputs=tuple(
+            OutputSpec(
+                name=name,
+                plugin="json",
+                options={"path": f"{name}.jsonl", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            )
+            for name in sinks
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def test_content_safety_llm_error_route_to_sink_names_the_offending_error_route() -> None:
+    state = _authorable_state(
+        replace(_llm(on_success="safe_in"), on_error="quarantine"),
+        _safety("safety", "safe_in", "main"),
+        sinks=("main", "quarantine"),
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.reason, finding.uncovered_stream) for finding in findings] == [
+        ("judge", "output_error_route_not_post_dominated", "quarantine"),
+    ]
+
+
+def test_content_safety_llm_error_route_discard_is_covered_and_authorable() -> None:
+    """The one repair the rejection message offers must actually validate."""
+    state = _authorable_state(
+        replace(_llm(on_success="safe_in"), on_error="discard"),
+        _safety("safety", "safe_in", "main"),
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
+    assert state.validate().is_valid
+
+
+def test_llm_error_route_through_the_control_is_not_authorable() -> None:
+    """Interposing a control on an error branch is NOT a repair — pin that.
+
+    Stream-level coverage accepts this shape, which makes it look like a
+    sanctioned pattern. It is not: on_error may only name a sink or 'discard'
+    (core/dag/builder.py:1108, mirrored in composer state validation), so the
+    graph rejects the edge. Any message or authoring aid that offers this
+    shape sends the planner between two rejections forever.
+    """
+    state = _authorable_state(
+        replace(_llm(on_success="safe_in"), on_error="quarantine_in"),
+        _safety("safety", "safe_in", "main"),
+        _safety("quarantine_safety", "quarantine_in", "quarantine"),
+        sinks=("main", "quarantine"),
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
+    assert "transform_on_error_unknown_sink" in {error.error_code for error in state.validate().errors}
+
+
+def test_llm_error_route_is_named_when_a_multi_hop_success_path_is_covered() -> None:
+    """The discriminating case: on_success covered through hops, on_error not.
+
+    This is the shape that must yield the error-route reason, and it is what
+    keeps the narrowing honest. Widening the condition to "any uncovered stream
+    that happens to be some node's on_error target" would still pass the
+    trivially-broken cases below while breaking
+    ``test_content_safety_error_route_to_sink_is_uncovered``, where the
+    uncovered on_error belongs to a DOWNSTREAM node, not the llm node.
+    """
+    state = _authorable_state(
+        replace(_llm(on_success="mid_in"), on_error="quarantine"),
+        _node("mid", "passthrough", "mid_in", "safe_in"),
+        _safety("safety", "safe_in", "main"),
+        sinks=("main", "quarantine"),
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.reason, finding.uncovered_stream) for finding in findings] == [
+        ("output_error_route_not_post_dominated", "quarantine"),
+    ]
+
+
+def test_llm_error_route_reason_stays_general_when_another_path_is_also_uncovered() -> None:
+    """The error-route diagnosis claims the SOLE uncovered stream, or nothing.
+
+    Here on_success writes straight to a sink, so both edges are uncovered and
+    naming only the error route would send the author on a repair that leaves
+    the pipeline rejected.
+    """
+    state = _authorable_state(
+        replace(_llm(on_success="main"), on_error="quarantine"),
+        sinks=("main", "quarantine"),
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.reason, finding.uncovered_stream) for finding in findings] == [
+        ("output_not_post_dominated", None),
+    ]
+
+
+# ── prompt-field provability (R2-F17 compounding half, elspeth-5c0c09db31) ───
+
+
+def _llm_with_template(template: str, *, input_stream: str = "llm_in", on_success: str = "main") -> NodeSpec:
+    """An LLM node whose prompt template is authored verbatim.
+
+    ``_llm`` synthesises ``{{ row.<field> }}`` accesses; these cases turn on
+    templates that carry NO provable ``row.*`` access at all.
+
+    The template must be one a real candidate could still carry, so the
+    upstream binding guard is asserted here rather than in each case:
+    ``_validate_prompt_template_variable_bindings`` (elspeth-bea314a89b) now
+    rejects bare-variable templates like ``{{ text }}`` at
+    ``CompositionState.validate`` — earlier in the funnel than coverage — so
+    that shape can no longer reach a coverage decision at all. Dynamic
+    ``row[<expr>]`` access is the surviving route to an empty provable field
+    set. Without this assertion a later tightening of the binding guard would
+    leave the provability cases silently vacuous: they call
+    ``control_coverage_findings`` directly and would keep passing on a shape
+    production forbids.
+    """
+    assert (
+        _validate_prompt_template_variable_bindings(_node("probe", "llm", input_stream, on_success, options={"prompt_template": template}))
+        is None
+    ), f"fixture template is rejected before coverage runs: {template!r}"
+    return _node(
+        "judge",
+        "llm",
+        input_stream,
+        on_success,
+        options={"prompt_template": template, "response_field": "llm_response"},
+    )
+
+
+def _all_fields_shield(node_id: str, input_stream: str, on_success: str) -> NodeSpec:
+    """A shield configured with the string scope ``fields: all``."""
+    return _node(
+        node_id,
+        "azure_prompt_shield",
+        input_stream,
+        on_success,
+        options={"detect_only": False, "fields": "all"},
+    )
+
+
+def test_all_fields_shield_is_credited_when_prompt_fields_are_unprovable() -> None:
+    """AWS acceptance run 2 (R2-F17): a correctly placed shield was rejected.
+
+    The incident's own template was ``Classify: {{ text }}``, which has no
+    ``row.*`` access, so the provable prompt field set is empty — and the
+    empty-set bail-out ran BEFORE the ``fields: all`` shortcut, so a control
+    that scans every field was never credited and ``input_not_dominated``
+    fired on a conforming pipeline. ``all`` is a superset of every protected
+    set, provable or not.
+
+    The fixture uses dynamic ``row[<expr>]`` access rather than the incident's
+    literal template because ``{{ text }}`` is now rejected upstream at
+    ``CompositionState.validate`` (elspeth-bea314a89b) and can no longer reach
+    coverage. The regression this pins is the ordering of the ``fields: all``
+    shortcut against the empty-set bail-out, which is unchanged by how the
+    protected set came to be empty.
+    """
+    state = _state(
+        _all_fields_shield("shield", "raw", "llm_in"),
+        _llm_with_template("Classify: {{ row[lookup.field_name] }}"),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+def test_unprovable_prompt_fields_are_a_distinct_diagnosis_naming_both_field_sets() -> None:
+    """A field-scoped shield still fails closed — but says why, not "not covered".
+
+    An empty extraction is not proof that no row field reaches the prompt, so
+    a control scanning a specific list cannot be credited. The author needs
+    the distinct diagnosis, not the generic domination message which points at
+    a topology that is in fact correct.
+
+    The fixture is the dynamic ``row[<expr>]`` access this rationale names:
+    every row field it reads is chosen at render time, so the prompt provably
+    DOES consume row data while the statically provable set stays empty — the
+    fail-closed case in its purest form, and the shape that survives the
+    upstream bare-variable guard (elspeth-bea314a89b).
+    """
+    state = _state(
+        _shield("shield", "raw", "llm_in", fields=("prompt",)),
+        _llm_with_template("Classify: {{ row[lookup.field_name] }}"),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_fields_unprovable"),
+    ]
+    assert findings[0].protected_fields == ()
+    assert findings[0].scanned_fields == ("prompt",)
+
+
+def test_missing_shield_keeps_the_domination_diagnosis_when_prompt_fields_are_unprovable() -> None:
+    """No upstream control at all is a topology failure, not a scope failure."""
+    state = _state(_llm_with_template("Classify: {{ row[lookup.field_name] }}"))
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_not_dominated"),
+    ]
+
+
+def test_mismatched_shield_still_fires_and_carries_both_field_sets() -> None:
+    """The real finding must survive the credit fix, with both sets named."""
+    state = _state(
+        _shield("shield", "raw", "llm_in", fields=("benign_label",)),
+        _llm(prompt_fields=("untrusted_prompt",)),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_not_dominated"),
+    ]
+    assert findings[0].protected_fields == ("untrusted_prompt",)
+    assert findings[0].scanned_fields == ("benign_label",)
+
+
+def test_all_fields_control_is_credited_for_output_coverage_too() -> None:
+    """The ``all`` shortcut is role-agnostic: it dominates any protected set."""
+    state = _authorable_state(
+        _llm(on_success="safe_in"),
+        _node("safety", "azure_content_safety", "safe_in", "main", options={"detect_only": False, "fields": "all"}),
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
+
+
+def test_external_call_below_the_shield_is_not_reported_as_a_scope_failure() -> None:
+    """The scope diagnosis must not claim a broken topology is already right.
+
+    A ``web_scrape`` between the shield and the LLM reintroduces unscanned
+    content, so no shield scope — not even ``all`` — can cover this node. The
+    diagnosis must stay ``input_not_dominated``: telling the author "the wiring
+    is already right, widen the control's fields" would send them round a
+    repair that cannot land.
+    """
+    state = _state(
+        _shield("shield", "raw", "fetch_in"),
+        _node("fetch", "web_scrape", "fetch_in", "llm_in"),
+        _llm_with_template("Classify: {{ row[lookup.field_name] }}"),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_not_dominated"),
+    ]
+    # No field sets are asserted for a topology failure — naming a control
+    # that does not dominate would be a second false statement.
+    assert findings[0].scanned_fields == ()

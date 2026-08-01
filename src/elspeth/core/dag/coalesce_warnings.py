@@ -25,18 +25,26 @@ def find_divert_transforms_in_chain(
     graph: ExecutionGraph,
     start_node: NodeID,
     divert_transforms: set[NodeID],
+    *,
+    stop_nodes: frozenset[NodeID] = frozenset(),
 ) -> set[NodeID]:
     """Find DIVERT transforms by walking backwards from a node.
 
     Walks backwards through MOVE edges from the start node, collecting
     any transforms that have DIVERT edges. Intermediate routing gates are
     part of supported branch topology, so the walk crosses GATE nodes and
-    stops only when the chain leaves the branch-processing path.
+    stops only when the chain leaves the branch-processing path or reaches
+    a caller-declared boundary in ``stop_nodes``.
 
     Args:
         graph: The execution graph to walk
         start_node: The node to start walking backwards from
         divert_transforms: Pre-computed set of transforms with DIVERT edges
+        stop_nodes: Walk boundary. A stop node is never collected or
+            crossed — the walk ends BEFORE examining it. The row_union
+            caller passes the union's originating fork gate(s) here
+            (elspeth-94d68e7aca); the default empty set preserves the
+            historical unbounded walk for the coalesce path.
 
     Returns:
         Set of transform node IDs in the chain that have DIVERT edges.
@@ -46,6 +54,8 @@ def find_divert_transforms_in_chain(
     visited: set[NodeID] = set()
 
     while current not in visited:
+        if current in stop_nodes:
+            break
         visited.add(current)
         current_info = graph.get_node_info(current)
         if current_info.node_type == NodeType.TRANSFORM:

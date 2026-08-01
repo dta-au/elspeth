@@ -527,9 +527,15 @@ def _settings_stub(tmp_path: Path, **overrides: object) -> Any:
     data_dir = tmp_path / "data"
     payload_dir = tmp_path / "payloads"
     blob_dir = data_dir / "blobs"
-    data_dir.mkdir(exist_ok=True)
+    data_dir.mkdir(mode=0o700, exist_ok=True)
     payload_dir.mkdir(mode=0o700, exist_ok=True)
-    blob_dir.mkdir(exist_ok=True)
+    blob_dir.mkdir(mode=0o700, exist_ok=True)
+    # mkdir's mode is masked by umask; enforce the private mode explicitly so
+    # this fixture stays a safe (group/world-unwritable) baseline regardless
+    # of the process umask.
+    data_dir.chmod(0o700)
+    payload_dir.chmod(0o700)
+    blob_dir.chmod(0o700)
     values: dict[str, object] = {
         "deployment_target": "default",
         "deployment_state_mode": "auto",
@@ -795,6 +801,38 @@ class TestReadinessFilesystemChecks:
 
         assert check.ok is False
         assert check.detail == "blob_dir directory must not be a symlink"
+
+    @pytest.mark.parametrize("mode", [0o770, 0o707, 0o777])
+    def test_data_dir_rejects_group_or_world_writable_mode(self, tmp_path: Path, mode: int) -> None:
+        settings = _settings_stub(tmp_path)
+        data_dir = Path(settings.data_dir)
+        data_dir.chmod(mode)
+
+        check = _check_data_dir(settings)[0]
+
+        assert check.ok is False
+        assert check.detail == "data_dir group/world-writable directory is not allowed"
+
+    @pytest.mark.parametrize("mode", [0o770, 0o707, 0o777])
+    def test_blob_dir_rejects_group_or_world_writable_mode(self, tmp_path: Path, mode: int) -> None:
+        settings = _settings_stub(tmp_path)
+        blob = Path(settings.data_dir) / "blobs"
+        blob.chmod(mode)
+
+        check = _check_blob_dir(settings)[0]
+
+        assert check.ok is False
+        assert check.detail == "blob_dir group/world-writable directory is not allowed"
+
+    def test_data_dir_and_blob_dir_private_mode_still_passes(self, tmp_path: Path) -> None:
+        settings = _settings_stub(tmp_path)
+        data_dir = Path(settings.data_dir)
+        blob = data_dir / "blobs"
+        data_dir.chmod(0o700)
+        blob.chmod(0o700)
+
+        assert _check_data_dir(settings)[0].ok is True
+        assert _check_blob_dir(settings)[0].ok is True
 
     def test_probe_uses_exclusive_create_immediate_unlink_and_same_fd(
         self,

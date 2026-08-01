@@ -76,6 +76,7 @@ def item_from_mapping(row: RowMapping) -> TokenWorkItem:
         expand_group_id=data["expand_group_id"],
         coalesce_node_id=data["coalesce_node_id"],
         coalesce_name=data["coalesce_name"],
+        row_union_name=data["row_union_name"],
         attempt=data["attempt"],
         lease_owner=data["lease_owner"],
         lease_expires_at=data["lease_expires_at"],
@@ -107,6 +108,7 @@ def ready_work_item_values(
     expand_group_id: str | None,
     coalesce_node_id: str | None,
     coalesce_name: str | None,
+    row_union_name: str | None = None,
 ) -> dict[str, object]:
     return {
         "work_item_id": work_item_id(run_id, token_id, node_id, attempt),
@@ -132,6 +134,7 @@ def ready_work_item_values(
         "expand_group_id": expand_group_id,
         "coalesce_node_id": coalesce_node_id,
         "coalesce_name": coalesce_name,
+        "row_union_name": row_union_name,
         "attempt": attempt,
         "lease_owner": None,
         "lease_expires_at": None,
@@ -268,6 +271,7 @@ def insert_work_item_idempotent(conn: Connection, *, values: dict[str, object], 
         "expand_group_id",
         "coalesce_node_id",
         "coalesce_name",
+        "row_union_name",
         "attempt",
     )
     mismatches = {

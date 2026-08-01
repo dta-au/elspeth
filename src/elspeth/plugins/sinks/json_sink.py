@@ -147,13 +147,34 @@ class JSONSink(BaseSink):
     name = "json"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c7e72d6839c80dea"
+    source_file_hash: str | None = "sha256:3e6bf030c7641d52"
     config_model = JSONSinkConfig
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
     supported_effect_modes = frozenset({"append", "write"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS, SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT})
     supported_audit_export_formats = frozenset({AuditExportFormat.JSON})
+
+    usage_when_to_use: str = (
+        "Use for structured JSON output: choose JSONL for resumable append, or a JSON array when each run should publish "
+        "one complete artifact."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use JSON arrays for resume or long append workloads, do not publish non-finite values, and prefer CSV or "
+        "text for consumers that require a flat table or line."
+    )
+    example_use: str = """sinks:
+  results:
+    plugin: json
+    options:
+      path: outputs/results.jsonl
+      format: jsonl
+      mode: write
+      collision_policy: auto_increment
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("json", "jsonl", "file", "structured")
 
     @classmethod
     def _resolve_sink_effect_mode(

@@ -4,18 +4,29 @@
 // Inline banner displayed between the inspector header and tab content.
 // Renders Stage 2 validation results with per-component attribution.
 //
-// Pass: green banner with checkmark, summary, and check details.
+// Pass: green banner collapsed to a one-line "Validation passed" summary,
+// mirroring AuditReadinessPanel's collapse rule — expanded only when
+// something is actionable (warnings, or a passed-but-advisory check like
+// identity_node_advisory) or the user clicked to expand. The expanded view
+// shows check details and warnings.
 // Fail: red banner with per-component error list, component_id mapped to
 // display name from CompositionState, and suggested fixes from backend.
 //
 // The Execute button enables/disables based on this result.
 // ============================================================================
 
-import type {
-  ValidationResult as ValidationResultType,
-  ValidationWarning,
-  NodeSpec,
+import { useState } from "react";
+
+import {
+  VALIDATION_ADVISORY_CHECK_NAMES,
+  type ValidationResult as ValidationResultType,
+  type ValidationWarning,
+  type NodeSpec,
 } from "@/types/index";
+
+const ADVISORY_CHECK_NAME_SET: ReadonlySet<string> = new Set(
+  VALIDATION_ADVISORY_CHECK_NAMES,
+);
 
 interface ValidationResultProps {
   result: ValidationResultType;
@@ -69,7 +80,51 @@ export function ValidationResultBanner({
   componentNames,
   onComponentClick,
 }: ValidationResultProps) {
+  // Mirrors AuditReadinessPanel: expansion is the user's explicit intent;
+  // warnings (actionable) force the expanded view regardless. Passed checks
+  // that are advisory (e.g. identity_node_advisory) carry the same kind of
+  // actionable guidance as a warning despite passed=true, so they force
+  // expansion too — otherwise the guidance sits inert behind a collapsed
+  // "Validation passed" banner. The banner unmounts when the validation
+  // result is cleared (session switch, new composition version), so a fresh
+  // result starts collapsed again.
+  const [userExpanded, setUserExpanded] = useState(false);
+
   if (result.is_valid) {
+    const warnings = result.warnings ?? [];
+    const advisoryChecks = result.checks.filter(
+      (check) => check.passed && ADVISORY_CHECK_NAME_SET.has(check.name),
+    );
+    const hasForcedGuidance = warnings.length > 0 || advisoryChecks.length > 0;
+    const showExpanded = hasForcedGuidance || userExpanded;
+
+    if (!showExpanded) {
+      return (
+        <div
+          role="status"
+          className="validation-banner validation-banner-pass validation-banner--collapsed"
+        >
+          <button
+            type="button"
+            className="validation-banner-summary-btn"
+            onClick={() => setUserExpanded(true)}
+            aria-expanded={false}
+            aria-label="Validation passed. Show details."
+          >
+            <span aria-hidden="true">{"\u2713"}</span>
+            <span className="validation-banner-summary">
+              {result.summary ?? "Validation passed"}
+            </span>
+            {result.checks.length > 0 && (
+              <span className="validation-banner-summary-meta">
+                {result.checks.length} checks
+              </span>
+            )}
+          </button>
+        </div>
+      );
+    }
+
     return (
       <div
         role="status"
@@ -80,6 +135,17 @@ export function ValidationResultBanner({
           <span className="validation-banner-summary">
             {result.summary ?? "Validation passed"}
           </span>
+          {!hasForcedGuidance && (
+            <button
+              type="button"
+              className="validation-banner-collapse-btn"
+              onClick={() => setUserExpanded(false)}
+              aria-expanded={true}
+              aria-label="Collapse validation details"
+            >
+              Collapse
+            </button>
+          )}
         </div>
         {result.checks.length > 0 && (
           <ul className="validation-banner-checks">

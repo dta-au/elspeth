@@ -78,6 +78,7 @@ from elspeth.web.composer.yaml_generator import (
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.repository import SessionDerivedCustodyError
+from elspeth.web.execution.completion_gates import CompletionGateFacts, parse_completion_gates
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import composer_completion_events_table
 from elspeth.web.sessions.protocol import SessionOperationAuthority
@@ -152,7 +153,13 @@ class _SessionServiceLike(Protocol):
 
 
 class _ExecutionServiceLike(Protocol):
-    async def validate(self, session_id: UUID, *, user_id: str | None = None) -> Any: ...
+    async def validate(
+        self,
+        session_id: UUID,
+        *,
+        session_operation_context: SessionOperationContext,
+        user_id: str | None = None,
+    ) -> Any: ...
     async def validate_state(
         self,
         state: Any,
@@ -160,6 +167,7 @@ class _ExecutionServiceLike(Protocol):
         user_id: str | None = None,
         session_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
+        completion_gates: CompletionGateFacts | None = None,
     ) -> Any: ...
 
 
@@ -385,12 +393,16 @@ class ShareableReviewService:
         composition_state = state_from_record(state_record)
         # session_id scopes the sink path allowlist (blobs/<session_id>/) and
         # inline-blob metadata lookups; omitting it fails closed to outputs-only
-        # and rejects states that /validate and /execute accept.
+        # and rejects states that /validate and /execute accept. Persisted
+        # completion-gate facts (advisor sign-off, R2-F14) are threaded from the
+        # record so the share-time validation reports the same readiness the
+        # composer and /validate report.
         validation = await self._execution_service.validate_state(
             composition_state,
             user_id=user_id,
             session_id=session_id,
             session_operation_context=session_operation_context,
+            completion_gates=parse_completion_gates(state_record.composer_meta),
         )
         if not validation.is_valid:
             raise CompositionNotRunnableError(

@@ -21,7 +21,7 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink import FILE_SINK_PLUGIN_SLASH_TEXT
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.recipes import (
@@ -69,10 +69,12 @@ from elspeth.web.composer.tools._common import (
     _normalize_trusted_legacy_interpretation_requirements,
     _options_with_default_llm_reviews,
     _plugin_policy_failure,
+    _post_mutation_invariant_error,
     _prevalidate_sink,
     _prevalidate_source,
     _prevalidate_transform_for_context,
     _resolver_owned_interpretation_requirement_error,
+    _row_union_node_contract_error,
     _runtime_owned_llm_option_error,
     _semantic_contracts_payload,
     _serialize_full_pipeline_state,
@@ -127,7 +129,11 @@ from elspeth.web.interpretation_state import (
     validate_pipeline_decision_node_semantics,
 )
 from elspeth.web.plugin_policy.models import PluginId, PluginUnavailableReason
-from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
+from elspeth.web.provider_config_policy import (
+    web_aws_s3_endpoint_url_policy_error,
+    web_aws_s3_source_policy_error,
+)
+from elspeth.web.sessions.protocol import InterpretationPlaceholderConsumedError
 from elspeth.web.validation import (
     _reject_credential_shaped_content,
     _validate_accepted_value_content,
@@ -609,6 +615,20 @@ def build_set_pipeline_candidate(
             plugin_error = _validate_plugin_name(context, "source", src_plugin)
             if plugin_error is not None:
                 return _plugin_policy_failure(state, plugin_error, component=f"Source '{source_name}'")
+            # Mirror execution/validation.py's unconditional aws_s3-source ban
+            # for non-trained-operator sessions (see _execute_set_source in
+            # sources.py for the full rationale). set_pipeline is a second
+            # door into the same trap: without this, a non-trained session
+            # could persist an aws_s3 source with no endpoint_url override
+            # here, bypassing the set_source gate entirely.
+            if not context.plugin_snapshot.is_trained_operator:
+                source_policy_error = web_aws_s3_source_policy_error(src_plugin)
+                if source_policy_error is not None:
+                    return _failure_result(
+                        state,
+                        f"Source '{source_name}': {source_policy_error}",
+                        error_code="aws_s3_source_not_allowed",
+                    )
             manual_blob_ref_error = None if reviewed_source else _reject_manual_source_blob_ref(src_options, tool_name="set_pipeline")
             if manual_blob_ref_error is not None:
                 return _failure_result(state, f"Source '{source_name}': {manual_blob_ref_error}")
@@ -786,6 +806,13 @@ def build_set_pipeline_candidate(
         plugin_error = _validate_plugin_name(context, "source", src_plugin)
         if plugin_error is not None:
             return _plugin_policy_failure(state, plugin_error)
+        # Mirror execution/validation.py's unconditional aws_s3-source ban for
+        # non-trained-operator sessions — see the named-sources branch above
+        # and _execute_set_source in sources.py for the full rationale.
+        if not context.plugin_snapshot.is_trained_operator:
+            source_policy_error = web_aws_s3_source_policy_error(src_plugin)
+            if source_policy_error is not None:
+                return _failure_result(state, source_policy_error, error_code="aws_s3_source_not_allowed")
         credential_error = _credential_wiring_contract_failure(
             state,
             component_id="source",
@@ -1078,6 +1105,7 @@ def build_set_pipeline_candidate(
             trigger=n.trigger.model_dump() if n.trigger is not None else None,
             output_mode=n.output_mode,
             expected_output_count=n.expected_output_count,
+            timeout_seconds=n.timeout_seconds,
         )
         # Validate every queue's intrinsic shape via the single shared guard
         # BEFORE the new state is assembled/assigned below, so a malformed
@@ -1087,6 +1115,13 @@ def build_set_pipeline_candidate(
         queue_contract_error = queue_node_contract_error(node_spec)
         if queue_contract_error is not None:
             return _failure_result(state, queue_contract_error)
+        row_union_contract_error = _row_union_node_contract_error(
+            node_spec,
+            output_names=frozenset(output.sink_name for output in validated.outputs),
+        )
+        if row_union_contract_error is not None:
+            message, error_code = row_union_contract_error
+            return _failure_result(state, message, error_code=error_code)
         node_specs.append(node_spec)
 
     edge_specs = []
@@ -1133,6 +1168,10 @@ def build_set_pipeline_candidate(
         metadata=metadata_spec,
         version=state.version + 1,
     )
+    invariant_error = _post_mutation_invariant_error(new_state)
+    if invariant_error is not None:
+        message, error_code = invariant_error
+        return _failure_result(state, message, error_code=error_code)
     try:
         new_state = reconcile_authoritative_reviews(state, new_state)
     except TypeError as exc:
@@ -1516,7 +1555,8 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                                 "publishes its merged rows under its own node id — a downstream "
                                 "consumer sets input='<coalesce id>' — and its on_success, when set, "
                                 "may ONLY name a sink; pointing a coalesce on_success at another "
-                                "node's input is rejected."
+                                "node's input is rejected. ROW_UNION EXCEPTION: row_union requires "
+                                "on_success to name a downstream processing connection, never a sink."
                             ),
                             "examples": ["fetched_text", "scored_rows", "lines_out"],
                         },
@@ -1535,6 +1575,11 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             "type": ["array", "object", "null"],
                             "items": {"type": "string"},
                             "additionalProperties": {"type": "string"},
+                            "description": (
+                                "Branch inputs for coalesce or row_union. For row_union, every "
+                                "branches value is a real consumed input connection; input must "
+                                "repeat the first value only as an adapter placeholder."
+                            ),
                         },
                         "policy": {"type": ["string", "null"]},
                         "merge": {"type": ["string", "null"]},
@@ -1549,15 +1594,24 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         },
                         "output_mode": {"type": ["string", "null"]},
                         "expected_output_count": {"type": ["integer", "null"]},
+                        "timeout_seconds": {
+                            "type": ["number", "null"],
+                            "exclusiveMinimum": 0,
+                            "description": ("Optional finite positive timeout for structural barrier nodes (coalesce or row_union)."),
+                        },
                     },
                     "required": ["id", "node_type", "input"],
                 },
                 "description": (
                     "Array of node specs: [{id, input, plugin?, node_type, options?, on_success?, on_error?, condition?, "
-                    "routes?, fork_to?, branches?, policy?, merge?, trigger?, output_mode?, expected_output_count?}]. "
+                    "routes?, fork_to?, branches?, policy?, merge?, trigger?, output_mode?, expected_output_count?, "
+                    "timeout_seconds?}]. "
                     "A queue node is a structural fan-in point: node_type='queue', id == input to the shared connection "
                     "name, plugin and every routing field omitted, options accepts only an optional description. "
-                    "Multiple producers may publish that connection name precisely because the queue is declared."
+                    "Multiple producers may publish that connection name precisely because the queue is declared. "
+                    "A row_union is plugin-free require_all N-to-N fork reconvergence: declare at least two ordered "
+                    "branches, set input to the first branch connection, publish on_success to downstream processing "
+                    "(not a sink), omit options/routing/policy/merge fields, and optionally set timeout_seconds."
                 ),
             },
             "edges": {
@@ -1640,26 +1694,24 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
 )
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="LLM composer get_pipeline_state tool-call component argument",
     source_param="component",
     suppresses=("R5",),
     invariant="returns False for non-string or non-alias component values; never raises on component",
-    non_raising=True,
 )
 def _is_full_state_component_alias(component: Any) -> bool:
     """Return whether a component argument explicitly requests full state."""
     return isinstance(component, str) and component.strip().lower() in _FULL_STATE_COMPONENT_ALIAS_SET
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="LLM composer tool-call arguments",
     source_param="args",
     suppresses=("R1",),
     invariant="omitted component returns full state; unknown component returns a repairable failure result; never raises on args",
-    non_raising=True,
 )
 def _execute_get_pipeline_state(
     args: dict[str, Any],
@@ -2397,19 +2449,31 @@ async def _handle_request_interpretation_review(
     # under the session write lock (defence in depth — the compose-state could
     # in principle race with another writer; the service is the authoritative
     # consistency gate).
-    event = await create_pending_interpretation_event(
-        session_id=session_id,
-        composition_state_id=composition_state_id,
-        affected_node_id=parsed.affected_node_id,
-        tool_call_id=tool_call_id,
-        user_term=parsed.user_term,
-        kind=parsed.kind,
-        llm_draft=parsed.llm_draft,
-        model_identifier=model_identifier,
-        model_version=model_version,
-        provider=provider,
-        composer_skill_hash=composer_skill_hash,
-    )
+    try:
+        event = await create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=composition_state_id,
+            affected_node_id=parsed.affected_node_id,
+            tool_call_id=tool_call_id,
+            user_term=parsed.user_term,
+            kind=parsed.kind,
+            llm_draft=parsed.llm_draft,
+            model_identifier=model_identifier,
+            model_version=model_version,
+            provider=provider,
+            composer_skill_hash=composer_skill_hash,
+        )
+    except InterpretationPlaceholderConsumedError as exc:
+        # The compose snapshot passed the Tier-3 component check above, but
+        # the service re-checks the persisted head under the session write
+        # lock.  A mismatch there is an expected stale-argument race: tell the
+        # model to rebuild from the latest state instead of letting the typed
+        # service conflict fall into the dispatcher's plugin-crash path.
+        raise ToolArgumentError(
+            argument="composition_state_id",
+            expected="the current composition state with matching reviewed content; reload the latest state and retry",
+            actual_type="stale composition state or reviewed content",
+        ) from exc
     if event.interpretation_source is InterpretationSource.AUTO_INTERPRETED_OPT_OUT:
         return ToolResult(
             success=True,

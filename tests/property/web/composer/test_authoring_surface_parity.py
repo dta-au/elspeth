@@ -41,33 +41,12 @@ LLM nodes are deliberately NOT generated: Task 4's shape list omits them, and th
 avoids re-deriving the Task 1 typed-query / operator-profile machinery here while
 losing no coverage.
 
-Guided-staged gap awareness (the false-green this file must NOT introduce)
---------------------------------------------------------------------------
-Two topology shapes are code-proven UN-authorable through the guided-staged stage
-protocol at HEAD (Task 3 excludes ``multi_output`` and ``fork_coalesce`` for the
-same reason, tracked as elspeth-b83b5b3204 and elspeth-93dd908354):
-
-* a **require-all coalesce** — the guided consumer model (``NodeSpec`` has a
-  single ``input``) cannot represent a multi-branch coalesce, so a branch
-  connection is structurally orphaned in the wire projection;
-* a **cross-sink ``on_write_failure`` fallback** — the structured sink review
-  locks ``on_write_failure`` to ``discard`` unless it is a visible knob field
-  (it is not for the json/csv sinks), so a priority→standard fallback is
-  unauthorable.
-
-The strategy generates BOTH shapes (they are real capabilities freeform and
-guided-full author correctly) but the guided-staged comparison is GATED to the
-supported subset. The gate is a *structural* predicate on the built graph —
-``_guided_staged_authorable`` excludes a case iff it contains a coalesce node OR
-any output whose ``on_write_failure`` is not ``discard`` — which maps EXACTLY to
-those two tracked gaps and nothing else. Freeform and guided-full are compared on
-the FULL generated space (all five terminals); only guided-staged drops the two
-gap shapes. This is a proven-capability exclusion, not a "shrink the space until
-it is green" exclusion: any guided-staged failure on a case that is NOT a
-coalesce / cross-sink-fallback shape is a genuine regression (or a newly
-discovered gap) and must fail this test, never be papered over by widening the
-exclusion. See the module docstring of ``parity/test_fixture_matrix.py`` for the
-per-mechanism code trace.
+Guided-staged coverage
+----------------------
+The strategy drives every generated shape through guided-staged as well as
+freeform and guided-full. This includes the formerly excluded require-all
+coalesce and cross-sink ``on_write_failure`` shapes, so their repaired
+stage-protocol boundaries remain under generated-DAG regression coverage.
 
 Determinism
 -----------
@@ -328,7 +307,10 @@ def _build_case(spec: _Spec) -> dict[str, Any]:
                 "node_type": "gate",
                 "input": head,
                 "condition": "True",
-                "routes": {"true": "gfork", "false": "gfork"},
+                # ``fork`` is the reserved gate-route sentinel; unlike ordinary
+                # connection labels it must not be namespaced when composing
+                # corpus fragments.
+                "routes": {"true": "fork", "false": "fork"},
                 "fork_to": ["gpath_a", "gpath_b"],
             }
         )
@@ -421,23 +403,6 @@ def _intent_for(spec: _Spec) -> str:
     return f"Build a pipeline that reads {src}, passes rows through {', '.join(mid)}, and finishes by {term}."
 
 
-def _guided_staged_authorable(case: dict[str, Any]) -> bool:
-    """True iff the built graph avoids BOTH proven guided-staged capability gaps.
-
-    Structural, not terminal-name based, so it maps to the mechanism rather than
-    the label: a require-all (any) coalesce node, or any output carrying a
-    non-``discard`` ``on_write_failure``. These are exactly elspeth-93dd908354
-    (multi-branch coalesce) and elspeth-b83b5b3204 (cross-sink write-failure
-    fallback). Every other shape guided-staged authors correctly (Task 3 proves
-    seven of nine corpus fixtures drive guided-staged, including gates, queues,
-    aggregation, row expansion, and source-validation error routing).
-    """
-    args = case["canonical_arguments"]
-    has_coalesce = any(node.get("node_type") == "coalesce" for node in args["nodes"])
-    has_cross_sink_fallback = any((output.get("on_write_failure") or "discard") != "discard" for output in args["outputs"])
-    return not (has_coalesce or has_cross_sink_fallback)
-
-
 @st.composite
 def _specs(draw: st.DrawFn) -> _Spec:
     """Draw a bounded, buildable ``_Spec``.
@@ -472,10 +437,7 @@ def _failure_report(spec: _Spec, case: dict[str, Any], surface: str, detail: str
 
 
 async def _drive_and_compare(env: ParityEnv, spec: _Spec, case: dict[str, Any], reference: Any) -> None:
-    surfaces = ["freeform", "guided_full"]
-    if _guided_staged_authorable(case):
-        surfaces.append("guided_staged")
-    for surface in surfaces:
+    for surface in ("freeform", "guided_full", "guided_staged"):
         committed = await env.drive(surface, case)
         graph_left = f"{surface}:{case['class']}"
         try:
@@ -495,10 +457,8 @@ async def _drive_and_compare(env: ParityEnv, spec: _Spec, case: dict[str, Any], 
 def test_generated_dag_surface_parity(parity_env: ParityEnv, spec: _Spec) -> None:  # noqa: F811
     """Every generated policy-valid DAG derives one isomorphic graph on all surfaces.
 
-    freeform + guided-full are compared on the full generated space; guided-staged
-    is compared only on cases it can author (the require-all-coalesce and
-    cross-sink-write-failure shapes are the two tracked gaps). The shared
-    reference anchors cross-surface parity transitively.
+    Freeform, guided-full, and guided-staged are compared on the full generated
+    space. The shared reference anchors cross-surface parity transitively.
     """
     case = _build_case(spec)
 

@@ -90,6 +90,7 @@ _BLOB_COPY_FORK_ORPHAN_ROWS_COUNTER = metrics.get_meter(__name__).create_counter
 
 _FORK_COPY_LEASE_CHECKPOINT_INTERVAL_SECONDS = 30.0
 _FORK_COPY_WRITE_CHUNK_BYTES = 1024 * 1024
+_STREAM_CHUNK_BYTES = 1024 * 1024
 
 _INLINE_CUSTODY_NAMESPACE = UUID("8ef5fd65-8a90-5fe4-9084-eab5b9d2d2db")
 _INLINE_CUSTODY_SCHEMA = "elspeth.inline-custody.v1"
@@ -2389,7 +2390,13 @@ class BlobServiceImpl:
             storage = Path(before.storage_path)
             if not storage.exists():
                 raise BlobContentMissingError(blob_id_str, storage_path=before.storage_path)
-            data = storage.read_bytes()
+            try:
+                data = storage.read_bytes()
+            except FileNotFoundError:
+                # The file may be deleted after the existence guard but
+                # before the descriptor is acquired. Preserve the blob
+                # lifecycle error contract for that raced deletion.
+                raise BlobContentMissingError(blob_id_str, storage_path=before.storage_path) from None
             if before.content_hash is None:
                 raise AuditIntegrityError(f"Tier 1: ready blob {blob_id_str} has NULL content_hash — DB integrity anomaly, cannot verify")
             actual = content_hash(data)
@@ -2404,6 +2411,99 @@ class BlobServiceImpl:
             return data
 
         def _sync() -> bytes:
+            with filesystem_session_lock(self._data_dir, session_operation_context.fence.session_id):
+                self._reconcile_blob_deletions_locked(session_operation_context)
+                return _read_locked()
+
+        return await self._run_sync(_sync)
+
+    async def read_blob_content_prefix_verified(
+        self,
+        blob_id: UUID,
+        *,
+        prefix_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, str, int]:
+        """Stream a ready blob, verifying its full content hash incrementally.
+
+        Mirrors ``read_blob_content``'s lifecycle/integrity guards exactly
+        (same status check, same missing-file check, same NULL-hash guard,
+        same hash-mismatch guard) but never holds the full blob in memory:
+        bytes are read and fed into one incremental sha256 digest in
+        ``_STREAM_CHUNK_BYTES``-sized chunks, and only the first
+        ``prefix_bytes`` of those bytes are retained. Memory use is bounded
+        by chunk size + ``prefix_bytes`` regardless of the blob's total size —
+        this is what lets a bounded preview (e.g. source inspection's 8 KiB
+        peek) verify a full-content hash without materializing a 100 MiB
+        upload to do it.
+        """
+        _require_blob_operation_context(
+            session_operation_context,
+            allowed_kinds=_READ_BLOB_OPERATION_KINDS,
+        )
+        if prefix_bytes < 1:
+            raise ValueError("prefix_bytes must be >= 1")
+        blob_id_str = str(blob_id)
+
+        def _read_locked() -> tuple[bytes, str, int]:
+            try:
+                before = self._session_operation_authority.mutate(
+                    session_operation_context,
+                    lambda transaction: transaction.blobs.read_blob(blob_id=blob_id),
+                )
+            except Exception as exc:
+                from elspeth.web.coordination.repository import SessionDerivedCustodyError
+
+                if isinstance(exc, SessionDerivedCustodyError):
+                    raise BlobNotFoundError(blob_id_str) from None
+                raise
+            self._reconcile_output_blob_tombstone(
+                before,
+                session_operation_context=session_operation_context,
+            )
+            if before.status != "ready":
+                raise BlobStateError(
+                    blob_id_str,
+                    message=f"Cannot read blob {blob_id_str} — status is '{before.status}', expected 'ready'",
+                )
+            storage = Path(before.storage_path)
+            if not storage.exists():
+                raise BlobContentMissingError(blob_id_str, storage_path=before.storage_path)
+            if before.content_hash is None:
+                raise AuditIntegrityError(f"Tier 1: ready blob {blob_id_str} has NULL content_hash — DB integrity anomaly, cannot verify")
+
+            digest = hashlib.sha256()
+            prefix = bytearray()
+            total_bytes = 0
+            try:
+                handle = storage.open("rb")
+            except FileNotFoundError:
+                # The file may be deleted after the existence guard but
+                # before the descriptor is acquired. Preserve the blob
+                # lifecycle error contract for that raced deletion.
+                raise BlobContentMissingError(blob_id_str, storage_path=before.storage_path) from None
+            with handle:
+                while True:
+                    chunk = handle.read(_STREAM_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    total_bytes += len(chunk)
+                    if len(prefix) < prefix_bytes:
+                        prefix.extend(chunk[: prefix_bytes - len(prefix)])
+
+            actual = digest.hexdigest()
+            if not hmac.compare_digest(actual, before.content_hash):
+                raise BlobIntegrityError(blob_id_str, expected=before.content_hash, actual=actual)
+            after = self._session_operation_authority.mutate(
+                session_operation_context,
+                lambda transaction: transaction.blobs.read_blob(blob_id=blob_id),
+            )
+            if after != before:
+                raise AuditIntegrityError("blob metadata changed during fenced content-prefix read")
+            return bytes(prefix[:prefix_bytes]), actual, total_bytes
+
+        def _sync() -> tuple[bytes, str, int]:
             with filesystem_session_lock(self._data_dir, session_operation_context.fence.session_id):
                 self._reconcile_blob_deletions_locked(session_operation_context)
                 return _read_locked()
@@ -2456,7 +2556,14 @@ class BlobServiceImpl:
             storage = Path(before.storage_path)
             if not storage.exists():
                 raise BlobContentMissingError(blob_id_str, storage_path=before.storage_path)
-            with storage.open("rb") as handle:
+            try:
+                handle = storage.open("rb")
+            except FileNotFoundError:
+                # The file may be deleted after the existence guard but
+                # before the descriptor is acquired. Preserve the blob
+                # lifecycle error contract for that raced deletion.
+                raise BlobContentMissingError(blob_id_str, storage_path=before.storage_path) from None
+            with handle:
                 data = handle.read(limit_bytes + 1)
             after = self._session_operation_authority.mutate(
                 session_operation_context,
@@ -3060,7 +3167,13 @@ class BlobServiceImpl:
                     storage = Path(storage_path)
                     if not storage.exists():
                         raise BlobContentMissingError(str(source_blob_id), storage_path=storage_path)
-                    return storage.read_bytes()
+                    try:
+                        return storage.read_bytes()
+                    except FileNotFoundError:
+                        # The file may be deleted after the existence guard but
+                        # before the descriptor is acquired. Preserve the blob
+                        # lifecycle error contract for that raced deletion.
+                        raise BlobContentMissingError(str(source_blob_id), storage_path=storage_path) from None
 
             content = await _await_fork_copy_io_with_checkpoints(
                 self._run_sync(_read_frozen_source),

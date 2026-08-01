@@ -1222,25 +1222,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[29]/body[16]/body[6]/body[0]/body[0]/value'
   judge_metadata_signature: 'hmac-sha256:v2:cd21a20a5b56dcba19c2ccb4b75c25ed2dfd6f7945a785620c49dcff0a8c357a'
-- key: plugins/infrastructure/clients/http.py:R4:AuditedHTTPClient:_emit_telemetry_after_audit:fp=55c835d8752036d8
+- key: plugins/infrastructure/clients/http.py:R4:AuditedHTTPClient:_emit_telemetry_after_audit:fp=8cb4398f454be36e
   owner: john
   reason: |-
     This is a prescribed telemetry-after-audit boundary, not a Tier-1 audit-data suppression. In `plugins/infrastructure/clients/http.py:249-260`, the audit write happens first via `call = self._record_call(...)`, and only after that succeeds does the code call `self._emit_telemetry_after_audit(...)`. Inside the cited method, `plugins/infrastructure/clients/http.py:309-312` explicitly re-raises Tier-1 integrity failures and programmer bugs: `except contract_errors.TIER_1_ERRORS: raise` and `except (TypeError, AttributeError, KeyError, NameError): raise`. The broad catch at `plugins/infrastructure/clients/http.py:313-323` is limited to non-Tier-1 telemetry emission failures after audit primacy has already been satisfied, and it explicitly acknowledges the failure with `logger.warning("telemetry_emit_failed", ..., exc_info=True)` rather than silently swallowing it. Drift that removes the prior audit write, widens the catch to include `contract_errors.TIER_1_ERRORS`, or drops the explicit telemetry failure log would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:12:48.539766+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T03:36:41.574157+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM. Telemetry primacy policy states audit fires first (sync, crash-on-failure) and telemetry fires second (async, best-effort). The visible code re-raises Tier-1 integrity errors and programmer-bug exceptions (TypeError/AttributeError/KeyError/NameError) before the broad catch, so the remaining Exception clause is scoped to genuine telemetry-emission failures after audit primacy is satisfied, and it records the failure via logger.warning with exc_info rather than silently swallowing. This matches the policy's prescribed shape for best-effort telemetry after the audit write.
+    PRESCRIBED FORM: `plugins/infrastructure/clients/http.py:298-319` shows the Landscape audit write completing before telemetry emission begins, so the broad catch cannot suppress an audit-recording failure. At `plugins/infrastructure/clients/http.py:358-372`, Tier-1 integrity exceptions and enumerated programmer errors are explicitly re-raised, while remaining telemetry failures are acknowledged with a warning and exception details. This conforms to the required audit-first, telemetry-second best-effort ordering and uses logging only after telemetry itself has failed.
   judge_signature_version: 2
   scope_fingerprint: f0a6f8fc062ac02180496e221f342a0a209b0e8e4f0221fc80ed7213ceaa777c
-  judge_transport: openrouter
-  ast_path: 'body[26]/body[10]/body[2]/handlers[2]'
-  judge_metadata_signature: 'hmac-sha256:v2:a070d71c10d8818769eee804a8dd297caf8d1babd168fe42dc1bd867d4c9f419'
+  judge_transport: codex_cli
+  ast_path: 'body[29]/body[11]/body[2]/handlers[2]'
+  judge_metadata_signature: 'hmac-sha256:v2:8245b37c19ca4a8afb3c7462974ab1c1f46f2038a523de80a16d5db6850f4520'
 - key: plugins/infrastructure/clients/http.py:R5:AuditedHTTPClient:_execute_request:fp=6f35bfed0cfea005
   owner: john
   reason: |-

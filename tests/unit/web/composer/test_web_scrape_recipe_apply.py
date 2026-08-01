@@ -70,7 +70,7 @@ def _policy_context() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
                 "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
             }
         },
-        tutorial_llm_profile="tutorial-default",
+        default_llm_profile="tutorial-default",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)

@@ -235,6 +235,7 @@ def _build_model(state: Mapping[str, Any]) -> _Model:
             _freeze(node.get("output_mode")),
             _freeze(node.get("trigger")),
             _freeze(node.get("expected_output_count")),
+            _freeze(node.get("timeout_seconds")),
         )
         links.append((atom, "node.input", conn_atom(str(node["input"]))))
         if node.get("on_success") is not None:
@@ -420,7 +421,7 @@ def canonical_graph(state: CompositionState | Mapping[str, Any]) -> CanonicalGra
         branches = node.get("branches")
         if isinstance(branches, Mapping):
             entry["branches"] = sorted(tok(str(v)) for v in branches.values())
-        for optional in ("policy", "merge", "output_mode", "expected_output_count"):
+        for optional in ("policy", "merge", "output_mode", "expected_output_count", "timeout_seconds"):
             if node.get(optional) is not None:
                 entry[optional] = node[optional]
         if node.get("trigger") is not None:

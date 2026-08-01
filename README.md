@@ -169,16 +169,26 @@ Composer authoring, trust boundaries, and committed blob cleanup.
 - **Composer validation stays bound to current state.** Runtime preflight is
   keyed to the composition content that produced it instead of reusing a stale
   result for different unsaved state.
+- **Web Composer can author correlated row unions.** Freeform, guided,
+  import/export, validation, and graph surfaces support plugin-free,
+  require-all `row_union` barriers that release branch rows unchanged in
+  declared order for long-format processing. Audit, recovery, concurrency,
+  browser-backed round-trip, and scale acceptance remains deferred and tracked
+  separately.
 - **Trust boundaries fail closed.** Deployment admission rejects unsafe state
   roots, weak uniform JWT secrets, and unauthenticated PostgreSQL transport for
   ECS; provider and tool data remain bounded and redacted.
 
-**Operational:** 0.7.2 is a pre-1.0 session-store cutover. The session store moves
-from epoch 35 to 37 for retryable blob deletion and the compatible-generation
-coordination schema; guided schema remains at 10, and Landscape remains at epoch 29.
-Archive or export evidence as required, stop the old service, recreate a stale
-session store, and install 0.7.2. A Landscape store already at epoch 29 remains
-current. Do not roll older code back over the recreated session database.
+**Operational:** 0.7.2 is a pre-1.0 database cutover. The session store moves
+from epoch 35 to 42; guided schema remains at 10, and Landscape moves from epoch
+29 to 30. Session epoch 40 makes the required coalesce timeout field an eager
+startup cutover instead of allowing epoch-39 guided payloads to fail during
+replay, and session epoch 41 does the same for the projected node option
+summary the review cards render. Session epoch 42 adds persistent
+session-operation authority and compatible-generation coordination. Archive or
+export evidence as required, stop the old service, recreate a stale session
+store and a Landscape store left at epoch 29, and install 0.7.2. Do not roll
+older code back over the recreated databases.
 `data/auth.db` remains separate; recreating the session store does not remove
 local user accounts.
 
@@ -311,6 +321,15 @@ Then open `http://localhost:5173`.
   `data/email-verifications.jsonl` for an operator or mailer to deliver.
   For controlled local setups or closed registration, manage users with
   `elspeth composer users add ...` and `elspeth composer users remove ...`.
+- The web application has three separately configured LLM surfaces: the
+  Composer's primary model (`ELSPETH_WEB__COMPOSER_MODEL`), its independent
+  advisor model (`ELSPETH_WEB__COMPOSER_ADVISOR_MODEL` — a different model;
+  the two defaults need `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` in the
+  environment), and the operator LLM profiles that web-authored `llm`
+  transform nodes select by alias (`ELSPETH_WEB__LLM_PROFILES`, with
+  `ELSPETH_WEB__DEFAULT_LLM_PROFILE` naming the profile the first-run
+  tutorial uses). See
+  [Web LLM Configuration](docs/reference/environment-variables.md#web-llm-configuration).
 - Session state is stored in `data/sessions.db`; local auth users are stored in
   `data/auth.db`.
 - Run audit data defaults to `data/runs/audit.db`; payloads default to
@@ -875,15 +894,18 @@ locked SQLAlchemy 2.0 line, `postgresql+psycopg://` selects psycopg 3 and a bare
 `postgresql+psycopg2://` URLs remain supported. The final runtime is a pinned,
 non-root distroless image with no package manager; add runtime capabilities
 through locked Python extras or a reviewed derived image, not by installing
-packages in a running container. The shipped Compose bundle is the only
-maintained bundle that provisions PostgreSQL; AWS and the maintained Azure
-Ubuntu VM path use external PostgreSQL in production. Run one web process and
-preserve payload persistence separately from database persistence. See the
+packages in a running container. The shipped Compose bundle can provision a
+PostgreSQL container, and the tracked AWS Terraform package provisions Aurora
+PostgreSQL outside the application task. The maintained Azure Ubuntu VM path
+uses external PostgreSQL in production. Run one web process and preserve
+payload persistence separately from database persistence. For a complete new
+AWS stack, follow the
+[AWS ECS cold-install runbook](docs/runbooks/aws-ecs-cold-install.md). See the
 [deployment platform matrix](docs/reference/deployment-platforms.md) for the
 maintained Compose, AWS ECS, and native Linux paths plus the explicit Azure VM
-and Kubernetes boundaries. The AWS procedure validates operator-supplied
-task-definition ARNs; it does not synthesize or clone a generic task
-definition.
+and Kubernetes boundaries. The separate
+[existing-service procedure](docs/runbooks/aws-ecs-existing-service-redeploy.md)
+discovers and narrowly clones that service's selected task definition.
 
 ```bash
 : "${IMAGE_TAG:?export an exact published sha-* or v* image tag}"
@@ -971,6 +993,7 @@ See [Architecture Documentation](ARCHITECTURE.md) for C4 diagrams and detailed d
 | [docs/reference/deployment-platforms.md](docs/reference/deployment-platforms.md) | Operators | Maintained deployment paths, database ownership, persistence, and deferred platform boundaries |
 | [docs/runbooks/](docs/runbooks/) | Operators | Deployment and operations |
 | [docs/runbooks/caddy-development-refresh.md](docs/runbooks/caddy-development-refresh.md) | Developers | Rebuild and restart the source-checkout Caddy/systemd development install |
+| [docs/runbooks/aws-ecs-cold-install.md](docs/runbooks/aws-ecs-cold-install.md) | Operators | Create a complete disposable AWS ECS stack with Aurora, monitoring, and Bedrock |
 | [docs/runbooks/aws-ecs-existing-service-redeploy.md](docs/runbooks/aws-ecs-existing-service-redeploy.md) | Operators | Build, scan, and deploy an immutable image to an existing ECS service |
 
 ---

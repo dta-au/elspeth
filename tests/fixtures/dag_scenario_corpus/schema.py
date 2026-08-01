@@ -56,7 +56,7 @@ RecoveryKind = Literal[
 ]
 RecoveryFaultKind = Literal["sink_effect"]
 RecoveryFaultSeam = Literal["before_effect"]
-GraphNodeType = Literal["aggregation", "coalesce", "gate", "queue", "sink", "source", "transform"]
+GraphNodeType = Literal["aggregation", "coalesce", "gate", "queue", "row_union", "sink", "source", "transform"]
 
 EXPECTED_DIMENSIONS: tuple[Dimension, ...] = (
     "config",
@@ -495,6 +495,7 @@ def _require_unique_sorted_keys(
 def _validate_projected_token_parent_graph(
     tokens: tuple[StableTokenProjection, ...],
     dispositions: tuple[StableTerminalDisposition, ...],
+    batches: tuple[StableBatchProjection, ...] = (),
 ) -> None:
     parents_by_token = {token.key: tuple(parent.parent_key for parent in token.parents) for token in tokens}
     children_by_token: dict[str, list[str]] = {token.key: [] for token in tokens}
@@ -520,9 +521,25 @@ def _validate_projected_token_parent_graph(
     if any(not children_by_token[token_key] for token_key in fork_parent_keys):
         raise ValueError("transient fork_parent token must parent a projected child token")
 
-    terminal_reachable = {disposition.token_key for disposition in dispositions if disposition.outcome in ("success", "failure")}
-    if tokens and not terminal_reachable:
+    terminal_keys = {disposition.token_key for disposition in dispositions if disposition.outcome in ("success", "failure")}
+    if tokens and not terminal_keys:
         raise ValueError("non-empty projection must contain a terminal success or failure outcome")
+
+    disposition_by_token = {disposition.token_key: disposition for disposition in dispositions}
+    validated_completed_batch_members = {
+        member.token_key
+        for batch in batches
+        if batch.status == "completed"
+        for member in batch.members
+        if member.token_key in parents_by_token
+        and (
+            disposition_by_token[member.token_key].outcome,
+            disposition_by_token[member.token_key].path,
+            disposition_by_token[member.token_key].sink_name,
+        )
+        == ("transient", "batch_consumed", None)
+    }
+    terminal_reachable = terminal_keys | validated_completed_batch_members
     pending = sorted(terminal_reachable, reverse=True)
     while pending:
         token_key = pending.pop()
@@ -770,7 +787,7 @@ class StableRunProjection(ClosedModel):
         disposition_token_keys = tuple(disposition.token_key for disposition in self.terminal_dispositions)
         if len(disposition_token_keys) != len(token_keys) or set(disposition_token_keys) != token_keys:
             raise ValueError("terminal dispositions must exactly cover tokens one-to-one")
-        _validate_projected_token_parent_graph(self.tokens, self.terminal_dispositions)
+        _validate_projected_token_parent_graph(self.tokens, self.terminal_dispositions, self.batches)
         _validate_completed_coalesce_lineage(
             self.tokens,
             self.node_states,
@@ -894,7 +911,7 @@ class SemanticRuntimeProjection(ClosedModel):
             )
             for token in self.tokens
         )
-        _validate_projected_token_parent_graph(semantic_as_raw, self.terminal_dispositions)
+        _validate_projected_token_parent_graph(semantic_as_raw, self.terminal_dispositions, self.batches)
         if any(state.token_key not in token_keys for state in self.node_states):
             raise ValueError("every semantic node state must reference a projected token")
         if any(route.token_key not in token_keys for route in self.routes):

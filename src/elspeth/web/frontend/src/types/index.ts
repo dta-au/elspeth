@@ -89,6 +89,11 @@ export interface ChatMessage {
   created_at: string;
   local_status?: "pending" | "failed";
   local_error?: string;
+  /** Closed failure code from the ApiError that failed this local send
+   *  (e.g. "policy_blocked", which is permanent by construction — retry
+   *  affordances must not invite a retry for it). Set only when the error
+   *  carried one; cleared wherever local_status is cleared. */
+  local_failure_code?: string;
   composition_state_id?: string | null;
   tool_call_id?: string | null;
   parent_assistant_id?: string | null;
@@ -111,9 +116,17 @@ export interface SourceSpec {
  * Mirrors the backend `NodeType` / `COMPOSER_NODE_TYPES` in
  * src/elspeth/web/composer/state.py. `queue` is the structural fan-in
  * primitive: id == input, plugin null, description-only options — one or more
- * upstream producers, exactly one ordinary downstream consumer.
+ * upstream producers, exactly one ordinary downstream consumer. `row_union`
+ * is the correlated N-to-N barrier: it waits for every branch, then forwards
+ * each branch row without merging records.
  */
-export type NodeType = "transform" | "gate" | "aggregation" | "coalesce" | "queue";
+export type NodeType =
+  | "transform"
+  | "gate"
+  | "aggregation"
+  | "coalesce"
+  | "row_union"
+  | "queue";
 
 /**
  * A node in the pipeline composition DAG.
@@ -136,6 +149,7 @@ export interface NodeSpec {
   trigger?: Record<string, unknown> | null;
   output_mode?: "default" | "passthrough" | "transform" | null;
   expected_output_count?: number | null;
+  timeout_seconds?: number | null;
 }
 
 /** An edge connecting two nodes in the DAG. */
@@ -326,8 +340,9 @@ export interface ComposerProgressSnapshot {
 /** Plugin summary from the catalog listing endpoints.
  *
  * Phase 7A added reference-content fields populated by plugin authors.
- * Unfilled plugins return `null` / empty values; the catalog drawer
- * renders a "see the technical description" fallback for them.
+ * Blank or whitespace-only reference fields suppress their corresponding
+ * sections; when all three are blank, the catalog drawer suppresses the
+ * Details disclosure entirely.
  *
  * ``audit_characteristics`` is typed as the closed vocabulary union to
  * mirror the Python ``DerivedAuditCharacteristics = tuple[AuditCharacteristic, ...]``
@@ -419,6 +434,19 @@ export const VALIDATION_CHECK_OUTCOME_CODE_VALUES = [
 ] as const;
 
 export type ValidationCheckOutcomeCode = (typeof VALIDATION_CHECK_OUTCOME_CODE_VALUES)[number];
+
+/**
+ * Check names that report a self-correction hint rather than a blocking gate.
+ * Mirrors the complement of VALIDATION_BLOCKING_CHECK_NAMES in schemas.py:
+ * these checks can appear with passed=true and still carry actionable
+ * removal/repair guidance in `detail` that the UI must not hide behind a
+ * collapsed "Validation passed" banner.
+ */
+export const VALIDATION_ADVISORY_CHECK_NAMES = [
+  "identity_node_advisory",
+  "gate_fan_out_advisory",
+  "static_llm_prompt_advisory",
+] as const;
 
 export interface ValidationCheck {
   name: string;
@@ -961,8 +989,37 @@ export interface ApiError {
   status: number;
   detail: string;
   error_type?: string;
+  /** Server correlation id (RequestIdMiddleware). Present on fail-closed
+   *  audit-integrity 500s so the banner can name a support reference. */
+  request_id?: string;
+  /** Closed guided-operation failure code (guided_operation_terminal_failure
+   *  envelopes). "policy_blocked" is permanent by construction — retry
+   *  affordances must not invite a retry for it. */
+  failure_code?: string;
   component_id?: string;
   plugin_id?: string;
+  /**
+   * Public convergence taxonomy from a 422 body — the same closed vocabulary
+   * as `ComposerProgressReason`, kept as a plain string because ApiError is
+   * the shared envelope for every route, not just the composer.
+   * Branch on this, never on `detail` text.
+   */
+  reason?: string;
+  /**
+   * Actionable next-step copy the backend derived for this failure (mirrors
+   * the composer-progress `likely_next`), so the chat error can name the next
+   * practical action without the SPA re-deriving it.
+   */
+  recovery_text?: string | null;
+  /**
+   * The deployment's configured compose wall clock, in seconds. Present only
+   * on `convergence_wall_clock_timeout` 422s. Server-authoritative on
+   * purpose: the client's own abort ceiling is this value plus a grace
+   * constant and falls back to a checked-in default before the boot
+   * /api/system/status fetch lands, so it must never be used to tell the user
+   * how long ELSPETH actually ran.
+   */
+  timeout_seconds?: number;
   partial_state?: CompositionState | null;
   failed_turn?: FailedTurn | null;
   partial_state_save_failed?: boolean;

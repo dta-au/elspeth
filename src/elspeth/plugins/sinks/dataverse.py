@@ -27,6 +27,7 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
+    MemberSinkEffectCapability,
     ResolvedSinkEffectMode,
     RestrictedSinkEffectContext,
     SinkEffectCommitResult,
@@ -70,12 +71,26 @@ from elspeth.plugins.sinks._diversion_attribution import build_diversion_attribu
 # Unprocessable-Entity response is about this row's payload.
 _DIVERTABLE_STATUS_CODES: frozenset[int] = frozenset({400, 404, 409, 412, 422})
 _ROW_ATTRIBUTABLE_ERROR_CATEGORIES: frozenset[str] = frozenset({"row_data_error"})
+_DATAVERSE_ENTITY_SET_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _is_row_attributable_write_error(error: DataverseClientError) -> bool:
     return (
         not error.retryable and error.status_code in _DIVERTABLE_STATUS_CODES and error.error_category in _ROW_ATTRIBUTABLE_ERROR_CATEGORIES
     )
+
+
+def _validate_dataverse_entity_set_name(value: object, *, field_name: str) -> str:
+    """Require a case-preserving Dataverse EntitySetName with no URI delimiters."""
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string containing a valid ASCII identifier")
+    reject_operator_required_placeholder_value(value, field_name=field_name)
+    if _DATAVERSE_ENTITY_SET_NAME_PATTERN.fullmatch(value) is None:
+        raise ValueError(
+            f"{field_name} must be an ASCII identifier beginning with a letter or underscore "
+            "and containing only letters, digits, and underscores"
+        )
+    return value
 
 
 # An @odata.bind value sits in the UNQUOTED entity-key position of the bind
@@ -96,15 +111,13 @@ class LookupConfig(BaseModel):
 
     model_config = {"extra": "forbid", "frozen": True}
 
-    target_entity: str  # Dataverse entity to bind to (e.g., "accounts")
-    target_field: str  # Navigation property name (e.g., "parentcustomerid")
+    target_entity: str = Field(description="Target Dataverse EntitySetName to bind to (e.g., 'accounts')")
+    target_field: str = Field(description="Target Dataverse navigation property name (e.g., 'parentcustomerid')")
 
     @field_validator("target_entity")
     @classmethod
     def validate_target_entity_not_empty(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("target_entity cannot be empty")
-        return reject_operator_required_placeholder_value(v.strip(), field_name="target_entity")
+        return _validate_dataverse_entity_set_name(v, field_name="target_entity")
 
     @field_validator("target_field")
     @classmethod
@@ -137,7 +150,7 @@ class DataverseSinkConfig(DataPluginConfig):
 
     entity: str = Field(
         ...,
-        description="Target entity logical name",
+        description="Target Dataverse EntitySetName used in the OData collection path",
     )
     mode: Literal["upsert"] = Field(
         default="upsert",
@@ -185,9 +198,7 @@ class DataverseSinkConfig(DataPluginConfig):
     @field_validator("entity")
     @classmethod
     def validate_entity_not_empty(cls, v: str) -> str:
-        if not v or not v.strip():
-            raise ValueError("entity cannot be empty")
-        return reject_operator_required_placeholder_value(v.strip(), field_name="entity")
+        return _validate_dataverse_entity_set_name(v, field_name="entity")
 
     @field_validator("alternate_key")
     @classmethod
@@ -262,7 +273,7 @@ class DataverseSinkConfig(DataPluginConfig):
 DataverseSinkConfig.model_rebuild()
 
 
-class DataverseSink(BaseSink):
+class DataverseSink(BaseSink, MemberSinkEffectCapability):
     """Write rows to Microsoft Dataverse via OData v4 REST API.
 
     Day-one supports upsert mode only (PATCH with alternate key).
@@ -272,7 +283,7 @@ class DataverseSink(BaseSink):
 
     name = "dataverse"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:cf5eb66494366d40"
+    source_file_hash: str | None = "sha256:034b82b4ebab232d"
     determinism = Determinism.EXTERNAL_CALL
     config_model = DataverseSinkConfig
     idempotent = True  # PATCH upsert is idempotent — safe for retries and crash recovery (engine does not yet read this flag)
@@ -281,7 +292,35 @@ class DataverseSink(BaseSink):
     effect_call_type = CallType.HTTP
     supported_effect_modes = frozenset({"upsert"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
-    supports_member_effects = True
+
+    usage_when_to_use: str = (
+        "Use for idempotent Dataverse upsert when every row has an explicit field mapping and a stable string alternate "
+        "key for the target entity set."
+    )
+    usage_when_not_to_use: str = (
+        "Do not use for create, update, delete, or bulk modes; duplicate alternate keys; arbitrary lookup URIs; or "
+        "endpoints outside approved Microsoft Dataverse domains."
+    )
+    example_use: str = """sinks:
+  contacts:
+    plugin: dataverse
+    options:
+      environment_url: https://tenant.crm.dynamics.com
+      auth:
+        method: managed_identity
+      entity: contacts
+      mode: upsert
+      field_mapping:
+        email: emailaddress1
+        full_name: fullname
+      alternate_key: emailaddress1
+      schema:
+        mode: fixed
+        fields:
+          - "email: str"
+          - "full_name: str"
+"""
+    capability_tags: tuple[str, ...] = ("dataverse", "odata", "crm", "upsert")
 
     @classmethod
     def _resolve_sink_effect_mode(

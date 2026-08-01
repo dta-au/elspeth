@@ -1338,6 +1338,9 @@ class TestStepChatServerInvariants:
         event = invariant_events[0]
         assert event["exc_class"] == "InvariantError"
         assert isinstance(event["frames"], tuple) and len(event["frames"]) > 0
+        # R2-F16b: the correlation field is always emitted (None here — this
+        # app carries no RequestIdMiddleware).
+        assert "request_id" in event
         assert all(f.startswith("frame=") for f in event["frames"])
         assert _chat_turn_audit_bodies(composer_test_client, session_id) == []
 
@@ -1651,6 +1654,49 @@ class TestChatHistoryDiscriminatorPersistence:
         assert chat_history[1]["assistant_message_kind"] == "synthetic_failure"
         assert chat_history[1]["synthetic_failure_reason"] == "quality_guard"
 
+    def test_model_shape_defect_turn_persists_model_defect_reason(self, composer_test_client: TestClient) -> None:
+        """inv-f1 D4: a model reply that violates resolve_source's argument
+        contract is a MODEL-output defect — the provider answered. The wire
+        reason must say so (``model_defect``), never fold it into the
+        transient ``unavailable`` set: the turn's own copy invites Retry
+        ("Press Retry to have me redo this step") and the frontend keeps the
+        Retry affordance live for this reason.
+        """
+        session_id = _create_session(composer_test_client)
+        _seed_guided_session(composer_test_client, session_id)
+
+        empty_content_reply = _fake_source_resolution_tool_call(
+            {
+                "resolution": "source",
+                "plugin": "csv",
+                "filename": "inventory.csv",
+                "mime_type": "text/csv",
+                "content": "",
+                "options": {"schema": {"mode": "observed"}},
+                "observed_columns": ["sku"],
+                "sample_rows": [],
+                "assistant_message": "Bound the uploaded file.",
+            }
+        )
+        with patch(
+            _CHAT_SOLVER_ACOMPLETION,
+            new=_ReturningLiteLLMCompletion(empty_content_reply),
+        ):
+            status, body = _post_chat(
+                composer_test_client,
+                session_id,
+                message="Create a CSV source from my inventory data.",
+            )
+
+        assert status == 200, body
+        assert body["assistant_message_kind"] == "synthetic_failure"
+
+        get_resp = composer_test_client.get(f"/api/sessions/{session_id}/guided")
+        assert get_resp.status_code == 200, get_resp.json()
+        chat_history = get_resp.json()["guided_session"]["chat_history"]
+        assert chat_history[-1]["assistant_message_kind"] == "synthetic_failure"
+        assert chat_history[-1]["synthetic_failure_reason"] == "model_defect"
+
     def test_real_reply_turn_persists_kind_across_get(self, composer_test_client: TestClient) -> None:
         session_id = _create_session(composer_test_client)
         _seed_guided_session(composer_test_client, session_id)
@@ -1881,3 +1927,113 @@ class TestStepChatProgressWiring:
 
         final_progress = self._progress(composer_test_client, session_id)
         assert final_progress["phase"] == "complete"
+
+
+class TestFormAuthoredSourceReachesChat:
+    """A source authored through the Step-1 FORM must reach the provider whole.
+
+    Chat had coverage for sources the model resolved through ``resolve_source``,
+    but none for a source the OPERATOR authored on the schema form — and that is
+    the path whose reviewed shape the provider projections had never been
+    updated for. A form-authored source binds its blob through the
+    ``blob:<id>`` path sentinel (never a ``blob_ref`` custody key) and carries
+    its field inventory in ``schema.fields``, so the projections reported it as
+    an unbound source with no fields, in the one surface where the operator can
+    repair it.
+
+    ``DECLARED_ONLY_FIELD`` is deliberately absent from the uploaded CSV header
+    and from the confirmed columns: an assertion on a declared field that also
+    appears as an observed column would pass off the observed-column projection
+    and prove nothing.
+    """
+
+    DECLARED_ONLY_FIELD = "ticket_id"
+    CSV_CONTENT = "text,note\nHello,world\n"
+
+    @staticmethod
+    def _respond(client: TestClient, session_id: str, **kwargs) -> dict:
+        return _post_respond(client, session_id, **kwargs)
+
+    @classmethod
+    def _author_source_on_the_form(cls, client: TestClient, session_id: str) -> str:
+        """Drive the real Step-1 turns, editing the schema on the form.
+
+        Returns the seeded blob's id — the custody value that must never appear
+        in provider-visible content.
+        """
+        resp = client.post(
+            f"/api/sessions/{session_id}/blobs/inline",
+            json={"filename": "data.csv", "content": cls.CSV_CONTENT, "mime_type": "text/csv"},
+        )
+        assert resp.status_code == 201, resp.json()
+        blob_id = resp.json()["id"]
+
+        selected = cls._respond(client, session_id, chosen=["csv"])
+        prefilled = selected["next_turn"]["payload"]["prefilled"]
+        # Pin the prefill shape this fixture edits: the guided prefill for an
+        # inspected CSV is already an EXPLICIT schema with declared fields, so
+        # the declared-field projection is on the mainstream path, not an
+        # exotic one. The path is the server-held blob sentinel.
+        assert prefilled["schema"]["mode"] == "flexible", prefilled
+        assert prefilled["schema"]["fields"] == ["text: str", "note: str"], prefilled
+        assert prefilled["path"].startswith("blob:"), prefilled
+
+        options = {
+            **prefilled,
+            "schema": {
+                **prefilled["schema"],
+                "fields": [*prefilled["schema"]["fields"], f"{cls.DECLARED_ONLY_FIELD}: str"],
+            },
+        }
+        cls._respond(client, session_id, edited_values={"plugin": "csv", "options": options})
+        cls._respond(client, session_id, edited_values={"columns": ["text", "note"]})
+        cls._respond(
+            client,
+            session_id,
+            component_action={"action": "finish", "component_kind": "source"},
+        )
+        return blob_id
+
+    def test_form_authored_source_names_its_fields_and_binding_to_the_provider(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        _seed_guided_session(composer_test_client, session_id)
+        blob_id = self._author_source_on_the_form(composer_test_client, session_id)
+
+        guided = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()
+        assert guided["guided_session"]["step"] == "step_2_sink", guided
+
+        completion = _ReturningLiteLLMCompletion(_fake_llm_reply("You can add that transform at the next step."))
+        with patch(_CHAT_SOLVER_ACOMPLETION, new=completion):
+            status, body = _post_chat(
+                composer_test_client,
+                session_id,
+                message="after the output, uppercase the ticket id column",
+            )
+        assert status == 200, body
+
+        assert completion.calls, "the chat route made no provider call"
+        messages = [message for call in completion.calls for message in call["messages"]]
+        system_content = "\n".join(str(m["content"]) for m in messages if m["role"] == "system")
+        user_content = "\n".join(str(m["content"]) for m in messages if m["role"] != "system")
+
+        # The applied source names its declared fields (by alias) and reports
+        # that it reads server-held storage.
+        assert '"declared_fields":' in system_content
+        assert '"server_storage_bound": true' in system_content
+        # The exact declared label is available only as delimited user-role
+        # data — including the one that is NOT an observed column.
+        assert "<untrusted_source_field_labels>" in user_content
+        assert f'"uploaded_label": "{self.DECLARED_ONLY_FIELD}"' in user_content
+        declared_alias = json.loads(user_content.split("<untrusted_source_field_labels>")[1].split("</untrusted_source_field_labels>")[0])
+        alias_by_label = {record["uploaded_label"]: record["alias"] for record in declared_alias}
+        assert self.DECLARED_ONLY_FIELD in alias_by_label
+        assert (
+            f'"declared_fields": ["{alias_by_label["text"]}", "{alias_by_label["note"]}", "{alias_by_label[self.DECLARED_ONLY_FIELD]}"]'
+            in (system_content)
+        )
+        # Custody stays server-side: no sentinel, no blob id.
+        assert f"blob:{blob_id}" not in system_content
+        assert blob_id not in system_content

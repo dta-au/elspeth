@@ -23,7 +23,7 @@ from __future__ import annotations
 # Slice 4 — additional imports for shared validation/repair helpers.
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, TypedDict, cast
@@ -45,6 +45,7 @@ from elspeth.core.secrets import (
     collect_credential_field_violations,
     collect_disallowed_secret_ref_markers,
     parse_secret_ref_marker,
+    redact_secret_refs_for_validation,
 )
 from elspeth.engine.orchestrator.preflight import check_config_value_sources
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
@@ -91,7 +92,11 @@ from elspeth.web.paths import (
     resolve_sink_data_path,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
-from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error, web_rag_provider_config_policy_error
+from elspeth.web.provider_config_policy import (
+    AWS_S3_SOURCE_POLICY_ERROR,
+    web_llm_retry_budget_policy_error,
+    web_rag_provider_config_policy_error,
+)
 from elspeth.web.secrets.ref_policy import (
     allowed_secret_ref_fields,
     allowed_secret_ref_fields_text,
@@ -640,13 +645,26 @@ def _duplicate_consumer_repair_suggestions(
     if not duplicate_error_components:
         return []
 
-    consumers_by_connection: dict[str, list[NodeSpec]] = {}
+    # ``branch_alias`` is None for an ordinary ``node.input`` consumer and
+    # names the branch slot for a row_union consumer. The row_union's own
+    # ``input`` is only an adapter placeholder and must never be repaired as
+    # though it were an independent consumption edge.
+    consumers_by_connection: dict[str, list[tuple[NodeSpec, str | None]]] = {}
     for node in state.nodes:
-        if node.node_type == "coalesce":
+        if node.node_type in ("coalesce", "queue", "row_union"):
             continue
-        if node.input not in consumers_by_connection:
-            consumers_by_connection[node.input] = []
-        consumers_by_connection[node.input].append(node)
+        consumers_by_connection.setdefault(node.input, []).append((node, None))
+    for node in state.nodes:
+        if node.node_type != "row_union":
+            continue
+        for row_union_branch_alias, branch_connection in zip(
+            _coalesce_branch_names(node.branches),
+            _coalesce_branch_connections(node.branches),
+            strict=True,
+        ):
+            if row_union_branch_alias == branch_connection:
+                continue
+            consumers_by_connection.setdefault(branch_connection, []).append((node, row_union_branch_alias))
 
     reserved_node_ids = {node.id for node in state.nodes}
     reserved_connection_names = _reserved_connection_names(state)
@@ -660,10 +678,10 @@ def _duplicate_consumer_repair_suggestions(
         gate_id = _unique_name(f"fork_{connection_fragment}", reserved_node_ids)
         branch_names = [
             _unique_name(
-                f"{connection_fragment}_to_{_repair_identifier_fragment(node.id, fallback='node')}",
+                f"{connection_fragment}_to_{_repair_identifier_fragment(binding[0].id, fallback='node')}",
                 reserved_connection_names,
             )
-            for node in consumer_nodes
+            for binding in consumer_nodes
         ]
         gate_args: dict[str, object] = {
             "id": gate_id,
@@ -674,7 +692,7 @@ def _duplicate_consumer_repair_suggestions(
             "on_error": None,
             "options": {},
             "condition": "True",
-            "routes": {},
+            "routes": {"true": "fork", "false": "fork"},
             "fork_to": branch_names,
             "branches": None,
             "policy": None,
@@ -685,10 +703,35 @@ def _duplicate_consumer_repair_suggestions(
         }
         tool_sequence: list[_RepairToolCall] = []
         affected_consumers: list[_AffectedConsumer] = []
-        for node, branch_name in zip(consumer_nodes, branch_names, strict=True):
-            patched_consumer = _serialize_node(node)
-            patched_consumer["input"] = branch_name
-            tool_sequence.append({"tool": "upsert_node", "arguments": patched_consumer})
+        # One row_union can contribute two (node, alias) bindings when two of
+        # its aliases share a connection. Every patch for a node must land on
+        # one running payload: re-serializing the original node per binding
+        # emits two upsert_node calls for the same id, and the second reverts
+        # the first. Insertion order preserves the cross-node sequence.
+        patched_consumers: dict[str, dict[str, Any]] = {}
+        for (node, consumer_branch_alias), branch_name in zip(consumer_nodes, branch_names, strict=True):
+            patched_consumer = patched_consumers.get(node.id)
+            if patched_consumer is None:
+                patched_consumer = _serialize_node(node)
+                patched_consumers[node.id] = patched_consumer
+            if consumer_branch_alias is None:
+                patched_consumer["input"] = branch_name
+            else:
+                patched_branches = patched_consumer["branches"]
+                if not isinstance(patched_branches, dict):
+                    patched_branches = dict(
+                        zip(
+                            _coalesce_branch_names(node.branches),
+                            _coalesce_branch_connections(node.branches),
+                            strict=True,
+                        )
+                    )
+                patched_branches[consumer_branch_alias] = branch_name
+                patched_consumer["branches"] = patched_branches
+                # ``input`` is only the adapter placeholder for the first
+                # branch connection; re-derive it from the accumulated mapping
+                # so it stays consistent no matter which aliases were repaired.
+                patched_consumer["input"] = next(iter(patched_branches.values()))
             affected_consumers.append(
                 {
                     "id": node.id,
@@ -696,6 +739,7 @@ def _duplicate_consumer_repair_suggestions(
                     "new_input": branch_name,
                 }
             )
+        tool_sequence.extend({"tool": "upsert_node", "arguments": patched_consumer} for patched_consumer in patched_consumers.values())
         tool_sequence.append({"tool": "upsert_node", "arguments": gate_args})
         tool_sequence.append({"tool": "preview_pipeline", "arguments": {}})
         suggestions.append(
@@ -1200,6 +1244,7 @@ def _serialize_node(node: NodeSpec) -> dict[str, Any]:
         "trigger": deep_thaw(node.trigger) if node.trigger else None,
         "output_mode": node.output_mode,
         "expected_output_count": node.expected_output_count,
+        "timeout_seconds": node.timeout_seconds,
     }
 
 
@@ -1273,9 +1318,9 @@ def _credential_wiring_contract_failure(
       rolls back — meaning ``wire_secret_ref`` cannot be used to attach
       the secret post-hoc (the node never lands in state).
     - ``collect_credential_field_violations`` short-circuits on
-      ``{secret_ref: NAME}`` markers and ``set_pipeline`` strips those
-      markers before pydantic validation, so passing the marker inline
-      in the node's options is the supported new-node path.
+      ``{secret_ref: NAME}`` markers and ``set_pipeline`` validates those
+      deferred fields without resolving their values, so passing the marker
+      inline in the node's options is the supported new-node path.
 
     The post-hoc ``wire_secret_ref`` sequence is still documented as
     the secondary path for nodes that already exist in state.
@@ -1300,8 +1345,9 @@ def _credential_wiring_contract_failure(
     repair_text = "list_secret_refs -> validate_secret_ref -> wire_secret_ref"
     inline_instruction = (
         "Set `<field>: {secret_ref: NAME}` directly in the node's options "
-        "when calling set_pipeline / upsert_node. (The marker is stripped "
-        "before option validation and resolved at execution time.) This "
+        "when calling set_pipeline / upsert_node. (The marker is handled "
+        "without resolving its value during option validation and resolved at "
+        "execution time.) This "
         "rejection left pipeline state unchanged: repair by re-issuing only "
         "the rejected call with the marker substituted for the literal "
         "value — do not rebuild the pipeline from scratch. For a component "
@@ -1374,6 +1420,14 @@ _PLUGIN_UNAVAILABLE_EXPLANATIONS: Final[dict[PluginUnavailableReason, str]] = {
         "the plugin is installed but not turned on in this deployment — no operator profile is "
         "configured for it; an operator must enable one before it can be used"
     ),
+    # WEB_SURFACE_PROHIBITED has exactly ONE producer today — the aws_s3 source
+    # ban in ``build_plugin_snapshot`` — so this entry names that policy directly
+    # by reusing its single source of truth instead of restating it (the two
+    # copies cannot drift). A second producer must generalise this text.
+    PluginUnavailableReason.WEB_SURFACE_PROHIBITED: (
+        "the plugin is installed and authorized for this deployment's runtime but prohibited on the "
+        f"web authoring surface by security policy, and no operator setting can enable it here: {AWS_S3_SOURCE_POLICY_ERROR}"
+    ),
 }
 
 
@@ -1381,10 +1435,28 @@ def _plugin_unavailable_message(plugin_type: PluginKind, reason: PluginUnavailab
     return f"{plugin_type} plugin selection is unavailable ({reason.value}): {_PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]}"
 
 
-# gate/coalesce/queue are built-in node_types wired with plugin=null — they do
-# not exist in the plugin registry, and answering a registry probe for them
-# with "not installed" invites a false honest decline ("this deployment cannot
-# merge branches"). These names are closed composer vocabulary, safe to echo.
+def _prohibited_section(items: Sequence[Any]) -> tuple[dict[str, str], ...]:
+    """Shape ``PolicyCatalogView.list_prohibited_*`` entries for chat discovery.
+
+    Every ``item`` here already cleared ``PolicyCatalogView._prohibited`` —
+    i.e. it carries ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED``, the
+    one closed reason this section ever names (R2-F18 / elspeth-28a695d7f4).
+    Reuses the same static policy prose the attempt path
+    (``_plugin_unavailable_message``) already shows on a rejected
+    ``set_source`` — no new disclosure surface, just an earlier one, so a
+    user naming a prohibited plugin gets the reason without first trying and
+    failing.
+    """
+    reason = PluginUnavailableReason.WEB_SURFACE_PROHIBITED
+    explanation = _PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]
+    return tuple({"name": item.name, "reason": reason.value, "explanation": explanation} for item in items)
+
+
+# gate/coalesce/row_union/queue are built-in node_types wired with plugin=null —
+# they do not exist in the plugin registry, and answering a registry probe for
+# them with "not installed" invites a false honest decline ("this deployment
+# cannot merge branches"). These names are closed composer vocabulary, safe to
+# echo.
 _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
     "coalesce": (
         "'coalesce' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "
@@ -1397,6 +1469,15 @@ _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
         "'gate' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a node "
         "with node_type='gate', plugin=null, a `condition` row expression and routes={'true': ..., "
         "'false': ...}; route to 'fork' with fork_to=[...] to fan a row out to several branches."
+    ),
+    "row_union": (
+        "'row_union' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "
+        "node with node_type='row_union', plugin=null, at least two ordered `branches` mapping each "
+        "fork branch alias to its incoming connection, `input` equal to the first mapped connection "
+        "as a serialization placeholder, and `on_success` naming a downstream processing connection. "
+        "It has fixed require_all N-to-N semantics: it waits for every branch, then releases every "
+        "original row unchanged in declared branch order; an optional finite positive "
+        "`timeout_seconds` is supported."
     ),
     "queue": (
         "'queue' is not a plugin — it is a built-in node_type that needs no plugin, used for fan-in: "
@@ -1604,11 +1685,12 @@ def _prevalidate_plugin_options(
     function asks the plugin what it needs rather than hardcoding
     knowledge about individual plugins.
 
-    Secret-ref markers (``{"secret_ref": "NAME"}``) are stripped before
-    validation. The underlying Pydantic errors are filtered to exclude
-    errors on secret-ref'd fields — those fields ARE provisioned, just
-    deferred to execution time when ``resolve_secret_refs`` replaces them
-    with actual values.
+    Secret-ref markers (``{"secret_ref": "NAME"}``) are withheld from the
+    primary config-model validation and field-level errors on those fields are
+    filtered because they ARE provisioned. If a model-level validator needs to
+    observe paired or conditional credential presence, validation is retried
+    with the shared non-secret placeholder. Real secret values remain
+    unavailable to authoring and are resolved only at execution time.
 
     Args:
         plugin_type: "source", "transform", or "sink".
@@ -1652,13 +1734,13 @@ def _prevalidate_plugin_options(
     if plugin_type == "transform" and plugin_name == "llm":
         _mask_pending_interpretation_placeholders_for_authoring_validation(merged)
 
-    # Strip secret_ref markers before validation.  A secret-ref'd field
-    # IS provisioned (the user called wire_secret_ref, or operator-profile
-    # lowering injected the credential as a scoped marker), just deferred to
-    # execution time.  Stripping it may cause Pydantic to report
-    # "field required" — we filter those errors out below.  The canonical
-    # parser accepts both the bare {"secret_ref"} form and the scoped
-    # {"secret_ref", "secret_scope"} form profile lowering emits.
+    # Withhold secret_ref markers from the primary validation pass. A
+    # secret-ref'd field IS provisioned (the user called wire_secret_ref, or
+    # operator-profile lowering injected the credential as a scoped marker),
+    # just deferred to execution time. The canonical parser accepts both the
+    # bare {"secret_ref"} form and the scoped {"secret_ref", "secret_scope"}
+    # form profile lowering emits.
+    placeholder_options = redact_secret_refs_for_validation(merged)
     secret_ref_keys: set[str] = set()
     for key, value in list(merged.items()):
         if parse_secret_ref_marker(value) is not None:
@@ -1675,6 +1757,7 @@ def _prevalidate_plugin_options(
         if shape is not None and shape.mode == "inline_content":
             blob_inline_ref_keys.add(key)
             del merged[key]
+            del placeholder_options[key]
 
     try:
         config = config_cls.from_dict(merged, plugin_name=plugin_name)
@@ -1684,15 +1767,31 @@ def _prevalidate_plugin_options(
             msg = exc.cause if exc.cause is not None else str(exc)
             return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
 
-        # Secret refs were stripped.  Filter out errors on those fields.
         cause = exc.__cause__
+        has_model_level_error = not isinstance(cause, PydanticValidationError) or any(not error["loc"] for error in cause.errors())
+        if secret_ref_keys and has_model_level_error:
+            # Presence-dependent model validators cannot distinguish a withheld
+            # marker from an absent credential. Retry structure-only validation
+            # with the same non-secret placeholder used by export preflight.
+            # Return immediately on success to preserve the established deferred
+            # secret path, which intentionally does not inspect secret values or
+            # advance into value-source checks that the primary pass did not reach.
+            try:
+                config_cls.from_dict(placeholder_options, plugin_name=plugin_name)
+            except PluginConfigError as placeholder_exc:
+                msg = placeholder_exc.cause if placeholder_exc.cause is not None else str(placeholder_exc)
+                return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
+            return None
+
+        # Secret refs were withheld. Filter out field-level errors on those
+        # fields while retaining every unrelated validation failure.
         if not isinstance(cause, PydanticValidationError):
             # ValueError path (model validators) — can't filter per-field.
             msg = exc.cause if exc.cause is not None else str(exc)
             return f"Invalid options for {plugin_type} '{plugin_name}': {msg}"
 
-        stripped_keys = secret_ref_keys | blob_inline_ref_keys
-        remaining = [e for e in cause.errors() if not (e["loc"] and e["loc"][0] in stripped_keys)]
+        deferred_keys = secret_ref_keys | blob_inline_ref_keys
+        remaining = [e for e in cause.errors() if not (e["loc"] and e["loc"][0] in deferred_keys)]
         if not remaining:
             return None
 
@@ -2571,6 +2670,7 @@ class _SetPipelineNodePayload(TypedDict):
     trigger: dict[str, JsonValue] | None
     output_mode: str | None
     expected_output_count: int | None
+    timeout_seconds: float | None
 
 
 def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonValue]:
@@ -2595,6 +2695,80 @@ def _serialize_set_pipeline_node(node: NodeSpec) -> _SetPipelineNodePayload:
     payload = cast(_SetPipelineNodePayload, _serialize_node(node))
     payload["options"] = _serialize_authoring_options(node.options)
     return payload
+
+
+_ROW_UNION_INTRINSIC_ERROR_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "row_union_config_invalid",
+        "row_union_branches_invalid",
+        "row_union_branch_invalid",
+        "row_union_input_mismatch",
+        "row_union_on_success_invalid",
+        "row_union_timeout_invalid",
+    }
+)
+
+_MUTATION_BLOCKING_INVARIANT_CODES: Final[frozenset[str]] = _ROW_UNION_INTRINSIC_ERROR_CODES | {
+    "row_union_on_success_must_be_connection",
+    "node_timeout_unsupported",
+}
+
+
+def _post_mutation_invariant_error(
+    proposed_state: CompositionState,
+) -> tuple[str, str] | None:
+    """Return an invariant a mutation must not persist.
+
+    Composer permits incomplete topology during incremental authoring, so a
+    mutation cannot require the entire pipeline to validate. This shared
+    preflight selects only intrinsic node-shape and namespace invariants whose
+    persistence would make later generic mutation tools violate their own
+    contracts. Callers return the original state on failure, giving the tools
+    one rollback discipline without weakening ordinary validation telemetry.
+    """
+    for entry in proposed_state.validate().errors:
+        if entry.error_code in _MUTATION_BLOCKING_INVARIANT_CODES:
+            assert entry.error_code is not None
+            return entry.message, entry.error_code
+    return None
+
+
+def _row_union_node_contract_error(
+    node: NodeSpec,
+    *,
+    output_names: frozenset[str] = frozenset(),
+) -> tuple[str, str] | None:
+    """Return the first intrinsic row-union authoring failure.
+
+    Reuse ``CompositionState.validate`` as the contract authority rather than
+    maintaining a second structural validator in the tool layer. Topology
+    findings (unreachable branches and a not-yet-consumed output connection)
+    remain incremental-authoring telemetry. A configured sink target is
+    rejected here because row_union v1 may release only to processing.
+    """
+    if node.node_type != "row_union":
+        return None
+    if node.on_success in output_names:
+        return (
+            (
+                f"row_union '{node.id}' on_success '{node.on_success}' names a sink. "
+                "A released group must continue on a processing connection."
+            ),
+            "row_union_on_success_must_be_connection",
+        )
+    probe = CompositionState(
+        source=None,
+        nodes=(node,),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    for entry in probe.validate().errors:
+        if entry.component == f"node:{node.id}" and entry.error_code in _ROW_UNION_INTRINSIC_ERROR_CODES:
+            assert entry.error_code is not None
+            return entry.message, entry.error_code
+    return None
 
 
 def _serialize_set_pipeline_source(

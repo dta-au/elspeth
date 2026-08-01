@@ -31,6 +31,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.capability_skill import load_pipeline_capability_core
@@ -39,6 +40,7 @@ from elspeth.web.composer.guided.planning import guided_redacted_current_state_c
 from elspeth.web.composer.guided.prompts import load_step_planner_skill
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.pipeline_planner import (
+    _REPEAT_NOTICE,
     PLANNER_DISCOVERY_TOOL_NAMES,
     PipelinePlannerError,
     PlannerBudgetPolicy,
@@ -48,11 +50,14 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerOriginatingMessage,
     PlannerRequestLifecycle,
     _allowlisted_candidate_feedback,
+    _feedback_error_codes,
     _parse_response_tool_calls,
     _ParsedToolCall,
     _serialize_provider_discovery_result,
+    _transform_node_count,
     plan_pipeline,
     planner_tool_definitions,
+    prepare_pipeline_plan,
 )
 from elspeth.web.composer.pipeline_proposal import (
     AbsentBase,
@@ -73,8 +78,10 @@ from elspeth.web.composer.state import (
     ValidationSummary,
 )
 from elspeth.web.composer.tools._common import ToolContext, ToolResult
+from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
+from elspeth.web.config import WebSettings
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
@@ -83,7 +90,9 @@ from elspeth.web.interpretation_state import (
     RAW_HTML_CLEANUP_USER_TERM,
     pipeline_decision_artifact_hash,
 )
+from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, composition_proposals_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -429,6 +438,18 @@ def _invalid_pipeline(data_dir: Path) -> dict[str, Any]:
     return pipeline
 
 
+def _pipeline_with_bogus_source_option(data_dir: Path) -> dict[str, Any]:
+    """An otherwise-valid pipeline whose csv source carries an unknown option.
+
+    Trips the pre-application ``plugin_options_invalid`` rejection on the
+    ``rejected_mutation`` component — the exact failure class observed on the
+    AWS acceptance runs (ticket elspeth-5904b1683a, F14).
+    """
+    pipeline = _pipeline(data_dir)
+    pipeline["source"]["options"]["bogus_option"] = True
+    return pipeline
+
+
 def _pipeline_with_short_form_llm_review(data_dir: Path) -> dict[str, Any]:
     """A valid csv -> llm -> json plan whose LLM node carries the skill's short form.
 
@@ -458,7 +479,7 @@ def _pipeline_with_short_form_llm_review(data_dir: Path) -> dict[str, Any]:
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
-                    "prompt_template": "Summarise {{ text }}",
+                    "prompt_template": "Summarise {{ row.text }}",
                     "interpretation_requirements": [
                         {
                             "kind": "pipeline_decision",
@@ -581,6 +602,8 @@ async def _plan(
     claim_evaluator: Any = None,
     rendered_skill: str | None = None,
     supersedes_draft_hash: str | None = None,
+    candidate_finalizer: Any = None,
+    unproducible_output_fields: tuple[str, ...] = (),
 ) -> Any:
     # Candidate validation needs the real plugin contracts.  ``tool_context``
     # remains in the test signature so the standard composer fixture proves
@@ -598,6 +621,7 @@ async def _plan(
         ),
         reviewed_facts={"request": "Build the requested pipeline."},
         reviewed_planner_context={"request": "Build the requested pipeline."},
+        unproducible_output_fields=unproducible_output_fields,
         eligible_deferred_intent_ids=eligible_deferred_intent_ids,
         claim_evaluator=claim_evaluator,
         supersedes_draft_hash=supersedes_draft_hash,
@@ -614,7 +638,7 @@ async def _plan(
         custody_config=custody_config or _custody(tmp_path),
         lifecycle=lifecycle or _lifecycle(),
         recorder=recorder or BufferingRecorder(),
-        candidate_finalizer=lambda candidate: candidate,
+        candidate_finalizer=candidate_finalizer or (lambda candidate: candidate),
     )
 
 
@@ -1105,6 +1129,99 @@ async def test_plan_preserves_custom_review_identity_through_internal_reconcilia
     )
 
 
+def _web_authored_policy_pair() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """RESTRICTED (web-authored) authority over the FULL catalog availability.
+
+    Deliberately NOT the snapshot ``build_plugin_snapshot`` would produce for a
+    web principal: that one declines ``source:aws_s3`` up front, and the
+    plugin-visibility gate would then answer first. Keeping every installed
+    plugin available isolates the plumbing under test — the authoritative
+    aws_s3-source gate's own rejection code reaching the planner failure — from
+    the separate availability question. Do not "fix" this to match production
+    availability: that would silently stop pinning the plumbing.
+    """
+    full_catalog = create_catalog_service()
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(full_catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="web-authored-planner-policy",
+        principal_scope="local:planner-user",
+        available=unrestricted.available,
+        unavailable=(),
+        selected=unrestricted.selected,
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="web-authored-planner-generation",
+    )
+    settings = WebSettings.model_validate(
+        {
+            "composer_max_composition_turns": 4,
+            "composer_max_discovery_turns": 4,
+            "composer_timeout_seconds": 60,
+            "composer_rate_limit_per_minute": 20,
+            "shareable_link_signing_key": b"0123456789abcdef0123456789abcdef",
+        }
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    return PolicyCatalogView(full_catalog, snapshot, profiles), snapshot
+
+
+def _aws_s3_source_pipeline(data_dir: Path) -> dict[str, Any]:
+    pipeline = _pipeline(data_dir)
+    pipeline["source"] = {
+        "plugin": "aws_s3",
+        "on_success": "rows",
+        "options": {"bucket": "operator-bucket", "key": "input.csv", "schema": {"mode": "observed"}},
+        "on_validation_failure": "discard",
+    }
+    return pipeline
+
+
+@pytest.mark.asyncio
+async def test_server_derived_rejection_carries_its_closed_codes(tmp_path: Path) -> None:
+    """The server-derived gate must name WHY it refused, not just that it did.
+
+    ``prepare_pipeline_plan`` makes no provider call: the pipeline is
+    server-synthesized, so a candidate rejection here is the only signal the
+    route ever gets. Dropping ``detail_codes`` recorded VALIDATION_FAILED with
+    ``rejection_codes=[]`` while a coded policy refusal existed — the run looked
+    rejection-free exactly when the cause mattered, and the failure was
+    indistinguishable from a provider fault. The model-driven exhaustion path
+    (``_rejection_exhausted``) already carried these codes; this pins the two
+    paths symmetric.
+    """
+    policy_catalog, snapshot = _web_authored_policy_pair()
+
+    with pytest.raises(PipelinePlannerError) as caught:
+        await prepare_pipeline_plan(
+            pipeline=_aws_s3_source_pipeline(tmp_path),
+            current_state=_empty_state(),
+            reviewed_facts={"request": "Read the archive from S3."},
+            reviewed_planner_context={"request": "Read the archive from S3."},
+            supersedes_draft_hash=None,
+            surface=PlannerSurface.GUIDED_STAGED,
+            policy_catalog=policy_catalog,
+            plugin_snapshot=snapshot,
+            originating_message=_origin(),
+            base=AbsentBase(),
+            rendered_skill="server-derived pass-through plan",
+            tool_call_id=str(uuid4()),
+            model_identifier="server-derived",
+            model_version="server-derived",
+            provider="server-derived",
+            repair_count=0,
+            timeout_seconds=10.0,
+            custody_config=_custody(tmp_path),
+        )
+
+    assert caught.value.code == "VALIDATION_FAILED"
+    assert caught.value.detail_codes == ("aws_s3_source_not_allowed",)
+    # The code must resolve to actionable guidance, or the planner and the
+    # durable disposition both carry a bare token.
+    assert explain_validation_code("aws_s3_source_not_allowed") is not None
+
+
 @pytest.mark.asyncio
 async def test_unguarded_candidate_error_becomes_typed_planner_failure(
     tmp_path: Path,
@@ -1240,7 +1357,15 @@ async def test_provider_side_call_input_mutation_is_detected_as_audit_integrity_
     ("provider_outcome", "expected_status"),
     (
         (_response(("emit_pipeline_proposal", {"pipeline": {}})), ComposerLLMCallStatus.SUCCESS),
-        (RuntimeError("provider unavailable"), ComposerLLMCallStatus.API_ERROR),
+        (
+            LiteLLMAPIError(
+                status_code=503,
+                message="provider unavailable",
+                llm_provider="test-provider",
+                model="anthropic/claude-planner",
+            ),
+            ComposerLLMCallStatus.API_ERROR,
+        ),
         (asyncio.CancelledError(), ComposerLLMCallStatus.CANCELLED),
     ),
 )
@@ -1293,6 +1418,26 @@ async def test_provider_input_mutation_is_audited_once_before_integrity_failure(
     assert audit_call.status is expected_status
     assert audit_call.messages_hash != manifest.rendered_prompt_hash
     assert audit_call.tools_spec_hash == manifest.effective_tool_hash
+
+
+@pytest.mark.asyncio
+async def test_unexpected_completion_exception_propagates_without_provider_audit(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    failure = RuntimeError("local completion adapter defect")
+    recorder = BufferingRecorder()
+
+    with pytest.raises(RuntimeError) as caught:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=_ScriptedCompletion(failure),
+            recorder=recorder,
+        )
+
+    assert caught.value is failure
+    assert recorder.llm_calls == ()
 
 
 @pytest.mark.asyncio
@@ -1705,7 +1850,9 @@ async def test_list_sources_disclosure_closes_authoritative_validation_envelope(
         assert payload["data"]["success"] is False
         assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
     else:
-        assert isinstance(payload["data"], list)
+        assert isinstance(payload["data"], dict)
+        assert isinstance(payload["data"]["available"], list)
+        assert isinstance(payload["data"]["prohibited"], list)
     if restricted:
         assert all(canary not in tool_message["content"] for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
         for entries in (
@@ -2438,6 +2585,55 @@ async def test_nodeless_revision_candidate_gets_one_coded_nudge_then_valve(
 
 
 @pytest.mark.asyncio
+async def test_two_defect_nodeless_unproducible_revision_gets_one_coherent_rejection(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """T1xT3 (acceptance-r2 final review, must-fix 2): one instruction, not two.
+
+    A guided revision candidate can carry BOTH defects at once: zero
+    transform/aggregation nodes AND reviewed output fields no source declares
+    or observes. The nodeless nudge's omit-valve ("re-emit the same pipeline
+    unchanged ... the confirmation will be accepted") and the satisfiability
+    guard ("re-emitting ... will be rejected again") are contradictory repair
+    instructions; against the default repair budget of 2 the pair is a
+    guaranteed unrepairable path. The satisfiability guard must fire FIRST —
+    its feedback names the missing fields, adding a transform clears both
+    guards in one turn, and the omit-valve promise is only ever made when it
+    is true.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_short_form_llm_review(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        supersedes_draft_hash=stable_hash("superseded-draft"),
+        unproducible_output_fields=("rating",),
+        repair_budget=2,  # the production default (composer_planner_repair_budget)
+    )
+
+    # One rejection, then the transformful re-emit lands: the contradictory
+    # pair cannot exhaust the budget because only ONE guard ever speaks.
+    assert proposal.proposal.repair_count == 1
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    assert feedback["success"] is False
+    codes = [error["error_code"] for error in feedback["validation"]["errors"]]
+    assert codes == ["passthrough_cannot_produce_declared_fields"]
+    # The surviving message names the missing fields ...
+    assert "rating" in feedback["validation"]["errors"][0]["detail"]
+    # ... and the contradictory omit-valve never reaches the model: no error
+    # carries the nodeless-nudge code, and nothing in the feedback promises
+    # that an unchanged re-emit will be accepted.
+    assert "proposal_missing_requested_transforms" not in codes
+    assert "will be accepted" not in json.dumps(feedback)
+
+
+@pytest.mark.asyncio
 async def test_transformful_revision_candidate_passes_without_nudge(
     tmp_path: Path,
     tool_context: ToolContext,
@@ -2543,6 +2739,226 @@ def test_allowlisted_candidate_feedback_enriches_node_shape_codes() -> None:
     # because nothing told them the exact code string is the key. One static
     # line, no topology hints (mid-repair suggestions have derailed runs).
     assert feedback["guidance"] == ("To expand any code, call explain_validation_error with the exact code string.")
+
+
+def test_allowlisted_candidate_feedback_carries_plugin_options_detail() -> None:
+    """``plugin_options_invalid`` carries the validator message as ``detail``.
+
+    The options-validator message quotes only the rejected candidate's own
+    authored options — already verbatim in the planner's context — and it
+    names the exact failing option with its repair. Withholding it made the
+    rejection unrepairable: run 06c9ec49 (2026-07-29) burned every repair
+    turn on the static enrichment's profile-alias hypothesis while the
+    validator's missing-``required_input_fields`` message (and its one-line
+    patch) never reached the model. Other codes keep the message withheld.
+    """
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="node:summarize",
+                message=(
+                    "Node 'summarize': Invalid options for transform 'llm': "
+                    "LLM prompt_template references row fields ['content'] "
+                    "but options.required_input_fields is not declared."
+                ),
+                severity="error",
+                error_code="plugin_options_invalid",
+            ),
+            ValidationEntry(
+                component="node:other",
+                message="WITHHELD_MESSAGE_CANARY",
+                severity="error",
+                error_code="unknown_node_type",
+            ),
+        ),
+    )
+
+    feedback = _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=summary)))
+
+    entries = feedback["validation"]["errors"]
+    options_entry = next(e for e in entries if e["error_code"] == "plugin_options_invalid")
+    assert "required_input_fields is not declared" in options_entry["detail"]
+    # The static enrichment still rides along and now defers to detail.
+    assert "detail" in options_entry["explanation"]
+    # Every other code keeps its raw message withheld.
+    other_entry = next(e for e in entries if e["error_code"] == "unknown_node_type")
+    assert "detail" not in other_entry
+    assert "WITHHELD_MESSAGE_CANARY" not in json.dumps(feedback)
+
+
+@pytest.mark.parametrize(
+    "feedback",
+    (
+        {},
+        {"validation": {}},
+        {"validation": {"errors": [{}]}},
+    ),
+)
+def test_feedback_error_codes_rejects_malformed_internal_envelopes(feedback: dict[str, Any]) -> None:
+    with pytest.raises((KeyError, TypeError)):
+        _feedback_error_codes(feedback)
+
+
+@pytest.mark.parametrize(
+    "pipeline",
+    (
+        {},
+        {"nodes": [{}]},
+    ),
+)
+def test_transform_node_count_rejects_malformed_validated_pipeline(pipeline: dict[str, Any]) -> None:
+    with pytest.raises((KeyError, TypeError)):
+        _transform_node_count(pipeline)
+
+
+def test_coalesce_feedback_rejects_missing_internal_reachability_fact(monkeypatch: pytest.MonkeyPatch) -> None:
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="node:coalesce_missing",
+                message="closed diagnostic",
+                severity="error",
+                error_code="coalesce_branch_unreachable",
+            ),
+        ),
+    )
+    monkeypatch.setattr(planner_module, "coalesce_reachability_facts", lambda _state: {})
+
+    with pytest.raises(KeyError, match="coalesce_missing"):
+        _allowlisted_candidate_feedback(
+            cast(
+                Any,
+                SimpleNamespace(
+                    validation=summary,
+                    updated_state=object(),
+                ),
+            )
+        )
+
+
+def _dangling_destination_state() -> CompositionState:
+    """Candidate state with a dangling source on_success AND a bad transform on_error."""
+    return CompositionState(
+        source=SourceSpec(
+            plugin="csv",
+            on_success="ghost_connection",
+            options={"path": "input.csv", "schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        ),
+        nodes=(
+            NodeSpec(
+                id="clean_rows",
+                node_type="transform",
+                plugin="field_mapper",
+                input="rows",
+                on_success="cleaned",
+                on_error="quarantine_typo",
+                options={"schema": {"mode": "observed"}, "mapping": {"name": "name"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="cleaned",
+                plugin="json",
+                options={
+                    "path": "outputs/result.jsonl",
+                    "schema": {"mode": "observed"},
+                    "format": "jsonl",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=2,
+    )
+
+
+def test_allowlisted_candidate_feedback_carries_route_destination_facts() -> None:
+    """Dangling-destination rejections carry instance wiring facts.
+
+    F14 (elspeth-5904b1683a): the canonical CSV-to-JSON acceptance prompt
+    intermittently exhausted its repair budget on ``source_on_success_dangling``
+    because the bare code named neither the value that dangled nor the sink it
+    should have matched, and the static guidance sent the model to
+    ``get_pipeline_state`` — which shows the BASELINE session state (empty on a
+    fresh compose), not the rejected candidate. The feedback now carries the
+    dangling value and the candidate's valid destinations — sink names and
+    connection names the planner itself authored, the same redaction class as
+    the coalesce reachability facts.
+    """
+    state = _dangling_destination_state()
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="source",
+                message="Source on_success 'ghost_connection' is neither a sink nor a known connection.",
+                severity="high",
+                error_code="source_on_success_dangling",
+            ),
+            ValidationEntry(
+                component="node:clean_rows",
+                message="Transform 'clean_rows' on_error 'quarantine_typo' references unknown sink.",
+                severity="high",
+                error_code="transform_on_error_unknown_sink",
+            ),
+        ),
+    )
+
+    feedback = _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=summary, updated_state=state)))
+
+    entries = feedback["validation"]["errors"]
+    source_entry = next(e for e in entries if e["error_code"] == "source_on_success_dangling")
+    assert source_entry["connectivity"] == {
+        "dangling_on_success": "ghost_connection",
+        "declared_sinks": ["cleaned"],
+        "consumable_connections": ["rows"],
+    }
+    on_error_entry = next(e for e in entries if e["error_code"] == "transform_on_error_unknown_sink")
+    # on_error may only target sinks, so the facts deliberately omit
+    # consumable_connections — steering the repair toward them would be wrong.
+    assert on_error_entry["connectivity"] == {
+        "dangling_on_error": "quarantine_typo",
+        "declared_sinks": ["cleaned"],
+    }
+    # Raw validator messages stay withheld; the facts replace them.
+    assert "is neither a sink nor a known connection" not in json.dumps(feedback)
+    # No repeat: the notice only rides an identical-fingerprint repetition.
+    assert "repeat_notice" not in feedback
+
+
+def test_route_destination_feedback_rejects_missing_internal_fact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A destination-dangling code with no matching fact fails loud, not silent."""
+    import elspeth.web.composer.pipeline_planner as planner_module
+
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="source",
+                message="closed diagnostic",
+                severity="high",
+                error_code="source_on_success_dangling",
+            ),
+        ),
+    )
+    monkeypatch.setattr(planner_module, "route_destination_facts", lambda _state: {})
+
+    with pytest.raises(KeyError, match="source"):
+        _allowlisted_candidate_feedback(cast(Any, SimpleNamespace(validation=summary, updated_state=object())))
 
 
 @pytest.mark.asyncio
@@ -2771,6 +3187,211 @@ async def test_pydantic_invalid_terminal_draft_gets_bounded_schema_repair(
             ],
         },
     }
+
+
+_CANONICAL_SCHEMA_FEEDBACK = {
+    "success": False,
+    "validation": {
+        "is_valid": False,
+        "errors": [
+            {
+                "component": "pipeline",
+                "severity": "high",
+                "error_code": "canonical_schema",
+                "error_class": "SchemaValidationError",
+            }
+        ],
+    },
+}
+
+
+def _missing_source_feedback() -> dict[str, Any]:
+    explanation, suggested_fix = explain_validation_code("no_source_configured") or ("", "")
+    return {
+        "success": False,
+        "validation": {
+            "is_valid": False,
+            "errors": [
+                {
+                    "component": "rejected_mutation",
+                    "severity": "high",
+                    "error_code": "no_source_configured",
+                    "error_class": "ValidationError",
+                    "explanation": explanation,
+                    "suggested_fix": suggested_fix,
+                }
+            ],
+        },
+        "guidance": "To expand any code, call explain_validation_error with the exact code string.",
+    }
+
+
+def _sourceless_pipeline(data_dir: Path) -> dict[str, Any]:
+    """A terminal candidate naming no source at all.
+
+    Legal against the terminal schema: ``SetPipelineArgumentsModel`` leaves
+    both ``source`` and ``sources`` optional, so a re-plan "delta" candidate
+    that drops the source block validates and reaches the finalizer.
+    """
+    pipeline = _pipeline(data_dir)
+    del pipeline["source"]
+    return pipeline
+
+
+def _binder_style_finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Stand in for ``bind_guided_reviewed_components``'s sources contract."""
+    if candidate.get("sources") is None and candidate.get("source") is None:
+        raise AuditIntegrityError("guided planner candidate does not identify reviewed sources")
+    return candidate
+
+
+@pytest.mark.asyncio
+async def test_freeform_sources_omitted_candidate_gets_bounded_no_source_repair(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Characterize the repair the freeform surface already produces.
+
+    Pins the exact feedback the guided surface must match — the parity the
+    planner-side guard preserves rather than replacing with a bare schema
+    complaint.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    assert proposal.proposal.repair_count == 1
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _missing_source_feedback()
+
+
+@pytest.mark.asyncio
+async def test_guided_sources_omitted_candidate_gets_bounded_repair_not_integrity_error(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A sources-free candidate is an authoring slip, not an integrity breach.
+
+    The guided binder answers that shape with ``AuditIntegrityError``; before
+    the planner-side guard that error escaped the loop as a terminal 500
+    (elspeth-bcc6bdac99) instead of one budgeted repair turn.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        candidate_finalizer=_binder_style_finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 1
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _missing_source_feedback()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "finalizer"),
+    [
+        (PlannerSurface.FREEFORM, None),
+        (PlannerSurface.GUIDED_STAGED, _binder_style_finalizer),
+    ],
+)
+async def test_repeated_sources_omitted_candidate_draws_the_repeat_notice(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    surface: PlannerSurface,
+    finalizer: Any,
+) -> None:
+    """A re-emitted sourceless candidate is told it changed nothing.
+
+    Rejecting the shape in the planner loop must not drop it out of rejection
+    fingerprinting: an identical rejection repeating across attempts is a
+    feedback-quality defect the loop has to name, not silently burn budget on.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=2,
+        surface=surface,
+        candidate_finalizer=finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 2
+    first = json.loads(completion.requests[1]["messages"][-1]["content"])
+    second = json.loads(completion.requests[2]["messages"][-1]["content"])
+    assert first == _missing_source_feedback()
+    assert second == {**_missing_source_feedback(), "repeat_notice": _REPEAT_NOTICE}
+
+
+@pytest.mark.asyncio
+async def test_binder_candidate_shape_defect_gets_bounded_schema_repair(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Every remaining binder candidate-shape defect is repairable too."""
+    attempts: list[Mapping[str, Any]] = []
+
+    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        attempts.append(candidate)
+        if len(attempts) == 1:
+            raise AuditIntegrityError("guided planner candidate sources differ from reviewed authority")
+        return candidate
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        candidate_finalizer=finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 1
+    assert len(attempts) == 2
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _CANONICAL_SCHEMA_FEEDBACK
+
+
+@pytest.mark.asyncio
+async def test_finalizer_integrity_error_outside_candidate_shape_stays_terminal(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A genuine integrity breach is never downgraded into repair feedback."""
+
+    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        raise AuditIntegrityError("reviewed source authority hash does not match the sealed session")
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    with pytest.raises(AuditIntegrityError, match="reviewed source authority hash"):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            surface=PlannerSurface.GUIDED_STAGED,
+            candidate_finalizer=finalizer,
+        )
 
 
 @pytest.mark.asyncio
@@ -3700,6 +4321,63 @@ def test_escape_hatch_model_and_provider_must_be_configured_together(overrides: 
         _model(_ScriptedCompletion(), **overrides)
 
 
+def test_escape_hatch_api_base_requires_escape_hatch_model() -> None:
+    with pytest.raises(ValueError, match="escape_hatch_api_base requires escape_hatch_model"):
+        _model(_ScriptedCompletion(), api_base="https://primary.example.test/v1", escape_hatch_api_base="https://advisor.example.test/v1")
+
+
+def test_escape_hatch_api_key_requires_escape_hatch_model() -> None:
+    with pytest.raises(ValueError, match="escape_hatch_api_key requires escape_hatch_model"):
+        _model(_ScriptedCompletion(), escape_hatch_api_key="advisor-secret")
+
+
+def test_api_base_without_api_key_rejected() -> None:
+    """Defense-in-depth (belt-and-braces alongside the WebSettings-level
+    pairing validator): a PlannerModelConfig built with an unpaired primary
+    endpoint must be rejected at construction, not silently forwarded."""
+    with pytest.raises(ValueError, match="api_base and api_key must be configured together"):
+        _model(_ScriptedCompletion(), api_base="https://primary-gateway.example.test/v1")
+
+
+def test_api_key_without_api_base_rejected() -> None:
+    with pytest.raises(ValueError, match="api_base and api_key must be configured together"):
+        _model(_ScriptedCompletion(), api_key="orphaned-primary-key")
+
+
+def test_escape_hatch_api_base_without_api_key_rejected() -> None:
+    with pytest.raises(ValueError, match="escape_hatch_api_base and escape_hatch_api_key must be configured together"):
+        _model(
+            _ScriptedCompletion(),
+            escape_hatch_model="openrouter/advisor-under-test",
+            escape_hatch_provider="openrouter",
+            escape_hatch_api_base="https://advisor-gateway.example.test/v1",
+        )
+
+
+def test_escape_hatch_api_key_without_api_base_rejected() -> None:
+    with pytest.raises(ValueError, match="escape_hatch_api_base and escape_hatch_api_key must be configured together"):
+        _model(
+            _ScriptedCompletion(),
+            escape_hatch_model="openrouter/advisor-under-test",
+            escape_hatch_provider="openrouter",
+            escape_hatch_api_key="orphaned-advisor-key",
+        )
+
+
+def test_both_endpoint_pairs_configured_together_is_valid() -> None:
+    config = _model(
+        _ScriptedCompletion(),
+        api_base="https://primary-gateway.example.test/v1",
+        api_key="primary-secret",
+        escape_hatch_model="openrouter/advisor-under-test",
+        escape_hatch_provider="openrouter",
+        escape_hatch_api_base="https://advisor-gateway.example.test/v1",
+        escape_hatch_api_key="advisor-secret",
+    )
+    assert config.api_base == "https://primary-gateway.example.test/v1"
+    assert config.escape_hatch_api_base == "https://advisor-gateway.example.test/v1"
+
+
 @pytest.mark.asyncio
 async def test_discovery_pressure_notice_injected_at_two_turns_remaining(
     tmp_path: Path,
@@ -3773,6 +4451,127 @@ async def test_escape_hatch_overtime_turn_runs_advisor_with_terminal_tool_only(
     assert proposal.provider == "openrouter"
     # The second discovery batch was never dispatched.
     assert [invocation.tool_name for invocation in recorder.invocations] == ["list_sources"]
+
+
+@pytest.mark.asyncio
+async def test_planner_omits_endpoint_kwargs_when_unset(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """No-regression guarantee: with no endpoint settings configured, ordinary
+    planner calls carry no api_base/api_key at all — byte-identical to
+    pre-affordance behaviour."""
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    assert len(completion.requests) == 1
+    assert "api_base" not in completion.requests[0]
+    assert "api_key" not in completion.requests[0]
+
+
+@pytest.mark.asyncio
+async def test_planner_ordinary_calls_use_primary_endpoint(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Ordinary (non-hatch) planner calls get the PRIMARY role's endpoint."""
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        model_overrides={
+            "api_base": "https://primary-gateway.example.test/v1",
+            "api_key": "primary-bearer-token",  # secret-scan: allow-this-line
+        },
+    )
+
+    assert len(completion.requests) == 2
+    for request in completion.requests:
+        assert request["api_base"] == "https://primary-gateway.example.test/v1"
+        assert request["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
+
+
+@pytest.mark.asyncio
+async def test_escape_hatch_uses_advisor_endpoint_not_primary(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The highest-risk routing case: model_override selects the escape-hatch
+    (ADVISOR) model at line ~1552, so the SAME condition must select the
+    escape-hatch endpoint — never the primary's. Both endpoints are
+    configured here, deliberately different, so a cross-role leak in either
+    direction would be caught."""
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        _response(("list_sinks", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        model_overrides={
+            "max_discovery_turns": 1,
+            "escape_hatch_model": "openrouter/advisor-under-test",
+            "escape_hatch_provider": "openrouter",
+            "api_base": "https://primary-gateway.example.test/v1",
+            "api_key": "primary-bearer-token",  # secret-scan: allow-this-line
+            "escape_hatch_api_base": "https://advisor-gateway.example.test/v1",
+            "escape_hatch_api_key": "advisor-bearer-token",  # secret-scan: allow-this-line
+        },
+    )
+
+    assert len(completion.requests) == 3
+    ordinary_calls = completion.requests[:2]
+    hatch_call = completion.requests[2]
+    for request in ordinary_calls:
+        assert request["api_base"] == "https://primary-gateway.example.test/v1"
+        assert request["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
+    assert hatch_call["model"] == "openrouter/advisor-under-test"
+    assert hatch_call["api_base"] == "https://advisor-gateway.example.test/v1"
+    assert hatch_call["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
+
+
+@pytest.mark.asyncio
+async def test_escape_hatch_omits_endpoint_kwargs_when_only_primary_configured(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The advisor never silently falls back to the primary's endpoint: with
+    only the primary endpoint configured, the hatch call carries no
+    api_base/api_key at all."""
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        _response(("list_sinks", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        model_overrides={
+            "max_discovery_turns": 1,
+            "escape_hatch_model": "openrouter/advisor-under-test",
+            "escape_hatch_provider": "openrouter",
+            "api_base": "https://primary-gateway.example.test/v1",
+            "api_key": "primary-bearer-token",  # secret-scan: allow-this-line
+        },
+    )
+
+    hatch_call = completion.requests[2]
+    assert hatch_call["model"] == "openrouter/advisor-under-test"
+    assert "api_base" not in hatch_call
+    assert "api_key" not in hatch_call
 
 
 @pytest.mark.asyncio
@@ -3903,6 +4702,149 @@ async def test_escape_hatch_fires_on_repair_exhaustion(
     assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
     assert completion.requests[2]["model"] == "openrouter/advisor-under-test"
     assert [tool["function"]["name"] for tool in completion.requests[2]["tools"]] == ["emit_pipeline_proposal"]
+
+
+@pytest.mark.asyncio
+async def test_oscillating_option_and_wiring_rejections_converge_within_budget(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The F14 acceptance-failure pattern converges inside the default budget.
+
+    AWS acceptance runs 2026-07-30 (elspeth-5904b1683a): the canonical
+    CSV-to-JSON prompt oscillated between ``plugin_options_invalid`` (on
+    ``rejected_mutation``) and ``source_on_success_dangling``, exhausting the
+    repair budget ~20% of the time. Both rejection classes must carry the
+    exact instance facts a repair needs: the options validator's own message
+    (``detail``) and the wiring facts (``connectivity`` — the dangling value
+    plus the candidate's valid destinations), so each repair is a copy-paste,
+    not a guess.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_bogus_source_option(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=2,
+        model_overrides={"escape_hatch_model": None},
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    assert proposal.proposal.repair_count == 2
+
+    # Repair turn 1: plugin_options_invalid carries the validator's own
+    # message naming the offending option (candidate-authored content only).
+    first_feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    options_entry = next(e for e in first_feedback["validation"]["errors"] if e["error_code"] == "plugin_options_invalid")
+    assert "bogus_option" in options_entry["detail"]
+    # The empty-baseline red herrings stay gated out of the repair feedback.
+    assert all(e["error_code"] not in ("no_source_configured", "no_sinks_configured") for e in first_feedback["validation"]["errors"])
+
+    # Repair turn 2: the dangling rejection names the dangling value and the
+    # candidate's actual valid destinations — no more get_pipeline_state
+    # misdirection toward the (empty) baseline state.
+    second_feedback = json.loads(completion.requests[2]["messages"][-1]["content"])
+    dangling_entry = next(e for e in second_feedback["validation"]["errors"] if e["error_code"] == "source_on_success_dangling")
+    assert dangling_entry["connectivity"] == {
+        "dangling_on_success": "rows",
+        "declared_sinks": ["not_rows"],
+        "consumable_connections": [],
+    }
+    # Distinct fingerprints: neither turn is a repetition, so no repeat notice.
+    assert "repeat_notice" not in first_feedback
+    assert "repeat_notice" not in second_feedback
+
+
+@pytest.mark.asyncio
+async def test_repeated_rejection_fingerprint_carries_repeat_notice(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """An identical rejection fingerprint repeating is named to the model.
+
+    Project doctrine: an identical-rejection fingerprint repeating across
+    attempts is OUR feedback-quality bug, never the model's budget — so at
+    minimum the loop must TELL the model the repetition happened (it has no
+    attempt counter of its own) instead of silently burning budget.
+    """
+    from structlog.testing import capture_logs
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    with capture_logs() as logs:
+        proposal = await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            repair_budget=2,
+            model_overrides={"escape_hatch_model": None},
+        )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    first_feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    second_feedback = json.loads(completion.requests[2]["messages"][-1]["content"])
+    assert "repeat_notice" not in first_feedback
+    assert "same rejection set" in second_feedback["repeat_notice"]
+
+    rejected = [entry for entry in logs if entry["event"] == "composer.planner_attempt" and entry["outcome"] == "candidate_rejected"]
+    assert [entry["repeated_fingerprint"] for entry in rejected] == [False, True]
+
+
+@pytest.mark.asyncio
+async def test_escape_hatch_receives_final_rejection_context(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The hatch advisor sees WHY the final candidate failed.
+
+    The over-budget attempt is dropped from the conversation (no dangling
+    assistant tool_calls message), which used to take its rejection feedback
+    with it — the advisor retried blind to the very failure that exhausted the
+    budget. The allowlisted feedback envelope now rides inside the hatch
+    notice: closed codes and candidate-authored names only.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=1,
+        model_overrides={
+            "escape_hatch_model": "openrouter/advisor-under-test",
+            "escape_hatch_provider": "openrouter",
+        },
+    )
+
+    assert deep_thaw(proposal.proposal.pipeline) == _pipeline(tmp_path)
+    hatch_request = completion.requests[2]
+    assert hatch_request["model"] == "openrouter/advisor-under-test"
+    notices = [
+        message for message in hatch_request["messages"] if message["role"] == "user" and "escape hatch" in str(message.get("content"))
+    ]
+    assert len(notices) == 1
+    notice_content = str(notices[0]["content"])
+    assert "source_on_success_dangling" in notice_content
+    assert '"dangling_on_success":"rows"' in notice_content.replace(" ", "")
+    # The dropped attempt still leaves no dangling assistant tool_calls.
+    for message in hatch_request["messages"]:
+        if message["role"] == "assistant" and message.get("tool_calls"):
+            call_ids = {call["id"] for call in message["tool_calls"]}
+            answered = {reply["tool_call_id"] for reply in hatch_request["messages"] if reply["role"] == "tool"}
+            assert call_ids <= answered
 
 
 @pytest.mark.asyncio
@@ -4248,8 +5190,39 @@ async def test_repair_exhaustion_records_last_rejection_codes(
 
     assert excinfo.value.code == "REPAIR_EXHAUSTED"
     assert excinfo.value.detail_codes, "exhaustion must carry the last rejection's codes"
+    # A genuinely-unrepairable candidate still exhausts honestly: the terminal
+    # error names the wall, and no fake success escapes the loop.
+    assert "source_on_success_dangling" in excinfo.value.detail_codes
     # Codes are the closed, leak-safe discriminant — no messages/paths.
     assert all(isinstance(c, str) for c in excinfo.value.detail_codes)
+
+
+@pytest.mark.asyncio
+async def test_opted_in_rejection_diagnostics_never_log_authored_values(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    authored_canary = "AUTHORED_VALUE_MUST_NOT_ENTER_LOGS"
+    invalid = _pipeline(tmp_path)
+    invalid["outputs"][0]["sink_name"] = authored_canary
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": invalid})))
+    monkeypatch.setenv("ELSPETH_PLANNER_REJECTION_DETAIL_LOG", "1")
+
+    with capture_logs() as logs, pytest.raises(PipelinePlannerError):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            repair_budget=0,
+            model_overrides={"escape_hatch_model": None},
+        )
+
+    diagnostic = next(entry for entry in logs if entry["event"] == "composer.planner_rejection_detail")
+    assert authored_canary not in json.dumps(diagnostic)
+    assert all("message" not in entry for entry in diagnostic["entries"])
 
 
 @pytest.mark.asyncio
@@ -4348,3 +5321,231 @@ async def test_planner_summary_on_exhaustion_carries_the_full_code_history(
     # BOTH rounds' codes survive — the blindspot this trail exists to close.
     assert [entry["attempt"] for entry in summary["rejection_history"]] == [1, 2]
     assert all(entry["codes"] for entry in summary["rejection_history"])
+
+
+# ── Stated-threshold fidelity guard (R2-F17, elspeth-5c0c09db31) ────────────
+
+
+def _pipeline_with_constant_gate(data_dir: Path) -> dict[str, Any]:
+    """A VALID fan-out plan: one constant-condition gate forking to two sinks.
+
+    This is the shape acceptance run 2 got when it asked for ``amount > 500``
+    routing — and it is also the shape ``pipeline_composer.md`` teaches for
+    genuine dual outputs. Only the instruction tells the two apart.
+    """
+    pipeline = _pipeline(data_dir)
+    pipeline["nodes"] = [
+        {
+            "id": "split",
+            "node_type": "gate",
+            "input": "rows",
+            "condition": "True",
+            "routes": {"true": "fork", "false": "fork"},
+            "fork_to": ["high_value", "standard"],
+        }
+    ]
+    pipeline["outputs"] = [
+        {
+            "sink_name": name,
+            "plugin": "json",
+            "options": {
+                "path": f"outputs/{name}.jsonl",
+                "schema": {"mode": "observed"},
+                "format": "jsonl",
+                "mode": "write",
+                "collision_policy": "auto_increment",
+            },
+            "on_write_failure": "discard",
+        }
+        for name in ("high_value", "standard")
+    ]
+    return pipeline
+
+
+def _pipeline_with_conditional_gate(data_dir: Path) -> dict[str, Any]:
+    pipeline = _pipeline_with_constant_gate(data_dir)
+    pipeline["nodes"][0]["condition"] = "row['amount'] > 500"
+    pipeline["nodes"][0]["routes"] = {"true": "high_value", "false": "standard"}
+    del pipeline["nodes"][0]["fork_to"]
+    return pipeline
+
+
+class TestStatedThresholdDetector:
+    """False-positive posture: the detector fires only on a real comparison."""
+
+    @pytest.mark.parametrize(
+        ("instruction", "expected"),
+        [
+            ("Route rows with amount > 500 to high_value.", "amount > 500"),
+            ("Send rows where score>=0.85 to the review sink.", "score>=0.85"),
+            ("Anything greater than 500 goes to high_value.", "greater than 500"),
+            ("Rows at least 10 dollars go to paid.", "at least 10"),
+            ("Split on amount below 100.", "below 100"),
+        ],
+    )
+    def test_comparison_language_is_detected(self, instruction: str, expected: str) -> None:
+        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
+
+        assert _stated_threshold_in(instruction) == expected
+
+    @pytest.mark.parametrize(
+        "instruction",
+        [
+            # Comparison wording bound to a number, but about a LIMIT, not a
+            # route. Firing here would tell a model to author a gate condition
+            # for a pipeline that never asked for one — and a compliant model
+            # would turn a correct fan-out into a wrong pipeline. Under a
+            # repair_budget of 1 that is REPAIR_EXHAUSTED with no proposal.
+            "Summarise each row in under 50 words, then fan out to both sinks.",
+            "Truncate descriptions over 40 characters and write both copies.",
+            "Keep at most 100 rows and fan every row out to both sinks.",
+            "Use a temperature below 0.5 for the summariser.",
+            # The same limit prose alongside a REAL routing verb from
+            # _ROUTING_INTENT_PATTERN — the cases the disjoint-vocabulary
+            # negatives above never exercise. Two independent defences must
+            # hold: the unit noun after the number, and the clause boundary
+            # between the limit and the routing verb.
+            "Summarise each row in under 50 words and send the results to the sink.",
+            "Split the rows into two sinks and keep at most 100 rows.",
+            "Split into more than 2 branches.",
+            "Route the summary (limit under 50 words) to both sinks.",
+            # Clause separation alone, with a unit noun that is not listed.
+            "Summarise in under 50 milliseconds. Route every row to both sinks.",
+        ],
+    )
+    def test_limit_prose_is_not_read_as_a_routing_threshold(self, instruction: str) -> None:
+        """Three halves must hold: a comparison, routing intent, same clause, no unit noun."""
+        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
+
+        assert _stated_threshold_in(instruction) is None
+
+    @pytest.mark.parametrize(
+        "instruction",
+        [
+            "Fan out every row to both sinks.",
+            "Wire the source -> summarise -> json sink.",
+            "Add the transform above the gate.",
+            "Summarise each row and write the result.",
+            "",
+        ],
+    )
+    def test_prose_without_a_threshold_is_not_detected(self, instruction: str) -> None:
+        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
+
+        assert _stated_threshold_in(instruction) is None
+
+
+@pytest.mark.asyncio
+async def test_constant_gate_against_a_stated_threshold_gets_one_coded_nudge_then_valve(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """AWS acceptance run 2, R2-F17: the stated threshold never reached the gate.
+
+    Asked to route on ``amount > 500``, the planner authored a constant-condition
+    fan-out that would write every row to BOTH sinks. The shape is legal, so it
+    draws ONE coded repair naming the comparison verbatim; re-emitting the same
+    pipeline is the valve for a genuinely intended fan-out.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Add a gate that routes rows with amount > 500 to high_value and every other row to standard.",
+    )
+
+    assert proposal.proposal.repair_count == 1
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    assert feedback["success"] is False
+    codes = [error["error_code"] for error in feedback["validation"]["errors"]]
+    assert codes == ["gate_condition_ignores_stated_threshold"]
+    error = feedback["validation"]["errors"][0]
+    assert error["explanation"]
+    assert error["suggested_fix"]
+    # The comparison the operator stated, verbatim — without it the planner
+    # cannot author the condition it dropped.
+    assert "amount > 500" in error["detail"]
+
+
+@pytest.mark.asyncio
+async def test_fan_out_instruction_without_a_threshold_is_never_nudged(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The documented fan-out macro must pass untouched — both halves must hold."""
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Fan every row out to both the high_value and standard sinks.",
+    )
+
+    assert proposal.proposal.repair_count == 0
+
+
+@pytest.mark.asyncio
+async def test_authored_condition_satisfies_the_stated_threshold(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A candidate that DID author the condition is accepted first time."""
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_conditional_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Add a gate that routes rows with amount > 500 to high_value and every other row to standard.",
+    )
+
+    assert proposal.proposal.repair_count == 0
+
+
+@pytest.mark.asyncio
+async def test_threshold_guard_reads_the_current_stage_intent_not_the_message_transcript(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Guided-staged provenance: earlier-stage text must not trip a later stage.
+
+    ``sessions/routes/composer/guided.py:3263-3268`` deliberately splits the
+    two: ``planner_intent`` is the CURRENT stage's instruction alone, while the
+    root-plus-instruction concatenation goes to
+    ``PlannerOriginatingMessage.content``. The guard reads ``intent``, so a
+    threshold stated at an earlier stage cannot reject a later stage's legal
+    fan-out. Pinned here because the split lives in a route, one refactor away
+    from being "simplified" into a single concatenated string.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        intent="Fan every row out to both the high_value and standard sinks.",
+        originating_message=PlannerOriginatingMessage(
+            session_id=_TEST_SESSION_ID,
+            message_id="00000000-0000-4000-8000-000000000001",
+            content=(
+                "Route rows with amount > 500 to high_value and everything else to standard.\n\n"
+                "Fan every row out to both the high_value and standard sinks."
+            ),
+            user_id="user-1",
+        ),
+    )
+
+    assert proposal.proposal.repair_count == 0

@@ -49,9 +49,12 @@
   .type-badge-sink,
   .type-badge-aggregation,
   .type-badge-coalesce,
+  .type-badge-row_union,
   .type-badge-queue {
     border-width: 2px;
-    forced-color-adjust: none;
+    border-color: ButtonText;
+    background-color: Canvas;
+    color: ButtonText;
   }
 
   .react-flow__edge-path {

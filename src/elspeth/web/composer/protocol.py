@@ -15,11 +15,13 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, final
 from uuid import UUID
 
 if TYPE_CHECKING:
+    from pydantic import SecretStr
+
     from elspeth.contracts.session_operation import SessionOperationContext
     from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalState
-    from elspeth.web.composer.pipeline_planner import PipelinePlanResult, PlannerOriginatingMessage
+    from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, PipelinePlanResult, PlannerOriginatingMessage
     from elspeth.web.composer.pipeline_proposal import PresentBase
     from elspeth.web.composer.service import AdvisorCheckpointVerdict
     from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -1068,6 +1070,12 @@ class ComposerSettings(Protocol):
     def composer_model(self) -> str: ...
 
     @property
+    def composer_endpoint_base_url(self) -> str | None: ...
+
+    @property
+    def composer_endpoint_api_key(self) -> SecretStr | None: ...
+
+    @property
     def composer_temperature(self) -> float | None: ...
 
     @property
@@ -1105,6 +1113,12 @@ class ComposerSettings(Protocol):
 
     @property
     def composer_advisor_model(self) -> str: ...
+
+    @property
+    def composer_advisor_endpoint_base_url(self) -> str | None: ...
+
+    @property
+    def composer_advisor_endpoint_api_key(self) -> SecretStr | None: ...
 
     @property
     def composer_advisor_max_calls_per_compose(self) -> int: ...
@@ -1207,7 +1221,7 @@ class ComposerService(Protocol):
         operation_fence: GuidedOperationFence,
         session_operation_context: SessionOperationContext,
         progress: ComposerProgressSink | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]]:
+    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Run the shared planner once with split private/provider-safe facts."""
         ...
 
@@ -1224,7 +1238,7 @@ class ComposerService(Protocol):
         operation_fence: GuidedOperationFence,
         session_operation_context: SessionOperationContext,
         progress: ComposerProgressSink | None = None,
-    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]]:
+    ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Plan one ordinary guided-full proposal through the shared planner."""
         ...
 
@@ -1256,6 +1270,7 @@ class ComposerService(Protocol):
         session_id: str | None,
         recorder: BufferingRecorder | None,
         progress: ComposerProgressSink | None = None,
+        user_message: str | None = None,
     ) -> AdvisorCheckpointVerdict:
         """Run the deterministic END advisor sign-off checkpoint (phase='end').
 
@@ -1269,6 +1284,11 @@ class ComposerService(Protocol):
 
         ``recorder`` threads the advisor call's audit sidecar; ``progress``
         (when set) receives a ``calling_model`` event before the call.
+        ``user_message`` (R2-F8a, elspeth-583c2a0792) is the originating user
+        chat turn, forwarded so the advisor can verify the pipeline against
+        the user's own explicit constraints (schema mode, field names/types,
+        named plugins/values); optional, bounded, and rendered inside the
+        existing untrusted fence.
         """
         ...
 

@@ -714,7 +714,7 @@ def _proven_pg_catalog_text_builtin_calls(
 ) -> _TextBuiltinProof:
     if dialect.name != "postgresql":
         return _EMPTY_TEXT_BUILTIN_PROOF
-    bind = getattr(inspector, "bind", None)
+    bind: Engine | Connection | None = inspector.bind
     try:
         if isinstance(bind, Connection):
             proof_rows = _text_builtin_identity_rows_on_connection(bind)
@@ -874,7 +874,8 @@ def _collect_column_issues(
         issues.append(SchemaShapeIssue(f"{table_name} column mismatch", expected_names, actual_names))
 
     pk = inspector.get_pk_constraint(table_name)
-    actual_pk = frozenset(str(name) for name in cast("Sequence[object]", pk.get("constrained_columns") or ()))
+    raw_pk_columns = pk["constrained_columns"]
+    actual_pk = frozenset(str(name) for name in cast("Sequence[object]", raw_pk_columns))
     columns_by_name = {str(column["name"]): column for column in inspected_columns}
     for column in table.columns:
         if column.name not in columns_by_name:
@@ -918,7 +919,7 @@ def _collect_column_issues(
             dialect,
             cast("ExecutableDDLElement", None),
         ).get_column_default_string(column)
-        raw_actual_default = actual.get("default")
+        raw_actual_default = actual["default"]
         actual_default = None if raw_actual_default is None else str(raw_actual_default)
         if _implicit_postgres_sequence_default(column, actual_default, dialect):
             actual_default = None
@@ -1049,17 +1050,59 @@ def _expected_foreign_key_shape(constraint: ForeignKeyConstraint, dialect: Diale
 
 
 def _actual_foreign_key_shape(fk: Mapping[str, Any], dialect: Dialect) -> _ForeignKeyShape:
-    options = cast("Mapping[str, Any]", fk.get("options") or {})
+    if "options" in fk:
+        raw_options = fk["options"]
+    else:
+        raw_options = {}
+    if raw_options is None:
+        raw_options = {}
+    options = cast("Mapping[str, Any]", raw_options)
+    if "constrained_columns" in fk:
+        constrained_columns = fk["constrained_columns"]
+    else:
+        constrained_columns = ()
+    if constrained_columns is None:
+        constrained_columns = ()
+    if "referred_schema" in fk:
+        referred_schema = fk["referred_schema"]
+    else:
+        referred_schema = None
+    if "referred_columns" in fk:
+        referred_columns = fk["referred_columns"]
+    else:
+        referred_columns = ()
+    if referred_columns is None:
+        referred_columns = ()
+    if "onupdate" in options:
+        onupdate = options["onupdate"]
+    else:
+        onupdate = None
+    if "ondelete" in options:
+        ondelete = options["ondelete"]
+    else:
+        ondelete = None
+    if "deferrable" in options:
+        deferrable = bool(options["deferrable"])
+    else:
+        deferrable = False
+    if "initially" in options:
+        initially = options["initially"]
+    else:
+        initially = None
+    if "match" in options:
+        match = options["match"]
+    else:
+        match = None
     return (
-        tuple(str(column) for column in cast("Sequence[object]", fk.get("constrained_columns") or ())),
-        _normalize_referred_schema(_optional_string(fk.get("referred_schema")), dialect),
+        tuple(str(column) for column in cast("Sequence[object]", constrained_columns)),
+        _normalize_referred_schema(_optional_string(referred_schema), dialect),
         str(fk["referred_table"]),
-        tuple(str(column) for column in cast("Sequence[object]", fk.get("referred_columns") or ())),
-        _normalize_fk_action(_optional_string(options.get("onupdate"))),
-        _normalize_fk_action(_optional_string(options.get("ondelete"))),
-        bool(options.get("deferrable", False)),
-        _normalize_initially(_optional_string(options.get("initially"))),
-        _normalize_match(_optional_string(options.get("match"))),
+        tuple(str(column) for column in cast("Sequence[object]", referred_columns)),
+        _normalize_fk_action(_optional_string(onupdate)),
+        _normalize_fk_action(_optional_string(ondelete)),
+        deferrable,
+        _normalize_initially(_optional_string(initially)),
+        _normalize_match(_optional_string(match)),
     )
 
 
@@ -1079,7 +1122,8 @@ def _collect_check_issues(
 
     actual: Counter[tuple[str | None, _Ast]] = Counter()
     for reflected in inspector.get_check_constraints(table.name):
-        name = _optional_string(reflected.get("name"))
+        raw_name = reflected["name"]
+        name = _optional_string(raw_name)
         actual[(name, _expression_ast(str(reflected["sqltext"]), dialect, table))] += 1
 
     expected_names = Counter(name for (name, _sql), count in expected.items() for _ in range(count))
@@ -1125,13 +1169,14 @@ def _collect_unique_constraint_issues(
         for constraint in table.constraints
         if type(constraint) is UniqueConstraint and _ddl_object_applies_to_dialect(constraint, dialect)
     )
-    actual: Counter[_UniqueConstraintShape] = Counter(
-        (
-            frozenset(str(column) for column in cast("Sequence[object]", reflected.get("column_names") or ())),
+    actual: Counter[_UniqueConstraintShape] = Counter()
+    for reflected in inspector.get_unique_constraints(table.name):
+        raw_column_names = reflected["column_names"]
+        shape = (
+            frozenset(str(column) for column in cast("Sequence[object]", raw_column_names)),
             _actual_postgresql_nulls_not_distinct(reflected, dialect),
         )
-        for reflected in inspector.get_unique_constraints(table.name)
-    )
+        actual[shape] += 1
     if expected != actual:
         issues.append(
             SchemaShapeIssue(
@@ -1163,9 +1208,9 @@ def _collect_index_issues(
     actual_unique: dict[str, _IndexShape] = {}
     actual_ordinary: dict[str, _IndexShape] = {}
     for reflected in inspector.get_indexes(table.name):
-        if reflected.get("duplicates_constraint"):
+        if "duplicates_constraint" in reflected and reflected["duplicates_constraint"]:
             continue
-        name = reflected.get("name")
+        name = reflected["name"]
         if name is None:
             # An unnamed reflected index cannot satisfy any declared index;
             # unique ones remain integrity-bearing extras below.
@@ -1302,10 +1347,9 @@ def _expected_index_shape(index: Index, dialect: Dialect) -> _IndexShape:
     columns: list[str] = []
     expressions: list[_Ast] = []
     for expression in index.expressions:
-        name = getattr(expression, "name", None)
-        if name is not None and str(name) in table.c:
-            columns.append(str(name))
-            expressions.append(("column", str(name)))
+        if isinstance(expression, Column) and expression.name in table.c:
+            columns.append(str(expression.name))
+            expressions.append(("column", str(expression.name)))
         else:
             columns.append("<expression>")
             compiled = (
@@ -1321,23 +1365,49 @@ def _expected_index_shape(index: Index, dialect: Dialect) -> _IndexShape:
 
 
 def _actual_index_shape(index: Mapping[str, Any], dialect: Dialect, table: Table) -> _IndexShape:
-    columns = tuple(str(column) if column is not None else "<expression>" for column in index.get("column_names") or ())
-    raw_expressions = cast("Sequence[object]", index.get("expressions") or ())
+    if "column_names" in index:
+        raw_column_names = index["column_names"]
+    else:
+        raw_column_names = ()
+    if raw_column_names is None:
+        raw_column_names = ()
+    column_names = cast("Sequence[object]", raw_column_names)
+    columns = tuple(str(column) if column is not None else "<expression>" for column in column_names)
+    if "expressions" in index:
+        raw_expressions_value = index["expressions"]
+    else:
+        raw_expressions_value = ()
+    if raw_expressions_value is None:
+        raw_expressions_value = ()
+    raw_expressions = cast("Sequence[object]", raw_expressions_value)
     expressions = tuple(
         ("column", str(column))
         if column is not None
         else _expression_ast(str(raw_expressions[position]), dialect, table)
         if position < len(raw_expressions)
         else ("unknown-expression",)
-        for position, column in enumerate(index.get("column_names") or ())
+        for position, column in enumerate(column_names)
     )
-    raw_options = cast("Mapping[str, Any]", index.get("dialect_options") or {})
+    if "dialect_options" in index:
+        raw_options_value = index["dialect_options"]
+    else:
+        raw_options_value = {}
+    if raw_options_value is None:
+        raw_options_value = {}
+    raw_options = cast("Mapping[str, Any]", raw_options_value)
     key = f"{dialect.name}_where"
-    raw_predicate = raw_options.get(key)
+    if key in raw_options:
+        raw_predicate = raw_options[key]
+    else:
+        raw_predicate = None
     predicate = None if raw_predicate is None else _expression_ast(str(raw_predicate), dialect, table)
     nulls_not_distinct = _actual_postgresql_nulls_not_distinct(index, dialect)
     operator_classes = _actual_postgresql_operator_classes(index, dialect)
-    return _IndexShape(bool(index.get("unique", False)), columns, expressions, predicate, nulls_not_distinct, operator_classes)
+    if "unique" in index:
+        unique = bool(index["unique"])
+    else:
+        unique = False
+    return _IndexShape(unique, columns, expressions, predicate, nulls_not_distinct, operator_classes)
 
 
 def _is_ordinary_extra_index(shape: _IndexShape) -> bool:
@@ -1369,20 +1439,32 @@ def _index_expected_predicate(index: Index, dialect: Dialect) -> _Ast | None:
 def _expected_postgresql_nulls_not_distinct(obj: Constraint | Index, dialect: Dialect) -> bool:
     if dialect.name != "postgresql":
         return False
-    return obj.dialect_options["postgresql"].get("nulls_not_distinct") is True
+    options = obj.dialect_options["postgresql"]
+    return "nulls_not_distinct" in options and options["nulls_not_distinct"] is True
 
 
 def _actual_postgresql_nulls_not_distinct(reflected: Mapping[str, Any], dialect: Dialect) -> bool:
     if dialect.name != "postgresql":
         return False
-    options = cast("Mapping[str, Any]", reflected.get("dialect_options") or {})
-    return options.get("postgresql_nulls_not_distinct") is True
+    if "dialect_options" in reflected:
+        raw_options = reflected["dialect_options"]
+    else:
+        raw_options = {}
+    if raw_options is None:
+        raw_options = {}
+    options = cast("Mapping[str, Any]", raw_options)
+    return "postgresql_nulls_not_distinct" in options and options["postgresql_nulls_not_distinct"] is True
 
 
 def _expected_postgresql_operator_classes(index: Index, dialect: Dialect) -> tuple[tuple[str, str], ...]:
     if dialect.name != "postgresql":
         return ()
-    return _normalize_postgresql_operator_classes(index.dialect_options["postgresql"].get("ops"))
+    options = index.dialect_options["postgresql"]
+    if "ops" in options:
+        raw_operator_classes = options["ops"]
+    else:
+        raw_operator_classes = None
+    return _normalize_postgresql_operator_classes(raw_operator_classes)
 
 
 def _actual_postgresql_operator_classes(
@@ -1391,8 +1473,18 @@ def _actual_postgresql_operator_classes(
 ) -> tuple[tuple[str, str], ...]:
     if dialect.name != "postgresql":
         return ()
-    options = cast("Mapping[str, Any]", reflected.get("dialect_options") or {})
-    return _normalize_postgresql_operator_classes(options.get("postgresql_ops"))
+    if "dialect_options" in reflected:
+        raw_options = reflected["dialect_options"]
+    else:
+        raw_options = {}
+    if raw_options is None:
+        raw_options = {}
+    options = cast("Mapping[str, Any]", raw_options)
+    if "postgresql_ops" in options:
+        raw_operator_classes = options["postgresql_ops"]
+    else:
+        raw_operator_classes = None
+    return _normalize_postgresql_operator_classes(raw_operator_classes)
 
 
 def _normalize_postgresql_operator_classes(value: object) -> tuple[tuple[str, str], ...]:
@@ -1404,13 +1496,15 @@ def _normalize_postgresql_operator_classes(value: object) -> tuple[tuple[str, st
 
 
 def _ddl_object_applies_to_dialect(obj: Constraint | Index, dialect: Dialect) -> bool:
-    ddl_if = getattr(obj, "_ddl_if", None)
+    ddl_if = obj._ddl_if
     if ddl_if is None:
         return True
-    target = ddl_if.dialect
+    # SQLAlchemy's runtime contract accepts tuple/list/set despite the narrower
+    # ``str | None`` annotation on DDLIf.dialect.
+    target: object = ddl_if.dialect
     if isinstance(target, str) and target != dialect.name:
         return False
-    if target is not None and not isinstance(target, str) and dialect.name not in target:
+    if isinstance(target, (tuple, list, set)) and dialect.name not in target:
         return False
     if ddl_if.callable_ is None:
         return True
@@ -1424,6 +1518,7 @@ def _ddl_object_applies_to_dialect(obj: Constraint | Index, dialect: Dialect) ->
             state=ddl_if.state,
             dialect=dialect,
             compiler=compiler,
+            checkfirst=False,
         )
     )
 
@@ -1611,7 +1706,11 @@ def _tokenize_sql(sql: str) -> tuple[_SqlToken, ...]:
             tokens.append(_SqlToken("operator", operator))
             index += len(operator)
             continue
-        punctuation_kind = {"(": "lparen", ")": "rparen", "[": "lbracket", "]": "rbracket", ",": "comma", ".": "dot"}.get(character)
+        punctuation_kinds = {"(": "lparen", ")": "rparen", "[": "lbracket", "]": "rbracket", ",": "comma", ".": "dot"}
+        if character in punctuation_kinds:
+            punctuation_kind = punctuation_kinds[character]
+        else:
+            punctuation_kind = None
         if punctuation_kind is not None:
             tokens.append(_SqlToken(punctuation_kind, character))
             index += 1
@@ -1765,7 +1864,7 @@ class _SqlExpressionParser:
                 return "is", 30, 1
         if token.kind != "operator":
             return None
-        precedence = {
+        precedences = {
             "=": 30,
             "<>": 30,
             "!=": 30,
@@ -1785,7 +1884,11 @@ class _SqlExpressionParser:
             "*": 60,
             "/": 60,
             "%": 60,
-        }.get(token.value)
+        }
+        if token.value in precedences:
+            precedence = precedences[token.value]
+        else:
+            precedence = None
         return None if precedence is None else (token.value, precedence, 1)
 
     def _canonical_name(self, parts: tuple[tuple[str, str], ...]) -> _Ast:
@@ -1903,7 +2006,11 @@ def _canonicalize_ast(ast: _Ast, context: _ExpressionContext) -> _Ast:
         )
     if kind == "binary":
         raw_operator = cast("str", ast[1])
-        operator = {"!=": "<>", "~~": "like", "!~~": "not like"}.get(raw_operator, raw_operator)
+        operator_aliases = {"!=": "<>", "~~": "like", "!~~": "not like"}
+        if raw_operator in operator_aliases:
+            operator = operator_aliases[raw_operator]
+        else:
+            operator = raw_operator
         left = _canonicalize_ast(cast("_Ast", ast[2]), context)
         right = _canonicalize_ast(cast("_Ast", ast[3]), context)
         if operator in {"and", "or"}:

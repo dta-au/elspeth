@@ -21,7 +21,9 @@ import ast
 import hashlib
 import json
 from pathlib import Path
-from textwrap import dedent
+from textwrap import dedent, indent
+
+import pytest
 
 from elspeth_lints.core.cli import main
 from elspeth_lints.rules.trust_tier.tier_model.rule import Finding, TierModelVisitor
@@ -57,6 +59,54 @@ def _first_function(source: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
     raise AssertionError("fixture must contain a top-level function")
 
 
+_NESTED_OBSERVATION_HANDLER = """
+@observation_boundary(
+    tier=3,
+    source="x",
+    source_param="data",
+    suppresses=("R1",),
+    invariant="returns None on absence",
+)
+def handler(data):
+    return data.get("x")
+"""
+
+
+def _boundary_after_loop_source(
+    *,
+    loop_kind: str,
+    initial_import: str,
+    body: str,
+    orelse: str | None = None,
+) -> str:
+    header = {
+        "for": "for item in items:",
+        "async for": "async for item in items:",
+        "while": "while enabled:",
+    }[loop_kind]
+    loop = f"{header}\n{indent(dedent(body).strip(), '    ')}"
+    if orelse is not None:
+        loop += f"\nelse:\n{indent(dedent(orelse).strip(), '    ')}"
+    outer_body = f"{initial_import}\n\n{loop}\n\n{dedent(_NESTED_OBSERVATION_HANDLER).strip()}"
+    return f"async def outer(items, enabled, stop):\n{indent(outer_body, '    ')}\n"
+
+
+def _with_suite(with_kind: str, body: str, *, items: str = "suppressing_context()") -> str:
+    return f"{with_kind} {items}:\n{indent(dedent(body).strip(), '    ')}"
+
+
+def _boundary_in_finally_source(transfer: str) -> str:
+    try_body = f"""
+        from foreign import observation_boundary
+        {transfer}
+        from elspeth.contracts.trust_boundary import observation_boundary
+    """
+    try_suite = f"try:\n{indent(dedent(try_body).strip(), '    ')}\nfinally:\n{indent(dedent(_NESTED_OBSERVATION_HANDLER).strip(), '    ')}"
+    if transfer in {"break", "continue"}:
+        return f"async def outer(items):\n    for item in items:\n{indent(try_suite, '        ')}\n"
+    return f"def outer():\n{indent(try_suite, '    ')}\n"
+
+
 # =============================================================================
 # Positive cases: decorator suppresses qualifying findings
 # =============================================================================
@@ -87,6 +137,35 @@ class TestSuppressionPositive:
         # be suppressed.
         assert _findings_by_rule(findings, "R1") == []
         assert _findings_by_rule(findings, "R5") == []
+
+    def test_observation_boundary_alias_suppresses_and_records_nonraising_metadata(self) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary as observes
+
+            @observes(
+                tier=3,
+                source="optional LLM field",
+                source_param="arguments",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(arguments):
+                return arguments.get("value")
+        """)
+
+        visitor = _visitor(source)
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(visitor.suppressed_findings) == 1
+
+        tree = ast.parse(source)
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef))
+        metadata, diagnostics = extract_boundary_metadata(
+            function,
+            import_aliases={"observes": "elspeth.contracts.trust_boundary.observation_boundary"},
+        )
+        assert diagnostics == []
+        assert metadata is not None
+        assert metadata.non_raising is True
 
     def test_suppression_records_non_failing_observation(self) -> None:
         """Suppressed R1/R5 findings remain auditable as observation records."""
@@ -139,6 +218,25 @@ class TestSuppressionPositive:
                 source_param="arguments",
                 suppresses=("R1",),
                 invariant="raises on shape mismatch",
+            )
+            def handler(arguments):
+                return arguments.get("nodes")
+        """)
+
+        findings = _findings(source)
+        assert _findings_by_rule(findings, "R1") == []
+
+    def test_suppresses_with_fully_qualified_observation_boundary_after_sibling_import(self) -> None:
+        source = dedent("""
+            import elspeth.contracts.trust_boundary
+            import elspeth.web
+
+            @elspeth.contracts.trust_boundary.observation_boundary(
+                tier=3,
+                source="optional LLM field",
+                source_param="arguments",
+                suppresses=("R1",),
+                invariant="returns None on absence",
             )
             def handler(arguments):
                 return arguments.get("nodes")
@@ -951,6 +1049,1135 @@ class TestDecoratorStackOrdering:
 
         assert len(_findings_by_rule(visitor.findings, "R1")) == 1
         assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_elspeth_prefixed_root_alias_does_not_masquerade_as_observation_boundary(self) -> None:
+        """An exact-looking chain remains foreign when its root alias resolves elsewhere."""
+        source = dedent("""
+            import elspeth.fake as elspeth
+
+            @elspeth.contracts.trust_boundary.observation_boundary(
+                tier=3,
+                source="x",
+                source_param="arguments",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(arguments):
+                return arguments.get("k")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_nested_legitimate_import_cannot_legitimize_forged_module_alias(self) -> None:
+        source = dedent("""
+            import elspeth.fake as elspeth
+
+            def unrelated():
+                import elspeth.contracts.trust_boundary
+
+            @elspeth.contracts.trust_boundary.observation_boundary(
+                tier=3,
+                source="x",
+                source_param="arguments",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(arguments):
+                return arguments.get("k")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_nested_foreign_import_cannot_poison_legitimate_module_alias(self) -> None:
+        source = dedent("""
+            import elspeth.contracts.trust_boundary
+
+            def unrelated():
+                import elspeth.fake as elspeth
+
+            @elspeth.contracts.trust_boundary.observation_boundary(
+                tier=3,
+                source="optional field",
+                source_param="arguments",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(arguments):
+                return arguments.get("k")
+        """)
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    def test_class_local_legitimate_import_cannot_legitimize_forged_module_alias(self) -> None:
+        source = dedent("""
+            import elspeth.fake as elspeth
+
+            class Unrelated:
+                import elspeth.contracts.trust_boundary
+
+            @elspeth.contracts.trust_boundary.observation_boundary(
+                tier=3,
+                source="x",
+                source_param="arguments",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(arguments):
+                return arguments.get("k")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_class_local_foreign_import_cannot_poison_legitimate_module_alias(self) -> None:
+        source = dedent("""
+            import elspeth.contracts.trust_boundary
+
+            class Unrelated:
+                import elspeth.fake as elspeth
+
+            @elspeth.contracts.trust_boundary.observation_boundary(
+                tier=3,
+                source="optional field",
+                source_param="arguments",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(arguments):
+                return arguments.get("k")
+        """)
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    def test_parameter_binding_shadows_imported_trust_boundary_for_whole_function(self) -> None:
+        source = dedent("""
+            from elspeth.contracts import trust_boundary
+
+            def outer(trust_boundary):
+                @trust_boundary(
+                    tier=3,
+                    source="x",
+                    source_param="data",
+                    suppresses=("R1",),
+                    invariant="x",
+                )
+                def nested(data):
+                    return data.get("x")
+                return nested
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_module_assignment_shadows_imported_observation_boundary(self) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary
+
+            observation_boundary = object()
+
+            @observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_method_parameter_shadows_module_observation_boundary(self) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary
+
+            class Handler:
+                def outer(self, observation_boundary):
+                    @observation_boundary(
+                        tier=3,
+                        source="x",
+                        source_param="data",
+                        suppresses=("R1",),
+                        invariant="returns None on absence",
+                    )
+                    def nested(data):
+                        return data.get("x")
+                    return nested
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize(
+        "binding",
+        [
+            "observation_boundary = object()",
+            "observation_boundary: object",
+            "(observation_boundary := object())",
+            "for observation_boundary in ():\n    pass",
+            "with context() as observation_boundary:\n    pass",
+            "try:\n    pass\nexcept ValueError as observation_boundary:\n    pass",
+            "import foreign as observation_boundary",
+            "from foreign import decorator as observation_boundary",
+            "def observation_boundary():\n    pass",
+            "class observation_boundary:\n    pass",
+        ],
+    )
+    def test_function_local_bindings_shadow_inherited_boundary_for_whole_scope(self, binding: str) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary
+
+            def outer():
+                @observation_boundary(
+                    tier=3,
+                    source="x",
+                    source_param="data",
+                    suppresses=("R1",),
+                    invariant="returns None on absence",
+                )
+                def nested(data):
+                    return data.get("x")
+        """)
+        source += "\n".join(f"    {line}" for line in binding.splitlines())
+        source += "\n    return nested\n"
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize(
+        "binding",
+        [
+            "observation_boundary = object()",
+            "observation_boundary: object = object()",
+            "(observation_boundary := object())",
+            "for observation_boundary in ():\n    pass",
+            "with context() as observation_boundary:\n    pass",
+            "try:\n    pass\nexcept ValueError as observation_boundary:\n    pass",
+            "import foreign as observation_boundary",
+            "from foreign import decorator as observation_boundary",
+            "def observation_boundary():\n    pass",
+            "class observation_boundary:\n    pass",
+        ],
+    )
+    def test_module_bindings_replace_imported_boundary_meaning(self, binding: str) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary
+        """)
+        source += f"\n{binding}\n"
+        source += dedent("""
+            @observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_later_local_import_restores_boundary_meaning_without_leaking_outward(self) -> None:
+        source = dedent("""
+            from foreign import observation_boundary
+
+            def outer():
+                observation_boundary = object()
+                from elspeth.contracts.trust_boundary import observation_boundary
+
+                @observation_boundary(
+                    tier=3,
+                    source="x",
+                    source_param="data",
+                    suppresses=("R1",),
+                    invariant="returns None on absence",
+                )
+                def nested(data):
+                    return data.get("x")
+                return nested
+        """)
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    def test_function_match_capture_shadows_boundary_for_whole_scope(self) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary
+
+            def outer(subject):
+                @observation_boundary(
+                    tier=3,
+                    source="x",
+                    source_param="data",
+                    suppresses=("R1",),
+                    invariant="returns None on absence",
+                )
+                def nested(data):
+                    return data.get("x")
+
+                match subject:
+                    case {"items": [Point(value=observation_boundary), *tail], **rest}:
+                        pass
+                return nested
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_module_match_or_capture_replaces_imported_boundary_meaning(self) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary
+
+            match subject:
+                case ("tag", observation_boundary) | ["tag", observation_boundary]:
+                    pass
+
+            @observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_class_match_as_capture_replaces_class_local_boundary_meaning(self) -> None:
+        source = dedent("""
+            class Handler:
+                from elspeth.contracts.trust_boundary import observation_boundary
+
+                match subject:
+                    case observation_boundary as captured:
+                        pass
+
+                @observation_boundary(
+                    tier=3,
+                    source="x",
+                    source_param="data",
+                    suppresses=("R1",),
+                    invariant="returns None on absence",
+                )
+                def handler(data):
+                    return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_function_type_alias_shadows_boundary_for_whole_scope(self) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary
+
+            def outer():
+                @observation_boundary(
+                    tier=3,
+                    source="x",
+                    source_param="data",
+                    suppresses=("R1",),
+                    invariant="returns None on absence",
+                )
+                def nested(data):
+                    return data.get("x")
+
+                type observation_boundary = object
+                return nested
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_module_type_alias_replaces_imported_boundary_meaning(self) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary
+
+            type observation_boundary = object
+
+            @observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_class_type_alias_replaces_class_local_boundary_meaning(self) -> None:
+        source = dedent("""
+            class Handler:
+                from elspeth.contracts.trust_boundary import observation_boundary
+
+                type observation_boundary = object
+
+                @observation_boundary(
+                    tier=3,
+                    source="x",
+                    source_param="data",
+                    suppresses=("R1",),
+                    invariant="returns None on absence",
+                )
+                def handler(data):
+                    return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_module_star_import_invalidates_all_trusted_aliases(self) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary
+            from foreign import *
+
+            @observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_match_case_real_import_does_not_legitimize_foreign_alias_in_sibling_case(self) -> None:
+        source = dedent("""
+            from foreign import observation_boundary
+
+            match subject:
+                case 1:
+                    from elspeth.contracts.trust_boundary import observation_boundary
+                case 2:
+                    @observation_boundary(
+                        tier=3,
+                        source="x",
+                        source_param="data",
+                        suppresses=("R1",),
+                        invariant="returns None on absence",
+                    )
+                    def sibling(data):
+                        return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_match_case_foreign_import_does_not_poison_real_alias_in_sibling_case(self) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary
+
+            match subject:
+                case 1:
+                    from foreign import observation_boundary
+                case 2:
+                    @observation_boundary(
+                        tier=3,
+                        source="x",
+                        source_param="data",
+                        suppresses=("R1",),
+                        invariant="returns None on absence",
+                    )
+                    def sibling(data):
+                        return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    def test_match_case_rebinding_invalidates_alias_after_match(self) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary
+
+            match subject:
+                case 1:
+                    from foreign import observation_boundary
+                case _:
+                    pass
+
+            @observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_match_without_alias_changes_retains_legitimate_alias_after_match(self) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import observation_boundary
+
+            match subject:
+                case 1:
+                    def helper():
+                        from foreign import observation_boundary
+
+                        return observation_boundary
+                case _:
+                    value = "other"
+
+            @observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    def test_assignment_cannot_forge_fully_qualified_elspeth_marker(self) -> None:
+        source = dedent("""
+            elspeth = foreign
+
+            @elspeth.contracts.trust_boundary.observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_parameter_cannot_forge_fully_qualified_elspeth_marker(self) -> None:
+        source = dedent("""
+            import elspeth.contracts.trust_boundary
+
+            def outer(elspeth):
+                @elspeth.contracts.trust_boundary.observation_boundary(
+                    tier=3,
+                    source="x",
+                    source_param="data",
+                    suppresses=("R1",),
+                    invariant="returns None on absence",
+                )
+                def nested(data):
+                    return data.get("x")
+                return nested
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_relative_import_cannot_prove_canonical_boundary_marker(self) -> None:
+        source = dedent("""
+            from .elspeth.contracts.trust_boundary import observation_boundary
+
+            @observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_optional_if_import_does_not_grant_post_branch_trust(self) -> None:
+        source = dedent("""
+            if enabled:
+                from elspeth.contracts.trust_boundary import observation_boundary
+
+            @observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_optional_loop_import_does_not_grant_post_loop_trust(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from foreign import observation_boundary",
+            body="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_optional_loop_foreign_rebinding_invalidates_post_loop_trust(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from elspeth.contracts.trust_boundary import observation_boundary",
+            body="from foreign import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_loop_else_can_prove_canonical_marker_on_every_normal_exit(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from foreign import observation_boundary",
+            body="from elspeth.contracts.trust_boundary import observation_boundary",
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_loop_else_does_not_hide_foreign_break_path(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from foreign import observation_boundary",
+            body="""
+                if stop:
+                    break
+                from elspeth.contracts.trust_boundary import observation_boundary
+            """,
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_loop_else_and_break_can_agree_on_canonical_marker(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from foreign import observation_boundary",
+            body="""
+                from elspeth.contracts.trust_boundary import observation_boundary
+                if stop:
+                    break
+            """,
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_loop_continue_path_cannot_hide_foreign_rebinding(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from elspeth.contracts.trust_boundary import observation_boundary",
+            body="""
+                from foreign import observation_boundary
+                if stop:
+                    continue
+                from elspeth.contracts.trust_boundary import observation_boundary
+            """,
+        )
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_loop_finally_rebinding_applies_to_break_path(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from foreign import observation_boundary",
+            body="""
+                try:
+                    from elspeth.contracts.trust_boundary import observation_boundary
+                    break
+                finally:
+                    from foreign import observation_boundary
+            """,
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_loop_canonical_finally_applies_to_break_path(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from foreign import observation_boundary",
+            body="""
+                try:
+                    from foreign import observation_boundary
+                    break
+                finally:
+                    from elspeth.contracts.trust_boundary import observation_boundary
+            """,
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_loop_finally_rebinding_applies_to_continue_path(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from foreign import observation_boundary",
+            body="""
+                try:
+                    from elspeth.contracts.trust_boundary import observation_boundary
+                    continue
+                finally:
+                    from foreign import observation_boundary
+            """,
+        )
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_loop_canonical_finally_applies_to_continue_path(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from elspeth.contracts.trust_boundary import observation_boundary",
+            body="""
+                try:
+                    from foreign import observation_boundary
+                    continue
+                finally:
+                    from elspeth.contracts.trust_boundary import observation_boundary
+            """,
+        )
+
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    @pytest.mark.parametrize(
+        ("outer_finally_import", "suppressed"),
+        [
+            ("from foreign import observation_boundary", False),
+            ("from elspeth.contracts.trust_boundary import observation_boundary", True),
+        ],
+    )
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_nested_loop_finally_blocks_apply_in_execution_order(
+        self,
+        loop_kind: str,
+        outer_finally_import: str,
+        *,
+        suppressed: bool,
+    ) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from foreign import observation_boundary",
+            body=f"""
+                try:
+                    try:
+                        from foreign import observation_boundary
+                        break
+                    finally:
+                        from elspeth.contracts.trust_boundary import observation_boundary
+                finally:
+                    {outer_finally_import}
+            """,
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert (_findings_by_rule(visitor.findings, "R1") == []) is suppressed
+        assert (len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1) is suppressed
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_finally_break_replaces_pending_continue_path(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from elspeth.contracts.trust_boundary import observation_boundary",
+            body="""
+                try:
+                    from foreign import observation_boundary
+                    continue
+                    from elspeth.contracts.trust_boundary import observation_boundary
+                finally:
+                    break
+            """,
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_finally_continue_replaces_pending_break_path(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from elspeth.contracts.trust_boundary import observation_boundary",
+            body="""
+                try:
+                    from foreign import observation_boundary
+                    break
+                    from elspeth.contracts.trust_boundary import observation_boundary
+                finally:
+                    continue
+            """,
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    @pytest.mark.parametrize("pending_exit", ["return None", "raise RuntimeError"])
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_finally_break_replaces_non_loop_abrupt_path(self, loop_kind: str, pending_exit: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from elspeth.contracts.trust_boundary import observation_boundary",
+            body=f"""
+                try:
+                    from foreign import observation_boundary
+                    {pending_exit}
+                    from elspeth.contracts.trust_boundary import observation_boundary
+                finally:
+                    break
+            """,
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize("final_exit", ["return None", "raise RuntimeError"])
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_finally_non_loop_abrupt_path_replaces_pending_break(self, loop_kind: str, final_exit: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from elspeth.contracts.trust_boundary import observation_boundary",
+            body=f"""
+                try:
+                    from foreign import observation_boundary
+                    break
+                    from elspeth.contracts.trust_boundary import observation_boundary
+                finally:
+                    {final_exit}
+            """,
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_nested_finally_replaces_transfer_kind_inner_to_outer(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from elspeth.contracts.trust_boundary import observation_boundary",
+            body="""
+                try:
+                    try:
+                        from foreign import observation_boundary
+                        continue
+                        from elspeth.contracts.trust_boundary import observation_boundary
+                    finally:
+                        break
+                finally:
+                    continue
+            """,
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    def test_finally_alias_analysis_is_non_emitting_for_lint_expression(self) -> None:
+        source = dedent("""
+            async def outer(payload, items):
+                for item in items:
+                    try:
+                        break
+                    finally:
+                        payload.get("x")
+        """)
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_finally_break_preserves_conservative_implicit_exception_path(self, loop_kind: str) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from elspeth.contracts.trust_boundary import observation_boundary",
+            body="""
+                try:
+                    from foreign import observation_boundary
+                    might_raise()
+                    from elspeth.contracts.trust_boundary import observation_boundary
+                finally:
+                    break
+            """,
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize("with_kind", ["with", "async with"])
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_with_suppressed_explicit_exception_reaches_break_with_exception_aliases(
+        self,
+        loop_kind: str,
+        with_kind: str,
+    ) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from foreign import observation_boundary",
+            body=_with_suite(
+                with_kind,
+                """
+                    raise RuntimeError
+                    from elspeth.contracts.trust_boundary import observation_boundary
+                """,
+            )
+            + "\nbreak",
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize("with_kind", ["with", "async with"])
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_with_suppressed_implicit_exception_reaches_break_with_exception_aliases(
+        self,
+        loop_kind: str,
+        with_kind: str,
+    ) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from foreign import observation_boundary",
+            body=_with_suite(
+                with_kind,
+                """
+                    might_raise()
+                    from elspeth.contracts.trust_boundary import observation_boundary
+                """,
+            )
+            + "\nbreak",
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    @pytest.mark.parametrize("with_kind", ["with", "async with"])
+    @pytest.mark.parametrize("loop_kind", ["for", "async for", "while"])
+    def test_with_canonical_exception_path_ignores_unreachable_foreign_rebinding(
+        self,
+        loop_kind: str,
+        with_kind: str,
+    ) -> None:
+        source = _boundary_after_loop_source(
+            loop_kind=loop_kind,
+            initial_import="from elspeth.contracts.trust_boundary import observation_boundary",
+            body=_with_suite(
+                with_kind,
+                """
+                    raise RuntimeError
+                    from foreign import observation_boundary
+                """,
+            )
+            + "\nbreak",
+            orelse="from elspeth.contracts.trust_boundary import observation_boundary",
+        )
+
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
+
+    @pytest.mark.parametrize("transfer", ["break", "continue", "return None", "raise RuntimeError"])
+    def test_finally_decorator_uses_reachable_pre_finally_aliases(self, transfer: str) -> None:
+        visitor = _visitor(_boundary_in_finally_source(transfer))
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_finally_decorator_uses_implicit_exception_aliases_before_unreachable_repair(self) -> None:
+        source = f"""
+            def outer(exported):
+                try:
+                    from foreign import observation_boundary
+                    might_raise()
+                    from elspeth.contracts.trust_boundary import observation_boundary
+                finally:
+{indent(dedent(_NESTED_OBSERVATION_HANDLER).strip(), "                    ")}
+                    exported.append(handler)
+                    return handler
+        """
+
+        visitor = _visitor(dedent(source))
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_if_foreign_then_legitimate_else_does_not_grant_post_branch_trust(self) -> None:
+        source = dedent("""
+            if enabled:
+                from foreign import observation_boundary
+            else:
+                from elspeth.contracts.trust_boundary import observation_boundary
+
+            @observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_try_foreign_then_legitimate_handler_does_not_grant_post_try_trust(self) -> None:
+        source = dedent("""
+            try:
+                from foreign import observation_boundary
+            except ImportError:
+                from elspeth.contracts.trust_boundary import observation_boundary
+
+            @observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert len(_findings_by_rule(visitor.findings, "R1")) == 1
+        assert _findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED") == []
+
+    def test_identical_canonical_imports_on_both_if_paths_retain_trust(self) -> None:
+        source = dedent("""
+            if enabled:
+                from elspeth.contracts.trust_boundary import observation_boundary
+            else:
+                from elspeth.contracts.trust_boundary import observation_boundary
+
+            @observation_boundary(
+                tier=3,
+                source="x",
+                source_param="data",
+                suppresses=("R1",),
+                invariant="returns None on absence",
+            )
+            def handler(data):
+                return data.get("x")
+        """)
+        visitor = _visitor(source)
+
+        assert _findings_by_rule(visitor.findings, "R1") == []
+        assert len(_findings_by_rule(visitor.suppressed_findings, "R_TB_SUPPRESSED")) == 1
 
     def test_non_elspeth_bare_import_named_trust_boundary_does_not_suppress(self) -> None:
         """``from foo import trust_boundary`` must not masquerade as Elspeth's decorator."""

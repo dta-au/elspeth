@@ -15,7 +15,7 @@ import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import ClassVar, Literal, Protocol, get_args, runtime_checkable
+from typing import ClassVar, Literal, Protocol, get_args
 from uuid import UUID, uuid5
 
 from elspeth.contracts.enums import CreationModality
@@ -585,7 +585,6 @@ class BlobForkCleanupResult:
         freeze_fields(self, "deleted_ids", "errors")
 
 
-@runtime_checkable
 class BlobServiceProtocol(Protocol):
     """Protocol for blob persistence and lifecycle operations."""
 
@@ -701,6 +700,31 @@ class BlobServiceProtocol(Protocol):
         session_operation_context: SessionOperationContext,
     ) -> tuple[bytes, bool]:
         """Read a bounded prefix of a ready blob under exact authority."""
+        ...
+
+    async def read_blob_content_prefix_verified(
+        self,
+        blob_id: UUID,
+        *,
+        prefix_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, str, int]:
+        """Stream a ready blob, verifying its full content hash incrementally.
+
+        Mirrors :meth:`read_blob_content`'s lifecycle and integrity guards
+        (only ready blobs readable; a missing backing file raises
+        ``BlobContentMissingError``; a hash mismatch raises
+        ``BlobIntegrityError``; a NULL stored hash raises
+        ``AuditIntegrityError``) but never materializes the full blob in
+        memory: content is read and hashed in bounded chunks, retaining
+        only the first ``prefix_bytes`` bytes. Memory use is O(chunk size +
+        ``prefix_bytes``) regardless of blob size.
+
+        Returns ``(prefix, verified_content_hash, total_size_bytes)`` where
+        ``prefix`` is at most ``prefix_bytes`` long and ``verified_content_hash``
+        is the sha256 hex digest already confirmed to match the blob's stored
+        ``content_hash``.
+        """
         ...
 
     async def link_blob_to_run(

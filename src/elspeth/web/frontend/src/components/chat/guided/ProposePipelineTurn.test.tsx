@@ -136,12 +136,18 @@ function payload(): ProposePipelinePayload {
         plugin: null,
         behavior: {
           kind: "gate",
+          condition: "row['amount'] > 500",
           route_aliases: ["route-1", "route-2"],
+          routes: [
+            { alias: "route-1", key: "true" },
+            { alias: "route-2", key: "false" },
+          ],
           fork_branches: [
             { routes: ["route-1"], branch: "branch-1" },
             { routes: ["route-1"], branch: "branch-2" },
           ],
         },
+        node_options_summary: [],
       },
       {
         stable_id: IDS.queue,
@@ -149,6 +155,7 @@ function payload(): ProposePipelinePayload {
         node_type: "queue",
         plugin: null,
         behavior: { kind: "queue" },
+        node_options_summary: [],
       },
       {
         stable_id: IDS.aggregation,
@@ -163,6 +170,7 @@ function payload(): ProposePipelinePayload {
           output_mode: "passthrough",
           expected_output_count: "2",
         },
+        node_options_summary: [],
       },
       {
         stable_id: IDS.coalesce,
@@ -174,7 +182,9 @@ function payload(): ProposePipelinePayload {
           branch_aliases: ["branch-1", "branch-2"],
           policy: "quorum",
           merge: "nested",
+          timeout_seconds: 12.5,
         },
+        node_options_summary: [],
       },
     ],
     outputs: [
@@ -220,14 +230,168 @@ describe("ProposePipelineTurn", () => {
     expect(container.querySelector(`[data-edge-id="${edgeId(6)}"]`)).not.toBeNull();
     expect(container.querySelector('[data-node-kind="discard"]')).not.toBeNull();
     expect(screen.getByText("2 sources · 4 nodes · 13 routes · 2 outputs")).toBeVisible();
-    expect(screen.getByText(/routes route-1, route-2/i)).toBeVisible();
+    // F11: the gate summary carries the authored predicate verbatim plus each
+    // author-visible route key resolved to its destination — with the ordinal
+    // aliases still visible (they are the revise-target / integrity tokens).
+    expect(
+      screen.getByText(
+        /When row\['amount'\] > 500 — true → node-3 \+ node-4 \(route-1\), false → output-2 \(route-2\)\. 2 fork branches\./,
+      ),
+    ).toBeVisible();
     expect(screen.getByText(/queue continues in sequence/i)).toBeVisible();
     expect(screen.getByText(/count 50 or timeout 10s/i)).toBeVisible();
-    expect(screen.getByText(/joins branch-1, branch-2/i)).toBeVisible();
-    expect(screen.getAllByText(/route-1 forks to branch-1/i).length).toBeGreaterThan(0);
+    expect(
+      screen.getByText(
+        /joins branch-1, branch-2 using quorum \/ nested; timeout 12.5s/i,
+      ),
+    ).toBeVisible();
+    // F11: edge labels resolve route ordinals to "when <key>" while keeping
+    // the ordinal alias visible.
+    expect(screen.getAllByText(/when true \(route-1\) forks to branch-1/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/when false \(route-2\)/i).length).toBeGreaterThan(0);
     expect(screen.getAllByText(/on error → discard/i).length).toBeGreaterThan(0);
     expect(screen.getByText("source-2 · json")).toBeVisible();
     expect(screen.getByText("output-2 · csv")).toBeVisible();
+  });
+
+  it("renders the key transform options beside the behavior discriminant", () => {
+    // R2-F3: every transform read as "Transforms each incoming item.", so a
+    // field_mapper's renames and its drop-the-rest projection were invisible
+    // on the card the operator accepts.
+    const base = payload();
+    const mapperPayload: ProposePipelinePayload = {
+      ...base,
+      component_counts: { sources: 0, nodes: 1, edges: 0, outputs: 0 },
+      graph: { sources: [], edges: [] },
+      nodes: [
+        {
+          stable_id: IDS.aggregation,
+          label: "node-1",
+          node_type: "transform",
+          plugin: { kind: "transform", id: "field_mapper" },
+          behavior: { kind: "transform" },
+          node_options_summary: [
+            { key: "mapping", value: "given_name → first_name, meta.source → origin" },
+            { key: "select_only", value: "only the mapped fields are kept" },
+          ],
+        },
+      ],
+      outputs: [],
+      edit_targets: [],
+    };
+
+    render(
+      <ProposePipelineTurn
+        payload={mapperPayload}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText(/Transforms each incoming item\./)).toBeVisible();
+    expect(
+      screen.getByText("Mapping: given_name → first_name, meta.source → origin"),
+    ).toBeVisible();
+    expect(screen.getByText("Select only: only the mapped fields are kept")).toBeVisible();
+  });
+
+  it("renders row_union as a distinct N-to-N barrier with its own success flow and honest copy", () => {
+    const rowUnionPayload = payload();
+    rowUnionPayload.nodes[3] = {
+      ...rowUnionPayload.nodes[3],
+      node_type: "row_union",
+      behavior: {
+        kind: "row_union",
+        branch_aliases: ["branch-1", "branch-2"],
+        policy: "require_all",
+        timeout_seconds: 12.5,
+      },
+      node_options_summary: [],
+    };
+    rowUnionPayload.graph.edges[10] = {
+      ...rowUnionPayload.graph.edges[10],
+      flow: { kind: "row_union_success", branch: null },
+    };
+
+    const { container } = render(
+      <ProposePipelineTurn
+        payload={rowUnionPayload}
+        reviewState={activeReview()}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    expect(
+      container.querySelector('[data-node-kind="row_union"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector(
+        ".guided-readonly-graph__node--row_union",
+      ),
+    ).not.toBeNull();
+    expect(
+      screen.getByText(
+        /waits for branch-1, branch-2, then forwards every row without merging records; timeout 12.5s/i,
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getAllByText(/after row union → output-1/i).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("distinguishes parallel row-union revision controls by gate-fork flow", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    const rowUnionPayload = payload();
+    rowUnionPayload.nodes[3] = {
+      ...rowUnionPayload.nodes[3],
+      node_type: "row_union",
+      behavior: {
+        kind: "row_union",
+        branch_aliases: ["branch-1", "branch-2"],
+        policy: "require_all",
+        timeout_seconds: null,
+      },
+      node_options_summary: [],
+    };
+    rowUnionPayload.graph.edges[5] = {
+      ...rowUnionPayload.graph.edges[5],
+      to_endpoint: { kind: "node", stable_id: IDS.coalesce },
+    };
+    rowUnionPayload.graph.edges[6] = {
+      ...rowUnionPayload.graph.edges[6],
+      to_endpoint: { kind: "node", stable_id: IDS.coalesce },
+    };
+    rowUnionPayload.edit_targets = [
+      { kind: "edge", stable_id: edgeId(6) },
+      { kind: "edge", stable_id: edgeId(7) },
+    ];
+
+    render(
+      <ProposePipelineTurn
+        payload={rowUnionPayload}
+        reviewState={activeReview()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    const control = screen.getByRole("button", {
+      name: "Revise route from node-1 to node-4: when true (route-1) forks to branch-1",
+    });
+    const treatment = screen.getByRole("button", {
+      name: "Revise route from node-1 to node-4: when true (route-1) forks to branch-2",
+    });
+    expect(control).toHaveTextContent(
+      "Revise route from node-1 to node-4: when true (route-1) forks to branch-1",
+    );
+    expect(treatment).toHaveTextContent(
+      "Revise route from node-1 to node-4: when true (route-1) forks to branch-2",
+    );
+
+    await user.click(treatment);
+    expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      edit_target: { kind: "edge", stable_id: edgeId(7) },
+    }));
   });
 
   it("uses fixed local copy for server template ids and never renders template ids as rationale", () => {

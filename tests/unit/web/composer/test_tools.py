@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -66,7 +67,10 @@ from elspeth.web.plugin_policy.models import (
     PluginUnavailableReason,
 )
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
+from elspeth.web.provider_config_policy import (
+    AWS_S3_ENDPOINT_URL_POLICY_ERROR,
+    AWS_S3_SOURCE_POLICY_ERROR,
+)
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -133,6 +137,11 @@ def _empty_state() -> CompositionState:
 
 
 _AWS_S3_ENDPOINT_SENTINEL = "https://composer-canary.attacker.invalid/private"
+_VALID_AWS_S3_OPTIONS: Mapping[str, Any] = {
+    "bucket": "test-bucket",
+    "key": "test-key",
+    "schema": {"mode": "observed"},
+}
 
 
 def _aws_s3_source_state() -> CompositionState:
@@ -290,8 +299,12 @@ def execute_tool(
     owned_context = None
     if kwargs.get("data_dir") is not None and "session_id" not in kwargs:
         kwargs["session_id"] = "test-session"
+    source_arguments = arguments.get("source")
+    requires_session_operation_authority = tool_name in {"create_blob", "update_blob", "delete_blob"} or (
+        tool_name == "set_pipeline" and type(source_arguments) is dict and "inline_blob" in source_arguments
+    )
     if (
-        tool_name in {"create_blob", "update_blob", "delete_blob"}
+        requires_session_operation_authority
         and kwargs.get("session_engine") is not None
         and kwargs.get("session_id") is not None
         and kwargs.get("session_operation_authority") is None
@@ -380,6 +393,44 @@ def _trained_tool_context(catalog: CatalogService | None = None, **kwargs: Any) 
         plugin_snapshot=snapshot,
         **kwargs,
     )
+
+
+def _web_authored_tool_context(catalog: CatalogService | None = None, **kwargs: Any) -> Any:
+    """Non-trained (web-authored) ToolContext, for handlers invoked directly
+    (bypassing the ``execute_tool`` test shim's trained-operator default)."""
+    full_catalog = catalog or _mock_catalog()
+    view, snapshot = _web_authored_policy_pair(full_catalog)
+    return ToolContext(
+        catalog=view,
+        plugin_snapshot=snapshot,
+        **kwargs,
+    )
+
+
+def _web_authored_policy_pair(
+    catalog: CatalogService,
+) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """Non-trained (web-authored) snapshot with full catalog availability.
+
+    Unlike ``_restricted_policy_pair`` (which additionally hides one
+    plugin), this mirrors the plugin_snapshot shape a real web/LLM
+    composer session carries: ``PluginSnapshotAuthority.RESTRICTED`` so
+    ``is_trained_operator`` is False, but nothing removed from
+    ``available`` — isolating the web-authored-policy gate under test
+    from the separate plugin-visibility gate.
+    """
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="web-authored-test-policy",
+        principal_scope="local:test-user",
+        available=unrestricted.available,
+        unavailable=(),
+        selected=unrestricted.selected,
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="web-authored-test-generation",
+    )
+    return PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry)), snapshot
 
 
 def _restricted_policy_pair(
@@ -1175,6 +1226,246 @@ class TestAwsS3EndpointUrlComposerPolicy:
         )
 
         _assert_aws_s3_endpoint_url_rejected(result, state, forbidden_value=secret_name)
+
+
+class TestAwsS3SourceComposerPolicy:
+    """Mutation-time enforcement must not diverge from authoritative validation.
+
+    ``execution/validation.py`` unconditionally rejects any web-authored
+    (non-trained-operator) ``aws_s3`` source — independent of
+    ``endpoint_url`` — because S3 reads there would use the server AWS
+    credential chain with author-chosen bucket/key. ``set_source``
+    previously only enforced the narrower endpoint_url policy, so a
+    non-trained session could store an aws_s3 source with no
+    endpoint_url override that would then unconditionally fail every
+    subsequent dry-run/proposal validation — a state that can never be
+    made valid without deleting the source.
+    """
+
+    def test_set_source_rejects_aws_s3_for_web_authored_session_without_mutating_state(self) -> None:
+        state = _empty_state()
+        catalog = _mock_catalog()
+        view, snapshot = _web_authored_policy_pair(catalog)
+
+        result = execute_tool(
+            "set_source",
+            {
+                "plugin": "aws_s3",
+                "on_success": "main",
+                "options": _VALID_AWS_S3_OPTIONS,
+                "on_validation_failure": "discard",
+            },
+            state,
+            view,
+            plugin_snapshot=snapshot,
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.data is not None
+        assert result.data["error"] == AWS_S3_SOURCE_POLICY_ERROR
+        assert result.data["error_code"] == "aws_s3_source_not_allowed"
+
+    def test_set_source_allows_aws_s3_for_trained_operator_session(self) -> None:
+        """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
+        state = _empty_state()
+
+        result = execute_tool(
+            "set_source",
+            {
+                "plugin": "aws_s3",
+                "on_success": "main",
+                "options": _VALID_AWS_S3_OPTIONS,
+                "on_validation_failure": "discard",
+            },
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is True
+        assert result.updated_state.sources["source"].plugin == "aws_s3"
+
+    def test_set_pipeline_rejects_aws_s3_named_source_for_web_authored_session_without_mutating_state(self) -> None:
+        state = _empty_state()
+        catalog = _mock_catalog()
+        view, snapshot = _web_authored_policy_pair(catalog)
+        args = _valid_pipeline_args()
+        args.pop("source")
+        args["sources"] = {
+            "archive": {
+                "plugin": "aws_s3",
+                "on_success": "main",
+                "options": _VALID_AWS_S3_OPTIONS,
+                "on_validation_failure": "discard",
+            }
+        }
+        args["nodes"] = []
+        args["edges"] = []
+
+        result = execute_tool("set_pipeline", args, state, view, plugin_snapshot=snapshot)
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.data is not None
+        assert result.data["error"] == f"Source 'archive': {AWS_S3_SOURCE_POLICY_ERROR}"
+        assert result.data["error_code"] == "aws_s3_source_not_allowed"
+
+    def test_set_pipeline_rejects_aws_s3_legacy_source_for_web_authored_session_without_mutating_state(self) -> None:
+        state = _empty_state()
+        catalog = _mock_catalog()
+        view, snapshot = _web_authored_policy_pair(catalog)
+        args = _valid_pipeline_args()
+        args["source"]["plugin"] = "aws_s3"
+        args["source"]["options"] = dict(_VALID_AWS_S3_OPTIONS)
+
+        result = execute_tool("set_pipeline", args, state, view, plugin_snapshot=snapshot)
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.data is not None
+        assert result.data["error"] == AWS_S3_SOURCE_POLICY_ERROR
+        assert result.data["error_code"] == "aws_s3_source_not_allowed"
+
+    def test_set_pipeline_allows_aws_s3_legacy_source_for_trained_operator_session(self) -> None:
+        """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
+        state = _empty_state()
+        args = _valid_pipeline_args()
+        args["source"]["plugin"] = "aws_s3"
+        args["source"]["options"] = dict(_VALID_AWS_S3_OPTIONS)
+
+        result = execute_tool("set_pipeline", args, state, _mock_catalog())
+
+        assert result.success is True
+        assert result.updated_state.sources["source"].plugin == "aws_s3"
+
+    def test_set_source_from_blob_rejects_aws_s3_for_web_authored_session_without_mutating_state(self) -> None:
+        from elspeth.web.composer.tools.sources import _execute_set_source_from_blob, _ResolvedSourceBlob
+
+        state = _empty_state()
+        resolved = _ResolvedSourceBlob(
+            plugin="aws_s3",
+            options=dict(_VALID_AWS_S3_OPTIONS),
+            payload={
+                "blob_id": str(uuid4()),
+                "filename": "input.jsonl",
+                "mime_type": "application/jsonl",
+                "size_bytes": 1,
+                "content_hash": _STUB_SHA256,
+            },
+            creation_modality=CreationModality.VERBATIM,
+        )
+
+        with patch("elspeth.web.composer.tools.sources._resolve_source_blob", return_value=resolved):
+            result = _execute_set_source_from_blob(
+                {"blob_id": str(uuid4()), "on_success": "main", "options": {}},
+                state,
+                _web_authored_tool_context(),
+            )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.data is not None
+        assert result.data["error"] == AWS_S3_SOURCE_POLICY_ERROR
+        assert result.data["error_code"] == "aws_s3_source_not_allowed"
+
+    def test_set_source_from_blob_allows_aws_s3_for_trained_operator_session(self) -> None:
+        """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
+        from elspeth.web.composer.tools.sources import _execute_set_source_from_blob, _ResolvedSourceBlob
+
+        state = _empty_state()
+        resolved = _ResolvedSourceBlob(
+            plugin="aws_s3",
+            options=dict(_VALID_AWS_S3_OPTIONS),
+            payload={
+                "blob_id": str(uuid4()),
+                "filename": "input.jsonl",
+                "mime_type": "application/jsonl",
+                "size_bytes": 1,
+                "content_hash": _STUB_SHA256,
+            },
+            creation_modality=CreationModality.VERBATIM,
+        )
+
+        with patch("elspeth.web.composer.tools.sources._resolve_source_blob", return_value=resolved):
+            result = _execute_set_source_from_blob(
+                {"blob_id": str(uuid4()), "on_success": "main", "options": {}},
+                state,
+                _trained_tool_context(),
+            )
+
+        assert result.success is True
+        assert result.updated_state.sources["source"].plugin == "aws_s3"
+
+    def test_prohibited_source_selection_explains_the_policy_not_a_repairable_setting(self) -> None:
+        """A snapshot-declared prohibition must name the policy, not a code.
+
+        Once ``build_plugin_snapshot`` declines ``source:aws_s3`` with
+        ``WEB_SURFACE_PROHIBITED``, the plugin-visibility gate is the FIRST one
+        an authoring call meets (it precedes the aws_s3-specific gate below in
+        both ``set_source`` and ``set_pipeline``). Its message therefore has to
+        carry the policy cause; otherwise the honest decline degrades to a bare
+        code and the author is told a plugin is "unavailable" with nothing to
+        act on.
+        """
+        from elspeth.web.composer.tools._common import _validate_plugin_name
+
+        catalog = _mock_catalog()
+        view, snapshot = _restricted_policy_pair(
+            catalog,
+            PluginId("source", "aws_s3"),
+            PluginUnavailableReason.WEB_SURFACE_PROHIBITED,
+        )
+
+        violation = _validate_plugin_name(ToolContext(catalog=view, plugin_snapshot=snapshot), "source", "aws_s3")
+
+        assert violation is not None
+        assert violation.error_code is PluginUnavailableReason.WEB_SURFACE_PROHIBITED
+        assert AWS_S3_SOURCE_POLICY_ERROR in violation.message
+
+        result = execute_tool(
+            "set_source",
+            {
+                "plugin": "aws_s3",
+                "on_success": "main",
+                "options": _VALID_AWS_S3_OPTIONS,
+                "on_validation_failure": "discard",
+            },
+            _empty_state(),
+            view,
+            plugin_snapshot=snapshot,
+        )
+
+        assert result.success is False
+        assert result.data["error_code"] == "plugin_not_allowed_on_web"
+        assert AWS_S3_SOURCE_POLICY_ERROR in result.data["error"]
+
+    def test_prohibited_sink_selection_is_unaffected(self) -> None:
+        """Only the SOURCE is prohibited; S3 writes stay authorable."""
+        catalog = _mock_catalog()
+        view, snapshot = _restricted_policy_pair(
+            catalog,
+            PluginId("source", "aws_s3"),
+            PluginUnavailableReason.WEB_SURFACE_PROHIBITED,
+        )
+
+        result = execute_tool(
+            "set_output",
+            {
+                "sink_name": "archive",
+                "plugin": "aws_s3",
+                "options": {"bucket": "test-bucket", "key": "out.jsonl", "schema": {"mode": "observed"}},
+            },
+            _empty_state(),
+            view,
+            plugin_snapshot=snapshot,
+        )
+
+        assert result.success is True, result.data
+        assert [(output.name, output.plugin) for output in result.updated_state.outputs] == [("archive", "aws_s3")]
 
 
 class TestSetSource:
@@ -3150,7 +3441,7 @@ class TestDiscoveryTools:
         )
 
         assert result.success is True
-        names = {item.name for item in result.data}
+        names = {item.name for item in result.data["available"]}
         assert "passthrough" in names
         assert "azure_prompt_shield" not in names
 
@@ -3165,7 +3456,7 @@ class TestDiscoveryTools:
         )
 
         assert result.success is True
-        names = {item.name for item in result.data}
+        names = {item.name for item in result.data["available"]}
         assert "azure_prompt_shield" in names
 
     def test_get_plugin_schema_rejects_snapshot_unavailable_plugin(self) -> None:
@@ -8435,6 +8726,47 @@ class TestSetPipeline:
         node = result.updated_state.nodes[0]
         assert node.options["api_key"] == {"secret_ref": "OPENROUTER_API_KEY"}
 
+    def test_set_pipeline_accepts_textract_paired_secret_ref_markers(self) -> None:
+        state = _empty_state()
+        catalog = _mock_catalog()
+        catalog.list_transforms.return_value = [
+            *catalog.list_transforms.return_value,
+            PluginSummary(
+                name="aws_textract_document_analysis",
+                description="Asynchronous S3-backed document analysis",
+                plugin_type="transform",
+                config_fields=[],
+            ),
+        ]
+        args = _valid_pipeline_args()
+        args["nodes"][0] = {
+            "id": "analyze_document",
+            "node_type": "transform",
+            "plugin": "aws_textract_document_analysis",
+            "input": "source_out",
+            "on_success": "main",
+            "on_error": "discard",
+            "options": {
+                "region": "ap-southeast-2",
+                "auth_mode": "secret_refs",
+                "aws_access_key_id": {"secret_ref": "AWS_ACCESS_KEY_ID"},
+                "aws_secret_access_key": {"secret_ref": "AWS_SECRET_ACCESS_KEY"},
+                "bucket_field": "document_bucket",
+                "key_field": "document_key",
+                "feature_types": ["FORMS"],
+                "text_field": "textract_text",
+                "schema": {"mode": "observed"},
+            },
+        }
+        args["edges"][0]["to_node"] = "analyze_document"
+
+        result = execute_tool("set_pipeline", args, state, catalog)
+
+        assert result.success is True
+        node = result.updated_state.nodes[0]
+        assert node.options["aws_access_key_id"] == {"secret_ref": "AWS_ACCESS_KEY_ID"}
+        assert node.options["aws_secret_access_key"] == {"secret_ref": "AWS_SECRET_ACCESS_KEY"}
+
     def test_set_pipeline_rejects_user_supplied_llm_runtime_hash_without_mutating_state(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
@@ -9230,6 +9562,209 @@ class TestSetPipeline:
                 )
         finally:
             csv.field_size_limit(previous_limit)
+
+    def test_first_nonempty_csv_row_from_path_returns_header_when_complete_in_window(self, tmp_path: Path) -> None:
+        """A header row that terminates inside the window still parses normally."""
+        from elspeth.web.composer.tools.sources import _first_nonempty_csv_row_from_path
+
+        path = tmp_path / "small.csv"
+        path.write_text("name,email\nAlice,alice@example.com\n", encoding="utf-8")
+
+        assert _first_nonempty_csv_row_from_path(path) == ("name", "email")
+
+    def test_first_nonempty_csv_row_from_path_tolerates_first_record_crossing_window(self, tmp_path: Path) -> None:
+        """A well-formed CSV whose first record's quoted cell crosses the 64 KiB
+        bounded-inspection window must not be reported as a parse failure: the
+        file continues past the window (this is expected truncation, not
+        corruption), so the header is legitimately undeterminable here rather
+        than broken.
+        """
+        from elspeth.web.composer.tools.sources import _first_nonempty_csv_row_from_path
+
+        cell_a = "A" * 40000
+        cell_b = "B" * 40000
+        header_row = f'"{cell_a}","{cell_b}"\n'
+        assert len(header_row) > 64 * 1024
+        assert len(cell_a) < 64 * 1024
+        assert len(cell_b) < 64 * 1024
+        path = tmp_path / "wide_header.csv"
+        path.write_text(header_row + "trailer,row\n", encoding="utf-8")
+
+        # The full file parses without error...
+        full_rows = list(csv.reader(io.StringIO(path.read_text(encoding="utf-8")), strict=True))
+        assert full_rows[0] == [cell_a, cell_b]
+
+        # ...but the bounded reader, which only ever inspects a fixed-size
+        # prefix, cannot determine the header because the window closes
+        # mid-quote. It must report "undeterminable" (None), never raise.
+        assert _first_nonempty_csv_row_from_path(path) is None
+
+    def test_first_nonempty_csv_row_from_path_still_raises_for_genuine_corruption(self, tmp_path: Path) -> None:
+        """A small, fully-read file that is genuinely malformed CSV (not merely
+        truncated by the window) must still surface as a boundary error so
+        callers can escalate it.
+        """
+        from elspeth.web.composer.tools.sources import _CsvContentBoundaryError, _first_nonempty_csv_row_from_path
+
+        path = tmp_path / "malformed.csv"
+        path.write_text('"unterminated\n', encoding="utf-8")
+
+        with pytest.raises(_CsvContentBoundaryError):
+            _first_nonempty_csv_row_from_path(path)
+
+    def test_first_nonempty_csv_row_from_path_tolerates_multibyte_char_straddling_window(self, tmp_path: Path) -> None:
+        """A valid multi-byte UTF-8 character split across the window boundary
+        is expected truncation, not corruption or a decoding failure — the
+        file continues past the window, so a dangling partial byte sequence
+        at the cut point must not raise ``UnicodeDecodeError``.
+        """
+        from elspeth.web.composer.tools.sources import _first_nonempty_csv_row_from_path
+
+        # Pad so the multi-byte character's leading byte lands exactly at
+        # the window's last byte, splitting it across the boundary.
+        pad = "x" * ((64 * 1024) - 1)
+        content = pad + "あ" + ",trailer\ndata,row\n"
+        path = tmp_path / "straddled_char.csv"
+        path.write_text(content, encoding="utf-8")
+
+        assert path.read_bytes()[(64 * 1024) - 1 : (64 * 1024) + 2] == "あ".encode()
+
+        result = _first_nonempty_csv_row_from_path(path)
+
+        assert result is not None
+        assert result[0].startswith("x")
+
+    def test_set_pipeline_header_only_inline_csv_tolerates_candidate_first_record_crossing_window(self, tmp_path: Path) -> None:
+        """A ready uploaded CSV whose first record merely crosses the bounded
+        inspection window must not abort an unrelated header-only inline
+        set_pipeline call with AuditIntegrityError. The candidate's header is
+        legitimately undeterminable within the bounded window, so it is
+        treated as a non-match rather than escalated as corruption.
+        """
+        from datetime import UTC, datetime
+
+        state = _empty_state()
+        catalog = _mock_catalog()
+        engine, session_id = _session_engine_with_session()
+        uploaded_id = str(uuid4())
+        cell_a = "A" * 40000
+        cell_b = "B" * 40000
+        uploaded_content = f'"{cell_a}","{cell_b}"\n' + "trailer,row\n"
+        assert len(uploaded_content.encode("utf-8")) > 64 * 1024
+        uploaded_path = tmp_path / "blobs" / session_id / f"{uploaded_id}_wide_header.csv"
+        uploaded_path.parent.mkdir(parents=True)
+        uploaded_path.write_text(uploaded_content, encoding="utf-8")
+        now = datetime.now(UTC)
+        with engine.begin() as conn:
+            conn.execute(
+                blobs_table.insert().values(
+                    id=uploaded_id,
+                    session_id=session_id,
+                    filename="wide_header.csv",
+                    mime_type="text/csv",
+                    size_bytes=len(uploaded_content.encode("utf-8")),
+                    content_hash=_STUB_SHA256,
+                    storage_path=str(uploaded_path),
+                    created_at=now,
+                    created_by="user",
+                    source_description="uploaded rows with a wide first record",
+                    status="ready",
+                )
+            )
+
+        inline_content = "name,email\n"
+        args = _valid_pipeline_args()
+        args["source"] = {
+            "plugin": "csv",
+            "on_success": "source_out",
+            "options": {"schema": {"mode": "observed"}},
+            "inline_blob": {
+                "filename": "contacts.csv",
+                "mime_type": "text/csv",
+                "content": inline_content,
+            },
+            "on_validation_failure": "quarantine",
+        }
+        args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / session_id / "out.csv")
+        args["outputs"][0]["options"]["mode"] = "write"
+        args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
+
+        result = execute_tool(
+            "set_pipeline",
+            args,
+            state,
+            catalog,
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            **_verbatim_blob_context(engine, session_id, inline_content),
+        )
+
+        assert result.success is True, result.data
+        assert _default_source(result.updated_state) is not None
+
+    def test_set_pipeline_header_only_inline_csv_escalates_definitive_parse_error_before_window_end(self, tmp_path: Path) -> None:
+        """A larger backing file must not hide syntax errors raised before the
+        bounded reader reaches its prefix boundary.
+        """
+        from datetime import UTC, datetime
+
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        state = _empty_state()
+        catalog = _mock_catalog()
+        engine, session_id = _session_engine_with_session()
+        uploaded_id = str(uuid4())
+        uploaded_content = '"a"x,b\n' + ("z" * (64 * 1024))
+        uploaded_path = tmp_path / "blobs" / session_id / f"{uploaded_id}_malformed.csv"
+        uploaded_path.parent.mkdir(parents=True)
+        uploaded_path.write_text(uploaded_content, encoding="utf-8")
+        now = datetime.now(UTC)
+        with engine.begin() as conn:
+            conn.execute(
+                blobs_table.insert().values(
+                    id=uploaded_id,
+                    session_id=session_id,
+                    filename="malformed.csv",
+                    mime_type="text/csv",
+                    size_bytes=len(uploaded_content.encode("utf-8")),
+                    content_hash=_STUB_SHA256,
+                    storage_path=str(uploaded_path),
+                    created_at=now,
+                    created_by="user",
+                    source_description="uploaded rows with malformed CSV syntax",
+                    status="ready",
+                )
+            )
+
+        inline_content = "name,email\n"
+        args = _valid_pipeline_args()
+        args["source"] = {
+            "plugin": "csv",
+            "on_success": "source_out",
+            "options": {"schema": {"mode": "observed"}},
+            "inline_blob": {
+                "filename": "contacts.csv",
+                "mime_type": "text/csv",
+                "content": inline_content,
+            },
+            "on_validation_failure": "quarantine",
+        }
+        args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / session_id / "out.csv")
+        args["outputs"][0]["options"]["mode"] = "write"
+        args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
+
+        with pytest.raises(AuditIntegrityError, match="bounded CSV inspection"):
+            execute_tool(
+                "set_pipeline",
+                args,
+                state,
+                catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                **_verbatim_blob_context(engine, session_id, inline_content),
+            )
 
     @pytest.mark.parametrize(
         ("candidate_count", "match_on_read", "expected_reads", "expected_error"),
@@ -10980,7 +11515,7 @@ class TestPreviewPipeline:
                 "on_error": None,
                 "options": {},
                 "condition": "True",
-                "routes": {},
+                "routes": {"true": "fork", "false": "fork"},
                 "fork_to": ["classified_rows_to_fraud_filter", "classified_rows_to_regular_filter"],
                 "branches": None,
                 "policy": None,
@@ -10999,6 +11534,397 @@ class TestPreviewPipeline:
         fixed_preview = execute_tool("preview_pipeline", {}, fixed_state, _mock_catalog()).to_dict()["data"]
 
         assert not any("Duplicate consumer for connection 'classified_rows'" in err["message"] for err in fixed_preview["errors"])
+
+    @pytest.mark.parametrize("duplicate_branch", ["control", "treatment"])
+    def test_duplicate_consumer_repair_patches_row_union_branch_and_validates(self, duplicate_branch: str) -> None:
+        """Every suggested mutation succeeds and repairs the real branch slot.
+
+        The deliberately minimal fork skeleton does not synthesize an inner
+        correlated barrier. It therefore leaves the pre-existing independent
+        fork-destination/topology issue visible for the planner's next repair
+        turn instead of silently changing downstream semantics.
+        """
+        branch_connections = {
+            "control": "control_done",
+            "treatment": "treatment_done",
+        }
+        duplicate_connection = branch_connections[duplicate_branch]
+        state = (
+            _empty_state()
+            .with_source(
+                SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="fan_out",
+                    node_type="gate",
+                    plugin=None,
+                    input="rows",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=("control", "treatment"),
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="control_path",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="control",
+                    on_success="control_done",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="treatment_path",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="treatment",
+                    on_success="treatment_done",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="variant_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="control_done",
+                    on_success="unioned_rows",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=branch_connections,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="duplicate_reader",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input=duplicate_connection,
+                    on_success="duplicate_rows",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="consume_union",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="unioned_rows",
+                    on_success="main",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_output(
+                OutputSpec(
+                    name="main",
+                    plugin="json",
+                    options={"path": "outputs/main.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+            .with_output(
+                OutputSpec(
+                    name="duplicate_rows",
+                    plugin="json",
+                    options={"path": "outputs/duplicate.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+        )
+
+        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+        repair = preview.data["graph_repair_suggestions"][0]
+        union_step = next(
+            step for step in repair["tool_sequence"] if step["tool"] == "upsert_node" and step["arguments"]["id"] == "variant_union"
+        )
+        repaired_branches = union_step["arguments"]["branches"]
+        repaired_connection = repaired_branches[duplicate_branch]
+
+        assert repaired_connection != duplicate_connection
+        assert union_step["arguments"]["input"] == (repaired_connection if duplicate_branch == "control" else "control_done")
+
+        repaired_state = state
+        for step in repair["tool_sequence"][:-1]:
+            step_result = execute_tool(step["tool"], dict(step["arguments"]), repaired_state, _mock_catalog())
+            assert step_result.success is True, step_result.to_dict()
+            repaired_state = step_result.updated_state
+
+        repaired_preview = execute_tool("preview_pipeline", {}, repaired_state, _mock_catalog())
+        remaining_codes = {entry["error_code"] for entry in repaired_preview.data["errors"]}
+        assert "duplicate_connection_consumer" not in remaining_codes
+        assert "row_union_input_mismatch" not in remaining_codes
+        assert "fork_branch_no_destination" in remaining_codes
+
+    def test_duplicate_consumer_repair_excludes_row_union_identity_branch(self) -> None:
+        """Identity barrier branches are direct COPY edges, not connection consumers."""
+
+        def _consumer(node_id: str) -> NodeSpec:
+            return NodeSpec(
+                id=node_id,
+                node_type="transform",
+                plugin="passthrough",
+                input="control",
+                on_success=f"{node_id}_out",
+                on_error="discard",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+
+        state = (
+            _empty_state()
+            .with_node(_consumer("ordinary_a"))
+            .with_node(_consumer("ordinary_b"))
+            .with_node(
+                NodeSpec(
+                    id="variant_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="control",
+                    on_success="unioned_rows",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches={"control": "control", "treatment": "treatment"},
+                    policy=None,
+                    merge=None,
+                )
+            )
+        )
+
+        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+        duplicate_error = next(entry for entry in preview.data["errors"] if entry["error_code"] == "duplicate_connection_consumer")
+        assert "ordinary_a" in duplicate_error["message"]
+        assert "ordinary_b" in duplicate_error["message"]
+        assert "variant_union" not in duplicate_error["message"]
+
+        repair = next(entry for entry in preview.data["graph_repair_suggestions"] if entry["connection"] == "control")
+        assert [consumer["id"] for consumer in repair["affected_consumers"]] == [
+            "ordinary_a",
+            "ordinary_b",
+        ]
+        assert [step["arguments"]["id"] for step in repair["tool_sequence"] if step["tool"] == "upsert_node"] == [
+            "ordinary_a",
+            "ordinary_b",
+            "fork_control",
+        ]
+
+    def test_duplicate_consumer_repair_patches_one_node_once_for_two_branch_bindings(self) -> None:
+        """Two aliases of one row_union sharing a connection collapse to one upsert.
+
+        A repair skeleton rebuilt from the original node per binding emits two
+        ``upsert_node`` calls for the same id, and the second reverts the first
+        — applying the suggested sequence leaves the duplicate in place. The
+        patches must accumulate onto one payload per node id while the fork
+        gate still publishes one distinct branch per binding.
+        """
+        state = (
+            _empty_state()
+            .with_source(
+                SourceSpec(
+                    plugin="csv",
+                    on_success="rows",
+                    options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="fan_out",
+                    node_type="gate",
+                    plugin=None,
+                    input="rows",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=("control", "treatment"),
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="control_path",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="control",
+                    on_success="control_done",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="treatment_path",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="treatment",
+                    on_success="treatment_done",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            # Inner barrier: its release connection is downstream of BOTH fork
+            # branches, so the outer row_union can bind both aliases to it.
+            .with_node(
+                NodeSpec(
+                    id="inner_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="control_done",
+                    on_success="union_out",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches={"control": "control_done", "treatment": "treatment_done"},
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="outer_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="union_out",
+                    on_success="union_out2",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    # BOTH aliases claim the one connection: one node, two bindings.
+                    branches={"control": "union_out", "treatment": "union_out"},
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="consume_union",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="union_out2",
+                    on_success="main",
+                    on_error="discard",
+                    options={"schema": {"mode": "observed"}},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_output(
+                OutputSpec(
+                    name="main",
+                    plugin="json",
+                    options={"path": "outputs/main.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+        )
+
+        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+        assert "duplicate_connection_consumer" in {entry["error_code"] for entry in preview.data["errors"]}
+        repair = next(entry for entry in preview.data["graph_repair_suggestions"] if entry["connection"] == "union_out")
+
+        upsert_ids = [step["arguments"]["id"] for step in repair["tool_sequence"] if step["tool"] == "upsert_node"]
+        assert len(upsert_ids) == len(set(upsert_ids)), repair["tool_sequence"]
+        assert upsert_ids.count("outer_union") == 1
+
+        union_step = next(step for step in repair["tool_sequence"] if step["arguments"].get("id") == "outer_union")
+        patched_branches = union_step["arguments"]["branches"]
+        assert patched_branches["control"] != patched_branches["treatment"]
+        assert "union_out" not in patched_branches.values()
+        assert union_step["arguments"]["input"] == patched_branches["control"]
+
+        gate_step = repair["tool_sequence"][-2]
+        assert gate_step["arguments"]["node_type"] == "gate"
+        assert sorted(gate_step["arguments"]["fork_to"]) == sorted(patched_branches.values())
+        assert repair["tool_sequence"][-1] == {"tool": "preview_pipeline", "arguments": {}}
+
+        repaired_state = state
+        for step in repair["tool_sequence"][:-1]:
+            step_result = execute_tool(step["tool"], dict(step["arguments"]), repaired_state, _mock_catalog())
+            assert step_result.success is True, step_result.to_dict()
+            repaired_state = step_result.updated_state
+
+        repaired_preview = execute_tool("preview_pipeline", {}, repaired_state, _mock_catalog())
+        remaining_codes = {entry["error_code"] for entry in repaired_preview.data["errors"]}
+        assert "duplicate_connection_consumer" not in remaining_codes
+        assert "row_union_input_mismatch" not in remaining_codes
 
     def test_preview_source_with_schema_config_field_name(self) -> None:
         state = _empty_state().with_source(
@@ -14423,6 +15349,465 @@ class TestUpsertNodeQueue:
         assert all(n.id != "inbound" for n in result.updated_state.nodes)
 
 
+_ROW_UNION_UPSERT_ARGS: dict[str, Any] = {
+    "id": "variant_union",
+    "node_type": "row_union",
+    "plugin": None,
+    "input": "control_done",
+    "on_success": "unioned_rows",
+    "on_error": None,
+    "options": {},
+    "branches": {
+        "control": "control_done",
+        "treatment": "treatment_done",
+    },
+    "timeout_seconds": 45.0,
+}
+
+
+def _row_union_node_spec() -> NodeSpec:
+    return NodeSpec(
+        id="variant_union",
+        node_type="row_union",
+        plugin=None,
+        input="control_done",
+        on_success="unioned_rows",
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches={
+            "control": "control_done",
+            "treatment": "treatment_done",
+        },
+        policy=None,
+        merge=None,
+        timeout_seconds=45.0,
+    )
+
+
+class TestUpsertNodeRowUnion:
+    def test_generic_tool_schema_advertises_row_union_and_structural_timeout(self) -> None:
+        definitions = get_tool_definitions()
+        names = {definition["name"] for definition in definitions}
+        assert "upsert_row_union" not in names
+
+        upsert = _upsert_node_definition()
+        assert "row_union" in upsert["parameters"]["properties"]["node_type"]["enum"]
+        timeout = upsert["parameters"]["properties"]["timeout_seconds"]
+        assert timeout["type"] == ["number", "null"]
+        assert timeout["exclusiveMinimum"] == 0
+        assert "finite" in timeout["description"]
+
+    def test_upsert_persists_canonical_row_union_and_timeout(self) -> None:
+        result = execute_tool("upsert_node", dict(_ROW_UNION_UPSERT_ARGS), _empty_state(), _mock_catalog())
+
+        assert result.success is True, result.to_dict()
+        union = next(node for node in result.updated_state.nodes if node.id == "variant_union")
+        assert union.node_type == "row_union"
+        assert union.plugin is None
+        assert union.input == "control_done"
+        assert dict(union.branches or {}) == {
+            "control": "control_done",
+            "treatment": "treatment_done",
+        }
+        assert union.on_success == "unioned_rows"
+        assert union.timeout_seconds == 45.0
+
+        inspected = execute_tool(
+            "get_pipeline_state",
+            {"component": "variant_union"},
+            result.updated_state,
+            _mock_catalog(),
+        )
+        assert inspected.success is True
+        assert inspected.data["node"]["timeout_seconds"] == 45.0
+
+    @pytest.mark.parametrize("invalid_timeout", [True, "30", 0, -1, float("nan"), float("inf")])
+    def test_timeout_rejects_invalid_tier_3_values_without_mutation(self, invalid_timeout: object) -> None:
+        from elspeth.web.composer.protocol import ToolArgumentError
+
+        state = _empty_state()
+
+        with pytest.raises(ToolArgumentError):
+            execute_tool(
+                "upsert_node",
+                {**_ROW_UNION_UPSERT_ARGS, "timeout_seconds": invalid_timeout},
+                state,
+                _mock_catalog(),
+            )
+
+        assert state.version == 1
+        assert state.nodes == ()
+
+    @pytest.mark.parametrize("timeout_seconds", [30, 30.5])
+    def test_timeout_accepts_actual_int_and_float_values(self, timeout_seconds: int | float) -> None:
+        result = execute_tool(
+            "upsert_node",
+            {**_ROW_UNION_UPSERT_ARGS, "timeout_seconds": timeout_seconds},
+            _empty_state(),
+            _mock_catalog(),
+        )
+
+        assert result.success is True, result.to_dict()
+        assert result.updated_state.nodes[0].timeout_seconds == float(timeout_seconds)
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {
+                "id": "transform_node",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "rows",
+                "on_success": "transformed",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "gate_node",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "rows",
+                "condition": "True",
+                "routes": {"true": "discard", "false": "discard"},
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "aggregation_node",
+                "node_type": "aggregation",
+                "plugin": None,
+                "input": "rows",
+                "on_success": "aggregated",
+                "on_error": "discard",
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "queue_node",
+                "node_type": "queue",
+                "plugin": None,
+                "input": "queue_node",
+                "options": {},
+                "timeout_seconds": 30,
+            },
+        ],
+        ids=["transform", "gate", "aggregation", "queue"],
+    )
+    def test_timeout_rejects_non_barrier_node_types_atomically(self, arguments: dict[str, Any]) -> None:
+        state = _empty_state()
+
+        result = execute_tool("upsert_node", arguments, state, _mock_catalog())
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert "timeout_seconds" in result.data["error"]
+
+    def test_patch_node_options_cannot_add_options_to_row_union(self) -> None:
+        state = _empty_state().with_node(_row_union_node_spec())
+
+        result = execute_tool(
+            "patch_node_options",
+            {"node_id": "variant_union", "patch": {"schema": {"mode": "observed"}}},
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.updated_state.nodes[0].options == {}
+
+    @pytest.mark.parametrize("edge_type", ["on_success", "on_error"])
+    def test_upsert_edge_cannot_route_row_union_directly_to_sink(self, edge_type: str) -> None:
+        state = (
+            _empty_state()
+            .with_node(_row_union_node_spec())
+            .with_output(
+                OutputSpec(
+                    name="results",
+                    plugin="json",
+                    options={"path": "outputs/results.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+        )
+
+        result = execute_tool(
+            "upsert_edge",
+            {
+                "id": f"variant_union_{edge_type}",
+                "from_node": "variant_union",
+                "to_node": "results",
+                "edge_type": edge_type,
+            },
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        union = result.updated_state.nodes[0]
+        assert union.on_success == "unioned_rows"
+        assert union.on_error is None
+
+    def test_set_output_cannot_turn_row_union_processing_connection_into_sink(self) -> None:
+        state = _empty_state().with_node(_row_union_node_spec())
+
+        result = execute_tool(
+            "set_output",
+            {
+                "sink_name": "unioned_rows",
+                "plugin": "json",
+                "options": {"path": "outputs/results.json", "schema": {"mode": "observed"}},
+                "on_write_failure": "discard",
+            },
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert result.updated_state.outputs == ()
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"plugin": "passthrough"},
+            {"input": "not_the_first_branch"},
+            {"on_success": None},
+            {"on_error": "errors"},
+            {"options": {"schema": {"mode": "observed"}}},
+            {"branches": {"only": "control_done"}},
+            {"policy": "require_all"},
+            {"merge": "union"},
+        ],
+    )
+    def test_intrinsically_malformed_row_union_is_rejected_atomically(self, override: dict[str, Any]) -> None:
+        state = _empty_state()
+        result = execute_tool(
+            "upsert_node",
+            {**_ROW_UNION_UPSERT_ARGS, **override},
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+
+
+class TestRowUnionTopologyCodesDoNotBlockUnrelatedMutations:
+    """row_union step-8 topology findings are telemetry, not mutation gates.
+
+    ``_post_mutation_invariant_error`` selects only intrinsic node-shape and
+    namespace invariants. While the two step-8 topology checks shared the
+    intrinsic ``row_union_branch_invalid`` code, completing the topology from
+    an *unrelated* node made that node's own mutation roll back with an error
+    naming the mis-wired row_union.
+    """
+
+    @staticmethod
+    def _transform(node_id: str, input_connection: str, on_success: str) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="passthrough",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _mis_wired_state(self) -> CompositionState:
+        """A swapped-branch row_union whose topology is not yet complete.
+
+        ``treatment`` is deliberately absent, so ``treatment_done`` has no
+        producer and only the non-blocking reachability code fires.
+        """
+        return (
+            _empty_state()
+            .with_source(
+                SourceSpec(
+                    plugin="csv",
+                    on_success="fork_in",
+                    options={"path": "/data/in.csv", "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            )
+            .with_node(
+                NodeSpec(
+                    id="fork_rows",
+                    node_type="gate",
+                    plugin=None,
+                    input="fork_in",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "fork", "false": "fork"},
+                    fork_to=("control_branch", "treatment_branch"),
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(self._transform("control", "control_branch", "control_done"))
+            .with_node(
+                NodeSpec(
+                    id="variant_union",
+                    node_type="row_union",
+                    plugin=None,
+                    input="treatment_done",
+                    on_success="union_out",
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    # Swapped: each alias claims the other branch's connection.
+                    branches={
+                        "control_branch": "treatment_done",
+                        "treatment_branch": "control_done",
+                    },
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_node(self._transform("after_union", "union_out", "main"))
+            .with_output(
+                OutputSpec(
+                    name="main",
+                    plugin="json",
+                    options={"path": "outputs/main.json", "schema": {"mode": "observed"}},
+                    on_write_failure="discard",
+                )
+            )
+        )
+
+    def test_topology_codes_are_not_mutation_blocking_invariants(self) -> None:
+        from elspeth.web.composer.tools._common import (
+            _MUTATION_BLOCKING_INVARIANT_CODES,
+            _ROW_UNION_INTRINSIC_ERROR_CODES,
+        )
+
+        topology_codes = {
+            "row_union_branch_origin_invalid",
+            "row_union_branch_not_downstream",
+            "row_union_downstream_group_invalid",
+            "row_union_schema_incompatible",
+        }
+        assert not topology_codes & _MUTATION_BLOCKING_INVARIANT_CODES
+        assert not topology_codes & _ROW_UNION_INTRINSIC_ERROR_CODES
+        # The intrinsic node-shape family must still gate mutations.
+        assert {
+            "row_union_config_invalid",
+            "row_union_branches_invalid",
+            "row_union_branch_invalid",
+            "row_union_input_mismatch",
+            "row_union_on_success_invalid",
+            "row_union_timeout_invalid",
+        } <= _MUTATION_BLOCKING_INVARIANT_CODES
+
+    def test_completing_topology_from_an_unrelated_node_is_not_rejected(self) -> None:
+        state = self._mis_wired_state()
+
+        preview = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+        assert "row_union_branch_unreachable" in {entry["error_code"] for entry in preview.data["errors"]}
+
+        result = execute_tool(
+            "upsert_node",
+            {
+                "id": "treatment",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "treatment_branch",
+                "on_success": "treatment_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+                "condition": None,
+                "routes": None,
+                "fork_to": None,
+                "branches": None,
+                "policy": None,
+                "merge": None,
+                "trigger": None,
+                "output_mode": None,
+                "expected_output_count": None,
+            },
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is True, result.to_dict()
+        assert any(node.id == "treatment" for node in result.updated_state.nodes)
+        assert not any(entry.component == "rejected_mutation" for entry in result.validation.errors)
+
+        # The mis-wiring now surfaces as non-blocking validation telemetry
+        # against the row_union itself, under a topology-specific code.
+        codes = {entry.error_code for entry in result.validation.errors}
+        assert "row_union_branch_not_downstream" in codes
+        assert "row_union_branch_invalid" not in codes
+
+    def test_mis_wired_row_union_still_persists_while_topology_is_incomplete(self) -> None:
+        state = self._mis_wired_state()
+
+        result = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+
+        assert result.success is True
+        assert any(node.id == "variant_union" for node in result.updated_state.nodes)
+
+
+class TestStructuralBarrierTimeoutBoundary:
+    @staticmethod
+    def _coalesce_arguments(timeout_seconds: object) -> dict[str, Any]:
+        return {
+            "id": "joined",
+            "node_type": "coalesce",
+            "plugin": None,
+            "input": "control_done",
+            "branches": {
+                "control": "control_done",
+                "treatment": "treatment_done",
+            },
+            "policy": "require_all",
+            "merge": "union",
+            "timeout_seconds": timeout_seconds,
+        }
+
+    @pytest.mark.parametrize("invalid_timeout", [0, -1, float("nan"), float("inf")])
+    @pytest.mark.parametrize("tool_name", ["upsert_node", "set_pipeline"])
+    def test_invalid_coalesce_timeout_is_rejected_before_mutation(
+        self,
+        tool_name: str,
+        invalid_timeout: float,
+    ) -> None:
+        from elspeth.web.composer.protocol import ToolArgumentError
+
+        state = _empty_state()
+        node = self._coalesce_arguments(invalid_timeout)
+        arguments = node
+        if tool_name == "set_pipeline":
+            arguments = _valid_pipeline_args()
+            arguments["nodes"] = [node]
+
+        with pytest.raises(ToolArgumentError):
+            execute_tool(tool_name, arguments, state, _mock_catalog())
+
+        assert state.version == 1
+        assert state.nodes == ()
+
+
 class TestQueueBoundaryFieldEvidenceAbstains:
     """A queue exposes observed/unknown schema — field/numeric evidence must
     abstain at that boundary and MUST NOT synthesise a union of the
@@ -14581,7 +15966,7 @@ class TestExplainStructuralNodeShapeCodes:
 
 
 class TestStructuralNodeTypeProbedAsPlugin:
-    """gate/coalesce/queue are built-in node_types, not plugins. A model that
+    """gate/coalesce/row_union/queue are built-in node_types, not plugins. A model that
     probes the plugin registry for them must be taught the wiring, not told
     "not installed" — live regression: the composer honestly declined an A/B
     request on the false premise that coalesce "is not installed in this
@@ -14599,6 +15984,10 @@ class TestStructuralNodeTypeProbedAsPlugin:
         [
             ("coalesce", ("node_type", "branches", "policy", "queries")),
             ("gate", ("node_type", "fork_to", "routes")),
+            (
+                "row_union",
+                ("node_type", "branches", "input", "on_success", "require_all", "N-to-N", "timeout_seconds"),
+            ),
             ("queue", ("node_type", "fan-in")),
         ],
     )

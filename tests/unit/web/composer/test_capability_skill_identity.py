@@ -190,6 +190,7 @@ def test_capability_coverage_is_exactly_derived_from_canonical_authorities() -> 
     assert set(CAPABILITY_CORE_NODE_GUIDANCE) == set(COMPOSER_NODE_TYPES)
     core = load_pipeline_capability_core()
     assert all(core.count(anchor) == 1 for anchor in CAPABILITY_CORE_NODE_GUIDANCE.values())
+    assert "timeout_seconds" in actual_fields["node"]
 
 
 def test_capability_field_extraction_detects_new_structural_field() -> None:
@@ -197,6 +198,14 @@ def test_capability_field_extraction_detects_new_structural_field() -> None:
     schema["properties"]["future_topology"] = {"type": "object"}
 
     assert canonical_capability_fields(schema) != CANONICAL_CAPABILITY_FIELDS
+
+
+def test_capability_field_extraction_rejects_missing_required_schema_node() -> None:
+    schema = canonical_set_pipeline_schema()
+    del schema["properties"]
+
+    with pytest.raises(KeyError, match="properties"):
+        canonical_capability_fields(schema)
 
 
 def test_manifest_rejects_schema_and_terminal_updated_without_documented_field() -> None:
@@ -291,6 +300,34 @@ def test_manifest_fails_closed_on_capability_identity_drift(mutation: str) -> No
             surface=PlannerSurface.FREEFORM,
             profile="ordinary",
             messages=messages,
+            tools=tools,
+            canonical_schema=canonical_set_pipeline_schema(),
+        )
+
+
+def test_manifest_rejects_message_missing_required_role() -> None:
+    messages = _messages(build_system_prompt(None))
+    del messages[0]["role"]
+
+    with pytest.raises(KeyError, match="role"):
+        build_planner_capability_manifest(
+            surface=PlannerSurface.FREEFORM,
+            profile="ordinary",
+            messages=messages,
+            tools=planner_tool_definitions(),
+            canonical_schema=canonical_set_pipeline_schema(),
+        )
+
+
+def test_manifest_rejects_terminal_missing_required_parameters() -> None:
+    tools = planner_tool_definitions()
+    del tools[-1]["function"]["parameters"]
+
+    with pytest.raises(KeyError, match="parameters"):
+        build_planner_capability_manifest(
+            surface=PlannerSurface.FREEFORM,
+            profile="ordinary",
+            messages=_messages(build_system_prompt(None)),
             tools=tools,
             canonical_schema=canonical_set_pipeline_schema(),
         )

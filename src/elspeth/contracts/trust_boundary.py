@@ -56,6 +56,7 @@ from typing import Any, Literal, ParamSpec, TypeVar
 __all__ = [
     "BoundaryRule",
     "TrustBoundaryMetadata",
+    "observation_boundary",
     "trust_boundary",
 ]
 
@@ -255,3 +256,27 @@ def trust_boundary(
         return wrapper
 
     return decorator
+
+
+def observation_boundary(
+    *,
+    tier: Literal[3],
+    source: str,
+    source_param: str,
+    suppresses: tuple[BoundaryRule, ...],
+    invariant: str,
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Mark a Tier-3 boundary that observes input without assuring it.
+
+    Runtime metadata is identical to ``@trust_boundary(...,
+    non_raising=True)``. The distinct function identity lets static trust
+    grammars model its output as still externally derived.
+    """
+    return trust_boundary(
+        tier=tier,
+        source=source,
+        source_param=source_param,
+        suppresses=suppresses,
+        invariant=invariant,
+        non_raising=True,
+    )

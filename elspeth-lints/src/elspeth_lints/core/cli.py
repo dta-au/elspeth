@@ -23,7 +23,7 @@ from elspeth_lints.core.ast_walker import (
     PythonSyntaxError,
     walk_python_files,
 )
-from elspeth_lints.core.atomic_io import atomic_update_text
+from elspeth_lints.core.atomic_io import allowlist_mutation_lock, atomic_update_text
 from elspeth_lints.core.emitters.github import render_github
 from elspeth_lints.core.emitters.json import render_json
 from elspeth_lints.core.emitters.sarif import render_sarif
@@ -727,7 +727,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allowlist-dir",
         type=Path,
         default=Path("config/cicd/enforce_tier_model"),
-        help="Directory of per-module allowlist YAML files to repair in place",
+        help="Active directory of per-module allowlist YAML files to replace coherently on success",
     )
     sign_judge_signatures.add_argument(
         "--env-file",
@@ -786,9 +786,13 @@ def _build_parser() -> argparse.ArgumentParser:
             "OPERATOR-ONLY: re-verify a staged review bundle against the source "
             "tree and fire it. The ONLY place a judge signature is minted from a "
             "bundle. Re-derives every binding from the tree and aborts on any "
-            "staleness BEFORE a single write; drift_repair / new_judgment run the "
+            "staleness BEFORE creating a transaction; deterministic stale-delete / "
+            "safe-rotation actions run first, then drift_repair / new_judgment run the "
             "real judge (re-judging prevents laundering a stale verdict over "
-            "changed content); rotation / stale_delete carry no verdict. Requires "
+            "changed content). All actions write to a recoverable private copy and "
+            "the active allowlist changes only through one coherent atomic directory "
+            "exchange after final re-verification. BLOCK/failure/interruption prints "
+            "a --resume command; --dry-run creates no transaction. Requires "
             "ELSPETH_JUDGE_METADATA_HMAC_KEY (an agent may PROPOSE the bundle, only "
             "an operator-held environment signs it)."
         ),
@@ -843,19 +847,33 @@ def _build_parser() -> argparse.ArgumentParser:
     sign_bundle.add_argument(
         "--dry-run",
         action="store_true",
-        help="Print the verify + per-lane plan without calling the judge, removing rows, or writing signed entries.",
+        help=(
+            "Print the verify + per-lane plan without calling the judge or "
+            "creating/writing a transaction, rotation log, or allowlist entry."
+        ),
     )
     sign_bundle.add_argument(
         "--yes",
         action="store_true",
-        help="Skip the interactive confirmation prompt before the (destructive) write phase.",
+        help="Skip the interactive confirmation prompt before creating/resuming the private transaction.",
+    )
+    sign_bundle.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        metavar="TRANSACTION_DIR",
+        help=(
+            "Resume a preserved sign-bundle transaction. Re-verifies the bundle, "
+            "live source tree, unchanged active allowlist, transaction journal, "
+            "and every previously produced authoritative signature before continuing."
+        ),
     )
     sign_bundle.add_argument(
         "--rotation-log",
         type=Path,
         default=Path(".elspeth/rotations.log"),
         help=(
-            "JSONL audit manifest written when a rotation action applies, so "
+            "JSONL audit manifest finalized only with coherent publish when a rotation action applies, so "
             "check-rotation-audit finds a record for the allowlist key rewrite "
             "(mirrors `rotate --rotation-log`). Default: .elspeth/rotations.log."
         ),
@@ -1989,20 +2007,22 @@ def _run_justify(args: argparse.Namespace) -> int:
         return 0
 
     yaml_entry = build_signed_yaml_entry()
-    _append_entry_to_yaml(
-        target_yaml,
-        yaml_entry,
-        entry_index=getattr(args, "_allow_hits_entry_index", None),
-    )
-    _append_judge_decision_event_after_judge(
-        allowlist_dir=allowlist_dir,
-        finding=finding,
-        effective_verdict=write_verdict,
-        model_verdict=response.verdict,
-        recorded_at=response.recorded_at,
-        write_disposition="written",
-    )
-    _refresh_override_rate_counter_snapshot_after_allowlist_write(target_yaml)
+    with allowlist_mutation_lock(allowlist_dir):
+        _append_entry_to_yaml(
+            target_yaml,
+            yaml_entry,
+            entry_index=getattr(args, "_allow_hits_entry_index", None),
+        )
+        _append_judge_decision_event_after_judge(
+            allowlist_dir=allowlist_dir,
+            finding=finding,
+            effective_verdict=write_verdict,
+            model_verdict=response.verdict,
+            recorded_at=response.recorded_at,
+            write_disposition="written",
+        )
+        if not getattr(args, "_defer_override_rate_counter_snapshot", False):
+            _refresh_override_rate_counter_snapshot_after_allowlist_write(target_yaml)
     _emit_justify_output(
         args=args,
         verdict=write_verdict,
@@ -2834,7 +2854,8 @@ def _upsert_audit_review_in_yaml(target_yaml: Path, *, entry_key: str, review_te
         new_lines = [*lines[:entry_start], *cleaned_entry, *lines[entry_end:]]
         return "".join(new_lines)
 
-    atomic_update_text(target_yaml, upsert_in, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, upsert_in, encoding="utf-8", create_parent=False)
 
 
 def _append_entry_to_yaml(target_yaml: Path, entry_text: str, *, entry_index: int | None = None) -> None:
@@ -2938,7 +2959,8 @@ def _append_entry_to_yaml(target_yaml: Path, entry_text: str, *, entry_index: in
         new_lines = [*lines[:insertion_point], entry_text, *lines[insertion_point:]]
         return "".join(new_lines)
 
-    atomic_update_text(target_yaml, append_to, encoding="utf-8", create_parent=True)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, append_to, encoding="utf-8", create_parent=True)
 
 
 def _emit_justify_output(
@@ -3723,7 +3745,8 @@ def _pop_allow_hits_entry_with_position(target_yaml: Path, entry_key: str) -> _R
         new_lines = [*lines[:entry_start], *lines[entry_end:]]
         return _normalize_empty_allow_hits("".join(new_lines))
 
-    atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
     if removed_entry is None:
         raise ValueError(f"{target_yaml}: no allow_hits entry found for key {entry_key!r}")
     return removed_entry
@@ -3779,7 +3802,8 @@ def _remove_allow_hits_entries(target_yaml: Path, entry_keys: set[str]) -> None:
             del new_lines[entry_start:entry_end]
         return _normalize_empty_allow_hits("".join(new_lines))
 
-    atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, remove_from, encoding="utf-8", create_parent=False)
 
 
 def _namespace_for_signing_spec(
@@ -3805,6 +3829,11 @@ def _namespace_for_signing_spec(
         judge_transport=args.judge_transport,
         judge_tools=args.judge_tools,
         _allow_hits_entry_index=allow_hits_entry_index,
+        _defer_override_rate_counter_snapshot=getattr(
+            args,
+            "_defer_override_rate_counter_snapshot",
+            False,
+        ),
     )
 
 
@@ -3856,7 +3885,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
     every binding from the live source (``verify_bundle_against_tree``) and
     aborts the whole run before a single write if any claim is stale (the
     atomicity gate -- "staging asserts, firing verifies"). After the confirm
-    gate, each action fires per-``kind``:
+    gate, actions fire into a durable private copy per-``kind``:
 
     * ``drift_repair`` re-runs the **real** judge through the
       ``sign-judge-signatures`` pop -> ``_run_justify`` -> restore-on-failure
@@ -3867,10 +3896,11 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
       ``apply_plan`` (no judge, no verdict) from the verify-time filtered plan;
     * ``stale_delete`` removes an orphaned entry (no judge).
 
-    Execute is **per-action non-transactional** by design (the verify gate is the
-    atomicity boundary): a mid-bundle BLOCK leaves earlier-accepted writes in
-    place, restores/skips the blocked action, and returns non-zero with a
-    per-action report.
+    Deterministic stale deletions and rotations run before paid judge work.
+    Successful actions are journalled so a later BLOCK or interruption can
+    resume without repeating accepted judge decisions.  The active allowlist is
+    changed only after every action succeeds, with an atomic whole-directory
+    exchange.
     """
     if args.judge_tools == "readonly" and _CLI_TRANSPORT_CHOICES[args.judge_transport] not in _READONLY_TOOL_TRANSPORTS:
         sys.stderr.write(_READONLY_TOOLS_TRANSPORT_ERROR)
@@ -3878,7 +3908,18 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
 
     from elspeth_lints.core.allowlist import _judge_metadata_hmac_key
     from elspeth_lints.core.bundle_verify import verify_bundle_against_tree
-    from elspeth_lints.core.review_bundle import read_bundle
+    from elspeth_lints.core.review_bundle import load_bundle
+    from elspeth_lints.core.sign_bundle_transaction import (
+        SignBundleTransactionError,
+        assert_active_unchanged,
+        assert_resume_identity,
+        create_transaction,
+        load_manifest,
+        publication_disposition,
+        rollback_pending_publish,
+        source_validation_pending,
+        transaction_lock,
+    )
 
     try:
         _load_judge_signing_env_file(args.env_file)
@@ -3897,18 +3938,79 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        bundle = read_bundle(args.bundle)
+        bundle_bytes = args.bundle.read_bytes()
+        bundle = load_bundle(bundle_bytes.decode("utf-8"))
     except (OSError, ValueError) as exc:
         sys.stderr.write(f"sign-bundle: cannot read bundle {args.bundle}: {exc}\n")
         return 2
+    verified_bundle_sha256 = hashlib.sha256(bundle_bytes).hexdigest()
+
+    resume_manifest: dict[str, Any] | None = None
+    resume_disposition: str | None = None
+    signing_policy = _sign_bundle_signing_policy(args)
+    verification_allowlist_dir = args.allowlist_dir
+    if args.resume is not None:
+        try:
+            resume_manifest = load_manifest(args.resume)
+            assert_resume_identity(
+                resume_manifest,
+                bundle_path=args.bundle,
+                root=args.root,
+                allowlist_dir=args.allowlist_dir,
+                rotation_log=args.rotation_log,
+                signing_policy=signing_policy,
+            )
+            resume_disposition = publication_disposition(resume_manifest)
+            if resume_disposition.startswith("published"):
+                # After the atomic swap the transaction's candidate path holds
+                # the original active tree. Re-derive bundle claims there while
+                # separately verifying journaled signatures in the live tree.
+                verification_allowlist_dir = Path(resume_manifest["candidate_dir"])
+        except SignBundleTransactionError as exc:
+            sys.stderr.write(f"sign-bundle: transaction error: {exc}\n")
+            return 2
 
     # --- Re-verify gate: the all-or-nothing atomicity boundary ---------------
     try:
-        verification = verify_bundle_against_tree(bundle, root=args.root, allowlist_dir=args.allowlist_dir)
+        verification = verify_bundle_against_tree(
+            bundle,
+            root=args.root,
+            allowlist_dir=verification_allowlist_dir,
+        )
     except ValueError as exc:
+        if (
+            args.resume is not None
+            and not args.dry_run
+            and resume_manifest is not None
+            and resume_disposition is not None
+            and resume_disposition.startswith("published")
+            and source_validation_pending(resume_manifest)
+        ):
+            try:
+                with transaction_lock(args.allowlist_dir, create=False):
+                    pending_manifest = load_manifest(args.resume)
+                    rollback_pending_publish(args.resume, pending_manifest)
+            except SignBundleTransactionError as rollback_exc:
+                sys.stderr.write(f"sign-bundle: transaction error while rolling back source-unverifiable publish: {rollback_exc}\n")
+                return 2
         sys.stderr.write(f"sign-bundle: verify error: {exc}\n")
         return 2
     if not verification.ok:
+        if (
+            args.resume is not None
+            and not args.dry_run
+            and resume_manifest is not None
+            and resume_disposition is not None
+            and resume_disposition.startswith("published")
+            and source_validation_pending(resume_manifest)
+        ):
+            try:
+                with transaction_lock(args.allowlist_dir, create=False):
+                    pending_manifest = load_manifest(args.resume)
+                    rollback_pending_publish(args.resume, pending_manifest)
+            except SignBundleTransactionError as exc:
+                sys.stderr.write(f"sign-bundle: transaction error while rolling back source-invalid publish: {exc}\n")
+                return 2
         sys.stderr.write("sign-bundle: staged claims no longer match the source tree; refusing to sign (re-run stage_scan):\n")
         for mismatch in verification.mismatches:
             sys.stderr.write(f"  mismatch: {mismatch}\n")
@@ -3925,7 +4027,81 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
         sys.stderr.write("sign-bundle: aborted at the confirmation prompt; nothing written.\n")
         return 0
 
-    return _execute_sign_bundle(bundle, verification=verification, args=args)
+    tx_path: Path | None = None
+    manifest: dict[str, Any] | None = None
+    try:
+        with transaction_lock(args.allowlist_dir, create=True):
+            if args.resume is None:
+                tx_path, manifest = create_transaction(
+                    bundle_path=args.bundle,
+                    verified_bundle_sha256=verified_bundle_sha256,
+                    bundle_id=bundle.bundle_id,
+                    root=args.root,
+                    allowlist_dir=args.allowlist_dir,
+                    rotation_log=args.rotation_log,
+                    signing_policy=signing_policy,
+                )
+                sys.stderr.write(f"sign-bundle: private transaction created at {tx_path}; if interrupted, resume with --resume {tx_path}\n")
+            else:
+                tx_path = args.resume.resolve()
+                manifest = load_manifest(tx_path)
+                assert_resume_identity(
+                    manifest,
+                    bundle_path=args.bundle,
+                    root=args.root,
+                    allowlist_dir=args.allowlist_dir,
+                    rotation_log=args.rotation_log,
+                    signing_policy=signing_policy,
+                )
+            disposition = publication_disposition(manifest)
+            if disposition == "not_published":
+                assert_active_unchanged(manifest)
+            code = _execute_sign_bundle(
+                bundle,
+                verification=verification,
+                args=args,
+                tx_path=tx_path,
+                manifest=manifest,
+                disposition=disposition,
+            )
+    except KeyboardInterrupt:
+        if tx_path is not None:
+            _emit_sign_bundle_recovery(args, tx_path, reason="interrupted")
+        else:
+            sys.stderr.write("sign-bundle: interrupted before a recovery transaction was created; active allowlist unchanged.\n")
+        return 130
+    except SignBundleTransactionError as exc:
+        sys.stderr.write(f"sign-bundle: transaction error: {exc}\n")
+        if tx_path is not None:
+            _emit_sign_bundle_recovery(args, tx_path, reason="transaction failed")
+        return 2
+    except Exception as exc:
+        # Unexpected failures are contained by the private-copy boundary.  Do
+        # not include repr(exc): provider/config exceptions may carry secrets.
+        sys.stderr.write(
+            f"sign-bundle: unexpected {type(exc).__name__}; the active allowlist was not left in a partial per-action state.\n"
+        )
+        if tx_path is not None:
+            _emit_sign_bundle_recovery(args, tx_path, reason="unexpected failure")
+        return 2
+
+    if code != 0 and tx_path is not None:
+        _emit_sign_bundle_recovery(args, tx_path, reason="action did not succeed")
+    return code
+
+
+def _sign_bundle_signing_policy(args: argparse.Namespace) -> dict[str, Any]:
+    """Bind every non-secret option that can change resumed judgment semantics."""
+    return {
+        "owner": args.owner,
+        "operator_override": args.operator_override,
+        "max_tokens": args.max_tokens,
+        "repo_root": None if args.repo_root is None else str(args.repo_root.resolve()),
+        "env_file": None if args.env_file is None else str(args.env_file.resolve()),
+        "justify_format": args.justify_format,
+        "judge_transport": args.judge_transport,
+        "judge_tools": args.judge_tools,
+    }
 
 
 def _emit_sign_bundle_summary(bundle: Any, *, args: argparse.Namespace) -> None:
@@ -3957,17 +4133,30 @@ def _emit_sign_bundle_summary(bundle: Any, *, args: argparse.Namespace) -> None:
 
 def _confirm_sign_bundle() -> bool:
     """Interactive confirmation gate for the destructive write phase."""
-    sys.stdout.write("sign-bundle: proceed with the write phase? [y/N]: ")
+    sys.stdout.write("sign-bundle: proceed with the recoverable transaction? [y/N]: ")
     sys.stdout.flush()
     response = sys.stdin.readline()
     return response.strip().lower() in {"y", "yes"}
 
 
-def _execute_sign_bundle(bundle: Any, *, verification: Any, args: argparse.Namespace) -> int:
-    """Fire each action per-``kind`` after the verify gate + confirm gate."""
+def _execute_sign_bundle(
+    bundle: Any,
+    *,
+    verification: Any,
+    args: argparse.Namespace,
+    tx_path: Path,
+    manifest: dict[str, Any],
+    disposition: str,
+) -> int:
+    """Resume/fire actions privately, then atomically publish one coherent tree."""
     diagnosis = verification.diagnosis
     specs, _stale_keys, unrepairable = _signing_specs_from_diagnosis(diagnosis)
     specs_by_stale_key = {spec.stale_key: spec for spec in specs if spec.stale_key is not None}
+    stale_delete_sources = {
+        item.key: item.source_file
+        for item in diagnosis.items
+        if any(action.kind == "stale_delete" and action.key == item.key for action in bundle.actions)
+    }
     unrepairable_keys = {item.key for item in unrepairable}
 
     # A drift_repair action that is no longer signable (now in `unrepairable`)
@@ -3979,48 +4168,100 @@ def _execute_sign_bundle(bundle: Any, *, verification: Any, args: argparse.Names
             sys.stderr.write(f"  {key}\n")
         return 2
 
-    total = len(bundle.actions)
-    successes = 0
-    failures: list[str] = []
-    first_failure_code = 0
+    from elspeth_lints.core.sign_bundle_transaction import run_sign_bundle_transaction
 
-    for index, action in enumerate(bundle.actions, start=1):
-        if action.kind == "drift_repair":
-            code = _execute_drift_repair_action(action, specs_by_stale_key=specs_by_stale_key, args=args)
-        elif action.kind == "justify":
-            code = _execute_new_judgment_action(action, args=args)
-        elif action.kind == "rotation":
-            code = _execute_rotation_action(action, rotation_plan=verification.rotation_plan, args=args)
-        elif action.kind == "stale_delete":
-            code = _execute_stale_delete_action(action, args=args)
-        else:  # pragma: no cover - BundleAction.__post_init__ rejects unknown kinds
-            sys.stderr.write(f"sign-bundle: unknown action kind {action.kind!r}\n")
-            code = 2
-
-        if code == 0:
-            successes += 1
-        else:
-            failures.append(f"[{index}/{total}] {action.kind} {action.key} exit={code}")
-            if first_failure_code == 0:
-                first_failure_code = code
-
-    if successes:
-        # Baseline regen runs only AFTER a successful write phase (Task 2.5);
-        # an all-failed run wrote nothing, so there is nothing to re-baseline.
-        _maybe_regen_fingerprint_baseline(args)
-    _emit_sign_bundle_post_state(args)
-
-    if failures:
+    result = run_sign_bundle_transaction(
+        bundle=bundle,
+        verification=verification,
+        args=args,
+        tx_path=tx_path,
+        manifest=manifest,
+        disposition=disposition,
+        specs_by_stale_key=specs_by_stale_key,
+        execute_action=lambda action, action_args: _execute_one_sign_bundle_action(
+            action,
+            verification=verification,
+            specs_by_stale_key=specs_by_stale_key,
+            stale_delete_sources=stale_delete_sources,
+            args=action_args,
+        ),
+    )
+    if result.exit_code != 0:
         sys.stderr.write(
-            f"sign-bundle: {successes} succeeded / {len(failures)} failed (verify was the atomic gate; "
-            "execute is per-action -- earlier writes stand, the blocked action's prior state was restored/skipped):\n"
+            f"sign-bundle: transaction stopped after {result.completed_count} completed action(s); "
+            f"[{(result.failed_index or 0) + 1}/{len(bundle.actions)}] "
+            f"{result.failed_kind} {result.failed_key} exit={result.exit_code}.\n"
         )
-        for line in failures:
-            sys.stderr.write(f"  {line}\n")
-        return first_failure_code
-
-    sys.stdout.write(f"sign-bundle: completed; {successes} action(s) applied.\n")
+        return result.exit_code
+    _maybe_regen_fingerprint_baseline(args)
+    _refresh_override_rate_counter_snapshot_after_allowlist_write(args.allowlist_dir / "_defaults.yaml")
+    _emit_sign_bundle_post_state(args)
+    prefix = "recovered completed coherent publish" if result.recovered_publish else "completed"
+    sys.stdout.write(f"sign-bundle: {prefix}; {result.completed_count} action(s) applied in one coherent publish.\n")
     return 0
+
+
+def _execute_one_sign_bundle_action(
+    action: Any,
+    *,
+    verification: Any,
+    specs_by_stale_key: dict[str, Any],
+    stale_delete_sources: dict[str, str],
+    args: argparse.Namespace,
+) -> int:
+    """Execute one already-verified bundle action against the private copy."""
+    if action.kind == "drift_repair":
+        return _execute_drift_repair_action(action, specs_by_stale_key=specs_by_stale_key, args=args)
+    if action.kind == "justify":
+        return _execute_new_judgment_action(action, args=args)
+    if action.kind == "rotation":
+        return _execute_rotation_action(action, rotation_plan=verification.rotation_plan, args=args)
+    if action.kind == "stale_delete":
+        source_file = stale_delete_sources.get(action.key)
+        if source_file is None:
+            sys.stderr.write(f"sign-bundle: stale_delete {action.key!r} has no fresh diagnosis owner.\n")
+            return 2
+        return _execute_stale_delete_action(action, source_file=source_file, args=args)
+    sys.stderr.write(f"sign-bundle: unknown action kind {action.kind!r}\n")
+    return 2
+
+
+def _emit_sign_bundle_recovery(args: argparse.Namespace, tx_path: Path, *, reason: str) -> None:
+    """Print a paste-ready, secret-free resume command."""
+    command = [
+        "elspeth-lints",
+        "sign-bundle",
+        str(args.bundle.resolve()),
+        "--root",
+        str(args.root.resolve()),
+        "--allowlist-dir",
+        str(args.allowlist_dir.resolve()),
+        "--owner",
+        args.owner,
+        "--rotation-log",
+        str(args.rotation_log.resolve()),
+        "--judge-transport",
+        args.judge_transport,
+        "--judge-tools",
+        args.judge_tools,
+        "--resume",
+        str(tx_path),
+        "--yes",
+    ]
+    if args.repo_root is not None:
+        command.extend(("--repo-root", str(args.repo_root.resolve())))
+    if args.env_file is not None:
+        command.extend(("--env-file", str(args.env_file.resolve())))
+    if args.max_tokens is not None:
+        command.extend(("--max-tokens", str(args.max_tokens)))
+    if args.operator_override:
+        command.append("--operator-override")
+    if args.justify_format != "text":
+        command.extend(("--format", args.justify_format))
+    sys.stderr.write(
+        f"sign-bundle: {reason}; private decisions preserved at {tx_path}.\n"
+        f"sign-bundle: re-verify and resume with:\n  {shlex.join(command)}\n"
+    )
 
 
 def _execute_drift_repair_action(action: Any, *, specs_by_stale_key: dict[str, Any], args: argparse.Namespace) -> int:
@@ -4096,6 +4337,11 @@ def _execute_new_judgment_action(action: Any, *, args: argparse.Namespace) -> in
         justify_format=args.justify_format,
         judge_transport=args.judge_transport,
         judge_tools=args.judge_tools,
+        _defer_override_rate_counter_snapshot=getattr(
+            args,
+            "_defer_override_rate_counter_snapshot",
+            False,
+        ),
     )
     return _run_justify(namespace)
 
@@ -4155,12 +4401,18 @@ def _execute_rotation_action(action: Any, *, rotation_plan: Any, args: argparse.
     return 0
 
 
-def _execute_stale_delete_action(action: Any, *, args: argparse.Namespace) -> int:
+def _execute_stale_delete_action(
+    action: Any,
+    *,
+    source_file: str,
+    args: argparse.Namespace,
+) -> int:
     """Surgically remove one orphaned ``allow_hits`` entry from its owning YAML."""
-    if action.source_file is None:  # pragma: no cover - enforced by BundleAction.__post_init__
-        sys.stderr.write(f"sign-bundle: stale_delete {action.key!r} is missing source_file.\n")
+    source_path = Path(source_file)
+    if source_path.is_absolute() or len(source_path.parts) != 1 or source_path.name != source_file:
+        sys.stderr.write(f"sign-bundle: stale_delete {action.key!r} has unsafe verified source_file {source_file!r}.\n")
         return 2
-    target_yaml = args.allowlist_dir / action.source_file
+    target_yaml = args.allowlist_dir / source_file
     try:
         _pop_allow_hits_entry(target_yaml, action.key)
     except ValueError as exc:
@@ -4467,7 +4719,8 @@ def _rekey_entries_in_yaml(target_yaml: Path, specs: list[_RekeyRewriteSpec]) ->
 
         return "".join(result_lines)
 
-    atomic_update_text(target_yaml, rewrite_in, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, rewrite_in, encoding="utf-8", create_parent=False)
 
 
 def _rekey_entry_signature_line(
@@ -4936,7 +5189,8 @@ def _rewrite_v1_entries_as_v2_in_yaml(target_yaml: Path, specs: list[_V2RewriteS
 
         return "".join(result_lines)
 
-    atomic_update_text(target_yaml, rewrite_in, encoding="utf-8", create_parent=False)
+    with allowlist_mutation_lock(target_yaml.parent):
+        atomic_update_text(target_yaml, rewrite_in, encoding="utf-8", create_parent=False)
 
 
 def _rewrite_entry_binding_lines(

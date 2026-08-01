@@ -19,18 +19,20 @@ from pydantic import JsonValue
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
-from elspeth.web.composer.guided.connection_consumers import ConsumerIdentity, canonical_connection_consumers
+from elspeth.web.composer.guided.connection_consumers import canonical_connection_consumers
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentClaimError, evaluate_deferred_intent_coverage
 from elspeth.web.composer.guided.protocol import (
     PROPOSAL_RATIONALE_TEMPLATE,
     PROPOSAL_SUMMARY_TEMPLATE,
     ProposePipelinePayload,
     TurnType,
+    node_options_summary,
     proposal_component_label,
     proposal_structural_label,
     validate_payload,
     validate_proposal_catalog_refs,
 )
+from elspeth.web.composer.guided.resolved import SinkOutputResolved
 from elspeth.web.composer.guided.stage_subjects import (
     ComponentCountConstraint,
     EdgeRouteConstraint,
@@ -39,6 +41,11 @@ from elspeth.web.composer.guided.stage_subjects import (
     SubjectPresenceConstraint,
 )
 from elspeth.web.composer.guided.state_machine import ComponentTarget, DeferredStageIntent, GuidedSession
+from elspeth.web.composer.guided_blob_refs import (
+    reviewed_schema_declared_field_names,
+    reviewed_schema_mode,
+    reviewed_source_is_blob_bound,
+)
 from elspeth.web.composer.pipeline_proposal import PipelineProposal
 from elspeth.web.composer.state import CompositionState, NodeSpec
 
@@ -418,11 +425,27 @@ def guided_redacted_planner_context(guided: GuidedSession) -> dict[str, object]:
                 "name": source.name,
                 "plugin": source.plugin,
                 "observed_columns": list(source.observed_columns),
+                # A reviewed source's schema mode and declared field names are
+                # the same class of fact as an output's schema_mode /
+                # required_fields below, and the planner needs them for the
+                # same reason: without them a form-authored explicit schema
+                # arrives as option_keys alone, so the planner cannot see which
+                # fields exist and proposes topology that reads none of them
+                # (or none at all). Names and modes only — never a declared
+                # type, a path, or any other option value.
+                "schema_mode": reviewed_schema_mode(schema),
+                "declared_fields": list(reviewed_schema_declared_field_names(schema)),
                 "option_keys": sorted(source.options),
+                # Boolean only: the reference, path, and blob id stay server-side
+                # (elspeth-0762539db5). Absence of the fact is not the same as an
+                # unbound source, and the planner reads inline-data proposals
+                # differently from storage-backed ones.
+                "server_storage_bound": reviewed_source_is_blob_bound(source.options),
                 "on_validation_failure": source.on_validation_failure,
             }
             for stable_id in guided.source_order
             for source in (guided.reviewed_sources[stable_id],)
+            for schema in (source.options.get("schema"),)
         ],
         "outputs": [
             {
@@ -500,6 +523,136 @@ def guided_redacted_current_state_context(state: CompositionState) -> dict[str, 
     }
 
 
+def _sink_options_with_declared_required_fields(
+    options: dict[str, JsonValue],
+    declared_fields: Sequence[str],
+) -> dict[str, JsonValue]:
+    """Materialize reviewed declared output fields into the sink's schema contract.
+
+    Step-2 field review captures ``SinkOutputResolved.required_fields``, but the
+    reviewed sink OPTIONS never carried them, so both the composer sink-contract
+    check and the runtime DAG validation (which key off ``options.schema``)
+    silently abstained — the operator's declared contract was display-only (F3).
+    Merge the declared fields into the sanctioned ``schema.required_fields``
+    expression (contracts/schema.py) at the binder seam so one edit reaches
+    candidate validation, the sealed proposal, committed state, YAML, and
+    runtime.
+
+    Rules:
+    - empty ``declared_fields`` never reaches this helper (options stay
+      byte-identical upstream);
+    - author-typed ``schema.required_fields`` is MERGED (union, author order
+      first), never overwritten;
+    - a malformed schema block or malformed ``required_fields`` value is left
+      untouched — candidate validation owns rejecting it
+      (``contract_config_invalid``), and rewriting it here would mask the
+      defect.
+    """
+    schema_key = "schema" if "schema" in options else ("schema_config" if "schema_config" in options else "schema")
+    raw_schema = options.get(schema_key)
+    if raw_schema is None:
+        schema: dict[str, JsonValue] = {"mode": "observed"}
+    elif type(raw_schema) is dict:
+        schema = raw_schema
+    else:
+        return options
+    existing = schema.get("required_fields")
+    if existing is None:
+        authored: list[str] = []
+    elif type(existing) is list and all(type(item) is str for item in existing):
+        authored = cast(list[str], existing)
+    else:
+        return options
+    merged: list[JsonValue] = [*authored, *(field for field in declared_fields if field not in authored)]
+    schema["required_fields"] = merged
+    options[schema_key] = schema
+    return options
+
+
+def guided_reviewed_sink_options(reviewed_output: SinkOutputResolved) -> dict[str, JsonValue]:
+    """Return one reviewed sink's options with its declared contract materialized.
+
+    The single seam every pipeline carrying a reviewed output must pass
+    through: the planner-authored candidate binder below, and the
+    server-synthesized zero-transform sketch in
+    ``ComposerServiceImpl.plan_guided_pipeline``. Those two seams had diverged —
+    the sketch merged nothing, so step-2's declared output fields never reached
+    ``options.schema.required_fields`` and the sink-contract check skipped
+    (R2-F4). Both call ``guided_reviewed_sink_options`` now so a future third
+    pipeline builder cannot re-open the same gap.
+    """
+    if type(reviewed_output) is not SinkOutputResolved:
+        raise TypeError("reviewed_output must be an exact SinkOutputResolved")
+    options = cast(dict[str, JsonValue], deep_thaw(reviewed_output.options))
+    if not reviewed_output.required_fields:
+        # Empty declared fields never reach the merge helper: the options stay
+        # byte-identical, per its documented precondition.
+        return options
+    return _sink_options_with_declared_required_fields(options, reviewed_output.required_fields)
+
+
+def guided_unproducible_output_fields(guided: GuidedSession) -> tuple[dict[str, JsonValue], ...]:
+    """Name the declared output fields a zero-transform pipeline cannot produce.
+
+    A pass-through pipeline emits exactly what the reviewed sources carry, so a
+    declared sink field that appears in no source's observed columns and in no
+    source's explicitly declared schema fields is unproducible without a
+    transform. Candidate validation cannot be the guard here (R2-F4): before
+    ``guided_reviewed_sink_options`` the sink carried no ``required_fields`` at
+    all, so the sink-contract check skipped outright and sealed the sketch
+    green. Merging them helps only when the producer PARTICIPATES in
+    propagation — a blob-inspected source resolves an explicit ``flexible``
+    schema and does, but a source whose schema stays ``observed`` abstains
+    under ADR-007 and the check emits no contract at all — and even when it
+    does fire it is an opaque ``sink_contract_violation`` the planner burns its
+    repair budget on. The guided seam holds both halves of the fact BEFORE any
+    pipeline is built, so it names the gap here and lets the caller act on it.
+
+    Advisory shape only — this reports; the caller decides. The returned
+    projection is provider-safe: every value is already in
+    ``guided_redacted_planner_context`` (source ``observed_columns`` /
+    ``declared_fields``, output ``required_fields``), so naming the gap adds no
+    new egress. Values are plain JSON (sorted lists of ``str``) because the
+    planner context is canonicalized before it reaches a provider.
+    """
+    if type(guided) is not GuidedSession:
+        raise TypeError("guided must be an exact GuidedSession")
+    available: set[str] = set()
+    for stable_id in guided.source_order:
+        source = guided.reviewed_sources[stable_id]
+        available.update(source.observed_columns)
+        available.update(reviewed_schema_declared_field_names(source.options.get("schema")))
+    gaps: list[dict[str, JsonValue]] = []
+    for stable_id in guided.output_order:
+        output = guided.reviewed_outputs[stable_id]
+        missing = sorted(set(output.required_fields) - available)
+        if missing:
+            gaps.append({"stable_id": stable_id, "fields": cast(JsonValue, missing)})
+    return tuple(gaps)
+
+
+def guided_unproducible_output_field_names(guided: GuidedSession) -> tuple[str, ...]:
+    """Flatten :func:`guided_unproducible_output_fields` to sorted field names.
+
+    The planner loop and the operator-visible failure both want "which fields
+    is nothing producing", not "which sink declared them" — a zero-transform
+    candidate is wrong for the union, and the repair is the same whichever sink
+    asked. Derived from the per-output projection rather than recomputed so the
+    two can never disagree about what the gap is.
+
+    Every name here is a field the OPERATOR typed. Step-2 field review admits
+    ``chosen`` only from ``_candidate_fields`` (the reviewed sources' observed
+    columns) and forbids ``custom_inputs`` from overlapping them, so a name
+    that survives the set difference came from ``custom_inputs`` verbatim.
+    """
+    names: set[str] = set()
+    for gap in guided_unproducible_output_fields(guided):
+        fields = gap["fields"]
+        assert type(fields) is list  # built above as list[str]
+        names.update(cast(list[str], fields))
+    return tuple(sorted(names))
+
+
 def bind_guided_reviewed_components(
     pipeline: Mapping[str, Any],
     guided: GuidedSession,
@@ -562,11 +715,12 @@ def bind_guided_reviewed_components(
         candidate_name = candidate.get("sink_name", candidate.get("name"))
         if type(candidate_name) is str and candidate_name != reviewed_output.name:
             output_rename[candidate_name] = reviewed_output.name
+        rebound_options = guided_reviewed_sink_options(reviewed_output)
         rebound_outputs.append(
             {
                 "sink_name": reviewed_output.name,
                 "plugin": reviewed_output.plugin,
-                "options": deep_thaw(reviewed_output.options),
+                "options": rebound_options,
                 "on_write_failure": reviewed_output.on_write_failure,
             }
         )
@@ -756,7 +910,7 @@ def _node_behavior(
     *,
     route_aliases: Mapping[str, str],
     branch_aliases: Mapping[str, str],
-    coalesce_incoming_aliases: Sequence[str] | None = None,
+    barrier_incoming_aliases: Sequence[str] | None = None,
 ) -> dict[str, object]:
     if node.node_type == "transform":
         return {"kind": "transform"}
@@ -778,8 +932,8 @@ def _node_behavior(
             "output_mode": node.output_mode,
             "expected_output_count": (str(node.expected_output_count) if node.expected_output_count is not None else None),
         }
-    if node.node_type == "coalesce":
-        # A coalesce's branch aliases must EQUAL, in order, the branch aliases on
+    if node.node_type in ("coalesce", "row_union"):
+        # A correlated barrier's branch aliases must EQUAL, in order, the branch aliases on
         # its incoming flows (validate_payload, protocol.py). Those incoming edges
         # are emitted in edge_specs order — the branch-producer node order — which
         # the planner authors nondeterministically and independently of the
@@ -791,17 +945,25 @@ def _node_behavior(
         # branches.keys() only when no incoming aliases are supplied (a degenerate
         # coalesce with no branch producers, which candidate validation rejects
         # upstream anyway).
-        if coalesce_incoming_aliases is not None:
-            aliases = list(coalesce_incoming_aliases)
+        if barrier_incoming_aliases is not None:
+            aliases = list(barrier_incoming_aliases)
         else:
             branches = node.branches
             names = list(branches.keys()) if isinstance(branches, Mapping) else list(branches or ())
             aliases = [branch_aliases[name] for name in names]
+        if node.node_type == "row_union":
+            return {
+                "kind": "row_union",
+                "branch_aliases": aliases,
+                "policy": "require_all",
+                "timeout_seconds": node.timeout_seconds,
+            }
         return {
             "kind": "coalesce",
             "branch_aliases": aliases,
             "policy": node.policy,
             "merge": node.merge,
+            "timeout_seconds": node.timeout_seconds,
         }
     assert node.node_type == "gate"
     routes = _ordered_gate_routes(node)
@@ -810,7 +972,18 @@ def _node_behavior(
     fork_to = list(node.fork_to or ())
     return {
         "kind": "gate",
+        # The authored predicate travels VERBATIM: without it the review
+        # surfaces show only opaque route ordinals, so an inverted or
+        # fabricated condition is invisible to the operator (F11). The
+        # condition is already operator-visible in the Ready YAML — this is
+        # a projection fix, not a new disclosure.
+        "condition": node.condition,
         "route_aliases": [route_aliases[name] for name in route_names],
+        # Bijective with route_aliases IN THE SAME ORDER (both derive from
+        # _ordered_gate_routes, fork routes included): each server ordinal
+        # alias is bound to its author-visible route key ("true"/"false" or
+        # an author label) so review surfaces can say which branch is which.
+        "routes": [{"alias": route_aliases[name], "key": name} for name in route_names],
         "fork_branches": [
             {
                 "routes": [route_aliases[name] for name in fork_routes],
@@ -884,20 +1057,20 @@ def _build_projection(
     route_aliases = {key: proposal_structural_label("route", index) for index, key in enumerate(route_keys)}
     branch_aliases = {name: proposal_structural_label("branch", index) for index, name in enumerate(branch_names)}
 
-    # An edge INTO a coalesce arrives on a branch VALUE connection but must carry
+    # An edge INTO a correlated barrier arrives on a branch VALUE connection but must carry
     # the branch KEY's alias — validate_payload matches a coalesce's incoming
     # branch aliases against its behavior branch_aliases (keyed by the fork branch
     # name). Map each (coalesce id, value connection) to the key's alias so
     # add_targets can stamp the branch when routing a producer into the fan-in.
-    coalesce_branch_alias: dict[tuple[str, str], str] = {}
+    barrier_branch_alias: dict[tuple[str, str], str] = {}
     for node in state.nodes:
-        if node.node_type != "coalesce":
+        if node.node_type not in ("coalesce", "row_union"):
             continue
         raw_branches = node.branches
         branch_pairs = raw_branches.items() if isinstance(raw_branches, Mapping) else ((name, name) for name in (raw_branches or ()))
         for branch_key, branch_value in branch_pairs:
             if type(branch_value) is str and branch_value and branch_key in branch_aliases:
-                coalesce_branch_alias[(node_ids[node.id], branch_value)] = branch_aliases[branch_key]
+                barrier_branch_alias[(node_ids[node.id], branch_value)] = branch_aliases[branch_key]
 
     def gate_route_aliases(node: NodeSpec) -> dict[str, str]:
         assert node.node_type == "gate"
@@ -911,28 +1084,6 @@ def _build_projection(
         )
     except ValueError as exc:  # pragma: no cover - validated state and exact IDs own this invariant
         raise AuditIntegrityError("guided proposal canonical consumer identities are malformed") from exc
-
-    # ``canonical_connection_consumers`` keys consumers off ``node.input`` and
-    # ``output.name`` only. A coalesce ALSO consumes each of its branch
-    # connections (``branches`` values) — a fan-in whose branch producers publish
-    # those connections. Without registering the coalesce as their consumer, a
-    # branch output reached only through ``branches`` (e.g. the B variant's
-    # ``on_success`` in a fork/coalesce A/B) has "no canonical consumer" and the
-    # projection raises. Register the coalesce as a consumer of every branch
-    # connection it does not already consume through its own ``input``.
-    consumers = dict(consumers)
-    for coalesce_node in state.nodes:
-        if coalesce_node.node_type != "coalesce":
-            continue
-        raw_branches = coalesce_node.branches
-        branch_connections = list(raw_branches.values()) if isinstance(raw_branches, Mapping) else list(raw_branches or ())
-        identity: ConsumerIdentity = ("node", node_ids[coalesce_node.id])
-        for connection in branch_connections:
-            if type(connection) is not str or not connection:
-                continue
-            existing = consumers.get(connection, ())
-            if identity not in existing:
-                consumers[connection] = (*existing, identity)
 
     edge_specs: list[tuple[dict[str, str], dict[str, str], dict[str, object]]] = []
 
@@ -964,12 +1115,12 @@ def _build_projection(
             raise AuditIntegrityError("guided proposal connection has no canonical consumer")
         for kind, stable_id in destinations:
             edge_flow = flow
-            # An edge into a coalesce via one of its branch connections must
+            # An edge into a correlated barrier via one of its branch connections must
             # carry that branch's alias (validate_payload rejects a branch-less
             # flow into a coalesce). The producer emitting the flow does not know
             # its consumer is a fan-in, so stamp the alias here per destination.
             if kind == "node":
-                branch_alias = coalesce_branch_alias.get((stable_id, connection))
+                branch_alias = barrier_branch_alias.get((stable_id, connection))
                 if branch_alias is not None:
                     edge_flow = {**flow, "branch": branch_alias}
             edge_specs.append((origin, _endpoint(kind, stable_id), edge_flow))
@@ -1015,6 +1166,8 @@ def _build_projection(
             if node.id in consumers:
                 add_targets(origin, node.id, {"kind": "coalesce_success", "branch": None})
             add_targets(origin, node.on_success, {"kind": "coalesce_success", "branch": None})
+        elif node.node_type == "row_union":
+            add_targets(origin, node.on_success, {"kind": "row_union_success", "branch": None})
         else:
             add_targets(origin, node.on_success, {"kind": "node_success", "branch": None})
             add_targets(origin, node.on_error, {"kind": "node_error"})
@@ -1025,6 +1178,23 @@ def _build_projection(
             output.on_write_failure,
             {"kind": "output_write_failure"},
         )
+
+    # Row-union release order is the authored ``branches`` mapping order, not
+    # the incidental order of its producer nodes. Keep the projection's incoming
+    # flows in that exact order so the public behavior and protocol validation
+    # preserve the runtime N-to-N release contract.
+    for node in state.nodes:
+        if node.node_type != "row_union" or not isinstance(node.branches, Mapping):
+            continue
+        stable_id = node_ids[node.id]
+        alias_rank = {branch_aliases[branch_name]: index for index, branch_name in enumerate(node.branches)}
+        positions = [index for index, (_origin, destination, _flow) in enumerate(edge_specs) if destination.get("stable_id") == stable_id]
+        ordered = sorted(
+            (edge_specs[index] for index in positions),
+            key=lambda spec: alias_rank[cast(str, spec[2]["branch"])],
+        )
+        for index, spec in zip(positions, ordered, strict=True):
+            edge_specs[index] = spec
 
     resolved_edge_ids = list(edge_stable_ids or (str(uuid4()) for _ in edge_specs))
     if len(resolved_edge_ids) != len(edge_specs):
@@ -1038,17 +1208,17 @@ def _build_projection(
         }
         for index, (origin, destination, flow) in enumerate(edge_specs)
     ]
-    # Branch aliases carried by each coalesce's incoming edges, in edge_specs
-    # (= wire-edge = validator ``incoming_edges``) order. A coalesce's behavior
+    # Branch aliases carried by each correlated barrier's incoming edges, in edge_specs
+    # (= wire-edge = validator ``incoming_edges``) order. A barrier's behavior
     # branch_aliases is derived from THIS so it equals its incoming flows by
     # construction, regardless of the planner's authored branch/node ordering.
-    coalesce_stable_ids = {node_ids[node.id] for node in state.nodes if node.node_type == "coalesce"}
-    coalesce_incoming_branch_aliases: dict[str, list[str]] = {}
+    barrier_stable_ids = {node_ids[node.id] for node in state.nodes if node.node_type in ("coalesce", "row_union")}
+    barrier_incoming_branch_aliases: dict[str, list[str]] = {}
     for _edge_origin, edge_destination, edge_flow in edge_specs:
         destination_id = edge_destination.get("stable_id")
         branch_alias = edge_flow.get("branch")
-        if destination_id in coalesce_stable_ids and isinstance(branch_alias, str) and branch_alias:
-            coalesce_incoming_branch_aliases.setdefault(destination_id, []).append(branch_alias)
+        if destination_id in barrier_stable_ids and isinstance(branch_alias, str) and branch_alias:
+            barrier_incoming_branch_aliases.setdefault(destination_id, []).append(branch_alias)
     nodes: list[dict[str, Any]] = [
         {
             "stable_id": node_ids[node.id],
@@ -1059,10 +1229,14 @@ def _build_projection(
                 node,
                 route_aliases=gate_route_aliases(node) if node.node_type == "gate" else {},
                 branch_aliases=branch_aliases,
-                coalesce_incoming_aliases=(
-                    coalesce_incoming_branch_aliases.get(node_ids[node.id]) if node.node_type == "coalesce" else None
+                barrier_incoming_aliases=(
+                    barrier_incoming_branch_aliases.get(node_ids[node.id]) if node.node_type in ("coalesce", "row_union") else None
                 ),
             ),
+            # Allowlisted key options as display text (R2-F3). Same closed
+            # server-owned vocabulary the wire review projects, so the proposal
+            # card and the wiring card describe a node identically.
+            "node_options_summary": node_options_summary(node.plugin, node.options),
         }
         for index, node in enumerate(state.nodes)
     ]
@@ -1138,10 +1312,12 @@ def _projection_kind_summary(payload: Mapping[str, Any]) -> _ProjectionKindSumma
     """Structural (Tier-3-safe) node/edge kind summary for projection failure logs.
 
     The PROPOSE_PIPELINE projection is already the closed, redacted wire shape —
-    it carries no options, prompts, or draft content, only catalog plugin ids,
-    node/flow kinds, and structural aliases. Project just those so a projection
-    failure names the offending shape (e.g. a coalesce whose branch aliases do
-    not match its incoming flow order) without touching private authored values.
+    it carries no prompts or draft content, and no options beyond the closed
+    ``_NODE_OPTION_SUMMARY_ALLOWLIST`` display pairs, only catalog plugin ids,
+    node/flow kinds, and structural aliases. Project just the kinds and aliases
+    (never the option summary) so a projection failure names the offending
+    shape (e.g. a coalesce whose branch aliases do not match its incoming flow
+    order) without touching private authored values.
     """
     nodes = payload["nodes"] if isinstance(payload.get("nodes"), list) else []
     graph = payload["graph"] if isinstance(payload.get("graph"), Mapping) else {}
@@ -1154,7 +1330,7 @@ def _projection_kind_summary(payload: Mapping[str, Any]) -> _ProjectionKindSumma
             "behavior": node["behavior"].get("kind") if isinstance(node.get("behavior"), Mapping) else None,
             "branch_aliases": (
                 node["behavior"].get("branch_aliases")
-                if isinstance(node.get("behavior"), Mapping) and node["behavior"].get("kind") == "coalesce"
+                if isinstance(node.get("behavior"), Mapping) and node["behavior"].get("kind") in ("coalesce", "row_union")
                 else None
             ),
         }
@@ -1244,6 +1420,9 @@ __all__ = [
     "guided_private_reviewed_facts",
     "guided_redacted_current_state_context",
     "guided_redacted_planner_context",
+    "guided_reviewed_sink_options",
+    "guided_unproducible_output_field_names",
+    "guided_unproducible_output_fields",
     "require_guided_correction_target_changed",
     "resolve_guided_correction_target",
     "verified_remaining_deferred_intents",

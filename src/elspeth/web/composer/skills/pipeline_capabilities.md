@@ -31,9 +31,21 @@ Author exactly one complete canonical pipeline proposal through
 
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live
-discovery proves it. Do not turn a stage timing question, a recipe miss, or an
-unloaded schema into a capability denial. Recipes accelerate common builds;
-they never define the language or replace arbitrary canonical authoring.
+discovery proves it — cite the `prohibited` array on `list_sources` /
+`list_transforms` / `list_sinks`, or an attempt failure (e.g. a rejected
+`set_source`), never a bare assertion. Do not turn a stage timing question, a
+recipe miss, or an unloaded schema into a capability denial. Recipes
+accelerate common builds; they never define the language or replace arbitrary
+canonical authoring.
+
+When a user names a specific plugin and asks why it cannot be used, check the
+relevant discovery tool's `prohibited` array before answering. A plugin listed
+there is closed by standing security policy, not by anything an operator can
+configure — state its `reason` and `explanation` verbatim rather than
+guessing, retrying, or silently dropping the question. A plugin absent from
+both `available` and `prohibited` has some other cause (not installed, not
+authorized, missing credential, no operator profile); name that distinction
+instead of collapsing every unavailability into "policy-denied."
 
 Model identifiers come only from `list_models`. Read the complete
 `list_secret_refs` result before describing credential state, validate the
@@ -60,6 +72,17 @@ are the routing contract: a producer's `on_success`, `on_error`, `routes`, or
   by subscripting the row namespace — `row['field']`; a bare field name is
   not in scope and is rejected. `get_expression_grammar` is the full grammar
   authority.
+  Gate semantics are the user's, never invented: use the user's stated
+  thresholds and comparison values VERBATIM in `condition`; never invent a
+  category literal the user or a reviewed schema fact did not state; never
+  invert a stated route — each route must reach the destination the user
+  named for that criterion. State the gate's condition and every route's
+  destination in your stage reply. If you chose a threshold, cutoff, or
+  category yourself, stage a pending `pipeline_decision` interpretation
+  requirement on that gate node and call
+  `request_interpretation_review(kind="pipeline_decision", ...)` — a gate is
+  not an `llm` node, so every other review kind (including `vague_term`) is
+  dropped there and never surfaces.
 - [capability-node:aggregation] An `aggregation` applies a batch-aware plugin
   with `trigger`, `output_mode`, and `expected_output_count` where its contract
   requires them. Row expansion is supported by an appropriate discovered
@@ -78,11 +101,23 @@ are the routing contract: a producer's `on_success`, `on_error`, `routes`, or
   ONLY the connections named in its `branches` values; its own `input` field
   is schema-required but is not a consuming binding — set it to the first
   branch's arriving connection by convention.
+- [capability-node:row_union] A `row_union` is a plugin-free, correlated
+  barrier that waits for every declared fork branch, then releases the
+  original branch rows in declared order without merging fields. Declare at
+  least two ordered `branches` as `{branch_name: input_connection}`; list form
+  normalizes to an identity mapping. Every branch value is a consuming
+  binding. The schema-required `input` is only an adapter placeholder and must
+  equal the first branch value. Set required `on_success` to a downstream
+  processing connection, never a sink. Optional top-level `timeout_seconds`
+  must be finite and positive. A row union publishes an observed schema and
+  does not invent field guarantees from its branches. Omit `plugin`, `options`,
+  error/routing, aggregation, and coalesce-only fields.
 
 Use `fork_to` for genuine fan-out and named branches for independent paths.
 Preserve multiple sources, multiple outputs, gates, queues, aggregations,
-forks, coalesces, row expansion, and failure paths whenever the request needs
-them. Never simplify a requested DAG into a single spine merely to converge.
+forks, coalesces, row unions, row expansion, and failure paths whenever the
+request needs them. Never simplify a requested DAG into a single spine merely
+to converge.
 
 ## Canonical structural fields
 
@@ -97,7 +132,7 @@ The terminal schema is authoritative. Its covered structural families are:
 | source | `plugin`, `blob_id`, `options`, `on_success`, `on_validation_failure`, `inline_blob` |
 | named_source | `plugin`, `options`, `on_success`, `on_validation_failure` |
 | inline_blob | `filename`, `mime_type`, `content`, `description` |
-| node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count` |
+| node | `id`, `node_type`, `plugin`, `input`, `on_success`, `on_error`, `options`, `condition`, `routes`, `fork_to`, `branches`, `policy`, `merge`, `trigger`, `output_mode`, `expected_output_count`, `timeout_seconds` |
 | trigger | `count`, `timeout_seconds`, `condition` |
 | edge | `id`, `from_node`, `to_node`, `edge_type`, `label` |
 | output | `sink_name`, `plugin`, `options`, `on_write_failure` |

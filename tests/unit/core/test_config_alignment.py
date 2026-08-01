@@ -419,10 +419,13 @@ class TestElspethSettingsAlignment:
         "sinks",  # Required - named sink configs
         "gates",  # Optional - config-driven routing
         "coalesce",  # Optional - fork path merging
+        "row_unions",  # Optional - fork-branch UNION ALL barriers
         "aggregations",  # Optional - config-driven batching
         "depends_on",  # Optional - pipeline dependencies
         "commencement_gates",  # Optional - pre-flight go/no-go conditions
         "collection_probes",  # Optional - vector store readiness checks
+        "llm_profiles",  # Optional - operator-owned LLM provider profile catalog
+        "default_llm_profile",  # Optional - preferred LLM profile alias
     }
 
     # Run mode fields (how to execute)

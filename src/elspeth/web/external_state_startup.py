@@ -62,18 +62,14 @@ def enforce_external_state_contract(
         )
 
 
-def _require_existing_directory(path: Path, *, label: str, env_var: str) -> None:
-    try:
-        directory_stat = path.lstat()
-    except (OSError, RuntimeError, ValueError):
-        raise _contract_error(f"External-state runtime directory {label} ({env_var}) is missing or invalid.") from None
-    if not stat.S_ISDIR(directory_stat.st_mode):
-        raise _contract_error(f"External-state runtime directory {label} ({env_var}) is missing or invalid.")
+def _require_safe_directory(path: Path, *, label: str, env_var: str) -> None:
+    """Require an existing, non-symlink, non-group/world-writable directory.
 
-
-def _require_safe_payload_directory(path: Path) -> None:
-    label = "payload_store"
-    env_var = "ELSPETH_WEB__PAYLOAD_STORE_PATH"
+    This is the same private-directory mode gate the deployment doctor
+    (``probe_directory_writable``) and the payload store apply: a directory
+    that another principal can write to (or replace via a symlink) is not a
+    safe place to keep the auth database or managed blob files.
+    """
     try:
         directory_stat = path.lstat()
         if stat.S_ISLNK(directory_stat.st_mode) or not stat.S_ISDIR(directory_stat.st_mode):
@@ -87,18 +83,18 @@ def _require_safe_payload_directory(path: Path) -> None:
 
 def require_runtime_directories_mounted(settings: WebSettings) -> None:
     """Require external-state runtime directories."""
-    _require_existing_directory(settings.data_dir, label="data_dir", env_var="ELSPETH_WEB__DATA_DIR")
+    _require_safe_directory(settings.data_dir, label="data_dir", env_var="ELSPETH_WEB__DATA_DIR")
 
     raw_payload_path = settings.payload_store_path
     if raw_payload_path is None:
         raise _contract_error("External-state runtime directory payload_store (ELSPETH_WEB__PAYLOAD_STORE_PATH) is missing or invalid.")
-    _require_safe_payload_directory(raw_payload_path.expanduser())
+    _require_safe_directory(raw_payload_path.expanduser(), label="payload_store", env_var="ELSPETH_WEB__PAYLOAD_STORE_PATH")
 
     try:
         blob_root = managed_blob_directory(str(settings.data_dir))
     except (OSError, RuntimeError, ValueError):
         raise _contract_error("External-state runtime directory blob (derived from ELSPETH_WEB__DATA_DIR) is missing or invalid.") from None
-    _require_existing_directory(blob_root, label="blob", env_var="ELSPETH_WEB__DATA_DIR")
+    _require_safe_directory(blob_root, label="blob", env_var="ELSPETH_WEB__DATA_DIR")
 
 
 def _probe_with_connection_budget(

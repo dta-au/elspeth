@@ -6,12 +6,18 @@
 #
 # Triggers:
 #   - After CI passes on main branch
-#   - On version tags (v*)
+#   - On version tags (v*). This includes pre-release/RC tags such as
+#     v0.7.2-RC-280726: the tag may point at a release/* branch commit (CI
+#     runs on release/** pushes), and the required-checks gate below verifies
+#     that exact commit's CI evidence. Pushing the git tag is the operator
+#     action that publishes a release-candidate image; nothing else does.
 #   - Manual dispatch with registry selection
 #
 # Tags:
-#   - sha-<commit>  (immutable, for CI)
-#   - v1.2.3        (semantic version, for releases)
+#   - sha-<commit>   (immutable, for CI)
+#   - <git tag name> (the release job promotes the verified digest to the
+#                     literal tag, e.g. v1.2.3 or v0.7.2-RC-280726; the
+#                     pre-release suffix is preserved, never rewritten)
 
 name: Build and Push
 
@@ -143,6 +149,32 @@ jobs:
               assert engine.dialect.driver == expected_driver
               engine.dispose()
           PY
+
+          # The reviewed AWS RDS trust root must be baked into this exact lean
+          # profile, root-owned and read-only, and readable under a read-only
+          # container filesystem. The expected digest is read from the
+          # committed sidecar so rotation touches only the sidecar, not this
+          # workflow.
+          image="$LEAN_IMAGE"
+          expected_rds_sha=$(cut -d' ' -f1 deploy/aws-ecs/trust/global-bundle.pem.sha256)
+          test "$(
+            docker inspect --format \
+              '{{ index .Config.Labels "io.elspeth.rds-ca-bundle-sha256" }}' \
+              "$image"
+          )" = "$expected_rds_sha"
+          test "$(
+            docker inspect --format \
+              '{{ index .Config.Labels "io.elspeth.rds-ca-certificate-identifier" }}' \
+              "$image"
+          )" = rds-ca-rsa2048-g1
+          docker run --rm --read-only --entrypoint python "$image" -c \
+            'from elspeth.web.aws_rds_trust import verify_aws_rds_trust_bundle; report = verify_aws_rds_trust_bundle(); assert report.certificate_count == 108'
+          docker run --rm --read-only --entrypoint /bin/sh "$image" -c \
+            'test "$(stat -c "%u:%g:%a" /etc/elspeth/rds/global-bundle.pem)" = "0:0:444" &&
+             test "$(stat -c "%u:%g:%a" /etc/elspeth/rds/global-bundle.pem.sha256)" = "0:0:444" &&
+             cd /etc/elspeth/rds &&
+             sha256sum -c global-bundle.pem.sha256'
+
           docker image rm "$LEAN_IMAGE"
 
       # -----------------------------------------------------------------------
@@ -191,6 +223,8 @@ jobs:
             # Semantic version from tag
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.revision=${{ env.IMAGE_SHA }}
 
       # -----------------------------------------------------------------------
       # Login to registries
@@ -368,6 +402,7 @@ jobs:
       - name: Verify generic image runtime contract
         run: |
           set -euo pipefail
+          expected_rds_sha=$(cut -d' ' -f1 deploy/aws-ecs/trust/global-bundle.pem.sha256)
           for image in "$GHCR_IMAGE" "$ACR_IMAGE"; do
             [[ -n "$image" ]] || continue
             docker pull "$image"
@@ -390,6 +425,29 @@ jobs:
               assert engine.dialect.driver == expected_driver
               engine.dispose()
           PY
+
+            # The reviewed AWS RDS trust root must be baked into every
+            # published image, root-owned and read-only, and readable under a
+            # read-only container filesystem. The expected digest is read
+            # from the committed sidecar so rotation touches only the
+            # sidecar, not this workflow.
+            test "$(
+              docker inspect --format \
+                '{{ index .Config.Labels "io.elspeth.rds-ca-bundle-sha256" }}' \
+                "$image"
+            )" = "$expected_rds_sha"
+            test "$(
+              docker inspect --format \
+                '{{ index .Config.Labels "io.elspeth.rds-ca-certificate-identifier" }}' \
+                "$image"
+            )" = rds-ca-rsa2048-g1
+            docker run --rm --read-only --entrypoint python "$image" -c \
+              'from elspeth.web.aws_rds_trust import verify_aws_rds_trust_bundle; report = verify_aws_rds_trust_bundle(); assert report.certificate_count == 108'
+            docker run --rm --read-only --entrypoint /bin/sh "$image" -c \
+              'test "$(stat -c "%u:%g:%a" /etc/elspeth/rds/global-bundle.pem)" = "0:0:444" &&
+               test "$(stat -c "%u:%g:%a" /etc/elspeth/rds/global-bundle.pem.sha256)" = "0:0:444" &&
+               cd /etc/elspeth/rds &&
+               sha256sum -c global-bundle.pem.sha256'
           done
 
       - name: Basic CLI tests
@@ -579,6 +637,9 @@ jobs:
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
         with:
           generate_release_notes: true
+          # A hyphen in the tag marks a semver pre-release (v0.7.2-RC-280726):
+          # publish it as a GitHub prerelease so an RC never becomes "latest".
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             ## Docker Images
 

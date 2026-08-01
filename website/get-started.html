@@ -102,8 +102,8 @@
     <div class="section-head" style="max-width:70ch">
       <span class="eyebrow">Important upgrade posture</span>
       <h2>Pre-1.0 databases are recreated, not migrated.</h2>
-      <p>APIs, interfaces, and schemas are unstable before 1.0; ELSPETH makes no backward-compatibility promise. From 0.7.1 to 0.7.2, <code>SESSION_SCHEMA_EPOCH</code> changes 35 → 37 for retryable blob deletion and the compatible-generation coordination schema. The guided schema remains at 10, and Landscape <code>SQLITE_SCHEMA_EPOCH</code> remains at 29.</p>
-      <p>Archive or export needed evidence, stop the old service, and recreate an incompatible session store. A Landscape store already at epoch 29 remains current. Do not run older code over the recreated session database: there is no in-place migration. The separate <code>auth.db</code> is not the session or Landscape store.</p>
+      <p>APIs, interfaces, and schemas are unstable before 1.0; ELSPETH makes no backward-compatibility promise. From 0.7.1 to 0.7.2, <code>SESSION_SCHEMA_EPOCH</code> changes 35 → 42 for retryable blob deletion, guided-state hard cuts, and compatible-generation coordination. The guided schema remains at 10, and Landscape <code>SQLITE_SCHEMA_EPOCH</code> changes 29 → 30 for durable row-union barrier attribution.</p>
+      <p>Archive or export needed evidence, stop the old service, and recreate an incompatible session store. A Landscape store at epoch 29 is stale and must be recreated too. Do not run older code over the recreated databases: there is no in-place migration. The separate <code>auth.db</code> is not the session or Landscape store.</p>
     </div>
   </div>
 </section>

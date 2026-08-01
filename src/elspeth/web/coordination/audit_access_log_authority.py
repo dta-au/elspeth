@@ -61,7 +61,8 @@ class RepositoryAuditAccessLogAuthority:
             raise TypeError("session_id must be a non-empty exact string")
         if type(requesting_principal) is not str or not requesting_principal:
             raise TypeError("requesting_principal must be a non-empty exact string")
-        if type(auth_provider_type) is not str or auth_provider_type not in {"local", "oidc", "entra"}:
+        auth_provider_candidate: object = auth_provider_type
+        if type(auth_provider_candidate) is not str or auth_provider_candidate not in {"local", "oidc", "entra"}:
             raise ValueError("auth_provider_type must be a supported exact provider")
         if type(request_path) is not str or not request_path:
             raise TypeError("request_path must be a non-empty exact string")

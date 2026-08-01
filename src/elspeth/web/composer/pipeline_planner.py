@@ -14,16 +14,21 @@ import asyncio
 import hashlib
 import json
 import math
+import os
+import re
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast
+from typing import Any, Final, Literal, NotRequired, Protocol, TypedDict, cast, final
 from uuid import UUID
 
 import structlog
+from litellm.exceptions import APIError as LiteLLMAPIError
+from litellm.exceptions import AuthenticationError as LiteLLMAuthError
+from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import Engine
@@ -39,6 +44,7 @@ from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
+from elspeth.web.composer.authority_hashing import project_composer_authority_payload
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads, require_bounded_text
 from elspeth.web.composer.capability_skill import (
     PLANNER_DISCOVERY_TOOL_NAMES,
@@ -66,8 +72,17 @@ from elspeth.web.composer.progress import (
 )
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
-from elspeth.web.composer.state import CompositionState, ValidationEntry, ValidationSummary, coalesce_reachability_facts
+from elspeth.web.composer.state import (
+    CompositionState,
+    RouteDestinationFactDict,
+    ValidationEntry,
+    ValidationSummary,
+    coalesce_reachability_facts,
+    gate_condition_is_constant,
+    route_destination_facts,
+)
 from elspeth.web.composer.tools._common import RuntimePreflight, ToolContext, ToolResult
 from elspeth.web.composer.tools._dispatch import (
     execute_discovery_tool_with_context,
@@ -94,12 +109,29 @@ class PipelinePlannerError(RuntimeError):
     exhaustion — the discriminant a live 5xx investigation needs, recorded on
     the durable failure disposition so it never requires a temp diagnostic.
     Empty for non-rejection failures (timeout, provider error, ...).
+
+    ``unproducible_output_fields`` carries the reviewed output fields no
+    reviewed source declares or observes, when the request was planned with a
+    known gap (R2-F4). Without it an exhausted guided plan answers the operator
+    with only "the provider returned an invalid response" while the server
+    holds the exact, actionable cause. The names are the operator's own
+    ``custom_inputs`` from step-2 field review (see
+    ``guided_unproducible_output_field_names``), so returning them to that same
+    operator discloses nothing new.
     """
 
-    def __init__(self, message: str, *, code: str, detail_codes: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        detail_codes: tuple[str, ...] = (),
+        unproducible_output_fields: tuple[str, ...] = (),
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.detail_codes = detail_codes
+        self.unproducible_output_fields = unproducible_output_fields
 
 
 class PlannerDeclined(PipelinePlannerError):
@@ -113,6 +145,29 @@ class PlannerDeclined(PipelinePlannerError):
     def __init__(self, message: str, *, decline_text: str) -> None:
         super().__init__(message, code="DECLINED")
         self.decline_text = decline_text
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class GuidedPlannerDecline:
+    """A ``PlannerDeclined`` outcome carried as a return value, not raised.
+
+    Guided callers (``ComposerServiceImpl.plan_guided_full_pipeline`` and
+    ``.plan_guided_pipeline``) catch ``PlannerDeclined`` themselves and
+    return this instead of letting it propagate as a
+    ``PipelinePlannerError``: a decline is a conversational outcome, not a
+    planner failure, so it must never route through the guided operation's
+    ``GuidedOperationFailureCode`` mapping. Callers persist ``decline_text``
+    as an ordinary assistant chat message and complete the guided operation
+    normally (mirrors the freeform surface's handling in
+    ``ComposerServiceImpl.compose``).
+    """
+
+    decline_text: str
+
+    def __post_init__(self) -> None:
+        if type(self.decline_text) is not str:
+            raise TypeError("GuidedPlannerDecline.decline_text must be an exact str")
 
 
 class _PipelineCandidateRejected(RuntimeError):
@@ -139,8 +194,11 @@ class PlannerBudgetPolicy:
     max_cumulative_provider_cost: Decimal
 
     def __post_init__(self) -> None:
-        for name in ("max_total_provider_calls", "max_request_bytes", "max_completion_tokens"):
-            value = getattr(self, name)
+        for name, value in (
+            ("max_total_provider_calls", self.max_total_provider_calls),
+            ("max_request_bytes", self.max_request_bytes),
+            ("max_completion_tokens", self.max_completion_tokens),
+        ):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive exact integer")
         if type(self.max_cumulative_provider_cost) is not Decimal:
@@ -178,12 +236,28 @@ class PlannerModelConfig:
     # None disables the hatch: budget exhaustion raises exactly as before.
     escape_hatch_model: str | None = None
     escape_hatch_provider: str | None = None
+    # Endpoint affordance (Phase 3 Task 2): when the operator has pointed the
+    # PRIMARY composer role at a custom OpenAI-compatible endpoint, these are
+    # forwarded as ``api_base``/``api_key`` on every ordinary (non-hatch)
+    # planner completion. None (the default) omits both kwargs entirely.
+    # ``repr=False`` keeps the credential out of any dataclass repr that
+    # might land in a log line or exception message.
+    api_base: str | None = None
+    api_key: str | None = field(default=None, repr=False)
+    # Same affordance for the escape-hatch (ADVISOR) model — used only on
+    # hatch turns, mirroring escape_hatch_model/escape_hatch_provider. Never
+    # falls back to the primary api_base/api_key: the two roles are
+    # deliberately independent (see composer_advisor_endpoint_base_url).
+    escape_hatch_api_base: str | None = None
+    escape_hatch_api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
-        for name in ("model_identifier", "provider"):
-            value = getattr(self, name)
-            if type(value) is not str or not value.strip():
-                raise ValueError(f"{name} must be a non-empty exact string")
+        for string_field_name, string_value in (
+            ("model_identifier", self.model_identifier),
+            ("provider", self.provider),
+        ):
+            if type(string_value) is not str or not string_value.strip():
+                raise ValueError(f"{string_field_name} must be a non-empty exact string")
         if self.escape_hatch_model is not None and (type(self.escape_hatch_model) is not str or not self.escape_hatch_model.strip()):
             raise ValueError("escape_hatch_model must be a non-empty exact string or None")
         if self.escape_hatch_provider is not None and (
@@ -192,10 +266,32 @@ class PlannerModelConfig:
             raise ValueError("escape_hatch_provider must be a non-empty exact string or None")
         if (self.escape_hatch_model is None) != (self.escape_hatch_provider is None):
             raise ValueError("escape_hatch_model and escape_hatch_provider must be configured together")
-        for name in ("max_composition_turns", "max_discovery_turns", "max_tool_calls_per_turn", "max_api_attempts"):
-            value = getattr(self, name)
-            if type(value) is not int or value <= 0:
-                raise ValueError(f"{name} must be a positive exact integer")
+        if self.escape_hatch_api_base is not None and self.escape_hatch_model is None:
+            raise ValueError("escape_hatch_api_base requires escape_hatch_model to be configured")
+        if self.escape_hatch_api_key is not None and self.escape_hatch_model is None:
+            raise ValueError("escape_hatch_api_key requires escape_hatch_model to be configured")
+        # Defense-in-depth pairing (belt-and-braces alongside
+        # WebSettings._validate_composer_endpoint_credential_pairing): a
+        # constructed PlannerModelConfig must never carry a base URL without
+        # its explicit key, or vice versa, for either role. An endpoint with
+        # no key would let LiteLLM silently fall back to an ambient provider
+        # credential (e.g. OPENAI_API_KEY) and send it to the configured
+        # endpoint. This does not replace the settings-level validator (the
+        # only production source of these values); it forecloses the same
+        # bug reappearing if a future caller ever constructs this dataclass
+        # from something other than validated WebSettings fields.
+        if (self.api_base is None) != (self.api_key is None):
+            raise ValueError("api_base and api_key must be configured together (or both omitted)")
+        if (self.escape_hatch_api_base is None) != (self.escape_hatch_api_key is None):
+            raise ValueError("escape_hatch_api_base and escape_hatch_api_key must be configured together (or both omitted)")
+        for integer_field_name, integer_value in (
+            ("max_composition_turns", self.max_composition_turns),
+            ("max_discovery_turns", self.max_discovery_turns),
+            ("max_tool_calls_per_turn", self.max_tool_calls_per_turn),
+            ("max_api_attempts", self.max_api_attempts),
+        ):
+            if type(integer_value) is not int or integer_value <= 0:
+                raise ValueError(f"{integer_field_name} must be a positive exact integer")
         if isinstance(self.timeout_seconds, bool) or not isinstance(self.timeout_seconds, int | float):
             raise TypeError("timeout_seconds must be a finite positive number")
         if not math.isfinite(float(self.timeout_seconds)) or self.timeout_seconds <= 0:
@@ -214,14 +310,12 @@ class PlannerOriginatingMessage:
     user_id: str | None
 
     def __post_init__(self) -> None:
-        for name in ("session_id",):
-            value = getattr(self, name)
-            try:
-                parsed = UUID(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{name} must be a canonical UUID string") from exc
-            if str(parsed) != value:
-                raise ValueError(f"{name} must be a canonical UUID string")
+        try:
+            parsed = UUID(self.session_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("session_id must be a canonical UUID string") from exc
+        if str(parsed) != self.session_id:
+            raise ValueError("session_id must be a canonical UUID string")
         if self.message_id is not None:
             try:
                 parsed_message_id = UUID(self.message_id)
@@ -312,8 +406,11 @@ class _PlannerAttemptTrail:
         codes: tuple[str, ...] = (),
         planner_code: str | None = None,
         tool_calls: int = 0,
+        repeated_fingerprint: bool = False,
     ) -> None:
-        self.phase_counts[phase] = self.phase_counts.get(phase, 0) + 1
+        if phase not in self.phase_counts:
+            self.phase_counts[phase] = 0
+        self.phase_counts[phase] += 1
         rejection_codes = sorted(set(codes))
         if rejection_codes:
             self.rejection_history.append({"attempt": self.attempts, "outcome": outcome, "codes": rejection_codes})
@@ -329,6 +426,9 @@ class _PlannerAttemptTrail:
             rejection_codes=rejection_codes,
             planner_code=planner_code,
             tool_calls=tool_calls,
+            # True when this rejection's (component, code) fingerprint already
+            # appeared in this request — the doctrine's "our bug" signal.
+            repeated_fingerprint=repeated_fingerprint,
         )
 
     def log_summary(self, final_outcome: str) -> None:
@@ -364,8 +464,11 @@ class PipelinePlanResult:
         custody_result = cast(Any, self.custody_result)
         if type(custody_result) is not str or custody_result not in {"not_required", "ready"}:
             raise ValueError("custody_result must be 'not_required' or 'ready'")
-        for name in ("model_identifier", "model_version", "provider"):
-            value = getattr(self, name)
+        for name, value in (
+            ("model_identifier", self.model_identifier),
+            ("model_version", self.model_version),
+            ("provider", self.provider),
+        ):
             if type(value) is not str or not value.strip():
                 raise ValueError(f"{name} must be a non-empty exact string")
 
@@ -610,6 +713,12 @@ def _truncated_response_notice() -> str:
 # died terminal on a single prose reply with its whole repair budget unspent).
 _PROSE_NUDGE_BUDGET = 2
 
+# Message prefix every ``bind_guided_reviewed_components`` complaint about the
+# SHAPE OF THE CANDIDATE carries (guided/planning.py). Those describe what the
+# planner authored, so they are repairable; every other AuditIntegrityError
+# reaching the finalizer describes server-side authority and stays terminal.
+_CANDIDATE_SHAPE_INTEGRITY_PREFIX: Final[str] = "guided planner candidate"
+
 
 def _prose_reply_notice() -> str:
     return "Your previous reply called no tool. You must respond with a declared tool call — continue from where you were."
@@ -647,21 +756,189 @@ def _assistant_tool_calls_message(message: Any, calls: tuple[_ParsedToolCall, ..
 
 def _feedback_error_codes(feedback: Mapping[str, Any]) -> tuple[str, ...]:
     """Extract the closed error codes from a structural feedback envelope."""
-    validation = feedback.get("validation")
-    if not isinstance(validation, Mapping):
-        return ()
-    errors = validation.get("errors")
-    if not isinstance(errors, list | tuple):
-        return ()
-    return tuple(entry["error_code"] for entry in errors if isinstance(entry, Mapping) and isinstance(entry.get("error_code"), str))
+    validation = cast(Mapping[str, Any], feedback["validation"])
+    errors = cast(list[Mapping[str, Any]], validation["errors"])
+    return tuple(cast(str, entry["error_code"]) for entry in errors)
 
 
 def _transform_node_count(pipeline: Mapping[str, Any]) -> int:
     """Count transform/aggregation nodes in a planner-authored pipeline dict."""
-    nodes = pipeline.get("nodes")
-    if not isinstance(nodes, list):
-        return 0
-    return sum(1 for node in nodes if isinstance(node, dict) and node.get("node_type") in ("transform", "aggregation"))
+    nodes = cast(list[Mapping[str, Any]], pipeline["nodes"])
+    return sum(1 for node in nodes if node["node_type"] in ("transform", "aggregation"))
+
+
+# A stated routing threshold: a comparison operator, or comparison wording,
+# bound to a NUMBER. Requiring the number is what keeps this conservative —
+# "the transform above the gate" and "source -> sink" are ordinary authoring
+# prose and must never trip the guard. The operator lookbehind rejects arrow
+# and fat-arrow forms outright.
+_THRESHOLD_NUMBER: Final[str] = r"\$?\d+(?:[.,]\d+)*(?!\d)"
+# A number immediately followed by a unit noun measures a LIMIT — prompt
+# length, a row cap, a branch count — not a value a row is routed on. The
+# trailing ``(?!\d)`` on the number above is load-bearing: without it the
+# engine backtracks to a shorter number ("5" out of "50 words") and slips past
+# this lookahead.
+_THRESHOLD_UNIT_NOUN: Final[str] = (
+    r"(?!\s*(?:%|(?:words?|characters?|chars?|rows?|records?|branch|branches|sinks?|nodes?|tokens?|"
+    r"seconds?|secs?|minutes?|ms|milliseconds?|times?|items?|entries|columns?|fields?)\b))"
+)
+_THRESHOLD_QUANTITY: Final[str] = _THRESHOLD_NUMBER + _THRESHOLD_UNIT_NOUN
+_THRESHOLD_OPERATOR: Final[str] = r"(?<![-=<>!])(?:>=|<=|==|>|<)"
+_THRESHOLD_WORDING: Final[str] = (
+    r"(?:greater than|less than|more than|fewer than|at least|at most|no more than|no less than|above|below|over|under)"
+)
+_STATED_THRESHOLD_PATTERN: Final[re.Pattern[str]] = re.compile(
+    rf"[A-Za-z_]\w*\s*{_THRESHOLD_OPERATOR}\s*{_THRESHOLD_QUANTITY}"
+    rf"|{_THRESHOLD_NUMBER}\s*{_THRESHOLD_OPERATOR}\s*[A-Za-z_]\w*"
+    rf"|{_THRESHOLD_WORDING}\s+{_THRESHOLD_QUANTITY}",
+    re.IGNORECASE,
+)
+
+
+# Routing intent. A comparison alone is not enough: "summarise each row in
+# under 50 words" and "keep at most 100 rows" bind comparison wording to a
+# number while asking for nothing about routing, and firing on those would
+# tell the model to author a gate condition a correct pipeline never needed —
+# turning a right answer into a wrong one. Both halves must hold.
+_ROUTING_INTENT_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:route|routes|routed|routing|send|sends|sent|go to|goes to|split|splits|gate|divert|diverts|separate|separates)\b",
+    re.IGNORECASE,
+)
+# Clause boundaries. "Split the rows into two sinks AND keep at most 100 rows"
+# states a routing action and an unrelated cap; only a comparison in the SAME
+# clause as the routing verb is plausibly the rule that routes.
+_CLAUSE_BOUNDARY_PATTERN: Final[re.Pattern[str]] = re.compile(
+    # ``\.(?!\d)`` splits sentences without splitting decimals: a decimal
+    # point is always followed by a digit, a full stop never is.
+    r"\.(?!\d)|[;:!?\n]|\band\b|\bthen\b|\bbut\b|\bwhile\b|\balso\b",
+    re.IGNORECASE,
+)
+
+
+def _stated_threshold_in(instruction: str) -> str | None:
+    """Return the routing comparison the instruction states, or None.
+
+    Deliberately conservative on three axes, because a false positive here is
+    worse than a miss: the rejection asserts the instruction stated a routing
+    rule and tells the model to author a gate condition, so on a pipeline that
+    is already correct a compliant model makes it wrong — and under a repair
+    budget of one that ends in REPAIR_EXHAUSTED with no proposal at all. A
+    comparison counts only when
+
+    1. an operator (or comparison wording) is bound to a literal number;
+    2. the number is NOT followed by a unit noun (``under 50 words``,
+       ``at most 100 rows``, ``more than 2 branches`` measure a limit, not a
+       row value); and
+    3. it shares a clause with a routing verb.
+
+    Known false negative, accepted: the expression form
+    ``row['amount'] > 500`` is missed, because the ``]`` breaks the
+    ``[A-Za-z_]\\w*`` operand. Widening the operand to swallow bracket
+    subscripts would also swallow ordinary prose ahead of an operator, and
+    false negatives are the safe direction — the non-blocking
+    ``gate_fan_out_advisory`` still names the shape at review.
+    """
+    for clause in _CLAUSE_BOUNDARY_PATTERN.split(instruction):
+        if _ROUTING_INTENT_PATTERN.search(clause) is None:
+            continue
+        match = _STATED_THRESHOLD_PATTERN.search(clause)
+        if match is not None:
+            return match.group(0).strip()
+    return None
+
+
+def _threshold_homeless_gate_id(pipeline: Mapping[str, Any]) -> str | None:
+    """Return a constant-condition gate id when NO gate carries a real condition.
+
+    Both halves matter. A candidate that authored a row-reading condition
+    somewhere has a home for the stated comparison and is left alone, even if
+    it also contains a constant fan-out gate; only a candidate whose every
+    gate is constant has provably dropped the rule.
+    """
+    gates = [node for node in cast(list[Mapping[str, Any]], pipeline["nodes"]) if node["node_type"] == "gate"]
+    constant_gate_ids = [
+        str(gate["id"]) for gate in gates if isinstance(gate.get("condition"), str) and gate_condition_is_constant(gate["condition"])
+    ]
+    if not constant_gate_ids or len(constant_gate_ids) != len(gates):
+        return None
+    return constant_gate_ids[0]
+
+
+def _stated_threshold_ignored_rejection(state: CompositionState, *, node_id: str, stated: str) -> ToolResult:
+    """Synthesize the coded rejection for a dropped routing threshold.
+
+    AWS acceptance run 2 (R2-F17, elspeth-5c0c09db31): asked to route rows on
+    ``amount > 500``, the planner authored a constant-condition gate forking
+    every row to BOTH sinks. That shape is legal — it is the documented
+    fan-out macro, generated by our own authoring aids — so it can never be a
+    structural rejection. What makes it wrong HERE is the instruction, which
+    only the planner loop can see.
+
+    The message quotes the comparison span from the instruction the planner's
+    own prompt was built from — content already verbatim in its context, the
+    same custody judgment ``plugin_options_invalid`` detail rides on — because
+    a bare code cannot tell the model which rule it dropped.
+    """
+    entry = ValidationEntry(
+        component=f"node:{node_id}",
+        message=(
+            f"Gate '{node_id}' has a constant condition, so it makes no per-row decision, but the "
+            f'instruction states the comparison "{stated}". Every row would take the same path.'
+        ),
+        severity="high",
+        error_code="gate_condition_ignores_stated_threshold",
+    )
+    return ToolResult(
+        success=False,
+        updated_state=state,
+        validation=ValidationSummary(is_valid=False, errors=(entry,), warnings=(), suggestions=()),
+        affected_nodes=(node_id,),
+    )
+
+
+_UNPRODUCIBLE_OUTPUT_FIELDS_CODE: Final[str] = "passthrough_cannot_produce_declared_fields"
+
+
+def _unproducible_output_fields_rejection(state: CompositionState, *, fields: tuple[str, ...]) -> ToolResult:
+    """Synthesize the coded rejection for a zero-transform candidate with a gap.
+
+    R2-F4 (elspeth-6e311df389). Step-2 field review let the operator declare
+    output fields no reviewed source declares or observes; a candidate with no
+    transform or aggregation node has nothing that could produce them, so it is
+    unbuildable no matter how it is wired. Structural validation cannot answer
+    it: the sink-contract check emits no contract at all when the source
+    abstains from propagation (ADR-007), which is exactly the observed-schema
+    case. Only the planner loop sees both the reviewed gap and the candidate's
+    node count, so the rejection lives here.
+
+    Deliberately NOT one-shot with an omit-valve, unlike the nodeless-revision
+    and stated-threshold nudges: those infer intent from PROSE ELSPETH cannot
+    prove, so re-emitting is a legitimate "I meant it". This is a mechanical set
+    difference over reviewed facts, and adding ANY transform clears the guard in
+    one turn — so it fires on every attempt, including the escape hatch, rather
+    than letting the second identical candidate through. Repeated identical
+    rejections draw the ordinary repeat notice via the shared fingerprint path.
+
+    The message names the missing fields. They are the operator's own
+    ``custom_inputs`` strings, already verbatim in the planner's
+    ``reviewed_planner_context`` (``outputs[].required_fields``) — the same
+    custody judgment ``gate_condition_ignores_stated_threshold`` rides on.
+    """
+    entry = ValidationEntry(
+        component="pipeline",
+        message=(
+            "This candidate has no transform or aggregation nodes, so it can only emit what the source "
+            f"carries, but no reviewed source declares or observes these reviewed output fields: {', '.join(fields)}."
+        ),
+        severity="high",
+        error_code=_UNPRODUCIBLE_OUTPUT_FIELDS_CODE,
+    )
+    return ToolResult(
+        success=False,
+        updated_state=state,
+        validation=ValidationSummary(is_valid=False, errors=(entry,), warnings=(), suggestions=()),
+        affected_nodes=(),
+    )
 
 
 def _nodeless_revision_rejection(state: CompositionState) -> ToolResult:
@@ -679,6 +956,33 @@ def _nodeless_revision_rejection(state: CompositionState) -> ToolResult:
         ),
         severity="high",
         error_code="proposal_missing_requested_transforms",
+    )
+    return ToolResult(
+        success=False,
+        updated_state=state,
+        validation=ValidationSummary(is_valid=False, errors=(entry,), warnings=(), suggestions=()),
+        affected_nodes=(),
+    )
+
+
+def _missing_source_rejection(state: CompositionState) -> ToolResult:
+    """Synthesize the coded rejection for a candidate that names no source.
+
+    Both ``source`` and ``sources`` are optional on the terminal schema, so a
+    re-plan "delta" candidate that drops the source block is schema-legal and
+    reaches the candidate finalizer. The guided finalizer binds reviewed
+    component authority and has nothing to bind, so it answers that shape with
+    ``AuditIntegrityError`` — a terminal 500 for what is an ordinary authoring
+    slip (elspeth-bcc6bdac99). Rejecting the shape here, ahead of any
+    finalizer, keeps the repair identical on every surface: the same
+    ``no_source_configured`` entry ``set_pipeline`` already produces, carrying
+    the catalogue's "include a source block" fix.
+    """
+    entry = ValidationEntry(
+        component="rejected_mutation",
+        message="set_pipeline requires source or sources.",
+        severity="high",
+        error_code="no_source_configured",
     )
     return ToolResult(
         success=False,
@@ -720,7 +1024,43 @@ def _candidate_rejection_codes(result: ToolResult) -> tuple[str, ...]:
     return tuple(entry.error_code or "validation_error" for entry in _rejection_entries(result))
 
 
-def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
+# Closed routing-destination codes whose feedback carries instance wiring
+# facts from ``route_destination_facts`` (the rejected candidate's dangling
+# value plus its valid destinations). Same custody class as the coalesce
+# reachability facts: node ids, sink names, and connection names the planner
+# itself authored in the candidate being answered.
+_ROUTE_DESTINATION_FACT_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "source_on_success_dangling",
+        "transform_on_success_dangling",
+        "aggregation_on_success_dangling",
+        "transform_on_error_unknown_sink",
+        "coalesce_on_success_unknown_sink",
+    }
+)
+
+
+def _rejection_fingerprint(result: ToolResult) -> tuple[tuple[str, str], ...]:
+    """Identity of one candidate rejection: sorted (component, code) pairs.
+
+    Two rejections with the same fingerprint failed for the same reasons on
+    the same components — the previous repair changed nothing that mattered.
+    Project doctrine: an identical fingerprint repeating across attempts is a
+    feedback-quality defect (ours), so the loop must at minimum TELL the model
+    the repetition happened instead of silently burning budget on it.
+    """
+    return tuple(sorted((entry.component, entry.error_code or "validation_error") for entry in _rejection_entries(result)))
+
+
+_REPEAT_NOTICE = (
+    "This candidate failed with EXACTLY the same rejection set (same components, same codes) "
+    "as an earlier candidate in this request: the intervening changes did not fix — or "
+    "reintroduced — the failure. Change ONLY the fields the errors below name, keep every "
+    "other part of your last candidate byte-identical, and re-emit."
+)
+
+
+def _allowlisted_candidate_feedback(result: ToolResult, *, repeated_fingerprint: bool = False) -> dict[str, Any]:
     """Project only structured validation fields already safe for tool output.
 
     Raw validation messages are withheld — they can quote plugin names, option
@@ -732,10 +1072,23 @@ def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
     registered pipeline-decision kinds. The enrichment text is a public
     constant, never per-request data, so it does not re-open the message
     boundary this allowlist protects. Codes with no catalogue entry stay bare.
+
+    ``plugin_options_invalid`` additionally carries the validator's own
+    message as ``detail``. That message quotes only the OPTIONS OF THE
+    REJECTED CANDIDATE — content the planner itself authored in the very
+    tool call being answered, already present verbatim in its context and
+    in the session's tool audit — so echoing it back to the same planner
+    crosses no custody boundary. Withholding it made an exactly-repairable
+    rejection unrepairable: on run 06c9ec49 (2026-07-29) the validator
+    named the missing ``required_input_fields`` declaration and its
+    one-line patch, the planner never saw either, burned every repair on
+    the static enrichment's profile-alias hypothesis, and declined with a
+    confabulated cause — twice, in two sessions.
     """
     validation = result.validation
     errors: list[dict[str, Any]] = []
     reachability_facts: dict[str, dict[str, Any]] | None = None
+    destination_facts: dict[str, RouteDestinationFactDict] | None = None
     for entry in _rejection_entries(result):
         code = entry.error_code or "validation_error"
         projected: dict[str, Any] = {
@@ -747,6 +1100,26 @@ def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
         guidance = explain_validation_code(code)
         if guidance is not None:
             projected["explanation"], projected["suggested_fix"] = guidance
+        if code in ("plugin_options_invalid", "gate_condition_ignores_stated_threshold", _UNPRODUCIBLE_OUTPUT_FIELDS_CODE):
+            # Same custody judgment for all three: the message quotes only
+            # content the planner itself already holds verbatim — the options
+            # of the candidate it just authored, the comparison span from the
+            # instruction its own prompt was built from, or the reviewed output
+            # field names already in its ``reviewed_planner_context``.
+            projected["detail"] = entry.message
+        if code in _ROUTE_DESTINATION_FACT_CODES:
+            # Instance wiring facts derived from the REJECTED candidate state
+            # the result carries — the dangling value and the exact valid
+            # destinations (sink names / consumable connections) the planner
+            # itself authored. Without them the bare code names neither WHICH
+            # value dangled nor what it should match, and the static guidance
+            # can only send the model to get_pipeline_state — which reads the
+            # BASELINE session state, not the rejected candidate (empty on a
+            # fresh compose). AWS acceptance runs 2026-07-30 exhausted their
+            # repair budget on exactly that blindness (elspeth-5904b1683a).
+            if destination_facts is None:
+                destination_facts = route_destination_facts(result.updated_state)
+            projected["connectivity"] = destination_facts[entry.component]
         if code == "coalesce_branch_unreachable":
             # Instance wiring facts derived from the REJECTED state the result
             # carries — same redaction class as the contract facts below (node
@@ -758,9 +1131,7 @@ def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
             # exist.
             if reachability_facts is None:
                 reachability_facts = coalesce_reachability_facts(result.updated_state)
-            connectivity = reachability_facts.get(entry.component.removeprefix("node:"))
-            if connectivity is not None:
-                projected["connectivity"] = connectivity
+            projected["connectivity"] = reachability_facts[entry.component.removeprefix("node:")]
         if entry.contract is not None:
             # Structured contract facts: producer/consumer component ids and
             # schema FIELD NAMES from validated contract config — pipeline
@@ -771,8 +1142,16 @@ def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
             # fields are missing. This stays inside the message-redaction
             # boundary this allowlist protects.
             projected["contract"] = entry.contract.to_dict()
+        if entry.row_union_schema is not None:
+            # Structured row-union branch declarations: branch aliases,
+            # schema modes, field names, and declared field properties from
+            # the REJECTED candidate the planner authored. These are the
+            # row-union equivalent of the safe contract facts above, never
+            # runtime row content, and make the incompatibility repairable
+            # without exposing the free-form validation message.
+            projected["row_union_schema"] = entry.row_union_schema.to_dict()
         errors.append(projected)
-    return {
+    feedback: dict[str, Any] = {
         "success": False,
         "validation": {
             "is_valid": validation.is_valid,
@@ -785,6 +1164,12 @@ def _allowlisted_candidate_feedback(result: ToolResult) -> dict[str, Any]:
         # derailed otherwise-converging repairs.
         "guidance": "To expand any code, call explain_validation_error with the exact code string.",
     }
+    if repeated_fingerprint:
+        # Static text, never per-request data: names the repetition the model
+        # cannot see on its own (it has no attempt counter) so budget stops
+        # burning on byte-identical failures without the model knowing.
+        feedback["repeat_notice"] = _REPEAT_NOTICE
+    return feedback
 
 
 class _DeferredIntentClaimFeedbackError(TypedDict):
@@ -1070,7 +1455,10 @@ async def _build_valid_pipeline_plan(
     # Validate the exact provider-authored payload before adding server-owned
     # interpretation identity/status. Otherwise a forged canonical-looking row
     # would be indistinguishable from the trusted canonicalizer's output.
-    candidate_context = replace(terminal_context, tool_arguments_hash=stable_hash({"pipeline": pipeline}))
+    candidate_context = replace(
+        terminal_context,
+        tool_arguments_hash=stable_hash({"pipeline": project_composer_authority_payload(pipeline)}),
+    )
     try:
         candidate = await run_sync(
             build_set_pipeline_candidate,
@@ -1096,7 +1484,7 @@ async def _build_valid_pipeline_plan(
     pipeline = canonicalize_authored_node_review_requirements(pipeline, current_state=current_state)
     candidate_context = replace(
         terminal_context,
-        tool_arguments_hash=stable_hash({"pipeline": pipeline}),
+        tool_arguments_hash=stable_hash({"pipeline": project_composer_authority_payload(pipeline)}),
         _interpretation_requirements_are_internal=True,
     )
     candidate = await run_sync(
@@ -1146,7 +1534,7 @@ async def _build_valid_pipeline_plan(
         safe_pipeline = cast(dict[str, Any], deep_thaw(preparation.arguments))
         safe_context = replace(
             terminal_context,
-            tool_arguments_hash=stable_hash({"pipeline": safe_pipeline}),
+            tool_arguments_hash=stable_hash({"pipeline": project_composer_authority_payload(safe_pipeline)}),
             _interpretation_requirements_are_internal=True,
         )
         safe_candidate = await run_sync(
@@ -1210,6 +1598,15 @@ async def prepare_pipeline_plan(
 
     if policy_catalog.snapshot is not plugin_snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
+    # R2-F10: server-derived proposals (recipe router, guided sketch) never
+    # pass through a planner candidate_finalizer, so the required-control
+    # auto-wire pass runs here — BEFORE the pipeline is sealed into a proposal
+    # and its authority hash is computed. It cannot run any later: the commit
+    # path (pipeline_commit.prepare_pipeline_proposal_commit) re-executes the
+    # exact sealed arguments under the proposal's authority-hash binding, so a
+    # commit-time mutation would be an integrity violation by construction.
+    # The pass is idempotent — a covered pipeline passes through unchanged.
+    pipeline = wire_required_controls(pipeline, plugin_snapshot, policy_catalog)
     # Server-derived plans do not send this context to a provider, but accept
     # the same explicit authority split as the model-driven entry point.
     canonical_json(reviewed_planner_context)
@@ -1280,7 +1677,18 @@ async def prepare_pipeline_plan(
             provider=provider,
         )
     except _PipelineCandidateRejected as exc:
-        raise PipelinePlannerError("server-derived pipeline failed candidate validation", code="VALIDATION_FAILED") from exc
+        # Carry the rejection's closed codes exactly as the model-driven
+        # exhaustion path does (``_rejection_exhausted``). Discarding them here
+        # made the server-derived path structurally undiagnosable: the route
+        # recorded VALIDATION_FAILED with rejection_codes=[] while a coded
+        # rejection existed, so the durable disposition named no cause at all
+        # and a policy refusal was indistinguishable from a wiring mistake
+        # (guided S3 investigation, 2026-07-31).
+        raise PipelinePlannerError(
+            "server-derived pipeline failed candidate validation",
+            code="VALIDATION_FAILED",
+            detail_codes=_candidate_rejection_codes(exc.result),
+        ) from exc
 
 
 async def plan_pipeline(
@@ -1290,6 +1698,7 @@ async def plan_pipeline(
     provider_current_state: Mapping[str, Any],
     reviewed_facts: Mapping[str, Any],
     reviewed_planner_context: Mapping[str, Any],
+    unproducible_output_fields: tuple[str, ...],
     eligible_deferred_intent_ids: tuple[str, ...],
     claim_evaluator: PipelineClaimEvaluator | None,
     supersedes_draft_hash: str | None,
@@ -1322,6 +1731,8 @@ async def plan_pipeline(
     canonical_json(provider_current_state)
     if not callable(candidate_finalizer):
         raise TypeError("candidate_finalizer must be callable")
+    if type(unproducible_output_fields) is not tuple or any(type(field) is not str for field in unproducible_output_fields):
+        raise TypeError("unproducible_output_fields must be an exact string tuple")
     if type(eligible_deferred_intent_ids) is not tuple or any(type(intent_id) is not str for intent_id in eligible_deferred_intent_ids):
         raise TypeError("eligible_deferred_intent_ids must be an exact string tuple")
     if len(set(eligible_deferred_intent_ids)) != len(eligible_deferred_intent_ids):
@@ -1356,6 +1767,7 @@ async def plan_pipeline(
                 provider_current_state=provider_current_state,
                 reviewed_facts=reviewed_facts,
                 reviewed_planner_context=reviewed_planner_context,
+                unproducible_output_fields=unproducible_output_fields,
                 eligible_deferred_intent_ids=eligible_deferred_intent_ids,
                 claim_evaluator=claim_evaluator,
                 supersedes_draft_hash=supersedes_draft_hash,
@@ -1408,6 +1820,7 @@ async def _plan_pipeline_inner(
     provider_current_state: Mapping[str, Any],
     reviewed_facts: Mapping[str, Any],
     reviewed_planner_context: Mapping[str, Any],
+    unproducible_output_fields: tuple[str, ...],
     eligible_deferred_intent_ids: tuple[str, ...],
     claim_evaluator: PipelineClaimEvaluator | None,
     supersedes_draft_hash: str | None,
@@ -1501,8 +1914,16 @@ async def _plan_pipeline_inner(
     repair_count = 0
     prose_nudges = 0
     nodeless_nudge_given = False
+    threshold_nudge_given = False
+    # Computed once: the instruction is fixed for the whole planning request.
+    stated_threshold = _stated_threshold_in(intent)
     seen_discovery: set[tuple[str, str]] = set()
     seen_discovery_round = 0
+    # (component, code) fingerprints of every candidate rejection so far in
+    # this request. A repeat means the intervening repair changed nothing that
+    # mattered — the feedback then says so explicitly (repeat_notice) instead
+    # of letting the model burn budget without knowing it is looping.
+    seen_rejection_fingerprints: set[tuple[tuple[str, str], ...]] = set()
 
     async def call_model(
         *,
@@ -1544,6 +1965,32 @@ async def _plan_pipeline_inner(
             raise PipelinePlannerError("planner request byte budget exhausted", code="REQUEST_BYTES_EXHAUSTED")
         await emit_progress(lifecycle.progress, model_call_progress_event(intent))
 
+        def record_provider_failure(
+            exc: BaseException,
+            status: ComposerLLMCallStatus,
+            *,
+            started_at: datetime,
+            started_ns: int,
+            ordinal: int,
+        ) -> None:
+            failed_call = build_llm_call_record(
+                model_requested=effective_model,
+                messages=marked_messages,
+                tools=marked_tools,
+                status=status,
+                started_at=started_at,
+                started_ns=started_ns,
+                temperature=model_config.temperature,
+                seed=model_config.seed,
+                error_class=type(exc).__name__,
+                error_message=type(exc).__name__,
+                max_completion_tokens_requested=budget_policy.max_completion_tokens,
+                planner_policy_hash=budget_policy.audit_hash,
+                planner_call_ordinal=ordinal,
+            )
+            _assert_planner_call_matches_manifest(failed_call, manifest, recorder)
+            recorder.record_llm_call(failed_call)
+
         for attempt in range(1, model_config.max_api_attempts + 1):
             if total_calls >= budget_policy.max_total_provider_calls:
                 raise PipelinePlannerError("planner provider call budget exhausted", code="PROVIDER_CALLS_EXHAUSTED")
@@ -1571,6 +2018,21 @@ async def _plan_pipeline_inner(
                 kwargs["temperature"] = model_config.temperature
             if model_config.seed is not None:
                 kwargs["seed"] = model_config.seed
+            # Endpoint affordance: select by the SAME condition that selects
+            # effective_model above (model_override set == hatch turn), so
+            # the escape-hatch call never lands on the primary's endpoint —
+            # the two roles are independent by design.
+            if model_override is not None:
+                if model_config.escape_hatch_api_base is not None:
+                    kwargs["api_base"] = model_config.escape_hatch_api_base
+                if model_config.escape_hatch_api_key is not None:
+                    kwargs["api_key"] = model_config.escape_hatch_api_key
+            else:
+                if model_config.api_base is not None:
+                    kwargs["api_base"] = model_config.api_base
+                if model_config.api_key is not None:
+                    kwargs["api_key"] = model_config.api_key
+
             try:
                 response = await asyncio.wait_for(model_config.completion(**kwargs), timeout=remaining)
             except asyncio.CancelledError as exc:
@@ -1611,38 +2073,39 @@ async def _plan_pipeline_inner(
                 _assert_planner_call_matches_manifest(timed_out_call, manifest, recorder)
                 recorder.record_llm_call(timed_out_call)
                 raise PipelinePlannerError("planner wall-clock budget exhausted", code="TIMEOUT") from exc
-            except Exception as exc:
-                from litellm.exceptions import APIError as LiteLLMAPIError
-                from litellm.exceptions import AuthenticationError as LiteLLMAuthError
-                from litellm.exceptions import BadRequestError as LiteLLMBadRequestError
-
-                status = ComposerLLMCallStatus.API_ERROR
-                if isinstance(exc, LiteLLMAuthError):
-                    status = ComposerLLMCallStatus.AUTH_ERROR
-                elif isinstance(exc, LiteLLMBadRequestError):
-                    status = ComposerLLMCallStatus.BAD_REQUEST_ERROR
-                failed_call = build_llm_call_record(
-                    model_requested=effective_model,
-                    messages=marked_messages,
-                    tools=marked_tools,
-                    status=status,
+            except LiteLLMAuthError as exc:
+                record_provider_failure(
+                    exc,
+                    ComposerLLMCallStatus.AUTH_ERROR,
                     started_at=started_at,
                     started_ns=started_ns,
-                    temperature=model_config.temperature,
-                    seed=model_config.seed,
-                    error_class=type(exc).__name__,
-                    error_message=type(exc).__name__,
-                    max_completion_tokens_requested=budget_policy.max_completion_tokens,
-                    planner_policy_hash=budget_policy.audit_hash,
-                    planner_call_ordinal=ordinal,
+                    ordinal=ordinal,
                 )
-                _assert_planner_call_matches_manifest(failed_call, manifest, recorder)
-                recorder.record_llm_call(failed_call)
-                if (
-                    isinstance(exc, LiteLLMAPIError)
-                    and status is ComposerLLMCallStatus.API_ERROR
-                    and attempt < model_config.max_api_attempts
-                ):
+                raise PipelinePlannerError(
+                    f"planner provider call failed ({type(exc).__name__})",
+                    code="PROVIDER_ERROR",
+                ) from None
+            except LiteLLMBadRequestError as exc:
+                record_provider_failure(
+                    exc,
+                    ComposerLLMCallStatus.BAD_REQUEST_ERROR,
+                    started_at=started_at,
+                    started_ns=started_ns,
+                    ordinal=ordinal,
+                )
+                raise PipelinePlannerError(
+                    f"planner provider call failed ({type(exc).__name__})",
+                    code="PROVIDER_ERROR",
+                ) from None
+            except LiteLLMAPIError as exc:
+                record_provider_failure(
+                    exc,
+                    ComposerLLMCallStatus.API_ERROR,
+                    started_at=started_at,
+                    started_ns=started_ns,
+                    ordinal=ordinal,
+                )
+                if attempt < model_config.max_api_attempts:
                     retry_delay = model_config.api_retry_base_seconds * (2 ** (attempt - 1))
                     if retry_delay > 0:
                         await asyncio.sleep(min(retry_delay, max(0.0, deadline - asyncio.get_running_loop().time())))
@@ -1746,19 +2209,35 @@ async def _plan_pipeline_inner(
             "planner repair budget exhausted",
             code="REPAIR_EXHAUSTED",
             detail_codes=last_rejection_codes,
+            # Carried whenever the request HAD a gap, not only when the final
+            # rejection named it: the planner was asked to close this gap and
+            # did not, so it is the actionable cause of the exhaustion whatever
+            # code the last candidate happened to trip (R2-F4).
+            unproducible_output_fields=unproducible_output_fields,
         )
 
     def _hatch_available() -> bool:
         return model_config.escape_hatch_model is not None and not hatch_spent
 
-    def _engage_escape_hatch(error: PipelinePlannerError) -> None:
+    def _engage_escape_hatch(error: PipelinePlannerError, *, rejection_feedback: Mapping[str, Any] | None = None) -> None:
         # The over-budget attempt is dropped from the conversation so no
         # assistant tool_calls message dangles without its tool results.
+        # When the exhaustion was a candidate rejection, the advisor would
+        # otherwise never learn WHY the final candidate failed (the dropped
+        # attempt takes its feedback with it) — so the same allowlisted,
+        # message-stripped envelope the repair turn would have received rides
+        # inside the hatch notice. Closed codes and candidate-authored names
+        # only; no new disclosure surface.
         nonlocal hatch_error, hatch_turn_next, hatch_spent
         hatch_error = error
         hatch_turn_next = True
         hatch_spent = True
-        messages.append({"role": "user", "content": _escape_hatch_notice()})
+        content = _escape_hatch_notice()
+        if rejection_feedback is not None:
+            content += "\n\nFor context: the final candidate (dropped from the conversation above) was rejected with:\n" + canonical_json(
+                rejection_feedback
+            )
+        messages.append({"role": "user", "content": content})
 
     while True:
         is_hatch_turn = hatch_turn_next
@@ -1850,6 +2329,9 @@ async def _plan_pipeline_inner(
                     raise PipelinePlannerError("planner composition turn budget exhausted", code="COMPOSITION_EXHAUSTED")
             call = terminal_calls[0]
             terminal_feedback: Mapping[str, Any] | None = None
+            # Only fingerprinted feedback kinds can repeat; schema and
+            # deferred-claim feedback carry no rejection identity to compare.
+            repeated_terminal_fingerprint = False
             pipeline: dict[str, Any] | None = None
             claimed_deferred_intent_ids: tuple[str, ...] = ()
             allowed_terminal_keys = {"pipeline", "claimed_deferred_intent_ids"}
@@ -1869,25 +2351,78 @@ async def _plan_pipeline_inner(
                     claimed_deferred_intent_ids = tuple(str(intent_id) for intent_id in payload.claimed_deferred_intent_ids)
                     if not set(claimed_deferred_intent_ids).issubset(eligible_deferred_intent_ids):
                         terminal_feedback = _deferred_intent_claim_feedback()
+            finalized_pipeline: Mapping[str, Any] | None = None
+            if terminal_feedback is None:
+                assert pipeline is not None
+                if pipeline.get("source") is None and pipeline.get("sources") is None:
+                    # Fingerprinted like every other candidate rejection: a
+                    # sourceless candidate re-emitted unchanged must still draw
+                    # the repeat notice rather than silently burning budget.
+                    missing_source = _missing_source_rejection(current_state)
+                    missing_source_fingerprint = _rejection_fingerprint(missing_source)
+                    repeated_terminal_fingerprint = missing_source_fingerprint in seen_rejection_fingerprints
+                    seen_rejection_fingerprints.add(missing_source_fingerprint)
+                    terminal_feedback = _allowlisted_candidate_feedback(missing_source, repeated_fingerprint=repeated_terminal_fingerprint)
+                else:
+                    try:
+                        finalizer_result = candidate_finalizer(pipeline)
+                    except AuditIntegrityError as exc:
+                        if not str(exc).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX):
+                            # Not a candidate-shape complaint: a genuine
+                            # integrity breach stays terminal.
+                            raise
+                        # The reviewed-authority binder rejected the shape the
+                        # planner authored — repairable in one budgeted turn,
+                        # never a 500. The sourceless case is already answered
+                        # above with its own code; the residue (an empty
+                        # ``sources`` map, an invented component name) reaches
+                        # here and gets the canonical schema complaint.
+                        terminal_feedback = _canonical_schema_feedback()
+                    else:
+                        if type(finalizer_result) is not dict:
+                            raise AuditIntegrityError("pipeline candidate finalizer must return an exact dict")
+                        finalized_pipeline = finalizer_result
             if terminal_feedback is not None:
                 last_rejection_codes = _feedback_error_codes(terminal_feedback)
                 if is_hatch_turn:
-                    trail.log_attempt("hatch", "candidate_rejected", codes=last_rejection_codes, led_to="terminal")
+                    trail.log_attempt(
+                        "hatch",
+                        "candidate_rejected",
+                        codes=last_rejection_codes,
+                        led_to="terminal",
+                        repeated_fingerprint=repeated_terminal_fingerprint,
+                    )
                     assert hatch_error is not None
                     raise hatch_error from None
                 repair_count += 1
                 if repair_count > repair_budget:
                     if _hatch_available():
                         trail.log_attempt(
-                            attempt_phase, "candidate_rejected", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
+                            attempt_phase,
+                            "candidate_rejected",
+                            codes=last_rejection_codes,
+                            planner_code="REPAIR_EXHAUSTED",
+                            led_to="hatch",
+                            repeated_fingerprint=repeated_terminal_fingerprint,
                         )
-                        _engage_escape_hatch(_rejection_exhausted())
+                        _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=terminal_feedback)
                         continue
                     trail.log_attempt(
-                        attempt_phase, "candidate_rejected", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
+                        attempt_phase,
+                        "candidate_rejected",
+                        codes=last_rejection_codes,
+                        planner_code="REPAIR_EXHAUSTED",
+                        led_to="terminal",
+                        repeated_fingerprint=repeated_terminal_fingerprint,
                     )
                     raise _rejection_exhausted() from None
-                trail.log_attempt(attempt_phase, "candidate_rejected", codes=last_rejection_codes, led_to="repair")
+                trail.log_attempt(
+                    attempt_phase,
+                    "candidate_rejected",
+                    codes=last_rejection_codes,
+                    led_to="repair",
+                    repeated_fingerprint=repeated_terminal_fingerprint,
+                )
                 messages.append(_assistant_tool_calls_message(message, calls))
                 messages.append(
                     {
@@ -1897,14 +2432,11 @@ async def _plan_pipeline_inner(
                     }
                 )
                 continue
-            assert pipeline is not None
+            assert finalized_pipeline is not None
             effective_provider = model_config.provider
             if is_hatch_turn:
                 assert model_config.escape_hatch_provider is not None
                 effective_provider = model_config.escape_hatch_provider
-            finalized_pipeline = candidate_finalizer(pipeline)
-            if type(finalized_pipeline) is not dict:
-                raise AuditIntegrityError("pipeline candidate finalizer must return an exact dict")
             terminal_context = replace(
                 request_context,
                 composer_model_identifier=audited_call.model_requested,
@@ -1912,6 +2444,40 @@ async def _plan_pipeline_inner(
                 composer_provider=effective_provider,
             )
             try:
+                if unproducible_output_fields and _transform_node_count(finalized_pipeline) == 0:
+                    # R2-F4 (elspeth-6e311df389). The reviewed outputs declare
+                    # fields no reviewed source declares or observes, and this
+                    # candidate has nothing that could produce them. The
+                    # server-synthesized sketch is diverted here before it is
+                    # ever built (ComposerServiceImpl.plan_guided_pipeline);
+                    # without this guard a planner that answers the diverted
+                    # request with the same bare pass-through re-opens the
+                    # identical defect, provider-authored and sealed as a
+                    # COMPLETE proposal.
+                    #
+                    # Unlike the two nudges around it this fires on EVERY
+                    # attempt including the hatch, and has no omit-valve: the
+                    # claim is a mechanical set difference over reviewed facts,
+                    # not an inference from prose, and adding any transform
+                    # clears it in one turn. An identical re-emit draws the
+                    # ordinary repeat notice through the shared fingerprint
+                    # path rather than being waved through.
+                    #
+                    # ORDERING IS LOAD-BEARING (T1xT3, acceptance-r2 final
+                    # review): this guard must precede the nodeless-revision
+                    # nudge below. Both trigger on the same zero-transform
+                    # shape, but the nudge's omit-valve promises that an
+                    # unchanged re-emit "will be accepted" while this guard
+                    # rejects exactly that re-emit — two contradictory repair
+                    # instructions against a repair budget of 2 is a
+                    # guaranteed unrepairable path. Firing this guard first
+                    # gives the model ONE coherent instruction that names the
+                    # missing fields, and adding a transform clears both
+                    # guards' trigger in the same turn; the nudge's promise is
+                    # then only ever made when it is true.
+                    raise _PipelineCandidateRejected(
+                        _unproducible_output_fields_rejection(current_state, fields=unproducible_output_fields)
+                    )
                 if (
                     not is_hatch_turn
                     and not nodeless_nudge_given
@@ -1930,9 +2496,33 @@ async def _plan_pipeline_inner(
                     # 9137456ad omit-valve pattern; bounded like
                     # prose_nudges). Never fired on the hatch turn — the
                     # hatch is one clean proposal or terminal, and a nudge
-                    # there guarantees failure.
+                    # there guarantees failure. Only reachable when
+                    # ``unproducible_output_fields`` is empty — the
+                    # satisfiability guard above owns the zero-transform shape
+                    # otherwise (see its ordering note).
                     nodeless_nudge_given = True
                     raise _PipelineCandidateRejected(_nodeless_revision_rejection(current_state))
+                if not is_hatch_turn and not threshold_nudge_given and stated_threshold is not None:
+                    # Stated-threshold fidelity (R2-F17, elspeth-5c0c09db31).
+                    # The instruction named a comparison and no gate in the
+                    # candidate reads a row to apply it, so the rule was
+                    # dropped: a constant gate forking to several destinations
+                    # writes every row everywhere. Structurally the shape is
+                    # legal — this can only be caught here, where the
+                    # instruction is in scope — so it is ONE coded repair with
+                    # the same omit-valve as the nodeless nudge: re-emitting
+                    # the same pipeline confirms a deliberate fan-out. Never
+                    # on the hatch turn, which gets one clean shot.
+                    homeless_gate_id = _threshold_homeless_gate_id(finalized_pipeline)
+                    if homeless_gate_id is not None:
+                        threshold_nudge_given = True
+                        raise _PipelineCandidateRejected(
+                            _stated_threshold_ignored_rejection(
+                                current_state,
+                                node_id=homeless_gate_id,
+                                stated=stated_threshold,
+                            )
+                        )
                 accepted_plan = await _build_valid_pipeline_plan(
                     pipeline=finalized_pipeline,
                     current_state=current_state,
@@ -1965,7 +2555,7 @@ async def _plan_pipeline_inner(
                         trail.log_attempt(
                             attempt_phase, "deferred_claim", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
                         )
-                        _engage_escape_hatch(_rejection_exhausted())
+                        _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=_deferred_intent_claim_feedback())
                         continue
                     trail.log_attempt(
                         attempt_phase, "deferred_claim", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
@@ -1993,7 +2583,7 @@ async def _plan_pipeline_inner(
                         trail.log_attempt(
                             attempt_phase, "arg_error", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
                         )
-                        _engage_escape_hatch(_rejection_exhausted())
+                        _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=_allowlisted_argument_feedback(exc))
                         continue
                     trail.log_attempt(
                         attempt_phase, "arg_error", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
@@ -2011,6 +2601,29 @@ async def _plan_pipeline_inner(
                 continue
             except _PipelineCandidateRejected as exc:
                 last_rejection_codes = _candidate_rejection_codes(exc.result)
+                rejection_fingerprint = _rejection_fingerprint(exc.result)
+                repeated_fingerprint = rejection_fingerprint in seen_rejection_fingerprints
+                seen_rejection_fingerprints.add(rejection_fingerprint)
+                candidate_feedback = _allowlisted_candidate_feedback(exc.result, repeated_fingerprint=repeated_fingerprint)
+                if os.environ.get("ELSPETH_PLANNER_REJECTION_DETAIL_LOG") == "1":
+                    # Operator-opted diagnostic seam. Validator messages are never
+                    # logged: even an opt-in diagnostic must not persist authored
+                    # option values, row content, paths, or secret material. Closed
+                    # codes plus component/severity retain the useful classifier.
+                    slog.warning(
+                        "composer.planner_rejection_detail",
+                        session_id=trail.session_id,
+                        operation_id=trail.operation_id,
+                        attempt=trail.attempts,
+                        entries=[
+                            {
+                                "component": entry.component,
+                                "error_code": entry.error_code or "validation_error",
+                                "severity": entry.severity,
+                            }
+                            for entry in _rejection_entries(exc.result)
+                        ],
+                    )
                 if is_hatch_turn:
                     trail.log_attempt("hatch", "candidate_rejected", codes=last_rejection_codes, led_to="terminal")
                     assert hatch_error is not None
@@ -2019,21 +2632,37 @@ async def _plan_pipeline_inner(
                 if repair_count > repair_budget:
                     if _hatch_available():
                         trail.log_attempt(
-                            attempt_phase, "candidate_rejected", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
+                            attempt_phase,
+                            "candidate_rejected",
+                            codes=last_rejection_codes,
+                            planner_code="REPAIR_EXHAUSTED",
+                            led_to="hatch",
+                            repeated_fingerprint=repeated_fingerprint,
                         )
-                        _engage_escape_hatch(_rejection_exhausted())
+                        _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=candidate_feedback)
                         continue
                     trail.log_attempt(
-                        attempt_phase, "candidate_rejected", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
+                        attempt_phase,
+                        "candidate_rejected",
+                        codes=last_rejection_codes,
+                        planner_code="REPAIR_EXHAUSTED",
+                        led_to="terminal",
+                        repeated_fingerprint=repeated_fingerprint,
                     )
                     raise _rejection_exhausted() from None
-                trail.log_attempt(attempt_phase, "candidate_rejected", codes=last_rejection_codes, led_to="repair")
+                trail.log_attempt(
+                    attempt_phase,
+                    "candidate_rejected",
+                    codes=last_rejection_codes,
+                    led_to="repair",
+                    repeated_fingerprint=repeated_fingerprint,
+                )
                 messages.append(_assistant_tool_calls_message(message, calls))
                 messages.append(
                     {
                         "role": "tool",
                         "tool_call_id": call.call_id,
-                        "content": canonical_json(_allowlisted_candidate_feedback(exc.result)),
+                        "content": canonical_json(candidate_feedback),
                     }
                 )
                 continue
@@ -2203,6 +2832,7 @@ async def _plan_pipeline_inner(
 
 __all__ = [
     "PLANNER_DISCOVERY_TOOL_NAMES",
+    "GuidedPlannerDecline",
     "PipelineCustodyResult",
     "PipelinePlanResult",
     "PipelinePlannerError",

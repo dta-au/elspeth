@@ -1,6 +1,6 @@
 """SQLAlchemy Core table definitions for the session database.
 
-Tables include session content plus epoch-37 web coordination authority,
+Tables include session content plus epoch-42 web coordination authority,
 run-start, transient handoff, rate-limit, and cleanup state.
 
 Current schema bootstrap lives in ``sessions/schema.py``. Pre-release
@@ -169,11 +169,36 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #   36 -> ``blob_deletion_cleanups`` retains the exact staged filesystem delete
 #        across post-commit unlink/fsync failures. Epoch 35 cannot make those
 #        purges retryable after the ``blobs`` row is gone and is rejected.
-#   37 -> persistent session-operation authority, compatible-generation
+#   37 -> ``guided_operations`` completed-plan result CHECKs gain the
+#        ``declined`` result kind and its state-only locator. Epoch 36 cannot
+#        represent an ordinary guided planner decline and is rejected outright.
+#   38 -> completed guided-plan declines also retain the exact assistant
+#        message ID used for replay. Epoch 37 cannot distinguish the original
+#        decline from later assistant messages sharing an unchanged state.
+#   39 -> ``guided_operations.failure_code`` gains the closed ``policy_blocked``
+#        value so a deployment-policy refusal settles as a permanent failure
+#        instead of being misattributed to the provider. Epoch 38's CHECK
+#        rejects the row outright; SQLite cannot ALTER a CHECK in place, so
+#        pre-release policy remains delete-and-recreate for stale session
+#        databases (sessions.db only — auth.db is never touched).
+#   40 -> guided propose-pipeline payloads require an explicit coalesce
+#        ``timeout_seconds`` key, including ``None``. Epoch 39 sessions may
+#        reference persisted schema-10 payloads that omit it, so they are
+#        rejected at startup instead of failing lazily during guided replay.
+#        This is a semantic-only hard cut; guided checkpoint schema stays 10.
+#   41 -> guided propose-pipeline and confirm-wiring nodes require a
+#        ``node_options_summary`` key, including the empty list (R2-F3: the
+#        review cards render a transform's key options, not just its behavior
+#        discriminant). Epoch 40 sessions reference persisted payloads that
+#        omit it, so a stored proposal would fail its projection verifier —
+#        and its wire turn would fail frontend decode — mid-replay. Reject
+#        those stores at startup instead. Guided checkpoint schema stays 10.
+#   42 -> persistent session-operation authority, compatible-generation
 #        membership/run-start coordination, cross-replica ticket/progress/rate
-#        state, bounded cleanup claims, and monotonic user-secret row versions.
-#        Epoch 36 cannot represent these authorities and is rejected outright.
-SESSION_SCHEMA_EPOCH = 37
+#        state, bounded cleanup claims, monotonic user-secret row versions, and
+#        durable proposal blob-effect receipts. Epoch 41 cannot represent these
+#        authorities or receipts and is rejected outright; no migration exists.
+SESSION_SCHEMA_EPOCH = 42
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -789,6 +814,7 @@ guided_operations_table = Table(
     Column("proposal_id", String(128), nullable=True),
     Column("result_kind", String(32), nullable=True),
     Column("result_state_id", String(128), nullable=True),
+    Column("result_message_id", String(128), nullable=True),
     Column("result_session_id", String(128), nullable=True),
     Column("response_hash", String(64), nullable=True),
     Column("failure_code", String(128), nullable=True),
@@ -821,6 +847,12 @@ guided_operations_table = Table(
         name="fk_guided_operations_result_state_session",
         ondelete="RESTRICT",
     ),
+    ForeignKeyConstraint(
+        ["result_message_id", "session_id"],
+        ["chat_messages.id", "chat_messages.session_id"],
+        name="fk_guided_operations_result_message_session",
+        ondelete="RESTRICT",
+    ),
     ForeignKeyConstraint(["result_session_id"], ["sessions.id"], name="fk_guided_operations_result_session", ondelete="RESTRICT"),
     CheckConstraint("length(operation_id) >= 1 AND length(operation_id) <= 128", name="ck_guided_operations_operation_id_bounded"),
     CheckConstraint(
@@ -834,6 +866,10 @@ guided_operations_table = Table(
     CheckConstraint(
         "result_state_id IS NULL OR (length(result_state_id) >= 1 AND length(result_state_id) <= 128)",
         name="ck_guided_operations_result_state_id_bounded",
+    ),
+    CheckConstraint(
+        "result_message_id IS NULL OR (length(result_message_id) >= 1 AND length(result_message_id) <= 128)",
+        name="ck_guided_operations_result_message_id_bounded",
     ),
     CheckConstraint(
         "result_session_id IS NULL OR (length(result_session_id) >= 1 AND length(result_session_id) <= 128)",
@@ -858,24 +894,25 @@ guided_operations_table = Table(
         name="ck_guided_operations_lease_token_bounded",
     ),
     CheckConstraint(
-        "result_kind IS NULL OR result_kind IN ('composition_state', 'pipeline_proposal', 'session')",
+        "result_kind IS NULL OR result_kind IN ('composition_state', 'pipeline_proposal', 'session', 'declined')",
         name="ck_guided_operations_result_kind",
     ),
     CheckConstraint(
         "failure_code IS NULL OR failure_code IN ('provider_unavailable', 'provider_timeout', "
-        "'invalid_provider_response', 'stale_conflict', 'integrity_error', 'custody_error', 'quota_exceeded', "
-        "'operation_failed', 'request_cancelled')",
+        "'invalid_provider_response', 'policy_blocked', 'stale_conflict', 'integrity_error', 'custody_error', "
+        "'quota_exceeded', 'operation_failed', 'request_cancelled')",
         name="ck_guided_operations_failure_code",
     ),
     CheckConstraint(
         "(status = 'in_progress' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL "
         "AND settled_at IS NULL AND result_kind IS NULL "
-        "AND response_hash IS NULL AND failure_code IS NULL) OR "
+        "AND result_message_id IS NULL AND response_hash IS NULL AND failure_code IS NULL) OR "
         "(status = 'completed' AND lease_token IS NULL AND lease_expires_at IS NULL "
         "AND settled_at IS NOT NULL AND result_kind IS NOT NULL AND response_hash IS NOT NULL AND failure_code IS NULL) OR "
         "(status = 'failed' AND lease_token IS NULL AND lease_expires_at IS NULL "
         "AND settled_at IS NOT NULL AND result_kind IS NULL AND result_state_id IS NULL "
-        "AND result_session_id IS NULL AND proposal_id IS NULL AND response_hash IS NULL AND failure_code IS NOT NULL)",
+        "AND result_message_id IS NULL AND result_session_id IS NULL AND proposal_id IS NULL "
+        "AND response_hash IS NULL AND failure_code IS NOT NULL)",
         name="ck_guided_operations_status_bundle",
     ),
     CheckConstraint(
@@ -885,14 +922,18 @@ guided_operations_table = Table(
         "(proposal_id IS NULL OR kind IN ('guided_respond', 'guided_chat'))) OR "
         "(status = 'completed' AND ("
         "(kind = 'session_fork' AND result_kind = 'session' AND result_session_id IS NOT NULL "
-        "AND result_state_id IS NULL AND proposal_id IS NULL) OR "
+        "AND result_state_id IS NULL AND result_message_id IS NULL AND proposal_id IS NULL) OR "
         "(kind = 'guided_plan' AND result_kind = 'pipeline_proposal' "
-        "AND result_state_id IS NOT NULL AND result_session_id IS NULL AND proposal_id IS NOT NULL) OR "
+        "AND result_state_id IS NOT NULL AND result_message_id IS NULL "
+        "AND result_session_id IS NULL AND proposal_id IS NOT NULL) OR "
+        "(kind = 'guided_plan' AND result_kind = 'declined' "
+        "AND result_state_id IS NOT NULL AND result_message_id IS NOT NULL "
+        "AND result_session_id IS NULL AND proposal_id IS NULL) OR "
         "(kind NOT IN ('session_fork', 'guided_plan') AND result_kind = 'composition_state' "
-        "AND result_state_id IS NOT NULL AND result_session_id IS NULL "
+        "AND result_state_id IS NOT NULL AND result_message_id IS NULL AND result_session_id IS NULL "
         "AND (proposal_id IS NULL OR kind IN ('guided_respond', 'guided_chat'))))) OR "
         "(status = 'failed' AND result_kind IS NULL AND result_state_id IS NULL "
-        "AND result_session_id IS NULL AND proposal_id IS NULL)",
+        "AND result_message_id IS NULL AND result_session_id IS NULL AND proposal_id IS NULL)",
         name="ck_guided_operations_result_locator",
     ),
     CheckConstraint(
@@ -2221,7 +2262,7 @@ run_start_permits_table = Table(
 )
 
 # Immutable, secret-reference-only envelope substrate. Task 8 owns the public
-# serialization and resolver carrier; epoch 37 reserves and constrains its
+# serialization and resolver carrier; epoch 42 reserves and constrains its
 # durable shape now so deployment compatibility cannot drift underneath it.
 _RUN_EXECUTION_IDENTITY_COLUMNS = (
     "canonical_input_digest",

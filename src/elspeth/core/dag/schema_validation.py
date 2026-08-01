@@ -10,10 +10,12 @@ signatures.
 
 from __future__ import annotations
 
+from itertools import combinations
 from typing import TYPE_CHECKING
 
 from elspeth.contracts import PluginSchema, RoutingMode, check_compatibility
 from elspeth.contracts.enums import NodeType
+from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.types import NodeID
 from elspeth.core.dag.guarantees import (
     EffectiveGuaranteeVote,
@@ -57,6 +59,13 @@ def validate_edge_compatibility(graph: ExecutionGraph) -> None:
     for coalesce_id in coalesce_nodes:
         validate_coalesce_compatibility(graph, coalesce_id, _schema_cache=schema_cache)
 
+    # row_union releases every branch payload unchanged into one long-format
+    # stream. Any branch contracts Composer/runtime can prove fixed must
+    # therefore be mutually compatible; observed/unknown branches abstain.
+    row_union_nodes = [node_id for node_id, data in graph._graph.nodes(data=True) if data["info"].node_type == NodeType.ROW_UNION]
+    for row_union_id in row_union_nodes:
+        validate_row_union_compatibility(graph, row_union_id, _schema_cache=schema_cache)
+
     # Validate sink required-field satisfaction against direct predecessors.
     # Catches mismatches between sink.declared_required_fields and upstream
     # output optionality at build time, rather than at runtime with a
@@ -94,9 +103,11 @@ def validate_single_edge(
     """
     to_info = graph.get_node_info(to_node_id)
 
-    # Skip edge validation for coalesce nodes - they have special validation
-    # that checks all incoming branches together
-    if to_info.node_type == NodeType.COALESCE:
+    # Skip edge validation for correlated barriers: their dedicated validators
+    # compare all incoming branches together. row_union branch payloads are
+    # released untouched, so consumer-style single-edge derivation does not
+    # apply even though its known fixed branches must agree with each other.
+    if to_info.node_type in (NodeType.COALESCE, NodeType.ROW_UNION):
         return
 
     # Rule 0: Gates must preserve schema (input == output)
@@ -484,6 +495,138 @@ def validate_coalesce_compatibility(
                     component_id=str(coalesce_id),
                     component_type="coalesce",
                 )
+
+
+def validate_row_union_compatibility(
+    graph: ExecutionGraph,
+    row_union_id: str,
+    *,
+    _schema_cache: dict[str, type[PluginSchema] | None] | None = None,
+) -> None:
+    """Validate all provably fixed row_union branch schemas are compatible.
+
+    row_union is a correlated ``UNION ALL``: it preserves every branch row
+    unchanged and publishes them as one long-format stream. Two known fixed
+    schemas that are not mutually compatible therefore make the stream's
+    declared contract false. Observed/unknown schemas continue to abstain
+    because their runtime rows may still be compatible.
+    """
+    incoming = list(graph._graph.in_edges(row_union_id, keys=True, data=True))
+    explicit_branches: list[tuple[str, type[PluginSchema], SchemaConfig | None]] = []
+    for from_id, _, _key, edge_data in incoming:
+        if edge_data["mode"] == RoutingMode.DIVERT:
+            # Failure/quarantine payloads do not conform to the producer's
+            # success schema, so that declaration proves nothing here.
+            continue
+        schema = get_effective_producer_schema(graph, from_id, _cache=_schema_cache)
+        if is_observed_schema(schema):
+            continue
+        assert schema is not None
+        explicit_branches.append(
+            (
+                from_id,
+                schema,
+                get_effective_producer_schema_config(graph, from_id),
+            )
+        )
+
+    if len(explicit_branches) < 2:
+        return
+
+    for (first_id, first_schema, first_config), (other_id, other_schema, other_config) in combinations(explicit_branches, 2):
+        if first_config is not None and other_config is not None:
+            compatible, conflicting_fields, error_msg = row_union_schema_configs_compatible(first_config, other_config)
+        else:
+            # An explicit model without its originating SchemaConfig cannot be
+            # proven flexible. Preserve the historical fail-closed full-shape
+            # comparison for that incomplete Tier-1 graph metadata.
+            compatible, error_msg = schemas_structurally_compatible(first_schema, other_schema)
+            conflicting_fields = ()
+        if compatible:
+            continue
+        conflict_suffix = f" Conflicting fields: {list(conflicting_fields)}." if conflicting_fields else ""
+        raise GraphValidationError(
+            f"row_union '{row_union_id}' receives incompatible schemas from multiple branches: "
+            f"branch from '{first_id}' has {first_schema.__name__}, "
+            f"branch from '{other_id}' has {other_schema.__name__}.{conflict_suffix} {error_msg}",
+            component_id=str(row_union_id),
+            component_type="row_union",
+        )
+
+
+def get_effective_producer_schema_config(
+    graph: ExecutionGraph,
+    node_id: str,
+    *,
+    _visited: frozenset[str] = frozenset(),
+) -> SchemaConfig | None:
+    """Resolve a producer's schema mode through true pass-through gates."""
+    if node_id in _visited:
+        return None
+    node_info = graph.get_node_info(node_id)
+    if node_info.output_schema_config is not None:
+        return node_info.output_schema_config
+    if node_info.node_type != NodeType.GATE:
+        return None
+
+    incoming_configs = [
+        get_effective_producer_schema_config(
+            graph,
+            from_id,
+            _visited=_visited | {node_id},
+        )
+        for from_id, _, _key, edge_data in graph._graph.in_edges(node_id, keys=True, data=True)
+        if edge_data["mode"] != RoutingMode.DIVERT
+    ]
+    known_configs = [config for config in incoming_configs if config is not None]
+    if not known_configs:
+        return None
+    first = known_configs[0]
+    return first if all(config == first for config in known_configs[1:]) else None
+
+
+def row_union_schema_configs_compatible(
+    first: SchemaConfig,
+    second: SchemaConfig,
+) -> tuple[bool, tuple[str, ...], str]:
+    """Compare two explicit row_union branch declarations.
+
+    Fixed/fixed declarations are exact contracts and therefore require full
+    mutual structural compatibility. If either side is flexible, undeclared
+    fields remain possible on that branch; only incompatible types on fields
+    both sides explicitly declare are mechanically provable.
+    """
+    if first.fields is None or second.fields is None:
+        return True, (), ""
+
+    first_fields = {field.name: field for field in first.fields}
+    second_fields = {field.name: field for field in second.fields}
+    if first.mode == "fixed" and second.mode == "fixed":
+        first_schema = build_coalesce_schema(first)
+        second_schema = build_coalesce_schema(second)
+        compatible, error_msg = schemas_structurally_compatible(first_schema, second_schema)
+        if compatible:
+            return True, (), ""
+        conflicting_fields = tuple(
+            sorted(name for name in first_fields.keys() | second_fields.keys() if first_fields.get(name) != second_fields.get(name))
+        )
+        return False, conflicting_fields, error_msg
+
+    conflicting_fields = tuple(
+        sorted(
+            name
+            for name in first_fields.keys() & second_fields.keys()
+            if first_fields[name].field_type != "any"
+            and second_fields[name].field_type != "any"
+            and first_fields[name].field_type != second_fields[name].field_type
+        )
+    )
+    if not conflicting_fields:
+        return True, (), ""
+    conflict_details = ", ".join(
+        f"{name} ({first_fields[name].field_type} vs {second_fields[name].field_type})" for name in conflicting_fields
+    )
+    return False, conflicting_fields, f"Conflicting shared field types: {conflict_details}"
 
 
 def validate_sink_required_fields(graph: ExecutionGraph) -> None:

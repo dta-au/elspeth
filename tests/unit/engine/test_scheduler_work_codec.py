@@ -19,7 +19,7 @@ import pytest
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.scheduler import BarrierEmission, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.engine.scheduler_work_codec import (
     TERMINAL_NODE_SENTINEL,
@@ -66,6 +66,7 @@ def _create_work_item(
     current_node_id: NodeID | None,
     coalesce_name: CoalesceName | None = None,
     coalesce_node_id: NodeID | None = None,
+    row_union_name: RowUnionName | None = None,
     on_success_sink: str | None = None,
 ) -> WorkItem:
     return WorkItem(
@@ -73,6 +74,8 @@ def _create_work_item(
         current_node_id=current_node_id,
         coalesce_node_id=coalesce_node_id,
         coalesce_name=coalesce_name,
+        row_union_node_id=NodeID(f"row_union_node_{row_union_name}") if row_union_name is not None else None,
+        row_union_name=row_union_name,
         on_success_sink=on_success_sink,
     )
 

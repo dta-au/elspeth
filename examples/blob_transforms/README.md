@@ -46,8 +46,11 @@ This example uses the public GitHub Pages tutorial files:
 Run:
 
 ```bash
-elspeth run --settings examples/blob_transforms/settings_fetch_tutorial_html.yaml --execute
+./examples/blob_transforms/run_hosted_fetch.sh
 ```
+
+The launcher makes the payload-store root private (`0700`) before execution,
+so the example also works in checkouts created under a collaborative umask.
 
 Output:
 

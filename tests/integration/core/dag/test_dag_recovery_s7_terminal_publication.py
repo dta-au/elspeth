@@ -41,19 +41,19 @@ def test_s7_reopens_after_both_coalesces_and_publishes_once(
     monkeypatch.setattr(Orchestrator, "resume", inspect.unwrap(Orchestrator.resume))
     install_corpus_plugin_manager(monkeypatch)
 
-    built_identity_tuples: list[tuple[int, int, int, int, int, int]] = []
+    built_object_tuples: list[tuple[object, object, object, object, object, object]] = []
     production_build = corpus_harness.build_scenario
 
     def record_fresh_build(*args: Any, **kwargs: Any) -> Any:
         built = production_build(*args, **kwargs)
-        built_identity_tuples.append(
+        built_object_tuples.append(
             (
-                id(built),
-                id(built.rendered),
-                id(built.rendered.settings),
-                id(built.bundle),
-                id(built.graph),
-                id(built.config),
+                built,
+                built.rendered,
+                built.rendered.settings,
+                built.bundle,
+                built.graph,
+                built.config,
             )
         )
         return built
@@ -65,12 +65,12 @@ def test_s7_reopens_after_both_coalesces_and_publishes_once(
     interrupted = recovery.interrupted
     resumed = recovery.resumed
 
-    assert len(built_identity_tuples) == 2
+    assert len(built_object_tuples) == 2
     assert all(
-        initial_identity != resumed_identity
-        for initial_identity, resumed_identity in zip(
-            built_identity_tuples[0],
-            built_identity_tuples[1],
+        initial_object is not resumed_object
+        for initial_object, resumed_object in zip(
+            built_object_tuples[0],
+            built_object_tuples[1],
             strict=True,
         )
     )

@@ -304,6 +304,12 @@ def test_build_push_grants_read_permissions_for_required_check_verifier() -> Non
     assert job["permissions"]["statuses"] == "read"
 
 
+def test_image_metadata_binds_oci_revision_to_the_checked_out_image_sha() -> None:
+    metadata = _step(_build_push_job(), "Generate image metadata")
+
+    assert "org.opencontainers.image.revision=${{ env.IMAGE_SHA }}" in metadata["with"]["labels"]
+
+
 # ---------------------------------------------------------------------------
 # elspeth-118bf5ea8c / elspeth-8cb798c3fd:
 # An ACR-only manual dispatch sets push_ghcr=false, so no GHCR image is pushed.
@@ -690,6 +696,19 @@ def test_release_build_context_excludes_frontend_unit_tests() -> None:
     assert "src/elspeth/web/frontend/src/**/*.test.tsx" in dockerignore_patterns
 
 
+def test_release_build_context_excludes_terraform_state_plans_and_real_tfvars() -> None:
+    raw_lines = DOCKERIGNORE.read_text(encoding="utf-8").splitlines()
+    patterns = {line.strip() for line in raw_lines if line.strip() and not line.lstrip().startswith("#")}
+
+    assert {"**/.terraform/", "*.tfstate", "*.tfstate.*", "*.tfplan", "*.tfvars", "*.tfvars.json"}.issubset(patterns)
+    assert "!*.tfvars.example" in patterns
+
+    import fnmatch
+
+    assert fnmatch.fnmatch("terraform.tfvars.json", "*.tfvars.json")
+    assert fnmatch.fnmatch("scenario-a.auto.tfvars.json", "*.tfvars.json")
+
+
 def test_release_dockerfile_copies_local_uv_sources_before_dependency_sync() -> None:
     """Root pyproject local uv sources must exist before Docker runs uv sync."""
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
@@ -883,3 +902,42 @@ def test_release_dockerfile_documents_orchestrator_owned_probe_wiring() -> None:
     assert "ALB target groups:     GET /api/ready" in dockerfile
     assert "Batch tasks:           process exit code" in dockerfile
     assert "elspeth health --port 8451" not in dockerfile
+
+
+RDS_BUNDLE_SHA256 = "e5bb2084ccf45087bda1c9bffdea0eb15ee67f0b91646106e466714f9de3c7e3"
+
+
+def test_release_image_bakes_the_reviewed_rds_trust_root() -> None:
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    dockerignore = DOCKERIGNORE.read_text(encoding="utf-8")
+
+    assert "!deploy/aws-ecs/trust/global-bundle.pem" in dockerignore
+    assert "COPY deploy/aws-ecs/trust/global-bundle.pem " in dockerfile
+    assert "/runtime-root/etc/elspeth/rds/global-bundle.pem" in dockerfile
+    assert "chmod 0444" in dockerfile
+    assert RDS_BUNDLE_SHA256 in dockerfile
+    assert "chown -R 0:0 /runtime-root/etc/elspeth" in dockerfile
+    assert "find /runtime-root/etc/elspeth -type d -exec chmod 0755 {} +" in dockerfile
+    assert 'LABEL io.elspeth.rds-ca-bundle-sha256="$RDS_CA_BUNDLE_SHA256"' in dockerfile
+    assert 'LABEL io.elspeth.rds-ca-certificate-identifier="rds-ca-rsa2048-g1"' in dockerfile
+    # The ARG must be redeclared in every stage that consumes it (global default,
+    # builder-stage digest check, runtime-stage LABEL) or the redeclaration is
+    # silently dropped and the value falls back to build-arg-less default scoping.
+    assert dockerfile.count("ARG RDS_CA_BUNDLE_SHA256") == 3
+
+
+def test_release_workflow_verifies_trust_root_under_read_only_rootfs() -> None:
+    job = _build_push_job()
+    lean = _step_run(job, "Verify lean PostgreSQL image contract")
+    generic = _step_run(_job("smoke-test"), "Verify generic image runtime contract")
+
+    for script in (lean, generic):
+        assert "io.elspeth.rds-ca-bundle-sha256" in script
+        assert "io.elspeth.rds-ca-certificate-identifier" in script
+        assert "rds-ca-rsa2048-g1" in script
+        assert "deploy/aws-ecs/trust/global-bundle.pem.sha256" in script
+        assert "verify_aws_rds_trust_bundle" in script
+        assert "docker run --rm --read-only" in script
+        assert "stat -c" in script
+        assert "0:0:444" in script
+        assert "sha256sum -c global-bundle.pem.sha256" in script

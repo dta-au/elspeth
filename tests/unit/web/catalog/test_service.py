@@ -10,7 +10,8 @@ from elspeth.contracts.plugin_capabilities import (
     PluginCapability,
     WebConfigAuthority,
 )
-from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.plugins.infrastructure.manager import PluginManager, get_shared_plugin_manager
+from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSecretRequirement, PluginSummary
 from elspeth.web.catalog.service import CatalogServiceImpl
@@ -34,6 +35,28 @@ class TestCatalogService:
 
     def test_implements_protocol(self, catalog: CatalogServiceImpl) -> None:
         assert isinstance(catalog, CatalogService)
+
+    def test_all_builtin_reference_content_is_serialized_unchanged(
+        self,
+        catalog: CatalogServiceImpl,
+        plugin_manager: PluginManager,
+    ) -> None:
+        groups = (
+            ("source", catalog.list_sources(), plugin_manager.get_sources()),
+            ("transform", catalog.list_transforms(), plugin_manager.get_transforms()),
+            ("sink", catalog.list_sinks(), plugin_manager.get_sinks()),
+        )
+        assert sum(len(summaries) for _, summaries, _ in groups) == 47
+
+        for kind, summaries, plugin_classes in groups:
+            classes_by_name = {plugin_cls.name: plugin_cls for plugin_cls in plugin_classes}
+            assert {summary.name for summary in summaries} == set(classes_by_name), kind
+            for summary in summaries:
+                plugin_cls = classes_by_name[summary.name]
+                assert summary.usage_when_to_use == plugin_cls.usage_when_to_use
+                assert summary.usage_when_not_to_use == plugin_cls.usage_when_not_to_use
+                assert summary.example_use == plugin_cls.example_use
+                assert summary.capability_tags == plugin_cls.capability_tags
 
 
 class TestListSources:
@@ -147,6 +170,30 @@ class TestListTransforms:
 
         assert prompt_shield.secret_requirements == expected
         assert catalog.get_schema("transform", "azure_prompt_shield").secret_requirements == expected
+
+    def test_textract_transform_is_discoverable_with_credentials_characteristic(
+        self,
+        catalog: CatalogServiceImpl,
+    ) -> None:
+        transforms = catalog.list_transforms()
+        textract = next(item for item in transforms if item.name == "aws_textract_document_analysis")
+
+        assert "credentials" in textract.audit_characteristics
+        schema = catalog.get_schema("transform", "aws_textract_document_analysis")
+        names = {field["name"] for field in schema.knob_schema["fields"]}
+        assert {"auth_mode", "aws_access_key_id", "aws_secret_access_key", "aws_session_token"} <= names
+
+    def test_textract_shared_discovery_and_assistance_describe_secure_async_s3_usage(self) -> None:
+        transform_cls = get_shared_plugin_manager().get_transform_by_name("aws_textract_document_analysis")
+        assistance = transform_cls.get_agent_assistance()
+
+        assert transform_cls is AWSTextractDocumentAnalysis
+        assert assistance is not None
+        guidance = "\n".join((assistance.summary, *assistance.composer_hints))
+        assert "S3" in guidance
+        assert "asynchronous" in guidance
+        assert "{secret_ref:" in guidance
+        assert "inline" in guidance
 
 
 class TestListSinks:
@@ -297,13 +344,14 @@ class TestGetSchema:
         info = catalog.get_schema("transform", "llm")
         schema = info.json_schema
         assert "oneOf" in schema
-        assert len(schema["oneOf"]) == 3
+        assert len(schema["oneOf"]) == 4
         assert schema["discriminator"]["propertyName"] == "provider"
-        assert set(schema["discriminator"]["mapping"].keys()) == {"azure", "openrouter", "bedrock"}
+        assert set(schema["discriminator"]["mapping"].keys()) == {"azure", "openrouter", "bedrock", "gateway"}
         defs = schema["$defs"]
         assert "AzureOpenAIConfig" in defs
         assert "OpenRouterConfig" in defs
         assert "BedrockConfig" in defs
+        assert "GatewayConfig" in defs
         assert set(defs["AzureOpenAIConfig"]["required"]) >= {
             "deployment_name",
             "endpoint",
@@ -312,6 +360,7 @@ class TestGetSchema:
         }
         assert set(defs["OpenRouterConfig"]["required"]) >= {"model", "api_key", "prompt_template"}
         assert set(defs["BedrockConfig"]["required"]) >= {"model", "prompt_template", "provider"}
+        assert set(defs["GatewayConfig"]["required"]) >= {"model", "endpoint", "api_key", "prompt_template"}
         assert "region_name" in defs["BedrockConfig"]["properties"]
         assert "api_key" not in defs["BedrockConfig"]["properties"]
 

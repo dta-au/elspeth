@@ -339,8 +339,10 @@ def _require_mutable_control_manifest(manifest: Mapping[str, object]) -> None:
     """Reject every rewrite after final receipt authority is committed."""
 
     final_evidence = manifest["final_evidence"]
-    if isinstance(final_evidence, Mapping) and final_evidence.get("phase") == "committed":
-        raise AcceptanceCheckError("control_manifest_finalized")
+    if final_evidence is not None:
+        phase = cast(Mapping[str, object], final_evidence)["phase"]
+        if phase == "committed":
+            raise AcceptanceCheckError("control_manifest_finalized")
 
 
 def _validate_retained_evidence_receipt(
@@ -371,9 +373,8 @@ def _validate_retained_evidence_receipt(
     acceptance_run_id = cast(str, manifest["acceptance_run_id"])
     for scenario_id in ("A", "B"):
         inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
-        orphan = inventory["orphan_sweep"]
+        orphan = cast(dict[str, object], inventory["orphan_sweep"])
         evidence = scenario_evidence[scenario_id]
-        assert isinstance(orphan, dict)
         if not isinstance(evidence, dict) or set(evidence) != _RETAINED_EVIDENCE_FIELDS:
             raise AcceptanceCheckError("retained_evidence_schema")
         candidate_orphan = {**orphan, **evidence}
@@ -385,9 +386,8 @@ def _validate_retained_evidence_receipt(
         namespace = f"{acceptance_run_id}-{scenario_id.lower()}"
         if any(
             not any(
-                isinstance(dimension, Mapping)
-                and dimension.get("name") == "elspeth.acceptance.namespace"
-                and dimension.get("value") == namespace
+                cast(Mapping[str, object], dimension)["name"] == "elspeth.acceptance.namespace"
+                and cast(Mapping[str, object], dimension)["value"] == namespace
                 for dimension in cast(list[object], metric["dimensions"])
             )
             for metric in metrics
@@ -402,8 +402,7 @@ def _validate_retained_evidence_receipt(
 
 
 def _load_retained_evidence(manifest: Mapping[str, object]) -> dict[str, object]:
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, Mapping)
+    evidence = cast(Mapping[str, object], manifest["evidence"])
     path = evidence["retained_evidence_path"]
     expected_sha256 = evidence["retained_evidence_sha256"]
     if type(path) is not str or type(expected_sha256) is not str:

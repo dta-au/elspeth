@@ -16,10 +16,34 @@ from typing import Any
 import jwt as pyjwt
 import pytest
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth import local as auth_local
 from elspeth.web.auth.local import LocalAuthProvider
 from elspeth.web.auth.models import AuthenticationError, UserIdentity, UserProfile
+
+
+class _CommitFailingConnection:
+    """Delegating sqlite3 connection proxy whose commit always fails."""
+
+    def __init__(self, real: sqlite3.Connection) -> None:
+        self._real = real
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    def commit(self) -> None:
+        raise sqlite3.OperationalError("simulated disk I/O error at commit")
+
+
+def _fail_commits(provider: LocalAuthProvider, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every subsequent provider transaction fail at commit time."""
+    real_get_conn = provider._get_conn
+
+    def failing_get_conn() -> Any:
+        return _CommitFailingConnection(real_get_conn())
+
+    monkeypatch.setattr(provider, "_get_conn", failing_get_conn)
 
 
 @pytest.fixture
@@ -41,6 +65,33 @@ def _delete_user(provider: LocalAuthProvider, user_id: str) -> None:
     """Delete a test user without leaking sqlite3's transaction-only context manager."""
     with closing(sqlite3.connect(str(provider._db_path))) as conn, conn:
         conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+
+
+def _audit_intents(provider: LocalAuthProvider) -> list[tuple[str, str]]:
+    """Read surviving token_issued audit intents directly from auth.db."""
+    with closing(sqlite3.connect(str(provider._db_path))) as conn:
+        return conn.execute("SELECT user_id, issuance_path FROM token_audit_intents ORDER BY created_at, intent_id").fetchall()
+
+
+def _insert_crashed_intent(
+    provider: LocalAuthProvider,
+    *,
+    user_id: str,
+    issuance_path: str,
+    created_at: int,
+    token_hash: str | None = None,
+    claimed_at: int | None = None,
+) -> None:
+    """Model a process crash that left a committed, undelivered audit intent."""
+    with provider._connect(immediate=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO token_audit_intents
+                (intent_id, user_id, issuance_path, token_hash, claimed_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (f"crashed-{user_id}", user_id, issuance_path, token_hash, claimed_at, created_at),
+        )
 
 
 class TestCreateUser:
@@ -163,7 +214,13 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         with pytest.raises(AuthenticationError, match="Invalid token"):
             await provider.authenticate(token)
 
-    def test_open_registration_is_invisible_until_required_audit_commits(self, provider) -> None:
+    def test_open_registration_audit_failure_removes_the_committed_user(self, provider) -> None:
+        """Audit runs after the durable commit; a failed audit compensates.
+
+        The user is durable while the required audit callback runs (so no
+        phantom token_issued record can precede the account), and an audit
+        failure deletes the unaudited account before the error propagates.
+        """
         audit_entered = threading.Event()
         release_audit = threading.Event()
 
@@ -182,12 +239,14 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
                 record_token_issued=fail_required_audit,
             )
             assert audit_entered.wait(timeout=2)
-            with pytest.raises(AuthenticationError, match="Invalid credentials"):
-                provider._login_sync("alice", "password123")
+            # The account is durable before the audit callback observes it.
+            token = provider._login_sync("alice", "password123")
+            assert len(token.split(".")) == 3
             release_audit.set()
             with pytest.raises(OSError, match="Landscape unavailable"):
                 future.result(timeout=2)
 
+        # The audit failure compensated: the unaudited account is gone.
         with pytest.raises(AuthenticationError, match="Invalid credentials"):
             provider._login_sync("alice", "password123")
 
@@ -221,6 +280,420 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
         token = await provider.login("alice", "password123")
         assert len(token.split(".")) == 3
+
+    def test_registration_commit_failure_after_audit_emits_no_phantom_token_issued(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failed auth.db commit must not leave a token_issued audit record.
+
+        The external audit callback must only observe issuance once the user
+        row is durable; otherwise Landscape asserts a token was issued for a
+        user that never existed.
+        """
+        issued_tokens: list[str] = []
+        _fail_commits(provider, monkeypatch)
+
+        with pytest.raises(sqlite3.OperationalError, match="simulated disk I/O error"):
+            provider.register_open_user_with_audit(
+                "alice",
+                "password123",
+                "Alice",
+                None,
+                record_token_issued=issued_tokens.append,
+            )
+        monkeypatch.undo()
+
+        assert issued_tokens == []
+        with pytest.raises(AuthenticationError, match="Invalid credentials"):
+            provider._login_sync("alice", "password123")
+
+    def test_verification_commit_failure_after_audit_emits_no_phantom_token_issued(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A failed verification commit must not leave a token_issued record."""
+        provider.create_user(
+            "alice",
+            "password123",
+            display_name="Alice",
+            email="alice@example.com",
+            email_verified=False,
+        )
+        token = provider.create_email_verification_token("alice")
+        issued_tokens: list[str] = []
+        _fail_commits(provider, monkeypatch)
+
+        with pytest.raises(sqlite3.OperationalError, match="simulated disk I/O error"):
+            provider.verify_email_and_issue_token(
+                token,
+                record_token_issued=lambda _identity, access_token: issued_tokens.append(access_token),
+            )
+        monkeypatch.undo()
+
+        assert issued_tokens == []
+        # The rollback restored the claimable token: verification still works.
+        access_token = provider.verify_email_and_issue_token(
+            token,
+            record_token_issued=lambda _identity, _access_token: None,
+        )
+        assert len(access_token.split(".")) == 3
+
+    def test_registration_audit_failure_with_failed_cleanup_surfaces_audit_integrity_error(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If the compensating cleanup fails too, the inconsistency is loud.
+
+        The surviving durable intent then lets a later drain point reclaim
+        the unaudited account instead of leaving it silently durable.
+        """
+        registered_at = int(time.time())
+
+        def fail_required_audit(_token: str) -> None:
+            _fail_commits(provider, monkeypatch)
+            raise OSError("Landscape unavailable")
+
+        with pytest.raises(AuditIntegrityError, match="cleanup"):
+            provider.register_open_user_with_audit(
+                "alice",
+                "password123",
+                "Alice",
+                None,
+                record_token_issued=fail_required_audit,
+            )
+        monkeypatch.undo()
+
+        # The account and its intent survived the failed cleanup...
+        assert _audit_intents(provider) == [("alice", "register")]
+        # ...and the next drain point past the grace window quarantines it.
+        monkeypatch.setattr(
+            auth_local.time,
+            "time",
+            lambda: registered_at + auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1,
+        )
+        provider.register_open_user_with_audit(
+            "carol",
+            "password789",
+            "Carol",
+            None,
+            record_token_issued=lambda _token: None,
+        )
+        with pytest.raises(AuthenticationError, match="Invalid credentials"):
+            provider._login_sync("alice", "password123")
+
+    def test_registration_audit_intent_is_durable_until_delivered(self, provider) -> None:
+        """The commit durably records an undelivered intent, cleared on delivery."""
+        audit_entered = threading.Event()
+        release_audit = threading.Event()
+
+        def record_required_audit(_token: str) -> None:
+            audit_entered.set()
+            assert release_audit.wait(timeout=2)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                provider.register_open_user_with_audit,
+                "alice",
+                "password123",
+                "Alice",
+                None,
+                record_token_issued=record_required_audit,
+            )
+            assert audit_entered.wait(timeout=2)
+            # The durable pre-delivery window is marked, never silent.
+            assert _audit_intents(provider) == [("alice", "register")]
+            release_audit.set()
+            token = future.result(timeout=2)
+
+        assert len(token.split(".")) == 3
+        assert _audit_intents(provider) == []
+
+    def test_reclaimed_active_registration_cannot_return_token(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A stale-intent sweep must fence a callback that later completes."""
+        now = [1_000_000]
+        monkeypatch.setattr(auth_local.time, "time", lambda: now[0])
+        audit_entered = threading.Event()
+        release_audit = threading.Event()
+
+        def record_required_audit(_token: str) -> None:
+            audit_entered.set()
+            assert release_audit.wait(timeout=2)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                provider.register_open_user_with_audit,
+                "alice",
+                "password123",
+                "Alice",
+                None,
+                record_token_issued=record_required_audit,
+            )
+            assert audit_entered.wait(timeout=2)
+            now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
+            restarted = LocalAuthProvider(
+                db_path=provider._db_path,
+                secret_key="test-secret-key-for-unit-tests",
+            )
+            replacement_token = restarted.register_open_user_with_audit(
+                "alice",
+                "replacement456",
+                "Replacement Alice",
+                None,
+                record_token_issued=lambda _token: None,
+            )
+            release_audit.set()
+
+            with pytest.raises(AuditIntegrityError):
+                future.result(timeout=2)
+
+        with pytest.raises(AuthenticationError, match="Invalid credentials"):
+            provider._login_sync("alice", "password123")
+        assert len(replacement_token.split(".")) == 3
+        assert len(restarted._login_sync("alice", "replacement456").split(".")) == 3
+
+    def test_reclaimed_registration_audit_failure_spares_replacement_account(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A late audit failure must not compensate away a replacement account.
+
+        Once the stale-intent sweep has reclaimed the original registration,
+        the same user_id may belong to a replacement registration; the
+        original call's compensating cleanup is fenced to its own intent
+        generation and must leave the replacement untouched.
+        """
+        now = [1_000_000]
+        monkeypatch.setattr(auth_local.time, "time", lambda: now[0])
+        audit_entered = threading.Event()
+        release_audit = threading.Event()
+
+        def fail_required_audit(_token: str) -> None:
+            audit_entered.set()
+            assert release_audit.wait(timeout=2)
+            raise OSError("Landscape unavailable")
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                provider.register_open_user_with_audit,
+                "alice",
+                "password123",
+                "Alice",
+                None,
+                record_token_issued=fail_required_audit,
+            )
+            assert audit_entered.wait(timeout=2)
+            now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
+            restarted = LocalAuthProvider(
+                db_path=provider._db_path,
+                secret_key="test-secret-key-for-unit-tests",
+            )
+            replacement_token = restarted.register_open_user_with_audit(
+                "alice",
+                "replacement456",
+                "Replacement Alice",
+                None,
+                record_token_issued=lambda _token: None,
+            )
+            release_audit.set()
+
+            with pytest.raises(OSError, match="Landscape unavailable"):
+                future.result(timeout=2)
+
+        # The replacement account survived the fenced compensation.
+        assert len(replacement_token.split(".")) == 3
+        assert len(restarted._login_sync("alice", "replacement456").split(".")) == 3
+        assert _audit_intents(provider) == []
+
+    def test_compensation_is_noop_once_intent_ownership_is_lost(self, provider) -> None:
+        """Compensation keyed to a consumed intent must not touch a replacement."""
+        provider.create_user("alice", "replacement456", display_name="Replacement Alice")
+
+        owned = provider._compensate_open_registration("alice", intent_id="original-generation")
+
+        assert owned is False
+        assert len(provider._login_sync("alice", "replacement456").split(".")) == 3
+
+    def test_reclaimed_active_verification_cannot_return_token(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A reclaimed verification cannot publish a usable access token."""
+        now = [1_000_000]
+        monkeypatch.setattr(auth_local.time, "time", lambda: now[0])
+        provider.create_user(
+            "alice",
+            "password123",
+            display_name="Alice",
+            email="alice@example.com",
+            email_verified=False,
+        )
+        verification_token = provider.create_email_verification_token("alice")
+        audit_entered = threading.Event()
+        release_audit = threading.Event()
+
+        def record_required_audit(_identity: UserIdentity, _access_token: str) -> None:
+            audit_entered.set()
+            assert release_audit.wait(timeout=2)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                provider.verify_email_and_issue_token,
+                verification_token,
+                record_token_issued=record_required_audit,
+            )
+            assert audit_entered.wait(timeout=2)
+            now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
+            restarted = LocalAuthProvider(
+                db_path=provider._db_path,
+                secret_key="test-secret-key-for-unit-tests",
+            )
+            retry_token = restarted.verify_email_and_issue_token(
+                verification_token,
+                record_token_issued=lambda _identity, _access_token: None,
+            )
+            release_audit.set()
+
+            with pytest.raises(AuditIntegrityError):
+                future.result(timeout=2)
+
+        assert len(retry_token.split(".")) == 3
+        assert len(restarted._login_sync("alice", "password123").split(".")) == 3
+
+    def test_startup_reclaims_crashed_registration_audit_intent(self, provider) -> None:
+        """Crash between commit and delivery: startup quarantines the account."""
+        provider.create_user("alice", "password123", display_name="Alice")
+        _insert_crashed_intent(provider, user_id="alice", issuance_path="register", created_at=1_000)
+
+        restarted = LocalAuthProvider(
+            db_path=provider._db_path,
+            secret_key="test-secret-key-for-unit-tests",
+        )
+
+        assert _audit_intents(restarted) == []
+        with pytest.raises(AuthenticationError, match="Invalid credentials"):
+            restarted._login_sync("alice", "password123")
+
+    def test_startup_reclaims_crashed_verification_audit_intent(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Crash between claim commit and delivery: startup restores retryability."""
+        now = [1_000_000]
+        monkeypatch.setattr(auth_local.time, "time", lambda: now[0])
+        provider.create_user(
+            "alice",
+            "password123",
+            display_name="Alice",
+            email="alice@example.com",
+            email_verified=False,
+        )
+        token = provider.create_email_verification_token("alice")
+        token_hash = auth_local._verification_token_hash(token)
+        # Model the crash: the claim committed durably, delivery never happened.
+        with provider._connect(immediate=True) as conn:
+            conn.execute(
+                "UPDATE email_verification_tokens SET used_at = ? WHERE token_hash = ?",
+                (now[0], token_hash),
+            )
+            conn.execute("UPDATE users SET email_verified = 1 WHERE user_id = 'alice'")
+        _insert_crashed_intent(
+            provider,
+            user_id="alice",
+            issuance_path="email_verification",
+            created_at=now[0],
+            token_hash=token_hash,
+            claimed_at=now[0],
+        )
+
+        now[0] += auth_local._TOKEN_AUDIT_INTENT_GRACE_SECONDS + 1
+        restarted = LocalAuthProvider(
+            db_path=provider._db_path,
+            secret_key="test-secret-key-for-unit-tests",
+        )
+
+        assert _audit_intents(restarted) == []
+        issued_tokens: list[str] = []
+        access_token = restarted.verify_email_and_issue_token(
+            token,
+            record_token_issued=lambda _identity, issued: issued_tokens.append(issued),
+        )
+        assert len(access_token.split(".")) == 3
+        assert issued_tokens == [access_token]
+
+    def test_fresh_audit_intents_survive_restart_within_grace(self, provider) -> None:
+        """In-flight deliveries are protected from concurrent startup sweeps."""
+        provider.create_user("alice", "password123", display_name="Alice")
+        _insert_crashed_intent(
+            provider,
+            user_id="alice",
+            issuance_path="register",
+            created_at=int(time.time()),
+        )
+
+        restarted = LocalAuthProvider(
+            db_path=provider._db_path,
+            secret_key="test-secret-key-for-unit-tests",
+        )
+
+        assert _audit_intents(restarted) == [("alice", "register")]
+        token = restarted._login_sync("alice", "password123")
+        assert len(token.split(".")) == 3
+
+    def test_stale_registration_intent_is_reclaimed_by_next_registration(self, provider) -> None:
+        """The next-operation drain resolves crashed intents without a restart."""
+        provider.create_user("alice", "password123", display_name="Alice")
+        _insert_crashed_intent(provider, user_id="alice", issuance_path="register", created_at=1_000)
+
+        bob_token = provider.register_open_user_with_audit(
+            "bob",
+            "password456",
+            "Bob",
+            None,
+            record_token_issued=lambda _token: None,
+        )
+
+        assert len(bob_token.split(".")) == 3
+        assert _audit_intents(provider) == []
+        with pytest.raises(AuthenticationError, match="Invalid credentials"):
+            provider._login_sync("alice", "password123")
+        assert len(provider._login_sync("bob", "password456").split(".")) == 3
+
+    def test_delivered_audit_with_stuck_intent_fails_closed(
+        self,
+        provider,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """If the intent cannot be cleared after delivery, the failure is loud."""
+        issued_tokens: list[str] = []
+
+        def record_then_break_commits(access_token: str) -> None:
+            issued_tokens.append(access_token)
+            _fail_commits(provider, monkeypatch)
+
+        with pytest.raises(AuditIntegrityError, match="could not be cleared"):
+            provider.register_open_user_with_audit(
+                "alice",
+                "password123",
+                "Alice",
+                None,
+                record_token_issued=record_then_break_commits,
+            )
+        monkeypatch.undo()
+
+        assert len(issued_tokens) == 1
+        # The intent survives, so a later drain point resolves the account.
+        assert _audit_intents(provider) == [("alice", "register")]
 
     def test_email_verification_token_has_exactly_one_concurrent_consumer(self, provider) -> None:
         provider.create_user(
@@ -367,9 +840,49 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
         auth_local._append_email_verification_record(outbox_path, record)
         assert [json.loads(line) for line in outbox_path.read_text().splitlines()] == [record]
 
-    def test_email_outbox_repairs_partial_crash_tail_before_republication(self, tmp_path) -> None:
+    def test_email_outbox_normalizes_valid_final_record_before_append(self, tmp_path) -> None:
         outbox_path = tmp_path / "email-verifications.jsonl"
-        outbox_path.write_bytes(b'{"delivery_id":"crashed"')
+        published = {
+            "delivery_id": "published",
+            "user_id": "alice",
+            "email": "alice@example.com",
+            "token": "published-token",
+            "verification_url": "https://composer.example.test/?verify_token=published-token",
+        }
+        record = {
+            "delivery_id": "delivery-1",
+            "user_id": "bob",
+            "email": "bob@example.com",
+            "token": "next-token",
+            "verification_url": "https://composer.example.test/?verify_token=next-token",
+        }
+        published_payload = json.dumps(published, sort_keys=True, separators=(",", ":")).encode()
+        record_payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+        outbox_path.write_bytes(published_payload)
+
+        auth_local._append_email_verification_record(outbox_path, record)
+
+        assert outbox_path.read_bytes() == published_payload + b"\n" + record_payload + b"\n"
+
+    @pytest.mark.parametrize(
+        "existing",
+        [
+            b'{"delivery_id":"crashed"',
+            (
+                b'{"delivery_id":"published","email":"published@example.com","token":"published-token",'
+                b'"user_id":"published-user","verification_url":'
+                b'"https://composer.example.test/?verify_token=published-token"}\n{"delivery_id":"crashed"'
+            ),
+        ],
+        ids=["malformed-only", "mixed-valid-and-malformed"],
+    )
+    def test_email_outbox_rejects_malformed_final_record_without_mutation(
+        self,
+        tmp_path,
+        existing: bytes,
+    ) -> None:
+        outbox_path = tmp_path / "email-verifications.jsonl"
+        outbox_path.write_bytes(existing)
         record = {
             "delivery_id": "delivery-1",
             "user_id": "alice",
@@ -378,9 +891,42 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
             "verification_url": "https://composer.example.test/?verify_token=verification-token",
         }
 
-        auth_local._append_email_verification_record(outbox_path, record)
+        with pytest.raises(auth_local.AuditIntegrityError, match="malformed"):
+            auth_local._append_email_verification_record(outbox_path, record)
 
-        assert [json.loads(line) for line in outbox_path.read_text().splitlines()] == [record]
+        assert outbox_path.read_bytes() == existing
+
+    @pytest.mark.parametrize(
+        "existing",
+        [
+            b'{"user_id":"corrupt"}',
+            (
+                b'{"delivery_id":"published","email":"published@example.com","token":"published-token",'
+                b'"user_id":"published-user","verification_url":'
+                b'"https://composer.example.test/?verify_token=published-token"}\n{"user_id":"corrupt"}'
+            ),
+        ],
+        ids=["invalid-only", "mixed-valid-and-invalid"],
+    )
+    def test_email_outbox_rejects_final_record_without_delivery_id_without_mutation(
+        self,
+        tmp_path,
+        existing: bytes,
+    ) -> None:
+        outbox_path = tmp_path / "email-verifications.jsonl"
+        outbox_path.write_bytes(existing)
+        record = {
+            "delivery_id": "delivery-1",
+            "user_id": "alice",
+            "email": "alice@example.com",
+            "token": "verification-token",
+            "verification_url": "https://composer.example.test/?verify_token=verification-token",
+        }
+
+        with pytest.raises(auth_local.AuditIntegrityError, match="delivery_id"):
+            auth_local._append_email_verification_record(outbox_path, record)
+
+        assert outbox_path.read_bytes() == existing
 
     def test_retry_after_expiry_rotates_pending_registration_delivery(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
         now = [1_000]
@@ -432,6 +978,64 @@ print(oct(stat.S_IMODE(path.stat().st_mode)))
 
         records = [json.loads(line) for line in outbox_path.read_text().splitlines()]
         assert len(records) == 1
+
+    def test_publish_retry_rejects_divergent_payload_for_existing_delivery_id(self, tmp_path) -> None:
+        provider = LocalAuthProvider(db_path=tmp_path / "auth.db", secret_key="test-key")
+        outbox_path = tmp_path / "email-verifications.jsonl"
+        provider.register_email_verified_user(
+            "alice",
+            "password123",
+            "Alice",
+            "alice@example.com",
+            verification_origin="https://composer.example.test",
+            outbox_path=outbox_path,
+        )
+        intended = json.loads(outbox_path.read_text().splitlines()[0])
+        divergent = dict(intended)
+        divergent["user_id"] = "mallory"
+        divergent["email"] = "mallory@example.com"
+        divergent["token"] = "wrong-token"
+        divergent["verification_url"] = "https://composer.example.test/?verify_token=wrong-token"
+        original_bytes = (json.dumps(divergent, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        outbox_path.write_bytes(original_bytes)
+        with provider._connect() as conn:
+            conn.execute("UPDATE email_verification_outbox SET published_at = NULL")
+
+        with pytest.raises(auth_local.AuditIntegrityError, match="does not match"):
+            provider.publish_pending_email_verifications(outbox_path)
+
+        assert outbox_path.read_bytes() == original_bytes
+        with provider._connect() as conn:
+            published_at = conn.execute(
+                "SELECT published_at FROM email_verification_outbox WHERE delivery_id = ?",
+                (intended["delivery_id"],),
+            ).fetchone()[0]
+        assert published_at is None
+
+    def test_email_outbox_rejects_duplicate_delivery_id_records(self, tmp_path) -> None:
+        outbox_path = tmp_path / "email-verifications.jsonl"
+        published = {
+            "delivery_id": "published",
+            "user_id": "alice",
+            "email": "alice@example.com",
+            "token": "verification-token",
+            "verification_url": "https://composer.example.test/?verify_token=verification-token",
+        }
+        record = {
+            "delivery_id": "delivery-1",
+            "user_id": "bob",
+            "email": "bob@example.com",
+            "token": "second-token",
+            "verification_url": "https://composer.example.test/?verify_token=second-token",
+        }
+        published_line = (json.dumps(published, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        original_bytes = published_line + published_line
+        outbox_path.write_bytes(original_bytes)
+
+        with pytest.raises(auth_local.AuditIntegrityError, match="duplicate delivery_id"):
+            auth_local._append_email_verification_record(outbox_path, record)
+
+        assert outbox_path.read_bytes() == original_bytes
 
     def test_startup_reclaims_pending_registration_after_retention_window(
         self,

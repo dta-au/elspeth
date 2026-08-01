@@ -59,6 +59,7 @@ from elspeth.web.composer.audit import (
     audit_envelope,
     chat_turn_audit_envelope,
     llm_call_audit_envelope,
+    llm_call_audit_summary,
 )
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.control_messages import replay_composer_control_message
@@ -123,10 +124,17 @@ from elspeth.web.composer.telemetry_phase8 import (
 from elspeth.web.composer.tools import _DATA_ERROR_KEY, ToolResult, execute_tool
 from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
+from elspeth.web.execution.completion_gates import (
+    COMPLETION_GATES_META_KEY,
+    CompletionGatesDict,
+    completion_gates_meta_from_facts,
+    completion_gates_meta_value,
+    parse_completion_gates,
+)
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.execution.validation import validate_pipeline
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter, get_rate_limiter
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import validate_authored_composition_state
 from elspeth.web.sessions._auto_title import maybe_auto_title_session
@@ -153,6 +161,12 @@ from elspeth.web.sessions.protocol import (
     CompositionProposalRecord,
     CompositionStateData,
     CompositionStateRecord,
+    InterpretationEventAlreadyResolvedError,
+    InterpretationEventNotFoundError,
+    InterpretationNodeMissingError,
+    InterpretationNodePluginMutatedError,
+    InterpretationPlaceholderConsumedError,
+    InterpretationUnsupportedChoiceError,
     InvalidForkTargetError,
     ProposalEventRecord,
     ProposalLifecycleStatus,
@@ -200,14 +214,6 @@ from elspeth.web.sessions.schemas import (
     UpdateSessionRequest,
     ValidationEntryResponse,
     WorkflowProfileResponse,
-)
-from elspeth.web.sessions.service import (
-    InterpretationEventAlreadyResolvedError,
-    InterpretationEventNotFoundError,
-    InterpretationNodeMissingError,
-    InterpretationNodePluginMutatedError,
-    InterpretationPlaceholderConsumedError,
-    InterpretationUnsupportedChoiceError,
 )
 
 slog = structlog.get_logger()
@@ -258,6 +264,9 @@ class _SessionComposeLockRegistry:
 
     async def get_lock(self, session_id: str) -> asyncio.Lock:
         async with self._ensure_locks_lock():
+            # Tier note: lazy per-session lock cache — a miss means this
+            # session has not needed a lock yet, not corrupted state; the
+            # WeakValueDictionary drops entries when their sessions go away.
             lock = self._session_locks.get(session_id)
             if lock is None:
                 lock = asyncio.Lock()
@@ -622,21 +631,70 @@ def _plugin_policy_findings(
     """Describe persisted components unavailable in the current snapshot."""
     if policy_catalog is None:
         return []
+
     components: list[tuple[str, PluginId]] = []
-    for source_name, source in (state.sources or {}).items():
-        plugin_name = source.get("plugin")
-        if isinstance(plugin_name, str):
-            components.append((source_name, PluginId("source", plugin_name)))
-    for node in state.nodes or ():
-        plugin_name = node.get("plugin")
-        component_id = node.get("id")
-        if isinstance(plugin_name, str) and isinstance(component_id, str):
+
+    # ``source`` is the documented bridge for rows written before the
+    # multi-source ``sources`` column. New writers always persist ``sources``;
+    # accepting both at once would make the source of truth ambiguous.
+    sources = state.sources
+    if sources is None:
+        sources = {}
+        if state.source is not None:
+            sources = {"source": state.source}
+    elif state.source is not None:
+        raise AuditIntegrityError("persisted plugin policy source projection has both source and sources")
+    for source_name, source in sources.items():
+        if type(source_name) is not str or source_name == "":
+            raise AuditIntegrityError("persisted plugin policy source name must be a non-empty string")
+        if "plugin" not in source:
+            raise AuditIntegrityError(f"persisted plugin policy source {source_name!r} has no plugin")
+        plugin_name = source["plugin"]
+        if type(plugin_name) is not str or plugin_name == "":
+            raise AuditIntegrityError(f"persisted plugin policy source {source_name!r} plugin must be a non-empty string")
+        components.append((source_name, PluginId("source", plugin_name)))
+
+    nodes = state.nodes
+    if nodes is None:
+        nodes = ()
+    for node in nodes:
+        if "id" not in node:
+            raise AuditIntegrityError("persisted plugin policy node has no id")
+        component_id = node["id"]
+        if type(component_id) is not str or component_id == "":
+            raise AuditIntegrityError("persisted plugin policy node id must be a non-empty string")
+        if "node_type" not in node:
+            raise AuditIntegrityError(f"persisted plugin policy node {component_id!r} has no node_type")
+        node_type = node["node_type"]
+        if "plugin" not in node:
+            raise AuditIntegrityError(f"persisted plugin policy {node_type} node {component_id!r} has no plugin")
+        plugin_name = node["plugin"]
+        if node_type == "transform" or node_type == "aggregation":
+            if type(plugin_name) is not str or plugin_name == "":
+                raise AuditIntegrityError(f"persisted plugin policy {node_type} node {component_id!r} plugin must be a non-empty string")
             components.append((component_id, PluginId("transform", plugin_name)))
-    for output in state.outputs or ():
-        plugin_name = output.get("plugin")
-        component_id = output.get("name", output.get("sink_name"))
-        if isinstance(plugin_name, str) and isinstance(component_id, str):
-            components.append((component_id, PluginId("sink", plugin_name)))
+        elif node_type in ("gate", "coalesce", "queue", "row_union"):
+            if plugin_name is not None:
+                raise AuditIntegrityError(f"persisted plugin policy structural node {component_id!r} plugin must be explicitly null")
+        else:
+            raise AuditIntegrityError(f"persisted plugin policy node {component_id!r} has unknown node_type {node_type!r}")
+
+    outputs = state.outputs
+    if outputs is None:
+        outputs = ()
+    for output in outputs:
+        if "name" not in output:
+            raise AuditIntegrityError("persisted plugin policy output has no canonical name")
+        component_id = output["name"]
+        if type(component_id) is not str or component_id == "":
+            raise AuditIntegrityError("persisted plugin policy output name must be a non-empty string")
+        if "plugin" not in output:
+            raise AuditIntegrityError(f"persisted plugin policy output {component_id!r} has no plugin")
+        plugin_name = output["plugin"]
+        if type(plugin_name) is not str or plugin_name == "":
+            raise AuditIntegrityError(f"persisted plugin policy output {component_id!r} plugin must be a non-empty string")
+        components.append((component_id, PluginId("sink", plugin_name)))
+
     findings: list[PluginPolicyFindingResponse] = []
     for component_id, plugin_id in components:
         reason = policy_catalog.unavailable_reason(plugin_id)
@@ -650,6 +708,26 @@ def _plugin_policy_findings(
                 )
             )
     return findings
+
+
+async def _durable_completion_gates(
+    service: SessionServiceProtocol,
+    session_id: UUID,
+) -> CompletionGatesDict:
+    """Fetch the prior row's completion-gate envelope for carry-forward.
+
+    Recovery persists (convergence / plugin-crash / runtime-preflight
+    failure) re-save a graph without any advisor adjudication of their own;
+    handing this envelope to :func:`_state_data_from_composer_state` keeps a
+    durable blocked advisor fact from being erased by those saves. Parsing
+    validates (Tier 1: corruption raises); re-serialization is verbatim, and
+    the fact's ``for_graph`` fingerprint downgrades it to pending wording on
+    read if the persisted graph moved.
+    """
+    record = await service.get_current_state(session_id)
+    if record is None:
+        return {}
+    return completion_gates_meta_from_facts(parse_completion_gates(record.composer_meta))
 
 
 def merge_composer_meta_updates(
@@ -1423,17 +1501,7 @@ async def _persist_llm_calls(
     is recorded via counter + slog so it cannot mask the primary error.
     """
     for call in llm_calls:
-        content = json.dumps(
-            {
-                "_kind": "llm_call_audit",
-                "status": call.status.value,
-                "model_requested": call.model_requested,
-                "model_returned": call.model_returned,
-                "total_tokens": call.total_tokens,
-                "reasoning_tokens": call.reasoning_tokens,
-                "provider_cost": call.provider_cost,
-            }
-        )
+        content = llm_call_audit_summary(call)
         try:
             await service.add_message(
                 session_id,
@@ -1472,7 +1540,13 @@ _CLIENT_DISCONNECT_CANCEL_MARKER = "elspeth_client_disconnected"
 
 
 def _is_client_disconnect_cancel(exc: asyncio.CancelledError) -> bool:
-    """True when ``exc`` was delivered by :func:`_cancel_on_client_disconnect`."""
+    """True when ``exc`` was delivered by :func:`_cancel_on_client_disconnect`.
+
+    Tier note: the ``getattr`` default is a cooperative-marker probe, not
+    defensive masking — the marker attribute is stamped onto the exception by
+    ``_cancel_on_client_disconnect`` alone, so its absence is the ordinary
+    "external cancel" case, never a hidden bug.
+    """
     return bool(getattr(exc, _CLIENT_DISCONNECT_CANCEL_MARKER, False))
 
 
@@ -1680,6 +1754,7 @@ async def _state_data_from_composer_state(
     initial_version: int | None,
     telemetry_source: _ComposerPreflightTelemetrySource,
     composer_meta: Mapping[str, Any] | None = None,
+    prior_completion_gates: CompletionGatesDict | None = None,
 ) -> tuple[CompositionStateData, ValidationSummary]:
     try:
         authoring = validate_authored_composition_state(
@@ -1766,6 +1841,32 @@ async def _state_data_from_composer_state(
     if state.guided_session is not None and "guided_session" not in surface_meta:
         surface_meta["guided_session"] = state.guided_session.to_dict()
     persisted_composer_meta = merge_implicit_decisions_meta(surface_meta, state)
+    # Completion-gate facts (advisor sign-off first) are durable only here:
+    # the key is OVERWRITTEN on every ADJUDICATING compose-preflight save —
+    # populated when the preflight withheld completion, empty when it did
+    # not — so a stale blocked fact cannot survive a clean compose turn.
+    # Exact-type dispatch mirrors the ``_RuntimePreflightOutcome``
+    # convention above: a captured ``_RuntimePreflightFailed`` persists
+    # ``is_valid=False`` and carries no gate verdict.
+    #
+    # Saves whose caller passed no adjudicated result (``runtime_preflight``
+    # argument was not a ``ValidationResult`` — the recovery persists and
+    # seeds) re-derive a plain preflight that can NEVER emit the advisor
+    # blocker, so overwriting would silently erase a durable advisor fact.
+    # Those callers hand in ``prior_completion_gates`` and the fact is
+    # carried forward verbatim; ``merge_completion_gates``' ``for_graph``
+    # fingerprint check downgrades it to pending wording on read if the
+    # graph moved, so the verdict is never re-attributed.
+    completion_gates_value = completion_gates_meta_value(
+        runtime if type(runtime) is ValidationResult else None,
+        state,
+    )
+    if not completion_gates_value and prior_completion_gates and type(runtime_preflight) is not ValidationResult:
+        completion_gates_value = prior_completion_gates
+    persisted_composer_meta = {
+        **persisted_composer_meta,
+        COMPLETION_GATES_META_KEY: completion_gates_value,
+    }
     normalized_persisted_errors = validation_errors_for_composer_surface(
         composer_meta=persisted_composer_meta,
         is_valid=persisted_is_valid,
@@ -1845,6 +1946,15 @@ async def _failed_turn_response_body(
 # prevent. ``COST_CAP_EXCEEDED`` and ``REQUEST_BYTES_EXHAUSTED`` are deliberately
 # absent (they fall through to ``operation_failed`` on both surfaces), matching
 # guided.
+#
+# ``policy_blocked`` is NOT keyed on ``PipelinePlannerError.code`` at all — it is
+# keyed on the rejection's ``detail_codes`` (see
+# :data:`PLANNER_POLICY_DETAIL_CODES`), because a deployment-policy refusal
+# surfaces under whichever planner code the refusal happened to exhaust
+# (``VALIDATION_FAILED`` on the server-derived path, ``REPAIR_EXHAUSTED`` when the
+# model burnt its budget re-authoring the same prohibited component). The code
+# alone cannot distinguish "the model produced garbage" from "the deployment
+# forbids this", so the detail-code test runs FIRST on both surfaces.
 _FREEFORM_PLANNER_INVALID_PROVIDER_CODES: Final[frozenset[str]] = frozenset(
     {
         "COMPLETION_TOKENS_EXCEEDED",
@@ -1861,6 +1971,25 @@ _FREEFORM_PLANNER_INVALID_PROVIDER_CODES: Final[frozenset[str]] = frozenset(
         "VALIDATION_FAILED",
     }
 )
+# The closed validation codes that mean "a deployment policy categorically
+# refuses this component", as opposed to "this candidate is wired wrong". A
+# rejection carrying any of them is PERMANENT: no repair to the pipeline and no
+# retry of the request can clear it, so both surfaces must answer
+# ``policy_blocked`` rather than a retryable provider fault.
+#
+# ``plugin_not_allowed_on_web`` is derived from
+# ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED`` rather than restated so the
+# two cannot drift; ``aws_s3_source_not_allowed`` is the authoritative source
+# gate's own code (``composer/tools/sessions.py``, ``execution/validation.py``),
+# which predates the snapshot-level reason and is emitted by a different seam.
+# A new categorical policy refusal MUST be added here or it silently reads as a
+# provider fault on both surfaces.
+PLANNER_POLICY_DETAIL_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "aws_s3_source_not_allowed",
+        PluginUnavailableReason.WEB_SURFACE_PROHIBITED.value,
+    }
+)
 # ``failure_code -> (http_status, safe static detail)``. Mirrors the subset of
 # ``_SAFE_FAILURES`` the freeform planner can reach; the detail text is
 # provider-safe (no exception message, no provider content).
@@ -1868,8 +1997,32 @@ _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
     "provider_timeout": (504, "The composer model timed out before producing a pipeline. Retry the request."),
     "provider_unavailable": (503, "The composer model is unavailable. Retry the request."),
     "invalid_provider_response": (502, "The composer model returned an unusable pipeline plan. Retry the request."),
+    # Same status and same message shape as the guided
+    # ``_SAFE_FAILURES["policy_blocked"]`` copy — a policy refusal is a
+    # property of the deployment and the pipeline, not of the authoring
+    # surface or the model — EXCEPT that freeform chat has no component
+    # highlight, so this copy must not say "highlighted" (the guided surface
+    # pins its blocked component in the review UI; here the detail text is
+    # the whole signal). Names neither the provider nor an operation id, and
+    # offers no retry.
+    "policy_blocked": (
+        422,
+        "This pipeline is blocked by a deployment policy and cannot be built as configured. "
+        "Change the blocked component — retrying will fail the same way.",
+    ),
     "operation_failed": (500, "The composer could not build a pipeline for this request."),
 }
+
+
+def planner_failure_is_policy_blocked(exc: PipelinePlannerError) -> bool:
+    """Return whether a planner failure was a categorical deployment-policy refusal.
+
+    The single shared predicate behind both surfaces' failure-code mappers, so
+    the guided/freeform lockstep is mechanical rather than a comment: see
+    ``routes/composer/guided_plan.py::_guided_full_failure_code`` and
+    :func:`_freeform_planner_failure_code`.
+    """
+    return any(code in PLANNER_POLICY_DETAIL_CODES for code in exc.detail_codes)
 
 
 def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
@@ -1879,6 +2032,8 @@ def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
     guided ``_guided_full_failure_code``; kept as a separate function so the
     guided path stays untouched.
     """
+    if planner_failure_is_policy_blocked(exc):
+        return "policy_blocked"
     if exc.code == "TIMEOUT":
         return "provider_timeout"
     if exc.code == "PROVIDER_ERROR":
@@ -2014,6 +2169,16 @@ async def _handle_convergence_error(
         # names the next practical action for each class" criterion.
         "recovery_text": progress.likely_next,
     }
+    if progress.reason == "convergence_wall_clock_timeout":
+        # The elapsed budget, server-authoritative (R2-F9,
+        # elspeth-114dd261bc). The SPA's timeout copy names this number, and
+        # the only honest source is the deployment's configured wall clock —
+        # NOT the client's own abort ceiling, which is that value plus a
+        # grace constant and falls back to a checked-in default whenever the
+        # boot /api/system/status fetch has not landed. Carried ONLY on the
+        # timeout reason: the two turn-budget causes did not exhaust a clock,
+        # so the field would be noise there.
+        response_body["timeout_seconds"] = settings.composer_timeout_seconds
     if exc.failed_turn is not None:
         response_body["failed_turn"] = await _failed_turn_response_body(service, session_id, exc.failed_turn)
     persisted_state_id: UUID | None = None
@@ -2042,6 +2207,7 @@ async def _handle_convergence_error(
                 preflight_exception_policy="persist_invalid",
                 initial_version=None,
                 telemetry_source="convergence",
+                prior_completion_gates=await _durable_completion_gates(service, session_id),
             )
             partial_record = await service.save_composition_state(
                 session_id,
@@ -2192,6 +2358,7 @@ async def _handle_plugin_crash(
                 preflight_exception_policy="persist_invalid",
                 initial_version=None,
                 telemetry_source="plugin_crash",
+                prior_completion_gates=await _durable_completion_gates(service, session_id),
             )
             partial_record = await service.save_composition_state(
                 session_id,
@@ -2433,6 +2600,7 @@ async def _handle_runtime_preflight_failure(
                 preflight_exception_policy="persist_invalid",
                 initial_version=None,
                 telemetry_source="runtime_preflight",
+                prior_completion_gates=await _durable_completion_gates(service, session_id),
             )
             partial_record = await service.save_composition_state(
                 session_id,
@@ -2581,6 +2749,7 @@ async def _inspect_latest_ready_session_blob(
 
 __all__ = [
     "AUDIT_GRADE_VIEW_QUERY_ARG_ALLOWLIST",
+    "PLANNER_POLICY_DETAIL_CODES",
     "SESSION_TERMINAL_RUN_STATUS_VALUES",
     "UTC",
     "UUID",
@@ -2820,12 +2989,14 @@ __all__ = [
     "inspect_blob_content",
     "json",
     "llm_call_audit_envelope",
+    "llm_call_audit_summary",
     "load_run_accounting_for_settings",
     "maybe_auto_title_session",
     "maybe_resolve_step_1_source_chat",
     "merge_composer_meta_updates",
     "merge_implicit_decisions_meta",
     "metrics",
+    "planner_failure_is_policy_blocked",
     "record_session_completed",
     "record_session_switched",
     "redact_source_storage_path",

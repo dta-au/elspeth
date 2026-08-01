@@ -10,24 +10,21 @@ import io
 import json
 import math
 import re
-import sys
 import tempfile
 import time
+from collections.abc import Generator, Mapping
 from collections.abc import Iterator as ABCIterator
-from collections.abc import Mapping
 from contextlib import suppress
 from decimal import Decimal
 from types import TracebackType
-from typing import Any, BinaryIO, ClassVar, Literal, Never, Self, cast
+from typing import Any, BinaryIO, ClassVar, Literal, Never, Protocol, Self, cast, runtime_checkable
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from elspeth.contracts import CallStatus, CallType, Determinism, PluginSchema, SourceRow
-from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
-from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identifiers import validate_field_names
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
@@ -221,11 +218,36 @@ class AWSS3SourceConfig(DataPluginConfig):
 AWSS3SourceConfig.model_rebuild()
 
 
-def _normalize_error_type(exc: BaseException) -> str:
-    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-        raise exc
+def _normalize_error_type(exc: Exception) -> str:
     name = type(exc).__name__
     return name if _SAFE_ERROR_TYPE.fullmatch(name) is not None else "ProviderError"
+
+
+def _s3_provider_exception_types() -> tuple[type[Exception], ...]:
+    """Return the declared SDK/transport failures at the optional AWS seam."""
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    return (BotoCoreError, ClientError, ConnectionError, TimeoutError)
+
+
+class _S3Client(Protocol):
+    def head_object(self, **kwargs: Any) -> object: ...
+
+    def get_object(self, **kwargs: Any) -> object: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class _S3Body(Protocol):
+    def read(self, size: int) -> bytes: ...
+
+    def close(self) -> None: ...
+
+
+@runtime_checkable
+class _S3Closable(Protocol):
+    def close(self) -> None: ...
 
 
 class S3SourceReadError(RuntimeError):
@@ -315,22 +337,12 @@ def _read_error(
     )
 
 
-def _close_body(body: Any) -> str | None:
-    cleanup_type: str | None = None
+def _close_body(body: _S3Closable) -> str | None:
     try:
         body.close()
-    except BaseException as exc:
-        cleanup_type = _normalize_error_type(exc)
-    return cleanup_type
-
-
-def _close_spool(spool: BinaryIO) -> str | None:
-    cleanup_type: str | None = None
-    try:
-        spool.close()
-    except BaseException as exc:
-        cleanup_type = _normalize_error_type(exc)
-    return cleanup_type
+    except _s3_provider_exception_types() as exc:
+        return _normalize_error_type(exc)
+    return None
 
 
 def _new_spool() -> BinaryIO:
@@ -342,19 +354,26 @@ def _raise_safe(error: S3SourceReadError) -> Never:
     raise error from None
 
 
-def _validated_length(response: Mapping[str, Any]) -> int | None:
-    value = response.get("ContentLength")
+def _validated_length(response: Mapping[str, object]) -> int | None:
+    if "ContentLength" not in response:
+        return None
+    value = response["ContentLength"]
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
     return value
 
 
-def _valid_encoding(response: Mapping[str, Any]) -> bool:
-    return response.get("ContentEncoding") in (None, "")
+def _valid_encoding(response: Mapping[str, object]) -> bool:
+    if "ContentEncoding" not in response:
+        return True
+    value = response["ContentEncoding"]
+    return type(value) is str and value == ""
 
 
-def _validated_etag(response: Mapping[str, Any]) -> str | None:
-    value = response.get("ETag")
+def _validated_etag(response: Mapping[str, object]) -> str | None:
+    if "ETag" not in response:
+        return None
+    value = response["ETag"]
     if not isinstance(value, str) or not value.strip():
         return None
     try:
@@ -368,13 +387,12 @@ def _validated_etag(response: Mapping[str, Any]) -> str | None:
     return value
 
 
-def _download_s3_object(client: Any, *, bucket: str, key: str, max_object_bytes: int) -> _DownloadedObject:
+def _download_s3_object(client: _S3Client, *, bucket: str, key: str, max_object_bytes: int) -> _DownloadedObject:
     """Download one immutable S3 object into a bounded spooled file."""
-    head_response: Any = None
     head_error_type: str | None = None
     try:
         head_response = client.head_object(Bucket=bucket, Key=key)
-    except BaseException as exc:
+    except _s3_provider_exception_types() as exc:
         head_error_type = _normalize_error_type(exc)
     if head_error_type is not None:
         _raise_safe(_read_error(head_error_type, max_object_bytes=max_object_bytes))
@@ -390,24 +408,25 @@ def _download_s3_object(client: Any, *, bucket: str, key: str, max_object_bytes:
     if head_length > max_object_bytes:
         _raise_safe(S3ObjectSizeLimitError(observed_bytes=head_length, limit_bytes=max_object_bytes))
 
-    get_response: Any = None
     get_error_type: str | None = None
     try:
         get_response = client.get_object(Bucket=bucket, Key=key, IfMatch=head_etag)
-    except BaseException as exc:
+    except _s3_provider_exception_types() as exc:
         get_error_type = _normalize_error_type(exc)
     if get_error_type is not None:
         _raise_safe(_read_error(get_error_type, max_object_bytes=max_object_bytes))
     if not isinstance(get_response, Mapping):
         _raise_safe(_read_error("InvalidS3Metadata", max_object_bytes=max_object_bytes))
 
-    body = get_response.get("Body")
-    body_close = getattr(body, "close", None)
-    if body is None or not callable(getattr(body, "read", None)) or not callable(body_close):
+    if "Body" not in get_response:
+        _raise_safe(_read_error("InvalidS3Body", max_object_bytes=max_object_bytes))
+    raw_body = get_response["Body"]
+    if not isinstance(raw_body, _S3Body):
         interface_error = _read_error("InvalidS3Body", max_object_bytes=max_object_bytes)
-        if callable(body_close):
-            interface_error.cleanup_error_type = _close_body(body)
+        if isinstance(raw_body, _S3Closable):
+            interface_error.cleanup_error_type = _close_body(raw_body)
         _raise_safe(interface_error)
+    body = raw_body
 
     get_length = _validated_length(get_response)
     validation_error: S3SourceReadError | None = None
@@ -421,80 +440,71 @@ def _download_s3_object(client: Any, *, bucket: str, key: str, max_object_bytes:
         validation_error.cleanup_error_type = _close_body(body)
         _raise_safe(validation_error)
 
-    spool: BinaryIO | None = None
-    spool_create_error_type: str | None = None
+    spool_created = False
     try:
         spool = _new_spool()
-    except BaseException as exc:
-        spool_create_error_type = _normalize_error_type(exc)
-    if spool_create_error_type is not None:
-        create_error = _read_error(spool_create_error_type, max_object_bytes=max_object_bytes)
-        create_error.cleanup_error_type = _close_body(body)
-        _raise_safe(create_error)
-    if spool is None:
-        raise AssertionError("S3 spool creation completed without a handle or failure")
+        spool_created = True
+    finally:
+        if not spool_created:
+            _close_body(body)
 
     digest = hashlib.sha256()
     total = 0
     primary_error: S3SourceReadError | None = None
-    while primary_error is None:
-        chunk: Any = None
-        read_error_type: str | None = None
-        try:
-            chunk = body.read(_DOWNLOAD_CHUNK_BYTES)
-        except BaseException as exc:
-            read_error_type = _normalize_error_type(exc)
-        if read_error_type is not None:
-            primary_error = _read_error(read_error_type, max_object_bytes=max_object_bytes, bytes_read=total)
-            break
-        if not isinstance(chunk, bytes) or len(chunk) > _DOWNLOAD_CHUNK_BYTES:
-            primary_error = _read_error("InvalidS3Body", max_object_bytes=max_object_bytes, bytes_read=total)
-            break
-        if not chunk:
-            break
-        observed = total + len(chunk)
-        if observed > max_object_bytes:
-            primary_error = S3ObjectSizeLimitError(observed_bytes=observed, limit_bytes=max_object_bytes)
-            break
-        write_result: Any = None
-        write_error_type: str | None = None
-        try:
+    body_closed = False
+    transfer_spool = False
+    try:
+        while primary_error is None:
+            try:
+                chunk = body.read(_DOWNLOAD_CHUNK_BYTES)
+            except _s3_provider_exception_types() as exc:
+                primary_error = _read_error(
+                    _normalize_error_type(exc),
+                    max_object_bytes=max_object_bytes,
+                    bytes_read=total,
+                )
+                break
+            if type(chunk) is not bytes or len(chunk) > _DOWNLOAD_CHUNK_BYTES:
+                primary_error = _read_error("InvalidS3Body", max_object_bytes=max_object_bytes, bytes_read=total)
+                break
+            if not chunk:
+                break
+            observed = total + len(chunk)
+            if observed > max_object_bytes:
+                primary_error = S3ObjectSizeLimitError(observed_bytes=observed, limit_bytes=max_object_bytes)
+                break
             write_result = spool.write(chunk)
-        except BaseException as exc:
-            write_error_type = _normalize_error_type(exc)
-        if write_error_type is not None:
-            primary_error = _read_error(write_error_type, max_object_bytes=max_object_bytes, bytes_read=total)
-            break
-        if isinstance(write_result, bool) or not isinstance(write_result, int) or write_result != len(chunk):
-            primary_error = _read_error("InvalidS3Spool", max_object_bytes=max_object_bytes, bytes_read=total)
-            break
-        digest.update(chunk)
-        total = observed
+            if type(write_result) is not int or write_result != len(chunk):
+                raise AssertionError("S3 private spool violated the BinaryIO.write contract")
+            digest.update(chunk)
+            total = observed
 
-    cleanup_error_type = _close_body(body)
-    if primary_error is None and total != head_length:
-        primary_error = _read_error("S3ContentLengthMismatch", max_object_bytes=max_object_bytes, bytes_read=total)
-    if primary_error is None and cleanup_error_type is not None:
-        primary_error = _read_error(cleanup_error_type, max_object_bytes=max_object_bytes, bytes_read=total)
-    elif primary_error is not None:
-        primary_error.cleanup_error_type = cleanup_error_type
-
-    if primary_error is None:
-        rewind_error_type: str | None = None
         try:
-            spool.seek(0)
-        except BaseException as exc:
-            rewind_error_type = _normalize_error_type(exc)
-        if rewind_error_type is not None:
-            primary_error = _read_error(rewind_error_type, max_object_bytes=max_object_bytes, bytes_read=total)
+            cleanup_error_type = _close_body(body)
+        except Exception as exc:
+            if primary_error is None:
+                raise
+            cleanup_error_type = _normalize_error_type(exc)
+        finally:
+            body_closed = True
+        if primary_error is None and total != head_length:
+            primary_error = _read_error("S3ContentLengthMismatch", max_object_bytes=max_object_bytes, bytes_read=total)
+        if primary_error is None and cleanup_error_type is not None:
+            primary_error = _read_error(cleanup_error_type, max_object_bytes=max_object_bytes, bytes_read=total)
+        elif primary_error is not None:
+            primary_error.cleanup_error_type = cleanup_error_type
 
-    if primary_error is not None:
-        spool_cleanup_type = _close_spool(spool)
-        if primary_error.cleanup_error_type is None:
-            primary_error.cleanup_error_type = spool_cleanup_type
-        _raise_safe(primary_error)
+        if primary_error is not None:
+            _raise_safe(primary_error)
 
-    return _DownloadedObject(spool, size_bytes=total, content_hash=digest.hexdigest())
+        spool.seek(0)
+        transfer_spool = True
+        return _DownloadedObject(spool, size_bytes=total, content_hash=digest.hexdigest())
+    finally:
+        if not body_closed:
+            _close_body(body)
+        if not transfer_spool:
+            spool.close()
 
 
 class _RecordLimitExceeded(ValueError):
@@ -793,11 +803,6 @@ def _iter_selected_json_items(
     raise _JSONBoundaryError("JSON document contains trailing data")
 
 
-def _raise_audit_error(error_type: str) -> Never:
-    error = AuditIntegrityError(f"Failed to record S3 call in the audit trail ({error_type}).")
-    raise error from None
-
-
 def _record_download_call(
     ctx: SourceContext,
     *,
@@ -808,23 +813,15 @@ def _record_download_call(
     response_data: dict[str, Any] | None = None,
     error_data: dict[str, Any] | None = None,
 ) -> None:
-    recorder_error_type: str | None = None
-    try:
-        ctx.record_call(
-            call_type=CallType.HTTP,
-            status=status,
-            request_data={"operation": "read_object", "bucket": bucket, "key": key},
-            response_data=response_data,
-            error=error_data,
-            latency_ms=latency_ms,
-            provider="aws_s3",
-        )
-    except contract_errors.TIER_1_ERRORS:
-        raise
-    except BaseException as exc:
-        recorder_error_type = _normalize_error_type(exc)
-    if recorder_error_type is not None:
-        _raise_audit_error(recorder_error_type)
+    ctx.record_call(
+        call_type=CallType.HTTP,
+        status=status,
+        request_data={"operation": "read_object", "bucket": bucket, "key": key},
+        response_data=response_data,
+        error=error_data,
+        latency_ms=latency_ms,
+        provider="aws_s3",
+    )
 
 
 class AWSS3Source(BaseSource):
@@ -833,8 +830,30 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3dd388167196481e"
+    source_file_hash: str | None = "sha256:3395879a00e6c3e4"
     config_model = AWSS3SourceConfig
+
+    usage_when_to_use: str = (
+        "Use for trusted CLI or batch ingestion of one bounded CSV, JSON-array, or JSONL S3 object through the "
+        "default AWS credential chain. The read is ETag-pinned, normalized, and validated at the source boundary."
+    )
+    usage_when_not_to_use: str = (
+        "Ordinary Web Composer cannot use this source. Do not use it for streams, prefixes or multi-object reads, "
+        "or AWS credentials embedded in YAML."
+    )
+    example_use: str = """sources:
+  s3_input:
+    plugin: aws_s3
+    on_success: output
+    options:
+      bucket: audit-input
+      key: incoming/records.jsonl
+      format: jsonl
+      schema:
+        mode: observed
+      on_validation_failure: discard
+"""
+    capability_tags: tuple[str, ...] = ("aws", "s3", "object-storage", "batch")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:
@@ -886,24 +905,21 @@ class AWSS3Source(BaseSource):
             if initial_contract.locked:
                 self.set_schema_contract(initial_contract)
 
-        self._s3_client: Any | None = None
+        self._s3_client: _S3Client | None = None
         self._active_download: _DownloadedObject | None = None
         self._closed = False
 
-    def _get_s3_client(self) -> Any:
+    def _get_s3_client(self) -> _S3Client:
         if self._s3_client is None:
-            client: Any = None
             client_error_type: str | None = None
             try:
-                client = build_s3_client(self._region_name, self._endpoint_url)
+                client = cast(_S3Client, build_s3_client(self._region_name, self._endpoint_url))
             except ImportError:
                 raise
-            except BaseException as exc:
+            except _s3_provider_exception_types() as exc:
                 client_error_type = _normalize_error_type(exc)
             if client_error_type is not None:
                 _raise_safe(_read_error(client_error_type, max_object_bytes=self._max_object_bytes))
-            if client is None:
-                raise AssertionError("S3 client construction completed without a client or failure")
             self._s3_client = client
         return self._s3_client
 
@@ -954,7 +970,7 @@ class AWSS3Source(BaseSource):
         if download is None:
             raise AssertionError("S3 download completed without a result or failure")
         self._active_download = download
-        parser: ABCIterator[SourceRow] | None = None
+        parser: Generator[SourceRow, None, None] | None = None
         try:
             _record_download_call(
                 ctx,
@@ -987,29 +1003,14 @@ class AWSS3Source(BaseSource):
                 elif self.get_schema_contract() is None:
                     self.set_schema_contract(create_contract_from_config(self._schema_config).with_locked())
         finally:
-            primary_active = sys.exc_info()[0] is not None
-            cleanup_failed = False
-            parser_close = getattr(parser, "close", None)
-            if callable(parser_close):
-                try:
-                    parser_close()
-                except (KeyboardInterrupt, SystemExit):
-                    raise
-                except BaseException:
-                    cleanup_failed = True
+            if parser is not None:
+                parser.close()
             if download is not None and self._active_download is download:
                 self._active_download = None
             if download is not None:
-                try:
-                    download.close()
-                except (KeyboardInterrupt, SystemExit):
-                    raise
-                except BaseException:
-                    cleanup_failed = True
-            if cleanup_failed and not primary_active:
-                raise RuntimeError("Failed to close aws_s3 parser resources.") from None
+                download.close()
 
-    def _file_error(self, ctx: SourceContext, message: str) -> ABCIterator[SourceRow]:
+    def _file_error(self, ctx: SourceContext, message: str) -> Generator[SourceRow, None, None]:
         raw_row = {"bucket": self._bucket, "key": self._key, "error": message}
         ctx.record_validation_error(
             row=raw_row,
@@ -1025,7 +1026,7 @@ class AWSS3Source(BaseSource):
                 source_row_index=0,
             )
 
-    def _load_csv(self, handle: BinaryIO, ctx: SourceContext) -> ABCIterator[SourceRow]:
+    def _load_csv(self, handle: BinaryIO, ctx: SourceContext) -> Generator[SourceRow, None, None]:
         stream = io.TextIOWrapper(handle, encoding=self._csv_options.encoding, errors="strict", newline="")
         lines = _BoundedDecodedLineIterator(stream, self._max_record_chars)
         reader = csv.reader(lines, delimiter=self._csv_options.delimiter, strict=True)
@@ -1120,7 +1121,7 @@ class AWSS3Source(BaseSource):
             with suppress(ValueError, OSError):
                 stream.detach()
 
-    def _load_jsonl(self, handle: BinaryIO, ctx: SourceContext) -> ABCIterator[SourceRow]:
+    def _load_jsonl(self, handle: BinaryIO, ctx: SourceContext) -> Generator[SourceRow, None, None]:
         stream = io.TextIOWrapper(
             handle,
             encoding=self._json_options.encoding,
@@ -1182,7 +1183,7 @@ class AWSS3Source(BaseSource):
             with suppress(ValueError, OSError):
                 stream.detach()
 
-    def _load_json_array(self, handle: BinaryIO, ctx: SourceContext) -> ABCIterator[SourceRow]:
+    def _load_json_array(self, handle: BinaryIO, ctx: SourceContext) -> Generator[SourceRow, None, None]:
         try:
             import ijson
         except ImportError as exc:
@@ -1397,23 +1398,13 @@ class AWSS3Source(BaseSource):
         client = self._s3_client
         self._s3_client = None
 
-        cleanup_error_type: str | None = None
-        if download is not None:
-            try:
+        try:
+            if download is not None:
                 download.close()
-            except BaseException as exc:
-                cleanup_error_type = _normalize_error_type(exc)
-        if client is not None:
-            close_method = getattr(client, "close", None)
-            if not callable(close_method):
-                if cleanup_error_type is None:
-                    cleanup_error_type = "InvalidS3Client"
-            else:
+        finally:
+            if client is not None:
                 try:
-                    close_method()
-                except BaseException as exc:
-                    if cleanup_error_type is None:
-                        cleanup_error_type = _normalize_error_type(exc)
-        if cleanup_error_type is not None:
-            error = RuntimeError(f"Failed to close aws_s3 source resources ({cleanup_error_type}).")
-            raise error from None
+                    client.close()
+                except _s3_provider_exception_types() as exc:
+                    error_type = _normalize_error_type(exc)
+                    raise RuntimeError(f"Failed to close aws_s3 source resources ({error_type}).") from None

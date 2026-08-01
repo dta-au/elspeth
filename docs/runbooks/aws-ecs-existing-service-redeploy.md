@@ -485,6 +485,10 @@ application exception. Never translate `STALE` into `--init-schema`.
 
 ## 6. Deploy with zero overlap
 
+Keep circuit-breaker failure detection enabled, but disable automatic rollback.
+A failed candidate remains operator-gated by the checks in [Rollback](#rollback);
+if they do not pass, keep traffic drained and repair forward.
+
 ```bash
 aws ecs update-service \
   --cluster "$ECS_CLUSTER" \
@@ -493,7 +497,7 @@ aws ecs update-service \
   --desired-count 1 \
   --force-new-deployment \
   --deployment-configuration \
-    '{"deploymentCircuitBreaker":{"enable":true,"rollback":true},"minimumHealthyPercent":0,"maximumPercent":100}' \
+    '{"deploymentCircuitBreaker":{"enable":true,"rollback":false},"minimumHealthyPercent":0,"maximumPercent":100}' \
   --profile "$AWS_PROFILE" --region "$AWS_REGION" >/dev/null
 
 aws ecs wait services-stable \

@@ -98,6 +98,7 @@ def _process_flush_results(
             current_node_id=work_item.current_node_id,
             coalesce_node_id=work_item.coalesce_node_id,
             coalesce_name=work_item.coalesce_name,
+            row_union_name=work_item.row_union_name,
         )
         accumulate_row_outcomes(downstream_results, counters, pending_tokens)
 

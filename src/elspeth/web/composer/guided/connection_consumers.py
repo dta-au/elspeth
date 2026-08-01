@@ -28,7 +28,16 @@ def canonical_connection_consumers(
 
     consumers: dict[str, list[ConsumerIdentity]] = {}
     for node in state.nodes:
-        consumers.setdefault(node.input, []).append(("node", node_identities[node.id]))
+        identity: ConsumerIdentity = ("node", node_identities[node.id])
+        if node.node_type in ("coalesce", "row_union"):
+            raw_branches = node.branches
+            branch_connections = raw_branches.values() if isinstance(raw_branches, Mapping) else raw_branches or ()
+            for connection in branch_connections:
+                destinations = consumers.setdefault(connection, [])
+                if identity not in destinations:
+                    destinations.append(identity)
+            continue
+        consumers.setdefault(node.input, []).append(identity)
     for output in state.outputs:
         consumers.setdefault(output.name, []).append(("output", output_identities[output.name]))
     return {connection: tuple(destinations) for connection, destinations in consumers.items()}

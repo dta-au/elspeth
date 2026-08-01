@@ -10,10 +10,14 @@ repair loop burns to REPAIR_EXHAUSTED (elspeth-859e2702dd).
 
 from __future__ import annotations
 
+import pytest
+
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.guided.planning import bind_guided_reviewed_components
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.composer.pipeline_planner import _CANDIDATE_SHAPE_INTEGRITY_PREFIX
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 OUTPUT_ID = "33333333-3333-4333-8333-333333333333"
@@ -45,6 +49,31 @@ def _guided() -> GuidedSession:
             )
         },
     )
+
+
+def test_bind_still_refuses_a_candidate_that_names_no_source() -> None:
+    """The binder's contract is unchanged; only the planner loop's handling is.
+
+    Repairing a sources-free candidate is the planner loop's job
+    (elspeth-bcc6bdac99) — it rejects the shape ahead of the finalizer. The
+    binder must keep refusing outright: it has no reviewed component to bind
+    and must never invent one.
+    """
+    pipeline = {
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+    with pytest.raises(AuditIntegrityError, match="does not identify reviewed sources") as raised:
+        bind_guided_reviewed_components(pipeline, _guided())
+
+    # The planner loop reclassifies binder candidate-shape complaints by this
+    # message prefix; pin the real message against the real constant so the
+    # two sides cannot drift into a terminal 500 again.
+    assert str(raised.value).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX)
 
 
 def test_bind_rewrites_invented_output_name_in_edges_and_routing() -> None:
@@ -275,3 +304,123 @@ def test_bind_keeps_discard_routing_untouched() -> None:
 
     assert bound["nodes"][0]["on_error"] == "discard"
     assert bound["nodes"][0]["on_success"] == "output"
+
+
+def _guided_with_output(
+    *,
+    required_fields: tuple[str, ...],
+    output_options: dict[str, object],
+) -> GuidedSession:
+    from dataclasses import replace
+
+    guided = _guided()
+    reviewed = dict(guided.reviewed_outputs)
+    reviewed[OUTPUT_ID] = SinkOutputResolved(
+        name="output",
+        plugin="json",
+        options=output_options,
+        required_fields=required_fields,
+        schema_mode="observed",
+        on_write_failure="discard",
+    )
+    return replace(guided, reviewed_outputs=reviewed)
+
+
+def _linear_pipeline() -> dict[str, object]:
+    return {
+        "sources": {
+            "source": {
+                "plugin": "csv",
+                "options": {},
+                "on_success": "output",
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
+        ],
+    }
+
+
+class TestBindDeclaredRequiredFields:
+    """F3 fix 3a: reviewed declared output fields become the sink's schema contract.
+
+    Step-2 field review captures ``SinkOutputResolved.required_fields``, but
+    both the composer sink-contract check and the runtime DAG validation key
+    off ``options.schema.required_fields`` — the binder is the one seam that
+    reaches candidate validation, the sealed proposal, committed state, YAML,
+    and runtime.
+    """
+
+    def test_declared_fields_materialize_as_the_sanctioned_schema_expression(self) -> None:
+        # No author schema block at all: the binder writes the sanctioned
+        # observed-mode contract expression (contracts/schema.py docs).
+        guided = _guided_with_output(
+            required_fields=("name", "score"),
+            output_options={"path": "outputs/colours.json"},
+        )
+
+        bound = bind_guided_reviewed_components(_linear_pipeline(), guided)
+
+        assert bound["outputs"][0]["options"] == {
+            "path": "outputs/colours.json",
+            "schema": {"mode": "observed", "required_fields": ["name", "score"]},
+        }
+
+    def test_empty_declared_fields_leave_reviewed_options_byte_identical(self) -> None:
+        options = {"path": "outputs/colours.json", "schema": {"mode": "observed"}}
+        guided = _guided_with_output(required_fields=(), output_options=dict(options))
+
+        bound = bind_guided_reviewed_components(_linear_pipeline(), guided)
+
+        assert bound["outputs"][0]["options"] == options
+        assert "required_fields" not in bound["outputs"][0]["options"]["schema"]
+
+    def test_author_typed_required_fields_merge_as_a_union_with_author_order_first(self) -> None:
+        # Author-typed schema.required_fields is never overwritten: the union
+        # keeps the author's entries and order, appending only the declared
+        # fields not already present.
+        guided = _guided_with_output(
+            required_fields=("name", "score"),
+            output_options={
+                "path": "outputs/colours.json",
+                "schema": {"mode": "observed", "required_fields": ["email", "name"]},
+            },
+        )
+
+        bound = bind_guided_reviewed_components(_linear_pipeline(), guided)
+
+        schema = bound["outputs"][0]["options"]["schema"]
+        assert schema == {"mode": "observed", "required_fields": ["email", "name", "score"]}
+
+    def test_declared_fields_merge_under_the_schema_config_alias_without_minting_schema(self) -> None:
+        guided = _guided_with_output(
+            required_fields=("name",),
+            output_options={"path": "outputs/colours.json", "schema_config": {"mode": "observed"}},
+        )
+
+        bound = bind_guided_reviewed_components(_linear_pipeline(), guided)
+
+        options = bound["outputs"][0]["options"]
+        assert "schema" not in options
+        assert options["schema_config"] == {"mode": "observed", "required_fields": ["name"]}
+
+    def test_author_schema_keys_beyond_required_fields_are_preserved(self) -> None:
+        guided = _guided_with_output(
+            required_fields=("email",),
+            output_options={
+                "path": "outputs/colours.json",
+                "schema": {"mode": "fixed", "fields": ["email: str"], "guaranteed_fields": ["email"]},
+            },
+        )
+
+        bound = bind_guided_reviewed_components(_linear_pipeline(), guided)
+
+        assert bound["outputs"][0]["options"]["schema"] == {
+            "mode": "fixed",
+            "fields": ["email: str"],
+            "guaranteed_fields": ["email"],
+            "required_fields": ["email"],
+        }

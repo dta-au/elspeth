@@ -9,13 +9,14 @@ import time
 import uuid
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import cast
 from urllib.parse import quote
 
 import httpx
 import yaml
 
+from elspeth.contracts.hashing import canonical_json
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -30,6 +31,7 @@ from .contracts import (
     RUN_POLL_INTERVAL_SECONDS,
     AcceptanceCheckError,
     AcceptanceInputError,
+    _artifact_id_field,
     _canonical_uuid,
     _mapping,
     _sha256,
@@ -37,6 +39,8 @@ from .contracts import (
     _string_field,
     _utc_timestamp,
     _uuid_field,
+    acceptance_step,
+    check_error_with_cause,
 )
 from .http_client import AcceptanceHttpClient
 from .state import AcceptanceState, read_acceptance_state, write_acceptance_state
@@ -53,7 +57,11 @@ def build_fixed_pipeline_yaml(*, session_id: str, source_path: str = "blobs/aws-
     """Return the fixed no-LLM CSV source-to-sink acceptance pipeline."""
 
     canonical_session_id = _canonical_uuid(session_id, label="session identity")
-    document = {
+    return yaml.safe_dump(_fixed_pipeline_document(canonical_session_id, source_path=source_path), sort_keys=False)
+
+
+def _fixed_pipeline_document(canonical_session_id: str, *, source_path: str) -> dict[str, object]:
+    return {
         "sources": {
             "source": {
                 "plugin": "csv",
@@ -82,7 +90,38 @@ def build_fixed_pipeline_yaml(*, session_id: str, source_path: str = "blobs/aws-
             }
         },
     }
-    return yaml.safe_dump(document, sort_keys=False)
+
+
+def _server_data_dir(env: Mapping[str, str]) -> str:
+    """Return the canonical absolute data directory the web service runs with.
+
+    The value must be the server's own canonical data dir (the deployment
+    inventory's ``ELSPETH_WEB__DATA_DIR``, e.g. ``/var/lib/elspeth``): the
+    server rewrites relative sink paths under it before execution, and the
+    expected sink node identity is derived from that rewritten path.
+    """
+
+    data_dir = env.get("ELSPETH_WEB__DATA_DIR")
+    if type(data_dir) is not str or not data_dir:
+        raise AcceptanceInputError("ELSPETH_WEB__DATA_DIR must be the canonical absolute data dir the web service runs with")
+    path = PurePosixPath(data_dir)
+    if not path.is_absolute() or str(path) != data_dir or any(part in {".", ".."} for part in path.parts):
+        raise AcceptanceInputError("ELSPETH_WEB__DATA_DIR must be the canonical absolute data dir the web service runs with")
+    return data_dir
+
+
+def _fixed_output_sink_node_id(session_id: str, *, data_dir: str) -> str:
+    canonical_session_id = _canonical_uuid(session_id, label="session identity")
+    document = _fixed_pipeline_document(canonical_session_id, source_path="blobs/aws-ecs-acceptance-input.csv")
+    sinks = cast(dict[str, dict[str, object]], document["sinks"])
+    sink_options = dict(cast(dict[str, object], sinks["output"]["options"]))
+    # Mirror the server-side resolve_sink_data_path() rewrite textually:
+    # the client filesystem is not the server filesystem, so the resolved
+    # path is composed as a string, never via Path.resolve().
+    sink_options["path"] = str(
+        PurePosixPath(data_dir) / "outputs" / canonical_session_id / f"aws-ecs-acceptance-{canonical_session_id}.csv"
+    )
+    return f"sink_output_{_sha256(canonical_json(sink_options).encode('utf-8'))[:12]}"
 
 
 def _canonical_tutorial_policy_state(*, profile_alias: str) -> CompositionState:
@@ -143,12 +182,12 @@ def _run_facts(payload: object, *, check: str) -> tuple[str, int, int]:
     return landscape_run_id, source_rows, failed_tokens
 
 
-def _select_output_artifact(payload: object, *, check: str) -> tuple[str, str]:
+def _select_output_artifact(payload: object, *, expected_sink_node_id: str, check: str) -> tuple[str, str]:
     manifest = _mapping(payload, check=check)
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list):
         raise AcceptanceCheckError(check)
-    matches = [artifact for artifact in artifacts if isinstance(artifact, dict) and artifact.get("sink_node_id") == "output"]
+    matches = [artifact for artifact in artifacts if isinstance(artifact, dict) and artifact.get("sink_node_id") == expected_sink_node_id]
     if len(matches) != 1:
         raise AcceptanceCheckError(check)
     artifact = matches[0]
@@ -156,7 +195,7 @@ def _select_output_artifact(payload: object, *, check: str) -> tuple[str, str]:
         raise AcceptanceCheckError(check)
     if artifact.get("exists_now") is not True or artifact.get("downloadable") is not True:
         raise AcceptanceCheckError(check)
-    return _uuid_field(artifact, "artifact_id", check=check), _sha256_field(artifact, "content_hash", check=check)
+    return _artifact_id_field(artifact, "artifact_id", check=check), _sha256_field(artifact, "content_hash", check=check)
 
 
 def capture(
@@ -170,20 +209,23 @@ def capture(
 ) -> AcceptanceState:
     """Capture one fixed public-API run and atomically persist its safe state."""
 
-    register_value = env.get("ELSPETH_ACCEPTANCE_REGISTER")
-    if register_value not in {None, "0", "1"}:
-        raise AcceptanceInputError("ELSPETH_ACCEPTANCE_REGISTER must be 0 or 1")
-    tutorial_profile = env.get("ELSPETH_WEB__TUTORIAL_LLM_PROFILE")
-    if type(tutorial_profile) is not str or not tutorial_profile.strip() or tutorial_profile != tutorial_profile.strip():
-        raise AcceptanceInputError("tutorial profile alias is invalid")
+    with acceptance_step("env_validate"):
+        register_value = env.get("ELSPETH_ACCEPTANCE_REGISTER")
+        if register_value not in {None, "0", "1"}:
+            raise AcceptanceInputError("ELSPETH_ACCEPTANCE_REGISTER must be 0 or 1")
+        tutorial_profile = env.get("ELSPETH_WEB__DEFAULT_LLM_PROFILE")
+        if type(tutorial_profile) is not str or not tutorial_profile.strip() or tutorial_profile != tutorial_profile.strip():
+            raise AcceptanceInputError("tutorial profile alias is invalid")
+        server_data_dir = _server_data_dir(env)
     captured_at = _utc_timestamp(now())
     client = AcceptanceHttpClient.from_env(env, transport=transport)
-    register = register_value == "1"
-    if register and client.credentials.mode != "local":
-        raise AcceptanceInputError("registration is available only for local acceptance authentication")
+    with acceptance_step("env_validate"):
+        register = register_value == "1"
+        if register and client.credentials.mode != "local":
+            raise AcceptanceInputError("registration is available only for local acceptance authentication")
 
     uploaded_sha256 = _sha256(FIXED_INPUT_BYTES)
-    with client:
+    with client, acceptance_step("capture_fetch"):
         client.authenticate(register=register)
         session = _mapping(client.request_json("POST", "/api/sessions", expected_statuses={201}, json_body={}), check="session_create")
         session_id = _uuid_field(session, "id", check="session_create")
@@ -243,7 +285,11 @@ def capture(
         if _run_facts(results, check="run_results") != (landscape_run_id, source_rows, failed_tokens):
             raise AcceptanceCheckError("run_results")
         manifest = client.request_json("GET", f"/api/runs/{run_id}/outputs", expected_statuses={200})
-        artifact_id, manifest_artifact_sha256 = _select_output_artifact(manifest, check="artifact_manifest")
+        artifact_id, manifest_artifact_sha256 = _select_output_artifact(
+            manifest,
+            expected_sink_node_id=_fixed_output_sink_node_id(session_id, data_dir=server_data_dir),
+            check="artifact_manifest",
+        )
         artifact_content = client.request_bytes(
             "GET",
             f"/api/runs/{run_id}/outputs/{artifact_id}/content",
@@ -372,8 +418,10 @@ def verify_api(
     """Re-authenticate and verify the captured API resources without mutation."""
 
     state = read_acceptance_state(state_file)
+    with acceptance_step("env_validate"):
+        server_data_dir = _server_data_dir(env)
     client = AcceptanceHttpClient.from_env(env, transport=transport)
-    with client:
+    with client, acceptance_step("verify_fetch"):
         client.authenticate(register=False)
         session = _mapping(
             client.request_json("GET", f"/api/sessions/{state.session_id}", expected_statuses={200}),
@@ -411,7 +459,11 @@ def verify_api(
         if _run_facts(results, check="results_readback") != expected_facts:
             raise AcceptanceCheckError("results_readback")
         manifest = client.request_json("GET", f"/api/runs/{state.run_id}/outputs", expected_statuses={200})
-        artifact_id, artifact_sha256 = _select_output_artifact(manifest, check="artifact_manifest")
+        artifact_id, artifact_sha256 = _select_output_artifact(
+            manifest,
+            expected_sink_node_id=_fixed_output_sink_node_id(state.session_id, data_dir=server_data_dir),
+            check="artifact_manifest",
+        )
         if artifact_id != state.artifact_id or artifact_sha256 != state.artifact_sha256:
             raise AcceptanceCheckError("artifact_manifest")
         artifact_content = client.request_bytes(
@@ -480,8 +532,8 @@ def provision_storage() -> dict[str, object]:
         payload_root = settings.get_payload_store_path()
     except AcceptanceCheckError:
         raise
-    except Exception:
-        raise AcceptanceCheckError("storage_settings") from None
+    except Exception as exc:
+        raise check_error_with_cause("storage_settings", exc) from None
     if os.geteuid() != _CONTAINER_RUNTIME_UID or os.getegid() != _CONTAINER_RUNTIME_GID:
         raise AcceptanceCheckError("storage_identity")
     if not isinstance(data_dir, Path) or not isinstance(payload_root, Path):
@@ -567,8 +619,8 @@ def verify_payloads(landscape_run_id: str) -> dict[str, object]:
         landscape_url = settings.get_landscape_url()
         passphrase = settings.landscape_passphrase
         payload_root = settings.get_payload_store_path()
-    except Exception:
-        raise AcceptanceCheckError("settings_load") from None
+    except Exception as exc:
+        raise check_error_with_cause("settings_load", exc) from None
 
     try:
         with LandscapeDB.from_url(
@@ -579,21 +631,21 @@ def verify_payloads(landscape_run_id: str) -> dict[str, object]:
         ) as database:
             rows = RecorderFactory.read_only(database).query.get_rows(canonical_run_id)
             refs = [row.source_data_ref for row in rows if row.source_data_ref is not None]
-    except Exception:
-        raise AcceptanceCheckError("landscape_payload_query") from None
+    except Exception as exc:
+        raise check_error_with_cause("landscape_payload_query", exc) from None
     if not refs:
         raise AcceptanceCheckError("payload_refs")
     if payload_root.is_symlink() or not payload_root.is_dir():
         raise AcceptanceCheckError("payload_root")
     try:
         store = FilesystemPayloadStore(payload_root)
-    except Exception:
-        raise AcceptanceCheckError("payload_store") from None
+    except Exception as exc:
+        raise check_error_with_cause("payload_store", exc) from None
     try:
         for ref in refs:
             store.retrieve(ref)
-    except Exception:
-        raise AcceptanceCheckError("payload_retrieval") from None
+    except Exception as exc:
+        raise check_error_with_cause("payload_retrieval", exc) from None
     return {
         "check": "verify-payloads",
         "ok": True,

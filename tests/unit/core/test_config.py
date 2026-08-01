@@ -2035,6 +2035,37 @@ class TestCoalesceSettings:
                 timeout_seconds=-1.0,
             )
 
+    def test_coalesce_settings_timeout_infinite_rejected(self) -> None:
+        """Infinite timeout values should be rejected.
+
+        `gt=0` lets `inf` through, and CoalesceExecutor.check_timeouts compares
+        `elapsed > timeout_seconds` — so an infinite timeout silently disables
+        the whole timeout sweep instead of bounding the wait.
+        """
+        from elspeth.core.config import CoalesceSettings
+
+        with pytest.raises(ValidationError, match="finite"):
+            CoalesceSettings(
+                name="test",
+                branches=["branch_a", "branch_b"],
+                policy="best_effort",
+                merge="union",
+                timeout_seconds=float("inf"),
+            )
+
+    def test_coalesce_settings_nan_timeout_rejected(self) -> None:
+        """NaN timeout values should be rejected."""
+        from elspeth.core.config import CoalesceSettings
+
+        with pytest.raises(ValidationError):
+            CoalesceSettings(
+                name="test",
+                branches=["branch_a", "branch_b"],
+                policy="best_effort",
+                merge="union",
+                timeout_seconds=float("nan"),
+            )
+
     def test_coalesce_settings_quorum_count_negative_rejected(self) -> None:
         """Negative quorum count should be rejected."""
         from elspeth.core.config import CoalesceSettings
@@ -2140,6 +2171,39 @@ class TestCoalesceSettings:
             merge="union",
         )
         assert settings.branches == {"path_a": "path_a", "path_b": "path_b"}
+
+    def test_coalesce_branches_dict_rejects_keys_that_collide_after_trim(self) -> None:
+        """Branch keys that collapse into one after trimming must be rejected.
+
+        min_length=2 is checked on the raw dict, so untrimmed keys could
+        silently shrink a 2-branch coalesce to 1 — the join contract changes
+        meaning (require_all over one branch) with no diagnostic.
+        """
+        from elspeth.core.config import CoalesceSettings
+
+        with pytest.raises(ValidationError, match="collide"):
+            CoalesceSettings(
+                name="merge",
+                branches={"path_a": "x", " path_a": "y"},
+                policy="require_all",
+                merge="union",
+            )
+
+    def test_coalesce_branches_list_rejects_entries_that_collide_after_trim(self) -> None:
+        """List entries differing only by whitespace must be rejected too.
+
+        The raw strings differ, so normalize_branches' duplicate check passes
+        and min_length=2 is satisfied — the collapse only happens at trim time.
+        """
+        from elspeth.core.config import CoalesceSettings
+
+        with pytest.raises(ValidationError, match="collide"):
+            CoalesceSettings(
+                name="merge",
+                branches=["path_a", " path_a"],
+                policy="require_all",
+                merge="union",
+            )
 
     def test_coalesce_branches_dict_validates_values(self) -> None:
         """Invalid connection names in dict values should be rejected.

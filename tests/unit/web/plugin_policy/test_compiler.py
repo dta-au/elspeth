@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
+from structlog.testing import capture_logs
 
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlRole, PluginCapability
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -39,6 +40,37 @@ def test_default_policy_authorizes_exact_required_core() -> None:
     assert policy.required == REQUIRED_WEB_PLUGIN_IDS
     assert policy.authorized == REQUIRED_WEB_PLUGIN_IDS
     assert PluginId("sink", "database") not in policy.authorized
+
+
+def test_compiling_a_categorically_prohibited_allowlist_entry_warns_at_boot() -> None:
+    """``source:aws_s3`` is a deliberate carve-out (R2-F1): the allowlist can
+    authorize it for the deployment's own runtime, but the web authoring
+    surface refuses it categorically (``provider_config_policy.py``). The
+    predicate is name-static — it needs no principal or credential state — so
+    the compiler can and should surface it at boot, not only when a
+    principal-scoped snapshot later declines it.
+    """
+    with capture_logs() as logs:
+        policy = compile_web_plugin_policy(
+            registry=get_shared_plugin_manager(),
+            settings=RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=("source:aws_s3",))),
+        )
+
+    assert PluginId("source", "aws_s3") in policy.authorized
+    warnings = [entry for entry in logs if entry.get("log_level") == "warning"]
+    assert len(warnings) == 1
+    assert warnings[0]["event"] == "web_plugin_policy_allowlist_contains_categorical_prohibition"
+    assert warnings[0]["plugin_ids"] == ["source:aws_s3"]
+
+
+def test_compiling_without_a_categorically_prohibited_entry_does_not_warn() -> None:
+    with capture_logs() as logs:
+        compile_web_plugin_policy(
+            registry=get_shared_plugin_manager(),
+            settings=RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=("sink:database",))),
+        )
+
+    assert [entry for entry in logs if entry.get("log_level") == "warning"] == []
 
 
 def test_allowlist_is_set_like_for_hashing() -> None:
@@ -176,13 +208,21 @@ def test_allowlisted_bedrock_shield_without_profile_rejects_old_optional_sdk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     real_import = importlib.import_module
+    real_version = importlib.metadata.version
 
     def old_sdk(name: str, package: str | None = None) -> object:
         if name in {"boto3", "botocore"}:
-            return SimpleNamespace(__version__="1.39.99")
+            return object()
         return real_import(name, package)
 
     monkeypatch.setattr(importlib, "import_module", old_sdk)
+
+    def old_sdk_version(distribution_name: str) -> str:
+        if distribution_name in {"boto3", "botocore"}:
+            return "1.39.99"
+        return real_version(distribution_name)
+
+    monkeypatch.setattr(importlib.metadata, "version", old_sdk_version)
     runtime = RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=("transform:aws_bedrock_prompt_shield",)))
 
     with pytest.raises(ValueError, match=r"^web plugin policy invalid: plugin_unavailable$"):

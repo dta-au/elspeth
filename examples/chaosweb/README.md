@@ -20,7 +20,7 @@ source ─(urls)─> scraper ─┬─(scraped)─> [content_check] ─┬─ ou
 **Terminal 1** — Start the ChaosWeb server:
 
 ```bash
-chaosweb serve --preset=realistic --port=8200
+chaosweb serve --preset=realistic --port=8200 --workers=1
 ```
 
 **Terminal 2** — Run the pipeline:
@@ -36,22 +36,28 @@ Results appear in `output/`:
 - `review.csv` — Pages with suspiciously short content (< 50 chars)
 - `scrape_failures.csv` — Failed fetches (429, 403, 404, timeout, etc.)
 
+The realistic preset is stochastic. A non-retryable injected fault produces a
+`PARTIAL` run and process exit 1 after routing the row to
+`scrape_failures.csv`; this is expected when every input is accounted for.
+Sink files with zero rows are not created. Failure reasons remain in the
+Landscape audit trail; the failure CSV carries the original input fields.
+
 ## Preset Variations
 
 Try different ChaosWeb presets to test different failure profiles:
 
 ```bash
 # Gentle (5% error rate) — most requests succeed
-chaosweb serve --preset=gentle --port=8200
+chaosweb serve --preset=gentle --port=8200 --workers=1
 
 # Realistic (15-20% error rate) — mixed failures
-chaosweb serve --preset=realistic --port=8200
+chaosweb serve --preset=realistic --port=8200 --workers=1
 
 # Stress (40%+ error rate) — heavy fault injection
-chaosweb serve --preset=stress_scraping --port=8200
+chaosweb serve --preset=stress_scraping --port=8200 --workers=1
 
 # Custom overrides
-chaosweb serve --rate-limit-pct=30 --forbidden-pct=10 --port=8200
+chaosweb serve --rate-limit-pct=30 --forbidden-pct=10 --port=8200 --workers=1
 ```
 
 ## Audit Trail

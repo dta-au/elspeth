@@ -33,7 +33,7 @@ from typing import Any, TypedDict, cast
 import yaml
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.guided.state_machine import TerminalKind
 from elspeth.web.composer.guided_blob_refs import (
     GUIDED_REVIEWED_BLOB_PATH_KEYS,
@@ -56,6 +56,7 @@ _WEB_ONLY_OPTION_KEYS = frozenset({"blob_ref"}) | AUTHORING_METADATA_OPTION_KEYS
 _PUBLIC_RECURSIVE_FORBIDDEN_OPTION_KEYS = _WEB_ONLY_OPTION_KEYS | frozenset(NESTED_LOCAL_PATH_OPTION_KEYS) | frozenset({"blob_id"})
 _PUBLIC_STORAGE_OPTION_KEYS = frozenset(SOURCE_LOCAL_PATH_OPTION_KEYS) | frozenset(SINK_LOCAL_PATH_OPTION_KEYS)
 _PUBLIC_CUSTODY_SUBTREE_KEYS = frozenset({"custody", "provider_config"})
+_YAML_LOWERED_NODE_TYPES = frozenset({"aggregation", "coalesce", "gate", "queue", "row_union", "transform"})
 
 
 class PublicCompositionDict(TypedDict):
@@ -69,25 +70,23 @@ class PublicCompositionDict(TypedDict):
     outputs: list[dict[str, Any]]
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored source options mapping (untrusted blob_ref value)",
     source_param="options",
     suppresses=("R1",),
     invariant="returns True only when blob_ref is present and non-null; absent keys yield False, never raise",
-    non_raising=True,
 )
 def _has_blob_binding(options: dict[str, Any]) -> bool:
     return options.get("blob_ref") is not None
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored source options mapping (untrusted mode value)",
     source_param="options",
     suppresses=("R1",),
     invariant="returns True only for the exact 'bind_source' mode string; absent or mistyped mode yields False, never raises",
-    non_raising=True,
 )
 def _has_bind_source_mode(options: dict[str, Any]) -> bool:
     return options.get("mode") == "bind_source"
@@ -150,6 +149,11 @@ def _generate_pipeline_dict(
     # to_dict() recursively converts MappingProxyType -> dict,
     # tuple -> list. Without this, yaml.dump() raises RepresenterError.
     state_dict = cast(PublicCompositionDict, state.to_dict()) if state_dict is None else state_dict
+
+    if COMPOSER_NODE_TYPES != _YAML_LOWERED_NODE_TYPES:
+        missing = sorted(COMPOSER_NODE_TYPES - _YAML_LOWERED_NODE_TYPES)
+        obsolete = sorted(_YAML_LOWERED_NODE_TYPES - COMPOSER_NODE_TYPES)
+        raise RuntimeError(f"Composer node type lowering drift: missing YAML lowering for {missing}; obsolete YAML lowering for {obsolete}")
 
     doc: dict[str, Any] = {}
 
@@ -223,6 +227,22 @@ def _generate_pipeline_dict(
                 entry["fork_to"] = g["fork_to"]
             doc["gates"].append(entry)
 
+    # Row unions — structural N-to-N barriers. ``input`` is a Composer-only
+    # placeholder derived from the first branch connection; runtime consumes
+    # only the ordered branches mapping.
+    row_unions = [n for n in state_dict["nodes"] if n["node_type"] == "row_union"]
+    if row_unions:
+        doc["row_unions"] = []
+        for row_union in row_unions:
+            entry = {
+                "name": row_union["id"],
+                "branches": row_union["branches"],
+                "on_success": row_union["on_success"],
+            }
+            if "timeout_seconds" in row_union:
+                entry["timeout_seconds"] = row_union["timeout_seconds"]
+            doc["row_unions"].append(entry)
+
     # Aggregations
     aggregations = [n for n in state_dict["nodes"] if n["node_type"] == "aggregation"]
     if aggregations:
@@ -269,6 +289,8 @@ def _generate_pipeline_dict(
             }
             if c["on_success"] is not None:
                 entry["on_success"] = c["on_success"]
+            if "timeout_seconds" in c:
+                entry["timeout_seconds"] = c["timeout_seconds"]
             doc["coalesce"].append(entry)
 
     # Sinks — always-present fields, direct access.
@@ -402,7 +424,7 @@ def _recursive_public_option_projection(
     if isinstance(value, Mapping):
         projected: dict[str, Any] = {}
         for key, nested in value.items():
-            if key in _PUBLIC_RECURSIVE_FORBIDDEN_OPTION_KEYS or key.endswith("_blob_id"):
+            if key in _PUBLIC_RECURSIVE_FORBIDDEN_OPTION_KEYS or (custody_subtree and key.endswith("_blob_id")):
                 continue
             if (strip_storage_here or custody_subtree) and key in _PUBLIC_STORAGE_OPTION_KEYS:
                 continue
@@ -481,8 +503,8 @@ def generate_yaml(state: CompositionState) -> str:
     """
     doc = generate_pipeline_dict(state)
 
-    # sort_keys=False preserves insertion order: source → transforms →
-    # gates → aggregations → coalesce → sinks (the natural pipeline flow).
+    # sort_keys=False preserves insertion order: sources → queues → transforms
+    # → gates → row_unions → aggregations → coalesce → sinks.
     return yaml.dump(doc, default_flow_style=False, sort_keys=False)
 
 

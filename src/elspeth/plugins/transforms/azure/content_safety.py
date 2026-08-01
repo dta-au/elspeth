@@ -37,10 +37,10 @@ class ContentSafetyThresholds(BaseModel):
     """Per-category severity thresholds for Azure Content Safety.
 
     Azure Content Safety returns severity scores from 0-6 for each category.
-    Content is flagged when its severity exceeds the configured threshold.
+    Content is flagged only when ``severity > threshold``.
 
-    A threshold of 0 means all content of that type is blocked.
-    A threshold of 6 means only the most severe content is blocked.
+    A threshold of 0 allows severity 0 and blocks severities 1-6.
+    A threshold of 6 blocks nothing.
     """
 
     model_config = {"extra": "forbid", "frozen": True}
@@ -160,9 +160,33 @@ class AzureContentSafety(BaseAzureSafetyTransform):
 
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:99c7979ca759fc26"
+    source_file_hash: str | None = "sha256:437a1c362c8defea"
     config_model = AzureContentSafetyConfig
     passes_through_input = True
+    capability_tags: tuple[str, ...] = ("azure", "content-safety", "moderation")
+
+    usage_when_to_use = (
+        "Use for Azure harmful-content moderation with explicit hate, violence, sexual, and self-harm "
+        "category threshold values from 0 through 6."
+    )
+    usage_when_not_to_use = (
+        "Not for jailbreak or prompt-injection detection; use azure_prompt_shield for those attacks. "
+        "Threshold 6 is effectively non-blocking because Azure severities never exceed 6."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: azure_content_safety\n"
+        "  options:\n"
+        "    endpoint: https://catalogue-safety.cognitiveservices.azure.com\n"
+        "    api_key: {secret_ref: AZURE_CONTENT_SAFETY_KEY}\n"
+        "    fields: [generated_text]\n"
+        "    thresholds:\n"
+        "      hate: 2\n"
+        "      violence: 2\n"
+        "      sexual: 2\n"
+        "      self_harm: 2\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
@@ -381,7 +405,7 @@ class AzureContentSafety(BaseAzureSafetyTransform):
                 composer_hints=(
                     "Thresholds use OR logic: a row is flagged when ANY category exceeds its threshold. Tighten thresholds individually, not globally.",
                     "Default thresholds tend to be 4 — set per-category based on the audit policy, not on Azure's recommendation.",
-                    "Always place upstream of any LLM transform when input came from web_scrape or other external sources (Tier 3 → safety check → Tier 2).",
+                    "Category moderation can block remote text that exceeds configured severity thresholds, but remote content remains untrusted; apply prompt-injection defenses before sending it to an LLM.",
                     "The transform records the full per-category response in audit, not just the flag — verify this is visible before declaring success.",
                 ),
             )

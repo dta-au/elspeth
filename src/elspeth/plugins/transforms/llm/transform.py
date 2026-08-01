@@ -2,7 +2,7 @@
 
 LLMTransform dispatches to SingleQueryStrategy or MultiQueryStrategy
 based on whether queries are configured. Provider dispatch (Azure,
-OpenRouter, Bedrock) is handled via _PROVIDERS registry.
+OpenRouter, Bedrock, Gateway) is handled via _PROVIDERS registry.
 
 Architecture:
     LLMTransform (BatchTransformMixin)
@@ -67,6 +67,7 @@ from elspeth.plugins.transforms.llm.provider import (
 )
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider, AzureOpenAIConfig, _configure_azure_monitor
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockLLMProvider
+from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig, GatewayLLMProvider
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterConfig, OpenRouterLLMProvider
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig, parse_tracing_config
@@ -247,13 +248,15 @@ def _finish_reason_error(
 
 # NOTE: type[LLMProvider] won't work here — mypy doesn't support type[Protocol]
 # for structural subtyping. The concrete classes (AzureLLMProvider,
-# OpenRouterLLMProvider, BedrockLLMProvider) are verified against LLMProvider by mypy at their
-# definition sites. The provider class is stored here for documentation only —
-# actual construction uses isinstance narrowing in _create_provider().
+# OpenRouterLLMProvider, BedrockLLMProvider, GatewayLLMProvider) are verified
+# against LLMProvider by mypy at their definition sites. The provider class is
+# stored here for documentation only — actual construction uses isinstance
+# narrowing in _create_provider().
 _PROVIDERS: dict[str, tuple[type[LLMConfig], type]] = {
     "azure": (AzureOpenAIConfig, AzureLLMProvider),
     "openrouter": (OpenRouterConfig, OpenRouterLLMProvider),
     "bedrock": (BedrockConfig, BedrockLLMProvider),
+    "gateway": (GatewayConfig, GatewayLLMProvider),
 }
 
 
@@ -1140,6 +1143,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         "azure"      → AzureOpenAIConfig + AzureLLMProvider
         "openrouter" → OpenRouterConfig  + OpenRouterLLMProvider
         "bedrock"    → BedrockConfig     + BedrockLLMProvider
+        "gateway"    → GatewayConfig     + GatewayLLMProvider
 
     Strategy selection:
         queries is not None → MultiQueryStrategy
@@ -1151,11 +1155,34 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f79bf0f2944245ad"
+    source_file_hash: str | None = "sha256:acc31f06c294a33c"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
     _provider: LLMProvider | None
+    capability_tags: tuple[str, ...] = ("llm", "generation", "structured-output")
+
+    usage_when_to_use = (
+        "Use an operator-approved profile for text generation or structured-output workflows. "
+        "ELSPETH records prompts, responses, the returned model, and input/output tokens when reported by the provider "
+        "in the audit trail. "
+        "Returned provider content is untrusted before LLM reuse or tool routing."
+    )
+    usage_when_not_to_use = (
+        "Do not put provider credentials or endpoints in web-authored options; the operator profile "
+        "owns those bindings. Do not use this non-deterministic transform where replay must reproduce "
+        "the same generated value without a recorded provider response."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: llm\n"
+        "  options:\n"
+        "    profile: approved-structured-generation\n"
+        "    prompt_template: 'Summarise {{ row.document_text }} in one sentence.'\n"
+        "    required_input_fields: [document_text]\n"
+        "    response_field: generated_summary\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def get_config_model(cls, config: dict[str, Any] | None = None) -> type[LLMConfig]:
@@ -1322,12 +1349,28 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             raise ValueError(f"Unknown LLM provider '{provider_name}'. Valid providers: {sorted(_PROVIDERS)}")
         config_cls, _ = _PROVIDERS[provider_name]
 
+        # `profile_alias` is a provenance-only marker the batch/CLI operator
+        # profile catalog lowering pass (core.config._lower_llm_profile_nodes)
+        # leaves in `self.config` (set by BaseTransform.__init__ above, from
+        # the SAME `config` dict) purely so the DAG's per-node audit config
+        # and the run's settings_json snapshot can answer "which llm_profiles
+        # alias did this node use" — no provider config model declares this
+        # field, and every provider config class forbids extra fields, so it
+        # must be excluded before validation rather than declared on
+        # LLMConfig itself. Named distinctly from the authored `profile`
+        # selector key on purpose: keying the retained alias as `profile`
+        # here would put a lowered node right back into the exact shape
+        # _lower_llm_profile_nodes's own ambiguity check rejects (`profile`
+        # + `provider` both present), making that pass unsafe to run twice
+        # over its own output.
+        provider_config = {key: value for key, value in config.items() if key != "profile_alias"} if "profile_alias" in config else config
+
         # Parse config with provider-specific model.
         # config_cls is one of the registered provider config classes at runtime;
         # from_dict() returns Self on the subclass, but mypy sees type[LLMConfig].
         self._config = cast(
-            "AzureOpenAIConfig | OpenRouterConfig | BedrockConfig",
-            config_cls.from_dict(config, plugin_name=self.name),
+            "AzureOpenAIConfig | OpenRouterConfig | BedrockConfig | GatewayConfig",
+            config_cls.from_dict(provider_config, plugin_name=self.name),
         )
         self._initialize_declared_input_fields(self._config)
 
@@ -1485,7 +1528,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         self._batch_initialized = False
 
     @property
-    def provider_config(self) -> AzureOpenAIConfig | OpenRouterConfig | BedrockConfig:
+    def provider_config(self) -> AzureOpenAIConfig | OpenRouterConfig | BedrockConfig | GatewayConfig:
         """Read-only accessor for the typed provider config.
 
         Exposes the post-validation ``LLMConfig`` subclass so cross-cutting
@@ -1570,6 +1613,8 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             if isinstance(self._config, AzureOpenAIConfig)
             else "bedrock"
             if isinstance(self._config, BedrockConfig)
+            else "gateway"
+            if isinstance(self._config, GatewayConfig)
             else "openrouter"
         )
         self._limiter = ctx.rate_limit_registry.get_limiter(limiter_name) if ctx.rate_limit_registry is not None else None
@@ -1638,6 +1683,27 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         elif isinstance(self._config, BedrockConfig):
             return BedrockLLMProvider(
                 region_name=self._config.region_name,
+                recorder=self._recorder,
+                run_id=self._run_id,
+                telemetry_emit=self._telemetry_emit,
+                limiter=self._limiter,
+                resolved_prompt_template_hash=self._resolved_prompt_template_hash,
+            )
+        elif isinstance(self._config, GatewayConfig):
+            # GatewayConfig.api_key already carries the resolved bearer value
+            # — the same convention AzureOpenAIConfig.api_key and
+            # OpenRouterConfig.api_key use. Resolution from an operator
+            # secret reference happens upstream of config construction (the
+            # web path's ``resolve_secret_refs`` walk, or ``${VAR}``
+            # expansion for batch/CLI YAML), never here. See Phase 2 Task 4's
+            # report for why an earlier direct ``EnvSecretLoader`` lookup at
+            # this call site was replaced with this shared path.
+            return GatewayLLMProvider(
+                endpoint=self._config.endpoint,
+                api_key=self._config.api_key,
+                contract_major=self._config.contract_major,
+                required_capabilities=self._config.required_capabilities,
+                timeout_seconds=self._config.timeout_seconds,
                 recorder=self._recorder,
                 run_id=self._run_id,
                 telemetry_emit=self._telemetry_emit,

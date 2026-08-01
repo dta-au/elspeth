@@ -435,8 +435,8 @@ def _validate_scenario_resource_bindings(
         if value and value not in log_group_names:
             raise AcceptanceCheckError("scenario_inventory_binding")
     event_rule = values["ECS_DEPLOYMENT_EVENT_RULE"]
-    event_rules = cast(list[object], orphan["event_rules"])
-    if event_rule and not any(isinstance(rule, Mapping) and rule.get("rule_name") == event_rule for rule in event_rules):
+    event_rules = cast(list[dict[str, object]], orphan["event_rules"])
+    if event_rule and not any(rule["rule_name"] == event_rule for rule in event_rules):
         raise AcceptanceCheckError("scenario_inventory_binding")
     listener_arns = cast(list[str], orphan["elbv2_listener_arns"])
     listener_pattern = re.compile(
@@ -454,10 +454,7 @@ def _validate_scenario_resource_bindings(
     if (
         event_rule
         and event_target
-        and not any(
-            isinstance(rule, Mapping) and rule.get("rule_name") == event_rule and event_target in cast(list[object], rule.get("target_ids"))
-            for rule in event_rules
-        )
+        and not any(rule["rule_name"] == event_rule and event_target in cast(list[object], rule["target_ids"]) for rule in event_rules)
     ):
         raise AcceptanceCheckError("scenario_inventory_binding")
     if scenario_id == "A":
@@ -715,7 +712,7 @@ def _validate_scenario_inventory(
         ):
             raise AcceptanceCheckError("scenario_inventory_schema")
     for name in PLUGIN_POLICY_ASSIGNMENT_NAMES:
-        if name == "ELSPETH_WEB__TUTORIAL_LLM_PROFILE":
+        if name == "ELSPETH_WEB__DEFAULT_LLM_PROFILE":
             continue
         try:
             json.loads(cast(str, values[name]))
@@ -867,12 +864,10 @@ def _validate_scenario_inventory_isolation(
     inventory_a: Mapping[str, object],
     inventory_b: Mapping[str, object],
 ) -> None:
-    values_a = inventory_a["values"]
-    values_b = inventory_b["values"]
-    orphan_a = inventory_a["orphan_sweep"]
-    orphan_b = inventory_b["orphan_sweep"]
-    assert isinstance(values_a, Mapping) and isinstance(values_b, Mapping)
-    assert isinstance(orphan_a, Mapping) and isinstance(orphan_b, Mapping)
+    values_a = cast(Mapping[str, object], inventory_a["values"])
+    values_b = cast(Mapping[str, object], inventory_b["values"])
+    orphan_a = cast(Mapping[str, object], inventory_a["orphan_sweep"])
+    orphan_b = cast(Mapping[str, object], inventory_b["orphan_sweep"])
     isolated_value_fields = {
         "ECS_CLUSTER",
         "ECS_SERVICE",
@@ -933,11 +928,9 @@ def _validate_scenario_inventory_isolation(
 
 
 def _load_preapply_scenario_inventory(manifest: Mapping[str, object], scenario_id: str) -> dict[str, object]:
-    scenarios = manifest["scenarios"]
-    aws = manifest["aws"]
-    assert isinstance(scenarios, dict) and isinstance(aws, dict)
-    scenario = scenarios[scenario_id]
-    assert isinstance(scenario, dict)
+    scenarios = cast(dict[str, object], manifest["scenarios"])
+    aws = cast(dict[str, object], manifest["aws"])
+    scenario = cast(dict[str, object], scenarios[scenario_id])
     inventory = _validate_scenario_inventory(
         _read_protected_document(Path(cast(str, scenario["preapply_inventory_path"])), check="scenario_inventory_file"),
         scenario_id=scenario_id,
@@ -959,24 +952,17 @@ def _load_bound_scenario_inventory(
     *,
     require_resolved: bool = False,
 ) -> dict[str, object]:
-    scenarios = manifest["scenarios"]
-    aws = manifest["aws"]
-    assert isinstance(scenarios, dict) and isinstance(aws, dict)
-    scenario = scenarios[scenario_id]
-    assert isinstance(scenario, dict)
-    acceptance_run_id = manifest["acceptance_run_id"]
-    candidate_sha = manifest["candidate_sha"]
-    account_id = aws["account_id"]
-    region = aws["region"]
-    binding = scenario["tf_binding_sha256"]
-    assert isinstance(acceptance_run_id, str)
-    assert isinstance(candidate_sha, str)
-    assert isinstance(account_id, str)
-    assert isinstance(region, str)
-    assert isinstance(binding, str)
+    scenarios = cast(dict[str, object], manifest["scenarios"])
+    aws = cast(dict[str, object], manifest["aws"])
+    scenario = cast(dict[str, object], scenarios[scenario_id])
+    acceptance_run_id = cast(str, manifest["acceptance_run_id"])
+    candidate_sha = cast(str, manifest["candidate_sha"])
+    account_id = cast(str, aws["account_id"])
+    region = cast(str, aws["region"])
+    binding = cast(str, scenario["tf_binding_sha256"])
     _load_preapply_scenario_inventory(manifest, scenario_id)
     inventory = _validate_scenario_inventory(
-        _read_protected_document(Path(scenario["inventory_path"]), check="scenario_inventory_file"),
+        _read_protected_document(Path(cast(str, scenario["inventory_path"])), check="scenario_inventory_file"),
         scenario_id=scenario_id,
         acceptance_run_id=acceptance_run_id,
         candidate_sha=candidate_sha,
@@ -989,8 +975,7 @@ def _load_bound_scenario_inventory(
         raise AcceptanceCheckError("scenario_inventory_unresolved")
     if _scenario_inventory_hash(inventory) != scenario["inventory_sha256"]:
         raise AcceptanceCheckError("scenario_inventory_binding")
-    values = inventory["values"]
-    assert isinstance(values, dict)
+    values = cast(dict[str, object], inventory["values"])
     if values["SCENARIO_TF_BINDING_FILE"] != scenario["tf_binding_path"]:
         raise AcceptanceCheckError("tf_binding_binding")
     _, state_identity = _validate_tf_binding_receipt(

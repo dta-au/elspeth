@@ -3169,9 +3169,9 @@ def test_route_gate_accepts_annotated_direct_binding() -> None:
     assert _route_violations(ast.parse(_blob_read_endpoint_source(annotated=True)), contract) == []
 
 
-def test_blob_read_vocabulary_widens_epoch_37_without_protocol_bump() -> None:
+def test_blob_read_vocabulary_widens_epoch_42_without_protocol_bump() -> None:
     assert SessionOperationKind.BLOB_READ.value == "blob_read"
-    assert SESSION_SCHEMA_EPOCH == 37
+    assert SESSION_SCHEMA_EPOCH == 42
     assert WEB_COORDINATION_PROTOCOL_VERSION == 1
     kind_check = next(
         constraint for constraint in session_operation_fences_table.constraints if constraint.name == "ck_session_operation_fences_kind"

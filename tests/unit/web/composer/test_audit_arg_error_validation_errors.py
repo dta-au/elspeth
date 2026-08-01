@@ -23,6 +23,7 @@ import json
 import tracemalloc
 from unittest.mock import patch
 
+import pytest
 from pydantic import BaseModel, ValidationError, field_validator
 
 from elspeth.web.composer.audit import canonicalize_pydantic_cause
@@ -168,6 +169,26 @@ def test_canonicalize_pydantic_cause_projects_list_index_loc() -> None:
     assert list_index_entries, f"expected items-loc entry, got {result}"
     entry = list_index_entries[0]
     assert entry["loc"] == ["field", "index"]
+
+
+def test_canonicalize_pydantic_cause_rejects_missing_internal_type() -> None:
+    cause = _make_int_parsing_error()
+
+    with (
+        patch.object(ValidationError, "errors", return_value=[{"loc": ("x",)}]),
+        pytest.raises(KeyError, match="type"),
+    ):
+        canonicalize_pydantic_cause(cause)
+
+
+def test_canonicalize_pydantic_cause_rejects_missing_internal_location() -> None:
+    cause = _make_int_parsing_error()
+
+    with (
+        patch.object(ValidationError, "errors", return_value=[{"type": "int_parsing"}]),
+        pytest.raises(KeyError, match="loc"),
+    ):
+        canonicalize_pydantic_cause(cause)
 
 
 def test_canonicalize_pydantic_cause_is_closed_bounded_and_canary_free() -> None:

@@ -12,6 +12,7 @@ from types import MappingProxyType
 
 import pytest
 
+import elspeth.contracts as contracts
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.plugin_protocols import SinkEffectProtocol
 from elspeth.contracts.results import ArtifactDescriptor
@@ -21,6 +22,8 @@ from elspeth.contracts.sink_effects import (
     AuditExportSignedManifestInput,
     AuditExportSigningMode,
     AuditExportSnapshotChunkInput,
+    MemberSinkEffectCapability,
+    RestagingSinkEffectCapability,
     RestrictedAuditExportSnapshotReader,
     RestrictedSinkEffectContext,
     SinkEffectAttemptAction,
@@ -66,6 +69,13 @@ def _member(ordinal: int = 0) -> SinkEffectMember:
         payload_hash=sha256(canonical_json(row).encode("utf-8")).hexdigest(),
         row=row,
     )
+
+
+def test_nominal_sink_effect_capabilities_are_public_contracts() -> None:
+    assert contracts.MemberSinkEffectCapability is MemberSinkEffectCapability
+    assert contracts.RestagingSinkEffectCapability is RestagingSinkEffectCapability
+    assert "MemberSinkEffectCapability" in contracts.__all__
+    assert "RestagingSinkEffectCapability" in contracts.__all__
 
 
 def _inspection(
@@ -561,6 +571,15 @@ def test_plan_protocol_descriptor_and_inspection_modes_validate_exactly() -> Non
             inspection_mode=SinkEffectInspectionMode.NO_INSPECTION_REQUIRED,
             expected_descriptor=EXACT_DESCRIPTOR,
             safe_evidence={"publication_kind": "virtual"},
+        ).expected_descriptor
+        == EXACT_DESCRIPTOR
+    )
+    assert (
+        _plan(
+            descriptor_mode=SinkEffectDescriptorMode.NO_PUBLICATION,
+            inspection_mode=SinkEffectInspectionMode.NO_INSPECTION_REQUIRED,
+            expected_descriptor=EXACT_DESCRIPTOR,
+            safe_evidence={"publication_kind": "reaffirmed"},
         ).expected_descriptor
         == EXACT_DESCRIPTOR
     )

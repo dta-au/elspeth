@@ -140,6 +140,13 @@ class _TerminateOutcome:
     # increments this, never the repair counter; the driver folds it into
     # ``advisor_checkpoint_passes_used``.
     advisor_passes_delta: int = 0  # 0 or 1
+    # Set only when this "continue" was produced by a FLAGGED END advisor
+    # pass: the index of the synthetic advisor sign-off message just
+    # appended to ``llm_messages``. The driver elides it once a genuine
+    # repair tool call lands (Task 6 Step 3, elspeth-bff8fe6864) so the
+    # eventual CLEAN finalize turn cannot anchor on advisor text the real
+    # user never saw.
+    advisor_injection_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

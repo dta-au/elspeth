@@ -1553,3 +1553,181 @@ class TestSetPipelineQueue:
         # Atomic: the exact prior state/version is untouched.
         assert result.updated_state.version == state.version
         assert result.updated_state.nodes == state.nodes
+
+
+_ROW_UNION_NODE_ENTRY: dict[str, Any] = {
+    "id": "variant_union",
+    "node_type": "row_union",
+    "plugin": None,
+    "input": "control_done",
+    "on_success": "unioned_rows",
+    "options": {},
+    "branches": {
+        "control": "control_done",
+        "treatment": "treatment_done",
+    },
+    "timeout_seconds": 30.0,
+}
+
+
+def _valid_args_with_row_union(override: dict[str, Any] | None = None) -> dict[str, Any]:
+    node = dict(_ROW_UNION_NODE_ENTRY)
+    if override is not None:
+        node.update(override)
+    return {
+        "source": {
+            "plugin": "csv",
+            "on_success": "control_done",
+            "options": {"path": "in.csv", "schema": {"mode": "observed"}},
+        },
+        "nodes": [node],
+        "edges": [],
+        "outputs": [],
+    }
+
+
+class TestSetPipelineRowUnion:
+    def test_pipeline_node_transport_remains_open_and_accepts_timeout(self) -> None:
+        from elspeth.web.composer.redaction import _PipelineNodeModel
+
+        assert _PipelineNodeModel.model_fields["node_type"].annotation is str
+        model = _PipelineNodeModel.model_validate(_ROW_UNION_NODE_ENTRY)
+        assert model.node_type == "row_union"
+        assert model.timeout_seconds == 30.0
+
+    def test_set_pipeline_persists_canonical_row_union(self) -> None:
+        result = _execute_set_pipeline(
+            _valid_args_with_row_union(),
+            _empty_state(),
+            ToolContext(catalog=_mock_catalog()),
+        )
+
+        assert result.success is True, result.to_dict()
+        union = result.updated_state.nodes[0]
+        assert union.node_type == "row_union"
+        assert union.timeout_seconds == 30.0
+        assert dict(union.branches or {}) == {
+            "control": "control_done",
+            "treatment": "treatment_done",
+        }
+
+    @pytest.mark.parametrize("invalid_timeout", [True, "30"])
+    def test_timeout_rejects_non_numeric_tier_3_values_without_mutation(self, invalid_timeout: object) -> None:
+        state = _empty_state()
+
+        with pytest.raises(ToolArgumentError):
+            _execute_set_pipeline(
+                _valid_args_with_row_union({"timeout_seconds": invalid_timeout}),
+                state,
+                ToolContext(catalog=_mock_catalog()),
+            )
+
+        assert state.version == 1
+        assert state.nodes == ()
+
+    @pytest.mark.parametrize("timeout_seconds", [30, 30.5])
+    def test_timeout_accepts_actual_int_and_float_values(self, timeout_seconds: int | float) -> None:
+        result = _execute_set_pipeline(
+            _valid_args_with_row_union({"timeout_seconds": timeout_seconds}),
+            _empty_state(),
+            ToolContext(catalog=_mock_catalog()),
+        )
+
+        assert result.success is True, result.to_dict()
+        assert result.updated_state.nodes[0].timeout_seconds == float(timeout_seconds)
+
+    @pytest.mark.parametrize(
+        "node",
+        [
+            {
+                "id": "transform_node",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "rows",
+                "on_success": "transformed",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "gate_node",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "rows",
+                "condition": "True",
+                "routes": {"true": "discard", "false": "discard"},
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "aggregation_node",
+                "node_type": "aggregation",
+                "plugin": None,
+                "input": "rows",
+                "on_success": "aggregated",
+                "on_error": "discard",
+                "timeout_seconds": 30,
+            },
+            {
+                "id": "queue_node",
+                "node_type": "queue",
+                "plugin": None,
+                "input": "queue_node",
+                "options": {},
+                "timeout_seconds": 30,
+            },
+        ],
+        ids=["transform", "gate", "aggregation", "queue"],
+    )
+    def test_timeout_rejects_non_barrier_node_types_atomically(self, node: dict[str, Any]) -> None:
+        state = _empty_state()
+        arguments = {
+            "source": {
+                "plugin": "csv",
+                "on_success": "rows",
+                "options": {"path": "in.csv", "schema": {"mode": "observed"}},
+            },
+            "nodes": [node],
+            "edges": [],
+            "outputs": [],
+        }
+
+        result = _execute_set_pipeline(arguments, state, ToolContext(catalog=_mock_catalog()))
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.version == state.version
+        assert "timeout_seconds" in result.data["error"]
+
+    @pytest.mark.parametrize(
+        "override",
+        [
+            {"plugin": "passthrough"},
+            {"input": "not_the_first_branch"},
+            {"on_success": None},
+            {"branches": {"only": "control_done"}},
+        ],
+    )
+    def test_set_pipeline_rejects_malformed_row_union_atomically(self, override: dict[str, Any]) -> None:
+        state = _empty_state()
+        result = _execute_set_pipeline(
+            _valid_args_with_row_union(override),
+            state,
+            ToolContext(catalog=_mock_catalog()),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+
+    @pytest.mark.parametrize("invalid_timeout", [0, -1, float("nan"), float("inf")])
+    def test_set_pipeline_rejects_invalid_row_union_timeout_before_mutation(self, invalid_timeout: float) -> None:
+        state = _empty_state()
+
+        with pytest.raises(ToolArgumentError):
+            _execute_set_pipeline(
+                _valid_args_with_row_union({"timeout_seconds": invalid_timeout}),
+                state,
+                ToolContext(catalog=_mock_catalog()),
+            )
+
+        assert state.version == 1
+        assert state.nodes == ()

@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
+from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
@@ -275,7 +276,12 @@ async def test_actual_step3_staged_and_tutorial_adapters_render_identical_provid
     async def mutating_completion(**kwargs: Any) -> Any:
         kwargs["messages"][0]["content"] += "\nprovider-side mutation"
         requests.append(kwargs)
-        raise RuntimeError("provider unavailable")
+        raise LiteLLMAPIError(
+            status_code=503,
+            message="provider unavailable",
+            llm_provider="test-provider",
+            model="test/planner",
+        )
 
     monkeypatch.setattr(planner_module, "build_planner_capability_manifest", capture_manifest)  # type: ignore[attr-defined]
     monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", mutating_completion)
@@ -1485,6 +1491,236 @@ class TestComposerMultiTurnToolCalls:
         assert result.state.metadata.name == "My Pipeline"
         assert result.state.version == 3  # two mutations
 
+    @pytest.mark.asyncio
+    async def test_flagged_to_clean_repair_cycle_elides_advisor_exchange_before_finalize_call(self) -> None:
+        """R2-F12 Step 3 (elspeth-bff8fe6864, belt-and-braces): once a repair
+        tool call has landed following a FLAGGED END advisor pass, the
+        injected advisor-findings message must not still be in context for
+        the LLM call that produces the eventual CLEAN finalize reply —
+        otherwise that reply can anchor on (quote/rebut) text the real user
+        never saw. The repair turn's own tool-call/tool-result messages
+        (which carry the real state change) must NOT be elided."""
+        catalog = _mock_catalog()
+        settings = _make_settings()
+        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "input.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        # Turn 1: no tool calls -> END advisor gate runs, FLAGGED.
+        turn1 = _make_llm_response(content="Looks ready to me.")
+        # Turn 2: a genuine repair tool call.
+        turn2 = _make_llm_response(
+            tool_calls=[{"id": "c1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
+        )
+        # Turn 3: no tool calls again -> END advisor gate re-runs, CLEAN -> finalize.
+        turn3 = _make_llm_response(content="Pipeline is ready.")
+
+        verdicts = iter(
+            [
+                AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating"),
+                AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
+            ]
+        )
+
+        async def _fake_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
+            return next(verdicts)
+
+        responses = iter([turn1, turn2, turn3])
+        captured_messages: list[list[dict[str, Any]]] = []
+
+        async def _fake_call_llm(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> Any:
+            captured_messages.append(list(messages))
+            return next(responses)
+
+        passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
+        ):
+            mock_llm.side_effect = _fake_call_llm
+            result = await service.compose("Review this pipeline", [], state)
+
+        assert result.message == "Pipeline is ready."
+        assert len(captured_messages) == 3
+        # Turn 2 (the repair call) saw the injected advisor findings.
+        assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[1])
+        # Turn 3 (the finalize call) must NOT — the elision boundary. The
+        # repair's own tool-call/tool-result messages must survive.
+        assert not any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[2])
+        assert any(m.get("role") == "tool" for m in captured_messages[2])
+        # Surgical removal, not an accidental match on the wrong entry: turn
+        # 3's list is turn 2's list with exactly the one advisor message
+        # removed and exactly the repair's two messages (assistant tool-call
+        # + tool result) appended — net +1, not some other count.
+        assert len(captured_messages[2]) == len(captured_messages[1]) + 1
+        # Every message present in turn 2's context OTHER than the advisor
+        # injection survives verbatim (by identity) into turn 3's context —
+        # the drain removed exactly one entry and touched nothing else.
+        turn2_minus_advisor = [m for m in captured_messages[1] if "Advisor sign-off" not in (m.get("content") or "")]
+        assert captured_messages[2][: len(turn2_minus_advisor)] == turn2_minus_advisor
+
+    @pytest.mark.asyncio
+    async def test_flagged_discovery_only_tool_call_does_not_elide_advisor_message(self) -> None:
+        """R2-F12 Step 3 non-regression (review finding 1): a discovery-only
+        tool call (list_sources — no mutation) following a FLAGGED advisor
+        pass must NOT drain the injected advisor message. If it did, the
+        model's NEXT no-tool reply would be asked to "fix" findings it can
+        no longer see, the END gate would re-flag on unchanged state, and
+        the run would needlessly block. The advisor message must survive
+        into the discovery turn's own context and into whatever follows it,
+        right up until a turn that actually mutates state."""
+        catalog = _mock_catalog()
+        settings = _make_settings()
+        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "input.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        turn1 = _make_llm_response(content="Looks ready to me.")
+        # Turn 2: discovery only — no mutation. Must NOT drain.
+        turn2 = _make_llm_response(tool_calls=[{"id": "c1", "name": "list_sources", "arguments": {}}])
+        # Turn 3: the genuine repair — this mutates. Drain fires HERE.
+        turn3 = _make_llm_response(
+            tool_calls=[{"id": "c2", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
+        )
+        # Turn 4: no tool calls -> END advisor gate re-runs, CLEAN -> finalize.
+        turn4 = _make_llm_response(content="Pipeline is ready.")
+
+        verdicts = iter(
+            [
+                AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating"),
+                AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text="CLEAN"),
+            ]
+        )
+
+        async def _fake_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
+            return next(verdicts)
+
+        responses = iter([turn1, turn2, turn3, turn4])
+        captured_messages: list[list[dict[str, Any]]] = []
+
+        async def _fake_call_llm(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> Any:
+            captured_messages.append(list(messages))
+            return next(responses)
+
+        passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
+        ):
+            mock_llm.side_effect = _fake_call_llm
+            result = await service.compose("Review this pipeline", [], state)
+
+        assert result.message == "Pipeline is ready."
+        assert len(captured_messages) == 4
+        # Turn 2 (discovery-only) still sees it — not drained by a non-mutating turn.
+        assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[1])
+        # Turn 3 (the mutating repair call) STILL sees it — the discovery
+        # turn must not have consumed it early.
+        assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[2])
+        # Turn 4 (the finalize call, after the mutating repair) must NOT —
+        # drained only once a real mutation landed.
+        assert not any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[3])
+
+    @pytest.mark.asyncio
+    async def test_flagged_still_flagged_after_elided_repair_blocks_on_fresh_findings(self) -> None:
+        """R2-F12 Step 3 non-regression: eliding the pass-1 advisor message
+        after a repair attempt must not make the SECOND (last-pass) advisor
+        round stale or inaccurate. The advisor gate re-evaluates ``state``
+        directly (never ``llm_messages``), so the fail-closed blocked result
+        must carry pass 2's fresh findings — not pass 1's, and not nothing —
+        even though pass 1's injected message was already elided from
+        context by the time pass 2's no-tool reply was generated."""
+        catalog = _mock_catalog()
+        settings = _make_settings()  # composer_advisor_checkpoint_max_passes default 2
+        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "input.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        turn1 = _make_llm_response(content="Looks ready to me.")
+        turn2 = _make_llm_response(
+            tool_calls=[{"id": "c1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
+        )
+        turn3 = _make_llm_response(content="Should be fine now.")
+
+        verdicts = iter(
+            [
+                AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: PASS_ONE_SINK_ISSUE"),
+                AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: PASS_TWO_STILL_BROKEN"),
+            ]
+        )
+
+        async def _fake_advisor_checkpoint(*_args: object, **_kwargs: object) -> AdvisorCheckpointVerdict:
+            return next(verdicts)
+
+        responses = iter([turn1, turn2, turn3])
+        captured_messages: list[list[dict[str, Any]]] = []
+
+        async def _fake_call_llm(messages: list[dict[str, Any]], _tools: list[dict[str, Any]]) -> Any:
+            captured_messages.append(list(messages))
+            return next(responses)
+
+        passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock) as mock_llm,
+            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service, "_run_advisor_checkpoint", side_effect=_fake_advisor_checkpoint),
+        ):
+            mock_llm.side_effect = _fake_call_llm
+            result = await service.compose("Review this pipeline", [], state)
+
+        # Fails closed — not finalized as a runnable success.
+        assert result.runtime_preflight is not None
+        assert result.runtime_preflight.is_valid is False
+        # Carries pass 2's FRESH findings...
+        assert "PASS_TWO_STILL_BROKEN" in result.message
+        # ...never pass 1's — proving the blocked surface is not stale even
+        # though pass 1's injected message was elided one turn earlier.
+        assert "PASS_ONE_SINK_ISSUE" not in result.message
+
+        # Freshness alone is structural (the advisor re-evaluates ``state``
+        # regardless of ``llm_messages``) and would hold even if the drain
+        # never fired — assert the drain actually fired too (review finding
+        # 4): turn 2 (the repair call) saw the pass-1 injection, turn 3 (the
+        # last-pass call that produces the blocked result) must not.
+        assert len(captured_messages) == 3
+        assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[1])
+        assert not any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[2])
+
 
 class TestComposerConvergence:
     @pytest.mark.asyncio
@@ -2372,43 +2608,36 @@ class TestProviderCacheTokenAudit:
 
     @pytest.mark.asyncio
     async def test_litellm_normalized_dual_shape_is_deduped_on_attribute_branch(self) -> None:
-        """Pydantic-shaped (attribute) usage object also dedups when siblings present.
+        """Attribute-shaped usage object also dedups when siblings present.
 
-        Real LiteLLM responses are Pydantic ``Usage`` objects, not Mappings.
-        Verifies the elif branch in ``token_usage_from_response`` honors the
-        same dedup rule: nested ``prompt_tokens_details.cached_tokens`` is
-        dropped when an Anthropic sibling is present on the attribute object.
+        Uses REAL litellm objects, not a dataclass fake. A fake could not
+        express the shape under test: litellm declares neither ``usage`` on
+        ``ModelResponse`` nor the Anthropic sibling counters on ``Usage`` —
+        all three live in ``__pydantic_extra__``, so a dataclass double that
+        exposes them as ordinary attributes exercises a reading path
+        production does not take (elspeth-6664a00cb0). The full reconciliation
+        of this path against real litellm lives in
+        ``test_llm_usage_real_litellm.py``.
         """
+        from litellm.types.utils import (
+            Choices,
+            Message,
+            ModelResponse,
+            PromptTokensDetailsWrapper,
+            Usage,
+        )
+
         from elspeth.web.composer.llm_response_parsing import token_usage_from_response
 
-        @dataclass
-        class FakePromptTokensDetails:
-            cached_tokens: int | None
-
-        @dataclass
-        class FakePydanticUsage:
-            prompt_tokens: int
-            completion_tokens: int
-            total_tokens: int
-            prompt_tokens_details: FakePromptTokensDetails
-            cache_creation_input_tokens: int | None
-            cache_read_input_tokens: int | None
-
-        @dataclass
-        class FakeResponseWithPydanticUsage:
-            choices: list[FakeChoice]
-            usage: FakePydanticUsage
-            model: str = "anthropic/claude-3-5-sonnet"
-            id: str = "msg_test"
-
-        text = _make_llm_response(content="Done.")
-        response = FakeResponseWithPydanticUsage(
-            choices=text.choices,
-            usage=FakePydanticUsage(
+        response = ModelResponse(
+            choices=[Choices(message=Message(content="Done.", role="assistant"), finish_reason="stop")],
+            model="anthropic/claude-3-5-sonnet",
+            id="msg_test",
+            usage=Usage(
                 prompt_tokens=8200,
                 completion_tokens=120,
                 total_tokens=8320,
-                prompt_tokens_details=FakePromptTokensDetails(cached_tokens=1100),
+                prompt_tokens_details=PromptTokensDetailsWrapper(cached_tokens=1100),  # type: ignore[no-untyped-call]
                 cache_creation_input_tokens=7000,
                 cache_read_input_tokens=1100,
             ),
@@ -2658,12 +2887,16 @@ class TestDiscoveryCache:
 
         # Should NOT have raised — second list_sources was a cache hit
         assert result.message == "Found sources."
-        # Catalog list_sources is called once by snapshot construction,
-        # twice by build_messages (visible list + capability grouping),
-        # and once by execute_tool (first discovery call).
-        # The second discovery call is a cache hit — no catalog call.
-        # Total: 4, not 5.
-        assert catalog.list_sources.call_count == 4
+        # Catalog list_sources is called once by snapshot construction
+        # (before any PolicyCatalogView exists) and once more by the
+        # PolicyCatalogView itself, which memoizes its unrestricted listing
+        # per instance (PolicyCatalogView._full_items) — build_messages's own
+        # list_sources() + capability_groups() call and execute_tool's first
+        # discovery dispatch all reuse that single cached fetch instead of
+        # re-deriving every PluginSummary three times over.
+        # The second discovery call is a composer tool-cache hit — no catalog call.
+        # Total: 2, not 4.
+        assert catalog.list_sources.call_count == 2
 
     @pytest.mark.asyncio
     async def test_cache_hit_rebuilds_result_envelope_from_current_state(self) -> None:
@@ -2717,7 +2950,11 @@ class TestDiscoveryCache:
             affected_nodes=(),
         ).to_dict()["validation"]
         assert cached_payload["validation"] == expected_validation
-        assert catalog.list_sources.call_count == 4
+        # See test_cacheable_tool_returns_cached_result: PolicyCatalogView
+        # memoizes its unrestricted listing per instance, so repeated
+        # internal list_sources()/capability_groups() reads within one
+        # compose() collapse into a single real catalog call.
+        assert catalog.list_sources.call_count == 2
 
     @pytest.mark.asyncio
     async def test_cache_key_includes_arguments(self) -> None:

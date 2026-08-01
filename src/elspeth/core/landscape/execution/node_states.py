@@ -28,6 +28,7 @@ from elspeth.contracts import (
     RoutingMode,
     RoutingReason,
     RoutingSpec,
+    RowUnionFailureReason,
 )
 from elspeth.contracts.advisory_locks import ELSPETH_ROUTING_GROUP_LOCK_CLASSID
 from elspeth.contracts.audit import validate_node_state_completion_fields
@@ -426,7 +427,7 @@ class NodeStateRepository:
         *,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
-        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | None = None,
+        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
         conn: Connection | None = None,
@@ -465,7 +466,7 @@ class NodeStateRepository:
         # ExecutionError and CoalesceFailureReason are frozen dataclasses with
         # to_dict(); TransformErrorReason is a TypedDict (already a dict).
         if error is not None:
-            error_data = error.to_dict() if isinstance(error, (ExecutionError, CoalesceFailureReason)) else error
+            error_data = error.to_dict() if isinstance(error, (ExecutionError, CoalesceFailureReason, RowUnionFailureReason)) else error
             error_json = canonical_json(error_data)
         else:
             error_json = None
@@ -829,6 +830,76 @@ class NodeStateRepository:
         )
         return self._ops.execute_fetchone(query) is not None
 
+    def get_released_row_ids_for_nodes(
+        self,
+        run_id: str,
+        node_ids: frozenset[str],
+    ) -> set[tuple[str, str]]:
+        """Get (node_id, row_id) pairs where a node_state completed as COMPLETED.
+
+        Released-only sibling of :meth:`get_completed_row_ids_for_nodes`: a
+        FAILED closure has ``completed_at`` set too, so the completed read
+        cannot distinguish a released row_union group from one failed closed
+        (timeout, EOF flush, branch loss). Restore's released-group
+        classification must see only actually-released closures.
+
+        Args:
+            run_id: Run ID to scope the query
+            node_ids: Set of node IDs to query (e.g., row_union node IDs)
+
+        Returns:
+            Set of (node_id, row_id) tuples with a status-COMPLETED
+            node_state.
+        """
+        if not node_ids:
+            return set()
+
+        query = (
+            select(node_states_table.c.node_id, tokens_table.c.row_id)
+            .select_from(
+                node_states_table.join(
+                    tokens_table,
+                    node_states_table.c.token_id == tokens_table.c.token_id,
+                )
+            )
+            .where(
+                node_states_table.c.run_id == run_id,
+                node_states_table.c.node_id.in_(node_ids),
+                node_states_table.c.completed_at.isnot(None),
+                node_states_table.c.status == NodeStateStatus.COMPLETED.value,
+            )
+            .distinct()
+        )
+        rows = self._ops.execute_fetchall(query)
+        return {(row.node_id, row.row_id) for row in rows}
+
+    def has_released_row_for_node(self, *, run_id: str, node_id: str, row_id: str) -> bool:
+        """Return whether one row completed as COMPLETED at one node in one run.
+
+        Released-only sibling of :meth:`has_completed_row_for_node` — the
+        point lookup for distinguishing a released row_union group from a
+        failure-closed one.
+        """
+        query = (
+            select(node_states_table.c.state_id)
+            .select_from(
+                node_states_table.join(
+                    tokens_table,
+                    (node_states_table.c.token_id == tokens_table.c.token_id) & (node_states_table.c.run_id == tokens_table.c.run_id),
+                )
+            )
+            .where(
+                node_states_table.c.run_id == run_id,
+                node_states_table.c.node_id == node_id,
+                node_states_table.c.completed_at.isnot(None),
+                node_states_table.c.status == NodeStateStatus.COMPLETED.value,
+                tokens_table.c.run_id == run_id,
+                tokens_table.c.row_id == row_id,
+            )
+            .limit(1)
+        )
+        return self._ops.execute_fetchone(query) is not None
+
     def record_routing_event(
         self,
         state_id: str,
@@ -1004,9 +1075,9 @@ class NodeStateRepository:
         )
         found = {str(row.edge_id): row for row in rows}
         for edge_id in unique_edge_ids:
-            row = found.get(edge_id)
-            if row is None:
+            if edge_id not in found:
                 raise LandscapeRecordError(f"{owner} requires existing state_id={state_id!r} and edge_id={edge_id!r} in the same run")
+            row = found[edge_id]
             if row.state_run_id != row.edge_run_id:
                 raise LandscapeRecordError(f"{owner} requires state_id={state_id!r} and edge_id={edge_id!r} to belong to the same run")
 

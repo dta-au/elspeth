@@ -8,6 +8,8 @@ from uuid import UUID
 import pytest
 
 from elspeth.web.composer.guided.protocol import (
+    _NODE_OPTION_SUMMARY_ALLOWLIST,
+    _NODE_OPTION_SUMMARY_RENDERERS,
     ComponentReviewPayload,
     ControlSignal,
     GuidedStep,
@@ -22,6 +24,122 @@ from elspeth.web.composer.guided.protocol import (
     validate_current_turn,
     validate_payload,
 )
+
+
+def test_every_allowlisted_node_option_has_a_renderer() -> None:
+    """The allowlist and the renderer table are hand-mirrored — pin the relation.
+
+    ``node_options_summary`` indexes ``_NODE_OPTION_SUMMARY_RENDERERS`` by
+    allowlisted key with no fallback, so an allowlist entry added without its
+    renderer would raise ``KeyError`` inside a live projection — a 500
+    mid-guided-flow, not a lint failure. Requiring the subset makes that
+    omission a red unit test instead.
+    """
+    allowlisted = {key for keys in _NODE_OPTION_SUMMARY_ALLOWLIST.values() for key in keys}
+
+    assert allowlisted <= _NODE_OPTION_SUMMARY_RENDERERS.keys()
+    # Renderers are reachable only through the allowlist; an orphan renderer is
+    # dead code that quietly widens what a future allowlist edit can publish.
+    assert _NODE_OPTION_SUMMARY_RENDERERS.keys() <= allowlisted
+
+
+def _wire_payload_for_cardinality(
+    *,
+    node_type: str | None = None,
+    input_cardinality: str | None = None,
+    output_cardinality: str,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "proposal_id": "00000000-0000-4000-8000-000000000001",
+        "draft_hash": "d" * 64,
+        "sources": [],
+        "nodes": [],
+        "outputs": [],
+        "connections": [],
+        "semantic_contracts": [],
+        "warnings": [],
+        "blockers": [],
+        "can_confirm": True,
+    }
+    row_cardinality = {
+        "input": "none" if node_type is None else "one",
+        "output": output_cardinality,
+        "expected_output_count": None,
+    }
+    if node_type is None:
+        payload["sources"] = [
+            {
+                "stable_id": "00000000-0000-4000-8000-000000000002",
+                "label": "source-1",
+                "plugin": "csv",
+                "on_validation_failure": "discard",
+                "guaranteed_fields": [],
+                "row_cardinality": row_cardinality,
+            }
+        ]
+        return payload
+    behavior: dict[str, Any]
+    plugin: str | None = None
+    if node_type == "transform":
+        behavior = {"kind": "transform"}
+        plugin = "passthrough"
+    elif node_type == "gate":
+        behavior = {
+            "kind": "gate",
+            "condition": "row['accepted']",
+            "route_aliases": ["route-1"],
+            "routes": [{"alias": "route-1", "key": "true"}],
+            "fork_branches": [],
+        }
+    elif node_type == "aggregation":
+        behavior = {
+            "kind": "aggregation",
+            "trigger_kinds": [],
+            "count": None,
+            "timeout_seconds": None,
+            "output_mode": "transform",
+            "expected_output_count": None,
+        }
+        plugin = "batch_stats"
+        row_cardinality["input"] = "batch"
+    elif node_type == "queue":
+        behavior = {"kind": "queue"}
+        row_cardinality["input"] = "many_producers"
+    elif node_type == "coalesce":
+        behavior = {
+            "kind": "coalesce",
+            "branch_aliases": ["branch-1", "branch-2"],
+            "policy": "require_all",
+            "merge": "union",
+            "timeout_seconds": None,
+        }
+        row_cardinality["input"] = "branches"
+    else:
+        assert node_type == "row_union"
+        behavior = {
+            "kind": "row_union",
+            "branch_aliases": ["branch-1", "branch-2"],
+            "policy": "require_all",
+            "timeout_seconds": None,
+        }
+        row_cardinality["input"] = "branches"
+    if input_cardinality is not None:
+        row_cardinality["input"] = input_cardinality
+    payload["nodes"] = [
+        {
+            "stable_id": "00000000-0000-4000-8000-000000000002",
+            "label": "node-1",
+            "node_type": node_type,
+            "plugin": plugin,
+            "behavior": behavior,
+            "node_options_summary": [],
+            "required_fields": [],
+            "guaranteed_fields": [],
+            "row_cardinality": row_cardinality,
+            "structured_output_fields": [],
+        }
+    ]
+    return payload
 
 
 class TestTurnType:
@@ -456,9 +574,28 @@ class TestPayloadValidation:
 
         ok = validate_payload(
             TurnType.SINGLE_SELECT,
-            {"question": "Q?", "options": [], "allow_custom": False},
+            {
+                "question": "Q?",
+                "options": [{"id": "csv", "label": "CSV", "hint": None}],
+                "allow_custom": False,
+                "source_blob_compatible_option_ids": ["csv"],
+            },
         )
         assert ok is None
+
+    def test_validate_single_select_rejects_undeclared_blob_compatible_option(self) -> None:
+        from elspeth.web.composer.guided.protocol import validate_payload
+
+        err = validate_payload(
+            TurnType.SINGLE_SELECT,
+            {
+                "question": "Q?",
+                "options": [{"id": "csv", "label": "CSV", "hint": None}],
+                "allow_custom": False,
+                "source_blob_compatible_option_ids": ["api"],
+            },
+        )
+        assert err == "payload.source_blob_compatible_option_ids must reference declared option ids"
 
     def test_validate_single_select_missing_field(self) -> None:
         from elspeth.web.composer.guided.protocol import validate_payload
@@ -503,6 +640,83 @@ class TestPayloadValidation:
         assert "payload.knobs" in err
         assert "fields" in err
 
+    def test_schema_form_knob_placeholder_is_in_the_closed_vocabulary(self) -> None:
+        # F5-5b atomic set: ``placeholder`` is a legal optional knob-field key
+        # (46/47 data plugins emit it on the ``schema`` knob), validated as
+        # bounded text like ``description``.
+        from elspeth.web.composer.guided.protocol import validate_payload
+
+        def payload(placeholder: object) -> dict[str, object]:
+            return {
+                "mode": "plugin_options",
+                "plugin": "csv",
+                "knobs": {
+                    "fields": [
+                        {
+                            "name": "schema",
+                            "label": "Schema",
+                            "kind": "json-value",
+                            "required": True,
+                            "nullable": False,
+                            "placeholder": placeholder,
+                        }
+                    ]
+                },
+                "prefilled": {},
+            }
+
+        assert validate_payload(TurnType.SCHEMA_FORM, payload('{"mode": "observed"}')) is None
+        err = validate_payload(TurnType.SCHEMA_FORM, payload(42))
+        assert err is not None
+        assert "placeholder" in err
+
+    def test_schema_form_knob_required_when_is_in_the_closed_vocabulary(self) -> None:
+        # R2-F2: ``required_when`` carries the composer's own conditional
+        # requiredness rule (file-sink collision_policy under mode='write') to
+        # the form. Every local file sink emits it, so the schema_form turn is
+        # rejected outright unless the key is inside the closed vocabulary.
+        #
+        # Unlike ``visible_when``, the target may be declared LATER: ``mode``
+        # lives on the concrete sink subclass and lowers after
+        # ``collision_policy`` on LocalFileSinkConfig. required_when only reads
+        # sibling form state — every field renders — so the ordering rule must
+        # not be ported.
+        from elspeth.web.composer.guided.protocol import validate_payload
+
+        def payload(predicate: object) -> dict[str, object]:
+            return {
+                "mode": "plugin_options",
+                "plugin": "json",
+                "knobs": {
+                    "fields": [
+                        {
+                            "name": "collision_policy",
+                            "label": "Collision Policy",
+                            "kind": "enum",
+                            "enum": ["fail_if_exists", "auto_increment", "append_or_create"],
+                            "required": False,
+                            "nullable": True,
+                            "required_when": predicate,
+                        },
+                        {
+                            "name": "mode",
+                            "label": "Mode",
+                            "kind": "enum",
+                            "enum": ["write", "append"],
+                            "required": False,
+                            "nullable": False,
+                        },
+                    ]
+                },
+                "prefilled": {},
+            }
+
+        assert validate_payload(TurnType.SCHEMA_FORM, payload({"field": "mode", "equals": "write"})) is None
+        for malformed in ({"field": "nonexistent", "equals": "write"}, {"field": "mode"}, 42):
+            err = validate_payload(TurnType.SCHEMA_FORM, payload(malformed))
+            assert err is not None
+            assert "required_when" in err
+
     def test_confirm_wiring_minimal_wire_payload_validates(self) -> None:
         payload = {
             "proposal_id": "00000000-0000-4000-8000-000000000001",
@@ -533,6 +747,7 @@ class TestPayloadValidation:
                     "node_type": "queue",
                     "plugin": None,
                     "behavior": {"kind": "queue"},
+                    "node_options_summary": [],
                     "required_fields": [],
                     "guaranteed_fields": [],
                     "row_cardinality": {
@@ -550,6 +765,62 @@ class TestPayloadValidation:
             "blockers": [],
             "can_confirm": True,
         }
+        assert validate_payload(TurnType.CONFIRM_WIRING, payload) is None
+
+    @pytest.mark.parametrize(
+        "node_type",
+        [None, "transform", "gate", "aggregation", "queue", "coalesce"],
+        ids=["source", "transform", "gate", "aggregation", "queue", "coalesce"],
+    )
+    def test_confirm_wiring_rejects_one_per_branch_cardinality_outside_row_union(
+        self,
+        node_type: str | None,
+    ) -> None:
+        payload = _wire_payload_for_cardinality(
+            node_type=node_type,
+            output_cardinality="one_per_branch",
+        )
+
+        error = validate_payload(TurnType.CONFIRM_WIRING, payload)
+
+        owner_path = "payload.sources[0]" if node_type is None else "payload.nodes[0]"
+        assert error == f"{owner_path}.row_cardinality.output 'one_per_branch' is only valid for row_union nodes"
+
+    @pytest.mark.parametrize("output_cardinality", ["one", "zero_or_many", "one_per_item", "one_per_branch_set"])
+    def test_confirm_wiring_requires_one_per_branch_cardinality_for_row_union(
+        self,
+        output_cardinality: str,
+    ) -> None:
+        payload = _wire_payload_for_cardinality(
+            node_type="row_union",
+            output_cardinality=output_cardinality,
+        )
+
+        error = validate_payload(TurnType.CONFIRM_WIRING, payload)
+
+        assert error == "payload.nodes[0].row_cardinality.output must be 'one_per_branch' for row_union nodes"
+
+    @pytest.mark.parametrize("input_cardinality", ["none", "one", "batch", "many_producers"])
+    def test_confirm_wiring_requires_branches_input_cardinality_for_row_union(
+        self,
+        input_cardinality: str,
+    ) -> None:
+        payload = _wire_payload_for_cardinality(
+            node_type="row_union",
+            input_cardinality=input_cardinality,
+            output_cardinality="one_per_branch",
+        )
+
+        error = validate_payload(TurnType.CONFIRM_WIRING, payload)
+
+        assert error == "payload.nodes[0].row_cardinality.input must be 'branches' for row_union nodes"
+
+    def test_confirm_wiring_accepts_one_per_branch_cardinality_for_row_union(self) -> None:
+        payload = _wire_payload_for_cardinality(
+            node_type="row_union",
+            output_cardinality="one_per_branch",
+        )
+
         assert validate_payload(TurnType.CONFIRM_WIRING, payload) is None
 
     def test_confirm_wiring_payload_missing_key_rejected(self) -> None:

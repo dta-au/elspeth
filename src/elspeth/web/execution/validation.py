@@ -23,52 +23,71 @@ only to be rejected pre-token at /execute.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-import yaml
-from pydantic import TypeAdapter
-from pydantic import ValidationError as PydanticValidationError
-
 from elspeth.contracts.blobs import BlobRecord
-from elspeth.contracts.blobs_inline import BlobInlineValidationViolation
-from elspeth.contracts.secrets import ScopedWebSecretResolver, SecretRefPlacementViolation, SecretScope, WebSecretResolver
-from elspeth.contracts.trust_boundary import trust_boundary
-from elspeth.core.blobs_inline import (
-    BLOB_INLINE_AGGREGATE_BYTE_CAP,
-    BLOB_INLINE_PER_REF_BYTE_CAP,
-    _substitute_blob_content_refs_for_validation,
-    _validate_blob_content_refs_sync,
-)
+from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
-from elspeth.core.dag.models import EdgeContractError, GraphValidationError, GraphValidationWarning
-from elspeth.core.secrets import (
-    collect_credential_field_violations,
-    collect_disallowed_secret_ref_markers,
-    parse_secret_ref_marker,
-    redact_secret_refs_for_validation,
-    resolve_secret_refs,
-    secret_env_ref_name,
-)
+from elspeth.core.dag.graph import ExecutionGraph
+from elspeth.core.dag.models import EdgeContractError
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
-from elspeth.engine.orchestrator.types import (
-    RouteValidationError,
-)
-from elspeth.engine.orchestrator.value_source_validation import ValueSourceValidationError
-from elspeth.plugins.infrastructure.config_base import PluginConfigError
-from elspeth.plugins.infrastructure.manager import PluginNotFoundError
-from elspeth.web.composer._semantic_validator import validate_semantic_contracts
 from elspeth.web.composer.state import (
     CompositionState,
-    _batch_aware_placement_error,
-    _batch_aware_required_input_fields_error,
-    _batch_distribution_profile_value_field_entries,
 )
-from elspeth.web.execution._semantic_helpers import (
-    assistance_suggestion_for,
-    serialize_semantic_contracts,
+from elspeth.web.execution._validation_authoring import (
+    _DEFAULT_PLUGIN_POLICY_SUGGESTION as _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION,
+)
+from elspeth.web.execution._validation_authoring import (
+    _collect_secret_refs as _collect_secret_refs,
+)
+from elspeth.web.execution._validation_authoring import (
+    lower_plugin_policy,
+    review_interpretations,
+    validate_batch_options,
+    validate_path_policy,
+    validate_secret_evidence,
+    validate_semantic_evidence,
+    validate_web_network_policy,
+    validate_web_resource_policy,
+)
+from elspeth.web.execution._validation_diagnostics import (
+    _build_edge_contract_suggestion_with_resolver,
+    _edge_patch_target_for_node_id,
+    _find_gate_fan_out_advisories,
+    _find_identity_node_advisories,
+    _find_static_llm_prompt_advisories,
+    _format_edge_contract_message,
+    _graph_warning_to_validation_warning,
+    _reframe_settings_missing_parts,
+)
+from elspeth.web.execution._validation_diagnostics import (
+    _infer_component_type_from_plugin_error as _infer_component_type_from_plugin_error,
+)
+from elspeth.web.execution._validation_ledger import ValidationLedger
+from elspeth.web.execution._validation_materialization import (
+    materialize_validation_yaml,
+    validate_aws_s3_endpoint_url_policy,
+    validate_aws_s3_source_policy,
+    validate_llm_base_url_policy,
+    validate_llm_retry_budget_policy,
+    validate_llm_tracing_policy,
+    validate_managed_identity_policy,
+)
+from elspeth.web.execution._validation_model import PhaseFailure, PhaseReport, _blocked_readiness
+from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
+from elspeth.web.execution._validation_runtime import (
+    build_gate_fan_out_advisory_checks,
+    build_identity_advisory_checks,
+    build_static_llm_prompt_advisory_checks,
+    load_runtime_settings,
+    validate_graph_structure,
+    validate_route_targets,
+    validate_runtime_plugins,
+    validate_schema_compatibility,
+    validate_value_source_compliance,
 )
 from elspeth.web.execution.preflight import (
     RUNTIME_CHECK_GRAPH_STRUCTURE,
@@ -77,97 +96,27 @@ from elspeth.web.execution.preflight import (
     RUNTIME_GRAPH_VALIDATION_CHECKS,
     build_runtime_graph,
     instantiate_runtime_plugins,
-    resolve_runtime_yaml_paths,
 )
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import (
-    CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-    CHECK_AWS_S3_SOURCE_POLICY,
-    CHECK_BATCH_TRANSFORM_OPTIONS,
-    CHECK_BLOB_INLINE_REFS,
-    CHECK_IDENTITY_NODE_ADVISORY,
-    CHECK_INTERPRETATION_REVIEW,
-    CHECK_LLM_BASE_URL_POLICY,
-    CHECK_LLM_RETRY_BUDGET_POLICY,
-    CHECK_LLM_TRACING_POLICY,
-    CHECK_MANAGED_IDENTITY_POLICY,
-    CHECK_OPERATOR_PROFILE_OPTIONS,
-    CHECK_OUTCOME_SECRET_REFS_NO_REFS,
-    CHECK_OUTCOME_SECRET_REFS_RESOLVED,
-    CHECK_OUTCOME_SECRET_REFS_SKIPPED_NO_SERVICE,
-    CHECK_OUTCOME_SECRET_REFS_UNRESOLVED,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
-    CHECK_PATH_ALLOWLIST,
-    CHECK_PLUGIN_ENABLEMENT,
-    CHECK_REQUIRED_CONTROL_AVAILABILITY,
-    CHECK_REQUIRED_CONTROL_COVERAGE,
-    CHECK_ROUTE_TARGETS,
-    CHECK_SECRET_REFS,
-    CHECK_SEMANTIC_CONTRACTS,
     CHECK_SETTINGS,
     CHECK_VALUE_SOURCE_COMPLIANCE,
-    CHECK_WEB_FETCH_RESOURCE_POLICY,
-    CHECK_WEB_SCRAPE_NETWORK_POLICY,
     VALIDATION_BLOCKING_CHECK_NAMES,
     ValidationCheck,
-    ValidationCheckName,
     ValidationError,
     ValidationReadiness,
-    ValidationReadinessBlocker,
     ValidationResult,
-    ValidationWarning,
-)
-from elspeth.web.interpretation_state import (
-    INTERPRETATION_REVIEW_PENDING_CODE,
-    InterpretationReviewPending,
-    InterpretationReviewSite,
-    materialize_state_for_authoring,
-    materialize_state_for_execution,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
-from elspeth.web.provider_config_policy import (
-    web_aws_s3_endpoint_url_policy_error,
-    web_aws_s3_source_policy_error,
-    web_llm_base_url_policy_error,
-    web_llm_retry_budget_policy_error,
-    web_llm_tracing_policy_error,
-    web_rag_provider_config_policy_error,
-)
-from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields, allowed_secret_ref_fields_text
 
-# ── Check names (ordered) ─────────────────────────────────────────────
-_CHECK_PLUGIN_ENABLEMENT = CHECK_PLUGIN_ENABLEMENT
-_CHECK_OPERATOR_PROFILE_OPTIONS = CHECK_OPERATOR_PROFILE_OPTIONS
-_CHECK_REQUIRED_CONTROL_AVAILABILITY = CHECK_REQUIRED_CONTROL_AVAILABILITY
-_CHECK_REQUIRED_CONTROL_COVERAGE = CHECK_REQUIRED_CONTROL_COVERAGE
-_CHECK_PATH_ALLOWLIST = CHECK_PATH_ALLOWLIST
-_CHECK_WEB_SCRAPE_NETWORK_POLICY = CHECK_WEB_SCRAPE_NETWORK_POLICY
-_CHECK_WEB_FETCH_RESOURCE_POLICY = CHECK_WEB_FETCH_RESOURCE_POLICY
-_CHECK_SECRET_REFS = CHECK_SECRET_REFS
-_CHECK_BLOB_INLINE_REFS = CHECK_BLOB_INLINE_REFS
-_CHECK_SEMANTIC_CONTRACTS = CHECK_SEMANTIC_CONTRACTS
-_CHECK_BATCH_TRANSFORM_OPTIONS = CHECK_BATCH_TRANSFORM_OPTIONS
-_CHECK_INTERPRETATION_REVIEW = CHECK_INTERPRETATION_REVIEW
-_CHECK_MANAGED_IDENTITY_POLICY = CHECK_MANAGED_IDENTITY_POLICY
-_CHECK_LLM_RETRY_BUDGET_POLICY = CHECK_LLM_RETRY_BUDGET_POLICY
-_CHECK_LLM_BASE_URL_POLICY = CHECK_LLM_BASE_URL_POLICY
-_CHECK_LLM_TRACING_POLICY = CHECK_LLM_TRACING_POLICY
-_CHECK_AWS_S3_ENDPOINT_URL_POLICY = CHECK_AWS_S3_ENDPOINT_URL_POLICY
-_CHECK_AWS_S3_SOURCE_POLICY = CHECK_AWS_S3_SOURCE_POLICY
 _CHECK_SETTINGS = CHECK_SETTINGS
 _CHECK_PLUGINS = RUNTIME_CHECK_PLUGIN_INSTANTIATION
 _CHECK_VALUE_SOURCE_COMPLIANCE = CHECK_VALUE_SOURCE_COMPLIANCE
 _CHECK_GRAPH = RUNTIME_CHECK_GRAPH_STRUCTURE
-_CHECK_ROUTE_TARGETS = CHECK_ROUTE_TARGETS
 _CHECK_SCHEMA = RUNTIME_CHECK_SCHEMA_COMPATIBILITY
 assert RUNTIME_GRAPH_VALIDATION_CHECKS == (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_SCHEMA)
-
-_WEB_FETCH_TRANSFORMS = frozenset({"blob_fetch", "web_scrape"})
-_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS = 30
-_WEB_BLOB_FETCH_MAX_BODY_BYTES = 10 * 1024 * 1024
-_WEB_BLOB_FETCH_INT_ADAPTER: TypeAdapter[int] = TypeAdapter(int)
 
 
 def _execution_ready() -> ValidationReadiness:
@@ -179,326 +128,47 @@ def _execution_ready() -> ValidationReadiness:
     )
 
 
-def _blocked_readiness(
-    *,
-    code: str,
-    detail: str,
-    component_id: str | None = None,
-    component_type: str | None = None,
-    authoring_valid: bool = False,
-    completion_ready: bool = False,
-) -> ValidationReadiness:
-    return ValidationReadiness(
-        authoring_valid=authoring_valid,
-        execution_ready=False,
-        completion_ready=completion_ready,
-        blockers=[
-            ValidationReadinessBlocker(
-                code=code,
-                component_id=component_id,
-                component_type=component_type,
-                detail=detail,
-            )
-        ],
-    )
-
-
-def _graph_warning_to_validation_warning(warning: GraphValidationWarning) -> ValidationWarning:
-    component_id = warning.node_ids[0] if warning.node_ids else None
-    return ValidationWarning(
-        component_id=component_id,
-        component_type="graph",
-        message=warning.message,
-        suggestion=None,
-        warning_code=warning.code,
-    )
-
-
-# Advisory check — non-blocking, multi-entry (one ValidationCheck per
-# detected node, all sharing this name).  Deliberately NOT included in
-# _ALL_CHECKS: that list governs the "skipped check" propagation when an
-# earlier pass/fail check fails.  This advisory uses ``passed=True`` for
-# every entry and is emitted only on the happy-path return, so structural
-# errors are never drowned in cosmetic noise.
-_CHECK_IDENTITY_NODE_ADVISORY = CHECK_IDENTITY_NODE_ADVISORY
-
 # _CHECK_VALUE_SOURCE_COMPLIANCE slots between _CHECK_PLUGINS (typed configs
 # now exist) and _CHECK_GRAPH (so a hallucinated model fails before any DAG
-# work). The position is asserted by tests/unit/web/execution/test_validation.py
-# to prevent silent reordering.
+# work). A focused regression pins this canonical position.
 _ALL_CHECKS = list(VALIDATION_BLOCKING_CHECK_NAMES)
 
-_PLUGIN_POLICY_CHECKS: tuple[tuple[PolicyValidationStage, ValidationCheckName], ...] = (
-    ("plugin_enablement", _CHECK_PLUGIN_ENABLEMENT),
-    ("operator_profile_options", _CHECK_OPERATOR_PROFILE_OPTIONS),
-    ("required_control_availability", _CHECK_REQUIRED_CONTROL_AVAILABILITY),
-    ("required_control_coverage", _CHECK_REQUIRED_CONTROL_COVERAGE),
-)
+_DEFAULT_PLUGIN_POLICY_SUGGESTION = _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION
 
 
-@dataclass(frozen=True, slots=True)
-class _EdgePatchTarget:
-    component_id: str
-    component_type: str | None
-    display_name: str
-    schema_patch_tool_call: str
-
-
-def _node_schema_patch_target(component_id: str, component_type: str | None) -> _EdgePatchTarget:
-    return _EdgePatchTarget(
-        component_id=component_id,
-        component_type=component_type,
-        display_name=f"{component_type or 'node'} '{component_id}'",
-        schema_patch_tool_call=f"patch_node_options(node_id='{component_id}', patch={{'schema': {{...}}}})",
-    )
-
-
-def _source_schema_patch_target(source_name: str, plugin_name: str | None) -> _EdgePatchTarget:
-    component_id = "source" if source_name == "source" else f"source:{source_name}"
-    if source_name == "source":
-        display = "source" if plugin_name is None else f"source '{plugin_name}'"
-        schema_patch_tool_call = "patch_source_options(patch={'schema': {...}})"
-    else:
-        display = f"source '{source_name}'" if plugin_name is None else f"source '{source_name}' ({plugin_name})"
-        schema_patch_tool_call = f"patch_source_options(source_name={source_name!r}, patch={{'schema': {{...}}}})"
-    return _EdgePatchTarget(
-        component_id=component_id,
-        component_type="source",
-        display_name=display,
-        schema_patch_tool_call=schema_patch_tool_call,
-    )
-
-
-def _output_schema_patch_target(sink_name: str) -> _EdgePatchTarget:
-    return _EdgePatchTarget(
-        component_id=sink_name,
-        component_type="sink",
-        display_name=f"output '{sink_name}'",
-        schema_patch_tool_call=f"patch_output_options(sink_name='{sink_name}', patch={{'schema': {{...}}}})",
-    )
-
-
-def _unmapped_schema_patch_target(dag_node_id: str, component_type: str | None) -> _EdgePatchTarget:
-    return _EdgePatchTarget(
-        component_id=dag_node_id,
-        component_type=component_type,
-        display_name=f"unmapped DAG node '{dag_node_id}'",
-        schema_patch_tool_call="get_pipeline_state(component='all')  # inspect composer IDs before patching this DAG node",
-    )
-
-
-def _source_name_for_dag_source(state: CompositionState, graph: Any, dag_source_id: str) -> str | None:
-    node_info = graph.get_node_info(dag_source_id)
-    config = node_info.config
-    if "source_name" in config:
-        source_name = cast(str, config["source_name"])
-        if source_name in state.sources:
-            return source_name
-    if len(state.sources) == 1:
-        return next(iter(state.sources))
-    return None
-
-
-def _edge_patch_targets_by_dag_id(state: CompositionState, graph: Any) -> dict[str, _EdgePatchTarget]:
-    """Map runtime DAG node IDs back to composer patch-tool targets."""
-    targets: dict[str, _EdgePatchTarget] = {}
-    nodes_by_id = {node.id: node for node in state.nodes}
-
-    if state.sources:
-        for source_id in graph.get_sources():
-            dag_source_id = str(source_id)
-            source_name = _source_name_for_dag_source(state, graph, dag_source_id)
-            if source_name is None:
-                continue
-            source = state.sources[source_name]
-            targets[dag_source_id] = _source_schema_patch_target(source_name, source.plugin)
-
-    transform_nodes = [node for node in state.nodes if node.node_type == "transform"]
-    transform_id_map = graph.get_transform_id_map()
-    for sequence, dag_node_id in transform_id_map.items():
-        if sequence >= len(transform_nodes):
-            continue
-        node = transform_nodes[sequence]
-        targets[str(dag_node_id)] = _node_schema_patch_target(node.id, node.node_type)
-
-    config_gate_id_map = graph.get_config_gate_id_map()
-    for gate_name, dag_node_id in config_gate_id_map.items():
-        component_id = str(gate_name)
-        node_type = nodes_by_id[component_id].node_type if component_id in nodes_by_id else "gate"
-        targets[str(dag_node_id)] = _node_schema_patch_target(component_id, node_type)
-
-    aggregation_id_map = graph.get_aggregation_id_map()
-    for aggregation_name, dag_node_id in aggregation_id_map.items():
-        component_id = str(aggregation_name)
-        node_type = nodes_by_id[component_id].node_type if component_id in nodes_by_id else "aggregation"
-        targets[str(dag_node_id)] = _node_schema_patch_target(component_id, node_type)
-
-    coalesce_id_map = graph.get_coalesce_id_map()
-    for coalesce_name, dag_node_id in coalesce_id_map.items():
-        component_id = str(coalesce_name)
-        node_type = nodes_by_id[component_id].node_type if component_id in nodes_by_id else "coalesce"
-        targets[str(dag_node_id)] = _node_schema_patch_target(component_id, node_type)
-
-    sink_id_map = graph.get_sink_id_map()
-    for sink_name, dag_node_id in sink_id_map.items():
-        targets[str(dag_node_id)] = _output_schema_patch_target(str(sink_name))
-
-    return targets
-
-
-def _edge_patch_target_for_node_id(
-    dag_node_id: str,
-    *,
-    state: CompositionState | None = None,
-    graph: Any | None = None,
-    component_type: str | None = None,
-) -> _EdgePatchTarget:
-    """Resolve a DAG node ID to the composer component/tool that can patch it."""
-    if state is None or graph is None:
-        return _node_schema_patch_target(dag_node_id, component_type)
-
-    targets = _edge_patch_targets_by_dag_id(state, graph)
-    if not targets:
-        return _node_schema_patch_target(dag_node_id, component_type)
-    if dag_node_id in targets:
-        return targets[dag_node_id]
-    return _unmapped_schema_patch_target(dag_node_id, component_type)
-
-
-def _infer_component_type_from_plugin_error(
-    exc: PluginNotFoundError | PluginConfigError,
-) -> str | None:
-    """Extract component type from plugin error metadata.
-
-    Reads PluginConfigError.component_type directly — set by from_dict()
-    from the config class hierarchy's _plugin_component_type attribute.
-    Returns None for PluginNotFoundError or when component_type was not set.
-    """
-    if isinstance(exc, PluginConfigError):
-        return exc.component_type
-    return None
-
-
-def _format_edge_contract_failure(
-    exc: EdgeContractError,
-    *,
-    state: CompositionState | None = None,
-    graph: Any | None = None,
-) -> tuple[str, str]:
-    """Build LLM-actionable (message, suggestion) pair from a structured edge-contract error.
-
-    The composer surfaces both fields verbatim into the assistant's reply when
-    runtime preflight rejects a completion claim. Empirically (cohort
-    diagnosis 2026-05-07), models converge on retry only when the message
-    names the producer/consumer node IDs and per-field issues, AND the
-    suggestion lists concrete tool-call shapes for the fix. Prose like
-    "Type mismatches: f (expected X, got Y)" by itself routinely caused the
-    model to surrender mid-loop because there was no obvious next move.
-
-    Format choices:
-      - Producer/consumer are introduced by NODE ID first (the model uses
-        these as ``node_id=`` arguments), then by SCHEMA NAME (informational
-        — schema classes are baked-in plugin contracts, the model can't
-        target them directly).
-      - Each ``CompatibilityResult`` issue category gets its own bullet
-        block. We keep the original "expected ... got ..." nomenclature
-        from ``CompatibilityResult.error_message`` for continuity, but
-        switch to "consumer requires ... producer emits ..." prose because
-        empirically the composer LLM mis-grounds "expected/got" against
-        the validator's perspective rather than the data-flow direction.
-      - The suggestion leads with option (a) (patch consumer) because the
-        dominant captured failure mode is consumer over-declaration. The
-        producer-side option is listed second with the caveat that plugin
-        output schemas are baked-in.
-    """
-    result = exc.compatibility_result
-    issue_lines: list[str] = []
-    if result.missing_fields:
-        issue_lines.append("Missing required fields (consumer requires, producer does not guarantee):")
-        for field_name in result.missing_fields:
-            issue_lines.append(f"  - '{field_name}'")
-    if result.type_mismatches:
-        issue_lines.append("Type mismatches:")
-        for field_name, expected, actual in result.type_mismatches:
-            issue_lines.append(f"  - field '{field_name}': consumer requires '{expected}', producer emits '{actual}'")
-    if result.constraint_mismatches:
-        issue_lines.append("Constraint mismatches:")
-        for field_name, reason in result.constraint_mismatches:
-            issue_lines.append(f"  - field '{field_name}': {reason}")
-    if result.extra_fields:
-        issue_lines.append("Extra fields forbidden by consumer (producer emits, consumer rejects):")
-        for field_name in result.extra_fields:
-            issue_lines.append(f"  - '{field_name}'")
-
-    issues_block = "\n".join(issue_lines) if issue_lines else "(no per-field detail available)"
-
-    message = (
-        f"Edge contract violation between producer node '{exc.from_node_id}' "
-        f"(schema '{exc.producer_schema_name}') and consumer node '{exc.to_node_id}' "
-        f"(schema '{exc.consumer_schema_name}'):\n"
-        f"{issues_block}"
-    )
-
-    suggestion = _build_edge_contract_suggestion(exc, state=state, graph=graph)
-    return message, suggestion
+def _apply_phase[T](ledger: ValidationLedger, outcome: PhaseReport[T] | PhaseFailure) -> T:
+    """Apply one typed outcome; failures terminate through ``PhaseTermination``."""
+    return outcome.apply(ledger)
 
 
 def _build_edge_contract_suggestion(
     exc: EdgeContractError,
     *,
     state: CompositionState | None = None,
-    graph: Any | None = None,
+    graph: ExecutionGraph | None = None,
 ) -> str:
-    """Compose the action-oriented suggestion text for an edge-contract failure.
+    """Compatibility wrapper preserving the facade's live patch target."""
+    return _build_edge_contract_suggestion_with_resolver(
+        exc,
+        state=state,
+        graph=graph,
+        resolve_target=_edge_patch_target_for_node_id,
+    )
 
-    Split out from ``_format_edge_contract_failure`` so the suggestion text
-    can be unit-tested without exercising the full message-building flow,
-    and so future tuning of the suggestion (e.g., emitting different prose
-    for missing-field vs type-mismatch cases) keeps the message format
-    stable.
+
+def _format_edge_contract_failure(
+    exc: EdgeContractError,
+    *,
+    state: CompositionState | None = None,
+    graph: ExecutionGraph | None = None,
+) -> tuple[str, str]:
+    """Preserve the live patch seam and the LLM-actionable diagnostic contract.
+
+    Messages ground both ends by node ID. Suggestions expose concrete patch
+    tool calls and lead with the consumer-side repair before the narrower
+    producer-side alternative.
     """
-    result = exc.compatibility_result
-    has_type_mismatch = bool(result.type_mismatches)
-    has_missing = bool(result.missing_fields)
-    has_extras = bool(result.extra_fields)
-    consumer = _edge_patch_target_for_node_id(
-        exc.to_node_id,
-        state=state,
-        graph=graph,
-        component_type=exc.component_type,
-    )
-    producer = _edge_patch_target_for_node_id(
-        exc.from_node_id,
-        state=state,
-        graph=graph,
-        component_type=None,
-    )
-
-    parts: list[str] = []
-    parts.append("Most edge-contract failures come from the consumer over-declaring fields it doesn't operate on. Try option (a) first.")
-    parts.append("")
-    parts.append(f"  (a) Relax the consumer's input schema on {consumer.display_name}. Either:")
-    if has_type_mismatch:
-        parts.append("      - Change the declared field type(s) to match what the producer emits (see Type mismatches above).")
-    if has_missing:
-        parts.append("      - Drop missing required fields from the consumer's required_fields if the consumer doesn't actually need them.")
-    if has_extras:
-        parts.append(
-            "      - Switch the consumer's input schema mode to 'flexible' or 'observed' so it accepts the producer's extra fields."
-        )
-    parts.append(
-        "      - Or switch the consumer's input schema mode to 'flexible' so it accepts the producer's full output without redeclaring every field."
-    )
-    parts.append(f"      Tool: {consumer.schema_patch_tool_call}")
-    parts.append("")
-    parts.append(
-        f"  (b) Patch the producer {producer.display_name}. Note: plugin output schemas are largely baked-in by the plugin's contract — "
-        f"this option only works if you mis-declared the producer's schema in your initial set_pipeline / upsert_node call. "
-        f"If the producer is using its plugin's default output contract, option (a) is the only fix."
-    )
-    parts.append(f"      Tool: {producer.schema_patch_tool_call}")
-
-    return "\n".join(parts)
+    return _format_edge_contract_message(exc), _build_edge_contract_suggestion(exc, state=state, graph=graph)
 
 
 def _skipped_checks(from_check: str, *, already_emitted: frozenset[str] = frozenset()) -> list[ValidationCheck]:
@@ -522,294 +192,7 @@ def _skipped_checks(from_check: str, *, already_emitted: frozenset[str] = frozen
     return result
 
 
-def _append_skipped_checks(checks: list[ValidationCheck], from_check: str) -> None:
-    checks.extend(_skipped_checks(from_check, already_emitted=frozenset(check.name for check in checks)))
-
-
-def _format_interpretation_site(site: InterpretationReviewSite) -> str:
-    return f"{site.kind.value} review pending for {site.component_type} {site.component_id!r}: {site.user_term}"
-
-
-def _format_interpretation_sites(sites: Sequence[InterpretationReviewSite]) -> str:
-    return ", ".join(_format_interpretation_site(site) for site in sites)
-
-
-@dataclass(frozen=True, slots=True)
-class _IdentityFinding:
-    """One detected identity-shaped passthrough between a transform and a sink.
-
-    Emitted by ``_find_identity_node_advisories``; consumed by the advisory
-    block in ``validate_pipeline``.  All four fields are scalars, so
-    ``frozen=True`` is sufficient (no ``deep_freeze`` guard needed).
-
-    Attributes:
-        node_id: ID of the passthrough node itself.
-        upstream_id: ID of the producer feeding the passthrough's input
-            (or "source" when the source feeds it directly).
-        sink_name: Name of the downstream sink (output) the passthrough emits to.
-        sink_schema_mode: Schema mode of the sink ("fixed" / "flexible" /
-            "observed"), or ``None`` when the sink declares no schema mode.
-            Used purely for the advisory's detail string — not a detection input.
-    """
-
-    node_id: str
-    upstream_id: str
-    sink_name: str
-    sink_schema_mode: str | None
-
-
-@trust_boundary(
-    tier=3,
-    source="composer-authored CompositionState sink/node options (Tier-3, operator/LLM-supplied)",
-    source_param="state",
-    suppresses=("R1",),
-    invariant="returns advisory findings; every malformed-options branch returns/continues, never raises on state",
-    non_raising=True,
-)
-def _find_identity_node_advisories(state: CompositionState) -> list[_IdentityFinding]:
-    """Detect identity-shaped passthrough transforms between a real transform and a sink.
-
-    A node is flagged iff ALL of the following hold:
-
-    1. ``node_type == "transform"`` and ``plugin == "passthrough"`` (literal
-       string check — deliberately narrow per dispatch; broader registry-based
-       detection of ``passes_through_input`` plugins is out of scope).
-    2. Exactly one upstream producer feeds ``node.input`` (single inbound).
-    3. ``on_success`` targets exactly one sink (output by name) — the
-       downstream must be a sink, not another transform.
-    4. The node has no fork machinery (``fork_to``, ``routes`` empty).
-    5. ``options["schema"]["fields"]`` is missing or empty (not Concept-5
-       schema-anchoring per ``pipeline_composer.md:758-768``).
-    6. The upstream node is NOT a ``gate`` (per ``pipeline_composer.md:1517-1518``,
-       per-fork-branch passthrough is the documented legitimate pattern).
-
-    Returns:
-        List of :class:`_IdentityFinding`, one per detected node.  Empty when
-        nothing was detected.
-    """
-    findings: list[_IdentityFinding] = []
-
-    output_by_name = {output.name: output for output in state.outputs}
-    nodes_by_id = {node.id: node for node in state.nodes}
-
-    # Producer index: maps a connection-target name (the value carried by an
-    # upstream's on_success / on_error / route value / fork_to entry) back to
-    # the producer node id.  Used to find a node's upstream by matching its
-    # input field.  Explicit "if key not in dict" preserves first-writer-wins
-    # semantics; the schema validator rejects duplicate connection targets
-    # earlier in the pipeline so collisions here would already have surfaced.
-    producer_by_target: dict[str, str] = {}
-
-    def _record(target: str, producer_id: str) -> None:
-        if target not in producer_by_target:
-            producer_by_target[target] = producer_id
-
-    for source_name, source in state.sources.items():
-        if source.on_success:
-            producer_id = "source" if source_name == "source" else f"source:{source_name}"
-            producer_by_target[source.on_success] = producer_id
-    for upstream in state.nodes:
-        if upstream.on_success:
-            _record(upstream.on_success, upstream.id)
-        if upstream.on_error:
-            _record(upstream.on_error, upstream.id)
-        if upstream.routes:
-            for route_target in upstream.routes.values():
-                _record(route_target, upstream.id)
-        if upstream.fork_to:
-            for fork_target in upstream.fork_to:
-                _record(fork_target, upstream.id)
-    # Canonicalize declared queues: a queue interleaves many producers under
-    # its own id, so the queue itself — not whichever source registered first —
-    # is the canonical producer of that connection (elspeth-a5b86149d4).
-    for node in state.nodes:
-        if node.node_type == "queue":
-            producer_by_target[node.id] = node.id
-
-    for node in state.nodes:
-        # Rule 1: identity passthrough plugin (literal name).
-        if node.node_type != "transform" or node.plugin != "passthrough":
-            continue
-        # Rule 4: no fork machinery on the node itself.
-        if node.fork_to or node.routes:
-            continue
-        # Rule 3: on_success must point to exactly one sink (output).
-        if node.on_success is None or node.on_success not in output_by_name:
-            continue
-        sink = output_by_name[node.on_success]
-        # Rule 2: must have an upstream producer.  Absence means the pipeline
-        # has a dangling input ref, which a structural check will already have
-        # surfaced; the advisory simply skips the node.
-        if node.input not in producer_by_target:
-            continue
-        upstream_id = producer_by_target[node.input]
-        # Rule 6: upstream is not a gate or a queue. A gate-fork's per-branch
-        # passthrough is the documented legitimate pattern (skill lines
-        # 1517-1518); a queue interleaves fan-in with an observed/unknown schema,
-        # so a downstream passthrough is doing real structural work, not dead
-        # weight (elspeth-a5b86149d4). ``upstream_id == "source"`` is not in
-        # nodes_by_id; the source is neither, so falling through is correct.
-        if upstream_id in nodes_by_id and nodes_by_id[upstream_id].node_type in ("gate", "queue"):
-            continue
-        # Rule 5: passthrough has no schema.fields anchor (Concept-5 exemption
-        # per skill lines 758-768).  ``options`` values are Tier-3 (LLM- or
-        # operator-supplied), so isinstance() dispatches the optional schema
-        # block legitimately — a non-Mapping value means "no schema declared".
-        schema_block = node.options["schema"] if "schema" in node.options else None
-        if isinstance(schema_block, Mapping):
-            fields = schema_block.get("fields")
-            if isinstance(fields, (list, tuple)) and len(fields) > 0:
-                continue
-        # Compute sink schema mode for the advisory's detail string.  Same
-        # Tier-3 dispatch: sink options are operator-supplied, schema may be
-        # absent or shaped differently than expected.
-        sink_schema_mode: str | None = None
-        sink_schema_block = sink.options.get("schema")
-        if isinstance(sink_schema_block, Mapping):
-            mode = sink_schema_block.get("mode")
-            if isinstance(mode, str):
-                sink_schema_mode = mode
-        findings.append(
-            _IdentityFinding(
-                node_id=node.id,
-                upstream_id=upstream_id,
-                sink_name=sink.name,
-                sink_schema_mode=sink_schema_mode,
-            )
-        )
-    return findings
-
-
-def _collect_secret_refs(obj: Any, env_ref_names: set[str] | None = None) -> list[tuple[str, SecretScope | None]]:
-    """Collect deferred-secret names together with their requested scope."""
-    refs: list[tuple[str, SecretScope | None]] = []
-    if isinstance(obj, Mapping):
-        marker = parse_secret_ref_marker(obj)
-        if marker is not None:
-            refs.append(marker)
-            return refs
-        for v in obj.values():
-            refs.extend(_collect_secret_refs(v, env_ref_names))
-    elif isinstance(obj, (list, tuple)):
-        for item in obj:
-            refs.extend(_collect_secret_refs(item, env_ref_names))
-    else:
-        ref = secret_env_ref_name(obj, env_ref_names or frozenset())
-        if ref is not None:
-            refs.append((ref, None))
-    return refs
-
-
-def _secret_ref_exists(
-    secret_service: WebSecretResolver,
-    user_id: str,
-    secret_ref: tuple[str, SecretScope | None],
-) -> bool:
-    """Check a deferred reference without discarding an explicit scope."""
-    name, scope = secret_ref
-    if scope is None:
-        return secret_service.has_ref(user_id, name)
-    if not isinstance(secret_service, ScopedWebSecretResolver):
-        raise TypeError("Scoped secret marker requires a ScopedWebSecretResolver")
-    return secret_service.resolve_scoped(user_id, name, scope) is not None
-
-
-def _blob_inline_component_id(field_path: str) -> str | None:
-    if field_path == "(aggregate)":
-        return None
-    if field_path.startswith("source."):
-        return "source"
-    if field_path.startswith("node:"):
-        component, _separator, _rest = field_path.partition(".")
-        return component[len("node:") :]
-    if field_path.startswith("output:"):
-        component, _separator, _rest = field_path.partition(".")
-        return component[len("output:") :]
-    return field_path
-
-
-def _blob_inline_component_type(field_path: str) -> str | None:
-    if field_path == "(aggregate)":
-        return None
-    if field_path.startswith("source."):
-        return "source"
-    if field_path.startswith("node:"):
-        return "transform"
-    if field_path.startswith("output:"):
-        return "sink"
-    return None
-
-
-def _blob_inline_validation_detail(violations: list[BlobInlineValidationViolation]) -> str:
-    return "; ".join(f"{violation.field_path}: {violation.category}" for violation in violations)
-
-
-def _blob_inline_validation_error(violation: BlobInlineValidationViolation) -> ValidationError:
-    return ValidationError(
-        component_id=_blob_inline_component_id(violation.field_path),
-        component_type=_blob_inline_component_type(violation.field_path),
-        message=f"Inline content blob reference at {violation.field_path} is {violation.category}: {violation.detail}",
-        suggestion="Verify the blob exists, is ready, is under the configured size caps, and matches the pinned sha256.",
-        error_code=f"{violation.category}_inline_blob_content",
-    )
-
-
-# The two required-with-no-default top-level parts of ElspethSettings (see
-# core/config.py). A composition missing either fails assembly with a raw
-# pydantic "Field required" dump; ``_reframe_settings_missing_parts`` maps each
-# to a novice-register finding keyed on this table.
-_SETTINGS_MISSING_PART_REFRAMES: dict[str, tuple[str, str, str]] = {
-    # pydantic loc field -> (error_code, message, suggestion)
-    "sources": (
-        "missing_source",
-        "Add a data source so your pipeline has data to read.",
-        "Pick a data source like a CSV file or text input, then validate again.",
-    ),
-    "sinks": (
-        "missing_sink",
-        "Add an output step so your pipeline has somewhere to send its results.",
-        "Pick an output like CSV or JSON and connect your last step to it, then validate again.",
-    ),
-}
-
-
-def _reframe_settings_missing_parts(exc: PydanticValidationError) -> list[ValidationError]:
-    """Reframe ElspethSettings "Field required" failures on the required
-    top-level parts (``sources`` / ``sinks``) into novice-register findings.
-
-    Returns one finding per missing part, in a stable source-before-sink order
-    (so a lone-transform composition surfaces two honest findings). Returns
-    ``[]`` when the failure is anything other than a missing top-level part —
-    the caller then falls back to ``str(exc)``. Detection is over the
-    *structured* ``exc.errors()`` (``type == "missing"`` at the top of ``loc``),
-    never the version-stamped human ``str(exc)`` text.
-    """
-    missing_parts: set[str] = set()
-    for error in exc.errors():
-        if error.get("type") != "missing":
-            continue
-        loc = error.get("loc") or ()
-        # pydantic ``loc`` entries are ``int | str`` (ints index list fields);
-        # our required parts are top-level string keys, so narrow to str.
-        part = loc[0] if loc else None
-        if isinstance(part, str) and part in _SETTINGS_MISSING_PART_REFRAMES:
-            missing_parts.add(part)
-    # Emit in the canonical source-before-sink order regardless of pydantic's
-    # error ordering, so the paired findings read consistently.
-    return [
-        ValidationError(
-            component_id=None,
-            component_type=None,
-            message=_SETTINGS_MISSING_PART_REFRAMES[part][1],
-            suggestion=_SETTINGS_MISSING_PART_REFRAMES[part][2],
-            error_code=_SETTINGS_MISSING_PART_REFRAMES[part][0],
-        )
-        for part in _SETTINGS_MISSING_PART_REFRAMES
-        if part in missing_parts
-    ]
-
-
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="composer-authored CompositionState (pipeline nodes/options) re-read at dry-run validation",
     source_param="state",
@@ -818,7 +201,6 @@ def _reframe_settings_missing_parts(exc: PydanticValidationError) -> list[Valida
         "converts expected user/config validation failures into a ValidationResult and returns it; never raises "
         "on the shape of state (Tier-1 invariant crashes on the analyzer's own generated YAML still propagate)"
     ),
-    non_raising=True,
 )
 def validate_pipeline(
     state: CompositionState,
@@ -833,6 +215,45 @@ def validate_pipeline(
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
     allow_pending_interpretation_placeholders: bool = False,
     session_id: str | None = None,
+) -> ValidationResult:
+    """Compatibility facade that captures patchable runtime dependencies per call."""
+    dependencies = ValidationDependencies(
+        load_yaml=load_bounded_pipeline_yaml,
+        load_settings_yaml=load_settings_from_yaml_string,
+        load_settings_dict=load_settings_from_config_dict,
+        instantiate_plugins=instantiate_runtime_plugins,
+        build_graph=build_runtime_graph,
+        validate_routes=assemble_and_validate_pipeline_config,
+    )
+    return ValidationPipeline(dependencies, run_impl=_validate_pipeline_impl).run(
+        state,
+        settings,
+        yaml_generator,
+        plugin_snapshot=plugin_snapshot,
+        profile_registry=profile_registry,
+        catalog=catalog,
+        secret_service=secret_service,
+        user_id=user_id,
+        blob_get_metadata=blob_get_metadata,
+        allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
+        session_id=session_id,
+    )
+
+
+def _validate_pipeline_impl(
+    state: CompositionState,
+    settings: ValidationSettings,
+    yaml_generator: YamlGenerator,
+    *,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    profile_registry: OperatorProfileRegistry | None,
+    catalog: CatalogService,
+    secret_service: WebSecretResolver | None = None,
+    user_id: str | None = None,
+    blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
+    allow_pending_interpretation_placeholders: bool = False,
+    session_id: str | None = None,
+    dependencies: ValidationDependencies,
 ) -> ValidationResult:
     """Dry-run validation through the real engine code path.
 
@@ -877,31 +298,17 @@ def validate_pipeline(
         profile_registry: Frozen operator-profile resolver registry. Required
             when the snapshot exposes operator-profiled plugin aliases.
     """
-    checks: list[ValidationCheck] = []
-    errors: list[ValidationError] = []
-
-    # Preserve which model bindings came from public operator-profile aliases
-    # before policy lowering replaces those aliases with private provider/model
-    # options.  A concrete model selected by the operator is not a model choice
-    # authored by the composer and therefore has no user review card to resolve.
-    operator_resolved_model_node_ids = frozenset(
-        node.id for node in state.nodes if node.plugin == "llm" and isinstance(node.options.get("profile"), str)
-    )
-
-    # Step 0: Empty-composition short-circuit.
+    # Empty compositions have a deliberate legacy producer shape rather than
+    # entering the ordered core ledger: no authored phase can make them
+    # executable, and engine settings diagnostics would leak internal names.
     #
-    # A CompositionState with no source, no transforms, and no outputs cannot
-    # be assembled into ElspethSettings — pydantic would raise
-    # ``2 validation errors for ElspethSettings: source/sinks Field required``,
-    # which is a Tier-3 boundary violation (internal pydantic model names
-    # leaking to a user-facing UI). It also auto-populates the post-
-    # ``exit_to_freeform`` view of any guided session, so the surface is
-    # exercised on a normal workflow, not just on hand-crafted empty configs.
-    #
-    # Return a clean ``empty_pipeline`` ValidationResult instead. The frontend
-    # subscription guard treats ``empty_pipeline`` as non-broadcast (no chat
-    # injection, no validation feedback sent to the LLM) — see
-    # ``stores/subscriptions.ts``.
+    # This is the ONE result exempt from the complete-failure-ledger
+    # invariant every other path satisfies (a full VALIDATION_BLOCKING_CHECK
+    # sequence with a single failure and a skipped tail): the 18 checks that
+    # canonically precede settings_load never ran here, and recording them
+    # as passed would fabricate evidence. Consumers indexing by canonical
+    # rank must tolerate this shape; pinned by
+    # test_empty_pipeline_is_the_only_partial_ledger_shape.
     if not state.sources and not state.nodes and not state.outputs:
         return ValidationResult(
             is_valid=False,
@@ -919,1613 +326,167 @@ def validate_pipeline(
                 ValidationError(
                     component_id=None,
                     component_type=None,
-                    message=("Pipeline is empty. Add a data source and an output step to begin building."),
-                    suggestion=("Pick a data source like a CSV file or text input, and an output like CSV or JSON, then validate again."),
+                    message="Pipeline is empty. Add a data source and an output step to begin building.",
+                    suggestion="Pick a data source like a CSV file or text input, and an output like CSV or JSON, then validate again.",
                     error_code="empty_pipeline",
                 ),
             ],
-            readiness=_blocked_readiness(
-                code="empty_pipeline",
-                detail="Pipeline is empty.",
-            ),
+            readiness=_blocked_readiness(code="empty_pipeline", detail="Pipeline is empty."),
         )
 
-    # Policy checks deliberately precede path, YAML, and runtime construction.
-    # The authored state remains audit-safe; only the in-memory copy returned
-    # by policy validation contains private operator-profile bindings.
-    policy_result = validate_plugin_policy(
-        state,
-        snapshot=plugin_snapshot,
-        profile_registry=profile_registry,
-        catalog=catalog,
-    )
-    for stage, check_name in _PLUGIN_POLICY_CHECKS:
-        stage_findings = policy_result.findings_for(stage)
-        checks.append(
-            ValidationCheck(
-                name=check_name,
-                passed=not stage_findings,
-                detail=(f"{len(stage_findings)} plugin policy finding(s)." if stage_findings else f"{check_name} passed."),
-                affected_nodes=tuple(dict.fromkeys(finding.component_id for finding in stage_findings if finding.component_id is not None)),
-                outcome_code=None,
-            )
-        )
-        if stage_findings:
-            first_finding = stage_findings[0]
-            errors = [
-                ValidationError(
-                    component_id=item.component_id,
-                    component_type=item.component_type,
-                    message=item.message,
-                    suggestion="Choose an available plugin or repair the required control path, then validate again.",
-                    error_code=item.error_code,
-                )
-                for item in stage_findings
-            ]
-            _append_skipped_checks(checks, check_name)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=errors,
-                readiness=_blocked_readiness(
-                    code=first_finding.error_code,
-                    detail=first_finding.message,
-                    component_id=first_finding.component_id,
-                    component_type=first_finding.component_type,
-                ),
-            )
-    state = policy_result.executable_state
+    ledger = ValidationLedger()
 
-    # Step 1: Source + sink path allowlist check (C3/S2 defense-in-depth)
-    # Local filesystem keys in source/sink options must resolve under allowed
-    # directories. Uses the shared helpers from AD-4.
-    from elspeth.web.paths import (
-        NESTED_LOCAL_PATH_OPTION_KEYS,
-        SINK_LOCAL_PATH_OPTION_KEYS,
-        SOURCE_LOCAL_PATH_OPTION_KEYS,
-        allowed_sink_directories,
-        allowed_source_directories,
-        resolve_data_path,
-        resolve_sink_data_path,
-    )
-
-    allowed_source_dirs = allowed_source_directories(str(settings.data_dir), session_id=session_id)
-    allowed_sink_dirs = allowed_sink_directories(str(settings.data_dir), session_id=session_id)
-    path_checked = False
-    for source_name, source in state.sources.items():
-        source_options = dict(source.options)
-        source_component = "source" if source_name == "source" else f"source:{source_name}"
-        for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
-            value = source_options.get(key)
-            if value is not None:
-                path_checked = True
-                resolved = resolve_data_path(value, str(settings.data_dir))
-                if not any(resolved.is_relative_to(d) for d in allowed_source_dirs):
-                    return ValidationResult(
-                        is_valid=False,
-                        checks=[
-                            ValidationCheck(
-                                name=_CHECK_PATH_ALLOWLIST,
-                                passed=False,
-                                detail=f"Source '{source_name}' {key} '{value}' is outside allowed source directories",
-                                affected_nodes=(source_component,),
-                                outcome_code=None,
-                            ),
-                            *_skipped_checks(_CHECK_PATH_ALLOWLIST),
-                        ],
-                        errors=[
-                            ValidationError(
-                                component_id=source_component,
-                                component_type="source",
-                                message=(
-                                    f"Path traversal blocked: source '{source_name}' {key}='{value}' resolves outside allowed directories"
-                                ),
-                                suggestion="Use a file within the blobs directory.",
-                                error_code=None,
-                            ),
-                        ],
-                        readiness=_blocked_readiness(
-                            code="path_allowlist",
-                            detail=f"source '{source_name}' {key} resolves outside allowed source directories",
-                            component_id=source_component,
-                            component_type="source",
-                        ),
-                    )
-
-    # Sink path allowlist — prevents arbitrary file writes via sink options.
-    for output in state.outputs or ():
-        for key in SINK_LOCAL_PATH_OPTION_KEYS:
-            value = output.options[key] if key in output.options else None
-            if value is not None:
-                path_checked = True
-                resolved = resolve_sink_data_path(value, str(settings.data_dir), session_id=session_id)
-                if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
-                    return ValidationResult(
-                        is_valid=False,
-                        checks=[
-                            ValidationCheck(
-                                name=_CHECK_PATH_ALLOWLIST,
-                                passed=False,
-                                detail=f"Sink '{output.name}' {key} '{value}' is outside allowed output directories",
-                                affected_nodes=(),
-                                outcome_code=None,
-                            ),
-                            *_skipped_checks(_CHECK_PATH_ALLOWLIST),
-                        ],
-                        errors=[
-                            ValidationError(
-                                component_id=output.name,
-                                component_type="sink",
-                                message=f"Path traversal blocked: sink '{output.name}' {key}='{value}' resolves outside allowed directories",
-                                suggestion="Use a path within this session's output or blob subtree.",
-                                error_code=None,
-                            ),
-                        ],
-                        readiness=_blocked_readiness(
-                            code="path_allowlist",
-                            detail=f"sink {output.name} {key} resolves outside allowed output directories",
-                            component_id=output.name,
-                            component_type="sink",
-                        ),
-                    )
-
-    # Nested transform provider_config path allowlist — RAG retrieval
-    # transforms carry a local Chroma persist_directory under
-    # options.provider_config. It is a read/write target like a sink, so it is
-    # confined to the allowed SINK directories.
-    for node in state.nodes:
-        if node.node_type != "transform":
-            continue
-        provider_config = node.options["provider_config"] if "provider_config" in node.options else None
-        if not isinstance(provider_config, Mapping):
-            continue
-        for key in NESTED_LOCAL_PATH_OPTION_KEYS:
-            value = provider_config.get(key)
-            if value is not None:
-                path_checked = True
-                resolved = resolve_sink_data_path(value, str(settings.data_dir), session_id=session_id)
-                if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
-                    return ValidationResult(
-                        is_valid=False,
-                        checks=[
-                            ValidationCheck(
-                                name=_CHECK_PATH_ALLOWLIST,
-                                passed=False,
-                                detail=f"Transform '{node.id}' {key} '{value}' is outside allowed output directories",
-                                affected_nodes=(),
-                                outcome_code=None,
-                            ),
-                            *_skipped_checks(_CHECK_PATH_ALLOWLIST),
-                        ],
-                        errors=[
-                            ValidationError(
-                                component_id=node.id,
-                                component_type="transform",
-                                message=f"Path traversal blocked: transform '{node.id}' {key}='{value}' resolves outside allowed directories",
-                                suggestion="Use a path within this session's output or blob subtree.",
-                                error_code=None,
-                            ),
-                        ],
-                        readiness=_blocked_readiness(
-                            code="path_allowlist",
-                            detail=f"transform {node.id} {key} resolves outside allowed output directories",
-                            component_id=node.id,
-                            component_type="transform",
-                        ),
-                    )
-
-    # B11 fix: Always record the path_allowlist check
-    if path_checked:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_PATH_ALLOWLIST,
-                passed=True,
-                detail="All paths within allowed directories",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-    else:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_PATH_ALLOWLIST,
-                passed=True,
-                detail="No path option — check skipped",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-
-    web_fetch_network_errors: list[ValidationError] = []
-    for node in state.nodes:
-        if plugin_snapshot.is_trained_operator or node.plugin not in _WEB_FETCH_TRANSFORMS:
-            continue
-        http_options = node.options["http"] if "http" in node.options else None
-        if not isinstance(http_options, Mapping):
-            continue
-        if "allowed_hosts" in http_options:
-            allowed_hosts = http_options["allowed_hosts"]
-            if allowed_hosts == "allow_private":
-                message = (
-                    f"{node.plugin}.http.allowed_hosts='allow_private' is not permitted in web execution. "
-                    "Web-authored pipelines may only use public SSRF policy; private-network fetching requires "
-                    "an operator-owned runtime outside the web composer."
-                )
-            elif isinstance(allowed_hosts, Sequence) and not isinstance(allowed_hosts, str):
-                message = (
-                    f"{node.plugin}.http.allowed_hosts CIDR allowlists are not permitted in web execution. "
-                    "Web-authored pipelines may only use allowed_hosts='public_only'; private-network fetching "
-                    "requires an operator-owned runtime outside the web composer."
-                )
-            else:
-                message = None
-            if message is not None:
-                error_code = (
-                    "web_scrape_private_network_not_allowed" if node.plugin == "web_scrape" else "web_fetch_private_network_not_allowed"
-                )
-                web_fetch_network_errors.append(
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=message,
-                        suggestion=f"Set {node.plugin}.http.allowed_hosts to 'public_only' or remove the option.",
-                        error_code=error_code,
-                    )
-                )
-    if web_fetch_network_errors:
-        affected_nodes = tuple(error.component_id for error in web_fetch_network_errors if error.component_id is not None)
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_WEB_SCRAPE_NETWORK_POLICY,
-                passed=False,
-                detail="web fetch transform private-network allowlists are not permitted in web execution",
-                affected_nodes=affected_nodes,
-                outcome_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_WEB_SCRAPE_NETWORK_POLICY)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=web_fetch_network_errors,
-            readiness=_blocked_readiness(
-                code="web_scrape_network_policy",
-                detail="web fetch transform private-network allowlists are not permitted in web execution.",
-                component_id=web_fetch_network_errors[0].component_id,
-                component_type="transform",
-            ),
-        )
-
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_WEB_SCRAPE_NETWORK_POLICY,
-            passed=True,
-            detail=(
-                "No web fetch transform private-network allowlists found"
-                if not plugin_snapshot.is_trained_operator
-                else "Local trained-operator validation is exempt from the web fetch private-network policy"
-            ),
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    web_fetch_resource_errors: list[ValidationError] = []
-    if not plugin_snapshot.is_trained_operator:
-        for node in state.nodes:
-            if node.plugin != "blob_fetch":
-                continue
-            http_options = node.options["http"] if "http" in node.options else None
-            if not isinstance(http_options, Mapping):
-                continue
-
-            try:
-                timeout = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(http_options.get("timeout"))
-            except PydanticValidationError:
-                timeout = None
-            if timeout is not None and timeout > _WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS:
-                web_fetch_resource_errors.append(
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=(
-                            f"blob_fetch.http.timeout={timeout} exceeds the web execution limit of "
-                            f"{_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} seconds."
-                        ),
-                        suggestion=f"Set blob_fetch.http.timeout to {_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} or less.",
-                        error_code="web_fetch_resource_limit_exceeded",
-                    )
-                )
-
-            try:
-                max_body_bytes = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(http_options.get("max_body_bytes"))
-            except PydanticValidationError:
-                max_body_bytes = None
-            if max_body_bytes is not None and max_body_bytes > _WEB_BLOB_FETCH_MAX_BODY_BYTES:
-                web_fetch_resource_errors.append(
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=(
-                            f"blob_fetch.http.max_body_bytes={max_body_bytes} exceeds the web execution limit of "
-                            f"{_WEB_BLOB_FETCH_MAX_BODY_BYTES} bytes."
-                        ),
-                        suggestion=f"Set blob_fetch.http.max_body_bytes to {_WEB_BLOB_FETCH_MAX_BODY_BYTES} or less.",
-                        error_code="web_fetch_resource_limit_exceeded",
-                    )
-                )
-
-    if web_fetch_resource_errors:
-        affected_nodes = tuple(error.component_id for error in web_fetch_resource_errors if error.component_id is not None)
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_WEB_FETCH_RESOURCE_POLICY,
-                passed=False,
-                detail="blob_fetch resource limits exceed the web execution policy",
-                affected_nodes=affected_nodes,
-                outcome_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_WEB_FETCH_RESOURCE_POLICY)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=web_fetch_resource_errors,
-            readiness=_blocked_readiness(
-                code=_CHECK_WEB_FETCH_RESOURCE_POLICY,
-                detail="blob_fetch resource limits exceed the web execution policy.",
-                component_id=web_fetch_resource_errors[0].component_id,
-                component_type="transform",
-            ),
-        )
-
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_WEB_FETCH_RESOURCE_POLICY,
-            passed=True,
-            detail=(
-                "No blob_fetch resource limits exceed the web execution policy"
-                if not plugin_snapshot.is_trained_operator
-                else "Local trained-operator validation is exempt from the web blob_fetch resource policy"
-            ),
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    # Step 1b: Secret ref validation — check that
-    #   (a) every wired ``{secret_ref: ...}`` / inventory ``${NAME}`` resolves
-    #       (existing missing-refs gate), AND
-    #   (b) every credential-bearing field (per ``is_secret_field``) contains
-    #       a wired secret rather than a literal placeholder string
-    #       (issue elspeth-72d1dccd44 — S1A "WILL_BE_WIRED_FROM_..." defect).
-    #
-    # The remediation note (docs/composer/evidence/composer-remediation-program-2026-05-01.md)
-    # suggested "the catalog already knows which fields require secrets."  In
-    # practice the catalog renders the per-plugin schema but does not mark
-    # credential fields; the closed list of credential-bearing field names
-    # already lives in ``elspeth.core.secrets.is_secret_field`` and is shared
-    # with the runtime fingerprinting code path.  Reusing it here keeps
-    # validate-time and runtime in lock-step — divergence would re-open the
-    # parity gap this issue was filed to close.
-    all_refs: list[tuple[str, SecretScope | None]] = []
-    env_ref_names: set[str] = set()
-    fabricated_components: list[tuple[str | None, str | None, list[str]]] = []
-    disallowed_secret_ref_components: list[tuple[str | None, str, str, list[SecretRefPlacementViolation]]] = []
-    if secret_service is not None and user_id is not None:
-        env_ref_names = {item.name for item in secret_service.list_refs(user_id)}
-        # Walk source options, node configs, and output options for secret refs
-        for source_name, source in state.sources.items():
-            source_component = "source" if source_name == "source" else f"source:{source_name}"
-            all_refs.extend(_collect_secret_refs(source.options, env_ref_names))
-            fabricated = collect_credential_field_violations(source.options, env_ref_names)
-            if fabricated:
-                fabricated_components.append((source_component, "source", fabricated))
-            disallowed = collect_disallowed_secret_ref_markers(
-                source.options,
-                env_ref_names,
-                additional_allowed_fields=allowed_secret_ref_fields("source", source.plugin),
-            )
-            if disallowed:
-                disallowed_secret_ref_components.append((source_component, "source", source.plugin, disallowed))
-        for node in state.nodes or ():
-            all_refs.extend(_collect_secret_refs(node.options, env_ref_names))
-            fabricated = collect_credential_field_violations(node.options, env_ref_names)
-            if fabricated:
-                fabricated_components.append((node.id, "transform", fabricated))
-            node_plugin = node.plugin or "<unset>"
-            disallowed = collect_disallowed_secret_ref_markers(
-                node.options,
-                env_ref_names,
-                additional_allowed_fields=allowed_secret_ref_fields("transform", node_plugin),
-            )
-            if disallowed:
-                disallowed_secret_ref_components.append((node.id, "transform", node_plugin, disallowed))
-        for output in state.outputs or ():
-            all_refs.extend(_collect_secret_refs(output.options, env_ref_names))
-            fabricated = collect_credential_field_violations(output.options, env_ref_names)
-            if fabricated:
-                fabricated_components.append((output.name, "sink", fabricated))
-            disallowed = collect_disallowed_secret_ref_markers(
-                output.options,
-                env_ref_names,
-                additional_allowed_fields=allowed_secret_ref_fields("sink", output.plugin),
-            )
-            if disallowed:
-                disallowed_secret_ref_components.append((output.name, "sink", output.plugin, disallowed))
-
-        missing_refs = [ref[0] for ref in all_refs if not _secret_ref_exists(secret_service, user_id, ref)]
-        if missing_refs or fabricated_components or disallowed_secret_ref_components:
-            detail_parts: list[str] = []
-            if missing_refs:
-                names = ", ".join(missing_refs)
-                detail_parts.append(f"Missing secret references: {names}")
-                errors.append(
-                    ValidationError(
-                        component_id=None,
-                        component_type=None,
-                        message=f"Cannot resolve secret references: {names}",
-                        suggestion="Add the missing secrets via the Secrets panel before executing.",
-                        error_code="missing_secret_ref",
-                    )
-                )
-            if fabricated_components:
-                fabricated_summary = ", ".join(f"{cid}:{','.join(fields)}" for cid, _ctype, fields in fabricated_components)
-                detail_parts.append("Literal value in credential field(s): " + fabricated_summary)
-                # Audit hygiene: name the field, never echo the value.  A value
-                # that looks like a placeholder may be a near-miss real secret
-                # and the validation response is operator-visible.
-                for component_id, component_type, fields in fabricated_components:
-                    fields_text = ", ".join(fields)
-                    errors.append(
-                        ValidationError(
-                            component_id=component_id,
-                            component_type=component_type,
-                            message=(f"Credential field(s) {fields_text} contain a literal value; expected a wired secret reference."),
-                            suggestion=(
-                                "Wire each credential field through the Secrets panel "
-                                "(produces a {secret_ref: NAME} marker) instead of typing "
-                                "the value directly."
-                            ),
-                            error_code="fabricated_secret",
-                        )
-                    )
-            if disallowed_secret_ref_components:
-                for component_id, component_type, plugin_name, violations in disallowed_secret_ref_components:
-                    violation_text = ", ".join(f"{v.field_path} -> {v.secret_name}" for v in violations)
-                    allowed_text = allowed_secret_ref_fields_text(component_type, plugin_name)
-                    detail_parts.append(f"Disallowed secret_ref for {plugin_name} {component_id}: {violation_text}")
-                    for violation in violations:
-                        errors.append(
-                            ValidationError(
-                                component_id=component_id,
-                                component_type=component_type,
-                                message=(
-                                    f"Plugin '{plugin_name}' field '{violation.field_path}' contains secret_ref "
-                                    f"'{violation.secret_name}', but only credential-bearing fields may carry secret_ref "
-                                    f"markers. Allowed credential-bearing fields for this plugin: {allowed_text}."
-                                ),
-                                suggestion=(
-                                    "Move the secret_ref marker to an actual credential field, or use a literal "
-                                    "non-secret value for wire-visible identity/configuration fields."
-                                ),
-                                error_code="disallowed_secret_ref",
-                            )
-                        )
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_SECRET_REFS,
-                    passed=False,
-                    detail="; ".join(detail_parts),
-                    affected_nodes=(),
-                    outcome_code=CHECK_OUTCOME_SECRET_REFS_UNRESOLVED,
-                )
-            )
-            _append_skipped_checks(checks, _CHECK_SECRET_REFS)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=errors,
-                readiness=_blocked_readiness(
-                    code="secret_refs",
-                    detail="Secret reference validation failed.",
-                ),
-            )
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SECRET_REFS,
-                passed=True,
-                detail=f"All {len(all_refs)} secret reference(s) resolved" if all_refs else "No secret references found",
-                affected_nodes=(),
-                outcome_code=CHECK_OUTCOME_SECRET_REFS_RESOLVED if all_refs else CHECK_OUTCOME_SECRET_REFS_NO_REFS,
-            )
-        )
-    else:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SECRET_REFS,
-                passed=True,
-                detail="No secret service — check skipped",
-                affected_nodes=(),
-                outcome_code=CHECK_OUTCOME_SECRET_REFS_SKIPPED_NO_SERVICE,
-            )
-        )
-
-    semantic_errors, semantic_contracts = validate_semantic_contracts(state)
-    if semantic_errors:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SEMANTIC_CONTRACTS,
-                passed=False,
-                detail="Semantic contract check failed",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        for entry in semantic_errors:
-            # entry.message already names plugins, fields, requirement code.
-            # Suggestion is plugin-owned — fetch from PluginAssistance.
-            errors.append(
-                ValidationError(
-                    component_id=entry.component.removeprefix("node:"),
-                    component_type="transform",
-                    message=entry.message,
-                    suggestion=assistance_suggestion_for(entry, semantic_contracts),
-                    error_code=None,
-                )
-            )
-        _append_skipped_checks(checks, _CHECK_SEMANTIC_CONTRACTS)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="semantic_contracts",
-                detail="Semantic contract check failed.",
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_SEMANTIC_CONTRACTS,
-            passed=True,
-            detail=(
-                f"All {len(semantic_contracts)} semantic contract(s) satisfied" if semantic_contracts else "No semantic contracts to check"
-            ),
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    batch_option_errors: list[tuple[str, str]] = []
-    for node in state.nodes:
-        batch_placement_error = _batch_aware_placement_error(node.id, node.node_type, node.plugin, node.output_mode)
-        if batch_placement_error is not None:
-            batch_option_errors.append((node.id, batch_placement_error))
-        batch_required_error = _batch_aware_required_input_fields_error(node.id, node.plugin, node.options)
-        if batch_required_error is not None:
-            batch_option_errors.append((node.id, batch_required_error))
-    numeric_contract_errors, _numeric_contract_warnings = _batch_distribution_profile_value_field_entries(state.sources, state.nodes)
-    for entry in numeric_contract_errors:
-        batch_option_errors.append((entry.component.removeprefix("node:"), entry.message))
-    if batch_option_errors:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_BATCH_TRANSFORM_OPTIONS,
-                passed=False,
-                detail="Batch-aware transform option check failed",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        for node_id, message in batch_option_errors:
-            errors.append(
-                ValidationError(
-                    component_id=node_id,
-                    component_type="transform",
-                    message=message,
-                    suggestion=(
-                        "Use node_type='aggregation' for batch-aware plugins; remove required_input_fields from batch-aware transform "
-                        "options and use schema.required_fields for batch input validation."
-                    ),
-                    error_code=None,
-                )
-            )
-        _append_skipped_checks(checks, _CHECK_BATCH_TRANSFORM_OPTIONS)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="batch_transform_options",
-                detail="Batch-aware transform option check failed.",
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_BATCH_TRANSFORM_OPTIONS,
-            passed=True,
-            detail="Batch-aware transform options are compatible with ADR-013",
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    materialized_state = (
-        materialize_state_for_authoring(state)
-        if allow_pending_interpretation_placeholders
-        else materialize_state_for_execution(
+    policy = _apply_phase(
+        ledger,
+        lower_plugin_policy(
             state,
-            operator_resolved_model_node_ids=operator_resolved_model_node_ids,
-        )
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=profile_registry,
+            catalog=catalog,
+        ),
     )
-    if isinstance(materialized_state, InterpretationReviewPending):
-        site_detail = _format_interpretation_sites(materialized_state.sites)
-        affected_nodes = tuple(dict.fromkeys(site.component_id for site in materialized_state.sites if site.component_type == "transform"))
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_INTERPRETATION_REVIEW,
-                passed=False,
-                detail=f"Interpretation review is pending for {site_detail}.",
-                affected_nodes=affected_nodes,
-                outcome_code=None,
-            )
-        )
-        errors.extend(
-            ValidationError(
-                component_id=site.component_id,
-                component_type=site.component_type,
-                message=_format_interpretation_site(site),
-                suggestion="Resolve the pending interpretation review before running.",
-                error_code=INTERPRETATION_REVIEW_PENDING_CODE,
-            )
-            for site in materialized_state.sites
-        )
-        _append_skipped_checks(checks, _CHECK_INTERPRETATION_REVIEW)
-        single_site = materialized_state.sites[0] if len(materialized_state.sites) == 1 else None
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code=INTERPRETATION_REVIEW_PENDING_CODE,
-                detail=site_detail,
-                component_id=single_site.component_id if single_site is not None else None,
-                component_type=single_site.component_type if single_site is not None else None,
-                authoring_valid=True,
-                completion_ready=True,
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_INTERPRETATION_REVIEW,
-            passed=True,
-            detail="No pending interpretation review",
-            affected_nodes=(),
-            outcome_code=None,
-        )
+    path_validated = _apply_phase(
+        ledger,
+        validate_path_policy(
+            policy,
+            data_dir=settings.data_dir,
+            session_id=session_id,
+        ),
     )
-
-    # Step 2: Generate YAML
-    pipeline_yaml = yaml_generator.generate_yaml(materialized_state)
-    pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(settings.data_dir), session_id=session_id)
-
-    if blob_get_metadata is not None and "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml:
-        config_dict = load_bounded_pipeline_yaml(pipeline_yaml)
-        if type(config_dict) is not dict:
-            raise TypeError(
-                f"generate_yaml() produced non-dict YAML (got {type(config_dict).__name__}) — this is a bug in the YAML generator"
-            )
-        blob_violations = _validate_blob_content_refs_sync(
-            blob_get_metadata,
-            config_dict,
-            per_ref_byte_cap=BLOB_INLINE_PER_REF_BYTE_CAP,
-            aggregate_byte_cap=BLOB_INLINE_AGGREGATE_BYTE_CAP,
-        )
-        if blob_violations:
-            detail = _blob_inline_validation_detail(blob_violations)
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_BLOB_INLINE_REFS,
-                    passed=False,
-                    detail=detail,
-                    affected_nodes=(),
-                    outcome_code=None,
-                )
-            )
-            errors.extend(_blob_inline_validation_error(violation) for violation in blob_violations)
-            _append_skipped_checks(checks, _CHECK_BLOB_INLINE_REFS)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=errors,
-                readiness=_blocked_readiness(
-                    code="blob_inline_refs",
-                    detail=detail,
-                ),
-                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-            )
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_BLOB_INLINE_REFS,
-                passed=True,
-                detail="All inline-content blob references are valid",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        pipeline_yaml = yaml.dump(_substitute_blob_content_refs_for_validation(config_dict), default_flow_style=False)
-    elif blob_get_metadata is None:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_BLOB_INLINE_REFS,
-                passed=True,
-                detail="No blob metadata service — check skipped",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-    else:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_BLOB_INLINE_REFS,
-                passed=True,
-                detail="No inline-content blob references found",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-
-    # managed_identity_policy (#8) and llm_retry_budget_policy (#9) run here to
-    # match their declared position in VALIDATION_BLOCKING_CHECK_NAMES — AFTER
-    # web_scrape_network_policy (#2) through blob_inline_refs (#7). Emitting them
-    # earlier left their pass records in ``checks`` before an earlier-declared
-    # gate could fail, which suppressed the canonical skipped-after-failure record
-    # and made the trail report a later gate passing under an earlier failure.
-    for node in state.nodes:
-        if node.node_type != "transform":
-            continue
-        provider_policy_error = web_rag_provider_config_policy_error(node.options)
-        if provider_policy_error is not None:
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_MANAGED_IDENTITY_POLICY,
-                    passed=False,
-                    detail=f"Transform '{node.id}' uses disallowed managed identity provider_config",
-                    affected_nodes=(node.id,),
-                    outcome_code=None,
-                )
-            )
-            _append_skipped_checks(checks, _CHECK_MANAGED_IDENTITY_POLICY)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=[
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=provider_policy_error,
-                        suggestion="Use api_key authentication or an operator-controlled named connector/allowlist.",
-                        error_code=None,
-                    ),
-                ],
-                readiness=_blocked_readiness(
-                    code=_CHECK_MANAGED_IDENTITY_POLICY,
-                    detail=f"transform {node.id} enables managed identity from web-authored provider_config",
-                    component_id=node.id,
-                    component_type="transform",
-                ),
-                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-            )
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_MANAGED_IDENTITY_POLICY,
-            passed=True,
-            detail="No web-authored managed identity provider_config",
-            affected_nodes=(),
-            outcome_code=None,
-        )
+    network_validated = _apply_phase(
+        ledger,
+        validate_web_network_policy(path_validated, plugin_snapshot=plugin_snapshot),
     )
-
-    for node in state.nodes:
-        if node.node_type != "transform":
-            continue
-        llm_retry_policy_error = web_llm_retry_budget_policy_error(node.plugin, node.options)
-        if llm_retry_policy_error is not None:
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_LLM_RETRY_BUDGET_POLICY,
-                    passed=False,
-                    detail=f"Transform '{node.id}' uses disallowed sequential multi-query LLM retry budget",
-                    affected_nodes=(node.id,),
-                    outcome_code=None,
-                )
-            )
-            _append_skipped_checks(checks, _CHECK_LLM_RETRY_BUDGET_POLICY)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=[
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=llm_retry_policy_error,
-                        suggestion=(
-                            "Set max_capacity_retry_seconds to a small positive value or configure pool_size > 1 for pooled retry handling."
-                        ),
-                        error_code=None,
-                    ),
-                ],
-                readiness=_blocked_readiness(
-                    code=_CHECK_LLM_RETRY_BUDGET_POLICY,
-                    detail=f"transform {node.id} uses an unsafe sequential multi-query LLM retry budget",
-                    component_id=node.id,
-                    component_type="transform",
-                ),
-                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-            )
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_LLM_RETRY_BUDGET_POLICY,
-            passed=True,
-            detail="No unsafe web-authored sequential multi-query LLM retry budget",
-            affected_nodes=(),
-            outcome_code=None,
-        )
+    resource_validated = _apply_phase(
+        ledger,
+        validate_web_resource_policy(network_validated, plugin_snapshot=plugin_snapshot),
     )
-
-    # llm_base_url_policy (#10) — web-authored OpenRouter LLM nodes may not
-    # override base_url. The api_key resolves server-side (possibly a server-
-    # scoped secret the author cannot read), so a custom base_url would direct
-    # the server's bearer to an author-chosen destination — a credential-egress
-    # / SSRF vector. The plugin config-validator tolerates HTTP loopback for the
-    # CLI dev examples; this web-execution gate is the boundary that makes the
-    # single-machine threat model not leak into the hosted path. Mirrors the
-    # managed_identity / web_scrape network policies.
-    for node in state.nodes:
-        if node.node_type != "transform":
-            continue
-        llm_base_url_policy_error = web_llm_base_url_policy_error(node.plugin, node.options)
-        if llm_base_url_policy_error is not None:
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_LLM_BASE_URL_POLICY,
-                    passed=False,
-                    detail=f"Transform '{node.id}' overrides OpenRouter base_url in a web-authored pipeline",
-                    affected_nodes=(node.id,),
-                    outcome_code=None,
-                )
-            )
-            _append_skipped_checks(checks, _CHECK_LLM_BASE_URL_POLICY)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=[
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=llm_base_url_policy_error,
-                        suggestion="Remove the base_url option to use the canonical OpenRouter endpoint.",
-                        error_code="llm_base_url_not_allowed",
-                    ),
-                ],
-                readiness=_blocked_readiness(
-                    code=_CHECK_LLM_BASE_URL_POLICY,
-                    detail=f"transform {node.id} overrides OpenRouter base_url in a web-authored pipeline",
-                    component_id=node.id,
-                    component_type="transform",
-                ),
-                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-            )
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_LLM_BASE_URL_POLICY,
-            passed=True,
-            detail="No web-authored OpenRouter base_url override",
-            affected_nodes=(),
-            outcome_code=None,
-        )
+    secret_validated = _apply_phase(
+        ledger,
+        validate_secret_evidence(
+            resource_validated,
+            secret_service=secret_service,
+            user_id=user_id,
+        ),
     )
-
-    for node in state.nodes:
-        if node.node_type != "transform":
-            continue
-        llm_tracing_policy_error = web_llm_tracing_policy_error(node.plugin, node.options)
-        if llm_tracing_policy_error is not None:
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_LLM_TRACING_POLICY,
-                    passed=False,
-                    detail=f"Transform '{node.id}' configures tracing in a web-authored pipeline",
-                    affected_nodes=(node.id,),
-                    outcome_code=None,
-                )
-            )
-            _append_skipped_checks(checks, _CHECK_LLM_TRACING_POLICY)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=[
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=llm_tracing_policy_error,
-                        suggestion="Remove tracing; tracing destinations and credentials are operator-controlled.",
-                        error_code="llm_tracing_not_allowed",
-                    ),
-                ],
-                readiness=_blocked_readiness(
-                    code=_CHECK_LLM_TRACING_POLICY,
-                    detail=f"transform {node.id} configures tracing in a web-authored pipeline",
-                    component_id=node.id,
-                    component_type="transform",
-                ),
-                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-            )
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_LLM_TRACING_POLICY,
-            passed=True,
-            detail="No web-authored LLM tracing configuration",
-            affected_nodes=(),
-            outcome_code=None,
-        )
+    semantic_validated = _apply_phase(
+        ledger,
+        validate_semantic_evidence(secret_validated),
     )
-
-    for source_name, source in state.sources.items():
-        endpoint_policy_error = (
-            None if plugin_snapshot.is_trained_operator else web_aws_s3_endpoint_url_policy_error(source.plugin, source.options)
-        )
-        if endpoint_policy_error is None:
-            continue
-        source_component = "source" if source_name == "source" else f"source:{source_name}"
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-                passed=False,
-                detail=f"Source '{source_name}' sets aws_s3 endpoint_url in a web-authored pipeline",
-                affected_nodes=(source_component,),
-                outcome_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_AWS_S3_ENDPOINT_URL_POLICY)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=[
-                ValidationError(
-                    component_id=source_component,
-                    component_type="source",
-                    message=endpoint_policy_error,
-                    suggestion="Remove endpoint_url and use operator-controlled AWS configuration.",
-                    error_code="aws_s3_endpoint_url_not_allowed",
-                )
-            ],
-            readiness=_blocked_readiness(
-                code=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-                detail=f"source {source_component} sets aws_s3 endpoint_url in a web-authored pipeline",
-                component_id=source_component,
-                component_type="source",
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-
-    for output in state.outputs:
-        endpoint_policy_error = (
-            None if plugin_snapshot.is_trained_operator else web_aws_s3_endpoint_url_policy_error(output.plugin, output.options)
-        )
-        if endpoint_policy_error is None:
-            continue
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-                passed=False,
-                detail=f"Sink '{output.name}' sets aws_s3 endpoint_url in a web-authored pipeline",
-                affected_nodes=(output.name,),
-                outcome_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_AWS_S3_ENDPOINT_URL_POLICY)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=[
-                ValidationError(
-                    component_id=output.name,
-                    component_type="sink",
-                    message=endpoint_policy_error,
-                    suggestion="Remove endpoint_url and use operator-controlled AWS configuration.",
-                    error_code="aws_s3_endpoint_url_not_allowed",
-                )
-            ],
-            readiness=_blocked_readiness(
-                code=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-                detail=f"sink {output.name} sets aws_s3 endpoint_url in a web-authored pipeline",
-                component_id=output.name,
-                component_type="sink",
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-            passed=True,
-            detail=(
-                "No web-authored aws_s3 endpoint_url override"
-                if not plugin_snapshot.is_trained_operator
-                else "Local trained-operator validation is exempt from the web aws_s3 endpoint_url policy"
-            ),
-            affected_nodes=(),
-            outcome_code=None,
-        )
+    batch_validated = _apply_phase(
+        ledger,
+        validate_batch_options(semantic_validated),
     )
-
-    if not plugin_snapshot.is_trained_operator:
-        for source_name, source in state.sources.items():
-            source_policy_error = web_aws_s3_source_policy_error(source.plugin)
-            if source_policy_error is None:
-                continue
-            source_component = "source" if source_name == "source" else f"source:{source_name}"
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_AWS_S3_SOURCE_POLICY,
-                    passed=False,
-                    detail=f"Source '{source_name}' uses aws_s3 in a web-authored pipeline",
-                    affected_nodes=(source_component,),
-                    outcome_code=None,
-                )
-            )
-            _append_skipped_checks(checks, _CHECK_AWS_S3_SOURCE_POLICY)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=[
-                    ValidationError(
-                        component_id=source_component,
-                        component_type="source",
-                        message=source_policy_error,
-                        suggestion=("Use an operator-controlled connector, allowlisted ingestion job, or batch/CLI runtime for S3 reads."),
-                        error_code="aws_s3_source_not_allowed",
-                    )
-                ],
-                readiness=_blocked_readiness(
-                    code=_CHECK_AWS_S3_SOURCE_POLICY,
-                    detail=f"source {source_component} uses aws_s3 in a web-authored pipeline",
-                    component_id=source_component,
-                    component_type="source",
-                ),
-                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-            )
-
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_AWS_S3_SOURCE_POLICY,
-            passed=True,
-            detail=(
-                "Web-authored pipeline does not use an aws_s3 source"
-                if not plugin_snapshot.is_trained_operator
-                else "Local trained-operator validation is exempt from the web aws_s3 source policy"
-            ),
-            affected_nodes=(),
-            outcome_code=None,
-        )
+    interpretation_validated = _apply_phase(
+        ledger,
+        review_interpretations(
+            batch_validated,
+            allow_pending_placeholders=allow_pending_interpretation_placeholders,
+        ),
     )
+    materialized = _apply_phase(
+        ledger,
+        materialize_validation_yaml(
+            interpretation_validated,
+            yaml_generator=yaml_generator,
+            data_dir=settings.data_dir,
+            session_id=session_id,
+            blob_get_metadata=blob_get_metadata,
+            load_yaml=dependencies.load_yaml,
+        ),
+    )
+    managed_identity_validated = _apply_phase(
+        ledger,
+        validate_managed_identity_policy(materialized),
+    )
+    retry_budget_validated = _apply_phase(
+        ledger,
+        validate_llm_retry_budget_policy(managed_identity_validated),
+    )
+    base_url_validated = _apply_phase(
+        ledger,
+        validate_llm_base_url_policy(retry_budget_validated),
+    )
+    tracing_validated = _apply_phase(
+        ledger,
+        validate_llm_tracing_policy(base_url_validated),
+    )
+    endpoint_validated = _apply_phase(
+        ledger,
+        validate_aws_s3_endpoint_url_policy(
+            tracing_validated,
+            plugin_snapshot=plugin_snapshot,
+        ),
+    )
+    provider_validated = _apply_phase(
+        ledger,
+        validate_aws_s3_source_policy(
+            endpoint_validated,
+            plugin_snapshot=plugin_snapshot,
+        ),
+    )
+    loaded = _apply_phase(
+        ledger,
+        load_runtime_settings(
+            provider_validated,
+            secret_service=secret_service,
+            user_id=user_id,
+            load_yaml=dependencies.load_yaml,
+            load_settings_yaml=dependencies.load_settings_yaml,
+            load_settings_dict=dependencies.load_settings_dict,
+            reframe_missing_parts=_reframe_settings_missing_parts,
+        ),
+    )
+    instantiated = _apply_phase(
+        ledger,
+        validate_runtime_plugins(
+            loaded,
+            plugin_snapshot=plugin_snapshot,
+            instantiate_plugins=dependencies.instantiate_plugins,
+        ),
+    )
+    value_source_validated = _apply_phase(ledger, validate_value_source_compliance(instantiated))
+    graphed = _apply_phase(
+        ledger,
+        validate_graph_structure(
+            value_source_validated,
+            build_graph=dependencies.build_graph,
+            warning_to_validation_warning=_graph_warning_to_validation_warning,
+        ),
+    )
+    routes_validated = _apply_phase(
+        ledger,
+        validate_route_targets(graphed, validate_routes=dependencies.validate_routes),
+    )
+    schema_validated = _apply_phase(
+        ledger,
+        validate_schema_compatibility(
+            routes_validated,
+            edge_patch_target_for_node_id=_edge_patch_target_for_node_id,
+            format_edge_contract_failure=_format_edge_contract_failure,
+        ),
+    )
+    for advisory in build_identity_advisory_checks(
+        schema_validated,
+        find_identity_node_advisories=_find_identity_node_advisories,
+    ):
+        ledger.record_advisory(advisory)
+    for advisory in build_gate_fan_out_advisory_checks(
+        schema_validated,
+        find_gate_fan_out_advisories=_find_gate_fan_out_advisories,
+    ):
+        ledger.record_advisory(advisory)
+    for advisory in build_static_llm_prompt_advisory_checks(
+        schema_validated,
+        find_static_llm_prompt_advisories=_find_static_llm_prompt_advisories,
+    ):
+        ledger.record_advisory(advisory)
 
-    # Step 3: Settings loading
-    #
-    # Always uses load_settings_from_yaml_string() — the same loader the
-    # execution service uses (in _run_pipeline).  This ensures validation
-    # exercises the exact same code path as execution, preventing
-    # false-pass or false-fail results from loader differences.
-    #
-    # When secret refs are present, resolve them before loading.
-    # Resolved secrets stay in process memory — never written to disk.
-    #
-    # SecretResolutionError is NOT caught: if a ref is missing here,
-    # Step 1b's existence check was wrong — that's an internal bug
-    # and must crash per the W18 rule.
-    try:
-        settings_config: dict[str, Any] | None = None
-        if secret_service is not None and user_id is not None and all_refs:
-            config_dict = load_bounded_pipeline_yaml(pipeline_yaml)
-            if not isinstance(config_dict, dict):
-                raise TypeError(
-                    f"generate_yaml() produced non-dict YAML (got {type(config_dict).__name__}) — this is a bug in the YAML generator"
-                )
-            resolved_dict, _resolutions = resolve_secret_refs(
-                config_dict,
-                secret_service,
-                user_id,
-                env_ref_names=env_ref_names,
-            )
-            settings_config = resolved_dict
-        elif secret_service is None and "secret_ref" in pipeline_yaml:
-            # No-resolver path (YAML-export preflight withholds the resolver so
-            # resolved secret values can never reach plugin error prose). A wired
-            # {secret_ref: NAME} marker is valid wiring, but plugin config models
-            # type credential fields as ``str`` (e.g. OpenRouter ``api_key: str``)
-            # — an unsubstituted marker dict fails instantiation with "Input
-            # should be a valid string" and false-rejects an exportable pipeline.
-            # Substitute a benign placeholder so structural validation proceeds.
-            # The export YAML is generated separately from the original state
-            # (generate_public_yaml), so the real marker is preserved on the wire
-            # — the placeholder lives only in this loader-local copy.
-            config_dict = load_bounded_pipeline_yaml(pipeline_yaml)
-            if isinstance(config_dict, dict):
-                settings_config = redact_secret_refs_for_validation(config_dict)
-
-        # Web-authored pipeline YAML must never expand host ${VAR} placeholders
-        # (parity with the execution path). Known secret inventory names are
-        # resolved above via resolve_secret_refs; any remaining ${VAR} is
-        # user-authored data, not a host-environment lookup.
-        if settings_config is None:
-            elspeth_settings = load_settings_from_yaml_string(pipeline_yaml, expand_env_vars=False)
-        else:
-            elspeth_settings = load_settings_from_config_dict(settings_config, expand_env_vars=False)
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SETTINGS,
-                passed=True,
-                detail="Settings loaded successfully",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-    except (PydanticValidationError, ValueError, TypeError) as exc:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SETTINGS,
-                passed=False,
-                detail=str(exc),
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        # Reframe the specific "a required top-level part is missing" failure
-        # (source or sink) into novice-register findings instead of leaking the
-        # raw pydantic dump ("<field> Field required [type=missing] … For
-        # further information visit https://errors.pydantic.dev/…"), which is a
-        # Tier-3 boundary violation on the four surfaces that render
-        # ``errors[].message`` — the rail strip, audit panel, wire-stage
-        # blockers, and chat transcript (elspeth-901a404926). Detected from the
-        # *structured* ``exc.errors()`` (type == "missing" on sources / sinks),
-        # never by parsing ``str(exc)`` — the human string is version-stamped
-        # and fragile. The raw dump is retained above in ``ValidationCheck``
-        # ``detail`` (and the Landscape trail) for the engineer read; other
-        # settings failures still surface ``str(exc)`` verbatim.
-        reframed = _reframe_settings_missing_parts(exc) if isinstance(exc, PydanticValidationError) else []
-        if reframed:
-            errors.extend(reframed)
-            readiness = _blocked_readiness(
-                code="incomplete_pipeline",
-                detail="Pipeline is missing a required source or output.",
-            )
-        else:
-            errors.append(
-                ValidationError(
-                    component_id=None,
-                    component_type=None,
-                    message=str(exc),
-                    suggestion=None,
-                    error_code=None,
-                )
-            )
-            readiness = _blocked_readiness(
-                code="settings_load",
-                detail="Settings failed to load.",
-            )
-        _append_skipped_checks(checks, _CHECK_SETTINGS)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=readiness,
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-
-    # Step 4: Plugin instantiation + value-source compliance
-    #
-    # ``instantiate_plugins_from_config`` now runs the value-source walker
-    # against ``bundle.transforms`` before returning, so a hallucinated
-    # model identifier (or any field that violates a plugin's
-    # VALUE_SOURCES declaration) raises ``ValueSourceValidationError``
-    # from inside this call. We disambiguate the two failure classes by
-    # exception type:
-    #
-    # * ``PluginNotFoundError`` / ``PluginConfigError`` / ``FileExistsError``
-    #   → the bundle was never built; PLUGINS check failed, value-source
-    #   compliance is skipped via cascade (it could not run).
-    # * ``ValueSourceValidationError`` → the bundle was built successfully
-    #   but rejected by the walker; PLUGINS check passed, VALUE_SOURCE
-    #   compliance check failed, downstream checks skipped via cascade.
-    try:
-        bundle = instantiate_runtime_plugins(elspeth_settings, plugin_snapshot=plugin_snapshot)
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_PLUGINS,
-                passed=True,
-                detail="All plugins instantiated",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_VALUE_SOURCE_COMPLIANCE,
-                passed=True,
-                detail="All declared value sources satisfied",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-    except ValueSourceValidationError as exc:
-        # Bundle was built — instantiation succeeded — but the walker
-        # rejected one or more declared field values. Surface PLUGINS
-        # as passed, VALUE_SOURCE as failed.
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_PLUGINS,
-                passed=True,
-                detail="All plugins instantiated",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_VALUE_SOURCE_COMPLIANCE,
-                passed=False,
-                detail=str(exc),
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        # Each finding names a single ``component_id`` field-violation —
-        # surface them as separate ValidationError records so the composer
-        # UI can attribute each to its node. ``finding`` is a
-        # :class:`ValueSourceFinding` carrying the attribution structurally
-        # — no string parsing, no silent ``component_id=None`` fallback.
-        for finding in exc.findings:
-            errors.append(
-                ValidationError(
-                    component_id=finding.component_id,
-                    component_type="transform",
-                    message=finding.format(),
-                    suggestion=(
-                        "Use the list_models composer tool to pick a known "
-                        "model identifier; for Azure transforms, leave 'model' "
-                        "empty so it inherits from 'deployment_name'."
-                    ),
-                    error_code=None,
-                )
-            )
-        _append_skipped_checks(checks, _CHECK_VALUE_SOURCE_COMPLIANCE)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="value_source_compliance",
-                detail="Value-source compliance failed.",
-                component_id=errors[-1].component_id if errors else None,
-                component_type=errors[-1].component_type if errors else None,
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-    except (PluginNotFoundError, PluginConfigError) as exc:
-        comp_type = _infer_component_type_from_plugin_error(exc)
-        plugin_error_name: str | None = exc.plugin_name if isinstance(exc, PluginConfigError) else None
-        # Prefer cause (validation detail) over str(exc) which includes the
-        # internal class name prefix (e.g. "Invalid configuration for CSVSourceConfig: ...").
-        if isinstance(exc, PluginConfigError) and exc.cause is not None and plugin_error_name is not None:
-            detail = f"Invalid configuration for {comp_type} '{plugin_error_name}': {exc.cause}"
-        else:
-            detail = str(exc)
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_PLUGINS,
-                passed=False,
-                detail=detail,
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        errors.append(
-            ValidationError(
-                component_id=plugin_error_name,
-                component_type=comp_type,
-                message=detail,
-                suggestion=None,
-                error_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_PLUGINS)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="plugin_instantiation",
-                detail="Plugin instantiation failed.",
-                component_id=plugin_error_name,
-                component_type=comp_type,
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-    except FileExistsError as exc:
-        # Belt-and-braces conversion for plugins that still perform filesystem
-        # collision checks during construction. Built-in local file sinks skip
-        # this check during runtime preflight and defer it to first write.
-        # Known raise sites in ``plugins/infrastructure/output_paths.py``:
-        #
-        # * line 48 — ``collision_policy="fail_if_exists"`` and the target path
-        #   already exists.
-        # * line 73 — ``collision_policy="auto_increment"`` and 9999 sibling
-        #   slots are all taken.
-        #
-        # Per CLAUDE.md trust tiers, the existing-file condition is a Tier 3
-        # boundary fact (external filesystem state), not a Tier 1 invariant
-        # break — convert to a structured validation result here so the
-        # composer ``/validate`` and ``/messages`` paths surface a 422-class
-        # diagnostic instead of an opaque 500 ``composer_plugin_error``. The
-        # exception does not carry sink-name attribution at this layer
-        # (sinks raise ``FileExistsError`` directly without wrapping); the
-        # message text contains the path, which is operator-actionable.
-        detail = str(exc)
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_PLUGINS,
-                passed=False,
-                detail=detail,
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        errors.append(
-            ValidationError(
-                component_id=None,
-                component_type="sink",
-                message=detail,
-                suggestion=("Set collision_policy='auto_increment' to pick a free sibling path automatically, or choose a different path."),
-                error_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_PLUGINS)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="plugin_instantiation",
-                detail="Plugin filesystem target validation failed.",
-                component_type="sink",
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-
-    # Step 5: Graph construction + structural validation
-    try:
-        graph = build_runtime_graph(elspeth_settings, bundle)
-        graph.validate()
-        graph_warnings = [_graph_warning_to_validation_warning(warning) for warning in graph.validation_warnings]
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_GRAPH,
-                passed=True,
-                detail="Graph structure is valid"
-                if not graph_warnings
-                else f"Graph structure is valid with {len(graph_warnings)} warning(s)",
-                affected_nodes=tuple(warning.component_id for warning in graph_warnings if warning.component_id is not None),
-                outcome_code=None,
-            )
-        )
-    except GraphValidationError as exc:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_GRAPH,
-                passed=False,
-                detail=str(exc),
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        errors.append(
-            ValidationError(
-                component_id=exc.component_id,
-                component_type=exc.component_type,
-                message=str(exc),
-                suggestion=None,
-                error_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_GRAPH)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="graph_structure",
-                detail="Graph validation failed.",
-                component_id=exc.component_id,
-                component_type=exc.component_type,
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-
-    # Step 5b: Route target resolution
-    #
-    # The orchestrator's pre-init runs four route-target validators that
-    # ``graph.validate()`` does not cover:
-    # ``validate_route_destinations``, ``validate_transform_error_sinks``,
-    # ``validate_source_quarantine_destination``, and
-    # ``validate_sink_failsink_destinations``. Without this step the composer's
-    # ``/validate`` returns ``is_valid: true`` for pipelines whose
-    # ``on_error`` / ``on_validation_failure`` / ``on_write_failure`` /
-    # ``gates[*].routes[*]`` reference a non-existent sink, and the runtime
-    # then rejects them at ``/execute`` pre-token (issue elspeth-127de6865a).
-    #
-    # ``OrchestrationInvariantError`` is intentionally NOT caught — it
-    # signals a framework bug (e.g. transform on_error is None when
-    # TransformSettings requires it) and must surface as a 500, not as a
-    # per-pipeline validation failure.
-    try:
-        assemble_and_validate_pipeline_config(
-            sources=bundle.sources,
-            transforms=bundle.transforms,
-            sinks=bundle.sinks,
-            aggregations=bundle.aggregations,
-            settings=elspeth_settings,
-            graph=graph,
-        )
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_ROUTE_TARGETS,
-                passed=True,
-                detail="All route targets resolve to existing sinks",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-    except RouteValidationError as exc:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_ROUTE_TARGETS,
-                passed=False,
-                detail=str(exc),
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        errors.append(
-            ValidationError(
-                component_id=None,
-                component_type=None,
-                message=str(exc),
-                suggestion=("Use 'discard' to drop rows without routing, or wire the destination to an existing sink."),
-                error_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_ROUTE_TARGETS)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="route_target_resolution",
-                detail="Route target validation failed.",
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-
-    # Step 6: Schema compatibility
-    try:
-        graph.validate_edge_compatibility()
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SCHEMA,
-                passed=True,
-                detail="All edge schemas compatible",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-    except GraphValidationError as exc:
-        # ValidationCheck.detail keeps the legacy single-line prose so the
-        # operator-facing /validate response and dashboard run-status panel
-        # render the same compact summary they always have. The richer
-        # multi-line message + suggestion live on the ValidationError below
-        # and surface to the composer LLM.
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SCHEMA,
-                passed=False,
-                detail=str(exc),
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        if isinstance(exc, EdgeContractError):
-            consumer_target = _edge_patch_target_for_node_id(
-                exc.to_node_id,
-                state=state,
-                graph=graph,
-                component_type=exc.component_type,
-            )
-            edge_message, edge_suggestion = _format_edge_contract_failure(exc, state=state, graph=graph)
-            errors.append(
-                ValidationError(
-                    component_id=consumer_target.component_id,
-                    component_type=consumer_target.component_type,
-                    message=edge_message,
-                    suggestion=edge_suggestion,
-                    error_code=None,
-                )
-            )
-        else:
-            errors.append(
-                ValidationError(
-                    component_id=exc.component_id,
-                    component_type=exc.component_type,
-                    message=str(exc),
-                    suggestion=None,
-                    error_code=None,
-                )
-            )
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="schema_compatibility",
-                detail="Schema compatibility failed.",
-                component_id=errors[-1].component_id if errors else None,
-                component_type=errors[-1].component_type if errors else None,
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-
-    # Identity-node advisory — non-blocking, multi-entry.  Emitted only on the
-    # happy path (after every structural check has passed) so structural errors
-    # are not drowned in cosmetic noise.  One ValidationCheck per detected node;
-    # the detail string names the offending node, its upstream, and its
-    # downstream sink, plus the repair action so the composer LLM can self-correct
-    # on the next turn.  See dispatch-prompt-floofy-noodle.md plan + skill lines
-    # 758-768 (Concept-5 exemption) and 1517-1518 (fork-branch exemption).
-    for identity_finding in _find_identity_node_advisories(state):
-        sink_mode_text = (
-            f", which uses schema.mode: {identity_finding.sink_schema_mode}" if identity_finding.sink_schema_mode is not None else ""
-        )
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_IDENTITY_NODE_ADVISORY,
-                passed=True,
-                detail=(
-                    f"Node '{identity_finding.node_id}' is an identity-shaped passthrough "
-                    f"between '{identity_finding.upstream_id}' and sink '{identity_finding.sink_name}'"
-                    f"{sink_mode_text}.  The sink accepts the upstream row directly; "
-                    f"the passthrough adds an audit hop with no contract benefit.  "
-                    f"Consider removing it and wiring '{identity_finding.upstream_id}'.on_success "
-                    f"directly to '{identity_finding.sink_name}'."
-                ),
-                # Structured node attribution for the audit-readiness panel's
-                # provenance row (see docs/composer/ux-redesign-2026-05/14a
-                # §"Six rows — projection mapping").
-                affected_nodes=(identity_finding.node_id,),
-                outcome_code=None,
-            )
-        )
-
-    return ValidationResult(
-        is_valid=True,
-        checks=checks,
-        errors=errors,
-        warnings=graph_warnings,
+    authored = schema_validated.instantiated.loaded.materialized.authored
+    return ledger.finish_success(
         readiness=_execution_ready(),
-        semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+        warnings=schema_validated.graph_warnings,
+        semantic_contracts=authored.semantic_contracts,
     )
 
 
@@ -2533,14 +494,26 @@ def validate_pipeline_for_trained_operator(
     state: CompositionState,
     settings: ValidationSettings,
     yaml_generator: YamlGenerator,
+    *,
+    plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+    profile_registry: OperatorProfileRegistry | None = None,
+    catalog: CatalogService | None = None,
     **kwargs: Any,
 ) -> ValidationResult:
-    """Explicit non-web validation root preserving CLI and local-tool neutrality."""
+    """Explicit non-web validation root preserving CLI and local-tool neutrality.
+
+    The three routing options are explicit keyword parameters rather than
+    ``kwargs`` mining: at base this used ``kwargs.pop(key, default)`` (two
+    active R9 findings), which a mid-refactor rewrite turned into
+    membership ternaries — semantically identical but invisible to the R9
+    detector. Naming the parameters removes the dict-mining pattern itself
+    instead of laundering it.
+    """
     from elspeth.web.dependencies import create_catalog_service
 
-    plugin_snapshot = kwargs.pop("plugin_snapshot", None)
-    catalog, plugin_snapshot = _trained_operator_validation_context(kwargs, plugin_snapshot, create_catalog_service)
-    profile_registry = kwargs.pop("profile_registry", None)
+    if catalog is None:
+        catalog = create_catalog_service()
+    catalog, plugin_snapshot = _trained_operator_validation_context(catalog, plugin_snapshot)
     return validate_pipeline(
         state,
         settings,
@@ -2557,12 +530,10 @@ if TYPE_CHECKING:
 
 
 def _trained_operator_validation_context(
-    kwargs: dict[str, Any],
+    catalog: CatalogService,
     plugin_snapshot: PluginAvailabilitySnapshot | None,
-    catalog_factory: Callable[[], CatalogService],
 ) -> tuple[CatalogService, PluginAvailabilitySnapshot]:
-    """Consume the local catalog and normalize a caller-supplied snapshot."""
-    catalog = kwargs.pop("catalog") if "catalog" in kwargs else catalog_factory()
+    """Normalize a caller-supplied snapshot without mutating forwarded options."""
     if plugin_snapshot is None:
         return catalog, PluginAvailabilitySnapshot.for_trained_operator(catalog)
     if plugin_snapshot.is_trained_operator:

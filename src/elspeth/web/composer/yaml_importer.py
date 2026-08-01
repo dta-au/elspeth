@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from math import isfinite
 from typing import Any, cast
 
 import yaml
@@ -28,15 +29,17 @@ MAX_RUNTIME_YAML_IMPORT_CHARS = 262_144
 _UNSUPPORTED_COALESCE_FIELDS = frozenset(
     {
         "union_collision_policy",
-        "timeout_seconds",
         "quorum_count",
         "select_branch",
     }
 )
+_ROW_UNION_FIELDS = frozenset({"name", "branches", "on_success", "timeout_seconds", "input"})
 # Recognised top-level pipeline sections. A parsed document that is a
 # mapping but shares none of these keys is not a pipeline export at all
 # (see the guard in composition_state_from_runtime_yaml).
-_PIPELINE_SECTION_KEYS = frozenset({"source", "sources", "transforms", "gates", "aggregations", "coalesce", "queues", "sinks"})
+_PIPELINE_SECTION_KEYS = frozenset(
+    {"source", "sources", "transforms", "gates", "row_unions", "aggregations", "coalesce", "queues", "sinks"}
+)
 
 
 class RuntimeYamlImportError(ValueError):
@@ -112,6 +115,28 @@ def _optional_str(entry: Mapping[str, Any], key: str) -> str | None:
     raise RuntimeYamlImportError(f"{key} must be a string when provided")
 
 
+def _require_nonblank_str(entry: Mapping[str, Any], key: str, path: str) -> str:
+    value = entry.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    raise RuntimeYamlImportError(f"{path}.{key} must be a non-empty string")
+
+
+def _finite_positive_timeout(entry: Mapping[str, Any], path: str) -> float | None:
+    value = entry.get("timeout_seconds")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeYamlImportError(f"{path}.timeout_seconds must be a finite positive number")
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise RuntimeYamlImportError(f"{path}.timeout_seconds must be a finite positive number") from exc
+    if not isfinite(normalized) or normalized <= 0:
+        raise RuntimeYamlImportError(f"{path}.timeout_seconds must be a finite positive number")
+    return normalized
+
+
 def _route_label(value: Any) -> str:
     if value is True:
         return "true"
@@ -138,6 +163,34 @@ def _string_tuple(value: Any, path: str) -> tuple[str, ...]:
             raise RuntimeYamlImportError(f"{path}[{index}] must be a non-empty string")
         items.append(item)
     return tuple(items)
+
+
+def _row_union_branches(value: Any, path: str) -> dict[str, str] | tuple[str, ...]:
+    if isinstance(value, Mapping):
+        result: dict[str, str] = {}
+        for raw_name, raw_connection in value.items():
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise RuntimeYamlImportError(f"{path} keys must be non-empty strings")
+            if not isinstance(raw_connection, str) or not raw_connection.strip():
+                raise RuntimeYamlImportError(f"{path}.{raw_name} must be a non-empty string")
+            name = raw_name.strip()
+            if name in result:
+                raise RuntimeYamlImportError(f"{path} must contain at least two unique branches")
+            result[name] = raw_connection.strip()
+        branches: dict[str, str] | tuple[str, ...] = result
+    else:
+        raw_branches = _require_sequence(value, path)
+        branch_items: list[str] = []
+        for index, raw_branch in enumerate(raw_branches):
+            if not isinstance(raw_branch, str) or not raw_branch.strip():
+                raise RuntimeYamlImportError(f"{path}[{index}] must be a non-empty string")
+            branch_items.append(raw_branch.strip())
+        branches = tuple(branch_items)
+
+    branch_names = tuple(branches) if isinstance(branches, Mapping) else branches
+    if len(branch_names) < 2 or len(set(branch_names)) != len(branch_names):
+        raise RuntimeYamlImportError(f"{path} must contain at least two unique branches")
+    return branches
 
 
 @trust_boundary(
@@ -256,6 +309,41 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
                     branches=branch_spec,
                     policy=_require_str(entry, "policy", path),
                     merge=_require_str(entry, "merge", path),
+                    timeout_seconds=_finite_positive_timeout(entry, path),
+                )
+            )
+            continue
+        if node_type == "row_union":
+            unknown = sorted(
+                set(entry) - _ROW_UNION_FIELDS,
+                key=lambda field: (type(field).__name__, repr(field)),
+            )
+            if unknown:
+                raise RuntimeYamlImportError(f"{path} contains unknown or inapplicable field(s): {unknown}")
+            branch_spec = _row_union_branches(entry.get("branches"), f"{path}.branches")
+            first_branch_input = next(iter(branch_spec.values())) if isinstance(branch_spec, Mapping) else branch_spec[0]
+            if "input" in entry:
+                row_union_input = _require_nonblank_str(entry, "input", path)
+                if row_union_input != first_branch_input:
+                    raise RuntimeYamlImportError(f"{path}.input must match its first branch input {first_branch_input!r}")
+            else:
+                row_union_input = first_branch_input
+            nodes.append(
+                NodeSpec(
+                    id=_require_nonblank_str(entry, "name", path),
+                    node_type=node_type,
+                    plugin=None,
+                    input=row_union_input,
+                    on_success=_require_nonblank_str(entry, "on_success", path),
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=branch_spec,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=_finite_positive_timeout(entry, path),
                 )
             )
             continue
@@ -410,7 +498,8 @@ def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1)
         # version -- a silent destructive replace of whatever composition
         # was there before, with no error to signal anything went wrong.
         raise RuntimeYamlImportError(
-            "pipeline YAML must define at least one pipeline section (sources, transforms, gates, aggregations, coalesce, or sinks)"
+            "pipeline YAML must define at least one pipeline section "
+            "(source, sources, transforms, gates, row_unions, aggregations, coalesce, queues, or sinks)"
         )
 
     raw_sources = doc.get("sources")
@@ -425,6 +514,7 @@ def composition_state_from_runtime_yaml(pipeline_yaml: str, *, version: int = 1)
     nodes = [
         *_nodes_from_runtime_list(doc.get("transforms"), "transforms", "transform"),
         *_nodes_from_runtime_list(doc.get("gates"), "gates", "gate"),
+        *_nodes_from_runtime_list(doc.get("row_unions"), "row_unions", "row_union"),
         *_nodes_from_runtime_list(doc.get("aggregations"), "aggregations", "aggregation"),
         *_nodes_from_runtime_list(doc.get("coalesce"), "coalesce", "coalesce"),
         # Queues carry no plugin, so the review-stamp map below is a pure no-op

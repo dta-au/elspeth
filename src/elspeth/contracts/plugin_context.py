@@ -594,25 +594,43 @@ def plugin_context_scope(
     scoped so state/token/contract attribution cannot leak into the next plugin
     call on the same context.
     """
-    updates = {
-        "node_id": node_id,
-        "token": token,
-        "batch_token_ids": batch_token_ids,
-        "aggregation_batch": aggregation_batch,
-        "contract": contract,
-        "state_id": state_id,
-        "operation_id": operation_id,
-    }
-    previous: dict[str, object] = {}
+    previous_node_id = ctx.node_id
+    previous_token = ctx.token
+    previous_batch_token_ids = ctx.batch_token_ids
+    previous_aggregation_batch = ctx.aggregation_batch
+    previous_contract = ctx.contract
+    previous_state_id = ctx.state_id
+    previous_operation_id = ctx.operation_id
 
-    for name, value in updates.items():
-        if value is _CONTEXT_SCOPE_UNSET:
-            continue
-        previous[name] = getattr(ctx, name)
-        setattr(ctx, name, value)
+    if not isinstance(node_id, _ContextScopeUnset):
+        ctx.node_id = node_id
+    if not isinstance(token, _ContextScopeUnset):
+        ctx.token = token
+    if not isinstance(batch_token_ids, _ContextScopeUnset):
+        ctx.batch_token_ids = batch_token_ids
+    if not isinstance(aggregation_batch, _ContextScopeUnset):
+        ctx.aggregation_batch = aggregation_batch
+    if not isinstance(contract, _ContextScopeUnset):
+        ctx.contract = contract
+    if not isinstance(state_id, _ContextScopeUnset):
+        ctx.state_id = state_id
+    if not isinstance(operation_id, _ContextScopeUnset):
+        ctx.operation_id = operation_id
 
     try:
         yield ctx
     finally:
-        for name, previous_value in previous.items():
-            setattr(ctx, name, previous_value)
+        if not isinstance(node_id, _ContextScopeUnset):
+            ctx.node_id = previous_node_id
+        if not isinstance(token, _ContextScopeUnset):
+            ctx.token = previous_token
+        if not isinstance(batch_token_ids, _ContextScopeUnset):
+            ctx.batch_token_ids = previous_batch_token_ids
+        if not isinstance(aggregation_batch, _ContextScopeUnset):
+            ctx.aggregation_batch = previous_aggregation_batch
+        if not isinstance(contract, _ContextScopeUnset):
+            ctx.contract = previous_contract
+        if not isinstance(state_id, _ContextScopeUnset):
+            ctx.state_id = previous_state_id
+        if not isinstance(operation_id, _ContextScopeUnset):
+            ctx.operation_id = previous_operation_id

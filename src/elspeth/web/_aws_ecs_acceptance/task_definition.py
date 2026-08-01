@@ -48,7 +48,9 @@ _SECRET_ARN_SUFFIX_PATTERN = re.compile(r"(.+)-[A-Za-z0-9]{6}\Z")
 _CLOUDWATCH_AGENT_CONFIG_MAX_BYTES = 16 * 1024
 _CLOUDWATCH_AGENT_CONFIG_MAX_BASE64_CHARS = 4 * ((_CLOUDWATCH_AGENT_CONFIG_MAX_BYTES + 2) // 3)
 _CLOUDWATCH_AGENT_COMMAND = (
-    "CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; CTL=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl; "
+    "CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; "
+    "TRANSLATOR=/opt/aws/amazon-cloudwatch-agent/bin/config-translator; "
+    "AGENT=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent; "
     'mkdir -p "$CONFIG_DIR"; printf \'%s\' "$ELSPETH_CW_AGENT_CONFIG_JSON_B64" | base64 -d > '
     "\"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\"; printf '%s' "
     '"$ELSPETH_CW_AGENT_OTEL_YAML_B64" | base64 -d > '
@@ -56,15 +58,18 @@ _CLOUDWATCH_AGENT_COMMAND = (
     '"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json" | '
     "sha256sum -c -; printf '%s\\n' "
     '"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml" | '
-    'sha256sum -c -; "$CTL" -a fetch-config -m auto -c '
-    '"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json" -s; "$CTL" -a append-config -m auto -c '
-    '"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml" -s; while "$CTL" -a status -m auto '
-    '| grep -q \'"status": "running"\'; do sleep 30; done; exit 1'
+    'sha256sum -c -; "$TRANSLATOR" -mode auto -os linux '
+    '-input "/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json" '
+    '-output "/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml"; '
+    'exec "$AGENT" -config "/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml" '
+    '-otelconfig "/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml"'
 )
 _CLOUDWATCH_AGENT_HEALTH_CHECK = {
     "command": [
-        "CMD-SHELL",
-        '/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q \'"status": "running"\'',
+        "CMD",
+        "python",
+        "-c",
+        "import socket; socket.create_connection(('127.0.0.1', 4317), timeout=3).close()",
     ],
     "interval": 10,
     "timeout": 5,
@@ -78,6 +83,24 @@ _CLOUDWATCH_AGENT_ENV_NAMES = frozenset(
         "ELSPETH_CW_AGENT_OTEL_YAML_B64",
         "ELSPETH_CW_AGENT_OTEL_YAML_SHA256",
     }
+)
+_PUBLISHED_WEB_ENTRYPOINT = (
+    "/bin/sh",
+    "-ceu",
+    (
+        'metadata_url="$ECS_CONTAINER_METADATA_URI_V4/task"\n'
+        "family=$(python -c 'import json,sys,urllib.request; "
+        'print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Family"])\' "$metadata_url")\n'
+        "revision=$(python -c 'import json,sys,urllib.request; "
+        'print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Revision"])\' "$metadata_url")\n'
+        'export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_FAMILY="$family"\n'
+        'export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_REVISION="$revision"\n'
+        'case "$1" in\n'
+        '  web|doctor) set -- elspeth "$@" ;;\n'
+        "esac\n"
+        'exec "$@"\n'
+    ),
+    "--",
 )
 _PUBLISHED_WEB_COMMAND = ("web", "--host", "0.0.0.0", "--port", "8451")
 
@@ -156,7 +179,7 @@ def _validate_cloudwatch_agent_sidecar(
 ) -> None:
     if (
         sidecar.get("name") != "cloudwatch-agent"
-        or sidecar.get("image") != values.get("CLOUDWATCH_AGENT_IMAGE")
+        or sidecar.get("image") != values["CLOUDWATCH_AGENT_IMAGE"]
         or sidecar.get("essential") is not False
         or type(sidecar.get("memoryReservation")) is not int
         or sidecar.get("memoryReservation") != 192
@@ -194,8 +217,8 @@ def _validate_cloudwatch_agent_sidecar(
     otel_yaml = _decode_cloudwatch_agent_config(observed["ELSPETH_CW_AGENT_OTEL_YAML_B64"])
     _cloudwatch_json_object(config_json)
     _cloudwatch_yaml_object(otel_yaml)
-    expected_json_sha256 = values.get("CLOUDWATCH_AGENT_CONFIG_JSON_SHA256")
-    expected_otel_sha256 = values.get("CLOUDWATCH_AGENT_OTEL_YAML_SHA256")
+    expected_json_sha256 = values["CLOUDWATCH_AGENT_CONFIG_JSON_SHA256"]
+    expected_otel_sha256 = values["CLOUDWATCH_AGENT_OTEL_YAML_SHA256"]
     if (
         observed["ELSPETH_CW_AGENT_CONFIG_JSON_SHA256"] != expected_json_sha256
         or observed["ELSPETH_CW_AGENT_OTEL_YAML_SHA256"] != expected_otel_sha256
@@ -224,10 +247,8 @@ def validate_task_definition_policy_binding(
         raise AcceptanceCheckError("task_definition_policy_binding")
     manifest = _read_control_manifest(manifest_path)
     inventory = _load_bound_scenario_inventory(manifest, scenario_id, require_resolved=True)
-    values = inventory["values"]
-    orphan = inventory["orphan_sweep"]
-    if not isinstance(values, dict) or not isinstance(orphan, dict):
-        raise AcceptanceCheckError("task_definition_policy_binding")
+    values = cast(dict[str, object], inventory["values"])
+    orphan = cast(dict[str, object], inventory["orphan_sweep"])
     task = payload.get("taskDefinition") if isinstance(payload, Mapping) else None
     if not isinstance(task, Mapping) or task.get("status") != "ACTIVE":
         raise AcceptanceCheckError("task_definition_policy_binding")
@@ -258,18 +279,18 @@ def validate_task_definition_policy_binding(
     container = matches[0]
     if container.get("essential") is not True:
         raise AcceptanceCheckError("task_definition_policy_binding")
-    if (
-        expected_user is None
-        and container_name == values.get("WEB_CONTAINER_NAME")
-        and container.get("command") != list(_PUBLISHED_WEB_COMMAND)
+    is_published_web_container = expected_user is None and container_name == values["WEB_CONTAINER_NAME"]
+    if is_published_web_container and (
+        container.get("entryPoint") != list(_PUBLISHED_WEB_ENTRYPOINT) or container.get("command") != list(_PUBLISHED_WEB_COMMAND)
     ):
         raise AcceptanceCheckError("task_definition_policy_binding")
     sidecars = [candidate for candidate in containers if isinstance(candidate, Mapping) and candidate.get("name") == "cloudwatch-agent"]
-    if sidecars:
+    if not sidecars:
+        if is_published_web_container:
+            raise AcceptanceCheckError("task_definition_policy_binding")
+    else:
         _validate_cloudwatch_agent_sidecar(sidecars[0], container, values)
-    ecr = manifest["ecr"]
-    if not isinstance(ecr, Mapping):
-        raise AcceptanceCheckError("task_definition_policy_binding")
+    ecr = cast(Mapping[str, object], manifest["ecr"])
     registry = ecr["registry"]
     repository = ecr["repository"]
     digest = ecr["candidate_digest"] if expected_image_role == "candidate" else ecr["baseline_digest"]
@@ -277,11 +298,9 @@ def validate_task_definition_policy_binding(
         raise AcceptanceCheckError("task_definition_policy_binding")
     if container.get("image") != f"{registry}/{repository}@{digest}":
         raise AcceptanceCheckError("task_definition_policy_binding")
-    aws = manifest["aws"]
-    role_names = orphan.get("iam_role_names")
-    if not isinstance(aws, Mapping) or not isinstance(role_names, list):
-        raise AcceptanceCheckError("task_definition_policy_binding")
-    account_id = aws.get("account_id")
+    aws = cast(Mapping[str, object], manifest["aws"])
+    role_names = cast(list[str], orphan["iam_role_names"])
+    account_id = aws["account_id"]
     namespace = scenario_resource_namespace(cast(str, manifest["acceptance_run_id"]), scenario_id)
     expected_roles = {
         "taskRoleArn": f"{namespace}-task-role",
@@ -322,7 +341,7 @@ def validate_task_definition_policy_binding(
         observed[name] = value
     if any(name in _TASK_DEFINITION_AWS_OVERRIDE_ENV or _plaintext_task_definition_secret(name) for name in observed):
         raise AcceptanceCheckError("task_definition_policy_binding")
-    if any(observed.get(name) != values.get(name) for name in _TASK_DEFINITION_COMPOSER_MODEL_ENV):
+    if any(observed.get(name) != values[name] for name in _TASK_DEFINITION_COMPOSER_MODEL_ENV):
         raise AcceptanceCheckError("task_definition_policy_binding")
     composer_providers = {
         infer_provider_from_model_name(observed[name]) or infer_provider_from_unprefixed_model_name(observed[name])
@@ -340,7 +359,7 @@ def validate_task_definition_policy_binding(
     if requires_openrouter:
         name, secret_suffix, json_key = _TASK_DEFINITION_OPENROUTER_SECRET_BINDING
         required_secret_bindings[name] = (f"{namespace}-{secret_suffix}", json_key, "", "")
-    aws_region = aws.get("region")
+    aws_region = aws["region"]
     assert task_definition_match is not None
     partition = task_definition_match.group(1)
     for entry in secrets:
@@ -388,15 +407,15 @@ def validate_task_definition_policy_binding(
     }
     if secret_names.intersection((*protected_names, *expected_runtime)):
         raise AcceptanceCheckError("task_definition_policy_binding")
-    if any(observed.get(name) != values.get(name) for name in protected_names):
+    if any(observed.get(name) != values[name] for name in protected_names):
         raise AcceptanceCheckError("task_definition_policy_binding")
     if any(observed.get(name) != value for name, value in expected_runtime.items()):
         raise AcceptanceCheckError("task_definition_policy_binding")
-    data_dir_value = observed.get("ELSPETH_WEB__DATA_DIR")
-    payload_root_value = observed.get("ELSPETH_WEB__PAYLOAD_STORE_PATH")
+    data_dir_value = observed["ELSPETH_WEB__DATA_DIR"]
+    payload_root_value = observed["ELSPETH_WEB__PAYLOAD_STORE_PATH"]
     try:
-        data_dir = PurePosixPath(cast(str, data_dir_value))
-        payload_root = PurePosixPath(cast(str, payload_root_value))
+        data_dir = PurePosixPath(data_dir_value)
+        payload_root = PurePosixPath(payload_root_value)
     except (TypeError, ValueError):
         raise AcceptanceCheckError("task_definition_policy_binding") from None
     if (
@@ -411,12 +430,10 @@ def validate_task_definition_policy_binding(
     ):
         raise AcceptanceCheckError("task_definition_policy_binding")
 
-    file_system_ids = orphan.get("efs_file_system_ids")
-    access_point_ids = orphan.get("efs_access_point_ids")
+    file_system_ids = cast(list[str], orphan["efs_file_system_ids"])
+    access_point_ids = cast(list[str], orphan["efs_access_point_ids"])
     if (
-        not isinstance(file_system_ids, list)
-        or not isinstance(access_point_ids, list)
-        or len(file_system_ids) != 1
+        len(file_system_ids) != 1
         or len(access_point_ids) != 1
         or type(file_system_ids[0]) is not str
         or type(access_point_ids[0]) is not str

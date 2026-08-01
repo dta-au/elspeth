@@ -9,6 +9,7 @@ import math
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta
+from typing import cast
 from urllib.parse import urlsplit
 
 import httpx
@@ -49,6 +50,15 @@ _BEDROCK_DETAIL_FIELDS = frozenset(
         "cache_tokens_present",
         "cost",
         "cost_source",
+    }
+)
+
+_TEXTRACT_DETAIL_FIELDS = frozenset(
+    {
+        "transform_registered",
+        "client_constructed",
+        "start_document_analysis_invocable",
+        "get_document_analysis_invocable",
     }
 )
 
@@ -125,7 +135,14 @@ _ROLLBACK_BASELINE_SESSION_EPOCH = 35
 
 _ROLLBACK_BASELINE_LANDSCAPE_EPOCH = 29
 
-_SCENARIO_B_STRUCTURAL_CHANGES = "session_epoch_35_to_37_coordination_schema"
+# Derived from the live epoch constants: a schema bump must rotate the label a
+# compatibility receipt attests, otherwise a stale receipt keeps validating
+# against a transition the candidate no longer performs.
+_SCENARIO_B_STRUCTURAL_CHANGES = (
+    f"session_epoch_{_ROLLBACK_BASELINE_SESSION_EPOCH}_to_{SESSION_SCHEMA_EPOCH}"
+    f"_landscape_epoch_{_ROLLBACK_BASELINE_LANDSCAPE_EPOCH}_to_{SQLITE_SCHEMA_EPOCH}"
+    "_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema"
+)
 
 
 def _expected_schema_facts(scenario_id: str) -> dict[str, object]:
@@ -151,7 +168,7 @@ def _expected_schema_facts(scenario_id: str) -> dict[str, object]:
             else None
         ),
         "structural_changes": (_SCENARIO_B_STRUCTURAL_CHANGES if scenario_id == "B" else "initial_create"),
-        "semantics_only_changes": "none",
+        "semantics_only_changes": ("guided_coalesce_timeout_seconds_and_node_options_summary_required" if scenario_id == "B" else "none"),
         "archive_export_decision": ("required_before_forward_migration" if scenario_id == "B" else "not_applicable"),
         "destructive_reset_required": False,
     }
@@ -192,6 +209,13 @@ def _validate_bedrock_receipt_details(details: Mapping[str, object]) -> None:
     if details["cost_source"] not in {"provider_reported", "litellm_calculated", "unavailable"}:
         raise AcceptanceCheckError("exec_receipt_schema")
     if (cost is None) != (details["cost_source"] == "unavailable"):
+        raise AcceptanceCheckError("exec_receipt_schema")
+
+
+def _validate_textract_receipt_details(details: Mapping[str, object]) -> None:
+    if set(details) != _TEXTRACT_DETAIL_FIELDS:
+        raise AcceptanceCheckError("exec_receipt_schema")
+    if any(details[field] is not True for field in _TEXTRACT_DETAIL_FIELDS):
         raise AcceptanceCheckError("exec_receipt_schema")
 
 
@@ -391,6 +415,7 @@ def _validate_exec_receipt_schema(payload: object) -> dict[str, object]:
     if type(check) is not str or check not in {
         "verify-s3",
         "verify-bedrock",
+        "verify-textract",
         "verify-bedrock-guardrails",
         "verify-connection-budget",
         "verify-operator-telemetry",
@@ -412,6 +437,8 @@ def _validate_exec_receipt_schema(payload: object) -> dict[str, object]:
         _validate_guardrail_receipt_details(details)
     elif check == "verify-connection-budget":
         _validate_connection_budget_receipt(details)
+    elif check == "verify-textract":
+        _validate_textract_receipt_details(details)
     else:
         _validate_operator_receipt_details(details)
     return payload
@@ -541,10 +568,9 @@ def extract_exec_receipt(
     if expected_plugin_policy_binding_sha256 is not None:
         if expected_check != "verify-bedrock-guardrails" or _SHA256_PATTERN.fullmatch(expected_plugin_policy_binding_sha256) is None:
             raise AcceptanceCheckError("plugin_policy_binding")
-        details = payload["details"]
-        assert isinstance(details, dict)
-        plugin_policy = details.get("plugin_policy")
-        if not isinstance(plugin_policy, Mapping) or plugin_policy.get("binding_sha256") != expected_plugin_policy_binding_sha256:
+        details = cast(dict[str, object], payload["details"])
+        plugin_policy = cast(Mapping[str, object], details["plugin_policy"])
+        if plugin_policy["binding_sha256"] != expected_plugin_policy_binding_sha256:
             raise AcceptanceCheckError("plugin_policy_binding")
     return payload
 
@@ -861,6 +887,7 @@ _RECEIPT_KINDS = frozenset(
         "terraform-destroy-plan",
         "verify-s3",
         "verify-bedrock",
+        "verify-textract",
         "verify-bedrock-guardrails",
         "verify-operator-telemetry",
     }
@@ -924,14 +951,12 @@ def _validate_stored_receipt(
     ):
         raise AcceptanceCheckError("receipt_store_binding")
     if expected_plugin_policy_binding_sha256 is not None:
-        details = receipt["details"]
-        assert isinstance(details, dict)
-        plugin_policy = details.get("plugin_policy")
+        details = cast(dict[str, object], receipt["details"])
+        plugin_policy = cast(Mapping[str, object], details["plugin_policy"])
         if (
             kind != "verify-bedrock-guardrails"
             or _SHA256_PATTERN.fullmatch(expected_plugin_policy_binding_sha256) is None
-            or not isinstance(plugin_policy, Mapping)
-            or plugin_policy.get("binding_sha256") != expected_plugin_policy_binding_sha256
+            or plugin_policy["binding_sha256"] != expected_plugin_policy_binding_sha256
         ):
             raise AcceptanceCheckError("receipt_store_binding")
     return receipt

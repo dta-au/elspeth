@@ -5,6 +5,7 @@ Layer: L0 (contracts). No upward imports.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal, Protocol, runtime_checkable
 
@@ -221,4 +222,20 @@ class WebSecretResolver(Protocol):
 class ScopedWebSecretResolver(WebSecretResolver, Protocol):
     """Web resolver that can honour an operator-pinned credential scope."""
 
+    def resolve_scoped(self, user_id: str, name: str, scope: SecretScope) -> ResolvedSecret | None: ...
+
+
+class ScopedSecretResolverContract(ABC):
+    """Nominal admission anchor for scoped secret resolution (ADR-032).
+
+    ``isinstance`` against this class is the security control at the
+    scoped-marker resolution boundary (``core/secrets._resolve_marker``).
+    The ``runtime_checkable`` Protocols above remain typing surface only:
+    they are structural, so an impostor with a matching method name passes
+    them, and since Python 3.12 they silently reject dynamic-attribute
+    objects such as pydantic ``extra="allow"`` models. A real scoped
+    resolver must INHERIT this class; lookalikes are not admitted.
+    """
+
+    @abstractmethod
     def resolve_scoped(self, user_id: str, name: str, scope: SecretScope) -> ResolvedSecret | None: ...

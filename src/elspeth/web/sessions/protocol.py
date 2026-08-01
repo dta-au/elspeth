@@ -84,7 +84,15 @@ PipelineProposalRejectionReason = Literal[
     "base_conflict",
     "request_cancelled",
     "superseded",
+    "guided_exit",
 ]
+# The subset a guided state mutation may record when it atomically rejects
+# the pending proposal it is clearing: "superseded" for a real supersession
+# (a newer draft or a rewind displaces the pending one), "guided_exit" when
+# exit-to-freeform abandons custody — nothing displaced the proposal, so
+# recording "superseded" there would fabricate a successor that never existed.
+GuidedProposalInvalidationReason = Literal["superseded", "guided_exit"]
+_GUIDED_PROPOSAL_INVALIDATION_REASONS = frozenset({"superseded", "guided_exit"})
 PipelineProposalSurface = Literal["freeform", "guided_full", "guided_staged", "tutorial_profile"]
 ProposalEventType = Literal[
     "proposal.created",
@@ -102,10 +110,30 @@ GuidedOperationKind = Literal[
     "state_revert",
     "session_fork",
 ]
+# Closed enum mirroring the ``ck_guided_operations_failure_code`` CHECK
+# constraint in ``web/sessions/models.py``; the order here mirrors the CHECK
+# declaration for visual diff clarity. Same paired-contract posture as
+# ``ChatMessageWriterPrincipal`` below: extending one side only lets the Python
+# writer pass while the DB rejects the row (or vice versa), so both edits ship
+# together with a ``SESSION_SCHEMA_EPOCH`` bump.
+#
+# The vocabulary also carries a PERMANENT-vs-TRANSIENT split the client reads to
+# decide whether a retry can succeed. ``provider_unavailable`` /
+# ``provider_timeout`` / ``invalid_provider_response`` / ``stale_conflict`` are
+# transient (retry or reload can win); ``policy_blocked`` is permanent by
+# construction — a deployment policy refused the pipeline, so the identical
+# request will be refused identically no matter how many operation ids the
+# client mints.
 GuidedOperationFailureCode = Literal[
     "provider_unavailable",
     "provider_timeout",
     "invalid_provider_response",
+    # Permanent refusal from a deployment security policy (e.g. a source plugin
+    # prohibited on the web authoring surface). Distinct from
+    # ``invalid_provider_response`` precisely because there is nothing to retry:
+    # collapsing the two blamed the provider for a policy decision and told the
+    # user to retry an operation that cannot ever succeed.
+    "policy_blocked",
     "stale_conflict",
     "integrity_error",
     "custody_error",
@@ -424,7 +452,24 @@ class GuidedPipelineProposalResult:
     checkpoint_state_id: UUID
 
 
-type GuidedOperationResult = GuidedCompositionStateResult | GuidedPipelineProposalResult | GuidedSessionResult
+@final
+@dataclass(frozen=True, slots=True)
+class GuidedDeclinedResult:
+    """Replay locator for a guided-full operation whose escape-hatch advisor
+    declined instead of proposing a pipeline.
+
+    No proposal is created. ``checkpoint_state_id`` names the (content-
+    unchanged) checkpoint composition_states row inserted alongside the
+    persisted decline message. ``decline_message_id`` is the immutable replay
+    locator; the checkpoint association is intentionally not unique across
+    later conversational turns.
+    """
+
+    checkpoint_state_id: UUID
+    decline_message_id: UUID
+
+
+type GuidedOperationResult = GuidedCompositionStateResult | GuidedPipelineProposalResult | GuidedSessionResult | GuidedDeclinedResult
 
 
 @final
@@ -1600,17 +1645,16 @@ class PreparedGuidedInterpretationDraft:
     def __post_init__(self) -> None:
         if type(self.event_id) is not UUID:
             raise AuditIntegrityError("PreparedGuidedInterpretationDraft.event_id must be a UUID")
-        for field_name in (
-            "affected_node_id",
-            "tool_call_id",
-            "user_term",
-            "llm_draft",
-            "model_identifier",
-            "model_version",
-            "provider",
-            "composer_skill_hash",
+        for field_name, value in (
+            ("affected_node_id", self.affected_node_id),
+            ("tool_call_id", self.tool_call_id),
+            ("user_term", self.user_term),
+            ("llm_draft", self.llm_draft),
+            ("model_identifier", self.model_identifier),
+            ("model_version", self.model_version),
+            ("provider", self.provider),
+            ("composer_skill_hash", self.composer_skill_hash),
         ):
-            value = getattr(self, field_name)
             if type(value) is not str or not value:
                 raise AuditIntegrityError(f"PreparedGuidedInterpretationDraft.{field_name} must be a non-empty exact string")
         if type(self.kind) is not InterpretationKind:
@@ -1620,11 +1664,19 @@ class PreparedGuidedInterpretationDraft:
 @final
 @dataclass(frozen=True, slots=True)
 class GuidedPendingProposalInvalidation:
-    """Exact pending proposal authority invalidated by a guided state mutation."""
+    """Exact pending proposal authority invalidated by a guided state mutation.
+
+    ``reason`` is the truthful rejection cause recorded on the terminal
+    ``proposal.rejected`` event (closed
+    :data:`GuidedProposalInvalidationReason` vocabulary) — the settlement
+    verifies the clear and terminalizes the row, but only the call site knows
+    WHY custody is being cleared.
+    """
 
     proposal_id: UUID
     draft_hash: str
     reviewed_facts: Mapping[str, Any]
+    reason: GuidedProposalInvalidationReason
 
     def __post_init__(self) -> None:
         if type(self.proposal_id) is not UUID:
@@ -1632,6 +1684,8 @@ class GuidedPendingProposalInvalidation:
         _require_guided_sha256(self.draft_hash, "Guided pending proposal invalidation draft_hash")
         if type(self.reviewed_facts) not in {dict, MappingProxyType}:
             raise AuditIntegrityError("Guided pending proposal invalidation reviewed_facts must be a mapping")
+        if self.reason not in _GUIDED_PROPOSAL_INVALIDATION_REASONS:
+            raise AuditIntegrityError("Guided pending proposal invalidation reason is outside the closed vocabulary")
         freeze_fields(self, "reviewed_facts")
 
 
@@ -1677,7 +1731,15 @@ class GuidedStateOperationCommand:
         ):
             raise AuditIntegrityError("GuidedStateOperationCommand.invalidated_pending_proposal must be exact or None")
         if self.invalidated_pending_proposal is not None and self.deferred_intent_action is None:
-            raise AuditIntegrityError("Pending proposal invalidation requires an exact deferred intent action")
+            # Closed producer set for clearing pending proposal authority:
+            # deferred-intent management (rewind) or a terminal checkpoint
+            # (exit-to-freeform, the binding-exempt universal escape). The
+            # settlement re-verifies the exact transition either way.
+            composer_meta = self.state.composer_meta
+            guided_meta = composer_meta.get("guided_session") if isinstance(composer_meta, Mapping) else None
+            terminal = guided_meta.get("terminal") if isinstance(guided_meta, Mapping) else None
+            if terminal is None:
+                raise AuditIntegrityError("Pending proposal invalidation requires a deferred intent action or a terminal exit checkpoint")
 
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
@@ -1756,8 +1818,12 @@ class GuidedPipelineProposalStageCommand:
 
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("GuidedPipelineProposalStageCommand.fence must be exact")
-        for field_name in ("expected_current_state_id", "checkpoint_state_id", "proposal_id"):
-            if type(getattr(self, field_name)) is not UUID:
+        for field_name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("checkpoint_state_id", self.checkpoint_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"GuidedPipelineProposalStageCommand.{field_name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("expected_current_state_version must be a positive exact integer")
@@ -1861,16 +1927,22 @@ class GuidedFullPipelineProposalStageCommand:
             raise AuditIntegrityError("guided-full expected state version must be positive or None")
         if self.expected_current_content_hash is not None:
             _require_guided_sha256(self.expected_current_content_hash, "guided-full expected content hash")
-        for field_name in ("checkpoint_state_id", "proposal_id"):
-            if type(getattr(self, field_name)) is not UUID:
+        for field_name, uuid_value in (
+            ("checkpoint_state_id", self.checkpoint_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(uuid_value) is not UUID:
                 raise AuditIntegrityError(f"guided-full {field_name} must be a UUID")
         if type(self.state) is not CompositionStateData:
             raise AuditIntegrityError("guided-full checkpoint state must be exact")
         if type(self.plan) is not PipelinePlanResult:
             raise AuditIntegrityError("guided-full plan must be exact")
-        for field_name in ("summary", "rationale", "actor"):
-            value = getattr(self, field_name)
-            if type(value) is not str or not value:
+        for field_name, text_value in (
+            ("summary", self.summary),
+            ("rationale", self.rationale),
+            ("actor", self.actor),
+        ):
+            if type(text_value) is not str or not text_value:
                 raise AuditIntegrityError(f"guided-full {field_name} must be non-empty")
         if type(self.affects) is not tuple or any(type(value) is not str or not value for value in self.affects):
             raise AuditIntegrityError("guided-full affects must be an exact non-empty-string tuple")
@@ -1942,6 +2014,76 @@ class GuidedFullPipelineProposalStageSettlement:
 
 @final
 @dataclass(frozen=True, slots=True)
+class GuidedFullPipelineDeclineCommand:
+    """Complete input for one atomic guided-full escape-hatch decline.
+
+    Sibling of GuidedFullPipelineProposalStageCommand for the other
+    guided-full planner outcome: no pipeline/proposal fields, because a
+    decline creates no proposal — only a checkpoint and the advisor's own
+    words as an ordinary assistant chat message.
+    """
+
+    fence: GuidedOperationFence
+    expected_current_state_id: UUID | None
+    expected_current_state_version: int | None
+    expected_current_content_hash: str | None
+    checkpoint_state_id: UUID
+    state: CompositionStateData
+    decline_text: str
+    actor: str
+    originating_message: GuidedOriginatingUserMessageDraft
+    audit_evidence: GuidedAuditEvidence = GuidedAuditEvidence()
+
+    def __post_init__(self) -> None:
+        if type(self.fence) is not GuidedOperationFence:
+            raise AuditIntegrityError("guided-full decline fence must be exact")
+        if (self.expected_current_state_id is None) != (self.expected_current_state_version is None):
+            raise AuditIntegrityError("guided-full decline expected state id/version must be paired")
+        if (self.expected_current_state_id is None) != (self.expected_current_content_hash is None):
+            raise AuditIntegrityError("guided-full decline expected state/hash must be paired")
+        if self.expected_current_state_id is not None and type(self.expected_current_state_id) is not UUID:
+            raise AuditIntegrityError("guided-full decline expected state id must be a UUID or None")
+        if self.expected_current_state_version is not None and (
+            type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1
+        ):
+            raise AuditIntegrityError("guided-full decline expected state version must be positive or None")
+        if self.expected_current_content_hash is not None:
+            _require_guided_sha256(self.expected_current_content_hash, "guided-full decline expected content hash")
+        if type(self.checkpoint_state_id) is not UUID:
+            raise AuditIntegrityError("guided-full decline checkpoint_state_id must be a UUID")
+        if type(self.state) is not CompositionStateData:
+            raise AuditIntegrityError("guided-full decline checkpoint state must be exact")
+        if type(self.decline_text) is not str:
+            raise AuditIntegrityError("guided-full decline text must be an exact str")
+        if type(self.actor) is not str or not self.actor:
+            raise AuditIntegrityError("guided-full decline actor must be non-empty")
+        if type(self.originating_message) is not GuidedOriginatingUserMessageDraft:
+            raise AuditIntegrityError("guided-full decline originating message must be exact")
+        if type(self.audit_evidence) is not GuidedAuditEvidence:
+            raise AuditIntegrityError("guided-full decline audit evidence must be exact")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class GuidedFullPipelineDeclineSettlement:
+    """Durable guided-full checkpoint, decline message, origin, and replay bytes."""
+
+    checkpoint_state: CompositionStateRecord
+    decline_message: ChatMessageRecord
+    originating_message: ChatMessageRecord
+    audit_messages: tuple[ChatMessageRecord, ...]
+    response_json: Mapping[str, Any]
+    response_hash: str
+
+    def __post_init__(self) -> None:
+        _require_guided_sha256(self.response_hash, "GuidedFullPipelineDeclineSettlement.response_hash")
+        freeze_fields(self, "audit_messages", "response_json")
+        if stable_hash(self.response_json) != self.response_hash:
+            raise AuditIntegrityError("guided-full decline response hash mismatch")
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class GuidedPipelineProposalAcceptCommand:
     """Complete atomic guided acceptance cohort."""
 
@@ -1963,13 +2105,20 @@ class GuidedPipelineProposalAcceptCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided accept fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, uuid_value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(uuid_value) is not UUID:
                 raise AuditIntegrityError(f"guided accept {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided accept expected version must be positive")
-        for name in ("draft_hash", "candidate_content_hash", "executor_content_hash"):
-            _require_guided_sha256(getattr(self, name), f"guided accept {name}")
+        for name, hash_value in (
+            ("draft_hash", self.draft_hash),
+            ("candidate_content_hash", self.candidate_content_hash),
+            ("executor_content_hash", self.executor_content_hash),
+        ):
+            _require_guided_sha256(hash_value, f"guided accept {name}")
         if type(self.reviewed_facts) not in {dict, MappingProxyType}:
             raise AuditIntegrityError("guided accept reviewed facts must be a mapping")
         from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
@@ -2000,8 +2149,11 @@ class GuidedPipelineConfirmationAdmissionCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided confirmation admission fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"guided confirmation admission {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided confirmation admission expected version must be positive")
@@ -2027,8 +2179,11 @@ class GuidedPipelineDispatchRecordCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided dispatch record fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"guided dispatch record {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided dispatch record expected version must be positive")
@@ -2068,8 +2223,11 @@ class GuidedPipelineProposalBackEditCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided back-edit fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"guided back-edit {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided back-edit expected version must be positive")
@@ -2117,8 +2275,11 @@ class GuidedPipelineProposalRejectCommand:
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
             raise AuditIntegrityError("guided reject fence must be exact")
-        for name in ("expected_current_state_id", "proposal_id"):
-            if type(getattr(self, name)) is not UUID:
+        for name, value in (
+            ("expected_current_state_id", self.expected_current_state_id),
+            ("proposal_id", self.proposal_id),
+        ):
+            if type(value) is not UUID:
                 raise AuditIntegrityError(f"guided reject {name} must be a UUID")
         if type(self.expected_current_state_version) is not int or self.expected_current_state_version < 1:
             raise AuditIntegrityError("guided reject expected version must be positive")
@@ -2216,9 +2377,16 @@ class RunRecord:
             raise AuditIntegrityError("Tier 1: failed run is missing error")
 
     def _validate_counters(self) -> None:
-        for field_name in _RUN_COUNTER_FIELDS:
+        for field_name, value in (
+            ("rows_processed", self.rows_processed),
+            ("rows_succeeded", self.rows_succeeded),
+            ("rows_failed", self.rows_failed),
+            ("rows_routed_success", self.rows_routed_success),
+            ("rows_routed_failure", self.rows_routed_failure),
+            ("rows_quarantined", self.rows_quarantined),
+        ):
             try:
-                require_int(getattr(self, field_name), f"runs.{field_name}", min_value=0)
+                require_int(value, f"runs.{field_name}", min_value=0)
             except (TypeError, ValueError) as exc:
                 raise AuditIntegrityError(f"Tier 1: {exc}") from exc
 
@@ -2320,6 +2488,34 @@ class StaleComposeStateError(RuntimeError):
     """
 
 
+class InterpretationResolveError(ValueError):
+    """Base class for expected interpretation-resolution failures."""
+
+
+class InterpretationEventNotFoundError(InterpretationResolveError):
+    """No event exists for the requested ``(session_id, event_id)`` pair."""
+
+
+class InterpretationEventAlreadyResolvedError(InterpretationResolveError):
+    """The event exists but is no longer pending."""
+
+
+class InterpretationNodeMissingError(InterpretationResolveError):
+    """The affected node disappeared from the live composition state."""
+
+
+class InterpretationNodePluginMutatedError(InterpretationResolveError):
+    """The affected node still exists but is no longer an LLM transform."""
+
+
+class InterpretationPlaceholderConsumedError(InterpretationResolveError):
+    """The affected LLM node no longer carries the expected placeholder."""
+
+
+class InterpretationUnsupportedChoiceError(InterpretationResolveError):
+    """The requested choice is valid generally but unsupported for this kind."""
+
+
 class AuditAccessLogWriteError(RuntimeError):
     """Audit-grade transcript access could not be recorded.
 
@@ -2375,7 +2571,6 @@ class SessionArchiveDisposition(StrEnum):
     SOFT_ARCHIVED = "soft_archived"
 
 
-@runtime_checkable
 class AuditAccessLogAuthority(Protocol):
     """Handle-free authority for one audit-grade transcript access row."""
 
@@ -2391,7 +2586,6 @@ class AuditAccessLogAuthority(Protocol):
     ) -> AuditAccessLogRecord: ...
 
 
-@runtime_checkable
 class SessionOperationSessionMutations(Protocol):
     """Session-row mutations available inside one exact operation fence."""
 
@@ -2404,7 +2598,6 @@ class SessionOperationSessionMutations(Protocol):
     ) -> SessionArchiveDisposition: ...
 
 
-@runtime_checkable
 class SessionOperationRunMutations(Protocol):
     """Run mutations available inside one exact EXECUTE operation fence."""
 
@@ -2449,7 +2642,6 @@ class SessionOperationRunMutations(Protocol):
     ) -> tuple[RunEventRecord, ...]: ...
 
 
-@runtime_checkable
 class SessionOperationBlobMutations(Protocol):
     """Blob/run-custody mutations available inside one exact operation fence."""
 
@@ -2594,7 +2786,6 @@ class SessionOperationBlobMutations(Protocol):
     ) -> None: ...
 
 
-@runtime_checkable
 class SessionOperationComposerProgressMutations(Protocol):
     """Composer-progress mutations under one exact operation fence."""
 
@@ -2625,7 +2816,6 @@ class SessionOperationComposerProgressMutations(Protocol):
     def retire_session_progress(self) -> None: ...
 
 
-@runtime_checkable
 class SessionOperationComposerCompletionMutations(Protocol):
     """Completion-audit writes under one exact BLOB_READ operation fence."""
 
@@ -2648,7 +2838,6 @@ class SessionOperationComposerCompletionMutations(Protocol):
     ) -> None: ...
 
 
-@runtime_checkable
 class SessionOperationMutationTransaction(Protocol):
     """Read-only capability composition over one private fenced transaction."""
 
@@ -2816,7 +3005,6 @@ class SessionOperationAuthority(Protocol):
     ) -> T: ...
 
 
-@runtime_checkable
 class SessionServiceProtocol(Protocol):
     """Protocol for session persistence operations."""
 
@@ -2974,6 +3162,13 @@ class SessionServiceProtocol(Protocol):
         *,
         session_operation_context: SessionOperationContext,
     ) -> GuidedFullPipelineProposalStageSettlement: ...
+
+    async def decline_guided_full_pipeline_proposal(
+        self,
+        command: GuidedFullPipelineDeclineCommand,
+        *,
+        session_operation_context: SessionOperationContext,
+    ) -> GuidedFullPipelineDeclineSettlement: ...
 
     async def accept_guided_pipeline_proposal(
         self,
@@ -3372,6 +3567,34 @@ class SessionServiceProtocol(Protocol):
         limit: int | None = 100,
         offset: int = 0,
     ) -> list[ChatMessageRecord]: ...
+
+    async def add_message_with_transcript(
+        self,
+        session_id: UUID,
+        role: ChatMessageRole,
+        content: str,
+        *,
+        writer_principal: ChatMessageWriterPrincipal,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
+        composition_state_id: UUID | None = None,
+        raw_content: str | None = None,
+        tool_call_id: str | None = None,
+        parent_assistant_id: UUID | None = None,
+    ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
+        """Insert one message and return ``(record, full transcript)``.
+
+        The insert and the transcript read MUST happen inside one
+        write-locked transaction on one connection, so the returned
+        transcript ends at the inserted row by construction. Callers that
+        need "the transcript this write belongs to" (the freeform
+        send_message snapshot guard) MUST use this method instead of an
+        ``add_message`` + ``get_messages`` pair — the split pair reads on
+        a different pooled connection and a stale reader turns the Tier-1
+        snapshot guard into a false 500. Implementations MUST also apply
+        the same fail-closed guided-failure cohort verification as
+        ``get_messages`` over the same rows.
+        """
+        ...
 
     async def get_verified_guided_root_intent(
         self,

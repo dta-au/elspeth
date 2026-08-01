@@ -177,7 +177,7 @@ llm_profiles:
     credential_scope: server
     credential_ref: OPENROUTER_API_KEY
 
-tutorial_llm_profile: tutorial-default
+default_llm_profile: tutorial-default
 ```
 
 ### `plugin_allowlist`
@@ -224,7 +224,7 @@ The settings layer converts explicitly into frozen runtime policy structures.
 Alignment tests cover every field and collection parser so an accepted
 setting cannot be silently ignored.
 
-### `llm_profiles` and `tutorial_llm_profile`
+### `llm_profiles` and `default_llm_profile`
 
 - LLM profiles are operator-owned, typed provider/model bindings. Web-authored
   YAML selects an opaque alias and safe row/prompt options; the server lowers
@@ -237,7 +237,7 @@ setting cannot be silently ignored.
   server store and `user` resolves only from the current principal's store.
   User-first fallback is never used for an operator-profile binding, so a user
   secret cannot shadow a server credential.
-- `tutorial_llm_profile` must name exactly one configured LLM profile when the
+- `default_llm_profile` must name exactly one configured LLM profile when the
   tutorial is expected to be ready. When absent, the server still starts and
   ordinary core pipelines work, but tutorial readiness is unhealthy.
 - The target LLM may see the alias and safe capability metadata, never the

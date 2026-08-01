@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import Connection, RowMapping
@@ -407,7 +407,15 @@ class BarrierJournalRepository:
                     now=now,
                     parked_lease_owner=pending_sink_lease_owner,
                 )
-            for emission in emitted_ready:
+            ready_emission_count = len(emitted_ready)
+            for emission_index, emission in enumerate(emitted_ready):
+                # ``claim_ready`` orders same-row/same-step continuations by
+                # created_at before its token-derived work_item_id fallback.
+                # Preserve the caller's emission tuple order durably by giving
+                # each READY row a distinct logical creation instant ending at
+                # the barrier completion timestamp. available_at remains
+                # ``now`` so a pinned/mock clock can claim the whole group.
+                claim_order_at = now - timedelta(microseconds=ready_emission_count - emission_index - 1)
                 self._insert_ready_emission(
                     conn,
                     run_id=run_id,
@@ -415,6 +423,7 @@ class BarrierJournalRepository:
                     emission=emission,
                     emission_context=emission_context,
                     now=now,
+                    claim_order_at=claim_order_at,
                 )
             for loss in branch_losses:
                 # §E.5 record-then-notify: the durable loss record commits iff
@@ -646,6 +655,7 @@ class BarrierJournalRepository:
             "expand_group_id": emission.expand_group_id,
             "coalesce_node_id": emission.coalesce_node_id,
             "coalesce_name": emission.coalesce_name,
+            "row_union_name": emission.row_union_name,
             "attempt": emission.attempt,
             "lease_owner": parked_lease_owner,
             "lease_expires_at": None,
@@ -680,6 +690,7 @@ class BarrierJournalRepository:
         emission: BarrierEmission,
         emission_context: Mapping[str, object],
         now: datetime,
+        claim_order_at: datetime,
     ) -> None:
         """INSERT a READY continuation emitted by a barrier completion."""
         if emission.row_id is None or emission.step_index is None or emission.ingest_sequence is None:
@@ -716,7 +727,9 @@ class BarrierJournalRepository:
             expand_group_id=emission.expand_group_id,
             coalesce_node_id=emission.coalesce_node_id,
             coalesce_name=emission.coalesce_name,
+            row_union_name=emission.row_union_name,
         )
+        values["created_at"] = claim_order_at
         insert_work_item(conn, values=values, operation="barrier-completion READY emission")
         self._events.record(
             conn,

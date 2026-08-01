@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from elspeth.web import aws_ecs_acceptance as acceptance
+from elspeth.web._aws_ecs_acceptance import task_definition
 from tests.unit.web.aws_ecs_acceptance.test_manifest_schema_inventory import (
     CLOUDWATCH_AGENT_CONFIG_JSON,
     CLOUDWATCH_AGENT_OTEL_YAML,
@@ -20,7 +21,9 @@ from tests.unit.web.aws_ecs_acceptance.test_manifest_schema_inventory import (
 )
 
 _CLOUDWATCH_AGENT_COMMAND = (
-    "CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; CTL=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl; "
+    "CONFIG_DIR=/tmp/elspeth-cloudwatch-agent; "
+    "TRANSLATOR=/opt/aws/amazon-cloudwatch-agent/bin/config-translator; "
+    "AGENT=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent; "
     'mkdir -p "$CONFIG_DIR"; printf \'%s\' "$ELSPETH_CW_AGENT_CONFIG_JSON_B64" | base64 -d > '
     "\"/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json\"; printf '%s' "
     '"$ELSPETH_CW_AGENT_OTEL_YAML_B64" | base64 -d > '
@@ -28,21 +31,42 @@ _CLOUDWATCH_AGENT_COMMAND = (
     '"$ELSPETH_CW_AGENT_CONFIG_JSON_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json" | '
     "sha256sum -c -; printf '%s\\n' "
     '"$ELSPETH_CW_AGENT_OTEL_YAML_SHA256  /tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml" | '
-    'sha256sum -c -; "$CTL" -a fetch-config -m auto -c '
-    '"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json" -s; "$CTL" -a append-config -m auto -c '
-    '"file:/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml" -s; while "$CTL" -a status -m auto '
-    '| grep -q \'"status": "running"\'; do sleep 30; done; exit 1'
+    'sha256sum -c -; "$TRANSLATOR" -mode auto -os linux '
+    '-input "/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.json" '
+    '-output "/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml"; '
+    'exec "$AGENT" -config "/tmp/elspeth-cloudwatch-agent/amazon-cloudwatch-agent.toml" '
+    '-otelconfig "/tmp/elspeth-cloudwatch-agent/elspeth.cloudwatch-agent.v1.otel.yaml"'
 )
 _CLOUDWATCH_AGENT_HEALTH_CHECK = {
     "command": [
-        "CMD-SHELL",
-        '/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status -m auto | grep -q \'"status": "running"\'',
+        "CMD",
+        "python",
+        "-c",
+        "import socket; socket.create_connection(('127.0.0.1', 4317), timeout=3).close()",
     ],
     "interval": 10,
     "timeout": 5,
     "retries": 6,
     "startPeriod": 30,
 }
+_PUBLISHED_WEB_ENTRYPOINT = (
+    "/bin/sh",
+    "-ceu",
+    (
+        'metadata_url="$ECS_CONTAINER_METADATA_URI_V4/task"\n'
+        "family=$(python -c 'import json,sys,urllib.request; "
+        'print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Family"])\' "$metadata_url")\n'
+        "revision=$(python -c 'import json,sys,urllib.request; "
+        'print(json.load(urllib.request.urlopen(sys.argv[1], timeout=5))["Revision"])\' "$metadata_url")\n'
+        'export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_FAMILY="$family"\n'
+        'export ELSPETH_WEB__OPERATOR_TELEMETRY_TASK_DEFINITION_REVISION="$revision"\n'
+        'case "$1" in\n'
+        '  web|doctor) set -- elspeth "$@" ;;\n'
+        "esac\n"
+        'exec "$@"\n'
+    ),
+    "--",
+)
 
 
 def test_manifest_and_task_definition_modules_exist() -> None:
@@ -50,8 +74,17 @@ def test_manifest_and_task_definition_modules_exist() -> None:
     assert importlib.util.find_spec("elspeth.web._aws_ecs_acceptance.task_definition") is not None
 
 
+def test_cloudwatch_sidecar_fails_loudly_for_incomplete_bound_inventory_contract() -> None:
+    with pytest.raises(KeyError, match="CLOUDWATCH_AGENT_IMAGE"):
+        task_definition._validate_cloudwatch_agent_sidecar(
+            {"name": "cloudwatch-agent", "image": "example.invalid/agent"},
+            {},
+            {},
+        )
+
+
 def test_manifest_and_task_definition_owners_are_facade_reexports_by_identity() -> None:
-    from elspeth.web._aws_ecs_acceptance import manifest, task_definition
+    from elspeth.web._aws_ecs_acceptance import manifest
 
     for name in (
         "control_manifest_bind_retained_evidence",
@@ -72,6 +105,7 @@ def _task_definition_policy_payload(
     composer_advisor_model: str = "openrouter/anthropic/claude-opus-4.6",
     cloudwatch_config_json: bytes = CLOUDWATCH_AGENT_CONFIG_JSON,
     cloudwatch_otel_yaml: bytes = CLOUDWATCH_AGENT_OTEL_YAML,
+    with_cloudwatch_agent: bool = True,
 ) -> tuple[Path, str, dict[str, Any], dict[str, Any]]:
     manifest_path = tmp_path / "control.json"
 
@@ -160,6 +194,7 @@ def _task_definition_policy_payload(
                     "name": container_name,
                     "essential": True,
                     "image": "123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/elspeth-acceptance@sha256:" + "d" * 64,
+                    "entryPoint": list(_PUBLISHED_WEB_ENTRYPOINT),
                     "command": ["web", "--host", "0.0.0.0", "--port", "8451"],
                     "environment": environment,
                     "secrets": secrets,
@@ -187,6 +222,8 @@ def _task_definition_policy_payload(
             ],
         }
     }
+    if with_cloudwatch_agent:
+        _attach_cloudwatch_agent(inventory, payload, config_json=cloudwatch_config_json, otel_yaml=cloudwatch_otel_yaml)
     return manifest_path, container_name, inventory, payload
 
 
@@ -252,8 +289,7 @@ def test_task_definition_policy_binding_allows_bedrock_models_without_openrouter
 
 
 def test_task_definition_policy_binding_allows_only_the_cloudwatch_agent_sidecar(tmp_path: Path) -> None:
-    manifest_path, container_name, inventory, payload = _task_definition_policy_payload(tmp_path)
-    _attach_cloudwatch_agent(inventory, payload)
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
 
     acceptance.validate_task_definition_policy_binding(
         payload,
@@ -277,9 +313,46 @@ def test_task_definition_policy_binding_requires_exact_published_web_command(tmp
         )
 
 
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        pytest.param(None, id="removed"),
+        pytest.param(["/bin/sh", "-c", "exit 0"], id="bypass-wrapper"),
+        pytest.param(
+            [
+                *_PUBLISHED_WEB_ENTRYPOINT[:2],
+                _PUBLISHED_WEB_ENTRYPOINT[2].replace('exec "$@"', 'exec elspeth "$@"'),
+                _PUBLISHED_WEB_ENTRYPOINT[3],
+            ],
+            id="mutated-wrapper",
+        ),
+    ],
+)
+def test_task_definition_policy_binding_requires_exact_published_web_entrypoint(
+    tmp_path: Path,
+    replacement: list[str] | None,
+) -> None:
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
+    container = payload["taskDefinition"]["containerDefinitions"][0]
+    if replacement is None:
+        del container["entryPoint"]
+    else:
+        container["entryPoint"] = replacement
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
+        acceptance.validate_task_definition_policy_binding(
+            payload,
+            manifest_path=manifest_path,
+            scenario_id="A",
+            container_name=container_name,
+        )
+
+
 def test_task_definition_policy_binding_rejects_cloudwatch_sidecar_image_substitution(tmp_path: Path) -> None:
-    manifest_path, container_name, inventory, payload = _task_definition_policy_payload(tmp_path)
-    sidecar = _attach_cloudwatch_agent(inventory, payload)
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
+    sidecar = next(
+        candidate for candidate in payload["taskDefinition"]["containerDefinitions"] if candidate.get("name") == "cloudwatch-agent"
+    )
     sidecar["image"] = "public.ecr.aws/attacker/cloudwatch-agent@sha256:" + "f" * 64
 
     with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
@@ -320,8 +393,10 @@ def test_task_definition_policy_binding_rejects_mutated_cloudwatch_sidecar(
     tmp_path: Path,
     mutation: str,
 ) -> None:
-    manifest_path, container_name, inventory, payload = _task_definition_policy_payload(tmp_path)
-    sidecar = _attach_cloudwatch_agent(inventory, payload)
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
+    sidecar = next(
+        candidate for candidate in payload["taskDefinition"]["containerDefinitions"] if candidate.get("name") == "cloudwatch-agent"
+    )
     environment = sidecar["environment"]
     main = payload["taskDefinition"]["containerDefinitions"][0]
 
@@ -395,6 +470,7 @@ def test_task_definition_policy_binding_rejects_invalid_bound_cloudwatch_config(
         tmp_path,
         cloudwatch_config_json=config_json,
         cloudwatch_otel_yaml=otel_yaml,
+        with_cloudwatch_agent=False,
     )
     _attach_cloudwatch_agent(inventory, payload, config_json=config_json, otel_yaml=otel_yaml)
 
@@ -877,3 +953,36 @@ def test_task_definition_policy_binding_rejects_surplus_openrouter_secret(tmp_pa
             scenario_id="A",
             container_name=container_name,
         )
+
+
+def test_task_definition_policy_binding_requires_cloudwatch_agent_for_published_web_container(tmp_path: Path) -> None:
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(
+        tmp_path,
+        with_cloudwatch_agent=False,
+    )
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
+        acceptance.validate_task_definition_policy_binding(
+            payload,
+            manifest_path=manifest_path,
+            scenario_id="A",
+            container_name=container_name,
+        )
+
+
+def test_task_definition_policy_binding_allows_missing_cloudwatch_agent_for_one_shot_task(tmp_path: Path) -> None:
+    manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(
+        tmp_path,
+        with_cloudwatch_agent=False,
+    )
+    container = payload["taskDefinition"]["containerDefinitions"][0]
+    container["user"] = "1654:1654"
+    container["entryPoint"] = ["python", "-m", "elspeth.web.aws_ecs_acceptance"]
+
+    acceptance.validate_task_definition_policy_binding(
+        payload,
+        manifest_path=manifest_path,
+        scenario_id="A",
+        container_name=container_name,
+        expected_user="1654:1654",
+    )

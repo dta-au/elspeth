@@ -17,7 +17,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
-from elspeth.contracts.errors import AuditIntegrityError, CoalesceFailureReason
+from elspeth.contracts.errors import AuditIntegrityError, CoalesceFailureReason, RowUnionFailureReason
 from elspeth.contracts.payload_store import (
     IntegrityError as PayloadIntegrityError,
 )
@@ -2156,6 +2156,60 @@ class TestAuditRunStatusProjection:
         self._fail_state(factory, token_id="tok-branch-b", node_id="coalesce-1", state_id="cs-b")
 
         assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 1
+
+    def test_row_union_failed_node_state_counts_as_failed_barrier(self):
+        _db, factory = _setup(run_id="run-1")
+        register_test_node(factory.data_flow, "run-1", "row-union-1", node_type=NodeType.ROW_UNION, plugin_name="row_union")
+        factory.data_flow.create_row(
+            "run-1",
+            "source-0",
+            0,
+            {"value": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+        factory.data_flow.create_token("row-1", token_id="tok-branch-a")
+        factory.execution.begin_node_state("tok-branch-a", "row-union-1", "run-1", 0, {"value": 1}, state_id="rus-a")
+        factory.execution.complete_node_state(
+            state_id="rus-a",
+            status=NodeStateStatus.FAILED,
+            error=RowUnionFailureReason(
+                failure_reason="row_union_timeout",
+                expected_branches=("branch_a", "branch_b"),
+                branches_arrived=("branch_a",),
+            ),
+            duration_ms=0.0,
+        )
+
+        assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 1
+
+    def test_row_union_late_arrival_after_release_is_not_a_failed_barrier(self):
+        _db, factory = _setup(run_id="run-1")
+        register_test_node(factory.data_flow, "run-1", "row-union-1", node_type=NodeType.ROW_UNION, plugin_name="row_union")
+        factory.data_flow.create_row(
+            "run-1",
+            "source-0",
+            0,
+            {"value": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+        )
+        factory.data_flow.create_token("row-1", token_id="tok-late")
+        factory.execution.begin_node_state("tok-late", "row-union-1", "run-1", 0, {"value": 1}, state_id="rus-late")
+        factory.execution.complete_node_state(
+            state_id="rus-late",
+            status=NodeStateStatus.FAILED,
+            error=RowUnionFailureReason(
+                failure_reason="late_arrival_after_release",
+                expected_branches=("branch_a", "branch_b"),
+                branches_arrived=(),
+            ),
+            duration_ms=0.0,
+        )
+
+        assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 0
 
     def test_attribution_failed_states_at_non_coalesce_nodes_do_not_count(self):
         """The anchor is nodes.node_type='coalesce': an ordinary transform

@@ -20,16 +20,18 @@ import math
 import sys
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from itertools import pairwise
-from typing import Any, Final, TypedDict, cast
+from typing import Any, Final, Literal, TypedDict, cast
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.composer_progress import ComposerProgressSink
-from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.secrets import WebSecretResolver
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError, get_sink_config_model
 from elspeth.web.blobs.protocol import ALLOWED_MIME_TYPES, AllowedMimeType
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
@@ -60,6 +62,7 @@ from elspeth.web.composer.guided.resolved import (
     freeze_guided_str_sequence,
 )
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent
+from elspeth.web.composer.guided_blob_refs import reviewed_schema_declared_field_names, reviewed_source_is_blob_bound
 from elspeth.web.composer.llm_response_parsing import (
     apply_anthropic_cache_markers,
     attach_llm_calls,
@@ -67,7 +70,7 @@ from elspeth.web.composer.llm_response_parsing import (
     supports_anthropic_prompt_cache_markers,
 )
 from elspeth.web.composer.progress import emit_progress, model_call_progress_event, tool_batch_progress_event
-from elspeth.web.composer.service import _litellm_acompletion
+from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._dispatch import get_discovery_tool_definitions
 from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
@@ -205,9 +208,19 @@ class AssistantScaffoldLeakError(ValueError):
 
 
 def _require_prose_assistant_message(value: object, *, tool: str) -> str:
-    """Validate an LLM-supplied assistant_message is user-facing prose."""
+    """Validate an LLM-supplied assistant_message is user-facing prose.
+
+    Raises :class:`GuidedToolArgumentShapeError` (a ``ValueError`` subclass,
+    resolved at call time — the class is defined later in this module) for a
+    non-string/empty value: this guard runs inside the step-1/step-2 tool
+    parsers, whose retain-alone pair salvage catches exactly that type. A
+    bare ``ValueError`` here escaped the salvage, silently discarding a
+    parsed-valid ``retain_deferred_intent`` and mislabeling the turn
+    SYNTHETIC_UNAVAILABLE (R2-F15 residual, acceptance-r2 final review).
+    :class:`AssistantScaffoldLeakError` stays distinct — the advisory wrapper
+    branches on it specifically."""
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{tool} assistant_message must be a non-empty string")
+        raise GuidedToolArgumentShapeError(f"{tool} assistant_message must be a non-empty string")
     lowered = value.lower()
     for marker in _TOOL_SCAFFOLD_MARKERS:
         if marker in lowered:
@@ -335,6 +348,44 @@ class GuidedChatDeferredIntentOutcome:
             raise TypeError("GuidedChatDeferredIntentOutcome.action must be exact")
 
 
+# Closed, value-free classifications of WHY a pair's resolution half did not
+# apply when its valid retain half applies alone. The caller renders and
+# audits the not-applied signal from these — never from model text.
+_PAIRED_RESOLUTION_ERROR_CLASSES: Final[frozenset[str]] = frozenset(
+    {
+        "PairedResolutionShapeRejected",
+        "PairedResolutionConfigRejected",
+        "PairedResolutionNotResent",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GuidedChatDeferredIntentWithheldResolutionOutcome:
+    """A pair's valid retain applies alone; its resolution half was withheld.
+
+    Returned instead of :class:`GuidedChatDeferredIntentOutcome` whenever the
+    reply PAIRED a resolution with the retain but the resolution half never
+    became acceptable (shape-invalid arguments, config-invalid at the
+    iteration cap, or the model declining to resend the pair). Carrying the
+    closed classification keeps the F1 honesty contract on the retain-alone
+    exits: the turn must surface and audit that the resolution was NOT
+    applied while the instruction was saved (round-2 review finding).
+    """
+
+    action: DeferredIntentAction
+    resolution_error_class: str
+
+    def __post_init__(self) -> None:
+        if type(self.action) is not DeferredIntentAction:
+            raise TypeError("GuidedChatDeferredIntentWithheldResolutionOutcome.action must be exact")
+        if self.resolution_error_class not in _PAIRED_RESOLUTION_ERROR_CLASSES:
+            raise TypeError(
+                "GuidedChatDeferredIntentWithheldResolutionOutcome.resolution_error_class must be one of "
+                f"{sorted(_PAIRED_RESOLUTION_ERROR_CLASSES)}"
+            )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuidedChatDeferredManagementOutcome:
     action: DeferredIntentManagementAction
@@ -347,10 +398,16 @@ class GuidedChatDeferredManagementOutcome:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Step1SourceResolvedOutcome:
     resolution: Step1SourceChatResolution
+    # Set when the reply PAIRED resolve_source with retain_deferred_intent:
+    # the source resolves at this stage and the future-stage instruction is
+    # retained in the same Send (elspeth-a96b2f1b0a / R2-F15).
+    deferred_action: DeferredIntentAction | None
 
     def __post_init__(self) -> None:
         if type(self.resolution) is not Step1SourceChatResolution:
             raise TypeError("Step1SourceResolvedOutcome.resolution must be exact")
+        if self.deferred_action is not None and type(self.deferred_action) is not DeferredIntentAction:
+            raise TypeError("Step1SourceResolvedOutcome.deferred_action must be exact or None")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -369,6 +426,7 @@ type Step1SourceChatOutcome = (
     GuidedChatEmptyOutcome
     | GuidedChatProseOutcome
     | GuidedChatDeferredIntentOutcome
+    | GuidedChatDeferredIntentWithheldResolutionOutcome
     | GuidedChatDeferredManagementOutcome
     | Step1SourcePluginReselectedOutcome
     | Step1SourceResolvedOutcome
@@ -667,6 +725,73 @@ def _parse_deferred_intent_management_tool_arguments(arguments: object) -> Defer
     return deferred_intent_management_action_from_dict(value)
 
 
+def _deferred_intent_repair_thread(
+    message: Any,
+    tool_calls: Any,
+    *,
+    retain_call: Any,
+    error: DeferredIntentActionShapeError,
+) -> list[dict[str, Any]]:
+    """Thread a retain shape rejection back as tool results for self-repair.
+
+    Mirrors the config-invalid ``resolve_sink`` threading: the assistant
+    tool-call turn is re-materialised, then EVERY call id is answered (the
+    OpenAI/LiteLLM protocol 400s on an unanswered id). The retain call gets
+    the value-free shape rejection; any paired call is told it was withheld
+    so the model resends the complete reply. Shape-error text is value-free
+    by construction (key names, types, vocabulary — never user prose).
+    """
+    thread: list[dict[str, Any]] = [_assistant_tool_calls_message(message, tool_calls)]
+    for tool_call in tool_calls:
+        if tool_call is retain_call:
+            content = (
+                f"retain_deferred_intent rejected: {error} "
+                "Correct the arguments and call retain_deferred_intent again with the "
+                "complete structural constraints."
+            )
+        else:
+            content = (
+                "Not applied: the paired retain_deferred_intent call was rejected. "
+                "After correcting it, resend BOTH calls together in one reply."
+            )
+        thread.append({"role": "tool", "tool_call_id": tool_call.id, "content": content})
+    return thread
+
+
+def _tool_calls_are_repair_threadable(tool_calls: Any) -> bool:
+    """Whether every provider tool call can be re-materialised for a repair turn.
+
+    The repair thread must answer every ``tool_call_id``; a provider reply
+    whose calls carry no usable string id (or non-string arguments) cannot be
+    faithfully re-threaded, so its shape failure stays terminal instead of
+    crashing the repair path on the defective reply.
+    """
+    for tool_call in tool_calls:
+        call_id = getattr(tool_call, "id", None)
+        if type(call_id) is not str or not call_id:
+            return False
+        function = getattr(tool_call, "function", None)
+        if function is not None and type(getattr(function, "arguments", None)) is not str:
+            return False
+    return True
+
+
+def _terminal_shape_error_type(terminal_calls: Any) -> type[GuidedSolverResponseShapeError]:
+    """Classify a malformed multi-terminal reply by the calls it contains.
+
+    A reply carrying a ``retain_deferred_intent`` call is a deferred-intent
+    failure (its caller degrades to durable clarification retention); one
+    carrying only ``manage_deferred_intent`` is a management failure (no
+    retention is wanted); anything else is a generic solver shape defect.
+    """
+    names = {call.function.name for call in terminal_calls if call.function is not None}
+    if "retain_deferred_intent" in names:
+        return DeferredIntentActionShapeError
+    if "manage_deferred_intent" in names:
+        return DeferredIntentManagementActionShapeError
+    return GuidedSolverResponseShapeError
+
+
 def _record_llm_call(
     *,
     recorder: BufferingRecorder | None,
@@ -854,6 +979,15 @@ def _validate_field_aliases(
 
 
 def _source_field_labels(current_source: SourceResolved) -> tuple[str, ...]:
+    """Collect every uploaded field label this source can name.
+
+    The registry must be complete, because an alias is only assigned to a label
+    that appears here: a label this misses is silently unnameable in every
+    provider projection. A form-authored explicit schema declares its fields
+    under ``schema.fields`` and may have no observed columns and no sample rows
+    at all, so declared names belong in the set alongside observed columns,
+    ``guaranteed_fields``, and sample-row keys.
+    """
     labels: list[str] = list(current_source.observed_columns)
 
     options = current_source.options if isinstance(current_source.options, Mapping) else {}
@@ -864,6 +998,7 @@ def _source_field_labels(current_source: SourceResolved) -> tuple[str, ...]:
             for label in guaranteed_fields:
                 if isinstance(label, str):
                     labels.append(label)
+    labels.extend(reviewed_schema_declared_field_names(schema))
 
     for row in current_source.sample_rows:
         if isinstance(row, Mapping):
@@ -918,16 +1053,16 @@ def _untrusted_source_field_context(
     )
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="web-authored source schema option value (untrusted mapping)",
     source_param="schema",
     suppresses=("R1", "R5"),
     invariant=(
-        "returns None for a non-mapping schema; extracts only string mode and aliases for "
-        "string-list guaranteed_fields; raw labels and malformed members are dropped, never raised on"
+        "returns None for a non-mapping schema; extracts only the string mode and aliases for "
+        "string-list guaranteed_fields plus the declared fields of an explicit (fixed/flexible) "
+        "schema; raw labels and malformed members are dropped, never raised on"
     ),
-    non_raising=True,
 )
 def _llm_safe_schema_option(
     schema: Any,
@@ -945,19 +1080,26 @@ def _llm_safe_schema_option(
         safe_guaranteed_fields = [field_aliases[field] for field in guaranteed_fields if isinstance(field, str) and field in field_aliases]
         if safe_guaranteed_fields:
             safe["guaranteed_fields"] = safe_guaranteed_fields
+    # An explicit schema's declared fields are its field inventory (and are
+    # implicitly guaranteed); without them a fixed-schema source reaches the
+    # provider as a mode with no fields, which reads as "this source has no
+    # known columns" and invites invented ones.
+    safe_declared_fields = [field_aliases[field] for field in reviewed_schema_declared_field_names(schema) if field in field_aliases]
+    if safe_declared_fields:
+        safe["declared_fields"] = safe_declared_fields
     return safe or {"shape": "object"}
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="committed SourceResolved carrying web-authored options (untrusted mapping values)",
     source_param="current_source",
     suppresses=("R1", "R5"),
     invariant=(
         "builds the LLM revision-context payload from well-formed option values only; "
-        "non-mapping options degrade to empty, malformed rows/schema are dropped, never raised on"
+        "non-mapping options degrade to empty, malformed rows/schema are dropped, never raised on; "
+        "blob binding is projected as a bare boolean, never as a reference, path, or blob id"
     ),
-    non_raising=True,
 )
 def _source_revision_context_for_llm(
     current_source: SourceResolved,
@@ -979,7 +1121,7 @@ def _source_revision_context_for_llm(
     schema = _llm_safe_schema_option(options.get("schema"), field_aliases=aliases)
     if schema is not None:
         payload["schema"] = schema
-    if "blob_ref" in options:
+    if reviewed_source_is_blob_bound(options):
         payload["server_storage_bound"] = True
     return payload
 
@@ -1154,6 +1296,13 @@ class DeferredIntentManagementChatRequest:
     seed: int | None
     timeout_seconds: float
     context_block: StepChatContextInput
+    # Endpoint affordance (Phase 3 Task 2) — guided solvers use the PRIMARY
+    # composer role only (see module callers), so this always carries the
+    # primary endpoint, never the advisor's. None/None reproduces the exact
+    # pre-affordance kwargs. ``repr=False`` on the key keeps it out of any
+    # dataclass repr that might land in a log line.
+    api_base: str | None = None
+    api_key: str | None = field(default=None, repr=False)
 
 
 def _deferred_management_outcome_from_message(message: Any) -> DeferredIntentManagementChatOutcome:
@@ -1202,6 +1351,7 @@ async def maybe_manage_deferred_intent_chat(
         kwargs["temperature"] = request.temperature
     if request.seed is not None:
         kwargs["seed"] = request.seed
+    _apply_endpoint_kwargs(kwargs, base_url=request.api_base, api_key=request.api_key)
     started_at = datetime.now(UTC)
     started_ns = time.monotonic_ns()
     status: ComposerLLMCallStatus | None = None
@@ -1437,7 +1587,11 @@ def _parse_step_1_source_tool_arguments(arguments: str, *, plugin_hint: str | No
     if on_validation_failure_raw is None or (isinstance(on_validation_failure_raw, str) and not on_validation_failure_raw):
         on_validation_failure = "discard"
     elif not isinstance(on_validation_failure_raw, str):
-        raise ValueError(
+        # The shape-error type (not a bare ValueError) is load-bearing: the
+        # step-1 retain-alone pair salvage catches exactly this class, and a
+        # bare ValueError discarded a parsed-valid retained intent with the
+        # defective source half (R2-F15 residual, acceptance-r2 final review).
+        raise GuidedToolArgumentShapeError(
             f"resolve_source on_validation_failure must be a string when provided; got {type(on_validation_failure_raw).__name__}"
         )
     else:
@@ -1485,6 +1639,11 @@ async def maybe_resolve_step_1_source_chat(
     timeout_seconds: float,
     context_block: StepChatContextInput | None = None,
     allow_plugin_reselection: bool = False,
+    # Endpoint affordance (Phase 3 Task 2) — guided solvers use the PRIMARY
+    # composer role only; callers always pass the primary endpoint, never
+    # the advisor's. None/None reproduces the exact pre-affordance kwargs.
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> Step1SourceChatOutcome:
     """Try to resolve a Step-1 schema-form chat message into source data.
 
@@ -1518,7 +1677,15 @@ async def maybe_resolve_step_1_source_chat(
         field_aliases = _source_field_aliases(current_source, field_aliases=field_aliases)
 
     retry_addendum: str | None = None
-    for attempt_index in range(2):
+    # Bounded retain self-repair (elspeth-a96b2f1b0a): one malformed
+    # retain_deferred_intent reply gets its shape rejection threaded back as a
+    # tool result (consuming the next attempt) instead of terminalizing the
+    # whole Send. The thread is re-appended after the rebuilt user message on
+    # the retry attempt.
+    deferred_repair_thread: list[dict[str, Any]] = []
+    deferred_repair_used = False
+    max_attempts = 2
+    for attempt_index in range(max_attempts):
         # SPLIT the system prompt: the stable per-step skill is the byte-stable,
         # markable head (messages[0]); the dynamic hint/revise context + tool
         # instructions ride in messages[1]. Only the ~1199-token skill is in the
@@ -1553,6 +1720,7 @@ async def maybe_resolve_step_1_source_chat(
         if untrusted_context is not None:
             messages.append({"role": "user", "content": untrusted_context})
         messages.append({"role": "user", "content": user_message})
+        messages.extend(deferred_repair_thread)
         tools = [_STEP_1_SOURCE_TOOL]
         reselection_tool = _step_1_source_plugin_reselection_tool(
             plugin_hint=plugin_hint if allow_plugin_reselection else None,
@@ -1578,6 +1746,7 @@ async def maybe_resolve_step_1_source_chat(
             kwargs["temperature"] = temperature
         if seed is not None:
             kwargs["seed"] = seed
+        _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
@@ -1593,24 +1762,50 @@ async def maybe_resolve_step_1_source_chat(
                 tool_call for tool_call in tool_calls if tool_call.function is not None and tool_call.function.name in terminal_action_names
             ]
             if terminal_calls:
-                if len(terminal_calls) != 1 or len(tool_calls) != 1:
-                    error_type = (
-                        DeferredIntentActionShapeError
-                        if any(
-                            call.function is not None and call.function.name in {"retain_deferred_intent", "manage_deferred_intent"}
-                            for call in terminal_calls
-                        )
-                        else GuidedSolverResponseShapeError
+                retain_calls = [
+                    call for call in terminal_calls if call.function is not None and call.function.name == "retain_deferred_intent"
+                ]
+                source_calls = [call for call in terminal_calls if call.function is not None and call.function.name == "resolve_source"]
+                # A resolve_source + retain_deferred_intent PAIR is the one
+                # multi-call reply this stage accepts: a message mixing current-
+                # stage source values with a future-stage instruction must lose
+                # neither half (elspeth-a96b2f1b0a / R2-F15).
+                is_retained_pair = len(tool_calls) == 2 and len(terminal_calls) == 2 and len(retain_calls) == 1 and len(source_calls) == 1
+                if not is_retained_pair and (len(terminal_calls) != 1 or len(tool_calls) != 1):
+                    raise _terminal_shape_error_type(terminal_calls)(
+                        "step-1 chat must return exactly one terminal guided action, or one resolve_source + retain_deferred_intent pair"
                     )
-                    raise error_type("step-1 chat must return exactly one terminal guided action")
-                function = terminal_calls[0].function
+                deferred: DeferredIntentAction | None = None
+                if retain_calls:
+                    try:
+                        deferred = _parse_deferred_intent_tool_arguments(retain_calls[0].function.arguments)
+                    except DeferredIntentActionShapeError as exc:
+                        # Bounded self-repair (mirrors the step-2 config-invalid
+                        # resolve_sink threading): thread the value-free shape
+                        # rejection back and let the model correct itself once
+                        # within the same Send. Exhaustion (or an argument shape
+                        # we cannot faithfully re-materialise) re-raises so the
+                        # caller's retention fallback applies.
+                        if deferred_repair_used or attempt_index + 1 >= max_attempts or not _tool_calls_are_repair_threadable(tool_calls):
+                            raise
+                        deferred_repair_used = True
+                        deferred_repair_thread = _deferred_intent_repair_thread(
+                            message,
+                            tool_calls,
+                            retain_call=retain_calls[0],
+                            error=exc,
+                        )
+                        status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+                        error_class = type(exc).__name__
+                        error_message = "malformed_response"
+                        continue
+                if deferred is not None and not is_retained_pair:
+                    status = ComposerLLMCallStatus.SUCCESS
+                    return GuidedChatDeferredIntentOutcome(action=deferred)
+                function = source_calls[0].function if is_retained_pair else terminal_calls[0].function
                 if function is None:  # pragma: no cover - filtered immediately above
                     raise GuidedSolverResponseShapeError("step-1 terminal action has no function")
                 arguments = function.arguments
-                if function.name == "retain_deferred_intent":
-                    deferred = _parse_deferred_intent_tool_arguments(arguments)
-                    status = ComposerLLMCallStatus.SUCCESS
-                    return GuidedChatDeferredIntentOutcome(action=deferred)
                 if function.name == "manage_deferred_intent":
                     management = _parse_deferred_intent_management_tool_arguments(arguments)
                     status = ComposerLLMCallStatus.SUCCESS
@@ -1626,12 +1821,33 @@ async def maybe_resolve_step_1_source_chat(
                     status = ComposerLLMCallStatus.SUCCESS
                     return reselection
                 if not isinstance(arguments, str):
+                    if is_retained_pair and deferred is not None:
+                        # The pair's retain half is valid; keep it rather than
+                        # discarding the instruction with the defective source
+                        # (R2-F15: never silently dropped). The withheld
+                        # resolution stays classified so the caller renders and
+                        # audits the not-applied signal.
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                            action=deferred,
+                            resolution_error_class="PairedResolutionShapeRejected",
+                        )
                     raise GuidedSolverResponseShapeError(
                         f"{function.name} function.arguments must be a JSON string; got {type(arguments).__name__}"
                     )
-                result = _parse_step_1_source_tool_arguments(arguments, plugin_hint=plugin_hint)
+                try:
+                    result = _parse_step_1_source_tool_arguments(arguments, plugin_hint=plugin_hint)
+                except GuidedToolArgumentShapeError:
+                    if is_retained_pair and deferred is not None:
+                        # Same retention rule for a shape-invalid source half.
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                            action=deferred,
+                            resolution_error_class="PairedResolutionShapeRejected",
+                        )
+                    raise
                 status = ComposerLLMCallStatus.SUCCESS
-                return Step1SourceResolvedOutcome(resolution=result)
+                return Step1SourceResolvedOutcome(resolution=result, deferred_action=deferred)
             # No resolve_source call: the model judged the message doesn't carry
             # enough detail to act (or it's a plain question) and answered in
             # prose instead. Validate + return that prose directly — the SAME
@@ -1900,6 +2116,53 @@ def _parse_step_2_sink_tool_arguments(arguments: str) -> tuple[SinkResolved, str
     return SinkResolved(outputs=(output,)), assistant_message
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedSinkConfigRejection:
+    """Repair feedback plus closed operator-safe classification."""
+
+    rejection_code: Literal["unknown_sink_plugin", "invalid_sink_configuration"]
+    exception_class: str
+    repair_message: str
+
+
+def resolved_sink_config_error(sink: SinkResolved) -> ResolvedSinkConfigRejection | None:
+    """Return the plugin config-model rejection for a resolved sink, if any.
+
+    LLM-resolved options that satisfy ``resolve_sink``'s shape contract can
+    still violate the target plugin's config model (observed live: ``schema:
+    {mode: flexible}`` without ``fields``, elspeth-a88c07cd47). Options staged
+    as schema-form prefill become server-held authority that every
+    ``/guided/respond`` echo re-validates, so an invalid resolution must be
+    caught before staging — afterwards the session is unrecoverable from the
+    client.
+    """
+    (output,) = sink.outputs
+    try:
+        config_model = get_sink_config_model(output.plugin)
+    except UnknownPluginTypeError as exc:
+        return ResolvedSinkConfigRejection(
+            rejection_code="unknown_sink_plugin",
+            exception_class=type(exc).__name__,
+            repair_message=str(exc),
+        )
+    if config_model is None:
+        return None
+    # Mirror the respond-time authority check: thaw the frozen snapshot for
+    # the exact-type config model, and keep on_write_failure out — it is node
+    # wrapper policy, not plugin config.
+    thawed = cast(dict[str, Any], deep_thaw(dict(output.options)))
+    plugin_options = {name: value for name, value in thawed.items() if name != "on_write_failure"}
+    try:
+        config_model.from_dict(plugin_options, plugin_name=output.plugin)
+    except PluginConfigError as exc:
+        return ResolvedSinkConfigRejection(
+            rejection_code="invalid_sink_configuration",
+            exception_class=type(exc).__name__,
+            repair_message=str(exc),
+        )
+    return None
+
+
 _STEP_2_SINK_DISCOVERY_TOOL_NAMES: Final[frozenset[str]] = frozenset({"list_sinks", "get_plugin_schema"})
 """Read-only discovery tools the sink stage offers the composer model.
 
@@ -1931,18 +2194,25 @@ direct callers bounded at the same default as :class:`WebSettings`.
 class Step2SinkResolvedOutcome:
     sink: SinkResolved
     assistant_message: str
+    # Set when the reply PAIRED resolve_sink with retain_deferred_intent:
+    # the sink resolves at this stage and the future-stage instruction is
+    # retained in the same Send (elspeth-a96b2f1b0a / R2-F15).
+    deferred_action: DeferredIntentAction | None
 
     def __post_init__(self) -> None:
         if type(self.sink) is not SinkResolved:
             raise TypeError("Step2SinkResolvedOutcome.sink must be exact")
         if type(self.assistant_message) is not str or not self.assistant_message:
             raise TypeError("Step2SinkResolvedOutcome.assistant_message must be a non-empty exact string")
+        if self.deferred_action is not None and type(self.deferred_action) is not DeferredIntentAction:
+            raise TypeError("Step2SinkResolvedOutcome.deferred_action must be exact or None")
 
 
 type Step2SinkChatOutcome = (
     GuidedChatEmptyOutcome
     | GuidedChatProseOutcome
     | GuidedChatDeferredIntentOutcome
+    | GuidedChatDeferredIntentWithheldResolutionOutcome
     | GuidedChatDeferredManagementOutcome
     | Step2SinkResolvedOutcome
 )
@@ -1967,6 +2237,11 @@ async def maybe_resolve_step_2_sink_chat(
     context_block: StepChatContextInput | None = None,
     progress: ComposerProgressSink | None = None,
     revision_target_index: int | None = None,
+    # Endpoint affordance (Phase 3 Task 2) — guided solvers use the PRIMARY
+    # composer role only; callers always pass the primary endpoint, never
+    # the advisor's. None/None reproduces the exact pre-affordance kwargs.
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> Step2SinkChatOutcome:
     """Resolve a Step-2 chat message into a sink config via a discovery loop.
 
@@ -2050,13 +2325,26 @@ async def maybe_resolve_step_2_sink_chat(
         messages.append({"role": "user", "content": untrusted_context})
     messages.append({"role": "user", "content": user_message})
 
-    for _iteration in range(max(1, iteration_cap)):
+    # Bounded retain self-repair (elspeth-a96b2f1b0a): one malformed
+    # retain_deferred_intent reply gets its shape rejection threaded back as a
+    # tool result (consuming one loop iteration) instead of terminalizing the
+    # whole Send.
+    deferred_repair_used = False
+    # A pair's VALID parsed retain must survive its sink half never becoming
+    # acceptable: if the loop would otherwise end without a terminal outcome
+    # (config-invalid sink at the iteration cap, a prose decline, or a
+    # hallucinated-tool fallback after the pair round), the retain applies
+    # alone rather than being silently discarded (R2-F15 review finding 3).
+    pending_deferred: DeferredIntentAction | None = None
+    iterations = max(1, iteration_cap)
+    for _iteration in range(iterations):
         request_messages = list(messages)
         kwargs: dict[str, Any] = {"model": model, "messages": request_messages, "tools": tools}
         if temperature is not None:
             kwargs["temperature"] = temperature
         if seed is not None:
             kwargs["seed"] = seed
+        _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
         status: ComposerLLMCallStatus | None = None
@@ -2078,35 +2366,117 @@ async def maybe_resolve_step_2_sink_chat(
                 and tool_call.function.name in {"resolve_sink", "retain_deferred_intent", "manage_deferred_intent"}
             ]
             if terminal_calls:
-                if len(terminal_calls) != 1 or len(tool_calls) != 1:
-                    error_type = (
-                        DeferredIntentActionShapeError
-                        if any(
-                            call.function is not None and call.function.name in {"retain_deferred_intent", "manage_deferred_intent"}
-                            for call in terminal_calls
-                        )
-                        else GuidedSolverResponseShapeError
+                retain_calls = [
+                    call for call in terminal_calls if call.function is not None and call.function.name == "retain_deferred_intent"
+                ]
+                sink_calls = [call for call in terminal_calls if call.function is not None and call.function.name == "resolve_sink"]
+                # A resolve_sink + retain_deferred_intent PAIR is the one
+                # multi-call reply this stage accepts: a message mixing current-
+                # stage output values with a future-stage instruction must lose
+                # neither half (elspeth-a96b2f1b0a / R2-F15).
+                is_retained_pair = len(tool_calls) == 2 and len(terminal_calls) == 2 and len(retain_calls) == 1 and len(sink_calls) == 1
+                if not is_retained_pair and (len(terminal_calls) != 1 or len(tool_calls) != 1):
+                    raise _terminal_shape_error_type(terminal_calls)(
+                        "step-2 chat must return exactly one terminal guided action, or one resolve_sink + retain_deferred_intent pair"
                     )
-                    raise error_type("step-2 chat must return exactly one terminal guided action")
-                function = terminal_calls[0].function
+                deferred: DeferredIntentAction | None = None
+                if retain_calls:
+                    try:
+                        deferred = _parse_deferred_intent_tool_arguments(retain_calls[0].function.arguments)
+                    except DeferredIntentActionShapeError as exc:
+                        # Bounded self-repair (mirrors the config-invalid
+                        # resolve_sink threading below): thread the value-free
+                        # shape rejection back and let the model correct itself
+                        # once within the same Send. Exhaustion (or an argument
+                        # shape we cannot faithfully re-materialise) re-raises
+                        # so the caller's retention fallback applies.
+                        if deferred_repair_used or _iteration + 1 >= iterations or not _tool_calls_are_repair_threadable(tool_calls):
+                            raise
+                        deferred_repair_used = True
+                        messages.extend(
+                            _deferred_intent_repair_thread(
+                                message,
+                                tool_calls,
+                                retain_call=retain_calls[0],
+                                error=exc,
+                            )
+                        )
+                        status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+                        error_class = type(exc).__name__
+                        error_message = "malformed_response"
+                        continue
+                if deferred is not None and not is_retained_pair:
+                    status = ComposerLLMCallStatus.SUCCESS
+                    return GuidedChatDeferredIntentOutcome(action=deferred)
+                if is_retained_pair and deferred is not None:
+                    pending_deferred = deferred
+                function = sink_calls[0].function if is_retained_pair else terminal_calls[0].function
                 if function is None:  # pragma: no cover - filtered immediately above
                     raise GuidedSolverResponseShapeError("step-2 terminal action has no function")
                 arguments = function.arguments
-                if function.name == "retain_deferred_intent":
-                    deferred = _parse_deferred_intent_tool_arguments(arguments)
-                    status = ComposerLLMCallStatus.SUCCESS
-                    return GuidedChatDeferredIntentOutcome(action=deferred)
                 if function.name == "manage_deferred_intent":
                     management = _parse_deferred_intent_management_tool_arguments(arguments)
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredManagementOutcome(action=management)
                 if not isinstance(arguments, str):
+                    if pending_deferred is not None:
+                        # The pair's retain half is valid; keep it rather than
+                        # discarding the instruction with the defective sink.
+                        # The withheld resolution stays classified so the
+                        # caller renders and audits the not-applied signal.
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                            action=pending_deferred,
+                            resolution_error_class="PairedResolutionShapeRejected",
+                        )
                     raise GuidedSolverResponseShapeError(
                         f"{function.name} function.arguments must be a JSON string; got {type(arguments).__name__}"
                     )
-                sink, assistant = _parse_step_2_sink_tool_arguments(arguments)
+                try:
+                    sink, assistant = _parse_step_2_sink_tool_arguments(arguments)
+                except GuidedToolArgumentShapeError:
+                    if pending_deferred is not None:
+                        # Same retention rule for a shape-invalid sink half.
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                            action=pending_deferred,
+                            resolution_error_class="PairedResolutionShapeRejected",
+                        )
+                    raise
+                config_rejection = resolved_sink_config_error(sink)
+                if config_rejection is None:
+                    status = ComposerLLMCallStatus.SUCCESS
+                    # A pending retain from an earlier pair round still applies
+                    # when the model resends only the corrected sink.
+                    return Step2SinkResolvedOutcome(
+                        sink=sink,
+                        assistant_message=assistant,
+                        deferred_action=deferred if deferred is not None else pending_deferred,
+                    )
+                # Config-invalid resolution: thread the rejection back as the
+                # tool result so the model can correct itself within the same
+                # Send (answering EVERY call id — a paired retain is told it was
+                # withheld so the model resends the complete reply). At the
+                # iteration cap the loop degrades to the advisory fallback below
+                # instead of staging prefill that would wedge every subsequent
+                # /guided/respond echo (elspeth-a88c07cd47).
+                messages.append(_assistant_tool_calls_message(message, tool_calls))
+                rejected_sink_call = sink_calls[0] if is_retained_pair else terminal_calls[0]
+                for tool_call in tool_calls:
+                    if tool_call is rejected_sink_call:
+                        content = (
+                            f"resolve_sink rejected: the options do not satisfy the {sink.outputs[0].plugin!r} "
+                            f"sink's configuration contract: {config_rejection.repair_message} "
+                            "Correct the options and call resolve_sink again."
+                        )
+                    else:
+                        content = (
+                            "Not applied: the paired resolve_sink call was rejected. "
+                            "After correcting it, resend BOTH calls together in one reply."
+                        )
+                    messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": content})
                 status = ComposerLLMCallStatus.SUCCESS
-                return Step2SinkResolvedOutcome(sink=sink, assistant_message=assistant)
+                continue
 
             # A clean, tool-call-free reply: the model judged the message
             # doesn't carry enough detail to act (or it's a plain question)
@@ -2118,6 +2488,15 @@ async def maybe_resolve_step_2_sink_chat(
             # carries a hallucinated tool call is a more suspicious shape and
             # must not have its prose trusted either (falls through instead).
             if not tool_calls:
+                if pending_deferred is not None:
+                    # The model declined to resend the pair after its sink half
+                    # was rejected; the valid retain still applies rather than
+                    # being silently discarded with the reply.
+                    status = ComposerLLMCallStatus.SUCCESS
+                    return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                        action=pending_deferred,
+                        resolution_error_class="PairedResolutionNotResent",
+                    )
                 content = message.content
                 if content is None or not str(content).strip():
                     status = ComposerLLMCallStatus.SUCCESS
@@ -2132,6 +2511,12 @@ async def maybe_resolve_step_2_sink_chat(
             # dispatching anything.
             discovery_calls = [tc for tc in tool_calls if tc.function is not None and tc.function.name in allowed_discovery]
             if not discovery_calls or len(discovery_calls) != len(tool_calls):
+                if pending_deferred is not None:
+                    status = ComposerLLMCallStatus.SUCCESS
+                    return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                        action=pending_deferred,
+                        resolution_error_class="PairedResolutionNotResent",
+                    )
                 status = ComposerLLMCallStatus.SUCCESS
                 return GuidedChatEmptyOutcome()
             if len(discovery_calls) > tool_call_cap:
@@ -2217,7 +2602,14 @@ async def maybe_resolve_step_2_sink_chat(
                 error_message=error_message,
             )
 
-    # Discovery iteration cap reached without a resolve_sink — advisory fallback.
+    # Discovery iteration cap reached without a resolve_sink. A pair's valid
+    # retain half still applies alone (R2-F15: the instruction is never
+    # silently discarded); otherwise degrade to the advisory fallback.
+    if pending_deferred is not None:
+        return GuidedChatDeferredIntentWithheldResolutionOutcome(
+            action=pending_deferred,
+            resolution_error_class="PairedResolutionConfigRejected",
+        )
     return GuidedChatEmptyOutcome()
 
 
@@ -2231,6 +2623,11 @@ async def solve_step_chat(
     recorder: BufferingRecorder | None = None,
     timeout_seconds: float,
     context_block: StepChatContextInput | None = None,
+    # Endpoint affordance (Phase 3 Task 2) — guided solvers use the PRIMARY
+    # composer role only; callers always pass the primary endpoint, never
+    # the advisor's. None/None reproduces the exact pre-affordance kwargs.
+    api_base: str | None = None,
+    api_key: str | None = None,
 ) -> str:
     """Send a user chat message to the LLM scoped to *step*; return the assistant reply.
 
@@ -2294,6 +2691,7 @@ async def solve_step_chat(
         kwargs["temperature"] = temperature
     if seed is not None:
         kwargs["seed"] = seed
+    _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
     started_at = datetime.now(UTC)
     started_ns = time.monotonic_ns()
     status: ComposerLLMCallStatus | None = None

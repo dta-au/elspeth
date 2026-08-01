@@ -293,19 +293,46 @@ def test_verify_aborts_on_vanished_new_judgment_finding(tmp_path: Path) -> None:
     assert any(action.key in m for m in report.mismatches)
 
 
-def test_verify_passes_when_new_judgment_finding_became_covered(tmp_path: Path) -> None:
+def test_verify_aborts_when_new_judgment_finding_became_exactly_covered(tmp_path: Path) -> None:
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
     _write_source(root, "plugins/gadget.py", "gadget")
     finding = _live_finding(root, "plugins/gadget.py")
     action = _new_judgment_action(finding, "plugins/gadget.py")
-    # An allowlist entry has since come to cover the same key (covered between
-    # stage and fire). Verify keys off finding existence, not the coverage delta.
+    # An exact allowlist entry has since come to cover the same key.
     _write_signed_v2_entry(allowlist_dir, "gadget.yaml", finding=finding)
 
     bundle = _bundle(root, allowlist_dir, (action,))
     report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
-    assert report.ok is True
+    assert report.ok is False
+    assert any("already covered" in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_aborts_when_new_judgment_finding_is_covered_by_per_file_rule(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    action = _new_judgment_action(finding, "plugins/gadget.py")
+    (allowlist_dir / "gadget.yaml").write_text(
+        "\n".join(
+            [
+                "per_file_rules:",
+                "- pattern: plugins/gadget.py",
+                "  rules: [R1]",
+                "  reason: existing production suppression",
+                "  expires: '2030-01-01'",
+                "  max_hits: 1",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    bundle = _bundle(root, allowlist_dir, (action,))
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+    assert report.ok is False
+    assert any("already covered" in mismatch for mismatch in report.mismatches)
 
 
 def test_verify_aborts_on_reappeared_stale_delete_finding(tmp_path: Path) -> None:
@@ -325,6 +352,25 @@ def test_verify_aborts_on_reappeared_stale_delete_finding(tmp_path: Path) -> Non
     report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
     assert report.ok is False
     assert any(key in m for m in report.mismatches)
+
+
+def test_verify_rejects_stale_delete_wrong_owning_yaml(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    bundle = _bundle(
+        root,
+        allowlist_dir,
+        (BundleAction(lane="resign", kind="stale_delete", key=key, source_file="other.yaml"),),
+    )
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("owning YAML" in mismatch for mismatch in report.mismatches)
 
 
 def test_verify_aborts_on_rotation_no_longer_applicable(tmp_path: Path) -> None:

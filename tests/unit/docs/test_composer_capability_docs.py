@@ -6,11 +6,13 @@ must say so, list the supported canonical structures, explain wrong-stage
 retention / back-edit, and describe the tutorial as a guided workflow profile.
 It must NOT tell users to switch to freeform because guided cannot express a
 supported topology. Where schema/epoch numbers are encoded, the runbook must use
-the current values (session epoch 37, guided schema 10, Landscape epoch 29), not
-the design doc's stale 8/28.
+the current values (the live ``SESSION_SCHEMA_EPOCH``, guided schema 10,
+Landscape epoch 30), not the design doc's stale 8/28.
 """
 
 from pathlib import Path
+
+from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 USER_MANUAL = REPO_ROOT / "docs/guides/user-manual.md"
@@ -67,16 +69,13 @@ def test_user_manual_describes_tutorial_as_shared_planner_profile() -> None:
     assert "not a separate or reduced-capability mode" in manual
 
 
-def test_user_manual_honestly_notes_guided_staged_known_limitations() -> None:
+def test_user_manual_states_guided_staged_full_canonical_parity() -> None:
     manual = _manual()
-    # Both tracked guided-staged gaps must be named with their issue ids so the
-    # honesty is auditable, and framed as defects rather than a capability wall.
-    assert "elspeth-93dd908354" in manual  # require-all (union) coalesce
-    assert "elspeth-b83b5b3204" in manual  # cross-sink on_write_failure fallback
-    assert "require-all (union) coalesce" in manual
-    assert "cross-sink `on_write_failure` fallback" in manual
-    assert "seven of the nine canonical structures" in manual
-    assert "not capability boundaries" in manual
+    assert "authors all nine canonical structures directly" in manual
+    assert "require-all coalesces" in manual
+    assert "cross-sink `on_write_failure` fallbacks" in manual
+    assert "seven of the nine canonical structures" not in manual
+    assert "not yet authorable" not in manual
 
 
 def test_user_manual_rejects_switch_to_freeform_for_a_supported_topology() -> None:
@@ -105,16 +104,22 @@ def test_runbook_uses_plan_05_epoch_and_schema_numbers() -> None:
     runbook = RUNBOOK.read_text(encoding="utf-8")
     current_cutover = runbook.split("## Current Cutover:", maxsplit=1)[1].split("## Historical Cutover:", maxsplit=1)[0]
 
-    # Current release values: session epoch 37, guided schema 10, Landscape 29.
-    assert "session epoch 37" in current_cutover
-    assert "Landscape epoch 29" in current_cutover
+    # Current release values: the live session epoch, guided schema 10,
+    # Landscape 30. Bound to the constant so the doc cannot drift behind a bump.
+    assert f"session epoch {SESSION_SCHEMA_EPOCH}" in current_cutover
+    assert "Landscape epoch 30" in current_cutover
     assert "guided schema 10" in runbook
+    assert "persistent session-operation authority" in current_cutover
+    assert "compatible-generation membership" in current_cutover
 
-    # The recreation/rollback record reference must name epoch-37, not the stale
-    # epoch-30 the header-bump left behind (elspeth composer-parity fix).
-    assert "session-epoch-37/Landscape-epoch-29 record" in current_cutover
-    assert "repair the epoch-37 release forward" in current_cutover
-    assert "epoch-30" not in current_cutover
+    # The recreation/rollback record reference must name the live session epoch,
+    # not the stale session epoch-30 the header-bump left behind (elspeth
+    # composer-parity fix). "Landscape-epoch-30" is the current Landscape
+    # boundary and is expected.
+    assert f"session-epoch-{SESSION_SCHEMA_EPOCH}/Landscape-epoch-30 record" in current_cutover
+    assert f"repair the epoch-{SESSION_SCHEMA_EPOCH} release forward" in current_cutover
+    assert "session-epoch-30" not in current_cutover
+    assert "session epoch 30" not in current_cutover.lower()
 
     # The design doc's stale §6.1 pairing (guided schema 8 / session epoch 28)
     # must never be encoded as the CURRENT guided schema.

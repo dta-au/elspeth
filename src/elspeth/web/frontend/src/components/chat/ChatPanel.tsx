@@ -1085,9 +1085,48 @@ export function ChatPanel({
   // that were deleted or are no longer ready. The derived list repeats those
   // checks synchronously so a stale candidate cannot leak during the effect's
   // cleanup render.
+  //
+  // guidedSourceBlobCandidateSet is component-local state: a page reload or
+  // remount mid step_1_source loses it while the backend's ready blobs
+  // survive. When that happens with `current === null`, re-derive the set
+  // from the reloaded ready blobs — without this, the chooser silently
+  // disappears and the outgoing request omits source_blob_id even though
+  // multiple ready blobs exist.
+  //
+  // A mid-session turn_token rotation while still parked on
+  // step_1_source/single_select (e.g. the planner reissuing the step) hits
+  // the same symptom: `current` is scoped to the old token and must be
+  // invalidated. The effect has no dependency on the state it sets, so if
+  // invalidation simply returned null, the re-derive above would only run
+  // on the NEXT dependency change (typically the next blobs poll) — the
+  // chooser would vanish despite ready blobs being available right now.
+  // Falling through to re-derive in this same pass closes that window. The
+  // re-derived set mirrors the remount recovery above: it presents ALL
+  // ready session blobs, not just the ones accumulated via uploads during
+  // the (now-superseded) turn — that is the intended recovery surface.
   useEffect(() => {
+    const deriveFromReadyBlobs = (): GuidedSourceBlobCandidateSet | null => {
+      if (
+        activeSessionId === null ||
+        guidedSession?.step !== "step_1_source" ||
+        guidedNextTurn?.type !== "single_select" ||
+        readyGuidedSourceBlobs.size === 0
+      ) {
+        return null;
+      }
+      const candidates = [...readyGuidedSourceBlobs.values()];
+      return {
+        sessionId: activeSessionId,
+        turnToken: guidedNextTurn.turn_token,
+        candidates,
+        requiresExplicitChoice: candidates.length > 1,
+      };
+    };
+
     setGuidedSourceBlobCandidateSet((current) => {
-      if (current === null) return current;
+      if (current === null) {
+        return deriveFromReadyBlobs() ?? current;
+      }
       if (
         activeSessionId === null ||
         guidedSession?.step !== "step_1_source" ||
@@ -1095,7 +1134,7 @@ export function ChatPanel({
         current.sessionId !== activeSessionId ||
         current.turnToken !== guidedNextTurn.turn_token
       ) {
-        return null;
+        return deriveFromReadyBlobs();
       }
 
       const candidates = current.candidates.flatMap((candidate) => {
@@ -2415,10 +2454,12 @@ export function ChatPanel({
         ) : (
           <span aria-hidden="true" />
         )}
-        <div
-          className="chat-panel-header-actions"
-          style={{ display: "inline-flex", gap: 8, alignItems: "center" }}
-        >
+        {/* Layout lives in chat.css, NOT in a style prop (elspeth-0b70269ccc).
+            As an inline style this row was `inline-flex` with no wrap and no
+            min-width, which no stylesheet rule and therefore no breakpoint
+            could override — the row stayed one line at every width and the
+            ModeSwitchButton clipped to "Sw" at 390px. */}
+        <div className="chat-panel-header-actions">
           {/* Persistent composer-model identity (elspeth-e9f7678de8): an
               auditability product should name the model doing the composing
               in the authoring chrome, not only in run records. */}
@@ -2521,8 +2562,19 @@ export function ChatPanel({
           // creates a confusing race between tool calls and the eventual
           // answer. User and system turns are always complete, so the gate
           // is a no-op for them. See turns.ts → ChatTurn.isComplete.
+          //
+          // `|| !isComposing` is the terminal escape (elspeth-e074575b6e).
+          // A turn is only "mid-flight" while the composer is still running;
+          // once isComposing goes false nothing more is coming, so an
+          // incomplete turn is one that ENDED without a reply (convergence /
+          // timeout — the backend persists partial state and the tool audit,
+          // then raises 422, and never writes a reply row). Those turns must
+          // still render so their tool calls stay visible; they simply carry
+          // no prose, because the only text on them is the model's internal
+          // narration and presenting that as an answer is the bug this
+          // fixes. Without the escape they would be hidden forever.
           chatTurns
-            .filter((turn: ChatTurn) => turn.isComplete)
+            .filter((turn: ChatTurn) => turn.isComplete || !isComposing)
             .map((turn: ChatTurn) => {
               const repr = turnRepresentativeMessage(turn);
               // Attach the inline-source summary to the most recent complete

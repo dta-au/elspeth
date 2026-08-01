@@ -5,9 +5,12 @@ from __future__ import annotations
 import csv
 import errno
 import hashlib
+import io
 import json
 import os
 import shutil
+import stat
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -263,18 +266,79 @@ def test_prepare_pins_exact_csv_files_manifest_and_aggregate_hash(tmp_path: Path
 
 
 def test_prepare_refuses_staging_tree_changed_during_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    original = bundle_effects._rename_noreplace
+    original = bundle_effects._rename_noreplace_at
 
-    def rename_then_change(source: Path, destination: Path) -> None:
-        original(source, destination)
-        if destination.name.endswith(".bundle-stage"):
-            (destination / "run.csv").write_text("changed", encoding="utf-8")
+    def rename_then_change(parent_fd: int, source_name: str, destination_name: str) -> None:
+        original(parent_fd, source_name, destination_name)
+        if destination_name.endswith(".bundle-stage"):
+            directory_fd = os.open(destination_name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+            try:
+                file_fd = os.open("run.csv", os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    os.write(file_fd, b"changed")
+                finally:
+                    os.close(file_fd)
+            finally:
+                os.close(directory_fd)
 
-    monkeypatch.setattr(bundle_effects, "_rename_noreplace", rename_then_change)
+    monkeypatch.setattr(bundle_effects, "_rename_noreplace_at", rename_then_change)
 
     with pytest.raises(bundle_effects.AuditExportBundlePreconditionError):
         _prepare(tmp_path / "audit")
     assert not (tmp_path / "audit").exists()
+
+
+def test_prepare_parent_replacement_cannot_redirect_or_leak_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+
+    def replace_parent(_building: Path, _staging: Path) -> None:
+        parent.rename(moved_parent)
+        parent.symlink_to(victim, target_is_directory=True)
+
+    monkeypatch.setattr(bundle_effects, "_before_prepare_install", replace_parent, raising=False)
+
+    with pytest.raises(bundle_effects.AuditExportBundlePreconditionError, match="parent"):
+        _prepare(parent / "audit")
+
+    assert parent.is_symlink()
+    assert not list(victim.iterdir())
+    assert not list(moved_parent.iterdir())
+
+
+def test_prepare_plan_failure_rolls_back_pinned_stage_not_foreign_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    stage_name = f".audit.elspeth-{EFFECT_ID}.bundle-stage"
+
+    class InjectedPlanFailure(BaseException):
+        pass
+
+    def fail_plan(**_values: object) -> None:
+        parent.rename(moved_parent)
+        parent.symlink_to(victim, target_is_directory=True)
+        shutil.copytree(moved_parent / stage_name, victim / stage_name)
+        raise InjectedPlanFailure
+
+    monkeypatch.setattr(bundle_effects, "SinkEffectPlan", fail_plan)
+
+    with pytest.raises(InjectedPlanFailure):
+        _prepare(parent / "audit")
+
+    assert (victim / stage_name).is_dir()
+    assert not (moved_parent / stage_name).exists()
 
 
 def test_commit_publishes_once_and_exact_existing_converges(tmp_path: Path) -> None:
@@ -370,13 +434,14 @@ def test_divergent_existing_tree_is_unknown_and_never_replaced(tmp_path: Path, m
     assert bundle_effects.reconcile_audit_export_bundle(plan).kind is SinkEffectReconcileKind.UNKNOWN
 
 
-def test_reordered_durable_manifest_is_unknown(tmp_path: Path) -> None:
+def test_reordered_durable_manifest_is_tier_one_corruption(tmp_path: Path) -> None:
     plan = _prepare(tmp_path / "audit")
     changed = dict(plan.safe_evidence)
     changed["files"] = list(reversed(list(plan.safe_evidence["files"])))
     tampered = replace(plan, safe_evidence=changed)
 
-    assert bundle_effects.reconcile_audit_export_bundle(tampered).kind is SinkEffectReconcileKind.UNKNOWN
+    with pytest.raises(bundle_effects.AuditExportBundlePreconditionError):
+        bundle_effects.reconcile_audit_export_bundle(tampered)
 
 
 @pytest.mark.parametrize(
@@ -392,8 +457,19 @@ def test_reserved_manifest_and_unsafe_generated_names_fail_before_publication(tm
     assert not target.exists()
 
 
-@pytest.mark.parametrize("failure", ["duplicate", "missing", "tampered"])
-def test_duplicate_missing_or_tampered_final_manifest_is_rejected_before_publication(tmp_path: Path, failure: str) -> None:
+@pytest.mark.parametrize(
+    ("failure", "error_type"),
+    [
+        ("duplicate", bundle_effects.AuditExportBundleInputError),
+        ("missing", KeyError),
+        ("tampered", ValueError),
+    ],
+)
+def test_duplicate_or_corrupt_final_manifest_fails_at_its_own_tier(
+    tmp_path: Path,
+    failure: str,
+    error_type: type[BaseException],
+) -> None:
     record_type = "manifest" if failure == "duplicate" else "run"
     snapshot, objects = _forged_snapshot({"record_type": record_type, "value": 1})
     if failure == "missing":
@@ -402,10 +478,108 @@ def test_duplicate_missing_or_tampered_final_manifest_is_rejected_before_publica
         objects[snapshot.signed_manifest.content_ref] = json.dumps({"record_type": "manifest"}).encode()
     target = tmp_path / "audit"
 
-    with pytest.raises(bundle_effects.AuditExportBundleInputError):
+    with pytest.raises(error_type):
         _prepare(target, snapshot)
     assert not target.exists()
     assert not list(tmp_path.glob(".*.building-*"))
+
+
+def test_verified_manifest_reader_programmer_fault_escapes_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, _manifest = _snapshot()
+
+    def fail_reader(_reader: object) -> bytes:
+        raise AssertionError("verified reader contract fault")
+
+    monkeypatch.setattr(type(snapshot.reader), "read_verified_signed_manifest", fail_reader)
+
+    with pytest.raises(AssertionError, match="verified reader contract fault"):
+        _prepare(tmp_path / "audit", snapshot)
+
+
+def test_private_csv_spool_corruption_is_tier_one_and_output_files_use_fd_permissions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_path_chmod(_path: Path, _mode: int) -> None:
+        raise AssertionError("path-based chmod is forbidden")
+
+    monkeypatch.setattr(os, "chmod", reject_path_chmod)
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        owned_names: list[str] = []
+        spool = bundle_effects._RecordSpool("run.csv", io.StringIO("[]\n"), set())
+        with pytest.raises(bundle_effects.AuditExportBundlePreconditionError, match="private spool"):
+            bundle_effects._write_csv_file_at(directory_fd, "run.csv", spool, owned_names)
+
+        entry = bundle_effects._write_exact_file_at(directory_fd, "audit_manifest.v2.json", b"{}", owned_names)
+    finally:
+        os.close(directory_fd)
+
+    assert entry.relative_path == "audit_manifest.v2.json"
+    assert stat.S_IMODE((tmp_path / entry.relative_path).stat().st_mode) == 0o600
+
+
+def test_output_hash_rejects_file_replacement_after_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_hash = bundle_effects._hash_regular_file_at
+
+    def replace_before_hash(directory_fd: int, name: str, *identity: os.stat_result) -> tuple[str, int]:
+        os.rename(name, f"{name}.original", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        replacement_fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            os.write(replacement_fd, b"replacement")
+        finally:
+            os.close(replacement_fd)
+        return original_hash(directory_fd, name, *identity)
+
+    monkeypatch.setattr(bundle_effects, "_hash_regular_file_at", replace_before_hash)
+    directory_fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        with pytest.raises(bundle_effects.AuditExportBundlePreconditionError, match="changed"):
+            bundle_effects._write_exact_file_at(directory_fd, "audit_manifest.v2.json", b"original", [])
+    finally:
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize("failure_name", ["node.csv", bundle_effects.AUDIT_MANIFEST_NAME])
+def test_prepare_removes_owned_file_when_writer_fails_after_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_name: str,
+) -> None:
+    original_hash = bundle_effects._hash_regular_file_at
+
+    class InjectedWriterFailure(OSError):
+        pass
+
+    def fail_selected_hash(
+        directory_fd: int,
+        name: str,
+        expected_identity: os.stat_result,
+    ) -> tuple[str, int]:
+        if name == failure_name:
+            observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            assert observed.st_dev == expected_identity.st_dev
+            assert observed.st_ino == expected_identity.st_ino
+            raise InjectedWriterFailure("injected failure after owned file creation")
+        return original_hash(directory_fd, name, expected_identity)
+
+    monkeypatch.setattr(bundle_effects, "_hash_regular_file_at", fail_selected_hash)
+
+    with pytest.raises(InjectedWriterFailure, match="after owned file creation"):
+        _prepare(tmp_path / "audit")
+
+    assert not list(tmp_path.iterdir())
 
 
 def test_casefold_filename_collision_fails_before_publication(tmp_path: Path) -> None:
@@ -418,6 +592,13 @@ def test_casefold_filename_collision_fails_before_publication(tmp_path: Path) ->
     with pytest.raises(bundle_effects.AuditExportBundleInputError, match="case-fold"):
         _prepare(tmp_path / "audit", snapshot)
     assert not (tmp_path / "audit").exists()
+
+
+def test_verified_audit_record_missing_record_type_is_tier_one_corruption(tmp_path: Path) -> None:
+    snapshot, _objects = _forged_snapshot({"value": 1})
+
+    with pytest.raises(KeyError, match="record_type"):
+        _prepare(tmp_path / "audit", snapshot)
 
 
 def test_stale_sweep_removes_crashed_building_trees_and_probes_but_not_staging(tmp_path: Path) -> None:
@@ -443,6 +624,41 @@ def test_stale_sweep_removes_crashed_building_trees_and_probes_but_not_staging(t
     assert stale_staging.exists()
 
 
+def test_stale_sweep_parent_replacement_cannot_delete_foreign_scratch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    moved_parent = tmp_path / "moved-parent"
+    scratch_name = f".audit.elspeth-{EFFECT_ID}.building-abc123"
+    original_scratch = parent / scratch_name
+    original_scratch.mkdir()
+    (original_scratch / "owned").write_text("owned", encoding="utf-8")
+    foreign_scratch = victim / scratch_name
+    foreign_scratch.mkdir()
+    (foreign_scratch / "foreign").write_text("foreign", encoding="utf-8")
+    old = time.time() - 2 * 60 * 60
+    os.utime(original_scratch, (old, old))
+    os.utime(foreign_scratch, (old, old))
+
+    def replace_parent(_parent: Path, candidate_name: str) -> None:
+        if candidate_name == scratch_name:
+            parent.rename(moved_parent)
+            parent.symlink_to(victim, target_is_directory=True)
+
+    monkeypatch.setattr(bundle_effects, "_before_stale_scratch_remove", replace_parent, raising=False)
+
+    removed = bundle_effects.cleanup_stale_audit_export_bundle_scratch(parent)
+
+    assert removed == 1
+    assert parent.is_symlink()
+    assert not (moved_parent / scratch_name).exists()
+    assert (foreign_scratch / "foreign").read_text(encoding="utf-8") == "foreign"
+
+
 def test_preflight_sweeps_stale_crashed_building_trees(tmp_path: Path) -> None:
     stale_building = tmp_path / f".audit.elspeth-{EFFECT_ID}.building-abc123"
     stale_building.mkdir()
@@ -465,11 +681,27 @@ def test_preflight_exercises_linux_noreplace_and_fsync_without_target_publicatio
 
 
 def test_preflight_rejects_non_linux_before_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(bundle_effects.sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "platform", "darwin")
     target = tmp_path / "audit"
     with pytest.raises(bundle_effects.AuditExportBundlePreflightError, match="Linux"):
         bundle_effects.preflight_audit_export_bundle(target)
     assert not target.exists()
+
+
+@pytest.mark.parametrize("flag_name", ["O_DIRECTORY", "O_NOFOLLOW"])
+def test_preflight_requires_no_follow_directory_open_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flag_name: str,
+) -> None:
+    monkeypatch.delattr(os, flag_name)
+    target = tmp_path / "audit"
+
+    with pytest.raises(bundle_effects.AuditExportBundlePreflightError, match=flag_name):
+        bundle_effects.preflight_audit_export_bundle(target)
+
+    assert not target.exists()
+    assert not list(tmp_path.glob(".elspeth-bundle-probe-*"))
 
 
 def test_preflight_rejects_enosys_unsupported_statfs_cross_device_and_fsync(

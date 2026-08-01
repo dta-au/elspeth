@@ -332,6 +332,35 @@ def test_result_derived_descriptor_refuses_non_authoritative_evidence(
         factory.execution.sink_effects.finalize(_request(factory, effect, members, lease))
 
 
+def test_result_derived_diversion_requires_exact_durable_attribution(
+    db_factory: tuple[LandscapeDB, RecorderFactory],
+) -> None:
+    _db, factory = db_factory
+    effect, members, lease = _prepared(factory, count=2, descriptor_mode=SinkEffectDescriptorMode.RESULT_DERIVED)
+    descriptor = _descriptor()
+    evidence = {
+        "accepted_ordinals": [0],
+        "descriptor": {
+            "artifact_type": descriptor.artifact_type,
+            "content_hash": descriptor.content_hash,
+            "metadata": None,
+            "path_or_uri": descriptor.path_or_uri,
+            "size_bytes": descriptor.size_bytes,
+        },
+        "diverted_ordinals": [1],
+    }
+    base_request = _request(factory, effect, members, lease, evidence=evidence)
+    request = replace(
+        base_request,
+        accepted_ordinals=(0,),
+        diverted_ordinals=(1,),
+        members=(base_request.members[0],),
+    )
+
+    with pytest.raises(LandscapeRecordError, match="requires diversion attribution"):
+        factory.execution.sink_effects.finalize(request)
+
+
 def test_result_derived_reconciled_retry_preserves_ordinals_and_returns_winner(
     db_factory: tuple[LandscapeDB, RecorderFactory],
 ) -> None:
@@ -351,6 +380,13 @@ def test_result_derived_reconciled_retry_preserves_ordinals_and_returns_winner(
             "size_bytes": descriptor.size_bytes,
         },
         "diverted_ordinals": [1],
+        "diversion_attribution": [
+            {
+                "error_hash": "b" * 16,
+                "ordinal": 1,
+                "reason_hash": "a" * 64,
+            }
+        ],
     }
     reconciliation = SinkEffectReconcileResult.applied(
         descriptor,

@@ -15,11 +15,13 @@ from pathlib import Path
 from typing import Literal, Self
 
 from .contracts import (
+    _ARTIFACT_ID_PATTERN,
     _SHA256_PATTERN,
     MAX_STATE_FILE_BYTES,
     AcceptanceInputError,
     AcceptanceStateError,
     _parse_utc_z_timestamp,
+    acceptance_step,
 )
 
 _STATE_FIELDS = frozenset(
@@ -93,9 +95,14 @@ class AcceptanceState:
         if data["schema_version"] != 1 or type(data["schema_version"]) is not int:
             raise AcceptanceStateError("acceptance state schema is invalid")
 
+        # session_id/tutorial_session_id/blob_id/run_id/landscape_run_id are
+        # all genuine canonical dashed UUIDs (str(uuid.uuid4()) at their web
+        # ID-generation sites). artifact_id is NOT: it is a landscape
+        # `artifacts.artifact_id` value (`String(64)` column), generated as
+        # a labeled SHA-256 hex digest by the sink-effect producer path
+        # (see `_ARTIFACT_ID_PATTERN` in contracts.py), never a UUID.
         identities = {
-            field: _state_string(data, field)
-            for field in ("session_id", "tutorial_session_id", "blob_id", "run_id", "landscape_run_id", "artifact_id")
+            field: _state_string(data, field) for field in ("session_id", "tutorial_session_id", "blob_id", "run_id", "landscape_run_id")
         }
         for value in identities.values():
             try:
@@ -104,6 +111,11 @@ class AcceptanceState:
                 raise AcceptanceStateError("acceptance state schema is invalid") from None
             if str(parsed) != value:
                 raise AcceptanceStateError("acceptance state schema is invalid")
+
+        artifact_id = _state_string(data, "artifact_id")
+        if _ARTIFACT_ID_PATTERN.fullmatch(artifact_id) is None:
+            raise AcceptanceStateError("acceptance state schema is invalid")
+        identities["artifact_id"] = artifact_id
 
         hashes = {field: _state_string(data, field) for field in ("uploaded_sha256", "blob_sha256", "artifact_sha256")}
         if any(_SHA256_PATTERN.fullmatch(value) is None for value in hashes.values()):
@@ -141,7 +153,23 @@ class AcceptanceState:
         )
 
     def to_dict(self) -> dict[str, object]:
-        return {field: getattr(self, field) for field in _STATE_FIELDS}
+        return {
+            "schema_version": self.schema_version,
+            "session_id": self.session_id,
+            "tutorial_session_id": self.tutorial_session_id,
+            "blob_id": self.blob_id,
+            "run_id": self.run_id,
+            "landscape_run_id": self.landscape_run_id,
+            "artifact_id": self.artifact_id,
+            "uploaded_sha256": self.uploaded_sha256,
+            "blob_sha256": self.blob_sha256,
+            "artifact_sha256": self.artifact_sha256,
+            "run_status": self.run_status,
+            "source_rows": self.source_rows,
+            "failed_tokens": self.failed_tokens,
+            "captured_at": self.captured_at,
+            "completed_at": self.completed_at,
+        }
 
 
 def _state_string(data: Mapping[str, object], field: str) -> str:
@@ -166,7 +194,7 @@ def _state_timestamp(data: Mapping[str, object], field: str) -> str:
 
 def _validate_protected_stat(stat_result: os.stat_result) -> None:
     if not stat.S_ISREG(stat_result.st_mode) or stat_result.st_uid != os.getuid() or stat_result.st_mode & 0o077:
-        raise AcceptanceStateError("acceptance state must be a regular owner-only file")
+        raise AcceptanceStateError("acceptance state must be a regular owner-only file", error_code="state_file_untrusted")
 
 
 def _validate_existing_state_destination(path: Path) -> None:
@@ -175,82 +203,84 @@ def _validate_existing_state_destination(path: Path) -> None:
     except FileNotFoundError:
         return
     except OSError:
-        raise AcceptanceStateError("acceptance state destination validation failed") from None
+        raise AcceptanceStateError("acceptance state destination validation failed", error_code="state_file_unwritable") from None
     _validate_protected_stat(stat_result)
 
 
 def write_acceptance_state(path: Path, state: AcceptanceState) -> None:
     """Atomically persist a closed state document beside its destination."""
 
-    _validate_existing_state_destination(path)
-    payload = json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
-    if len(payload) > MAX_STATE_FILE_BYTES:
-        raise AcceptanceStateError("acceptance state is too large")
+    with acceptance_step("state_persist"):
+        _validate_existing_state_destination(path)
+        payload = json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+        if len(payload) > MAX_STATE_FILE_BYTES:
+            raise AcceptanceStateError("acceptance state is too large", error_code="state_file_too_large")
 
-    temporary_path: str | None = None
-    try:
-        descriptor, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-        with os.fdopen(descriptor, "wb") as handle:
-            os.fchmod(handle.fileno(), 0o600)
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
-        temporary_path = None
-        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        temporary_path: str | None = None
         try:
-            os.fsync(directory_descriptor)
+            descriptor, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+            with os.fdopen(descriptor, "wb") as handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_path, path)
+            temporary_path = None
+            directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError:
+            raise AcceptanceStateError("acceptance state write failed", error_code="state_file_unwritable") from None
         finally:
-            os.close(directory_descriptor)
-    except OSError:
-        raise AcceptanceStateError("acceptance state write failed") from None
-    finally:
-        if temporary_path is not None:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(temporary_path)
+            if temporary_path is not None:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temporary_path)
 
 
 def read_acceptance_state(path: Path) -> AcceptanceState:
     """Read and validate one bounded protected state document without following links."""
 
-    try:
-        before = path.lstat()
-        _validate_protected_stat(before)
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except AcceptanceStateError:
-        raise
-    except OSError:
-        raise AcceptanceStateError("acceptance state must be a regular owner-only file") from None
+    with acceptance_step("state_load"):
+        try:
+            before = path.lstat()
+            _validate_protected_stat(before)
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except AcceptanceStateError:
+            raise
+        except OSError:
+            raise AcceptanceStateError("acceptance state is not readable", error_code="state_file_unreadable") from None
 
-    try:
-        opened = os.fstat(descriptor)
-        _validate_protected_stat(opened)
-        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
-            raise AcceptanceStateError("acceptance state changed during protected read")
-        if opened.st_size > MAX_STATE_FILE_BYTES:
-            raise AcceptanceStateError("acceptance state is too large")
-        chunks: list[bytes] = []
-        remaining = MAX_STATE_FILE_BYTES + 1
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 8192))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        content = b"".join(chunks)
-        if len(content) > MAX_STATE_FILE_BYTES:
-            raise AcceptanceStateError("acceptance state is too large")
-    except AcceptanceStateError:
-        raise
-    except OSError:
-        raise AcceptanceStateError("acceptance state read failed") from None
-    finally:
-        os.close(descriptor)
+        try:
+            opened = os.fstat(descriptor)
+            _validate_protected_stat(opened)
+            if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+                raise AcceptanceStateError("acceptance state changed during protected read", error_code="state_file_untrusted")
+            if opened.st_size > MAX_STATE_FILE_BYTES:
+                raise AcceptanceStateError("acceptance state is too large", error_code="state_file_too_large")
+            chunks: list[bytes] = []
+            remaining = MAX_STATE_FILE_BYTES + 1
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 8192))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            content = b"".join(chunks)
+            if len(content) > MAX_STATE_FILE_BYTES:
+                raise AcceptanceStateError("acceptance state is too large", error_code="state_file_too_large")
+        except AcceptanceStateError:
+            raise
+        except OSError:
+            raise AcceptanceStateError("acceptance state read failed", error_code="state_file_unreadable") from None
+        finally:
+            os.close(descriptor)
 
-    try:
-        decoded = json.loads(content)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise AcceptanceStateError("acceptance state schema is invalid") from None
-    if not isinstance(decoded, dict):
-        raise AcceptanceStateError("acceptance state schema is invalid")
-    return AcceptanceState.from_dict(decoded)
+        try:
+            decoded = json.loads(content)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise AcceptanceStateError("acceptance state schema is invalid") from None
+        if not isinstance(decoded, dict):
+            raise AcceptanceStateError("acceptance state schema is invalid")
+        return AcceptanceState.from_dict(decoded)

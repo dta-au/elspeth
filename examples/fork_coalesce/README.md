@@ -24,7 +24,7 @@ elspeth run --settings examples/fork_coalesce/settings.yaml --execute
 ```bash
 elspeth run --settings examples/fork_coalesce/settings_per_branch.yaml --execute
 ```
-> **Note:** Per-branch transforms are a new ARCH-15 feature. Validation currently has a schema config bug being fixed in the main implementation.
+> **Note:** Per-branch transforms are an ARCH-15 feature and validate through the same CLI path as the basic variant.
 
 ## Variants
 
@@ -70,7 +70,7 @@ source ─> [fork] ─┬─ path_a ─> truncate ─────> truncated_a �
     "product": "Widget Pro",
     "price": 2500,
     "category": "electronics",
-    "description": "High-performance w..."
+    "description": "High-performance ..."
   },
   "path_b": {
     "product_name": "Widget Pro",
@@ -128,8 +128,8 @@ In this minimal example both paths carry the same data. The real power emerges i
 
 Three additional configurations demonstrate `union_collision_policy` — a `CoalesceSettings` field controlling how field-name collisions are resolved when `merge: union` is used. Each variant forks into two paths that run `truncate` on `description` with different cutoffs (20 vs 50 chars), then union-merges the results so every field name collides.
 
-| Variant | Policy | Winner on collision | Exit |
-|---------|--------|---------------------|------|
+| Variant | Policy | Selected branch on collision | Exit |
+|---------|--------|------------------------------|------|
 | `settings_union_last_wins.yaml` | `last_wins` (default) | last branch in declaration order (`path_b`) | 0 |
 | `settings_union_first_wins.yaml` | `first_wins` | first branch in declaration order (`path_a`) | 0 |
 | `settings_union_fail.yaml` | `fail` | none — raises `CoalesceCollisionError` | non-zero (**deliberate**) |
@@ -164,7 +164,7 @@ Expected output excerpt (`output/union_first_wins.json`):
 
 ### `settings_union_fail.yaml` — fail (deliberate failure)
 
-**This pipeline is designed to fail.** Any overlap in field names raises `CoalesceCollisionError`. The orchestrator catches the error, marks the coalesce node `FAILED`, and persists the full collision record to the audit trail. Because both branches emit the same column set, every field collides and the coalesce fails on every row.
+**This pipeline is designed to fail.** Any overlap in field names raises `CoalesceCollisionError`. The orchestrator catches the first collision, marks that coalesce group `FAILED`, persists the collision record, and aborts the run. Because both branches emit the same column set, the first source row is sufficient to demonstrate the policy.
 
 ```bash
 elspeth run --settings examples/fork_coalesce/settings_union_fail.yaml --execute || echo "expected non-zero exit"
@@ -178,8 +178,8 @@ Note that `fail` does not distinguish "same value" from "different value" collis
 
 All three variants record the full collision provenance on the coalesce `node_states` row via `context_after_json`. The key fields are:
 
-- `union_field_origins` — map of `field_name → winning_branch_name` in the merged row
-- `union_field_collision_values` — map of `field_name → [[branch_name, value], ...]` showing every branch's contribution for each collided field (populated whenever ≥ 2 branches produced the same field name, regardless of value equality)
+- `union_field_origins` — map of `field_name → selected_branch_name` for `first_wins`/`last_wins`; under `fail`, it records the final resolution candidate even though no merged row is emitted
+- `union_field_collision_values` — map of each collided field to its branch contributions, represented by audit-safe value hashes and types rather than raw values
 
 Open the audit database with the Landscape MCP server:
 ```bash

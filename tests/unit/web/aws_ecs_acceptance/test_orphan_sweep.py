@@ -8,9 +8,9 @@ import os
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import ClassVar
 
 import pytest
+from botocore.exceptions import ClientError
 
 from elspeth.web import aws_ecs_acceptance as acceptance
 from elspeth.web._aws_ecs_acceptance import orphan_sweep as owner
@@ -24,6 +24,14 @@ def test_facade_reexports_orphan_sweep_owners_by_identity() -> None:
     assert acceptance.OrphanSweepClients is owner.OrphanSweepClients
     assert acceptance._transaction_search_projection is owner._transaction_search_projection
     assert acceptance.orphan_sweep is owner.orphan_sweep
+
+
+def test_aws_error_code_rejects_exception_objects_that_only_pretend_to_be_client_errors() -> None:
+    class Pretender(RuntimeError):
+        def __init__(self) -> None:
+            self.response = {"Error": {"Code": "ResourceNotFoundException"}}
+
+    assert owner._aws_error_code(Pretender()) is None
 
 
 def test_retained_evidence_is_one_way_post_observation_state_and_detects_drift(tmp_path: Path) -> None:
@@ -157,20 +165,24 @@ class _FakeOrphanClient:
             raise self.close_error
 
 
-class _OrphanNotFound(RuntimeError):
-    response: ClassVar[dict[str, object]] = {"Error": {"Code": "ResourceNotFoundException"}}
+class _OrphanNotFound(ClientError):
+    def __init__(self) -> None:
+        super().__init__({"Error": {"Code": "ResourceNotFoundException"}}, "AcceptanceTest")
 
 
-class _OrphanListenerNotFound(RuntimeError):
-    response: ClassVar[dict[str, object]] = {"Error": {"Code": "ListenerNotFound"}}
+class _OrphanListenerNotFound(ClientError):
+    def __init__(self) -> None:
+        super().__init__({"Error": {"Code": "ListenerNotFound"}}, "AcceptanceTest")
 
 
-class _OrphanRepositoryNotFound(RuntimeError):
-    response: ClassVar[dict[str, object]] = {"Error": {"Code": "RepositoryNotFoundException"}}
+class _OrphanRepositoryNotFound(ClientError):
+    def __init__(self) -> None:
+        super().__init__({"Error": {"Code": "RepositoryNotFoundException"}}, "AcceptanceTest")
 
 
-class _OrphanNoSuchEntity(RuntimeError):
-    response: ClassVar[dict[str, object]] = {"Error": {"Code": "NoSuchEntity"}}
+class _OrphanNoSuchEntity(ClientError):
+    def __init__(self) -> None:
+        super().__init__({"Error": {"Code": "NoSuchEntity"}}, "AcceptanceTest")
 
 
 def _empty_orphan_clients(*, tagged: list[dict[str, object]] | None = None) -> owner.OrphanSweepClients:

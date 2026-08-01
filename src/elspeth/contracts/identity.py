@@ -63,8 +63,12 @@ class TokenInfo:
             raise TypeError(f"TokenInfo.token_id must be str, got {type(self.token_id).__name__}: {self.token_id!r}")
         if not self.token_id:
             raise ValueError("TokenInfo.token_id must not be empty")
-        for _field_name in ("branch_name", "fork_group_id", "join_group_id", "expand_group_id"):
-            _value = getattr(self, _field_name)
+        for _field_name, _value in (
+            ("branch_name", self.branch_name),
+            ("fork_group_id", self.fork_group_id),
+            ("join_group_id", self.join_group_id),
+            ("expand_group_id", self.expand_group_id),
+        ):
             if _value is not None:
                 if not isinstance(_value, str):
                     raise TypeError(f"TokenInfo.{_field_name} must be str or None, got {type(_value).__name__}: {_value!r}")

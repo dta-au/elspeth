@@ -296,14 +296,22 @@ class TestChromaSinkClose:
     def test_close_releases_resources(self) -> None:
         mock_collection = _make_chroma_collection_double()
         sink = _make_sink_with_collection(mock_collection)
-        mock_client = _make_chroma_client_double()
-        sink._client = mock_client
+
+        class OwnedClient:
+            def __init__(self) -> None:
+                self.close_count = 0
+
+            def close(self) -> None:
+                self.close_count += 1
+
+        client = OwnedClient()
+        sink._client = client  # type: ignore[assignment]
 
         sink.close()
 
         assert sink._client is None
         assert sink._collection is None  # type: ignore[unreachable]
-        mock_client.clear_system_cache.assert_called_once()
+        assert client.close_count == 1
 
 
 def _chroma_effect_member(ordinal: int, row: dict[str, object]) -> SinkEffectMember:
@@ -516,9 +524,78 @@ class TestChromaMemberEffects:
 
         assert result.kind is SinkEffectReconcileKind.UNKNOWN
 
+    @pytest.mark.parametrize(
+        "provider_result",
+        [
+            [],
+            {"ids": [], "documents": ["unexpected"], "metadatas": []},
+            {"ids": [], "documents": [], "metadatas": "not-a-list"},
+            {"ids": ["d1"], "documents": ["one"], "metadatas": [0]},
+            {"ids": [1], "documents": ["one"], "metadatas": [{"topic": "alpha"}]},
+        ],
+    )
+    def test_reconcile_malformed_provider_shapes_are_unknown(self, provider_result: object) -> None:
+        class ResultCollection:
+            def get(self, *, ids: list[str], include: list[str]) -> object:
+                del ids, include
+                return provider_result
+
+        sink = ChromaSink(_make_config())
+        sink._collection = ResultCollection()  # type: ignore[assignment]
+        member = _chroma_effect_member(0, {"doc_id": "d1", "text": "one", "topic": "alpha"})
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,))
+        ctx = _chroma_effect_context()
+        inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
+        plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
+
+        result = sink.reconcile_member_effect(plan, member, effect_input, ctx)
+
+        assert result.kind is SinkEffectReconcileKind.UNKNOWN
+
+    def test_reconcile_ids_object_cannot_masquerade_as_empty_list(self) -> None:
+        class PretendEmptyIds:
+            def __eq__(self, _other: object) -> bool:
+                return True
+
+        class ResultCollection:
+            def get(self, *, ids: list[str], include: list[str]) -> dict[str, object]:
+                del ids, include
+                return {
+                    "ids": PretendEmptyIds(),
+                    "documents": [],
+                    "metadatas": [],
+                }
+
+        sink = ChromaSink(_make_config())
+        sink._collection = ResultCollection()  # type: ignore[assignment]
+        member = _chroma_effect_member(0, {"doc_id": "d1", "text": "one", "topic": "alpha"})
+        effect_input = SinkEffectPipelineMembersInput((member,), (member,))
+        ctx = _chroma_effect_context()
+        inspection = sink.inspect_effect(SinkEffectInspectionRequest(effect_id="b" * 64, target="{}", predecessor_descriptor=None), ctx)
+        plan = sink.prepare_effect(SinkEffectPrepareRequest(effect_id="b" * 64, effect_input=effect_input, inspection=inspection), ctx)
+
+        result = sink.reconcile_member_effect(plan, member, effect_input, ctx)
+
+        assert result.kind is SinkEffectReconcileKind.UNKNOWN
+
     def test_effect_mode_resolver_reads_on_duplicate_without_io(self) -> None:
         resolved = ChromaSink._resolve_sink_effect_mode(
             _make_config(on_duplicate="overwrite"),
             purpose=SinkEffectExecutionPurpose.FRESH,
         )
+        assert resolved is not None and resolved.value == "overwrite"
+
+    def test_effect_mode_resolver_uses_explicit_default_branch(self) -> None:
+        class DirectOnlyConfig(dict[str, object]):
+            def get(self, _key: str, _default: object = None) -> object:
+                raise AssertionError("raw config get(default) is forbidden")
+
+        config = DirectOnlyConfig(_make_config())
+        del config["on_duplicate"]
+
+        resolved = ChromaSink._resolve_sink_effect_mode(
+            config,
+            purpose=SinkEffectExecutionPurpose.FRESH,
+        )
+
         assert resolved is not None and resolved.value == "overwrite"

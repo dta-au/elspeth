@@ -1,0 +1,34 @@
+receivers:
+  otlp/elspeth:
+    protocols:
+      grpc:
+        endpoint: 127.0.0.1:4317
+processors:
+  memory_limiter/elspeth:
+    check_interval: 5s
+    limit_mib: 128
+    spike_limit_mib: 32
+  batch/elspeth:
+    send_batch_size: 512
+    send_batch_max_size: 1024
+    timeout: 5s
+exporters:
+  awsemf/elspeth:
+    namespace: ELSPETH/Operator
+    log_group_name: ${OPERATOR_METRICS_LOG_GROUP}
+    log_stream_name: telemetry
+    dimension_rollup_option: NoDimensionRollup
+    retain_initial_value_of_delta_metric: true
+    resource_to_telemetry_conversion:
+      enabled: true
+  awsxray/elspeth: {}
+service:
+  pipelines:
+    metrics/elspeth:
+      receivers: [otlp/elspeth]
+      processors: [memory_limiter/elspeth, batch/elspeth]
+      exporters: [awsemf/elspeth]
+    traces/elspeth:
+      receivers: [otlp/elspeth]
+      processors: [memory_limiter/elspeth, batch/elspeth]
+      exporters: [awsxray/elspeth]

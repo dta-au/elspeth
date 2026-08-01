@@ -39,6 +39,7 @@ import pytest
 from elspeth_lints.core.allowlist import JudgeVerdict, load_allowlist
 from elspeth_lints.core.cli import main
 from elspeth_lints.core.judge import (
+    _STATIC_POLICY_BLOCK,
     DEFAULT_JUDGE_MODEL,
     TRANSPORT_AGENT,
     TRANSPORT_OPENROUTER,
@@ -221,6 +222,77 @@ def _mock_judge_call(
 
 
 # ---------- call_judge: parsing ----------
+
+
+def test_static_policy_teaches_both_valid_trust_boundary_metadata_forms() -> None:
+    """The judge recommends only decorator forms accepted by the CI contract."""
+    policy = " ".join(_STATIC_POLICY_BLOCK.split())
+    assert "Raising boundary metadata (the function rejects malformed input by raising)" in policy
+    assert "MUST include both ``test_ref=<pytest nodeid>`` and ``test_fingerprint=<canonical AST fingerprint>``" in policy
+    assert "current behavioral test" in policy
+    assert "MUST omit ``non_raising=True``" in policy
+    assert "Non-raising boundary metadata" in policy
+    assert "optional-extraction, advisory, and convert-to-result boundaries" in policy
+    assert "returns a sentinel or result on malformed input and never raises on it" in policy
+    assert "MUST set ``non_raising=True``" in policy
+    assert "MUST omit both ``test_ref`` and ``test_fingerprint``" in policy
+    assert "mechanically verifies that malformed-input guards do not raise" in policy
+
+
+def test_static_policy_rejects_missing_or_contradictory_decorator_metadata() -> None:
+    """The prompt must fail closed instead of suggesting an invalid decorator."""
+    policy = " ".join(_STATIC_POLICY_BLOCK.split())
+    assert "A raising form missing either test field is INVALID" in policy
+    assert "A non-raising form carrying either test field is INVALID" in policy
+    assert "``non_raising=True`` on code whose malformed-input path raises is INVALID" in policy
+    assert "Do not emit a decorator recommendation with missing or contradictory metadata" in policy
+    assert "identify which metadata contract applies and enumerate its required and forbidden fields" in policy
+    assert "Never invent ``test_ref`` or ``test_fingerprint`` values" in policy
+    assert "Do not emit decorator code" in policy
+    assert "give that complete form" not in policy
+    assert "rationale describes a code-fix task" not in policy
+
+
+def test_static_policy_pins_explicit_tier1_synthesis_and_serialization_doctrine() -> None:
+    """Tier 1 remains owned data and permits only visibly explicit synthesis."""
+    policy = " ".join(_STATIC_POLICY_BLOCK.split())
+    assert 'value = owned["field"]' in policy
+    assert "if value is weird:" in policy
+    assert "value = correct_value" in policy
+    for forbidden in (
+        "``.get(default)``",
+        "truthiness fallback",
+        "exception fallback",
+        "implicit cast",
+        "helper-hidden normalization",
+    ):
+        assert forbidden in policy
+    assert "Serialization never demotes Tier 1" in policy
+
+
+def test_static_policy_bans_attribute_presence_proxies_without_revalidating_fixed_contracts() -> None:
+    """Unknown types use declared discrimination; fixed contracts direct-access."""
+    policy = " ".join(_STATIC_POLICY_BLOCK.split())
+    for forbidden in (
+        "``getattr``",
+        "``hasattr``",
+        "``inspect.getattr_static``",
+        "forwarding ``__getattr__``",
+        "property-swallowing",
+        "duck-typed presence probe",
+    ):
+        assert forbidden in policy
+    assert "At a genuinely unknown-type boundary" in policy
+    # ADR-032: the runtime-checkable-Protocol option was withdrawn — it is
+    # structural typing (an impostor passes) and since Python 3.12 it resolves
+    # through ``inspect.getattr_static`` (honest dynamic-attribute objects are
+    # rejected). Internal discrimination is nominal only.
+    assert "declared concrete type that ELSPETH defines" in policy
+    assert "Do NOT use a ``runtime_checkable`` ``Protocol`` for that discrimination" in policy
+    assert "never a security control" in policy
+    assert "Parse, don't validate" in policy
+    assert "Under a fixed contract, access the declared attribute directly and let breakage raise" in policy
+    assert "Do not use ``isinstance`` to revalidate Tier 1 or another fixed contract" in policy
 
 
 def test_call_judge_parses_should_use_decorator_with_blocked_verdict() -> None:

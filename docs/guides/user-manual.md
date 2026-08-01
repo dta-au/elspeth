@@ -124,6 +124,26 @@ Run completed: RunStatus.COMPLETED
 
 The **Run ID** is your key for querying the audit trail later.
 
+### Exit Codes
+
+`elspeth run --execute` (and `elspeth resume --execute`) exit with the
+engine's completion taxonomy, so scripts and CI wrappers can branch on the
+result:
+
+| Exit code | Meaning |
+|-----------|---------|
+| 0 | Completed successfully — every row reached a clean outcome. Also returned for a run whose source yielded zero rows. |
+| 1 | Completed with failures — at least one row failed or was quarantined (including a run where every row was quarantined). |
+| 2 | Failed — no row reached success or quarantine. |
+| 3 | Interrupted or evicted before completion. |
+| 4 | Framework or audit-integrity error. |
+
+Rows a source drops via a configured `on_validation_failure: discard` never
+enter the pipeline: the validation error is still recorded in the audit
+trail, but the run exits `0` when every ingested row succeeds. A transform's
+`on_error: discard` is different — the dropped row is recorded as a
+quarantined outcome, so the run reports completed-with-failures (exit `1`).
+
 ---
 
 ## Viewing Available Plugins
@@ -137,6 +157,7 @@ elspeth plugins list
 Output:
 ```
 SOURCES:
+  aws_s3               - Load bounded CSV, JSON-array, or JSONL rows from one immutable S3 object.
   azure_blob           - Load rows from Azure Blob Storage.
   csv                  - Load rows from a CSV file.
   dataverse            - Load rows from Microsoft Dataverse via OData v4 REST API.
@@ -145,32 +166,48 @@ SOURCES:
   text                 - Load one output row per text line into a configured column.
 
 TRANSFORMS:
-  azure_document_intelligence - Enrich rows with Azure AI Document Intelligence extraction.
-  blob_csv_expand     - Expand a payload-store CSV blob into rows.
-  blob_fetch          - Fetch an operator-authorised remote document into the payload store.
+  batch_classifier_metrics - Compute classifier confusion matrix and F-score metrics over a batch.
+  batch_data_quality_report - Report field-level batch quality counts and rates.
+  batch_distribution_profile - Compute distribution summaries over aggregation batches.
+  batch_drift_compare  - Compare baseline and current cohort distributions over a batch.
+  batch_effect_size    - Compute Cohen's d and Hedges' g for batch variant comparisons.
+  batch_experiment_compare - Compare experiment variants over a batch using mean deltas.
+  batch_outlier_annotator - Annotate batch rows with z-score and robust-z outlier signals.
+  batch_paired_preference - Compare paired variant scores over an aggregation batch.
   batch_replicate      - Replicate rows based on a copies field.
-  batch_stats          - Compute aggregate statistics over a batch, optionally per group_by value.
+  batch_stats          - Compute aggregate statistics over a batch of rows.
+  batch_threshold_summary - Report threshold match counts and rates for finite numeric batch values.
+  batch_top_k          - Report most frequent scalar values over a batch.
+  blob_csv_expand      - Parse a CSV blob and emit one output row per CSV data row.
+  blob_fetch           - Fetch an HTTP(S) URL into the run payload store and emit a blob reference.
   field_mapper         - Map, rename, and select row fields.
   json_explode         - Explode a JSON array field into multiple rows.
   keyword_filter       - Filter rows containing blocked content patterns.
+  line_explode         - Explode a string field into one output row per line.
   passthrough          - Pass rows through unchanged.
-  report_assemble      - Assemble a batch of text rows into one report row with pagination metadata.
+  report_assemble      - Assemble a paginated report from a flushed batch of text rows.
   truncate             - Truncate string fields to specified maximum lengths.
   type_coerce          - Perform explicit, strict, per-field type normalization.
   value_transform      - Apply expressions to compute new or modified field values.
   web_scrape           - Fetch webpages, extract content, generate fingerprints.
+  aws_bedrock_content_safety - Block configured harmful-content categories through Bedrock Guardrails.
+  aws_bedrock_prompt_shield - Block prompt attacks identified by an operator-owned Guardrail.
+  aws_textract_document_analysis - Enrich S3 document references through asynchronous Amazon Textract analysis.
   azure_content_safety - Analyze content using Azure Content Safety API.
+  azure_document_intelligence - Enrich rows with Azure Document Intelligence extraction (async analyze LRO).
   azure_prompt_shield  - Detect jailbreak attempts and prompt injection using Azure Prompt Shield.
   llm                  - Unified LLM transform with provider dispatch and strategy selection.
   rag_retrieval        - Enriches rows with retrieval-augmented context from search providers.
 
 SINKS:
+  aws_s3               - Write bounded cumulative CSV, JSON, or JSONL objects to AWS S3.
   azure_blob           - Write rows to Azure Blob Storage.
-  chroma_sink          - Write rows to a Chroma vector database.
+  chroma_sink          - Write pipeline rows into a ChromaDB collection.
   csv                  - Write rows to a CSV file.
   database             - Write rows to a database table.
   dataverse            - Write rows to Microsoft Dataverse via OData v4 REST API.
   json                 - Write rows to a JSON file.
+  text                 - Write one configured string field per canonical LF-delimited record.
 ```
 
 ### Filter by Type
@@ -297,6 +334,7 @@ Resume mode:
 - Uses `NullSource` (data comes from stored payloads)
 - Appends to existing output files (doesn't overwrite)
 - Continues from last successful checkpoint
+- Exits with the same [exit codes](#exit-codes) as `elspeth run --execute`
 
 ---
 
@@ -516,11 +554,27 @@ planner, produce the same canonical pipeline draft, and are checked by the same
 runtime validators, the same graph contracts, and the same audit trail.
 
 The choice of mode changes the conversation, not the pipeline language: the same
-canonical structures are available on both surfaces. Switching modes never
-discards pipeline state — only the authoring surface changes. (The staged guided
-conversation has two known, tracked exceptions, described under Known
-limitations below; those are specific defects being fixed, not a capability
-boundary.)
+canonical structures are available on both surfaces.
+
+### Switching between guided and freeform
+
+What a mode switch carries is **not symmetric**, and the asymmetry is a property
+of the wizard, not a capability boundary:
+
+- **Guided → freeform** carries the graph exactly. Dropping to freeform hands
+  the completed or in-progress pipeline to the freeform surface unchanged.
+- **Freeform → guided, re-entering after a guided exit** resumes the wizard you
+  left, with its reviewed stages intact.
+- **Freeform → guided for the first time**, or after a YAML import, starts a
+  **fresh wizard as a new version**. The existing draft is not adopted into the
+  wizard's stages: it stays in the session's version history and remains
+  reachable there, but the guided conversation begins from the source stage
+  rather than from your draft.
+
+So the safe reading is: guided → freeform loses nothing, and going back the way
+you came loses nothing. Turning guided on over freeform work for the first time
+is a new start — park anything you still want to edit in freeform before you do
+it.
 
 ### What guided mode is for
 
@@ -574,9 +628,13 @@ Because capability is identical, pick the interaction that fits how you think:
 - **Freeform** suits describing the whole pipeline at once, or refining a draft
   when you already know which plugins you want to wire together.
 
-Neither choice limits what you can build. Switch whenever the other interaction
-would be more convenient; the chat history and the pipeline draft carry over
-unchanged.
+Neither choice limits what you can build. Switching guided → freeform is
+lossless, and re-entering guided from that exit resumes the same wizard. Turning
+guided *on* for the first time — or after a YAML import — starts a fresh wizard
+instead of adopting the current draft, so finish or park freeform work you want
+to keep editing before you switch that direction. See
+[Switching between guided and freeform](#switching-between-guided-and-freeform)
+for the exact contract.
 
 ### Wrong-stage mentions are retained, not rejected
 
@@ -591,8 +649,13 @@ that owns the request has already been reviewed, guided opens the stable
 back/edit flow for that stage instead. Early-stage work is stored as interaction
 facts rather than a frozen partial pipeline, so a later requirement triggers a
 typed rewind to the affected stage and a replan — never an "unsupported
-topology" dead-end. (An unavailable plugin, by contrast, remains a distinct
-catalog/availability error.)
+topology" dead-end. A message that mixes a current-stage answer with a
+future-stage instruction applies both: the current stage is configured and the
+instruction is saved in the same turn. If guided cannot immediately verify the
+structure of a future-stage instruction, it still keeps it — as a pending
+instruction awaiting clarification — and asks you for the missing detail
+rather than dropping the request. (An unavailable plugin, by contrast, remains
+a distinct catalog/availability error.)
 
 ### Validation, interpretation, and sign-off
 
@@ -630,22 +693,12 @@ substitute a tutorial-only planner, remove capabilities from the planner schema,
 or rewrite the guided rules. Whatever you author in the tutorial transfers
 directly to a real guided session.
 
-### Known limitations of the staged conversation
+### Staged-conversation topology coverage
 
-Two topologies are not yet authorable through the staged guided conversation:
-
-- a **require-all (union) coalesce** — a fork whose parallel branches merge with
-  a require-all union (elspeth-93dd908354); and
-- a **cross-sink `on_write_failure` fallback** — an output whose write-failure
-  route targets another sink (elspeth-b83b5b3204).
-
-These are specific, tracked defects in how the staged conversation projects
-connections and sink options — not capability boundaries. The staged
-conversation therefore authors seven of the nine canonical structures directly.
-The same shared planner represents both topologies without trouble, so full
-parity is available today: build these two shapes in **freeform** (the
-single-turn `/guided/plan` endpoint authors them too). Both defects are being
-fixed so the staged conversation reaches the other two as well.
+The staged guided conversation authors all nine canonical structures directly,
+including require-all coalesces and cross-sink `on_write_failure` fallbacks.
+Those shapes use the same shared planner, validation, and commit path as
+freeform and the single-turn `/guided/plan` endpoint.
 
 ### See also
 

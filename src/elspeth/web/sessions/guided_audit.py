@@ -12,7 +12,7 @@ from elspeth.contracts.composer_llm_audit import ComposerChatTurn, ComposerLLMCa
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, stable_hash
-from elspeth.web.composer.audit import chat_turn_audit_envelope, llm_call_audit_envelope
+from elspeth.web.composer.audit import chat_turn_audit_envelope, llm_call_audit_envelope, llm_call_audit_summary
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.guided.protocol import ControlSignal, GuidedStep, TurnType
 from elspeth.web.composer.guided.state_machine import TerminalReason
@@ -158,7 +158,24 @@ def prepare_guided_audit_rows(
             # model-dispatched Composer tools and intentionally do not live
             # in MANIFEST, so the generic unknown-tool sentinel would destroy
             # their payload custody (including payload-reference binding).
-            content = json.dumps({"error_class": None, "error_message": None})
+            #
+            # ``_kind`` discriminator: every sibling content shape in this
+            # module carries one (guided_tool_audit / guided_tool_failure_
+            # audit / llm_call_audit / chat_turn_audit). Without it these
+            # rows rendered as bare '{"error_class": null, "error_message":
+            # null}' — "empty audit rows" that misled incident diagnosis.
+            # Safe to add: the failure-cohort commitment hashes are computed
+            # from these prepared rows at the same settlement write, so row
+            # bytes and commitment stay coherent for new writes, and stored
+            # rows verify against their own stored bytes.
+            content = json.dumps(
+                {
+                    "_kind": "guided_synthetic_audit",
+                    "tool_name": invocation.tool_name,
+                    "error_class": None,
+                    "error_message": None,
+                }
+            )
             envelope = {"_kind": "audit", "invocation": invocation.to_dict()}
         else:
             content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
@@ -182,17 +199,7 @@ def prepare_guided_audit_rows(
             content, envelope = _omitted_success_invocation(invocation)
         rows.append(PreparedGuidedAuditRow(kind="tool", content=content, envelope=envelope))
     for call in llm_calls:
-        content = json.dumps(
-            {
-                "_kind": "llm_call_audit",
-                "status": call.status.value,
-                "model_requested": call.model_requested,
-                "model_returned": call.model_returned,
-                "total_tokens": call.total_tokens,
-                "reasoning_tokens": call.reasoning_tokens,
-                "provider_cost": call.provider_cost,
-            }
-        )
+        content = llm_call_audit_summary(call)
         envelope = llm_call_audit_envelope(call)
         if call.status is not ComposerLLMCallStatus.SUCCESS:
             public_call = deep_thaw(envelope["call"])

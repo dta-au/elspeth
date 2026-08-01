@@ -44,6 +44,7 @@ from elspeth.contracts.enums import (
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     CapacityError,
+    ExecutionError,
     FrameworkBugError,
     MaxRetriesExceeded,
     OrchestrationInvariantError,
@@ -53,7 +54,7 @@ from elspeth.contracts.results import FailureInfo, GateResult
 from elspeth.contracts.routing import RoutingAction
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
-from elspeth.contracts.types import BranchName, CoalesceName, GateName, NodeID, SinkName
+from elspeth.contracts.types import BranchName, CoalesceName, GateName, NodeID, RowUnionName, SinkName
 from elspeth.core.checkpoint.recovery import IncompleteTokenSpec
 from elspeth.core.config import AggregationSettings, GateSettings
 from elspeth.core.landscape import LandscapeDB
@@ -75,6 +76,7 @@ from elspeth.engine.processor import (
     _LiveBarrierHold,
 )
 from elspeth.engine.retry import RetryManager
+from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome
 from elspeth.engine.spans import SpanFactory
 from elspeth.engine.work_items import WorkItem
 from elspeth.plugins.infrastructure.clients.llm import LLMClientError
@@ -313,6 +315,9 @@ def _make_processor(
     coalesce_executor: Any = None,
     coalesce_node_ids: dict[CoalesceName, NodeID] | None = None,
     branch_to_coalesce: dict[BranchName, CoalesceName] | None = None,
+    row_union_executor: Any = None,
+    row_union_node_ids: dict[RowUnionName, NodeID] | None = None,
+    branch_to_row_union: dict[BranchName, RowUnionName] | None = None,
     branch_to_sink: dict[BranchName, str] | None = None,
     node_step_map: dict[NodeID, int] | None = None,
     coalesce_on_success_map: dict[CoalesceName, str] | None = None,
@@ -358,6 +363,7 @@ def _make_processor(
     node_ids_to_register.update(traversal_next)
     node_ids_to_register.update(node_id for node_id in traversal_next.values() if node_id is not None)
     node_ids_to_register.update(coalesce_nodes.values())
+    node_ids_to_register.update((row_union_node_ids or {}).values())
     node_ids_to_register.update((aggregation_settings or {}).keys())
 
     for node_id in sorted(node_ids_to_register, key=str):
@@ -369,6 +375,9 @@ def _make_processor(
         if node_id in coalesce_nodes.values():
             node_type = NodeType.COALESCE
             plugin_name = "coalesce"
+        elif node_id in (row_union_node_ids or {}).values():
+            node_type = NodeType.ROW_UNION
+            plugin_name = "row_union"
         elif node_id in (aggregation_settings or {}):
             node_type = NodeType.AGGREGATION
             plugin_name = "aggregation"
@@ -396,6 +405,7 @@ def _make_processor(
         node_to_plugin=traversal_node_to_plugin,
         node_to_next=traversal_next,
         coalesce_node_map=coalesce_nodes,
+        row_union_node_map=dict(row_union_node_ids or {}),
         structural_node_ids=traversal_structural,
     )
 
@@ -426,6 +436,8 @@ def _make_processor(
         retry_manager=retry_manager,
         coalesce_executor=coalesce_executor,
         branch_to_coalesce=branch_to_coalesce,
+        row_union_executor=row_union_executor,
+        branch_to_row_union=branch_to_row_union,
         branch_to_sink={BranchName(k): SinkName(v) for k, v in (branch_to_sink or {}).items()},
         coalesce_on_success_map=coalesce_on_success_map,
         barrier_restore=barrier_restore,
@@ -3485,13 +3497,15 @@ class TestProcessRowGateBranching:
 
         inherited_sinks: list[str | None] = []
 
-        def continuation_side_effect(*, token, current_node_id, coalesce_name=None, on_success_sink=None):
+        def continuation_side_effect(*, token, current_node_id, coalesce_name=None, row_union_name=None, on_success_sink=None):
             inherited_sinks.append(on_success_sink)
             return WorkItem(
                 token=token,
                 current_node_id=None,
                 coalesce_node_id=None,
                 coalesce_name=coalesce_name,
+                row_union_node_id=NodeID(f"row_union::{row_union_name}") if row_union_name is not None else None,
+                row_union_name=row_union_name,
                 on_success_sink=on_success_sink,
             )
 
@@ -8256,6 +8270,125 @@ class TestTelemetryEmission:
         telemetry.handle_event.assert_called_once_with(event)
 
 
+class TestRowUnionBranchLossTelemetry:
+    def test_follower_stages_durable_loss_without_executor(self) -> None:
+        _, factory = _make_factory()
+        lost_token = make_token_info(row_id="row-1", token_id="lost-token", branch_name="control")
+        processor = _make_processor(
+            factory,
+            row_union_executor=None,
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+        )
+
+        assert processor._notify_row_union_of_lost_branch(lost_token, "error_routed") == []
+
+        loss = processor._take_claim_branch_loss("lost-token")
+        assert loss is not None
+        assert loss.coalesce_name == "variants"
+        assert loss.row_id == "row-1"
+        assert loss.branch_name == "control"
+        assert loss.reason == "error_routed"
+
+    def test_failed_siblings_emit_token_completed_after_audit(self) -> None:
+        _, factory = _make_factory()
+        held_sibling = make_token_info(row_id="row-1", token_id="held-token", branch_name="treatment")
+        lost_token = make_token_info(row_id="row-1", token_id="lost-token", branch_name="control")
+        row_union_executor = create_autospec(RowUnionExecutor, instance=True)
+        row_union_executor.is_group_released.return_value = False
+        row_union_executor.notify_branch_lost.return_value = RowUnionOutcome(
+            held=False,
+            consumed_tokens=(held_sibling,),
+            failure_reason="row_union_branch_lost",
+            row_union_name="variants",
+            outcomes_recorded=True,
+        )
+        telemetry = create_autospec(TelemetryManagerProtocol, instance=True)
+        processor = _make_processor(
+            factory,
+            row_union_executor=row_union_executor,
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+            telemetry_manager=telemetry,
+        )
+
+        with patch.object(processor, "_complete_row_union_fire"):
+            results = processor._notify_row_union_of_lost_branch(lost_token, "error_routed")
+
+        assert [result.token.token_id for result in results] == ["held-token"]
+        telemetry.handle_event.assert_called_once()
+        event = telemetry.handle_event.call_args.args[0]
+        assert event.token_id == "held-token"
+        assert event.outcome is TerminalOutcome.FAILURE
+        assert event.path is TerminalPath.UNROUTED
+
+    def test_released_group_stages_no_durable_loss_leader(self) -> None:
+        # Released row_union tokens keep branch_name, so a terminal divert
+        # downstream of the union re-enters the loss path; a released group
+        # must not stage a durable pre-barrier loss record.
+        _, factory = _make_factory()
+        released_token = make_token_info(row_id="row-1", token_id="released-token", branch_name="control")
+        row_union_executor = create_autospec(RowUnionExecutor, instance=True)
+        row_union_executor.is_group_released.return_value = True
+        processor = _make_processor(
+            factory,
+            row_union_executor=row_union_executor,
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+        )
+
+        assert processor._notify_row_union_of_lost_branch(released_token, "routed_to_sink") == []
+
+        row_union_executor.notify_branch_lost.assert_not_called()
+        assert processor._take_claim_branch_loss("released-token") is None
+
+    def test_released_group_stages_no_durable_loss_follower(self) -> None:
+        # Followers have no executor; the durable status-COMPLETED node state
+        # committed by the release is the discriminator.
+        _, factory = _make_factory()
+        union_node = NodeID("row_union::variants")
+        processor = _make_processor(
+            factory,
+            row_union_executor=None,
+            row_union_node_ids={RowUnionName("variants"): union_node},
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+        )
+        factory.data_flow.create_row("test-run", "source-0", 0, {"a": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_token("row-1", token_id="released-token")
+        state = factory.execution.begin_node_state("released-token", str(union_node), "test-run", 1, {"a": 1})
+        factory.execution.complete_node_state(state.state_id, NodeStateStatus.COMPLETED, output_data={"a": 1}, duration_ms=1.0)
+        released_token = make_token_info(row_id="row-1", token_id="released-token", branch_name="control")
+
+        assert processor._notify_row_union_of_lost_branch(released_token, "routed_to_sink") == []
+
+        assert processor._take_claim_branch_loss("released-token") is None
+
+    def test_failure_closed_group_still_stages_durable_loss_follower(self) -> None:
+        # A FAILED closure at the union node is not a release: a later
+        # pre-barrier loss for the same group is still a true loss record.
+        _, factory = _make_factory()
+        union_node = NodeID("row_union::variants")
+        processor = _make_processor(
+            factory,
+            row_union_executor=None,
+            row_union_node_ids={RowUnionName("variants"): union_node},
+            branch_to_row_union={BranchName("control"): RowUnionName("variants")},
+        )
+        factory.data_flow.create_row("test-run", "source-0", 0, {"a": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_token("row-1", token_id="failed-token")
+        state = factory.execution.begin_node_state("failed-token", str(union_node), "test-run", 1, {"a": 1})
+        factory.execution.complete_node_state(
+            state.state_id,
+            NodeStateStatus.FAILED,
+            error=ExecutionError(exception="row_union_timeout", exception_type="RowUnionFailureReason"),
+            duration_ms=1.0,
+        )
+        lost_token = make_token_info(row_id="row-1", token_id="failed-token", branch_name="control")
+
+        assert processor._notify_row_union_of_lost_branch(lost_token, "error_routed") == []
+
+        loss = processor._take_claim_branch_loss("failed-token")
+        assert loss is not None
+        assert loss.branch_name == "control"
+
+
 # =============================================================================
 # Regression: hscm.1 — Terminal deaggregation children inherit correct sink
 # =============================================================================
@@ -8532,6 +8665,35 @@ class TestCoalesceTraversalInvariant:
         # Follower coalesce barrier: (None, []) → mark_blocked, not a completion.
         assert result is None
         assert child_items == []
+
+
+class TestRowUnionTraversalInvariant:
+    def test_work_item_downstream_of_row_union_raises_invariant_error(self) -> None:
+        _db, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+        source_node = NodeID("source-0")
+        row_union_node = NodeID("row-union-1")
+        downstream_node = NodeID("downstream-2")
+        processor = _make_processor(
+            factory,
+            source_on_success="output",
+            node_step_map={source_node: 0, row_union_node: 1, downstream_node: 2},
+            node_to_next={source_node: row_union_node, row_union_node: downstream_node, downstream_node: None},
+            node_to_plugin={},
+            row_union_node_ids={RowUnionName("variant_union"): row_union_node},
+            structural_node_ids=frozenset({source_node, row_union_node, downstream_node}),
+        )
+        token = make_token_info(row_id="row-1", token_id="tok-1", branch_name="variant_a")
+        _persist_token_for_scheduler(factory, token)
+
+        with pytest.raises(OrchestrationInvariantError, match="downstream of row_union"):
+            processor._process_single_token(
+                token=token,
+                ctx=ctx,
+                current_node_id=downstream_node,
+                row_union_node_id=row_union_node,
+                row_union_name=RowUnionName("variant_union"),
+            )
 
 
 class TestTerminalWorkItemInvariant:
@@ -9018,6 +9180,58 @@ class TestGateJumpPastCoalesceInvariant:
                 coalesce_name=CoalesceName("merge"),
             )
 
+    def test_gate_jump_past_row_union_raises_invariant_error(self) -> None:
+        _db, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+        source_node = NodeID("source-0")
+        gate_node = NodeID("gate-1")
+        row_union_node = NodeID("row-union::variant_union")
+        past_row_union_node = NodeID("transform-3")
+        config_gate = GateSettings(
+            name="router",
+            input="in_conn",
+            condition="'skip_ahead'",
+            routes={"skip_ahead": "skip_conn"},
+        )
+        processor = _make_processor(
+            factory,
+            source_on_success="default",
+            node_step_map={source_node: 0, gate_node: 1, row_union_node: 2, past_row_union_node: 3},
+            node_to_next={
+                source_node: gate_node,
+                gate_node: row_union_node,
+                row_union_node: past_row_union_node,
+                past_row_union_node: None,
+            },
+            node_to_plugin={gate_node: config_gate},
+            row_union_node_ids={RowUnionName("variant_union"): row_union_node},
+            structural_node_ids=frozenset({source_node, row_union_node, past_row_union_node}),
+        )
+        gate_result = GateResult(
+            row={"value": 42},
+            action=RoutingAction.route("skip_ahead"),
+            contract=_make_contract(),
+        )
+
+        def config_gate_side_effect(*, gate_config, node_id, token, ctx, token_manager=None):
+            return GateOutcome(result=gate_result, updated_token=token, next_node_id=past_row_union_node)
+
+        token = make_token_info(row_id="row-1", token_id="tok-1", branch_name="variant_a")
+        _persist_token_for_scheduler(factory, token)
+
+        with (
+            patch.object(processor._gate_executor, "execute_config_gate", side_effect=config_gate_side_effect),
+            patch.object(processor._nav, "resolve_jump_target_sink", return_value="some_sink"),
+            pytest.raises(OrchestrationInvariantError, match=r"Gate jump moved token.*past its row_union node"),
+        ):
+            processor._process_single_token(
+                token=token,
+                ctx=ctx,
+                current_node_id=gate_node,
+                row_union_node_id=row_union_node,
+                row_union_name=RowUnionName("variant_union"),
+            )
+
     def test_gate_jump_before_coalesce_is_allowed(self) -> None:
         """Gate jump to a node BEFORE the coalesce node must NOT raise.
 
@@ -9339,6 +9553,11 @@ class TestReadyEmissionEnqueueParity:
             # node structural (in node_to_next, no plugin) so queue_key derives
             # the node id.
             "structural_queue",
+            # row_union-cursor item: the third barrier kind. Without a flavor
+            # that sets row_union_name non-None, both derivations project the
+            # column as NULL and the parity assertion passes while a drop site
+            # ships (elspeth-a5b86149d4 remediation).
+            "row_union_cursor",
         ],
     )
     def test_ready_emission_mirrors_enqueue_work_item_fields(self, flavor: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -9375,6 +9594,23 @@ class TestReadyEmissionEnqueueParity:
                 current_node_id=continue_node,
                 coalesce_node_id=coalesce_node,
                 coalesce_name=CoalesceName("merge"),
+                on_success_sink="merged_sink",
+            )
+        elif flavor == "row_union_cursor":
+            token = TokenInfo(
+                row_id="row-1",
+                token_id="token-merged-1",
+                row_data=make_pipeline_row({"value": 42}),
+                branch_name="path_a",
+                fork_group_id="fork-1",
+                expand_group_id="expand-1",
+            )
+            _persist_token_for_scheduler(factory, token)
+            item = WorkItem(
+                token=token,
+                current_node_id=continue_node,
+                row_union_node_id=NodeID("row_union::variants"),
+                row_union_name=RowUnionName("variants"),
                 on_success_sink="merged_sink",
             )
         else:
@@ -9438,13 +9674,14 @@ class TestReadyEmissionEnqueueParity:
             expand_group_id=emission.expand_group_id,
             coalesce_node_id=emission.coalesce_node_id,
             coalesce_name=emission.coalesce_name,
+            row_union_name=emission.row_union_name,
         )
 
         assert values_from_emission == values_from_enqueue
         # Pin the projected column count: adding a journal column to ONE of
         # the two builders (or to the mapper) must force this pin to be
         # revisited rather than silently desync the reconciliation contract.
-        assert len(values_from_emission) == 29
+        assert len(values_from_emission) == 30
 
         # Spot-check the per-flavor derived keys so a failure localizes.
         if flavor == "coalesce_cursor":
@@ -9454,11 +9691,23 @@ class TestReadyEmissionEnqueueParity:
             assert values_from_emission["coalesce_name"] == "merge"
             assert values_from_emission["branch_name"] == "path_a"
             assert values_from_emission["fork_group_id"] == "fork-1"
+            assert values_from_emission["row_union_name"] is None
+        elif flavor == "row_union_cursor":
+            # A barrier-bound item never derives a structural queue key, and
+            # the row_union name IS the durable barrier key.
+            assert values_from_emission["queue_key"] is None
+            assert values_from_emission["barrier_key"] == "variants"
+            assert values_from_emission["row_union_name"] == "variants"
+            assert values_from_emission["coalesce_node_id"] is None
+            assert values_from_emission["coalesce_name"] is None
+            assert values_from_emission["branch_name"] == "path_a"
+            assert values_from_emission["fork_group_id"] == "fork-1"
         else:
             assert values_from_emission["queue_key"] == str(continue_node)
             assert values_from_emission["barrier_key"] is None
             assert values_from_emission["coalesce_node_id"] is None
             assert values_from_emission["coalesce_name"] is None
+            assert values_from_emission["row_union_name"] is None
             assert values_from_emission["join_group_id"] == "join-1"
         assert values_from_emission["expand_group_id"] == "expand-1"
         assert values_from_emission["step_index"] == 2

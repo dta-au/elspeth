@@ -966,6 +966,89 @@ class TestR5IsinstanceClassification:
 
         assert self._r5_findings(source, filename="web/composer/llm_response_parsing.py") == []
 
+    @pytest.mark.parametrize(
+        ("helper_name", "filename"),
+        (
+            ("_collect_secret_refs", "web/execution/_validation_authoring.py"),
+            ("_secret_ref_exists", "web/execution/_validation_authoring.py"),
+            ("review_interpretations", "web/execution/_validation_authoring.py"),
+            ("_find_identity_node_advisories", "web/execution/_validation_diagnostics.py"),
+            ("_find_gate_fan_out_advisories", "web/execution/_validation_diagnostics.py"),
+            ("_infer_component_type_from_plugin_error", "web/execution/_validation_diagnostics.py"),
+            ("validate_pipeline", "web/execution/validation.py"),
+        ),
+    )
+    def test_execution_validation_helper_names_receive_no_closed_exemption(self, helper_name: str, filename: str) -> None:
+        source = dedent(f"""
+            def {helper_name}(value):
+                if isinstance(value, dict):
+                    return value
+                return None
+        """)
+
+        assert len(self._r5_findings(source, filename=filename)) == 1
+
+    @pytest.mark.parametrize(
+        ("source", "filename"),
+        (
+            (
+                """
+                from dataclasses import dataclass
+
+                @dataclass(frozen=True)
+                class TokenInfo:
+                    row_id: str
+
+                    def __post_init__(self) -> None:
+                        assert isinstance(self.row_id, str)
+                """,
+                "contracts/token.py",
+            ),
+            (
+                """
+                from pydantic import BaseModel, field_validator
+
+                class RunEvent(BaseModel):
+                    payload: object
+
+                    @field_validator("payload", mode="before")
+                    @classmethod
+                    def _validate_payload(cls, value):
+                        assert isinstance(value, dict)
+                        return value
+                """,
+                "web/execution/schemas.py",
+            ),
+            (
+                """
+                from fastapi import APIRouter
+
+                router = APIRouter()
+
+                @router.post("/sessions")
+                async def create_session(payload):
+                    assert isinstance(payload, dict)
+                    return payload
+                """,
+                "web/sessions/routes.py",
+            ),
+            (
+                """
+                from collections.abc import Mapping
+
+                def token_usage_from_response(response):
+                    assert isinstance(response, Mapping)
+                    return response
+                """,
+                "web/composer/llm_response_parsing.py",
+            ),
+        ),
+        ids=("frozen-post-init", "pydantic-before", "fastapi-route", "named-boundary"),
+    )
+    def test_assert_only_guard_stays_r5_inside_other_allowed_contexts(self, source: str, filename: str) -> None:
+        """Context exemptions must not make an optimized-away assertion a runtime guard."""
+        assert len(self._r5_findings(dedent(source), filename=filename)) == 1
+
     def test_unlisted_web_helper_still_flagged(self) -> None:
         """The boundary-helper split must not suppress arbitrary web helpers."""
         source = dedent("""
@@ -976,6 +1059,345 @@ class TestR5IsinstanceClassification:
         """)
 
         assert len(self._r5_findings(source, filename="web/composer/service.py")) == 1
+
+    @pytest.mark.parametrize(
+        "assertion",
+        (
+            "assert isinstance(value, str)",
+            "assert isinstance(value, str) and value",
+            "assert ready and isinstance(value, str) and valid",
+            "assert ready and (valid and isinstance(value, str))",
+        ),
+    )
+    def test_assert_test_isinstance_without_runtime_guard_still_flagged(self, assertion: str) -> None:
+        """An assertion cannot own a runtime contract because ``-O`` removes it."""
+        source = dedent(f"""\
+            def process(value, ready=True, valid=True):
+                {assertion}
+                return value
+        """)
+
+        assert len(self._r5_findings(source)) == 1
+
+    def test_assert_test_isinstance_after_matching_runtime_guard_not_flagged(self) -> None:
+        """A surviving explicit guard may dominate a narrowing-only assertion."""
+        source = dedent("""\
+            def process(value):
+                if not isinstance(value, str):
+                    raise TypeError("value must be str")
+                assert isinstance(value, str)
+                return value
+        """)
+
+        assert [finding.line for finding in self._r5_findings(source)] == [2]
+
+    @pytest.mark.parametrize(
+        ("guard", "assertion"),
+        (
+            (
+                "if not isinstance(value, str):",
+                "assert (value := replacement) and isinstance(value, str)",
+            ),
+            (
+                "if not isinstance(value, expected):",
+                "assert (expected := int) and isinstance(value, expected)",
+            ),
+            (
+                "if not isinstance(value, str):",
+                "assert ready and (isinstance(value, str) and valid)",
+            ),
+            (
+                "if not isinstance(value, str):",
+                "assert (ready and isinstance(value, str)) and valid",
+            ),
+        ),
+        ids=("subject-walrus", "type-walrus", "nested-outer-late", "nested-inner-late"),
+    )
+    def test_prior_assert_conjunct_prevents_runtime_guard_dominance(self, guard: str, assertion: str) -> None:
+        """Every enclosing ``and`` must evaluate the guarded call first."""
+        source = dedent(f"""\
+            def process(value, expected, replacement, ready=True, valid=True):
+                {guard}
+                    raise TypeError("value has the wrong type")
+                {assertion}
+        """)
+
+        assert [finding.line for finding in self._r5_findings(source)] == [2, 4]
+
+    @pytest.mark.parametrize(
+        "assertion",
+        (
+            "assert isinstance(value, str) and (value := replacement)",
+            "assert (isinstance(value, str) and ready) and valid",
+        ),
+        ids=("later-subject-walrus", "nested-first"),
+    )
+    def test_later_assert_conjunct_preserves_runtime_guard_dominance(self, assertion: str) -> None:
+        """A later conjunct cannot invalidate the type check before it executes."""
+        source = dedent(f"""\
+            def process(value, replacement, ready=True, valid=True):
+                if not isinstance(value, str):
+                    raise TypeError("value must be str")
+                {assertion}
+        """)
+
+        assert [finding.line for finding in self._r5_findings(source)] == [2]
+
+    def test_conditionally_executed_runtime_guard_does_not_dominate_assertion(self) -> None:
+        """A guard on only one control-flow path cannot justify the exemption."""
+        source = dedent("""\
+            def process(value, validate):
+                if validate:
+                    if not isinstance(value, str):
+                        raise TypeError("value must be str")
+                assert isinstance(value, str)
+                return value
+        """)
+
+        assert [finding.line for finding in self._r5_findings(source)] == [3, 5]
+
+    def test_non_terminating_type_check_does_not_dominate_assertion(self) -> None:
+        """The negative branch must terminate before the assertion can be narrowing-only."""
+        source = dedent("""\
+            def process(value):
+                if not isinstance(value, str):
+                    log_invalid(value)
+                assert isinstance(value, str)
+                return value
+        """)
+
+        assert [finding.line for finding in self._r5_findings(source)] == [2, 4]
+
+    def test_runtime_guard_invalidated_by_reassignment_does_not_dominate_assertion(self) -> None:
+        """Rebinding the checked value invalidates the earlier runtime fact."""
+        source = dedent("""\
+            def process(value, replacement):
+                if not isinstance(value, str):
+                    raise TypeError("value must be str")
+                value = replacement
+                assert isinstance(value, str)
+                return value
+        """)
+
+        assert [finding.line for finding in self._r5_findings(source)] == [2, 5]
+
+    @pytest.mark.parametrize(
+        ("target", "assignment"),
+        (
+            ("container.value", "container.value = replacement"),
+            ("items[0]", "items[0] = replacement"),
+        ),
+    )
+    def test_runtime_guard_invalidated_by_rooted_target_assignment(
+        self,
+        target: str,
+        assignment: str,
+    ) -> None:
+        """Store context must not hide mutation of an attribute or subscript target."""
+        source = dedent(f"""\
+            def process(container, items, replacement):
+                if not isinstance({target}, str):
+                    raise TypeError("target must be str")
+                {assignment}
+                assert isinstance({target}, str)
+        """)
+
+        assert [finding.line for finding in self._r5_findings(source)] == [2, 5]
+
+    def test_runtime_guard_for_different_value_does_not_dominate_assertion(self) -> None:
+        """Only a guard for the assertion's exact target and type may exempt it."""
+        source = dedent("""\
+            def process(value, other):
+                if not isinstance(other, str):
+                    raise TypeError("other must be str")
+                assert isinstance(value, str)
+                return value
+        """)
+
+        assert [finding.line for finding in self._r5_findings(source)] == [2, 4]
+
+    @pytest.mark.parametrize(
+        "subject",
+        ("factory()", "record.value", "items[0]"),
+        ids=("call", "attribute", "subscript"),
+    )
+    def test_effectful_or_unstable_subject_does_not_support_assert_dominance(self, subject: str) -> None:
+        """Two structurally equal expressions need not produce the same runtime value."""
+        source = dedent(f"""\
+            def process(factory, record, items):
+                if not isinstance({subject}, str):
+                    raise TypeError("subject must be str")
+                assert isinstance({subject}, str)
+        """)
+
+        assert [finding.line for finding in self._r5_findings(source)] == [2, 4]
+
+    @pytest.mark.parametrize(
+        "type_expression",
+        ("type_factory()", "registry.expected", "types_by_name['expected']"),
+        ids=("call", "attribute", "subscript"),
+    )
+    def test_effectful_or_unstable_type_input_does_not_support_assert_dominance(self, type_expression: str) -> None:
+        """The type input must be a stable binding as well as the checked subject."""
+        source = dedent(f"""\
+            def process(value, type_factory, registry, types_by_name):
+                if not isinstance(value, {type_expression}):
+                    raise TypeError("value has the wrong type")
+                assert isinstance(value, {type_expression})
+        """)
+
+        assert [finding.line for finding in self._r5_findings(source)] == [2, 4]
+
+    def test_runtime_guard_invalidated_by_type_name_reassignment_does_not_dominate_assertion(self) -> None:
+        """Rebinding either isinstance operand invalidates the earlier runtime fact."""
+        source = dedent("""\
+            def process(value, expected):
+                if not isinstance(value, expected):
+                    raise TypeError("value has the wrong type")
+                expected = int
+                assert isinstance(value, expected)
+        """)
+
+        assert [finding.line for finding in self._r5_findings(source)] == [2, 5]
+
+    @pytest.mark.parametrize(
+        ("body", "assert_line"),
+        (
+            (
+                """\
+                for value in values:
+                    assert isinstance(value, str)
+                """,
+                5,
+            ),
+            (
+                """\
+                if (value := replacement):
+                    assert isinstance(value, str)
+                """,
+                5,
+            ),
+            (
+                """\
+                with manager as value:
+                    assert isinstance(value, str)
+                """,
+                5,
+            ),
+            (
+                """\
+                match payload:
+                    case {"value": value}:
+                        assert isinstance(value, str)
+                """,
+                6,
+            ),
+            (
+                """\
+                try:
+                    value = replacement
+                finally:
+                    assert isinstance(value, str)
+                """,
+                7,
+            ),
+        ),
+        ids=("for-target", "walrus", "with-target", "match-capture", "try-finally"),
+    )
+    def test_runtime_guard_does_not_cross_binding_or_effect_constructs(self, body: str, assert_line: int) -> None:
+        """Dominance proof stays within the assertion's immediate statement list."""
+        source = (
+            dedent("""\
+            def process(value, values, replacement, manager, payload):
+                if not isinstance(value, str):
+                    raise TypeError("value must be str")
+        """)
+            + "    "
+            + dedent(body).replace("\n", "\n    ").rstrip()
+            + "\n"
+        )
+
+        assert [finding.line for finding in self._r5_findings(source)] == [2, assert_line]
+
+    @pytest.mark.parametrize(
+        "intervening",
+        (
+            """\
+            def value():
+                return object()
+            """,
+            """\
+            class value:
+                pass
+            """,
+            "import builtins as value",
+            """\
+            try:
+                raise ValueError
+            except ValueError as value:
+                pass
+            """,
+        ),
+        ids=("function-binding", "class-binding", "import-binding", "except-binding"),
+    )
+    def test_intervening_name_binding_prevents_assert_dominance(self, intervening: str) -> None:
+        """Only an immediately preceding guard can support the assertion exemption."""
+        indented_intervening = "    " + dedent(intervening).replace("\n", "\n    ").rstrip()
+        source = (
+            dedent("""\
+                def process(value):
+                    if not isinstance(value, str):
+                        raise TypeError("value must be str")
+            """)
+            + indented_intervening
+            + "\n    assert isinstance(value, str)\n"
+        )
+
+        assert len(self._r5_findings(source)) == 2
+
+    @pytest.mark.parametrize(
+        "assertion",
+        (
+            "assert isinstance(value, str) or ready",
+            "assert not isinstance(value, str)",
+            "assert all(isinstance(item, str) for item in value)",
+            "assert [isinstance(item, str) for item in value]",
+            "assert (lambda: isinstance(value, str))()",
+            "assert bool(isinstance(value, str))",
+            "assert ready, isinstance(value, str)",
+        ),
+    )
+    def test_isinstance_outside_direct_or_and_only_assert_test_still_flagged(self, assertion: str) -> None:
+        """Wrappers, inversion, disjunction, comprehensions, and messages remain R5."""
+        source = dedent(f"""\
+            def process(value, ready=True):
+                {assertion}
+                return value
+        """)
+
+        assert len(self._r5_findings(source)) == 1
+
+    def test_assert_isinstance_exemption_still_visits_nested_masking_calls(self) -> None:
+        """Flag the unguarded R5 call and keep visiting nested masking calls."""
+        source = dedent("""\
+            def process(payload):
+                assert isinstance(payload.get("value"), str) and payload.get("ready")
+                return payload
+        """)
+
+        findings = parse_and_visit(source)
+
+        assert [finding.rule_id for finding in findings] == ["R5", "R1", "R1"]
+
+    def test_isinstance_in_assert_message_stays_flagged_when_test_is_direct_isinstance(self) -> None:
+        """Both assert-test and assert-message checks remain R5 without a runtime guard."""
+        source = dedent("""\
+            def process(value):
+                assert isinstance(value, str), isinstance(value, object)
+                return value
+        """)
+
+        assert len(self._r5_findings(source)) == 2
 
 
 # =============================================================================
@@ -2605,6 +3027,192 @@ class TestC83InFileTransplantDefence:
         matched = _match_finding(al, finding)
         assert matched is entry
         assert entry.matched is True
+
+    def test_matcher_raises_for_stale_scope_binding(self) -> None:
+        """The direct matcher preserves the binding verifier's strict failure."""
+        finding = Finding(
+            rule_id="R1",
+            file_path="plugins/widget.py",
+            line=10,
+            col=4,
+            symbol_context=("Widget", "lookup"),
+            fingerprint="livefp00",
+            code_snippet="payload.get(...)",
+            message="dict.get on Tier-2 data",
+            ast_path="body[0]/body[1]/body[2]/value",
+            scope_fingerprint="b" * 64,
+        )
+        entry = AllowlistEntry(
+            key=finding.canonical_key,
+            owner="historic-agent",
+            reason="r",
+            safety="s",
+            expires=None,
+            ast_path=finding.ast_path,
+            scope_fingerprint="a" * 64,
+            judge_signature_version=2,
+            judge_transport="codex_cli",
+            judge_verdict=JudgeVerdict.ACCEPTED,
+            judge_recorded_at=datetime(2026, 5, 1, tzinfo=UTC),
+            judge_model=DEFAULT_JUDGE_MODEL,
+            judge_policy_hash=JUDGE_POLICY_HASH,
+            judge_rationale="judge accepted the former enclosing scope",
+            judge_metadata_signature=f"hmac-sha256:{'0' * 64}",
+        )
+        allowlist = Allowlist(entries=[entry], per_file_rules=[])
+
+        with pytest.raises(ValueError, match=r"scope_fingerprint mismatch.*plugins/widget\.py"):
+            _match_finding(allowlist, finding)
+        assert entry.matched is False
+        assert allowlist.get_unused_entries() == [entry]
+
+    def test_run_check_reports_stale_scope_binding_as_live_violation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Collection fails closed without replacing ordinary finding output."""
+        import elspeth_lints.rules.trust_tier.tier_model.rule as tier_rule
+
+        finding = Finding(
+            rule_id="R1",
+            file_path="plugins/widget.py",
+            line=10,
+            col=4,
+            symbol_context=("Widget", "lookup"),
+            fingerprint="livefp00",
+            code_snippet="payload.get(...)",
+            message="dict.get on Tier-2 data",
+            ast_path="body[0]/body[1]/body[2]/value",
+            scope_fingerprint="b" * 64,
+        )
+        entry = AllowlistEntry(
+            key=finding.canonical_key,
+            owner="historic-agent",
+            reason="r",
+            safety="s",
+            expires=None,
+            ast_path=finding.ast_path,
+            scope_fingerprint="a" * 64,
+            judge_signature_version=2,
+            judge_transport="codex_cli",
+            judge_verdict=JudgeVerdict.ACCEPTED,
+            judge_recorded_at=datetime(2026, 5, 1, tzinfo=UTC),
+            judge_model=DEFAULT_JUDGE_MODEL,
+            judge_policy_hash=JUDGE_POLICY_HASH,
+            judge_rationale="judge accepted the former enclosing scope",
+            judge_metadata_signature=f"hmac-sha256:{'0' * 64}",
+        )
+        allowlist = Allowlist(entries=[entry], per_file_rules=[])
+        monkeypatch.setattr(tier_rule, "_load_tier_model_allowlist", lambda *_args, **_kwargs: allowlist)
+        monkeypatch.setattr(tier_rule, "scan_directory_with_observations", lambda *_args: ([finding], []))
+        monkeypatch.setattr(tier_rule, "scan_layer_imports_directory", lambda *_args: ([], []))
+        args = argparse.Namespace(
+            root=tmp_path,
+            allowlist=tmp_path / "allowlist",
+            exclude=[],
+            format="text",
+            files=[],
+        )
+
+        assert run_check(args) == 1
+        captured = capsys.readouterr()
+        assert "VIOLATIONS FOUND: 1" in captured.out
+        assert finding.canonical_key in captured.out
+        assert "STALE ALLOWLIST ENTRIES: 1" in captured.out
+        assert "Error:" not in captured.err
+        assert "Traceback" not in captured.out + captured.err
+
+    def test_run_check_reports_stale_tc_scope_binding_as_layer_warning(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The TYPE_CHECKING collection loop uses the same fail-closed binding path."""
+        import elspeth_lints.rules.trust_tier.tier_model.rule as tier_rule
+
+        finding = Finding(
+            rule_id="TC",
+            file_path="plugins/widget.py",
+            line=10,
+            col=4,
+            symbol_context=("Widget", "lookup"),
+            fingerprint="livefp00",
+            code_snippet="from elspeth.core import Thing",
+            message="TYPE_CHECKING upward import",
+            ast_path="body[0]/body[1]/body[2]",
+            scope_fingerprint="b" * 64,
+        )
+        entry = AllowlistEntry(
+            key=finding.canonical_key,
+            owner="historic-agent",
+            reason="r",
+            safety="s",
+            expires=None,
+            ast_path=finding.ast_path,
+            scope_fingerprint="a" * 64,
+            judge_signature_version=2,
+            judge_transport="codex_cli",
+            judge_verdict=JudgeVerdict.ACCEPTED,
+            judge_recorded_at=datetime(2026, 5, 1, tzinfo=UTC),
+            judge_model=DEFAULT_JUDGE_MODEL,
+            judge_policy_hash=JUDGE_POLICY_HASH,
+            judge_rationale="judge accepted the former enclosing scope",
+            judge_metadata_signature=f"hmac-sha256:{'0' * 64}",
+        )
+        allowlist = Allowlist(entries=[entry], per_file_rules=[])
+        monkeypatch.setattr(tier_rule, "_load_tier_model_allowlist", lambda *_args, **_kwargs: allowlist)
+        monkeypatch.setattr(tier_rule, "scan_directory_with_observations", lambda *_args: ([], []))
+        monkeypatch.setattr(tier_rule, "scan_layer_imports_directory", lambda *_args: ([], [finding]))
+        args = argparse.Namespace(
+            root=tmp_path,
+            allowlist=tmp_path / "allowlist",
+            exclude=[],
+            format="text",
+            files=[],
+        )
+
+        assert run_check(args) == 1
+        captured = capsys.readouterr()
+        assert "LAYER WARNINGS (TYPE_CHECKING imports): 1" in captured.out
+        assert finding.canonical_key in captured.out
+        assert "STALE ALLOWLIST ENTRIES: 1" in captured.out
+        assert "Error:" not in captured.err
+        assert "Traceback" not in captured.out + captured.err
+
+    def test_collection_matcher_propagates_malformed_fallback_key(self) -> None:
+        """Only binding-verifier failures may degrade to an unsuppressed finding."""
+        import elspeth_lints.rules.trust_tier.tier_model.rule as tier_rule
+
+        finding = Finding(
+            rule_id="R1",
+            file_path="plugins/widget.py",
+            line=10,
+            col=4,
+            symbol_context=("Widget", "lookup"),
+            fingerprint="livefp00",
+            code_snippet="payload.get(...)",
+            message="dict.get on Tier-2 data",
+            ast_path="body[0]/body[1]/body[2]/value",
+            scope_fingerprint="a" * 64,
+            scope_depth=2,
+        )
+        malformed = AllowlistEntry(
+            key="not-a-canonical-key",
+            owner="historic-agent",
+            reason="r",
+            safety="s",
+            expires=None,
+            ast_path=finding.ast_path,
+            scope_fingerprint=finding.scope_fingerprint,
+            judge_signature_version=2,
+            judge_verdict=JudgeVerdict.ACCEPTED,
+        )
+
+        with pytest.raises(ValueError, match="missing ':fp=' suffix"):
+            tier_rule._match_finding_for_collection(Allowlist(entries=[malformed]), finding)
 
     def test_matcher_skips_binding_check_for_pre_judge_entry(self) -> None:
         """Pre-judge entries (no judge_verdict) carry no binding fields; matcher must skip the check.

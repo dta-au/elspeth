@@ -66,6 +66,16 @@ class TestNullSource:
         assert isinstance(source.plugin_version, str)
         assert source.plugin_version != ""
 
+    def test_null_source_reference_content_preserves_writable_protocol_types(self) -> None:
+        """Populated catalogue prose remains writable through SourceProtocol."""
+        from elspeth.plugins.sources.null_source import NullSource
+
+        for attribute in ("usage_when_to_use", "usage_when_not_to_use", "example_use"):
+            assert NullSource.__annotations__[attribute] == str | None
+            value = getattr(NullSource, attribute)
+            assert isinstance(value, str)
+            assert value.strip()
+
     def test_null_source_on_success_via_bridge(self) -> None:
         """NullSource on_success is set by instantiation bridge, not config."""
         from elspeth.plugins.sources.null_source import NullSource

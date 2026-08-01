@@ -15,13 +15,14 @@ from elspeth.core.landscape.database import SchemaCompatibilityError
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web import aws_ecs_startup as startup
 from elspeth.web import external_state_startup as external_startup
+from elspeth.web.aws_rds_trust import AWS_RDS_GLOBAL_BUNDLE_PATH
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import ContractCheck
 from elspeth.web.schema_probe import SchemaState
 from elspeth.web.sessions.schema import SessionSchemaError
 
 _SENTINEL = "opaque-credential SELECT raw_secret /secret/runtime/path"
-_AWS_TLS_QUERY = "sslmode=verify-full&sslrootcert=system"
+_AWS_TLS_QUERY = f"sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> WebSettings:
@@ -122,6 +123,48 @@ class _DisposableEngine:
 
 def _operational_error() -> OperationalError:
     return OperationalError("SELECT raw_secret", {"credential": _SENTINEL}, RuntimeError(_SENTINEL))
+
+
+@pytest.fixture(autouse=True)
+def _verified_trust_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        startup.aws_rds_trust,
+        "verify_aws_rds_trust_bundle",
+        lambda: startup.aws_rds_trust.AwsRdsTrustBundleReport(
+            path=str(startup.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH),
+            expected_sha256=startup.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_SHA256,
+            actual_sha256=startup.aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_SHA256,
+            certificate_count=108,
+        ),
+    )
+
+
+def test_trust_root_failure_precedes_settings_validation_and_database_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        startup.aws_rds_trust,
+        "verify_aws_rds_trust_bundle",
+        lambda: (_ for _ in ()).throw(
+            startup.aws_rds_trust.AwsRdsTrustBundleError(
+                "digest_mismatch",
+                actual_sha256="f" * 64,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        startup,
+        "validate_aws_ecs_settings",
+        lambda *_args, **_kwargs: pytest.fail("settings validation must not run"),
+    )
+
+    with pytest.raises(startup.AwsEcsStartupContractError) as caught:
+        startup.enforce_aws_ecs_contract(_settings(tmp_path))
+
+    assert "trust root" in str(caught.value)
+    assert "digest_mismatch" in str(caught.value)
+    _assert_redacted(caught.value)
 
 
 @pytest.mark.parametrize("failed_name", ["session_db_url", "landscape_url"])
@@ -341,6 +384,31 @@ def test_payload_unsafe_mode_is_rejected_by_startup_and_payload_store(tmp_path: 
         startup.require_runtime_directories_mounted(settings)
     with pytest.raises(ValueError, match="group/world-writable"):
         FilesystemPayloadStore(settings.payload_store_path)
+
+
+@pytest.mark.parametrize(
+    ("directory_of", "label"),
+    [
+        (lambda settings: settings.data_dir, "data_dir"),
+        (lambda settings: settings.data_dir / "blobs", "blob"),
+    ],
+)
+@pytest.mark.parametrize("mode", [0o770, 0o707])
+def test_group_or_world_writable_data_or_blob_directory_is_rejected(
+    tmp_path: Path,
+    directory_of: Callable[[WebSettings], Path],
+    label: str,
+    mode: int,
+) -> None:
+    settings = _settings(tmp_path)
+    target = directory_of(settings)
+    target.chmod(mode)
+
+    with pytest.raises(startup.AwsEcsStartupContractError, match=label) as exc_info:
+        startup.require_runtime_directories_mounted(settings)
+
+    assert "ELSPETH_WEB__DATA_DIR" in str(exc_info.value)
+    _assert_redacted(exc_info.value)
 
 
 @pytest.mark.parametrize("operation", ["lstat", "resolve"])

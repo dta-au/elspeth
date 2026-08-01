@@ -8,7 +8,7 @@
 # collision record (`union_field_origins`, `union_field_collision_values`)
 # to `node_states.context_after_json` so auditors can see exactly which
 # fields collided, which branches produced the conflicting values, and
-# what those values were.
+# audit-safe hashes/types for those values.
 #
 #   source ─(raw)─> [fork_gate] ─┬─ path_a ─> truncate(20) ─(trunc_a)─┐
 #                                 └─ path_b ─> truncate(50) ─(trunc_b)─┤

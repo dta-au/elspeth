@@ -152,10 +152,34 @@ class BatchClassifierMetrics(BaseTransform):
     name = "batch_classifier_metrics"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:9342302b423d86c6"
+    source_file_hash: str | None = "sha256:9ad081ebebcc56b2"
     config_model = BatchClassifierMetricsConfig
     is_batch_aware = True
-    capability_tags: tuple[str, ...] = ("narrative-summary",)
+    usage_when_to_use: str = (
+        "Use when rows carry actual and predicted scalar labels and each flushed window should emit confusion, "
+        "accuracy, precision/recall, and F1 metrics; None pairs are excluded."
+    )
+    usage_when_not_to_use: str = (
+        "Not for score-to-label conversion or per-row classification; convert model scores to labels upstream "
+        "before computing these batch metrics."
+    )
+    example_use: str = """aggregations:
+  - name: classifier_metrics
+    plugin: batch_classifier_metrics
+    input: labelled_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      actual_field: actual_label
+      predicted_field: predicted_label
+      positive_label: pass
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "classification", "narrative-summary")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

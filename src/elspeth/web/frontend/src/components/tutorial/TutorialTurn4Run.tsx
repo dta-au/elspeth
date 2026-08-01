@@ -1,8 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { cancelTutorialRun, runTutorialPipeline } from "@/api/client";
+import { cancelTutorialRun, fetchPluginPolicy, runTutorialPipeline } from "@/api/client";
 import { AlertBanner } from "@/components/ui";
 import type { TutorialRunResponse } from "@/types/api";
-import { TUTORIAL_RUN_PREAMBLE, TUTORIAL_SHIELD_OVERRIDE_CAVEAT, TURN_4_PRIMARY_BUTTON } from "./copy";
+import {
+  TUTORIAL_RUN_PREAMBLE,
+  TUTORIAL_SHIELD_OVERRIDE_CAVEAT,
+  TUTORIAL_SHIELD_WIRED_NOTE,
+  TURN_4_PRIMARY_BUTTON,
+} from "./copy";
 import type { RunResultRow, TutorialRunResult } from "./tutorialMachine";
 
 interface TutorialTurn4RunProps {
@@ -228,6 +233,54 @@ export function TutorialTurn4Run({
     setRetryNonce((n) => n + 1);
   };
 
+  /**
+   * Which prompt-shield teaching moment is true for THIS deployment.
+   *
+   * Both strings state a checkable fact about the pipeline the user is watching
+   * run, so neither may be rendered on a guess. Three states, not two:
+   *
+   * - `"wired"` — a shield is selected AND the control mode is `required`. Only
+   *   then is every clause true: coverage validation would have refused the
+   *   pipeline otherwise, so a shield is certainly in it.
+   * - `"absent"` — no shield selected, so the deployment cannot have wired one.
+   * - `null` — selected but merely `recommend`, or the policy is unreadable.
+   *   Under `recommend` the aid asks for a shield and nothing enforces it, so
+   *   whether this pipeline has one is unknowable from policy alone; claiming
+   *   either way would be the same falsehood this conditional exists to remove.
+   */
+  const [shieldNote, setShieldNote] = useState<"wired" | "absent" | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchPluginPolicy()
+      .then((snapshot) => {
+        if (cancelled) {
+          return;
+        }
+        const selected = snapshot.data.selections.some(
+          (selection) =>
+            selection.capability === "prompt_shield" && selection.plugin_id !== null,
+        );
+        if (!selected) {
+          setShieldNote("absent");
+          return;
+        }
+        const required = snapshot.data.control_modes.some(
+          (control) =>
+            control.capability === "prompt_shield" && control.mode === "required",
+        );
+        setShieldNote(required ? "wired" : null);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setShieldNote(null);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const phaseText = describePhase(phase);
 
   return (
@@ -239,7 +292,11 @@ export function TutorialTurn4Run({
       <AlertBanner tone="info" className="tutorial-disclosure">
         {TUTORIAL_RUN_PREAMBLE}
       </AlertBanner>
-      <p className="tutorial-callout">{TUTORIAL_SHIELD_OVERRIDE_CAVEAT}</p>
+      {shieldNote !== null && (
+        <p className="tutorial-callout">
+          {shieldNote === "wired" ? TUTORIAL_SHIELD_WIRED_NOTE : TUTORIAL_SHIELD_OVERRIDE_CAVEAT}
+        </p>
+      )}
       {result === null && error === null && (
         <>
           <div

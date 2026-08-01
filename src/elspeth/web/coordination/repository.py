@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
 from threading import RLock
-from typing import TYPE_CHECKING, Any, Literal, cast, final
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, final
 from uuid import UUID, uuid4
 
 from sqlalchemy import ColumnElement, Connection, Engine, Row, and_, delete, func, insert, select, update
@@ -119,6 +119,7 @@ from elspeth.web.sessions.protocol import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from contextlib import AbstractContextManager
 
     from elspeth.contracts.auth import AuthProviderType
 
@@ -126,7 +127,22 @@ _MAX_SESSION_ID_COLLISION_ATTEMPTS = 8
 _MUTATION_CONNECTION_REGISTRY = _mutation_connection_registry._MUTATION_CONNECTION_REGISTRY
 
 
-def _build_fork_mutation_connection_controls():
+class _ForkMutationConnectionResolver(Protocol):
+    def __call__(
+        self,
+        connection_token: str,
+        *,
+        parent_session_id: str,
+        child_session_id: str,
+    ) -> Connection: ...
+
+
+def _build_fork_mutation_connection_controls() -> tuple[
+    Callable[[Connection, SessionForkAuthority], str],
+    _ForkMutationConnectionResolver,
+    Callable[[str], None],
+    Callable[[], int],
+]:
     registered_pairs: dict[str, tuple[str, str]] = {}
     registry_lock = RLock()
 
@@ -3171,13 +3187,18 @@ class _ForkCreationTransaction:
 class _SessionOperationAuthorityRepository:
     """Dialect-specialized implementation shared by PostgreSQL and SQLite."""
 
-    def __build_locked_fork_pair_controls():
+    @staticmethod
+    def __build_locked_fork_pair_controls() -> tuple[
+        Callable[[_SessionOperationAuthorityRepository, str, str], AbstractContextManager[Connection]],
+        staticmethod[..., None],
+        staticmethod[[], int],
+    ]:
         active_pairs: dict[int, tuple[Connection, tuple[str, str]]] = {}
         registry_lock = RLock()
 
         @contextmanager
         def locked_pair_transaction(
-            self,
+            self: _SessionOperationAuthorityRepository,
             parent_session_id: str,
             child_session_id: str,
         ) -> Iterator[Connection]:

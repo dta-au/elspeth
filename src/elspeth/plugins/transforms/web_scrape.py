@@ -453,9 +453,34 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:33db98243c1da728"
+    source_file_hash: str | None = "sha256:239f2cab39ce5c91"
     config_model = WebScrapeConfig
     passes_through_input = True
+    capability_tags: tuple[str, ...] = ("http", "network", "scraping")
+
+    usage_when_to_use = (
+        "Use when each row contains a public HTTP(S) page URL and you need an audited fetch, "
+        "Markdown or plain text extraction, and a change fingerprint. Returned remote content is "
+        "untrusted before LLM consumption, so apply the appropriate prompt-injection control first."
+    )
+    usage_when_not_to_use = (
+        "Not for authenticated APIs or binary documents. Use a purpose-built authenticated API "
+        "integration for APIs, or blob_fetch when the workflow must preserve original document bytes."
+    )
+    example_use = (
+        "transform:\n"
+        "  plugin: web_scrape\n"
+        "  options:\n"
+        "    url_field: page_url\n"
+        "    content_field: page_markdown\n"
+        "    fingerprint_field: page_fingerprint\n"
+        "    format: markdown\n"
+        "    http:\n"
+        "      abuse_contact: catalogue-ops@example.org\n"
+        "      scraping_reason: Audited public policy monitoring\n"
+        "      allowed_hosts: public_only\n"
+        "    schema: {mode: observed}"
+    )
 
     @classmethod
     def probe_config(cls) -> dict[str, Any]:

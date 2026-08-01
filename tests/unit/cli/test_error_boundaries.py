@@ -201,6 +201,7 @@ class TestDatabaseConnectionErrors:
             },
             # Put database in unwritable directory
             "landscape": {"url": f"sqlite:///{readonly_dir}/cannot_write.db"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         settings_file = tmp_path / "settings.yaml"
         settings_file.write_text(yaml.dump(settings))
@@ -261,6 +262,7 @@ class TestDatabaseConnectionErrors:
                 },
             },
             "landscape": {"url": f"sqlite:///{db_file}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         settings_file = tmp_path / "settings.yaml"
         settings_file.write_text(yaml.dump(settings))
@@ -308,6 +310,7 @@ class TestSourceFileErrors:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         settings_file = tmp_path / "settings.yaml"
         settings_file.write_text(yaml.dump(settings))
@@ -353,6 +356,7 @@ class TestSourceFileErrors:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         settings_file = tmp_path / "settings.yaml"
         settings_file.write_text(yaml.dump(settings))
@@ -400,6 +404,7 @@ class TestExitCodeConsistency:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         settings_file = tmp_path / "settings.yaml"
         settings_file.write_text(yaml.dump(settings))
@@ -454,6 +459,7 @@ sinks:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         settings_file = tmp_path / "settings.yaml"
         settings_file.write_text(yaml.dump(settings))
@@ -511,6 +517,7 @@ class TestJsonModeErrors:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         settings_file = tmp_path / "settings.yaml"
         settings_file.write_text(yaml.dump(settings))

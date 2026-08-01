@@ -7,7 +7,7 @@ from typing import Protocol
 
 from elspeth.contracts import TokenInfo
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
 
 
 class WorkItemNavigation(Protocol):
@@ -15,6 +15,7 @@ class WorkItemNavigation(Protocol):
 
     def resolve_coalesce_node(self, coalesce_name: CoalesceName) -> NodeID: ...
     def resolve_coalesce_name(self, coalesce_node_id: NodeID) -> CoalesceName: ...
+    def resolve_row_union_node(self, row_union_name: RowUnionName) -> NodeID: ...
     def resolve_plugin_for_node(self, node_id: NodeID) -> object | None: ...
     def resolve_next_node(self, node_id: NodeID) -> NodeID | None: ...
     def resolve_branch_first_node(self, branch_name: str) -> NodeID: ...
@@ -29,6 +30,8 @@ class WorkItem:
     current_node_id: NodeID | None
     coalesce_node_id: NodeID | None = None
     coalesce_name: CoalesceName | None = None
+    row_union_node_id: NodeID | None = None
+    row_union_name: RowUnionName | None = None
     on_success_sink: str | None = None
 
     def __post_init__(self) -> None:
@@ -38,6 +41,18 @@ class WorkItem:
             raise OrchestrationInvariantError(
                 f"WorkItem coalesce fields must be both set or both None: "
                 f"coalesce_node_id={self.coalesce_node_id}, coalesce_name={self.coalesce_name}"
+            )
+        has_union_id = self.row_union_node_id is not None
+        has_union_name = self.row_union_name is not None
+        if has_union_id != has_union_name:
+            raise OrchestrationInvariantError(
+                f"WorkItem row_union fields must be both set or both None: "
+                f"row_union_node_id={self.row_union_node_id}, row_union_name={self.row_union_name}"
+            )
+        if has_name and has_union_name:
+            raise OrchestrationInvariantError(
+                f"WorkItem cannot target both a coalesce and a row_union barrier: "
+                f"coalesce_name={self.coalesce_name}, row_union_name={self.row_union_name}"
             )
 
 
@@ -54,6 +69,7 @@ class WorkItemFactory:
         current_node_id: NodeID | None,
         coalesce_name: CoalesceName | None = None,
         coalesce_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
         on_success_sink: str | None = None,
     ) -> WorkItem:
         """Create a WorkItem, resolving one missing coalesce half when possible."""
@@ -65,11 +81,15 @@ class WorkItemFactory:
         elif resolved_coalesce_node_id is not None and resolved_coalesce_name is None:
             resolved_coalesce_name = self.navigation.resolve_coalesce_name(resolved_coalesce_node_id)
 
+        row_union_node_id = self.navigation.resolve_row_union_node(row_union_name) if row_union_name is not None else None
+
         return WorkItem(
             token=token,
             current_node_id=current_node_id,
             coalesce_node_id=resolved_coalesce_node_id,
             coalesce_name=resolved_coalesce_name,
+            row_union_node_id=row_union_node_id,
+            row_union_name=row_union_name,
             on_success_sink=on_success_sink,
         )
 
@@ -79,26 +99,26 @@ class WorkItemFactory:
         token: TokenInfo,
         current_node_id: NodeID,
         coalesce_name: CoalesceName | None = None,
+        row_union_name: RowUnionName | None = None,
         on_success_sink: str | None = None,
     ) -> WorkItem:
-        """Create a child item that continues after current node or resumes at coalesce."""
-        if coalesce_name is not None:
-            coalesce_node_id = self.navigation.resolve_coalesce_node(coalesce_name)
-
+        """Create a child item that continues after current node or resumes at a barrier."""
+        if coalesce_name is not None or row_union_name is not None:
             # Fork children route to the first processing node in their branch.
             # Non-fork continuations are already mid-branch and advance normally.
             if self.navigation.is_fork_gate_node(current_node_id):
                 branch_name = token.branch_name
                 if branch_name is None:
                     raise OrchestrationInvariantError(
-                        f"Token '{token.token_id}' has coalesce_name='{coalesce_name}' but branch_name is None. "
+                        f"Token '{token.token_id}' targets barrier "
+                        f"'{coalesce_name or row_union_name}' but branch_name is None. "
                         "Fork children must have branch_name set."
                     )
                 return self.create(
                     token=token,
                     current_node_id=self.navigation.resolve_branch_first_node(branch_name),
                     coalesce_name=coalesce_name,
-                    coalesce_node_id=coalesce_node_id,
+                    row_union_name=row_union_name,
                     on_success_sink=on_success_sink,
                 )
 
@@ -106,7 +126,7 @@ class WorkItemFactory:
                 token=token,
                 current_node_id=self.navigation.resolve_next_node(current_node_id),
                 coalesce_name=coalesce_name,
-                coalesce_node_id=coalesce_node_id,
+                row_union_name=row_union_name,
                 on_success_sink=on_success_sink,
             )
 

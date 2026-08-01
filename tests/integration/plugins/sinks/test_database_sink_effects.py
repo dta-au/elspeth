@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
 import pytest
+import sqlalchemy
 from sqlalchemy import CheckConstraint, Column, Integer, MetaData, Table, Text, create_engine, func, insert, inspect, select
 from sqlalchemy.exc import IntegrityError
 
@@ -105,6 +107,141 @@ def test_inspection_is_read_only_and_refuses_missing_operator_ledger(tmp_path: P
         )
 
     assert set(inspect(engine).get_table_names()) == before
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "nullable_value",
+    ["missing", None, 0],
+)
+def test_inspection_rejects_missing_or_non_boolean_provider_nullable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    nullable_value: object,
+) -> None:
+    url = f"sqlite:///{tmp_path / 'nullable-contract.db'}"
+    _provision(url)
+    engine = create_engine(url)
+    delegate = inspect(engine)
+
+    class DivergentNullableInspector:
+        def has_table(self, table_name: str) -> bool:
+            return delegate.has_table(table_name)
+
+        def get_columns(self, table_name: str) -> list[dict[str, object]]:
+            columns = [dict(column) for column in delegate.get_columns(table_name)]
+            if table_name == "_elspeth_sink_effects":
+                if nullable_value == "missing":
+                    columns[0].pop("nullable")
+                else:
+                    columns[0]["nullable"] = nullable_value
+            return columns
+
+        def get_pk_constraint(self, table_name: str) -> dict[str, object]:
+            return dict(delegate.get_pk_constraint(table_name))
+
+    monkeypatch.setattr(sqlalchemy, "inspect", lambda _engine: DivergentNullableInspector())
+    sink = inject_write_failure(DatabaseSink(_config(url)))
+    sink._engine = engine
+
+    with pytest.raises(DatabaseEffectLedgerError, match="nullable"):
+        sink.inspect_effect(
+            SinkEffectInspectionRequest(effect_id="9" * 64, target="{}", predecessor_descriptor=None),
+            _CTX,
+        )
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    [
+        "dialect",
+        "effect_id",
+        "ledger_schema_version",
+        "ledger_table",
+        "target_columns",
+        "target_table",
+    ],
+)
+def test_owned_database_inspection_evidence_requires_every_consumed_field(tmp_path: Path, missing_key: str) -> None:
+    url = f"sqlite:///{tmp_path / 'inspection-contract.db'}"
+    _provision(url)
+    sink = inject_write_failure(DatabaseSink(_config(url)))
+    effect_id = "91" * 32
+    members = (_member(0, {"id": 1, "name": "one"}),)
+    inspection = sink.inspect_effect(
+        SinkEffectInspectionRequest(effect_id=effect_id, target="{}", predecessor_descriptor=None),
+        _CTX,
+    )
+    evidence = dict(inspection.evidence)
+    evidence.pop(missing_key)
+    divergent = replace(inspection, evidence=evidence)
+
+    with pytest.raises(KeyError, match=missing_key):
+        sink.prepare_effect(
+            SinkEffectPrepareRequest(
+                effect_id=effect_id,
+                effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=members),
+                inspection=divergent,
+            ),
+            _CTX,
+        )
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    [
+        "accepted_ordinals_json",
+        "accepted_payload_hash",
+        "completed",
+        "descriptor_json",
+        "diversion_hashes_json",
+        "diverted_ordinals_json",
+        "effect_id",
+        "evidence_json",
+        "payload_hash",
+        "plan_hash",
+        "protocol_version",
+        "schema_version",
+    ],
+)
+def test_owned_database_marker_requires_every_field(tmp_path: Path, missing_key: str) -> None:
+    url = f"sqlite:///{tmp_path / 'marker-contract.db'}"
+    _provision(url)
+    sink = inject_write_failure(DatabaseSink(_config(url)))
+    plan = _prepare(sink, ({"id": 1, "name": "one"},), effect_id="92" * 32)
+    sink.commit_effect(plan, _CTX)
+    engine = create_engine(url)
+    ledger = Table("_elspeth_sink_effects", MetaData(), autoload_with=engine)
+    with engine.connect() as conn:
+        marker = dict(conn.execute(select(ledger).where(ledger.c.effect_id == plan.effect_id)).mappings().one())
+    marker.pop(missing_key)
+
+    with pytest.raises(KeyError, match=missing_key):
+        sink._result_from_marker(marker, plan, member_count=1)
+
+    engine.dispose()
+
+
+@pytest.mark.parametrize("missing_key", ["table", "row_count"])
+def test_owned_database_marker_descriptor_metadata_requires_every_field(tmp_path: Path, missing_key: str) -> None:
+    url = f"sqlite:///{tmp_path / 'marker-descriptor-contract.db'}"
+    _provision(url)
+    sink = inject_write_failure(DatabaseSink(_config(url)))
+    plan = _prepare(sink, ({"id": 1, "name": "one"},), effect_id="93" * 32)
+    sink.commit_effect(plan, _CTX)
+    engine = create_engine(url)
+    ledger = Table("_elspeth_sink_effects", MetaData(), autoload_with=engine)
+    with engine.connect() as conn:
+        marker = dict(conn.execute(select(ledger).where(ledger.c.effect_id == plan.effect_id)).mappings().one())
+    descriptor = json.loads(marker["descriptor_json"])
+    descriptor["metadata"].pop(missing_key)
+    marker["descriptor_json"] = canonical_json(descriptor)
+
+    with pytest.raises(KeyError, match=missing_key):
+        sink._result_from_marker(marker, plan, member_count=1)
+
     engine.dispose()
 
 

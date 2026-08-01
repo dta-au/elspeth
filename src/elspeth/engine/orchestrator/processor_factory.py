@@ -28,6 +28,7 @@ from elspeth.contracts.schema_contract_factory import create_contract_from_confi
 from elspeth.contracts.types import (
     CoalesceName,
     NodeID,
+    RowUnionName,
 )
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.engine.barrier_coordination import BarrierJournalRestoreContext
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
     from elspeth.engine.orchestrator.types import (
         PipelineConfig,
     )
+    from elspeth.engine.row_union_executor import RowUnionExecutor
     from elspeth.engine.spans import SpanFactory
 
 
@@ -202,6 +204,8 @@ def build_row_processor(
     # regardless of whether settings is available.
     branch_to_coalesce: dict[BranchName, CoalesceName] = graph.get_branch_to_coalesce_map()
     coalesce_node_map: dict[CoalesceName, NodeID] = graph.get_coalesce_id_map()
+    branch_to_row_union: dict[BranchName, RowUnionName] = graph.get_branch_to_row_union_map()
+    row_union_node_map: dict[RowUnionName, NodeID] = graph.get_row_union_id_map()
 
     # Build traversal context BEFORE CoalesceExecutor/TokenManager so that
     # node_step_map is available for the step_resolver closure they require.
@@ -271,6 +275,31 @@ def build_row_processor(
         # F1: no blob restore here — on resume the RowProcessor rebuilds
         # coalesce pendings from journal BLOCKED rows (barrier_restore).
 
+    row_union_executor: RowUnionExecutor | None = None
+    if row_union_node_map and mode is not ProcessorMode.FOLLOWER:
+        from elspeth.engine.row_union_executor import RowUnionExecutor
+
+        if settings is None or not settings.row_unions:
+            raise OrchestrationInvariantError(
+                "Graph contains row_union nodes but settings.row_unions is missing. "
+                "row_union settings are required when fork branches release through a union barrier."
+            )
+        row_union_executor = RowUnionExecutor(
+            execution=factory.execution,
+            span_factory=span_factory,
+            run_id=run_id,
+            step_resolver=step_resolver,
+            clock=clock,
+            max_completed_keys=coalesce_completed_keys_limit,
+            data_flow=factory.data_flow,
+            barrier_restore_reads=factory.barrier_restore,
+        )
+        for row_union_settings_entry in settings.row_unions:
+            row_union_executor.register_row_union(
+                row_union_settings_entry,
+                row_union_node_map[RowUnionName(row_union_settings_entry.name)],
+            )
+
     # Derive coalesce on_success from graph's terminal sink map (graph-authoritative),
     # falling back to settings for non-terminal coalesce nodes. Followers never
     # complete a coalesce merge locally, so their map is empty (§B.2).
@@ -335,6 +364,8 @@ def build_row_processor(
         retry_manager=retry_manager,
         coalesce_executor=coalesce_executor,
         branch_to_coalesce=branch_to_coalesce,
+        row_union_executor=row_union_executor,
+        branch_to_row_union=branch_to_row_union,
         branch_to_sink=branch_to_sink,
         sink_names=frozenset(config.sinks),
         coalesce_on_success_map=coalesce_on_success_map,

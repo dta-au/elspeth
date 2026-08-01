@@ -25,7 +25,7 @@ from elspeth.contracts.barrier_scalars import BarrierScalars, CoalescePendingSca
 from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.schema_contract import PipelineRow
-from elspeth.contracts.types import BranchName, CoalesceName, NodeID, SinkName, StepResolver
+from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName, SinkName, StepResolver
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.barrier_coordination import (
@@ -87,6 +87,7 @@ if TYPE_CHECKING:
     from elspeth.engine.executors import GateOutcome
     from elspeth.engine.orchestrator.plugin_types import RowPlugin
     from elspeth.engine.orchestrator.ports import TelemetryManagerProtocol
+    from elspeth.engine.row_union_executor import RowUnionExecutor
 
 from elspeth.contracts import BatchTransformProtocol, SourceProtocol, TransformProtocol
 from elspeth.contracts.declaration_contracts import (
@@ -175,10 +176,12 @@ class DAGTraversalContext:
     node_to_next: Mapping[NodeID, NodeID | None]
     coalesce_node_map: Mapping[CoalesceName, NodeID]
     branch_first_node: Mapping[str, NodeID] = MappingProxyType({})
+    row_union_node_map: Mapping[RowUnionName, NodeID] = MappingProxyType({})
     # Explicit allowlist of non-plugin traversal nodes (sources, queues,
-    # coalesce points). Nodes in node_to_next that are neither plugin-bearing
-    # nor in this set fail closed at resolution instead of being skipped.
-    # Coalesce nodes are structural by definition and always unioned in.
+    # coalesce points, row_union barriers). Nodes in node_to_next that are
+    # neither plugin-bearing nor in this set fail closed at resolution
+    # instead of being skipped. Barrier nodes are structural by definition
+    # and always unioned in.
     structural_node_ids: frozenset[NodeID] = frozenset()
 
     def __post_init__(self) -> None:
@@ -187,10 +190,11 @@ class DAGTraversalContext:
         object.__setattr__(self, "node_to_next", deep_freeze(self.node_to_next))
         object.__setattr__(self, "coalesce_node_map", deep_freeze(self.coalesce_node_map))
         object.__setattr__(self, "branch_first_node", deep_freeze(self.branch_first_node))
+        object.__setattr__(self, "row_union_node_map", deep_freeze(self.row_union_node_map))
         object.__setattr__(
             self,
             "structural_node_ids",
-            frozenset(self.structural_node_ids) | frozenset(self.coalesce_node_map.values()),
+            frozenset(self.structural_node_ids) | frozenset(self.coalesce_node_map.values()) | frozenset(self.row_union_node_map.values()),
         )
 
 
@@ -220,6 +224,8 @@ class _FlushContext:
     triggering_token: TokenInfo | None
     coalesce_node_id: NodeID | None
     coalesce_name: CoalesceName | None
+    row_union_node_id: NodeID | None = None
+    row_union_name: RowUnionName | None = None
 
     def __post_init__(self) -> None:
         if not self.node_id:
@@ -238,6 +244,15 @@ class _FlushContext:
                 f"_FlushContext: coalesce_node_id and coalesce_name must be both set or both None, "
                 f"got node_id={self.coalesce_node_id!r}, name={self.coalesce_name!r}"
             )
+        has_row_union_id = self.row_union_node_id is not None
+        has_row_union_name = self.row_union_name is not None
+        if has_row_union_id != has_row_union_name:
+            raise ValueError(
+                f"_FlushContext: row_union_node_id and row_union_name must be both set or both None, "
+                f"got node_id={self.row_union_node_id!r}, name={self.row_union_name!r}"
+            )
+        if has_id and has_row_union_id:
+            raise ValueError("_FlushContext cannot target both coalesce and row_union barriers")
 
 
 def _validated_quarantined_indices(result: TransformResult, *, buffered_token_count: int, aggregation_name: str) -> set[int]:
@@ -350,6 +365,8 @@ class RowProcessor:
         retry_manager: RetryManager | None = None,
         coalesce_executor: CoalesceExecutor | None = None,
         branch_to_coalesce: dict[BranchName, CoalesceName] | None = None,
+        row_union_executor: RowUnionExecutor | None = None,
+        branch_to_row_union: dict[BranchName, RowUnionName] | None = None,
         branch_to_sink: dict[BranchName, SinkName] | None = None,
         sink_names: frozenset[str] | None = None,
         coalesce_on_success_map: dict[CoalesceName, str] | None = None,
@@ -466,12 +483,21 @@ class RowProcessor:
         # skipped plugin nodes missing from the mapping (fail-open).
         self._structural_node_ids: frozenset[NodeID] = traversal.structural_node_ids
         self._branch_to_coalesce: dict[BranchName, CoalesceName] = branch_to_coalesce or {}
+        self._row_union_executor = row_union_executor
+        self._row_union_node_ids: dict[RowUnionName, NodeID] = dict(traversal.row_union_node_map)
+        self._branch_to_row_union: dict[BranchName, RowUnionName] = branch_to_row_union or {}
         self._branch_to_sink: dict[BranchName, SinkName] = branch_to_sink or {}
         overlap = set(self._branch_to_coalesce.keys()) & set(self._branch_to_sink.keys())
         if overlap:
             raise OrchestrationInvariantError(
                 f"Branch names {sorted(overlap)} appear in both branch_to_coalesce and branch_to_sink. "
                 "A fork branch must route to EITHER a coalesce node OR a direct sink, not both."
+            )
+        barrier_overlap = set(self._branch_to_coalesce.keys()) & set(self._branch_to_row_union.keys())
+        if barrier_overlap:
+            raise OrchestrationInvariantError(
+                f"Branch names {sorted(barrier_overlap)} appear in both branch_to_coalesce and branch_to_row_union. "
+                "A fork branch must join at exactly one barrier."
             )
         self._sink_names: frozenset[str] = sink_names or frozenset()
         self._coalesce_on_success_map: dict[CoalesceName, str] = coalesce_on_success_map or {}
@@ -629,6 +655,10 @@ class RowProcessor:
         # so the re-driven sink node_state does not collide at attempt 0.
         self._resume_checkpoint_id: str | None = barrier_restore.resume_checkpoint_id if barrier_restore is not None else None
         restore_reads = barrier_restore_reads if barrier_restore_reads is not None else execution
+        # Retained for the row_union post-release divert discriminator: a
+        # released group's status-COMPLETED node state is the durable proof
+        # that a later terminal divert is not a pre-barrier branch loss.
+        self._barrier_restore_reads = restore_reads
         # Barrier subsystem (elspeth-e76a186916): the intake and recovery
         # coordinators own the crash-window adoption/restore ordering (open
         # batch -> fenced adopt -> feed memory -> evaluate trigger) behind one
@@ -656,6 +686,10 @@ class RowProcessor:
             terminal_coalesce_row_result=self._terminal_coalesce_row_result,
             emit_token_completed=self._emit_token_completed,
             mark_coalesce_consumed_terminal=self._mark_coalesce_consumed_scheduler_work_terminal,
+            row_union_executor=self._row_union_executor,
+            row_union_node_ids=self._row_union_node_ids,
+            complete_row_union_fire=self._complete_row_union_fire,
+            released_row_union_items=self.released_row_union_items,
         )
         # Scheduler-drain subsystem (elspeth-c49f33d6e4 component 3): the
         # coordinator owns the durable claim/drain loop, dispositions,
@@ -704,12 +738,22 @@ class RowProcessor:
                 coalesce_node_ids=self._coalesce_node_ids,
                 coordination_token=self._require_coordination_token(),
                 scheduler_lease_owner=self._scheduler_lease_owner,
+                row_union_executor=self._row_union_executor,
+                row_union_node_ids=self._row_union_node_ids,
+                released_row_union_items=self.released_row_union_items,
+                complete_row_union_fire=self._complete_row_union_fire,
+                emit_token_completed=self._emit_token_completed,
             ).restore_from_journal(barrier_restore)
 
     @property
     def token_manager(self) -> TokenManager:
         """Expose token manager for orchestrator to create tokens for quarantined rows."""
         return self._token_manager
+
+    @property
+    def row_union_executor(self) -> RowUnionExecutor | None:
+        """The leader's row_union barrier executor (None on followers)."""
+        return self._row_union_executor
 
     @property
     def coordination_token(self) -> CoordinationToken | None:
@@ -988,6 +1032,37 @@ class RowProcessor:
             if branch_name and BranchName(branch_name) in self._branch_to_coalesce:
                 coalesce_name = self._branch_to_coalesce[BranchName(branch_name)]
                 return self._coalesce_node_ids[coalesce_name], coalesce_name
+        return None, None
+
+    def _derive_row_union_from_scheduler(
+        self,
+        node_id: NodeID,
+        buffered_tokens: list[TokenInfo],
+    ) -> tuple[NodeID | None, RowUnionName | None]:
+        """Recover pending row_union context from the durable aggregation arrivals.
+
+        ``branch_name`` survives a row_union release by design, so it cannot
+        prove that an aggregation is still upstream of that barrier.  The
+        scheduler row is the authority: its ``row_union_name`` is present only
+        while the work item still owes that barrier.
+        """
+        token_ids = {token.token_id for token in buffered_tokens}
+        if not token_ids:
+            return None, None
+        names = {
+            row.row_union_name
+            for row in self._scheduler.list_blocked_barrier_items(run_id=self._run_id)
+            if row.barrier_key == str(node_id) and row.token_id in token_ids
+        }
+        if len(names) > 1:
+            raise AuditIntegrityError(
+                f"Aggregation {node_id!r} buffered tokens with inconsistent durable row_union context: {sorted(str(name) for name in names)}"
+            )
+        if names:
+            raw_name = next(iter(names))
+            if raw_name is not None:
+                row_union_name = RowUnionName(raw_name)
+                return self._row_union_node_ids[row_union_name], row_union_name
         return None, None
 
     def _handle_flush_error(
@@ -1357,7 +1432,7 @@ class RowProcessor:
                 )
             )
             results.extend(
-                self._notify_coalesce_of_lost_branch(
+                self._notify_barrier_of_lost_branch(
                     token,
                     "dropped_by_filter",
                     child_items,
@@ -1397,21 +1472,33 @@ class RowProcessor:
         has_downstream = self._nav.resolve_next_node(fctx.node_id) is not None
         first_branch = fctx.buffered_tokens[0].branch_name if fctx.buffered_tokens else None
         needs_coalesce = fctx.coalesce_node_id is not None and fctx.coalesce_name is not None and first_branch is not None
+        needs_row_union = fctx.row_union_node_id is not None and fctx.row_union_name is not None and first_branch is not None
 
         results: list[RowResult] = []
         child_items: list[WorkItem] = []
 
-        if has_downstream or needs_coalesce:
+        if has_downstream or needs_coalesce or needs_row_union:
             work_item_coalesce_name = fctx.coalesce_name if needs_coalesce else None
+            work_item_row_union_name = fctx.row_union_name if needs_row_union else None
             for token, enriched_data in zip(fctx.buffered_tokens, pipeline_rows, strict=True):
                 updated_token = token.with_updated_data(enriched_data)
-                child_items.append(
-                    self._work_items.create_continuation(
-                        token=updated_token,
-                        current_node_id=fctx.node_id,
-                        coalesce_name=work_item_coalesce_name,
+                if needs_row_union and not has_downstream:
+                    child_items.append(
+                        self._work_items.create(
+                            token=updated_token,
+                            current_node_id=fctx.row_union_node_id,
+                            row_union_name=work_item_row_union_name,
+                        )
                     )
-                )
+                else:
+                    child_items.append(
+                        self._work_items.create_continuation(
+                            token=updated_token,
+                            current_node_id=fctx.node_id,
+                            coalesce_name=work_item_coalesce_name,
+                            row_union_name=work_item_row_union_name,
+                        )
+                    )
         else:
             for token, enriched_data in zip(fctx.buffered_tokens, pipeline_rows, strict=True):
                 updated_token = token.with_updated_data(enriched_data)
@@ -1580,17 +1667,29 @@ class RowProcessor:
             has_downstream = self._nav.resolve_next_node(fctx.node_id) is not None
             first_expanded_branch = expanded_tokens[0].branch_name if expanded_tokens else None
             needs_coalesce = fctx.coalesce_node_id is not None and fctx.coalesce_name is not None and first_expanded_branch is not None
+            needs_row_union = fctx.row_union_node_id is not None and fctx.row_union_name is not None and first_expanded_branch is not None
 
-            if has_downstream or needs_coalesce:
+            if has_downstream or needs_coalesce or needs_row_union:
                 work_item_coalesce_name = fctx.coalesce_name if needs_coalesce else None
+                work_item_row_union_name = fctx.row_union_name if needs_row_union else None
                 for token in expanded_tokens:
-                    child_items.append(
-                        self._work_items.create_continuation(
-                            token=token,
-                            current_node_id=fctx.node_id,
-                            coalesce_name=work_item_coalesce_name,
+                    if needs_row_union and not has_downstream:
+                        child_items.append(
+                            self._work_items.create(
+                                token=token,
+                                current_node_id=fctx.row_union_node_id,
+                                row_union_name=work_item_row_union_name,
+                            )
                         )
-                    )
+                    else:
+                        child_items.append(
+                            self._work_items.create_continuation(
+                                token=token,
+                                current_node_id=fctx.node_id,
+                                coalesce_name=work_item_coalesce_name,
+                                row_union_name=work_item_row_union_name,
+                            )
+                        )
             else:
                 for token in expanded_tokens:
                     results.append(
@@ -1638,6 +1737,7 @@ class RowProcessor:
         )
 
         coalesce_node_id, coalesce_name = self._derive_coalesce_from_tokens(buffered_tokens)
+        row_union_node_id, row_union_name = self._derive_row_union_from_scheduler(node_id, buffered_tokens)
 
         fctx = _FlushContext(
             node_id=node_id,
@@ -1650,6 +1750,8 @@ class RowProcessor:
             triggering_token=None,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
+            row_union_node_id=row_union_node_id,
+            row_union_name=row_union_name,
         )
 
         if result.status != "success":
@@ -2289,6 +2391,7 @@ class RowProcessor:
             expand_group_id=fields.expand_group_id,
             coalesce_node_id=fields.coalesce_node_id,
             coalesce_name=fields.coalesce_name,
+            row_union_name=fields.row_union_name,
         )
         return scheduled
 
@@ -2538,6 +2641,7 @@ class RowProcessor:
         current_node_id: NodeID | None,
         coalesce_node_id: NodeID | None = None,
         coalesce_name: CoalesceName | None = None,
+        row_union_name: RowUnionName | None = None,
     ) -> list[RowResult]:
         """Process an existing token through the pipeline starting at current_node_id.
 
@@ -2553,6 +2657,7 @@ class RowProcessor:
                 current_node_id=current_node_id,
                 coalesce_node_id=coalesce_node_id,
                 coalesce_name=coalesce_name,
+                row_union_name=row_union_name,
             ),
             ctx,
         )
@@ -2745,6 +2850,150 @@ class RowProcessor:
             barrier_key=str(coalesce_name),
         )
         return True, None
+
+    def _maybe_row_union_token(
+        self,
+        current_token: TokenInfo,
+        *,
+        current_node_id: NodeID,
+        row_union_node_id: NodeID | None,
+        row_union_name: RowUnionName | None,
+    ) -> tuple[bool, RowResult | None]:
+        """Hold a fork-branch token arriving at its row_union barrier.
+
+        Same journal-first shape as ``_maybe_coalesce_token`` (§E.2): the
+        arrival is never accepted in-claim — the live token is stashed and
+        the drain marks its journal row BLOCKED under
+        ``barrier_key=row_union_name``; the leader's next intake adopts it
+        and runs the executor accept. Followers hold without stashing.
+        """
+        if current_token.branch_name is None or row_union_name is None or row_union_node_id is None or current_node_id != row_union_node_id:
+            return False, None
+
+        if self._row_union_executor is None:
+            logger.debug(
+                "follower: row_union barrier hold for token %r at node %r (row_union=%r) — marking blocked; leader adopts via journal-intake",
+                current_token.token_id,
+                current_node_id,
+                row_union_name,
+            )
+            return True, None
+
+        self._live_barrier_holds[current_token.token_id] = _LiveBarrierHold(
+            token=current_token,
+            barrier_key=str(row_union_name),
+        )
+        return True, None
+
+    def _notify_row_union_of_lost_branch(self, current_token: TokenInfo, reason: str) -> list[RowResult]:
+        """Notify the row_union executor that a forked branch was diverted.
+
+        v1 is fail-closed with no partial release, so a lost branch fails the
+        whole pending group immediately. The durable loss record is staged
+        before the in-memory notify, including on followers; the leader
+        replays it during barrier intake.
+
+        Released tokens deliberately retain their branch_name, so any
+        terminal divert DOWNSTREAM of the union (gate-to-sink route, drop,
+        error) re-enters this helper. A group that already released is not a
+        pre-barrier loss — staging one would persist a false
+        coalesce_branch_losses record on a healthy run. A genuine pre-barrier
+        loss can never coincide with a released group (release requires every
+        branch to arrive), so the guard changes no legitimate loss.
+        """
+        if current_token.branch_name is None:
+            return []
+        branch_name = BranchName(current_token.branch_name)
+        if branch_name not in self._branch_to_row_union:
+            return []
+        row_union_name = self._branch_to_row_union[branch_name]
+        if self._row_union_group_released(row_union_name, current_token.row_id):
+            return []
+        self._pending_branch_losses.append(
+            BranchLossSpec(
+                coalesce_name=str(row_union_name),
+                row_id=current_token.row_id,
+                branch_name=str(branch_name),
+                token_id=current_token.token_id,
+                reason=reason,
+                recorded_by=self._scheduler_lease_owner,
+            )
+        )
+        if self._row_union_executor is None:
+            return []
+        outcome = self._row_union_executor.notify_branch_lost(
+            row_union_name=str(row_union_name),
+            row_id=current_token.row_id,
+            lost_branch=current_token.branch_name,
+            reason=reason,
+        )
+        if outcome is None or not outcome.consumed_tokens:
+            return []
+        self._complete_row_union_fire(
+            row_union_name=row_union_name,
+            consumed_tokens=outcome.consumed_tokens,
+            scope_row_id=current_token.row_id,
+        )
+        for consumed in outcome.consumed_tokens:
+            with best_effort(
+                "TokenCompleted telemetry after row_union branch-loss audit",
+                run_id=self._run_id,
+                token_id=consumed.token_id,
+                row_union_name=row_union_name,
+            ):
+                self._emit_token_completed(
+                    consumed,
+                    outcome=TerminalOutcome.FAILURE,
+                    path=TerminalPath.UNROUTED,
+                )
+        return [
+            RowResult(
+                token=consumed,
+                final_data=consumed.row_data,
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.UNROUTED,
+            )
+            for consumed in outcome.consumed_tokens
+        ]
+
+    def _row_union_group_released(self, row_union_name: RowUnionName, row_id: str) -> bool:
+        """Whether the (row_union, row) group already released.
+
+        Leaders read the executor's in-memory closure reason; followers (no
+        executor) and post-resume processes fall back to the durable
+        status-COMPLETED node state at the union node. A release always
+        commits its COMPLETED states before the released tokens route
+        downstream, so the durable read is race-free.
+        """
+        if self._row_union_executor is not None and self._row_union_executor.is_group_released(str(row_union_name), row_id):
+            return True
+        if row_union_name not in self._row_union_node_ids:
+            return False
+        node_id = self._row_union_node_ids[row_union_name]
+        return self._barrier_restore_reads.has_released_row_for_node(run_id=self._run_id, node_id=str(node_id), row_id=row_id)
+
+    def _notify_barrier_of_lost_branch(
+        self,
+        current_token: TokenInfo,
+        reason: str,
+        child_items: list[WorkItem],
+    ) -> list[RowResult]:
+        """Notify whichever barrier owns this fork branch that it was lost.
+
+        THE single seam every early-exit path calls. Loss is discovered in
+        many places (retry exhaustion, filter drop, quarantine, error
+        routing, gate routing, gate discard, batch-flush drop), and each one
+        used to name the coalesce notifier directly — so adding a second
+        barrier kind silently left every one of those paths unnotified and
+        its held siblings waiting for the end-of-source sweep. Dispatching
+        here means a future barrier kind is wired by editing one method.
+
+        A branch belongs to at most ONE barrier — enforced at build time and
+        re-checked in this constructor — so at most one arm yields results.
+        """
+        results = self._notify_coalesce_of_lost_branch(current_token, reason, child_items)
+        results.extend(self._notify_row_union_of_lost_branch(current_token, reason))
+        return results
 
     def _notify_coalesce_of_lost_branch(
         self,
@@ -3262,6 +3511,70 @@ class RowProcessor:
             pending_sink_lease_owner=self._scheduler_lease_owner,
         )
 
+    def _complete_row_union_fire(
+        self,
+        *,
+        row_union_name: RowUnionName,
+        consumed_tokens: tuple[TokenInfo, ...],
+        scope_row_id: str,
+        released_items: tuple[WorkItem, ...] = (),
+    ) -> None:
+        """Complete a fired row_union barrier as ONE atomic journal transition.
+
+        Consumes the group's BLOCKED rows and emits every released branch
+        token as a READY continuation in the same F1 ``complete_barrier``
+        transaction — the emission order is the declared branch order, so
+        in-group release order is durable. A failure fire passes no
+        ``released_items`` and only consumes the failed group's rows.
+        """
+        consumed_token_ids = tuple(token.token_id for token in consumed_tokens)
+        if not consumed_token_ids and not released_items:
+            return
+        self._scheduler.complete_barrier(
+            run_id=self._run_id,
+            barrier_key=str(row_union_name),
+            consumed_token_ids=consumed_token_ids,
+            emitted_pending_sink=(),
+            emitted_ready=tuple(self._work_codec.ready_emission(item) for item in released_items),
+            now=self._clock.now_utc(),
+            intake_snapshot_token_ids=frozenset(consumed_token_ids),
+            scope_row_id=scope_row_id,
+            coordination_token=self._require_coordination_token(),
+            pending_sink_lease_owner=self._scheduler_lease_owner,
+        )
+
+    def released_row_union_items(
+        self,
+        *,
+        row_union_name: RowUnionName,
+        released_tokens: tuple[TokenInfo, ...],
+    ) -> tuple[WorkItem, ...]:
+        """Build READY continuations for a released group, in declared order.
+
+        Continuations start at the node AFTER the barrier, with no row_union
+        fields: the barrier is passed (the executor already completed each
+        member's node state there), so the group must not re-enter it —
+        released tokens still carry ``branch_name``.
+
+        The cursor must ADVANCE rather than sit on the union node. Unlike
+        coalesce — whose merged output is a fresh ``token_id`` — a row_union
+        releases the ORIGINAL tokens, so a continuation parked on the union
+        node would derive the same ``work_item_id``
+        (run_id, token_id, node_id, attempt) as the very BLOCKED row this
+        fire consumes. For an identity branch, whose blocked row already
+        sits on the union node, that collides inside the atomic completion
+        and the emission is rejected as a duplicate audit write.
+        """
+        union_node_id = self._row_union_node_ids[row_union_name]
+        continuation_node_id = self._nav.resolve_next_node(union_node_id)
+        if continuation_node_id is None:
+            raise OrchestrationInvariantError(
+                f"row_union '{row_union_name}' has no downstream node to release into. "
+                "A row_union must continue on a processing connection; terminal "
+                "row_union -> sink release is rejected at build time."
+            )
+        return tuple(self._work_items.create(token=token, current_node_id=continuation_node_id) for token in released_tokens)
+
     def complete_coalesce_merge(
         self,
         *,
@@ -3535,10 +3848,17 @@ class RowProcessor:
         raise OrchestrationInvariantError(f"Cannot schedule unknown node cursor {node_id!r}")
 
     def _queue_key_for_blocked_item(self, item: WorkItem) -> str | None:
-        """Return a queue key for structural queue blocking, if applicable."""
+        """Return a queue key for structural queue blocking, if applicable.
+
+        Barrier-bound items are excluded by BOTH barrier kinds: an identity
+        fork branch is parked AT its barrier node (the gate->barrier COPY
+        edge carries no intermediate transform), so without the row_union
+        arm such an item blocks under a structural queue key with a NULL
+        barrier_key and its group is never adopted by the intake.
+        """
         if item.current_node_id is None:
             return None
-        if item.current_node_id in self._structural_node_ids and item.coalesce_name is None:
+        if item.current_node_id in self._structural_node_ids and item.coalesce_name is None and item.row_union_name is None:
             return str(item.current_node_id)
         return None
 
@@ -3558,6 +3878,8 @@ class RowProcessor:
             return str(item.current_node_id)
         if item.coalesce_name is not None:
             return str(item.coalesce_name)
+        if item.row_union_name is not None:
+            return str(item.row_union_name)
         return None
 
     # --- TokenTraversalEngine delegates (c49 component 4) ---
@@ -3577,6 +3899,8 @@ class RowProcessor:
         coalesce_name: CoalesceName | None = None,
         on_success_sink: str | None = None,
         attempt_offset: int = 0,
+        row_union_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
     ) -> tuple[RowResult | tuple[RowResult, ...] | None, list[WorkItem]]:
         return self._token_traversal.process_single_token(
             token,
@@ -3586,6 +3910,8 @@ class RowProcessor:
             coalesce_name,
             on_success_sink,
             attempt_offset,
+            row_union_node_id,
+            row_union_name,
         )
 
     def _handle_transform_node(

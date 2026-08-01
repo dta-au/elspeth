@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import Future
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, create_autospec, patch
@@ -43,6 +44,8 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer import yaml_generator as real_yaml_generator
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.fanout_guard import ExecutionFanoutGuardRequired
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
@@ -126,6 +129,18 @@ async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(par
     fixture = _structured_llm_fixture()
     committed = parity_env.reference_state(fixture)
 
+    session = await parity_env.sessions.create_session(
+        user_id="alice",
+        title="readiness preflight profile lowering",
+        auth_provider_type="local",
+    )
+    session_id = session.id
+    committed_data = committed.to_dict()
+    for source in committed_data["sources"].values():
+        path = Path(source["options"]["path"])
+        source["options"]["path"] = str(parity_env.data_dir / "blobs" / str(session_id) / path.name)
+    committed = CompositionState.from_dict(committed_data)
+
     # The real set_pipeline path persists the profiled multi-query node in
     # AUTHORED-MINIMAL form: profile alias + queries survive, retry budget does
     # not (it is an operator-profile lowering concern). This is the precondition
@@ -137,7 +152,6 @@ async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(par
     assert "pool_size" not in assess["options"]
     assert "max_capacity_retry_seconds" not in assess["options"]
 
-    session_id = UUID("00000000-0000-4000-8000-000000000001")
     app_state = parity_env.app.state
     record = _record_from_committed(committed, session_id)
 
@@ -169,25 +183,55 @@ async def test_committed_profiled_multi_query_llm_passes_readiness_preflight(par
     # gate (and avoid instantiating the profile's bedrock provider). The
     # retry-budget gate under test is driven by the REAL operator-profile
     # lowering in validate_plugin_policy.
-    with (
-        patch("elspeth.web.execution.validation.validate_pipeline", return_value=_valid_validation_result()),
-        patch.object(service._executor, "submit", return_value=completed),
-    ):
-        # The profiled multi-query node must clear the retry-budget readiness
-        # gate. Were the gate still evaluated on the un-lowered options it would
-        # raise ``PipelineValidationError`` (``llm_retry_budget_policy``) here.
-        # Instead the only remaining pre-submission control is the separate,
-        # expected LLM fanout-ack confirmation — capture its token.
-        with pytest.raises(ExecutionFanoutGuardRequired) as fanout_excinfo:
-            await service.execute(session_id=session_id, user_id="alice")
+    try:
+        with (
+            patch("elspeth.web.execution.validation.validate_pipeline", return_value=_valid_validation_result()),
+            patch.object(service._executor, "submit", return_value=completed),
+        ):
+            # The profiled multi-query node must clear the retry-budget readiness
+            # gate. Were the gate still evaluated on the un-lowered options it would
+            # raise ``PipelineValidationError`` (``llm_retry_budget_policy``) here.
+            # Instead the only remaining pre-submission control is the separate,
+            # expected LLM fanout-ack confirmation — capture its token.
+            fanout_lease = await SessionOperationLease.acquire(
+                parity_env.sessions.session_operation_authority,
+                session_id=session_id,
+                operation_kind=SessionOperationKind.EXECUTE,
+                owner_instance_id=parity_env.sessions.session_operation_owner_instance_id,
+                lease_seconds=parity_env.sessions.session_operation_lease_seconds,
+            )
+            async with fanout_lease:
+                with pytest.raises(ExecutionFanoutGuardRequired) as fanout_excinfo:
+                    await service.execute(
+                        session_id=session_id,
+                        session_operation_lease=fanout_lease,
+                        user_id="alice",
+                    )
 
-        # Re-drive with the fanout ack: the run now clears every readiness gate
-        # and reaches submission.
-        run_id = await service.execute(
-            session_id=session_id,
-            user_id="alice",
-            fanout_ack_token=fanout_excinfo.value.guard.ack_token,
-        )
+            # Re-drive with the fanout ack: the run now clears every readiness gate
+            # and reaches submission. This is a fresh request, so it acquires a new
+            # exact lease; ownership transfers to ExecutionService on success.
+            execute_lease = await SessionOperationLease.acquire(
+                parity_env.sessions.session_operation_authority,
+                session_id=session_id,
+                operation_kind=SessionOperationKind.EXECUTE,
+                owner_instance_id=parity_env.sessions.session_operation_owner_instance_id,
+                lease_seconds=parity_env.sessions.session_operation_lease_seconds,
+            )
+            transferred = False
+            try:
+                run_id = await service.execute(
+                    session_id=session_id,
+                    session_operation_lease=execute_lease,
+                    user_id="alice",
+                    fanout_ack_token=fanout_excinfo.value.guard.ack_token,
+                )
+                transferred = True
+            finally:
+                if not transferred:
+                    await execute_lease.close()
+    finally:
+        await service.shutdown()
 
     assert isinstance(run_id, UUID)
     session_service.create_run.assert_awaited_once()

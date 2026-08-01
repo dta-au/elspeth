@@ -21,8 +21,8 @@ from elspeth.web.composer.state import (
     SourceSpec,
 )
 from elspeth.web.config import WebSettings
+from elspeth.web.execution.schemas import CHECK_IDENTITY_NODE_ADVISORY
 from elspeth.web.execution.validation import (
-    _CHECK_IDENTITY_NODE_ADVISORY,
     _find_identity_node_advisories,
     validate_pipeline_for_trained_operator,
 )
@@ -113,7 +113,7 @@ def _make_state_with(
 
 def test_check_constant_value() -> None:
     """The check name string is the public contract — frontend and LLM both read it."""
-    assert _CHECK_IDENTITY_NODE_ADVISORY == "identity_node_advisory"
+    assert CHECK_IDENTITY_NODE_ADVISORY == "identity_node_advisory"
 
 
 def test_helper_returns_empty_list_for_empty_state() -> None:
@@ -321,6 +321,36 @@ def test_passthrough_downstream_of_queue_is_not_flagged() -> None:
     assert findings == [], "Passthrough consuming a declared queue is legitimate structural fan-in and must not be flagged."
 
 
+def test_passthrough_downstream_of_row_union_is_not_flagged() -> None:
+    """A row_union is an observed structural boundary, not dead-weight input."""
+    union = NodeSpec(
+        id="variant_union",
+        node_type="row_union",
+        plugin=None,
+        input="control_done",
+        on_success="unioned_rows",
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches={"control": "control_done", "treatment": "treatment_done"},
+        policy=None,
+        merge=None,
+    )
+    passthrough = _make_passthrough_node(
+        node_id="forward_union",
+        input_field="unioned_rows",
+        on_success="json_out",
+    )
+    state = _make_state_with(
+        nodes=(union, passthrough),
+        outputs=(_make_observed_sink(),),
+    )
+
+    assert _find_identity_node_advisories(state) == []
+
+
 def test_identity_passthrough_to_fixed_sink_is_flagged() -> None:
     """Sink schema mode is irrelevant — passthrough still adds no contract benefit."""
     fixed_sink = OutputSpec(
@@ -435,7 +465,7 @@ def test_validate_pipeline_emits_advisory_on_happy_path(
     result = validate_pipeline_for_trained_operator(state, _make_settings(), yaml_gen, session_id="test-session")
 
     assert result.is_valid is True, "Advisory must not block is_valid"
-    advisories = [c for c in result.checks if c.name == _CHECK_IDENTITY_NODE_ADVISORY]
+    advisories = [c for c in result.checks if c.name == CHECK_IDENTITY_NODE_ADVISORY]
     assert len(advisories) == 1
     advisory = advisories[0]
     assert advisory.passed is True, "Advisory entries are passed=True (informational)"
@@ -472,7 +502,7 @@ def test_validate_pipeline_emits_no_advisory_when_clean(
     result = validate_pipeline_for_trained_operator(state, _make_settings(), yaml_gen, session_id="test-session")
 
     assert result.is_valid is True
-    advisories = [c for c in result.checks if c.name == _CHECK_IDENTITY_NODE_ADVISORY]
+    advisories = [c for c in result.checks if c.name == CHECK_IDENTITY_NODE_ADVISORY]
     assert advisories == []
 
 
@@ -498,5 +528,5 @@ def test_validate_pipeline_suppresses_advisory_on_failure_path() -> None:
     result = validate_pipeline_for_trained_operator(state, settings, _YamlGeneratorDouble())
 
     assert result.is_valid is False, "path_allowlist must block this pipeline"
-    advisories = [c for c in result.checks if c.name == _CHECK_IDENTITY_NODE_ADVISORY]
+    advisories = [c for c in result.checks if c.name == CHECK_IDENTITY_NODE_ADVISORY]
     assert advisories == [], "Advisory must NOT emit on the failure path — would drown the structural error in cosmetic noise."

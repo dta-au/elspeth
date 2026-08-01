@@ -83,6 +83,12 @@
   background-color: var(--color-surface-hover);
 }
 
+.audit-readiness-summary-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2xs);
+}
+
 .audit-readiness-summary-meta {
   display: block;
   font-size: var(--font-size-xs);
@@ -108,9 +114,7 @@
   color: var(--color-text);
 }
 
-/* Panel name outside the expanded header (loading / error / collapsed states)
-   — the destination the graduation copy points at must exist by name in every
-   state (elspeth-4f69b267dd). */
+/* Panel name outside the expanded header (loading / error states). */
 .audit-readiness-title--standalone {
   margin-bottom: var(--space-2xs);
 }

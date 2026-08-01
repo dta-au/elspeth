@@ -39,6 +39,28 @@ from elspeth.web.composer.state import EdgeType
 REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
 _REDACTED_OPTION_VALUE = "<redacted-option-value>"
 
+
+def _reject_coerced_timeout_seconds(value: object) -> object:
+    """Accept only actual JSON numbers at the Tier-3 boundary.
+
+    Pydantic's ordinary float parser coerces booleans and numeric strings.
+    Structural-barrier timeouts are persisted audit facts, so their wire type
+    must be proven before conversion. Integers remain valid JSON numbers and
+    are normalized to float by the annotated field.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("timeout_seconds must be an actual number, not a boolean or string")
+    return value
+
+
+_StrictTimeoutSeconds = Annotated[
+    float,
+    BeforeValidator(_reject_coerced_timeout_seconds),
+    Field(gt=0, allow_inf_nan=False),
+]
+
 # Fixed sentinel for response keys that appear in the input but are not
 # declared in the manifest entry's known_response_keys or
 # sensitive_response_keys sets.  The value is a closed constant — callers
@@ -1770,6 +1792,7 @@ class _PipelineNodeModel(BaseModel):
     trigger: _NodeTriggerModel | None = None
     output_mode: str | None = None
     expected_output_count: int | None = None
+    timeout_seconds: _StrictTimeoutSeconds | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -2356,9 +2379,13 @@ _LIST_SOURCES_REASON = HandlesNoSensitiveDataReason(
         "value on this surface; the handler reads zero keys from the arguments dict."
     ),
     why_responses_safe=(
-        "Response is the cached source-plugin descriptor list (name + summary per plugin) "
-        "produced by CatalogService.list_sources; it is registry metadata composed at "
-        "module import time, carries no user payload, and never references credentials."
+        "Response is {available, prohibited}: available is the cached source-plugin "
+        "descriptor list (name + summary per plugin) produced by CatalogService.list_sources; "
+        "it is registry metadata composed at module import time, carries no user payload, and "
+        "never references credentials. prohibited names any source categorically banned from "
+        "the web authoring surface (PolicyCatalogView.list_prohibited_sources), carrying only "
+        "its name and the same static, non-sensitive policy explanation already shown on a "
+        "rejected set_source attempt (R2-F18)."
     ),
 )
 
@@ -2371,9 +2398,13 @@ _LIST_TRANSFORMS_REASON = HandlesNoSensitiveDataReason(
         "reach the dispatch site; the handler reads zero keys from the arguments dict."
     ),
     why_responses_safe=(
-        "Response is the cached transform-plugin descriptor list (name + summary per plugin) "
-        "produced by CatalogService.list_transforms; it is registry metadata composed at "
-        "module import time, carries no operator data, and never references row content."
+        "Response is {available, prohibited}: available is the cached transform-plugin "
+        "descriptor list (name + summary per plugin) produced by CatalogService.list_transforms; "
+        "it is registry metadata composed at module import time, carries no operator data, and "
+        "never references row content. prohibited names any transform categorically banned from "
+        "the web authoring surface (PolicyCatalogView.list_prohibited_transforms), carrying only "
+        "its name and the same static, non-sensitive policy explanation already shown on a "
+        "rejected set_source attempt (R2-F18)."
     ),
 )
 
@@ -2386,9 +2417,13 @@ _LIST_SINKS_REASON = HandlesNoSensitiveDataReason(
         "on this surface; the handler reads zero keys from the arguments dict."
     ),
     why_responses_safe=(
-        "Response is the cached sink-plugin descriptor list (name + summary per plugin) "
-        "produced by CatalogService.list_sinks; it is registry metadata composed at "
-        "module import time, carries no destination credentials, and never references payload."
+        "Response is {available, prohibited}: available is the cached sink-plugin descriptor "
+        "list (name + summary per plugin) produced by CatalogService.list_sinks; it is registry "
+        "metadata composed at module import time, carries no destination credentials, and never "
+        "references payload. prohibited names any sink categorically banned from the web "
+        "authoring surface (PolicyCatalogView.list_prohibited_sinks), carrying only its name and "
+        "the same static, non-sensitive policy explanation already shown on a rejected "
+        "set_source attempt (R2-F18)."
     ),
 )
 
@@ -2865,6 +2900,36 @@ class _SchemaContractDetailShadowModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class _RowUnionFieldSchemaDetailShadowModel(BaseModel):
+    """One declared field in a row-union schema repair fact."""
+
+    name: str
+    field_type: str
+    required: bool
+    nullable: bool
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _RowUnionBranchSchemaDetailShadowModel(BaseModel):
+    """One branch declaration in a row-union schema repair fact."""
+
+    branch: str
+    mode: Literal["fixed", "flexible"]
+    fields: list[_RowUnionFieldSchemaDetailShadowModel]
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class _RowUnionSchemaDetailShadowModel(BaseModel):
+    """Typed redaction shadow for safe row-union branch-schema facts."""
+
+    branches: list[_RowUnionBranchSchemaDetailShadowModel]
+    conflicting_fields: list[str]
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class _ValidationEntryShadowModel(BaseModel):
     """Redaction shadow for ``ValidationEntry.to_dict()`` (state.py).
 
@@ -2873,8 +2938,10 @@ class _ValidationEntryShadowModel(BaseModel):
     ``Severity`` literal alias to its string value); ``error_code`` is the
     closed machine-readable discriminant, emitted only when set, and
     ``contract`` the structured schema-contract facts, emitted only for the
-    schema-contract family. The response scalar projection preserves the
-    closed severity value and summarizes all free-form diagnostic text.
+    schema-contract family, and ``row_union_schema`` the branch declarations
+    emitted only for row-union incompatibility. The response scalar projection
+    preserves the closed severity value and summarizes all free-form
+    diagnostic text.
     """
 
     component: str
@@ -2882,6 +2949,7 @@ class _ValidationEntryShadowModel(BaseModel):
     severity: str
     error_code: str | None = None
     contract: _SchemaContractDetailShadowModel | None = None
+    row_union_schema: _RowUnionSchemaDetailShadowModel | None = None
 
     model_config = ConfigDict(extra="forbid")
 
@@ -3424,6 +3492,7 @@ MANIFEST: Mapping[str, ToolRedaction] = MappingProxyType(
                     "trigger",
                     "output_mode",
                     "expected_output_count",
+                    "timeout_seconds",
                 ),
                 sensitive_argument_keys=("options", "routes", "trigger"),
                 argument_summarizers={
@@ -3883,7 +3952,10 @@ def redact_source_storage_path(state_dict: dict[str, Any]) -> dict[str, Any]:
         # (web/sessions/routes/sessions.py) treat them equivalently. Mask both so a
         # blob-backed source authored with the "file" option shape cannot leak the
         # internal storage_path through this redaction surface (elspeth-a7aa07b7ce).
-        for storage_path_key in ("path", "file"):
+        # The carrier list is the shared ``GUIDED_REVIEWED_BLOB_PATH_KEYS`` constant
+        # rather than a local literal: a third carrier added there must reach every
+        # masking surface at once, or the surface that kept its own copy leaks.
+        for storage_path_key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
             if storage_path_key in redacted_options:
                 redacted_options[storage_path_key] = REDACTED_BLOB_SOURCE_PATH
         redacted_source["options"] = redacted_options
@@ -4006,7 +4078,9 @@ def redact_guided_snapshot_storage_paths(
         for live_name, live_source in tuple(rebuilt_sources.items()):
             live_options = live_source_options[live_name]
             live_reviewed_paths = {
-                value for key in ("path", "file") if type(value := live_options.get(key)) is str and value in all_reviewed_paths
+                value
+                for key in GUIDED_REVIEWED_BLOB_PATH_KEYS
+                if type(value := live_options.get(key)) is str and value in all_reviewed_paths
             }
             if not live_reviewed_paths:
                 continue
@@ -4016,7 +4090,7 @@ def redact_guided_snapshot_storage_paths(
             if len(candidates) != 1:
                 raise AuditIntegrityError("guided blob source mapping is inconsistent")
             options_redacted = dict(live_options)
-            for key in ("path", "file"):
+            for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
                 if type(value := live_options.get(key)) is str and value in live_reviewed_paths:
                     private_path_projections[value] = REDACTED_BLOB_SOURCE_PATH
                     options_redacted[key] = REDACTED_BLOB_SOURCE_PATH
@@ -4063,7 +4137,7 @@ def redact_guided_snapshot_storage_paths(
             pending_out[stable_id] = intent
             continue
         options_redacted = dict(intent_options)
-        for key in ("path", "file"):
+        for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
             if key in options_redacted:
                 options_redacted[key] = REDACTED_BLOB_SOURCE_PATH
         intent_redacted = dict(intent)

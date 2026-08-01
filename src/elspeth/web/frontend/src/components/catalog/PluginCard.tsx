@@ -23,11 +23,11 @@
 // for its prefill action, and ChatInput.tsx remains the receiver.
 // ============================================================================
 
-import { useState, type MouseEvent } from "react";
+import { useEffect, useState, type MouseEvent } from "react";
 import type { PluginSummary, PluginSchemaInfo } from "@/types/index";
 import { MarkdownRenderer } from "@/components/chat/MarkdownRenderer";
 import { AuditCharacteristicIcon } from "./AuditCharacteristicIcon";
-import { isInternalPlugin, pluginDisplayName } from "./pluginDisplayName";
+import { pluginDisplayName } from "./pluginDisplayName";
 
 /** Event name dispatched by InlineChatSourceEntry and consumed by
  *  ChatInput.tsx. Re-exported here for backwards compatibility with
@@ -110,7 +110,9 @@ function renderFields(properties: Record<string, JsonSchemaField>, required: str
   ));
 }
 
-const PROSE_FALLBACK = "See the technical description above.";
+function hasCatalogText(value: string | null): value is string {
+  return value !== null && value.trim().length > 0;
+}
 
 export function PluginCard({
   plugin,
@@ -120,13 +122,28 @@ export function PluginCard({
   onRetrySchema,
   initialExpanded = false,
 }: PluginCardProps) {
-  const [expanded, setExpanded] = useState(initialExpanded);
-  const [detailsOpen, setDetailsOpen] = useState(false);
   const displayName = pluginDisplayName(plugin.name);
   const cardId = `${pluginCardIdSegment(plugin.plugin_type)}-${pluginCardIdSegment(plugin.name)}`;
+  const whenText = plugin.usage_when_to_use;
+  const avoidText = plugin.usage_when_not_to_use;
+  const exampleText = plugin.example_use;
+  const hasWhen = hasCatalogText(whenText);
+  const hasAvoid = hasCatalogText(avoidText);
+  const hasExample = hasCatalogText(exampleText);
+  const hasDetails = hasWhen || hasAvoid || hasExample;
+  const [expanded, setExpanded] = useState(initialExpanded);
+  const [detailsState, setDetailsState] = useState({ cardId, open: false });
+  const detailsOpen = hasDetails && detailsState.cardId === cardId && detailsState.open;
   const nameId = `plugin-card-name-${cardId}`;
   const detailsPanelId = `plugin-card-details-panel-${cardId}`;
   const schemaPanelId = `plugin-card-schema-panel-${cardId}`;
+
+  useEffect(() => {
+    setDetailsState((current) => {
+      if (current.cardId === cardId && (hasDetails || !current.open)) return current;
+      return { cardId, open: false };
+    });
+  }, [cardId, hasDetails]);
 
   function handleDisclosureClick(e: MouseEvent<HTMLButtonElement>) {
     e.preventDefault();
@@ -141,11 +158,6 @@ export function PluginCard({
 
   const configSchema = schema?.json_schema as (DiscriminatedSchema & JsonSchemaObject) | undefined;
 
-  const allFallback =
-    plugin.usage_when_to_use === null &&
-    plugin.usage_when_not_to_use === null &&
-    plugin.example_use === null;
-
   return (
     // role="article" + aria-labelledby promotes the card to a named region
     // (WCAG 1.3.1): the plugin name reads as the card's accessible name
@@ -158,9 +170,6 @@ export function PluginCard({
         <span className="plugin-card-title-group">
           <span id={nameId} className="plugin-card-name">{displayName}</span>
           <code className="plugin-card-id">{plugin.name}</code>
-          {isInternalPlugin(plugin.name) && (
-            <span className="plugin-card-internal-badge">internal</span>
-          )}
         </span>
         <span className="plugin-card-kind">{plugin.plugin_type}</span>
       </div>
@@ -185,16 +194,23 @@ export function PluginCard({
       )}
 
       <div className="plugin-card-actions">
-        <button
-          type="button"
-          className="btn btn-small plugin-card-detail-toggle"
-          onClick={() => setDetailsOpen((open) => !open)}
-          aria-expanded={detailsOpen}
-          aria-controls={detailsPanelId}
-          aria-label={`Reference details for ${displayName}`}
-        >
-          Details
-        </button>
+        {hasDetails && (
+          <button
+            type="button"
+            className="btn btn-small plugin-card-detail-toggle"
+            onClick={() =>
+              setDetailsState((current) => ({
+                cardId,
+                open: current.cardId === cardId ? !current.open : true,
+              }))
+            }
+            aria-expanded={detailsOpen}
+            aria-controls={detailsPanelId}
+            aria-label={`Reference details for ${displayName}`}
+          >
+            Details
+          </button>
+        )}
         <button
           type="button"
           className="btn btn-small plugin-card-disclosure"
@@ -209,19 +225,17 @@ export function PluginCard({
 
       {detailsOpen && (
         <div id={detailsPanelId} className="plugin-card-details">
-          {allFallback ? (
-            <div className="plugin-card-prose-fallback">{PROSE_FALLBACK}</div>
-          ) : (
-            <>
-              <ProseSection label="Use when" body={plugin.usage_when_to_use} />
-              <ProseSection label="Avoid when" body={plugin.usage_when_not_to_use} />
-              {plugin.example_use !== null && (
-                <div className="plugin-card-example">
-                  <div className="plugin-card-example-label">Example</div>
-                  <pre className="plugin-card-example-code">{plugin.example_use}</pre>
-                </div>
-              )}
-            </>
+          {hasWhen && (
+            <ProseSection label="Use when" body={whenText} />
+          )}
+          {hasAvoid && (
+            <ProseSection label="Avoid when" body={avoidText} />
+          )}
+          {hasExample && (
+            <div className="plugin-card-example">
+              <div className="plugin-card-example-label">Example</div>
+              <pre className="plugin-card-example-code">{exampleText}</pre>
+            </div>
           )}
         </div>
       )}
@@ -266,8 +280,7 @@ export function PluginCard({
   );
 }
 
-function ProseSection({ label, body }: { label: string; body: string | null }) {
-  if (body === null) return null;
+function ProseSection({ label, body }: { label: string; body: string }) {
   return (
     <div className="plugin-card-prose-section">
       <div className="plugin-card-prose-label">{label}:</div>

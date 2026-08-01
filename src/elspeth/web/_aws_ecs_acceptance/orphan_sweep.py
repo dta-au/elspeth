@@ -13,6 +13,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
+from botocore.exceptions import ClientError
+
 from .contracts import AcceptanceCheckError, _sha256, _task_definition_family, _utc_timestamp
 from .manifest_schema import _load_retained_evidence, _read_control_manifest
 from .receipt_contracts import _validate_bounded_receipt_document
@@ -115,17 +117,15 @@ def _build_orphan_sweep_clients(region: str) -> OrphanSweepClients:
         )
     except Exception:
         for created_client in reversed(created):
-            close = getattr(created_client, "close", None)
-            if callable(close):
-                with contextlib.suppress(Exception):
-                    close()
+            with contextlib.suppress(Exception):
+                created_client.close()
         raise AcceptanceCheckError("orphan_sweep_runtime") from None
 
 
 def _aws_error_code(exc: Exception) -> str | None:
-    response = getattr(exc, "response", None)
-    if not isinstance(response, Mapping):
+    if not isinstance(exc, ClientError):
         return None
+    response = exc.response
     error = response.get("Error")
     if not isinstance(error, Mapping):
         return None
@@ -155,9 +155,9 @@ _ORPHAN_NOT_FOUND_CODES = frozenset(
 )
 
 
-def _orphan_call(client: Any, method: str, **kwargs: object) -> Mapping[str, object] | None:
+def _orphan_call(method: Callable[..., object], **kwargs: object) -> Mapping[str, object] | None:
     try:
-        response = getattr(client, method)(**kwargs)
+        response = method(**kwargs)
     except Exception as exc:
         if _aws_error_code(exc) in _ORPHAN_NOT_FOUND_CODES:
             return None
@@ -177,8 +177,7 @@ def _orphan_response_items(response: Mapping[str, object] | None, field: str) ->
 
 
 def _orphan_paged_items(
-    client: Any,
-    method: str,
+    method: Callable[..., object],
     *,
     item_field: str,
     request_token: str,
@@ -193,7 +192,7 @@ def _orphan_paged_items(
         request = dict(kwargs)
         if token is not None:
             request[request_token] = token
-        response = _orphan_call(client, method, **request)
+        response = _orphan_call(method, **request)
         if response is None:
             return collected
         page_items = [] if allow_missing_items and item_field not in response else _orphan_response_items(response, item_field)
@@ -211,9 +210,8 @@ def _orphan_paged_items(
 
 
 def _orphan_inventory_values(inventory: Mapping[str, object]) -> tuple[dict[str, object], dict[str, object]]:
-    values = inventory["values"]
-    orphan = inventory["orphan_sweep"]
-    assert isinstance(values, dict) and isinstance(orphan, dict)
+    values = cast(dict[str, object], inventory["values"])
+    orphan = cast(dict[str, object], inventory["orphan_sweep"])
     return values, orphan
 
 
@@ -227,8 +225,7 @@ def _task_definition_owned(
     if _task_definition_family(task_definition_arn) != family:
         raise AcceptanceCheckError("orphan_sweep_binding")
     described = _orphan_call(
-        client,
-        "describe_task_definition",
+        client.describe_task_definition,
         taskDefinition=task_definition_arn,
         include=["TAGS"],
     )
@@ -308,8 +305,7 @@ def orphan_sweep(
         _load_bound_scenario_inventory(manifest, "A"),
         _load_bound_scenario_inventory(manifest, "B"),
     )
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, Mapping)
+    evidence = cast(Mapping[str, object], manifest["evidence"])
     if evidence["retained_evidence_path"] is None:
         retained_scenarios: dict[str, object] = {
             scenario_id: {
@@ -322,12 +318,9 @@ def orphan_sweep(
         }
     else:
         retained_evidence = _load_retained_evidence(manifest)
-        loaded_scenarios = retained_evidence["scenarios"]
-        assert isinstance(loaded_scenarios, dict)
-        retained_scenarios = loaded_scenarios
-    aws = manifest["aws"]
-    ecr_manifest = manifest["ecr"]
-    assert isinstance(aws, dict) and isinstance(ecr_manifest, dict)
+        retained_scenarios = cast(dict[str, object], retained_evidence["scenarios"])
+    aws = cast(dict[str, object], manifest["aws"])
+    ecr_manifest = cast(dict[str, object], manifest["ecr"])
     if clients is None:
         clients = _build_orphan_sweep_clients(str(aws["region"]))
     counts = {surface: {"queried": 0, "unapproved_survivors": 0} for surface in _ORPHAN_SURFACES}
@@ -341,9 +334,7 @@ def orphan_sweep(
     def close_client(client: Any) -> None:
         nonlocal resource_close_failed
         try:
-            close = getattr(client, "close", None)
-            if callable(close):
-                close()
+            client.close()
         except Exception:
             resource_close_failed = True
 
@@ -358,8 +349,7 @@ def orphan_sweep(
             for tag in tags:
                 counts["ecr"]["queried"] += 1
                 before = _orphan_call(
-                    clients.ecr,
-                    "describe_images",
+                    clients.ecr.describe_images,
                     registryId=aws["account_id"],
                     repositoryName=repository,
                     imageIds=[{"imageTag": tag}],
@@ -367,8 +357,7 @@ def orphan_sweep(
                 image_details = _orphan_response_items(before, "imageDetails")
                 if image_details:
                     deleted = _orphan_call(
-                        clients.ecr,
-                        "batch_delete_image",
+                        clients.ecr.batch_delete_image,
                         registryId=aws["account_id"],
                         repositoryName=repository,
                         imageIds=[{"imageTag": tag}],
@@ -376,8 +365,7 @@ def orphan_sweep(
                     if deleted is None or _orphan_response_items(deleted, "failures"):
                         raise AcceptanceCheckError("orphan_sweep_api")
                 after = _orphan_call(
-                    clients.ecr,
-                    "describe_images",
+                    clients.ecr.describe_images,
                     registryId=aws["account_id"],
                     repositoryName=repository,
                     imageIds=[{"imageTag": tag}],
@@ -386,8 +374,7 @@ def orphan_sweep(
                     counts["ecr"]["unapproved_survivors"] += 1
 
             tagged = _orphan_paged_items(
-                clients.tagging,
-                "get_resources",
+                clients.tagging.get_resources,
                 item_field="ResourceTagMappingList",
                 request_token="PaginationToken",
                 response_token="PaginationToken",
@@ -402,19 +389,16 @@ def orphan_sweep(
 
             for scenario_id, inventory in zip(("A", "B"), inventories, strict=True):
                 values, orphan = _orphan_inventory_values(inventory)
-                scenario_retained = retained_scenarios[scenario_id]
-                assert isinstance(scenario_retained, dict)
+                scenario_retained = cast(dict[str, object], retained_scenarios[scenario_id])
                 orphan = {**orphan, **scenario_retained}
-                retained_metric_count = orphan["expected_retained_metric_series"]
-                retained_trace_count = orphan["expected_retained_trace_ids"]
-                assert isinstance(retained_metric_count, int) and isinstance(retained_trace_count, int)
+                retained_metric_count = cast(int, orphan["expected_retained_metric_series"])
+                retained_trace_count = cast(int, orphan["expected_retained_trace_ids"])
                 retained_metrics += retained_metric_count
                 retained_traces += retained_trace_count
                 cluster = values["ECS_CLUSTER"]
                 service = values["ECS_SERVICE"]
                 services = _orphan_call(
-                    clients.ecs,
-                    "describe_services",
+                    clients.ecs.describe_services,
                     cluster=cluster,
                     services=[service],
                     include=["TAGS"],
@@ -423,8 +407,7 @@ def orphan_sweep(
                 counts["ecs"]["unapproved_survivors"] += len(_orphan_response_items(services, "services"))
                 for desired_status in ("RUNNING", "PENDING"):
                     task_arns = _orphan_paged_items(
-                        clients.ecs,
-                        "list_tasks",
+                        clients.ecs.list_tasks,
                         item_field="taskArns",
                         request_token="nextToken",
                         response_token="nextToken",
@@ -437,13 +420,11 @@ def orphan_sweep(
                     )
                     counts["ecs"]["queried"] += 1
                     counts["ecs"]["unapproved_survivors"] += len(task_arns)
-                families = orphan["ecs_task_definition_families"]
-                assert isinstance(families, list)
+                families = cast(list[str], orphan["ecs_task_definition_families"])
                 for family in families:
                     for desired_status in ("RUNNING", "PENDING"):
                         family_tasks = _orphan_paged_items(
-                            clients.ecs,
-                            "list_tasks",
+                            clients.ecs.list_tasks,
                             item_field="taskArns",
                             request_token="nextToken",
                             response_token="nextToken",
@@ -459,8 +440,7 @@ def orphan_sweep(
                     by_status: dict[str, list[object]] = {}
                     for status_value in ("ACTIVE", "INACTIVE", "DELETE_IN_PROGRESS"):
                         by_status[status_value] = _orphan_paged_items(
-                            clients.ecs,
-                            "list_task_definitions",
+                            clients.ecs.list_task_definitions,
                             item_field="taskDefinitionArns",
                             request_token="nextToken",
                             response_token="nextToken",
@@ -477,8 +457,8 @@ def orphan_sweep(
                                 raise AcceptanceCheckError("orphan_sweep_binding")
                     verified_task_definitions: set[str] = set()
                     inactive = list(by_status["INACTIVE"])
-                    for task_definition_arn in by_status["ACTIVE"]:
-                        assert isinstance(task_definition_arn, str)
+                    for item in by_status["ACTIVE"]:
+                        task_definition_arn = cast(str, item)
                         _task_definition_owned(
                             clients.ecs,
                             task_definition_arn,
@@ -487,15 +467,14 @@ def orphan_sweep(
                         )
                         verified_task_definitions.add(task_definition_arn)
                         deregistered = _orphan_call(
-                            clients.ecs,
-                            "deregister_task_definition",
+                            clients.ecs.deregister_task_definition,
                             taskDefinition=task_definition_arn,
                         )
                         if deregistered is None:
                             raise AcceptanceCheckError("orphan_sweep_api")
                         inactive.append(task_definition_arn)
-                    for task_definition_arn in by_status["DELETE_IN_PROGRESS"]:
-                        assert isinstance(task_definition_arn, str)
+                    for item in by_status["DELETE_IN_PROGRESS"]:
+                        task_definition_arn = cast(str, item)
                         _task_definition_owned(
                             clients.ecs,
                             task_definition_arn,
@@ -506,8 +485,8 @@ def orphan_sweep(
                         allowed_deleting_task_definitions.add(task_definition_arn)
                     for offset in range(0, len(inactive), 10):
                         batch = inactive[offset : offset + 10]
-                        for task_definition_arn in batch:
-                            assert isinstance(task_definition_arn, str)
+                        for item in batch:
+                            task_definition_arn = cast(str, item)
                             if task_definition_arn not in verified_task_definitions:
                                 _task_definition_owned(
                                     clients.ecs,
@@ -516,29 +495,26 @@ def orphan_sweep(
                                     acceptance_run_id=acceptance_run_id,
                                 )
                                 verified_task_definitions.add(task_definition_arn)
-                        deleted = _orphan_call(clients.ecs, "delete_task_definitions", taskDefinitions=batch)
+                        deleted = _orphan_call(clients.ecs.delete_task_definitions, taskDefinitions=batch)
                         if deleted is None or _orphan_response_items(deleted, "failures"):
                             raise AcceptanceCheckError("orphan_sweep_api")
                         allowed_deleting_task_definitions.update(cast(list[str], batch))
                     active_after = _orphan_paged_items(
-                        clients.ecs,
-                        "list_task_definitions",
+                        clients.ecs.list_task_definitions,
                         item_field="taskDefinitionArns",
                         request_token="nextToken",
                         response_token="nextToken",
                         kwargs={"familyPrefix": family, "status": "ACTIVE", "sort": "ASC", "maxResults": 100},
                     )
                     inactive_after = _orphan_paged_items(
-                        clients.ecs,
-                        "list_task_definitions",
+                        clients.ecs.list_task_definitions,
                         item_field="taskDefinitionArns",
                         request_token="nextToken",
                         response_token="nextToken",
                         kwargs={"familyPrefix": family, "status": "INACTIVE", "sort": "ASC", "maxResults": 100},
                     )
                     deleting_after = _orphan_paged_items(
-                        clients.ecs,
-                        "list_task_definitions",
+                        clients.ecs.list_task_definitions,
                         item_field="taskDefinitionArns",
                         request_token="nextToken",
                         response_token="nextToken",
@@ -554,8 +530,8 @@ def orphan_sweep(
                         if _task_definition_family(task_definition_arn) != family:
                             raise AcceptanceCheckError("orphan_sweep_binding")
                     counts["ecs"]["unapproved_survivors"] += len(active_after) + len(inactive_after)
-                    for task_definition_arn in deleting_after:
-                        assert isinstance(task_definition_arn, str)
+                    for item in deleting_after:
+                        task_definition_arn = cast(str, item)
                         if task_definition_arn not in verified_task_definitions:
                             _task_definition_owned(
                                 clients.ecs,
@@ -579,48 +555,44 @@ def orphan_sweep(
                         )
 
                 for field, method, argument_name, response_field, surface in (
-                    ("ALB_ARN", "describe_load_balancers", "LoadBalancerArns", "LoadBalancers", "elbv2"),
-                    ("TARGET_GROUP_ARN", "describe_target_groups", "TargetGroupArns", "TargetGroups", "elbv2"),
-                    ("FIRST_DEPLOY_LISTENER_RULE_ARN", "describe_rules", "RuleArns", "Rules", "elbv2"),
-                    ("DB_CLUSTER_IDENTIFIER", "describe_db_clusters", "DBClusterIdentifier", "DBClusters", "rds"),
+                    ("ALB_ARN", clients.elbv2.describe_load_balancers, "LoadBalancerArns", "LoadBalancers", "elbv2"),
+                    ("TARGET_GROUP_ARN", clients.elbv2.describe_target_groups, "TargetGroupArns", "TargetGroups", "elbv2"),
+                    ("FIRST_DEPLOY_LISTENER_RULE_ARN", clients.elbv2.describe_rules, "RuleArns", "Rules", "elbv2"),
+                    ("DB_CLUSTER_IDENTIFIER", clients.rds.describe_db_clusters, "DBClusterIdentifier", "DBClusters", "rds"),
                 ):
                     identity = values[field]
                     if identity:
                         argument: object = [identity] if argument_name.endswith("Arns") else identity
-                        response = _orphan_call(clients.elbv2 if surface == "elbv2" else clients.rds, method, **{argument_name: argument})
+                        response = _orphan_call(method, **{argument_name: argument})
                         counts[surface]["queried"] += 1
                         counts[surface]["unapproved_survivors"] += len(_orphan_response_items(response, response_field))
-                listener_arns = orphan["elbv2_listener_arns"]
-                assert isinstance(listener_arns, list)
+                listener_arns = cast(list[object], orphan["elbv2_listener_arns"])
                 for listener_arn in listener_arns:
-                    response = _orphan_call(clients.elbv2, "describe_listeners", ListenerArns=[listener_arn])
+                    response = _orphan_call(clients.elbv2.describe_listeners, ListenerArns=[listener_arn])
                     counts["elbv2"]["queried"] += 1
                     counts["elbv2"]["unapproved_survivors"] += len(_orphan_response_items(response, "Listeners"))
-                db_instances = orphan["rds_db_instance_identifiers"]
-                assert isinstance(db_instances, list)
+                db_instances = cast(list[object], orphan["rds_db_instance_identifiers"])
                 for identifier in db_instances:
-                    response = _orphan_call(clients.rds, "describe_db_instances", DBInstanceIdentifier=identifier)
+                    response = _orphan_call(clients.rds.describe_db_instances, DBInstanceIdentifier=identifier)
                     counts["rds"]["queried"] += 1
                     counts["rds"]["unapproved_survivors"] += len(_orphan_response_items(response, "DBInstances"))
                 for creation_token in cast(list[str], orphan["efs_creation_tokens"]):
-                    response = _orphan_call(clients.efs, "describe_file_systems", CreationToken=creation_token)
+                    response = _orphan_call(clients.efs.describe_file_systems, CreationToken=creation_token)
                     counts["efs"]["queried"] += 1
                     counts["efs"]["unapproved_survivors"] += len(_orphan_response_items(response, "FileSystems"))
                 for file_system_id in cast(list[str], orphan["efs_file_system_ids"]):
-                    response = _orphan_call(clients.efs, "describe_file_systems", FileSystemId=file_system_id)
+                    response = _orphan_call(clients.efs.describe_file_systems, FileSystemId=file_system_id)
                     counts["efs"]["queried"] += 1
                     counts["efs"]["unapproved_survivors"] += len(_orphan_response_items(response, "FileSystems"))
                     access_points = _orphan_paged_items(
-                        clients.efs,
-                        "describe_access_points",
+                        clients.efs.describe_access_points,
                         item_field="AccessPoints",
                         request_token="NextToken",
                         response_token="NextToken",
                         kwargs={"FileSystemId": file_system_id, "MaxResults": 100},
                     )
                     mount_targets = _orphan_paged_items(
-                        clients.efs,
-                        "describe_mount_targets",
+                        clients.efs.describe_mount_targets,
                         item_field="MountTargets",
                         request_token="Marker",
                         response_token="NextMarker",
@@ -629,16 +601,16 @@ def orphan_sweep(
                     counts["efs"]["queried"] += 2
                     counts["efs"]["unapproved_survivors"] += len(access_points) + len(mount_targets)
                 for access_point_id in cast(list[str], orphan["efs_access_point_ids"]):
-                    response = _orphan_call(clients.efs, "describe_access_points", AccessPointId=access_point_id, MaxResults=100)
+                    response = _orphan_call(clients.efs.describe_access_points, AccessPointId=access_point_id, MaxResults=100)
                     counts["efs"]["queried"] += 1
                     counts["efs"]["unapproved_survivors"] += len(_orphan_response_items(response, "AccessPoints"))
                 for secret_id in cast(list[str], orphan["secret_ids"]):
-                    response = _orphan_call(clients.secretsmanager, "describe_secret", SecretId=secret_id)
+                    response = _orphan_call(clients.secretsmanager.describe_secret, SecretId=secret_id)
                     counts["secretsmanager"]["queried"] += 1
                     if response is not None:
                         counts["secretsmanager"]["unapproved_survivors"] += 1
                 for role_name in cast(list[str], orphan["iam_role_names"]):
-                    response = _orphan_call(clients.iam, "get_role", RoleName=role_name)
+                    response = _orphan_call(clients.iam.get_role, RoleName=role_name)
                     counts["iam"]["queried"] += 1
                     if response is not None:
                         role = response.get("Role")
@@ -646,8 +618,7 @@ def orphan_sweep(
                             raise AcceptanceCheckError("orphan_sweep_api")
                         counts["iam"]["unapproved_survivors"] += 1
                 resource_policies = _orphan_paged_items(
-                    clients.logs,
-                    "describe_resource_policies",
+                    clients.logs.describe_resource_policies,
                     item_field="resourcePolicies",
                     request_token="nextToken",
                     response_token="nextToken",
@@ -665,8 +636,7 @@ def orphan_sweep(
                 } | set(cast(list[str], orphan["log_group_names"]))
                 for log_group_name in sorted(log_group_names):
                     groups = _orphan_paged_items(
-                        clients.logs,
-                        "describe_log_groups",
+                        clients.logs.describe_log_groups,
                         item_field="logGroups",
                         request_token="nextToken",
                         response_token="nextToken",
@@ -678,8 +648,7 @@ def orphan_sweep(
                     )
                 for dashboard_name in cast(list[str], orphan["cloudwatch_dashboard_names"]):
                     dashboards = _orphan_paged_items(
-                        clients.cloudwatch,
-                        "list_dashboards",
+                        clients.cloudwatch.list_dashboards,
                         item_field="DashboardEntries",
                         request_token="NextToken",
                         response_token="NextToken",
@@ -690,7 +659,7 @@ def orphan_sweep(
                         isinstance(entry, Mapping) and entry.get("DashboardName") == dashboard_name for entry in dashboards
                     )
                 for alarm_name in cast(list[str], orphan["cloudwatch_alarm_names"]):
-                    response = _orphan_call(clients.cloudwatch, "describe_alarms", AlarmNames=[alarm_name], MaxRecords=100)
+                    response = _orphan_call(clients.cloudwatch.describe_alarms, AlarmNames=[alarm_name], MaxRecords=100)
                     counts["cloudwatch"]["queried"] += 1
                     counts["cloudwatch"]["unapproved_survivors"] += (
                         len(_orphan_response_items(response, "MetricAlarms"))
@@ -700,8 +669,7 @@ def orphan_sweep(
                 for metric_query in cast(list[dict[str, object]], orphan["cloudwatch_retained_metrics"]):
                     dimensions = cast(list[dict[str, str]], metric_query["dimensions"])
                     metrics = _orphan_paged_items(
-                        clients.cloudwatch,
-                        "list_metrics",
+                        clients.cloudwatch.list_metrics,
                         item_field="Metrics",
                         request_token="NextToken",
                         response_token="NextToken",
@@ -732,8 +700,7 @@ def orphan_sweep(
                     else:
                         observed_retained_metrics += 1
                 groups = _orphan_paged_items(
-                    clients.xray,
-                    "get_groups",
+                    clients.xray.get_groups,
                     item_field="Groups",
                     request_token="NextToken",
                     response_token="NextToken",
@@ -745,8 +712,7 @@ def orphan_sweep(
                     isinstance(group, Mapping) and group.get("GroupName") in expected_groups for group in groups
                 )
                 sampling_rules = _orphan_paged_items(
-                    clients.xray,
-                    "get_sampling_rules",
+                    clients.xray.get_sampling_rules,
                     item_field="SamplingRuleRecords",
                     request_token="NextToken",
                     response_token="NextToken",
@@ -763,7 +729,7 @@ def orphan_sweep(
                 trace_ids = cast(list[str], orphan["xray_retained_trace_ids"])
                 for offset in range(0, len(trace_ids), 5):
                     requested_trace_ids = trace_ids[offset : offset + 5]
-                    response = _orphan_call(clients.xray, "batch_get_traces", TraceIds=requested_trace_ids)
+                    response = _orphan_call(clients.xray.batch_get_traces, TraceIds=requested_trace_ids)
                     if response is None:
                         raise AcceptanceCheckError("orphan_sweep_api")
                     traces = _orphan_response_items(response, "Traces")
@@ -780,15 +746,14 @@ def orphan_sweep(
                         counts["xray"]["unapproved_survivors"] += max(1, abs(len(traces) - len(requested_trace_ids)))
                     else:
                         observed_retained_traces += len(traces)
-                destination_response = _orphan_call(clients.xray, "get_trace_segment_destination")
+                destination_response = _orphan_call(clients.xray.get_trace_segment_destination)
                 if destination_response is None:
                     raise AcceptanceCheckError("orphan_sweep_api")
                 destination = destination_response.get("Destination")
                 if destination not in {None, "XRay", "CloudWatchLogs"}:
                     raise AcceptanceCheckError("orphan_sweep_api")
                 indexing_rules = _orphan_paged_items(
-                    clients.xray,
-                    "get_indexing_rules",
+                    clients.xray.get_indexing_rules,
                     item_field="IndexingRules",
                     request_token="NextToken",
                     response_token="NextToken",
@@ -796,8 +761,7 @@ def orphan_sweep(
                     allow_missing_items=True,
                 )
                 spans_groups = _orphan_paged_items(
-                    clients.logs,
-                    "describe_log_groups",
+                    clients.logs.describe_log_groups,
                     item_field="logGroups",
                     request_token="nextToken",
                     response_token="nextToken",
@@ -827,10 +791,8 @@ def orphan_sweep(
                         }
                     )
                 for event_rule in event_rules:
-                    assert isinstance(event_rule, dict)
                     response = _orphan_call(
-                        clients.events,
-                        "describe_rule",
+                        clients.events.describe_rule,
                         Name=event_rule["rule_name"],
                         EventBusName=event_rule["event_bus_name"],
                     )
@@ -838,8 +800,7 @@ def orphan_sweep(
                     if response is not None:
                         counts["events"]["unapproved_survivors"] += 1
                     targets = _orphan_paged_items(
-                        clients.events,
-                        "list_targets_by_rule",
+                        clients.events.list_targets_by_rule,
                         item_field="Targets",
                         request_token="NextToken",
                         response_token="NextToken",
@@ -852,10 +813,8 @@ def orphan_sweep(
                     counts["events"]["queried"] += 1
                     counts["events"]["unapproved_survivors"] += len(targets)
                 for guardrail in cast(list[dict[str, object]], orphan["bedrock_guardrails"]):
-                    assert isinstance(guardrail, dict)
                     guardrails = _orphan_paged_items(
-                        clients.bedrock,
-                        "list_guardrails",
+                        clients.bedrock.list_guardrails,
                         item_field="guardrails",
                         request_token="nextToken",
                         response_token="nextToken",
@@ -867,15 +826,14 @@ def orphan_sweep(
                     counts["bedrock"]["unapproved_survivors"] += len(guardrails)
                 user_pool_id = values["COGNITO_USER_POOL_ID"]
                 if user_pool_id and orphan["cognito_pool_owned"] is True:
-                    response = _orphan_call(clients.cognito, "describe_user_pool", UserPoolId=user_pool_id)
+                    response = _orphan_call(clients.cognito.describe_user_pool, UserPoolId=user_pool_id)
                     counts["cognito"]["queried"] += 1
                     if response is not None:
                         counts["cognito"]["unapproved_survivors"] += 1
                 subject_sub = orphan["cognito_subject_sub"]
                 if user_pool_id and subject_sub:
                     users = _orphan_paged_items(
-                        clients.cognito,
-                        "list_users",
+                        clients.cognito.list_users,
                         item_field="Users",
                         request_token="PaginationToken",
                         response_token="PaginationToken",

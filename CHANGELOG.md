@@ -10,8 +10,10 @@ All notable changes to ELSPETH are documented here.
 
 Release-candidate documentation now states the cross-platform deployment contract:
 Docker Compose, AWS ECS, native Linux, one Azure Ubuntu VM, and Kubernetes BYO.
-AWS uses operator-supplied task-definition ARNs; Azure Container Apps remains
-deferred pending cross-instance fencing.
+A new AWS stack comes from the tracked AWS ECS Terraform cold-install package,
+while the separate release acceptance controller and the existing-service
+redeploy path use operator-supplied task-definition ARNs; Azure Container Apps
+remains deferred pending cross-instance fencing.
 
 ## 0.7.2 - Release candidate (Release hardening and recovery correctness)
 
@@ -20,17 +22,30 @@ tightens deployment packaging, Composer correctness, authentication, and
 recovery after committed blob deletion. The notes below intentionally cover
 only major changes and critical correctness or security fixes.
 
-**Breaking pre-1.0 session-schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 37. Epoch 36 makes committed blob-deletion cleanup retryable; epoch 37 adds
-the persistent compatible-generation coordination schema for session-operation
-authority, run-start state, cross-replica handoff, and bounded cleanup. Guided
-checkpoints remain at schema 10 and Landscape
-`SQLITE_SCHEMA_EPOCH` remains at 29. ELSPETH does not migrate the predecessor
-session database in place before 1.0. Archive or export required evidence, stop
-the old service, recreate a stale session store, then install
-0.7.2. A Landscape database already at epoch 29 remains current. Do not roll
-older code back over the recreated session database; keep the service drained
-and repair this release forward.
+**Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
+to 42. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
+completed guided-plan decline contract, epoch 38 adds the decline result
+message locator that pins the exact assistant message a decline replays, and
+epoch 39 adds the `policy_blocked` guided-operation failure code so a
+deployment-policy refusal settles as a permanent failure instead of being
+misattributed to the model provider. Epoch 40 makes the explicit coalesce
+`timeout_seconds` key required in persisted proposal payloads, including
+`null`, so epoch-39 sessions fail at startup instead of during guided replay.
+Epoch 41 does the same for the `node_options_summary` key the proposal and
+wiring review cards render, so an epoch-40 session cannot reach a stored
+payload whose projection no longer verifies. Epoch 42 adds persistent
+session-operation authority, compatible-generation membership and run-start
+state, durable ticket/composer/rate-limit handoff, bounded cleanup claims, and
+monotonic user-secret row versions.
+Guided checkpoints remain at schema 10 and Landscape
+`SQLITE_SCHEMA_EPOCH` advances from 29 to 30, which adds the durable row_union
+barrier attribution column to scheduler work items. ELSPETH does not migrate
+either predecessor database in place before 1.0. Archive or export required
+evidence, stop the old service, recreate stale session and Landscape stores,
+then install
+0.7.2. A Landscape database at epoch 29 is not current and must be recreated.
+Do not roll older code back over the recreated databases; keep the service
+drained and repair this release forward.
 
 ### Major changes
 
@@ -46,6 +61,13 @@ and repair this release forward.
   retain provider, prompt, failure, source, and fork evidence, while runtime
   preflight and approved tutorial execution are keyed to the composition that
   produced them.
+- **Correlated row unions are first-class Composer topology** — freeform,
+  guided, import/export, validation, and graph surfaces can author and inspect
+  plugin-free, require-all `row_union` barriers that release branch rows
+  unchanged in declared order for long-format processing. Canonical
+  configuration, build, runtime, and guided coverage is present; broader audit,
+  recovery, concurrency, browser-backed round-trip, and scale acceptance
+  remains deferred under the open row-union work.
 
 ### Critical fixes
 

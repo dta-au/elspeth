@@ -156,6 +156,7 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
                 "credential_ref": "OPENROUTER_API_KEY",
             }
         },
+        default_llm_profile="sonnet",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
@@ -182,6 +183,181 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
         catalog=create_catalog_service(),
         profiles=profiles,
         principal_scope="local:authoring-aids-profile",
+        secret_inventory=_ServerKeyInventory(),
+        generation_key=b"authoring-aids-key",
+    )
+    return PolicyCatalogView(create_catalog_service(), snapshot, profiles), snapshot
+
+
+def _guardrail_profile_view(
+    tmp_path: Path,
+    *,
+    control_mode: str = "required",
+) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """Control-required posture: LLM profile plus both Bedrock Guardrail profiles.
+
+    Mirrors the AWS scenario module, which authorizes the two Bedrock controls,
+    sets both control modes to ``required``, and binds each to an operator-owned
+    Guardrail behind an opaque alias.
+    """
+    from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
+    from elspeth.web.config import WebSettings
+    from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+        llm_profiles={
+            "sonnet": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "credential_scope": "server",
+                "credential_ref": "OPENROUTER_API_KEY",
+            }
+        },
+        default_llm_profile="sonnet",
+        plugin_allowlist=("transform:aws_bedrock_prompt_shield", "transform:aws_bedrock_content_safety"),
+        plugin_preferences={
+            PluginCapability.PROMPT_SHIELD: ("transform:aws_bedrock_prompt_shield",),
+            PluginCapability.CONTENT_SAFETY: ("transform:aws_bedrock_content_safety",),
+        },
+        plugin_control_modes={
+            PluginCapability.PROMPT_SHIELD: ControlMode(control_mode),
+            PluginCapability.CONTENT_SAFETY: ControlMode(control_mode),
+        },
+        bedrock_guardrail_profiles=(
+            BedrockGuardrailProfileSettings(
+                alias="prompt-approved",
+                plugin="aws_bedrock_prompt_shield",
+                guardrail_identifier="operatorpromptguardrail",
+                guardrail_version="1",
+                region="ap-southeast-2",
+            ),
+            BedrockGuardrailProfileSettings(
+                alias="content-approved",
+                plugin="aws_bedrock_content_safety",
+                guardrail_identifier="operatorcontentguardrail",
+                guardrail_version="1",
+                region="ap-southeast-2",
+            ),
+        ),
+        bedrock_guardrail_default_profiles={
+            "aws_bedrock_prompt_shield": "prompt-approved",
+            "aws_bedrock_content_safety": "content-approved",
+        },
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+
+    class _ServerKeyInventory:
+        def has_server_ref(self, name: str) -> bool:
+            return name == "OPENROUTER_API_KEY"
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return name == "OPENROUTER_API_KEY"
+
+        def server_generation(self, name: str) -> str | None:
+            return "gen-1" if name == "OPENROUTER_API_KEY" else None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=create_catalog_service(),
+        profiles=profiles,
+        principal_scope="local:authoring-aids-guardrail",
+        secret_inventory=_ServerKeyInventory(),
+        generation_key=b"authoring-aids-key",
+    )
+    return PolicyCatalogView(create_catalog_service(), snapshot, profiles), snapshot
+
+
+def _direct_control_view(
+    tmp_path: Path,
+    *,
+    control_mode: str = "required",
+) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """Control posture with NO operator profile aliases for the controls.
+
+    The Azure safety plugins are USER_CONFIGURABLE_WITH_POLICY: selected and
+    available (their credential is in the inventory) but carrying zero
+    operator profile aliases — the direct-configuration deployment shape.
+    """
+    from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.web.config import WebSettings
+    from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+        llm_profiles={
+            "sonnet": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "credential_scope": "server",
+                "credential_ref": "OPENROUTER_API_KEY",
+            }
+        },
+        default_llm_profile="sonnet",
+        plugin_allowlist=("transform:azure_prompt_shield", "transform:azure_content_safety"),
+        plugin_preferences={
+            PluginCapability.PROMPT_SHIELD: ("transform:azure_prompt_shield",),
+            PluginCapability.CONTENT_SAFETY: ("transform:azure_content_safety",),
+        },
+        plugin_control_modes={
+            PluginCapability.PROMPT_SHIELD: ControlMode(control_mode),
+            PluginCapability.CONTENT_SAFETY: ControlMode(control_mode),
+        },
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+
+    class _ServerKeyInventory:
+        _names = frozenset({"OPENROUTER_API_KEY", "AZURE_CONTENT_SAFETY_KEY"})
+
+        def has_server_ref(self, name: str) -> bool:
+            return name in self._names
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return name in self._names
+
+        def server_generation(self, name: str) -> str | None:
+            return "gen-1" if name in self._names else None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=create_catalog_service(),
+        profiles=profiles,
+        principal_scope="local:authoring-aids-direct-control",
         secret_inventory=_ServerKeyInventory(),
         generation_key=b"authoring-aids-key",
     )
@@ -405,6 +581,204 @@ class TestForkCoalesceExemplar:
         assert len({llm["options"]["response_field"] for llm in llms}) == 2
         assert all("queries" not in llm["options"] for llm in llms)
 
+    def test_forked_exemplar_still_builds_with_controls_inserted(self, tmp_path: Path) -> None:
+        """Inserting the control nodes must not break the exemplar's topology.
+
+        Scope: this proves the bytes still construct a valid pipeline with two
+        extra nodes spliced into the stream chain. It does NOT prove control
+        coverage — ``build_set_pipeline_candidate`` does not run the plugin-policy
+        coverage check (an uncovered fork is accepted here and rejected later, at
+        completion validation). The dominance relationships that satisfy coverage
+        are asserted structurally in the next test.
+        """
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        assert candidate.acceptable is True, f"control-required fork exemplar rejected: {rejection}"
+
+    def test_selected_controls_are_wired_into_the_forked_llm_exemplar(self, tmp_path: Path) -> None:
+        """A control-required deployment must not be taught two bare llm branches.
+
+        ``control_coverage_findings`` proves coverage per LLM node: the shield
+        must dominate the node's prompt inputs and content safety must dominate
+        every one of its output streams. An exemplar modelling an uncovered fork
+        would teach exactly the topology this deployment's validator rejects, so
+        the controls are wired — one shield upstream of the fork covering both
+        branches' prompt fields, one safety node downstream of the rejoin
+        covering both branches' response fields.
+        """
+        view, _snapshot = _guardrail_profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        nodes = {node["id"]: node for node in args["nodes"]}
+        llms = [node for node in nodes.values() if node.get("plugin") == "llm"]
+        assert len(llms) == 2
+        gate = next(node for node in nodes.values() if node["node_type"] == "gate")
+        coalesce = next(node for node in nodes.values() if node["node_type"] == "coalesce")
+
+        shield = next(node for node in nodes.values() if node.get("plugin") == "aws_bedrock_prompt_shield")
+        safety = next(node for node in nodes.values() if node.get("plugin") == "aws_bedrock_content_safety")
+
+        # The shield dominates the fork, so one node covers both branches, and it
+        # covers exactly the row fields the branch prompts interpolate.
+        assert shield["input"] == args["source"]["on_success"]
+        assert gate["input"] == shield["on_success"]
+        prompt_fields = {"ticket_id", "body"}
+        assert prompt_fields <= set(shield["options"]["fields"])
+
+        # Safety dominates the rejoin, covering both branches' response fields.
+        assert safety["input"] == coalesce["id"]
+        assert {llm["options"]["response_field"] for llm in llms} <= set(safety["options"]["fields"])
+        cleanup = next(node for node in nodes.values() if node.get("plugin") == "field_mapper")
+        assert cleanup["input"] == safety["on_success"]
+
+        # Operator-owned bindings stay behind the alias — never modelled inline.
+        for control in (shield, safety):
+            assert control["options"]["profile"] in {"prompt-approved", "content-approved"}
+            assert "guardrail_identifier" not in control["options"]
+            assert "guardrail_version" not in control["options"]
+
+    def test_forked_exemplar_passes_required_control_coverage_at_completion(self, tmp_path: Path) -> None:
+        """The accepted exemplar must clear the completion-validation coverage gate.
+
+        ``build_set_pipeline_candidate`` does not run required-control
+        coverage — completion validation does. The exemplar's
+        one-shield-above-the-fork placement is only teachable if that gate
+        accepts a shield dominating both branches through the fan-out gate.
+        """
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+        assert candidate.acceptable is True, (candidate.result.data or {}).get("error")
+
+        result = view.validate_authored_state(candidate.result.updated_state)
+        coverage = [finding for finding in result.findings if finding.stage == "required_control_coverage"]
+        assert coverage == [], [finding.message for finding in coverage]
+
+    def test_recommended_controls_remain_advisory_and_do_not_mutate_the_exemplar(self, tmp_path: Path) -> None:
+        from elspeth.web.interpretation_state import PROMPT_SHIELD_AVAILABLE_DRAFT
+
+        view, _snapshot = _guardrail_profile_view(tmp_path, control_mode="recommend")
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        plugins = {node.get("plugin") for node in args["nodes"]}
+        assert "aws_bedrock_prompt_shield" not in plugins
+        assert "aws_bedrock_content_safety" not in plugins
+
+        aids = build_planner_authoring_aids(view)
+        rendered = "\n".join(aids["prompt_shield"]["rules"])
+        assert PROMPT_SHIELD_AVAILABLE_DRAFT in rendered
+        assert "required, not advisory" not in rendered
+        assert "content_safety" not in aids
+
+    def test_required_controls_without_profile_aliases_are_still_wired_into_the_exemplar(self, tmp_path: Path) -> None:
+        """Zero profile aliases must not drop a REQUIRED control from the exemplar.
+
+        A selected control can be usable without operator profile aliases
+        (direct user-configurable plugins such as the Azure safety pair).
+        Omitting the control nodes taught exactly the uncovered fork this
+        deployment's required-control-coverage validator rejects. The
+        alias-less form authors the control directly: no ``profile`` option,
+        the credential wired as the supported inline ``secret_ref`` marker,
+        and the remaining required service bindings as placeholders.
+        """
+        view, _snapshot = _direct_control_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        nodes = {node["id"]: node for node in args["nodes"]}
+        shield = next(node for node in nodes.values() if node.get("plugin") == "azure_prompt_shield")
+        safety = next(node for node in nodes.values() if node.get("plugin") == "azure_content_safety")
+        gate = next(node for node in nodes.values() if node["node_type"] == "gate")
+        coalesce = next(node for node in nodes.values() if node["node_type"] == "coalesce")
+
+        # Same dominance wiring as the profiled variant.
+        assert shield["input"] == args["source"]["on_success"]
+        assert gate["input"] == shield["on_success"]
+        assert safety["input"] == coalesce["id"]
+
+        for control in (shield, safety):
+            assert "profile" not in control["options"]
+            assert control["options"]["fields"]
+            assert control["options"]["api_key"] == {"secret_ref": "AZURE_CONTENT_SAFETY_KEY"}
+        # Effective blocking posture — all-6 thresholds are a coverage no-op.
+        thresholds = safety["options"]["thresholds"]
+        assert any(value < 6 for value in thresholds.values())
+
+
+class TestForkRowUnionExemplar:
+    def test_exemplar_validates_and_teaches_the_row_union_contract(self, tmp_path: Path) -> None:
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _trained_view()
+        args = planner_authoring_aids.fork_row_union_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        assert candidate.acceptable is True, f"fork/row_union exemplar rejected: {rejection}"
+        nodes = {node["id"]: node for node in args["nodes"]}
+        gate = next(node for node in nodes.values() if node["node_type"] == "gate")
+        union = next(node for node in nodes.values() if node["node_type"] == "row_union")
+        branch_nodes = [node for node in nodes.values() if node.get("input") in gate["fork_to"]]
+        assert set(union["branches"]) == set(gate["fork_to"])
+        assert set(union["branches"].values()) == {node["on_success"] for node in branch_nodes}
+        assert union["input"] == next(iter(union["branches"].values()))
+        assert union["on_success"] == "unioned_rows"
+        assert union["timeout_seconds"] > 0
+        assert "plugin" not in union
+        assert "policy" not in union
+        assert "merge" not in union
+
+    def test_authoring_aids_publish_row_union_rules_and_exemplar(self) -> None:
+        view, _snapshot = _trained_view()
+        payload = build_planner_authoring_aids(view)
+
+        assert payload["fork_row_union"]["set_pipeline_exemplar"] == planner_authoring_aids.fork_row_union_exemplar_args(view)
+        rendered = " ".join(payload["fork_row_union"]["rules"])
+        assert "require_all" in rendered
+        assert "N-to-N" in rendered
+        assert "first branch" in rendered
+
+    def test_alias_less_control_exemplar_validates_through_the_real_candidate_builder(self, tmp_path: Path) -> None:
+        """The exact alias-less control exemplar bytes must build."""
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _direct_control_view(tmp_path)
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+        content = args["source"]["inline_blob"]["content"]
+        context = _custody_context(tmp_path, content, view=view, snapshot=snapshot)
+
+        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+
+        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        assert candidate.acceptable is True, f"alias-less control exemplar rejected: {rejection}"
+
+    def test_recommended_alias_less_controls_do_not_mutate_the_exemplar(self, tmp_path: Path) -> None:
+        view, _snapshot = _direct_control_view(tmp_path, control_mode="recommend")
+        args = fork_coalesce_exemplar_args(view)
+        assert args is not None
+
+        plugins = {node.get("plugin") for node in args["nodes"]}
+        assert "azure_prompt_shield" not in plugins
+        assert "azure_content_safety" not in plugins
+
     def test_topology_exemplar_renders_and_validates_without_a_usable_llm_profile(self, tmp_path: Path) -> None:
         """No usable llm profile -> the SAME topology with non-LLM branches.
 
@@ -463,6 +837,51 @@ class TestForkCoalesceExemplar:
 
         section = payload["fork_coalesce"]
         assert section["set_pipeline_exemplar"] == fork_coalesce_exemplar_args(view)
+
+
+class TestSelectedControlProfile:
+    """Selection contract for the exemplar's required-control wiring."""
+
+    def test_required_with_aliases_returns_plugin_and_alias(self, tmp_path: Path) -> None:
+        from elspeth.contracts.plugin_capabilities import PluginCapability
+        from elspeth.web.composer.planner_authoring_aids import _selected_control_profile
+
+        view, _snapshot = _guardrail_profile_view(tmp_path)
+
+        assert _selected_control_profile(view, PluginCapability.PROMPT_SHIELD) == (
+            "aws_bedrock_prompt_shield",
+            "prompt-approved",
+        )
+        assert _selected_control_profile(view, PluginCapability.CONTENT_SAFETY) == (
+            "aws_bedrock_content_safety",
+            "content-approved",
+        )
+
+    def test_required_without_aliases_returns_plugin_with_no_alias(self, tmp_path: Path) -> None:
+        from elspeth.contracts.plugin_capabilities import PluginCapability
+        from elspeth.web.composer.planner_authoring_aids import _selected_control_profile
+
+        view, snapshot = _direct_control_view(tmp_path)
+        # Precondition: the controls really are selected with zero aliases.
+        aliases_by_plugin = dict(snapshot.usable_profile_aliases)
+        for capability in (PluginCapability.PROMPT_SHIELD, PluginCapability.CONTENT_SAFETY):
+            selected = dict(snapshot.selected)[capability]
+            assert selected is not None
+            assert not aliases_by_plugin.get(selected, ())
+
+        assert _selected_control_profile(view, PluginCapability.PROMPT_SHIELD) == ("azure_prompt_shield", None)
+        assert _selected_control_profile(view, PluginCapability.CONTENT_SAFETY) == ("azure_content_safety", None)
+
+    def test_recommend_mode_returns_none_even_with_a_selection(self, tmp_path: Path) -> None:
+        from elspeth.contracts.plugin_capabilities import PluginCapability
+        from elspeth.web.composer.planner_authoring_aids import _selected_control_profile
+
+        for view, _snapshot in (
+            _guardrail_profile_view(tmp_path, control_mode="recommend"),
+            _direct_control_view(tmp_path, control_mode="recommend"),
+        ):
+            assert _selected_control_profile(view, PluginCapability.PROMPT_SHIELD) is None
+            assert _selected_control_profile(view, PluginCapability.CONTENT_SAFETY) is None
 
 
 class TestExemplarDomainDisjointness:
@@ -675,26 +1094,18 @@ class TestPromptShieldRules:
     imported constants, so the aids can never drift from the contract.
     """
 
-    def test_trained_view_quotes_term_and_available_draft_verbatim(self) -> None:
-        from elspeth.web.interpretation_state import (
-            PROMPT_SHIELD_AVAILABLE_DRAFT,
-            PROMPT_SHIELD_USER_TERM,
-            PROMPT_SHIELD_WARNING_DRAFT,
-        )
+    def test_selected_recommended_shield_stays_an_advisory(self) -> None:
+        from elspeth.contracts.plugin_capabilities import PluginCapability
+        from elspeth.web.interpretation_state import PROMPT_SHIELD_AVAILABLE_DRAFT
 
         view, snapshot = _trained_view()
-        # The trained snapshot SELECTS a prompt shield — the honest draft is
-        # the shield-available wording (mirrors the warning→available upgrade
-        # the server itself applies when the shield is selected).
-        from elspeth.contracts.plugin_capabilities import PluginCapability
+        selected = dict(snapshot.selected).get(PluginCapability.PROMPT_SHIELD)
+        assert selected is not None
 
-        assert dict(snapshot.selected).get(PluginCapability.PROMPT_SHIELD) is not None
-
-        aids = build_planner_authoring_aids(view)
-        rendered = "\n".join(aids["prompt_shield"]["rules"])
-        assert PROMPT_SHIELD_USER_TERM in rendered
+        rendered = "\n".join(build_planner_authoring_aids(view)["prompt_shield"]["rules"])
+        assert selected.name in rendered
         assert PROMPT_SHIELD_AVAILABLE_DRAFT in rendered
-        assert PROMPT_SHIELD_WARNING_DRAFT not in rendered
+        assert "required, not advisory" not in rendered
 
     def test_shieldless_view_quotes_the_warning_draft_verbatim(self) -> None:
         from unittest.mock import MagicMock
@@ -733,12 +1144,65 @@ class TestPromptShieldRules:
         assert PROMPT_SHIELD_AVAILABLE_DRAFT not in rendered
 
     def test_rules_name_the_untrusted_producer_and_the_llm_attachment_point(self) -> None:
+        """Both regimes name the untrusted producer and the llm attachment point.
+
+        The shielded regime attaches a wired transform between them; the
+        shieldless regime attaches the review row to the llm node's
+        ``interpretation_requirements``.
+        """
         view, _snapshot = _trained_view()
 
         rendered = "\n".join(build_planner_authoring_aids(view)["prompt_shield"]["rules"])
         assert "web_scrape" in rendered
-        assert "interpretation_requirements" in rendered
         assert "llm" in rendered
+        # Shielded deployment: the attachment point is the wiring, not a card.
+        # Producer-neutral wording — "the fetch step" misdescribed a document
+        # extraction producer once aws_textract_document_analysis joined the
+        # untrusted set.
+        assert "between that producer node and" in rendered
+
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+
+        shieldless = "\n".join(_prompt_shield_rules(shield_plugin=None, untrusted_producers=("web_scrape",)))
+        assert "web_scrape" in shieldless
+        assert "llm" in shieldless
+        assert "interpretation_requirements" in shieldless
+
+    def test_rules_teach_every_untrusted_producer_in_the_contract_set(self) -> None:
+        """The taught producers come from the contract set, so a new one is taught automatically.
+
+        The aids intersect the contract's untrusted-producer set with the
+        policy-visible transforms, so membership is the only thing that decides
+        whether a producer is taught. Document extraction is in that set:
+        Textract returns whatever text the uploaded document carried.
+        """
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+        from elspeth.web.interpretation_state import _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS
+
+        assert "aws_textract_document_analysis" in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS
+
+        rendered = "\n".join(
+            _prompt_shield_rules(
+                shield_plugin="aws_bedrock_prompt_shield",
+                untrusted_producers=tuple(sorted(_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS)),
+            )
+        )
+        for producer in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
+            assert producer in rendered
+
+    def test_recommend_mode_draft_names_the_selected_shield_not_azure(self) -> None:
+        """A selected non-Azure shield's audit card must not claim azure_prompt_shield.
+
+        ``PROMPT_SHIELD_AVAILABLE_DRAFT`` used to hardcode "azure_prompt_shield"
+        in its text, and the planner is told to copy that draft verbatim into
+        the authored review row — so a deployment that selected a different
+        shield implementation got a review card recording the wrong control.
+        """
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+
+        rendered = "\n".join(_prompt_shield_rules(shield_plugin="aws_bedrock_prompt_shield", untrusted_producers=("web_scrape",)))
+        assert "azure_prompt_shield" not in rendered
+        assert "aws_bedrock_prompt_shield" in rendered
 
     def test_section_renders_under_the_live_profile_posture(self, tmp_path: Path) -> None:
         # The failing surface is the tutorial/guided walk under the operator-
@@ -750,6 +1214,85 @@ class TestPromptShieldRules:
 
         rendered = "\n".join(build_planner_authoring_aids(view)["prompt_shield"]["rules"])
         assert PROMPT_SHIELD_USER_TERM in rendered
+
+
+class TestRequiredModeAutoWireAids:
+    """R2-F10: REQUIRED mode is auto-wired server-side — the aids teach the
+    guarantee (and drop the shield-recommendation row) instead of demanding
+    manual wiring. RECOMMEND mode keeps the advisory regime, pinned by the
+    existing advisory tests."""
+
+    def test_required_shield_rules_teach_auto_wiring_not_manual_wiring(self, tmp_path: Path) -> None:
+        from elspeth.web.interpretation_state import (
+            PROMPT_SHIELD_USER_TERM,
+            REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
+        )
+
+        view, _snapshot = _guardrail_profile_view(tmp_path)
+
+        rendered = "\n".join(build_planner_authoring_aids(view)["prompt_shield"]["rules"])
+        assert "automatically splices" in rendered
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in rendered
+        assert "aws_bedrock_prompt_shield" in rendered
+        # The manual mandate is retired; the drop-the-recommendation-row rule stays.
+        assert "WIRE a" not in rendered
+        assert f"Do NOT stage the {PROMPT_SHIELD_USER_TERM} review row" in rendered
+
+    def test_required_content_safety_rules_teach_auto_wiring_and_keep_on_error_discipline(self, tmp_path: Path) -> None:
+        from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+
+        view, _snapshot = _guardrail_profile_view(tmp_path)
+
+        rendered = "\n".join(build_planner_authoring_aids(view)["content_safety"]["rules"])
+        assert "automatically splices" in rendered
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in rendered
+        assert "WIRE a" not in rendered
+        # Auto-wiring cannot repair an error route — the on_error discipline stays taught.
+        assert "on_error" in rendered
+        assert "'discard'" in rendered
+        assert "operator decision" in rendered
+
+    def test_placeholder_dependent_direct_required_posture_keeps_the_manual_wiring_mandate(self, tmp_path: Path) -> None:
+        """Review finding 1 counterpart: an alias-less selection whose required
+        bindings only exist as placeholder exemplars is NOT auto-wired, so the
+        aids must keep the manual WIRE mandate and never claim the guarantee."""
+        view, _snapshot = _direct_control_view(tmp_path)
+
+        aids = build_planner_authoring_aids(view)
+        shield_rules = "\n".join(aids["prompt_shield"]["rules"])
+        safety_rules = "\n".join(aids["content_safety"]["rules"])
+        for rendered in (shield_rules, safety_rules):
+            assert "automatically splices" not in rendered
+            assert "WIRE a" in rendered
+            assert "required, not advisory" in rendered
+
+    def test_review_registry_forbids_hand_authoring_the_auto_wire_disclosure(self) -> None:
+        """Minor 2: the disclosure row is server-staged only — a planner-authored
+        row would forge a policy_required audit entry."""
+        from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+
+        view, _snapshot = _trained_view()
+
+        rules = "\n".join(build_planner_authoring_aids(view)["review_registry"]["rules"])
+        assert "NEVER author a pipeline_decision row" in rules
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in rules
+        assert "forges" in rules
+
+    def test_required_but_unselected_shield_keeps_the_warning_advisory(self, tmp_path: Path) -> None:
+        """REQUIRED with no selected implementation is the operator-problem
+        posture: nothing can be auto-wired, so the aids must not claim it."""
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+        from elspeth.web.interpretation_state import PROMPT_SHIELD_WARNING_DRAFT
+
+        rendered = "\n".join(
+            _prompt_shield_rules(
+                shield_plugin=None,
+                shield_required=True,
+                untrusted_producers=("web_scrape",),
+            )
+        )
+        assert "automatically splices" not in rendered
+        assert PROMPT_SHIELD_WARNING_DRAFT in rendered
 
 
 class TestModelCustody:
@@ -978,3 +1521,100 @@ class TestRun3PackEdits:
         assert set(rows[0]) == {"kind", "user_term", "draft"}
         parts = urgency["options"]["prompt_template_parts"]
         assert any(p.get("kind") == "interpretation_ref" and p.get("requirement_id") == "urgency:assess_urgency" for p in parts)
+
+
+class TestRun5PackEdits:
+    """Pack pressure-suite run-5 closures — planner-shielding review findings.
+
+    Finding A: the run-4 CLOSED per-query key set (E1) omitted
+    ``response_format``, ``max_tokens``, and list-form ``name`` — all valid
+    ``QueryDefinition`` keys (``src/elspeth/plugins/transforms/llm/
+    multi_query.py``) — so the rule steered planners to omit valid
+    configuration or author a list entry validation rejects for a missing
+    name.
+
+    Finding B: the digest advertised an active profile-bound llm node's
+    operator-private fields (``provider`` et al.) as *required* — the raw
+    catalog schema's required set, never projected through the operator
+    profile's public schema — steering profile-bound authors toward a
+    ``profile_unavailable``/``plugin_unavailable`` rejection guaranteed by
+    ``_LLMProfileResolver`` (``src/elspeth/web/plugin_policy/profiles.py``).
+    """
+
+    def test_query_definition_rule_permits_the_full_supported_key_set(self) -> None:
+        view, _snapshot = _trained_view()
+        rendered = "\n".join(build_planner_authoring_aids(view)["llm_output_contract"]["rules"])
+        # response_format and max_tokens are real QueryDefinition fields the
+        # run-4 closed-set rule forbade by omission.
+        assert "response_format" in rendered
+        assert "max_tokens" in rendered
+
+    def test_llm_digest_required_options_are_profile_projected_under_an_active_profile(self, tmp_path: Path) -> None:
+        view, _snapshot = _profile_view(tmp_path)
+        aids = build_planner_authoring_aids(view)
+        llm_entry = next(e for e in aids["discovery_digest"]["plugins"]["transforms"] if e["name"] == "llm")
+        required = set(llm_entry["required_options"])
+        # Operator profile validation rejects these on a profile-bound node —
+        # the digest must never advertise them as required.
+        assert not required & {"provider", "model", "credential_ref", "api_key", "api_key_secret"}
+        assert "profile" in required
+
+    def test_trained_operator_llm_digest_required_options_are_unaffected(self) -> None:
+        """The trained-operator (profile-bypassed) view keeps the raw required set."""
+        view, _snapshot = _trained_view()
+        digest = discovery_digest(view)
+        llm_entry = next(e for e in digest["transforms"] if e["name"] == "llm")
+        assert set(llm_entry["required_options"]) == {"schema", "provider", "prompt_template"}
+
+
+class TestLlmOnErrorRuleGating:
+    """The on_error advice must match what the deployment's controls permit.
+
+    Taught unconditionally, "route on_error to a dedicated quarantine sink"
+    contradicted required_control_coverage: an llm node's on_error edge is an
+    independent output path, so a quarantine sink on it is rejected, and no
+    control transform can be interposed there (on_error may only name a sink
+    or 'discard'). Only the GATING is asserted here — which of the two module
+    constants is served — never the prose, per project convention.
+    """
+
+    def test_recommend_mode_keeps_the_quarantine_sink_advice(self, tmp_path: Path) -> None:
+        view, _snapshot = _guardrail_profile_view(tmp_path, control_mode="recommend")
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE in rules
+        assert not any(rule.startswith("This deployment REQUIRES the") for rule in rules)
+
+    def test_required_mode_serves_the_discard_only_rule(self, tmp_path: Path) -> None:
+        view, _snapshot = _guardrail_profile_view(tmp_path, control_mode="required")
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE not in rules
+        assert planner_authoring_aids._LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE.format(control="aws_bedrock_content_safety") in rules
+        assert planner_authoring_aids._LLM_ON_ERROR_CONTROLLED_TRADEOFF_TEMPLATE.format(control="aws_bedrock_content_safety") in rules
+
+    def test_recommend_mode_carries_no_operator_escalation_rule(self, tmp_path: Path) -> None:
+        """The operator escalation only makes sense when the gate is required."""
+        view, _snapshot = _guardrail_profile_view(tmp_path, control_mode="recommend")
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert not any("operator decision" in rule for rule in rules)
+
+    def test_alias_less_required_control_also_gates_the_rule(self, tmp_path: Path) -> None:
+        """Gating follows the control MODE, not how the control is configured."""
+        view, _snapshot = _direct_control_view(tmp_path, control_mode="required")
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE not in rules
+        assert planner_authoring_aids._LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE.format(control="azure_content_safety") in rules
+
+    def test_deployment_without_a_selected_control_keeps_the_quarantine_advice(self) -> None:
+        view, _snapshot = _trained_view()
+
+        rules = build_planner_authoring_aids(view)["llm_output_contract"]["rules"]
+
+        assert planner_authoring_aids._LLM_ON_ERROR_QUARANTINE_RULE in rules

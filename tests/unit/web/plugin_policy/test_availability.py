@@ -9,7 +9,12 @@ from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
-from elspeth.web.plugin_policy.models import PluginId
+from elspeth.web.plugin_policy.models import (
+    PluginAvailabilitySnapshot,
+    PluginId,
+    PluginUnavailableReason,
+    WebPluginPolicy,
+)
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 
 
@@ -52,12 +57,17 @@ def _settings(**overrides: object) -> WebSettings:
     return WebSettings.model_validate(values)
 
 
-def _build(settings: WebSettings, *, principal: str = "local:alice", inventory: _Inventory | None = None):
+def _build_with_policy(
+    settings: WebSettings,
+    *,
+    principal: str = "local:alice",
+    inventory: _Inventory | None = None,
+) -> tuple[WebPluginPolicy, PluginAvailabilitySnapshot]:
     runtime = RuntimeWebPluginConfig.from_settings(settings)
     manager = get_shared_plugin_manager()
     policy = compile_web_plugin_policy(registry=manager, settings=runtime)
     profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
-    return build_plugin_snapshot(
+    snapshot = build_plugin_snapshot(
         policy=policy,
         catalog=create_catalog_service(),
         profiles=profiles,
@@ -65,6 +75,55 @@ def _build(settings: WebSettings, *, principal: str = "local:alice", inventory: 
         secret_inventory=inventory or _Inventory(),
         generation_key=b"deterministic-test-generation-key",
     )
+    return policy, snapshot
+
+
+def _build(settings: WebSettings, *, principal: str = "local:alice", inventory: _Inventory | None = None):
+    _policy, snapshot = _build_with_policy(settings, principal=principal, inventory=inventory)
+    return snapshot
+
+
+_AWS_S3_ALLOWLIST = ("source:aws_s3", "sink:aws_s3")
+
+
+def test_web_prohibited_source_is_a_declined_authorization_not_an_offer() -> None:
+    """A runtime-authorized aws_s3 SOURCE must be declined, never offered.
+
+    A deployment can legitimately authorize S3 for its own runtime (the AWS
+    scenario module's ``default_plugin_allowlist`` does). The web authoring
+    surface refuses author-controlled S3 reads categorically, so the snapshot
+    has to carry that authorization as a *declined* one: without it, every
+    reader of ``available`` (discovery listings, the guided step-1 picker,
+    prompts, tool validation) offers the plugin and only the far end of
+    authoring refuses it — an unrepairable dead end (F13/F14, 2026-07-31).
+    """
+    policy, snapshot = _build_with_policy(_settings(plugin_allowlist=_AWS_S3_ALLOWLIST))
+    baseline = _build(_settings())
+    source_id = PluginId("source", "aws_s3")
+
+    assert source_id in policy.authorized
+    assert source_id not in snapshot.available
+    # Declared exactly once, and with the reason that names a policy no
+    # operator setting can clear — not a repairable credential/profile gap.
+    assert [item.reason for item in snapshot.unavailable if item.plugin_id == source_id] == [PluginUnavailableReason.WEB_SURFACE_PROHIBITED]
+    # The SINK is untouched: kind-qualified identity keeps S3 writes usable.
+    assert PluginId("sink", "aws_s3") in snapshot.available
+    # available never exceeds authorized, and a prohibition cannot silently
+    # re-point a capability selection.
+    assert snapshot.available <= policy.authorized
+    assert snapshot.selected == baseline.selected
+
+
+def test_trained_operator_snapshot_keeps_the_web_prohibited_source() -> None:
+    """The local trained-operator (CLI/MCP) exemption is unchanged.
+
+    ``for_trained_operator`` is a separate constructor that never consults the
+    web policy, so the prohibition cannot leak into the local surface.
+    """
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+
+    assert PluginId("source", "aws_s3") in snapshot.available
+    assert snapshot.unavailable == ()
 
 
 def test_operator_profiled_llm_is_unavailable_without_usable_alias() -> None:
@@ -82,7 +141,8 @@ def test_bedrock_profile_is_locally_available_without_secret() -> None:
                     "provider": "bedrock",
                     "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
                 }
-            }
+            },
+            default_llm_profile="task-role",
         )
     )
 
@@ -103,13 +163,71 @@ def test_configured_tutorial_profile_is_the_selected_usable_alias() -> None:
                     "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
                 },
             },
-            tutorial_llm_profile="tutorial",
+            default_llm_profile="tutorial",
         )
     )
 
     llm_id = PluginId("transform", "llm")
     assert dict(snapshot.usable_profile_aliases)[llm_id] == ("tutorial", "alpha")
     assert dict(snapshot.selected_profile_aliases)[llm_id] == "tutorial"
+
+
+def test_missing_default_profile_leaves_no_selected_alias() -> None:
+    """No designated default means no selected alias — not the alphabetical first.
+
+    A missing ``default_llm_profile`` is a supported degraded-readiness state:
+    profiles stay usable for explicit authoring, but the snapshot must not
+    promote whichever alias sorts first into a house default the operator never
+    designated — the Composer would author against the wrong provider/model.
+    """
+    snapshot = _build(
+        _settings(
+            llm_profiles={
+                "alpha": {
+                    "provider": "bedrock",
+                    "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+                },
+                "beta": {
+                    "provider": "bedrock",
+                    "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+                },
+            },
+        )
+    )
+
+    llm_id = PluginId("transform", "llm")
+    assert llm_id in snapshot.available
+    assert dict(snapshot.usable_profile_aliases)[llm_id] == ("alpha", "beta")
+    assert dict(snapshot.selected_profile_aliases)[llm_id] is None
+
+
+def test_unusable_default_profile_is_not_silently_substituted() -> None:
+    """A designated default the principal cannot use selects nothing.
+
+    Substituting the next usable alias would swap providers behind the
+    operator's designation; readiness reports the credential gap instead.
+    """
+    snapshot = _build(
+        _settings(
+            llm_profiles={
+                "house": {
+                    "provider": "openrouter",
+                    "model": "openai/gpt-5-mini",
+                    "credential_scope": "user",
+                    "credential_ref": "OPENROUTER_API_KEY",
+                },
+                "local": {
+                    "provider": "bedrock",
+                    "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+                },
+            },
+            default_llm_profile="house",
+        )
+    )
+
+    llm_id = PluginId("transform", "llm")
+    assert dict(snapshot.usable_profile_aliases)[llm_id] == ("local",)
+    assert dict(snapshot.selected_profile_aliases)[llm_id] is None
 
 
 def test_user_secret_can_narrow_but_never_expand_policy() -> None:
@@ -130,7 +248,8 @@ def test_profile_aliases_and_hash_are_principal_scoped() -> None:
                 "credential_scope": "user",
                 "credential_ref": "OPENROUTER_API_KEY",
             }
-        }
+        },
+        default_llm_profile="personal",
     )
     inventory = _Inventory(users={"local:alice": frozenset({"OPENROUTER_API_KEY"})})
     alice = _build(settings, principal="local:alice", inventory=inventory)
@@ -152,7 +271,8 @@ def test_in_place_profile_credential_rotation_changes_snapshot_identity(scope: s
                 "credential_scope": scope,
                 "credential_ref": "OPENROUTER_API_KEY",
             }
-        }
+        },
+        default_llm_profile="rotating",
     )
     principal = "local:alice"
     availability = {"OPENROUTER_API_KEY"}
@@ -231,9 +351,9 @@ def test_llm_operator_binding_change_changes_snapshot_identity(
     after_profile: dict[str, object],
     inventory: _Inventory,
 ) -> None:
-    before = _build(_settings(llm_profiles={"stable": before_profile}), inventory=inventory)
-    repeated = _build(_settings(llm_profiles={"stable": before_profile}), inventory=inventory)
-    after = _build(_settings(llm_profiles={"stable": after_profile}), inventory=inventory)
+    before = _build(_settings(llm_profiles={"stable": before_profile}, default_llm_profile="stable"), inventory=inventory)
+    repeated = _build(_settings(llm_profiles={"stable": before_profile}, default_llm_profile="stable"), inventory=inventory)
+    after = _build(_settings(llm_profiles={"stable": after_profile}, default_llm_profile="stable"), inventory=inventory)
 
     assert before.available == after.available
     assert before.binding_generation_fingerprint == repeated.binding_generation_fingerprint
@@ -281,7 +401,8 @@ def test_fresh_snapshot_detects_request_scoped_credential_deletion_without_resta
                 "credential_scope": "user",
                 "credential_ref": "OPENROUTER_API_KEY",
             }
-        }
+        },
+        default_llm_profile="personal",
     )
     principal = "local:alice"
 

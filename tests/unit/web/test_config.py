@@ -1686,6 +1686,192 @@ class TestPublicBaseUrlValidation:
         assert settings.public_base_url == "https://composer.example.test"
 
 
+class TestComposerEndpointAffordance:
+    """Phase 3 Task 2: per-role settable OpenAI-compatible endpoint."""
+
+    def test_endpoint_settings_default_to_none(self) -> None:
+        settings = _settings()
+
+        assert settings.composer_endpoint_base_url is None
+        assert settings.composer_endpoint_api_key is None
+        assert settings.composer_advisor_endpoint_base_url is None
+        assert settings.composer_advisor_endpoint_api_key is None
+
+    def test_endpoint_accepts_https_url_and_key(self) -> None:
+        settings = _settings(
+            composer_endpoint_base_url="https://gateway.example.test/v1",
+            composer_endpoint_api_key="gateway-bearer-token",
+        )
+
+        assert settings.composer_endpoint_base_url == "https://gateway.example.test/v1"
+        assert settings.composer_endpoint_api_key is not None
+        assert settings.composer_endpoint_api_key.get_secret_value() == "gateway-bearer-token"
+
+    def test_advisor_endpoint_accepts_https_url_and_key(self) -> None:
+        settings = _settings(
+            composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+            composer_advisor_endpoint_api_key="advisor-bearer-token",
+        )
+
+        assert settings.composer_advisor_endpoint_base_url == "https://advisor-gateway.example.test/v1"
+        assert settings.composer_advisor_endpoint_api_key is not None
+        assert settings.composer_advisor_endpoint_api_key.get_secret_value() == "advisor-bearer-token"
+
+    def test_endpoint_allows_http_loopback_with_path(self) -> None:
+        settings = _settings(
+            composer_endpoint_base_url="http://127.0.0.1:8787/v1",
+            composer_endpoint_api_key="loopback-bearer-token",
+        )
+
+        assert settings.composer_endpoint_base_url == "http://127.0.0.1:8787/v1"
+
+    def test_endpoint_allows_http_ipv6_loopback(self) -> None:
+        """The numeric IPv6 loopback form named in the rejection message
+        (``[::1]``) must actually be accepted — locks in the claim made by
+        ``test_endpoint_rejects_name_based_localhost``'s error text."""
+        settings = _settings(
+            composer_endpoint_base_url="http://[::1]:8787/v1",
+            composer_endpoint_api_key="loopback-bearer-token",
+        )
+
+        assert settings.composer_endpoint_base_url == "http://[::1]:8787/v1"
+
+    def test_endpoint_rejects_name_based_localhost(self) -> None:
+        """``localhost`` is resolver-dependent (/etc/hosts, NSS, container
+        DNS) and is not proof of on-box egress for a credential-bearing URL —
+        unlike the numeric 127.0.0.1/[::1] forms, which remain accepted."""
+        with pytest.raises(ValidationError, match="numeric loopback address"):
+            _settings(
+                composer_endpoint_base_url="http://localhost/v1",
+                composer_endpoint_api_key="loopback-bearer-token",
+            )
+
+    def test_advisor_endpoint_rejects_name_based_localhost(self) -> None:
+        with pytest.raises(ValidationError, match="numeric loopback address"):
+            _settings(
+                composer_advisor_endpoint_base_url="http://localhost/v1",
+                composer_advisor_endpoint_api_key="loopback-bearer-token",
+            )
+
+    def test_endpoint_rejects_non_loopback_http(self) -> None:
+        with pytest.raises(ValidationError):
+            _settings(composer_endpoint_base_url="http://gateway.example.test/v1")
+
+    def test_endpoint_rejects_query_string(self) -> None:
+        with pytest.raises(ValidationError, match="query string or fragment"):
+            _settings(composer_endpoint_base_url="https://gateway.example.test/v1?token=abc")
+
+    def test_endpoint_rejects_fragment(self) -> None:
+        with pytest.raises(ValidationError, match="query string or fragment"):
+            _settings(composer_endpoint_base_url="https://gateway.example.test/v1#frag")
+
+    def test_endpoint_rejects_embedded_userinfo(self) -> None:
+        with pytest.raises(ValidationError, match="embedded credentials"):
+            _settings(composer_endpoint_base_url="https://user:pass@gateway.example.test/v1")
+
+    def test_advisor_endpoint_url_validation_is_independent(self) -> None:
+        """The advisor endpoint field is validated the same way, separately."""
+        with pytest.raises(ValidationError, match="query string or fragment"):
+            _settings(composer_advisor_endpoint_base_url="https://advisor.example.test/v1?x=1")
+
+    def test_two_model_independence_rule_is_unaffected_by_endpoints(self) -> None:
+        """Per-role endpoints do not widen or narrow the exact-model-string rule.
+
+        Known residual gap (recorded, not fixed — out of this task's scope):
+        the rule compares model strings only, so it still rejects a
+        same-named model pinned at two different endpoints (arguably a
+        legitimate configuration), and it would not catch two differently
+        named models that happen to resolve to the same weights behind one
+        gateway. Endpoint-awareness was deliberately not added to this
+        validator.
+        """
+        with pytest.raises(ValidationError, match="composer_advisor_model must differ from composer_model"):
+            _settings(
+                composer_model="gpt-5.5",
+                composer_advisor_model="gpt-5.5",
+                composer_endpoint_base_url="https://primary-gateway.example.test/v1",
+                composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+            )
+
+
+class TestComposerEndpointCredentialPairing:
+    """Fix round 1: an endpoint with no key is a credential-egress trap.
+
+    LiteLLM does not require an explicit ``api_key`` — an unpaired
+    ``*_endpoint_base_url`` would silently fall back to whatever ambient
+    provider credential the process environment exposes (``OPENAI_API_KEY``
+    and friends) and send it to the operator-configured endpoint. Each role
+    (primary, advisor) is independently all-or-nothing.
+    """
+
+    def test_primary_base_url_without_key_rejected_naming_both_fields(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _settings(composer_endpoint_base_url="https://gateway.example.test/v1")
+        message = str(excinfo.value)
+        assert "composer_endpoint_base_url" in message
+        assert "composer_endpoint_api_key" in message
+
+    def test_primary_key_without_base_url_rejected_naming_both_fields(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _settings(composer_endpoint_api_key="orphaned-primary-key")
+        message = str(excinfo.value)
+        assert "composer_endpoint_base_url" in message
+        assert "composer_endpoint_api_key" in message
+
+    def test_advisor_base_url_without_key_rejected_naming_both_fields(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _settings(composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1")
+        message = str(excinfo.value)
+        assert "composer_advisor_endpoint_base_url" in message
+        assert "composer_advisor_endpoint_api_key" in message
+
+    def test_advisor_key_without_base_url_rejected_naming_both_fields(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _settings(composer_advisor_endpoint_api_key="orphaned-advisor-key")
+        message = str(excinfo.value)
+        assert "composer_advisor_endpoint_base_url" in message
+        assert "composer_advisor_endpoint_api_key" in message
+
+    def test_both_unset_is_valid(self) -> None:
+        settings = _settings()
+        assert settings.composer_endpoint_base_url is None
+        assert settings.composer_endpoint_api_key is None
+        assert settings.composer_advisor_endpoint_base_url is None
+        assert settings.composer_advisor_endpoint_api_key is None
+
+    def test_both_set_is_valid_for_each_role(self) -> None:
+        settings = _settings(
+            composer_endpoint_base_url="https://primary-gateway.example.test/v1",
+            composer_endpoint_api_key="primary-secret",
+            composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+            composer_advisor_endpoint_api_key="advisor-secret",
+        )
+        assert settings.composer_endpoint_base_url == "https://primary-gateway.example.test/v1"
+        assert settings.composer_endpoint_api_key is not None
+        assert settings.composer_advisor_endpoint_base_url == "https://advisor-gateway.example.test/v1"
+        assert settings.composer_advisor_endpoint_api_key is not None
+
+    def test_roles_are_independent_primary_configured_advisor_unset(self) -> None:
+        """Primary fully paired + advisor fully unset is valid — the two
+        roles' pairing checks do not entangle each other."""
+        settings = _settings(
+            composer_endpoint_base_url="https://primary-gateway.example.test/v1",
+            composer_endpoint_api_key="primary-secret",
+        )
+        assert settings.composer_endpoint_base_url == "https://primary-gateway.example.test/v1"
+        assert settings.composer_advisor_endpoint_base_url is None
+        assert settings.composer_advisor_endpoint_api_key is None
+
+    def test_roles_are_independent_advisor_configured_primary_unset(self) -> None:
+        settings = _settings(
+            composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+            composer_advisor_endpoint_api_key="advisor-secret",
+        )
+        assert settings.composer_advisor_endpoint_base_url == "https://advisor-gateway.example.test/v1"
+        assert settings.composer_endpoint_base_url is None
+        assert settings.composer_endpoint_api_key is None
+
+
 def test_advisor_must_differ_from_primary_exact() -> None:
     with pytest.raises(ValidationError, match="composer_advisor_model must differ from composer_model"):
         _settings(composer_model="gpt-5.5", composer_advisor_model="gpt-5.5")

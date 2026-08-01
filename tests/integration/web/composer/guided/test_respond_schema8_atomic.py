@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import inspect
 import json
 from collections.abc import Iterator
@@ -22,6 +23,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import (
     GuidedStep,
@@ -41,8 +43,11 @@ from elspeth.web.composer.guided.state_machine import (
     guided_reviewed_anchor_hash,
 )
 from elspeth.web.composer.pipeline_proposal import AbsentBase
+from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.source_inspection import SourceInspectionFacts
 from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.guided_replay import guided_turn_token, load_guided_json_payload
 from elspeth.web.sessions.models import guided_operations_table, session_operation_fences_table
@@ -63,10 +68,15 @@ def file_composer_test_client(composer_test_client: TestClient, tmp_path: Path) 
     engine = create_session_engine(f"sqlite:///{tmp_path / 'respond-races.db'}")
     initialize_session_schema(engine)
     composer_test_client.app.state.session_engine = engine
-    composer_test_client.app.state.session_service = SessionServiceImpl(
+    session_service = SessionServiceImpl(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test.guided.respond.races"),
+    )
+    composer_test_client.app.state.session_service = session_service
+    composer_test_client.app.state.composer_progress_registry = ComposerProgressRegistry(
+        engine=engine,
+        session_operation_authority=session_service.session_operation_authority,
     )
     try:
         yield composer_test_client
@@ -147,25 +157,80 @@ def _payload_file_count(client: TestClient) -> int:
     return sum(path.is_file() for path in client.app.state.payload_store.base_path.rglob("*"))
 
 
+_NON_FILE_SOURCE = "azure_blob"
+
+
+def _enable_non_file_source(client: TestClient) -> None:
+    """Authorize one blob-inspection-INCOMPATIBLE source for this deployment.
+
+    These tests only need a source that cannot be schema-inspected from an
+    uploaded file. ``aws_s3`` used to play that role, but the web authoring
+    surface now declines it categorically (``WEB_SURFACE_PROHIBITED``), so it is
+    never offered or selectable in a web session — the subject here is the
+    non-file selection path, not the S3 policy.
+    """
+    settings = client.app.state.settings.model_copy(
+        update={
+            "plugin_allowlist": (
+                *client.app.state.settings.plugin_allowlist,
+                f"source:{_NON_FILE_SOURCE}",
+            )
+        }
+    )
+    runtime_policy = RuntimeWebPluginConfig.from_settings(settings)
+    client.app.state.settings = settings
+    client.app.state.web_plugin_policy = compile_web_plugin_policy(
+        registry=get_shared_plugin_manager(),
+        settings=runtime_policy,
+    )
+    client.app.state.operator_profile_registry = OperatorProfileRegistry(
+        policy=client.app.state.web_plugin_policy,
+        settings=runtime_policy,
+    )
+
+
 class _ReadRaceBlobService:
     def __init__(self, record: object, outcome: bytes | Exception) -> None:
         self._record = record
         self._outcome = outcome
 
-    async def list_blobs(self, _session_id: UUID, limit: int | None = 50, offset: int = 0) -> list[object]:
-        del limit, offset
-        return [self._record]
-
-    async def read_blob_content(
+    async def get_blob(
         self,
         _blob_id: UUID,
         *,
         session_operation_context: SessionOperationContext,
-    ) -> bytes:
+    ) -> object:
+        # An explicit source_blob_id resolves via get_blob (a direct,
+        # session-qualified lookup) rather than list_blobs + Python filter —
+        # see inspect_selected_ready_session_blob. Both tests using this fake
+        # select an explicit blob_id, so this is the method exercised now.
         assert type(session_operation_context) is SessionOperationContext
+        return self._record
+
+    async def list_blobs(self, _session_id: UUID, limit: int | None = 50, offset: int = 0) -> list[object]:
+        del limit, offset
+        return [self._record]
+
+    async def read_blob_content_prefix_verified(
+        self,
+        _blob_id: UUID,
+        *,
+        prefix_bytes: int,
+        session_operation_context: SessionOperationContext,
+    ) -> tuple[bytes, str, int]:
+        assert type(session_operation_context) is SessionOperationContext
+        # inspect_selected_ready_session_blob now streams+verifies via this
+        # method instead of read_blob_content. This fake stands in for a
+        # (possibly non-compliant) BlobServiceProtocol implementation: on the
+        # bytes-mismatch path it returns a hash genuinely computed from the
+        # changed bytes it "read", which will not match the original
+        # record.content_hash the caller already holds — that mismatch is
+        # exactly what source_inspection.py's own verification must catch.
         if isinstance(self._outcome, Exception):
             raise self._outcome
-        return self._outcome
+        content = self._outcome
+        computed_hash = hashlib.sha256(content).hexdigest()
+        return content[:prefix_bytes], computed_hash, len(content)
 
 
 def _guided_audit_events(client: TestClient, session_id: str) -> list[tuple[str, dict[str, object]]]:
@@ -519,6 +584,57 @@ def test_source_selection_without_blob_identity_does_not_fall_back_to_latest_upl
     assert next(iter(intents.values()))["inspection_facts"] is None
 
 
+def test_non_file_source_without_blob_identity_ignores_one_unrelated_ready_blob(
+    composer_test_client: TestClient,
+) -> None:
+    _enable_non_file_source(composer_test_client)
+    session_id = _create_session(composer_test_client)
+    uploaded = composer_test_client.post(
+        f"/api/sessions/{session_id}/blobs/inline",
+        json={"filename": "unrelated.csv", "content": "id\n1\n", "mime_type": "text/csv"},
+    )
+    assert uploaded.status_code == 201, uploaded.json()
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    assert _NON_FILE_SOURCE in {option["id"] for option in turn["payload"]["options"]}
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(turn, chosen=[_NON_FILE_SOURCE]),
+    )
+
+    assert response.status_code == 200, response.json()
+    assert response.json()["next_turn"]["payload"]["plugin"] == _NON_FILE_SOURCE
+    intents = response.json()["composition_state"]["composer_meta"]["guided_session"]["pending_source_intents"]
+    assert next(iter(intents.values()))["inspection_facts"] is None
+
+
+def test_non_file_source_rejects_explicit_incompatible_blob_before_reservation(
+    composer_test_client: TestClient,
+) -> None:
+    _enable_non_file_source(composer_test_client)
+    session_id = _create_session(composer_test_client)
+    uploaded = composer_test_client.post(
+        f"/api/sessions/{session_id}/blobs/inline",
+        json={"filename": "unrelated.csv", "content": "id\n1\n", "mime_type": "text/csv"},
+    )
+    assert uploaded.status_code == 201, uploaded.json()
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    assert _NON_FILE_SOURCE in {option["id"] for option in turn["payload"]["options"]}
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json=_live_body(
+            turn,
+            chosen=[_NON_FILE_SOURCE],
+            source_blob_id=uploaded.json()["id"],
+        ),
+    )
+
+    assert response.status_code == 400, response.json()
+    assert response.json()["detail"] == "source_blob_id is not valid for the selected source plugin."
+    assert _respond_operation_count(composer_test_client, session_id) == 0
+
+
 def test_source_selection_rejects_blob_identity_outside_ready_session_set_before_reservation(
     composer_test_client: TestClient,
 ) -> None:
@@ -536,10 +652,17 @@ def test_source_selection_rejects_blob_identity_outside_ready_session_set_before
 
 
 @pytest.mark.parametrize("failure_kind", ("deleted", "not_ready"))
-def test_source_selection_maps_fenced_list_to_read_lifecycle_drift_to_stale_conflict(
+def test_source_selection_maps_fenced_get_to_read_lifecycle_drift_to_stale_conflict(
     composer_test_client: TestClient,
     failure_kind: str,
 ) -> None:
+    # Renamed from ...maps_list_to_read...: an explicit selection now
+    # resolves via a direct get_blob lookup, not list_blobs + Python
+    # filter (see inspect_selected_ready_session_blob). The invariant this
+    # test pins — a blob that goes missing/not-ready between resolution and
+    # read raises SourceInspectionBlobLifecycleError. The exact operation is
+    # already reserved at that point, so the fenced failure settles as a
+    # redacted stale-conflict response rather than a pre-reservation 400.
     session_id = _create_session(composer_test_client)
     uploaded = composer_test_client.post(
         f"/api/sessions/{session_id}/blobs/inline",
@@ -572,9 +695,18 @@ def test_source_selection_maps_fenced_list_to_read_lifecycle_drift_to_stale_conf
     assert _respond_operation_count(composer_test_client, session_id) == 1
 
 
-def test_source_selection_fails_closed_when_read_bytes_do_not_match_listed_hash(
+def test_source_selection_fails_closed_when_read_bytes_do_not_match_fetched_hash(
     composer_test_client: TestClient,
 ) -> None:
+    # Renamed from ...match_listed_hash...: the record's content_hash now
+    # comes from get_blob rather than list_blobs. The invariant this test
+    # pins is unchanged and remains load-bearing: source_inspection.py's own
+    # hash re-verification against `record.content_hash` is not redundant
+    # with a compliant BlobServiceProtocol implementation's internal check —
+    # it independently certifies the content_hash_prefix this module stamps
+    # into redacted_identity, catching a case (simulated here by a fake that
+    # skips its own verification) where the bytes returned by read_blob_content
+    # don't match the hash on the record snapshot this module already holds.
     session_id = _create_session(composer_test_client)
     uploaded = composer_test_client.post(
         f"/api/sessions/{session_id}/blobs/inline",
@@ -859,7 +991,10 @@ def test_step3_matching_proposal_binding_requires_durable_payload_before_reserva
     )
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+    assert response.json()["detail"] == {
+        "error_type": "server_invariant_violated",
+        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+    }
     assert _respond_operation_count(composer_test_client, session_id) == 0
 
 
@@ -986,6 +1121,76 @@ def test_schema_form_plugin_mismatch_never_selects_a_client_named_model_or_reser
     assert asyncio.run(composer_test_client.app.state.session_service.get_state_versions(UUID(session_id))) == versions_before
 
 
+def test_unsupported_guided_selection_never_reaches_operator_logs(
+    composer_test_client: TestClient,
+) -> None:
+    from structlog.testing import capture_logs
+
+    session_id = _create_session(composer_test_client)
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    canary = "raw-guided-selection-canary-7f3a9d"
+
+    with capture_logs() as logs:
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=_live_body(turn, chosen=[canary]),
+        )
+
+    assert response.status_code == 400, response.json()
+    rejection = next(entry for entry in logs if entry["event"] == "guided.respond_turn_contract_rejected")
+    assert rejection["rejection_code"] == "invalid_guided_response"
+    assert rejection["exc_class"] == "ValueError"
+    assert "error_detail" not in rejection
+    # The generic branch must log the class ONLY — its messages echo raw
+    # client-supplied values, and the audit scrubber redacts secret-shaped
+    # text, not arbitrary client text.
+    assert "exc_message" not in rejection
+    assert canary not in repr(logs)
+
+
+def test_web_surface_policy_rejection_reaches_operator_logs_with_distinct_code(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S7: a deployment-policy refusal must be diagnosable from the log alone.
+
+    The generic contract-rejection branch logs the exception class only (see
+    the canary test above), which left a policy refusal indistinguishable
+    from any authoring mistake — "invalid_guided_response ValueError" — with
+    the policy explanation dropped on the floor. The policy error's message
+    is server-composed end to end, so its branch logs the explanation under
+    its own closed rejection code. The client response body stays the closed
+    generic 400 either way.
+    """
+    from structlog.testing import capture_logs
+
+    from elspeth.web.composer.guided.stage_transitions import WebSurfacePolicyRejectedError
+    from elspeth.web.sessions.routes.composer import guided as guided_route
+
+    session_id = _create_session(composer_test_client)
+    turn = composer_test_client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    explanation = "source plugin 'aws_s3' is prohibited on the web authoring surface: policy-explanation-sentinel"
+
+    def reject(*_args: object, **_kwargs: object) -> None:
+        raise WebSurfacePolicyRejectedError(explanation)
+
+    monkeypatch.setattr(guided_route, "_schema8_answer_and_project_next", reject)
+
+    with capture_logs() as logs:
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=_live_body(turn, chosen=["csv"]),
+        )
+
+    assert response.status_code == 400, response.json()
+    assert response.json()["detail"] == "Guided response does not satisfy the current turn contract."
+    assert "policy-explanation-sentinel" not in response.text
+    rejection = next(entry for entry in logs if entry["event"] == "guided.respond_turn_contract_rejected")
+    assert rejection["rejection_code"] == "web_surface_policy_rejected"
+    assert rejection["exc_class"] == "WebSurfacePolicyRejectedError"
+    assert "policy-explanation-sentinel" in rejection["exc_message"]
+
+
 def test_expired_operation_is_not_taken_over_before_live_preflight(
     composer_test_client: TestClient,
 ) -> None:
@@ -1079,7 +1284,10 @@ def test_preflight_invariant_is_sanitized_without_reservation_or_mutation(
         response = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+    assert response.json()["detail"] == {
+        "error_type": "server_invariant_violated",
+        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+    }
     assert secret_canary not in response.text
     entry = next(log for log in logs if log["event"] == "guided.invariant_violated")
     assert entry["exc_class"] == "InvariantError"
@@ -1141,7 +1349,10 @@ def test_orphan_wire_occurrence_fails_closed_before_reservation_or_mutation(
     response = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=body)
 
     assert response.status_code == 500
-    assert response.json()["detail"] == "Server invariant violated. See application audit log for diagnostic detail."
+    assert response.json()["detail"] == {
+        "error_type": "server_invariant_violated",
+        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+    }
     assert _respond_operation_count(composer_test_client, session_id) == 0
     assert asyncio.run(composer_test_client.app.state.session_service.get_state_versions(UUID(session_id))) == versions_before
     assert asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None)) == messages_before
@@ -1522,6 +1733,9 @@ def test_settlement_failure_rolls_back_state_and_evidence_and_returns_only_safe_
     assert failure_log["exc_class"] == failure_type.__name__
     assert failure_log["site"] == "post_guided_respond"
     assert failure_log["frames"]
+    # R2-F16b: the correlation field is always emitted (None here — this app
+    # carries no RequestIdMiddleware).
+    assert "request_id" in failure_log
     assert secret_canary not in repr(logs)
     assert asyncio.run(service.get_state_versions(UUID(session_id))) == []
     assert asyncio.run(service.get_messages(UUID(session_id), limit=None)) == []

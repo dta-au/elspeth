@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from elspeth_lints.core.judge import (
+    CODEX_JUDGE_REASONING_EFFORT,
     DEFAULT_CODEX_JUDGE_MODEL,
     TRANSPORT_CODEX_CLI,
     AgentToolScope,
@@ -97,6 +98,10 @@ def test_codex_cli_transport_isolated_blinded_invocation(monkeypatch: pytest.Mon
     assert "--ignore-rules" in command
     assert command[command.index("--sandbox") : command.index("--sandbox") + 2] == ["--sandbox", "read-only"]
     assert command[command.index("--model") : command.index("--model") + 2] == ["--model", DEFAULT_CODEX_JUDGE_MODEL]
+    reasoning_setting = f'model_reasoning_effort="{CODEX_JUDGE_REASONING_EFFORT}"'
+    assert reasoning_setting == 'model_reasoning_effort="high"'
+    assert command.count(reasoning_setting) == 1
+    assert sum(part.startswith("model_reasoning_effort=") for part in command) == 1
     assert "features.shell_tool=false" in command
     assert "features.unified_exec=false" in command
     assert 'web_search="disabled"' in command

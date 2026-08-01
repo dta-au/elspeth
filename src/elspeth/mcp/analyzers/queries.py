@@ -15,7 +15,7 @@ from typing import Any, cast
 
 from elspeth.contracts import NodeStateStatus
 from elspeth.contracts.coalesce_metadata import collision_value_fingerprint as _fingerprint_collision_value
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import LandscapeReadRepositories, RecorderFactory
 from elspeth.core.landscape.serialization import dataclass_to_dict, serialize_datetime
@@ -665,7 +665,7 @@ def get_calls(db: LandscapeDB, factory: AnalyzerRepositories, state_id: str) -> 
 _VALUE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="stored coalesce collision values re-read from audit context JSON (heterogeneous persisted shapes)",
     source_param="value",
@@ -674,7 +674,6 @@ _VALUE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
         "total boolean classifier: returns False for any value not matching the exact "
         "redacted {value_hash, value_type} envelope; never raises"
     ),
-    non_raising=True,
 )
 def _is_collision_value_fingerprint(value: Any) -> bool:
     """Return True when a stored collision value is already an audit-safe fingerprint."""

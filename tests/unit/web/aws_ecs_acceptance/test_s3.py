@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import ClassVar
 
 import pytest
+from botocore.exceptions import ClientError
 
 from elspeth.contracts import ArtifactDescriptor, CallType
 from elspeth.contracts.sink_effects import (
@@ -18,6 +18,7 @@ from elspeth.contracts.sink_effects import (
     SinkEffectPlan,
     SinkEffectReconcileResult,
 )
+from elspeth.plugins.sinks.aws_s3_sink import S3ConditionalWriteRejectedError
 from elspeth.web import aws_ecs_acceptance as acceptance
 from elspeth.web._aws_ecs_acceptance import s3
 from elspeth.web._aws_ecs_acceptance.contracts import FORBIDDEN_AWS_OVERRIDE_ENV, AcceptanceCheckError
@@ -25,6 +26,14 @@ from elspeth.web._aws_ecs_acceptance.contracts import FORBIDDEN_AWS_OVERRIDE_ENV
 
 def test_facade_reexports_s3_owner_by_identity() -> None:
     assert acceptance.verify_s3 is s3.verify_s3
+
+
+def test_s3_not_found_rejects_exception_objects_that_only_pretend_to_be_client_errors() -> None:
+    class Pretender(RuntimeError):
+        def __init__(self) -> None:
+            self.response = {"Error": {"Code": "404"}, "ResponseMetadata": {"HTTPStatusCode": 404}}
+
+    assert s3._s3_not_found(Pretender()) is False
 
 
 _S3_PREFIX = "plan10/764dd764-c265-40d7-a907-390255dccb64"
@@ -41,8 +50,12 @@ def _s3_env(**updates: str) -> dict[str, str]:
     return values
 
 
-class _S3NotFound(RuntimeError):
-    response: ClassVar[dict[str, object]] = {"Error": {"Code": "404"}, "ResponseMetadata": {"HTTPStatusCode": 404}}
+class _S3NotFound(ClientError):
+    def __init__(self) -> None:
+        super().__init__(
+            {"Error": {"Code": "404"}, "ResponseMetadata": {"HTTPStatusCode": 404}},
+            "HeadObject",
+        )
 
 
 class _S3CleanupClient:
@@ -92,6 +105,10 @@ class _EffectS3SinkBase:
 
     def prepare_effect(self, request: object, _ctx: object) -> SinkEffectPlan:
         self.events.append(f"sink-{self.index}-prepare")
+        if self.index == 3:
+            # The third drive is the genuine-collision probe (different
+            # content, same key): the real sink rejects it at prepare.
+            raise S3ConditionalWriteRejectedError from None
         effect_id = request.effect_id  # type: ignore[attr-defined]
         target = f"s3://acceptance-bucket/{_S3_PREFIX}/verify-s3.jsonl"
         digest = "b" * 64 if self.failure == "integrity" and self.index == 1 else _S3_HASH
@@ -187,7 +204,11 @@ def test_verify_s3_round_trips_with_bounded_default_chain_plugin_configs_and_cle
         "max_object_bytes": 4096,
         "max_record_chars": 256,
     }
-    assert sink_configs == [{**expected_common, "overwrite": False}, {**expected_common, "overwrite": False}]
+    assert sink_configs == [
+        {**expected_common, "overwrite": False},
+        {**expected_common, "overwrite": False},
+        {**expected_common, "overwrite": False},
+    ]
     assert source_configs == [{**expected_common, "on_validation_failure": "discard"}]
     assert receipt == {
         "object_count": 1,
@@ -205,8 +226,11 @@ def test_verify_s3_round_trips_with_bounded_default_chain_plugin_configs_and_cle
         "sink-2-inspect",
         "sink-2-prepare",
         "sink-2-reconcile",
+        "sink-3-inspect",
+        "sink-3-prepare",
         "source-close",
         "sink-2-close",
+        "sink-3-close",
         "sink-1-close",
         "cleanup-client:ap-southeast-2:None",
         "delete",
@@ -260,6 +284,35 @@ def test_verify_s3_does_not_delete_when_primary_effect_fails_before_ownership() 
 
     assert events == ["sink-1-inspect", "sink-close"]
     assert "sentinel" not in str(raised.value)
+
+
+def test_verify_s3_rejects_reaffirmed_preexisting_object_without_deleting_it() -> None:
+    events: list[str] = []
+    target = {
+        "descriptor": ArtifactDescriptor(
+            artifact_type="file",
+            path_or_uri=f"s3://acceptance-bucket/{_S3_PREFIX}/verify-s3.jsonl",
+            content_hash=_S3_HASH,
+            size_bytes=len(s3._S3_ACCEPTANCE_BYTES),
+        )
+    }
+
+    class Sink(_EffectS3SinkBase):
+        def __init__(self) -> None:
+            super().__init__(index=1, events=events, target=target)
+
+        def close(self) -> None:
+            events.append("sink-close")
+
+    with pytest.raises(AcceptanceCheckError, match="s3_sink_write"):
+        s3.verify_s3(
+            _s3_env(),
+            sink_factory=lambda _config: Sink(),
+            source_factory=lambda _config: pytest.fail("no publication must stop before source verification"),
+            s3_client_factory=lambda _region, _endpoint: pytest.fail("pre-existing object is not cleanup-owned"),
+        )
+
+    assert "delete" not in events
 
 
 @pytest.mark.parametrize("post_commit_observation", ["exact", "mismatched-exact", "unknown"])
@@ -412,7 +465,7 @@ def test_verify_s3_cleanup_continues_after_resource_close_failure_and_fails_clos
             s3_client_factory=lambda _region, _endpoint: _S3CleanupClient(events),
         )
 
-    assert events.count("sink-close") == 2
+    assert events.count("sink-close") == 3
     assert "source-close" in events
     assert "delete" in events
     assert "head" in events

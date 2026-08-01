@@ -37,6 +37,7 @@ mcp = ["mcp>=1.27,<2"]
 
 [project.scripts]
 elspeth-lints = "elspeth_lints.core.cli:main"
+elspeth-tier-corpus = "elspeth_lints.core.tier_model_corpus:main"
 diagnose-judge-signatures = "elspeth_lints.core.judge_signature_diagnosis:main"
 sign-judge-signatures = "elspeth_lints.core.judge_signature_signing:main"
 elspeth-judge-mcp = "elspeth_lints.mcp:main"

@@ -1,26 +1,16 @@
 """Three-surface real-path parity matrix (Plan 05 Task 3).
 
-Nine canonical capability fixtures x three arbitrary authoring surfaces
-(freeform, guided-full, guided-staged). Each case drives one surface's
+Ten canonical capability fixtures x three arbitrary authoring surfaces
+(freeform, guided-full, guided-staged), for 30 real-path cases. Each case drives one surface's
 production entrypoint from the fixture intent all the way to the immutable
 committed ``CompositionState`` (real prompt/tool assembly → terminal parser →
 custody → candidate validation → durable proposal → acceptance / confirm-wiring
 → audited ``set_pipeline`` → public YAML compiler) and asserts the committed
 graph is semantically isomorphic to the ground-truth reference.
 
-Freeform and guided-full drive all nine fixtures (18 cases). Guided-staged
-drives seven (25 cases total): two fixtures — ``multi_output`` and
-``fork_coalesce`` — hit invariants in the guided wire-projection / structured
-review that are stricter than the shared ``set_pipeline`` commit path and
-therefore cannot be authored through the stage protocol at HEAD. Those are
-code-proven guided-staged capability GAPS (the identical committed graph commits
-fine on the other two surfaces); they are excluded here and reported as
-blockers, documented case-by-case in ``_GUIDED_STAGED_CAPABILITY_GAPS`` below.
-They are gaps to report, not tests to skip: there is no ``skip``/``xfail`` and
-no gutted fixture. (``multi_source_queue`` was a third such gap — a queue's
-fan-in self-looped the wire projection — until the guided projection learned to
-separate a queue connection's input side from its republish side; it now drives
-guided-staged like any other fixture.)
+All three surfaces drive all ten fixtures. Former guided-staged exclusions for
+``multi_source_queue``, ``fork_coalesce``, and ``multi_output`` remain in this
+matrix as permanent regressions for their repaired stage-protocol boundaries.
 
 No provider network, no skips, no xfail. Cross-surface parity is transitive:
 every surface is anchored to the same per-fixture reference committed graph.
@@ -55,54 +45,9 @@ SURFACES = ["freeform", "guided_full", "guided_staged"]
 # so byte-exact public-YAML equality and exact-name semantic expectations hold.
 _NAME_PRESERVING_SURFACES = frozenset({"freeform", "guided_full"})
 
-# Two capability fixtures cannot be authored through the guided-staged stage
-# protocol at HEAD: they hit invariants in the guided wire-projection /
-# structured review that are STRICTER than the shared audited ``set_pipeline``
-# commit path, so freeform + guided_full derive them but guided_staged cannot.
-# These are genuine, code-proven guided-staged capability gaps (not fixture
-# defects — the identical committed graph commits fine on the other two
-# surfaces). They are excluded from the guided_staged parity parametrization and
-# reported as blockers; each is traceable here to the exact mechanism + code
-# location so a reader sees *why* the guided_staged column is 7 fixtures, not 9,
-# and so the follow-up owner can find the seam. Do NOT paper over these by
-# gutting the fixture or asserting the failure — either would hide the gap the
-# corpus exists to surface. When a gap is closed in ``src/``, move the fixture
-# back into the guided_staged parity set (its drive will then succeed) — as
-# ``multi_source_queue`` was once the queue self-loop / fan-out was fixed in the
-# guided projection.
-_GUIDED_STAGED_CAPABILITY_GAPS: dict[str, str] = {
-    "multi_output": (
-        "Cross-sink write-failure fallback. The structured sink review "
-        "(``transition_sink_schema_form`` -> ``_validated_merged_options``, guided/stage_transitions.py) "
-        'treats ``on_write_failure`` as a server-held structural policy locked to ``"discard"`` unless '
-        "it is a visible knob field (it is not for the json sink); submitting the cross-sink target "
-        "raises ``client altered server-held structural policy 'on_write_failure'`` (HTTP 400). Since "
-        "``bind_guided_reviewed_components`` sources the committed ``on_write_failure`` from the reviewed "
-        "output, this fixture's json ``priority_out`` sink can only ever discard write failures — the "
-        "priority->standard fallback it proves is unauthorable. (Proven for the json sink here; whether "
-        "any sink exposes ``on_write_failure`` as an editable knob is unverified. Source "
-        "``on_validation_failure`` IS editable, which is why the ``error_routing`` fixture — a source "
-        "failure routed to a sink — passes.)"
-    ),
-    "fork_coalesce": (
-        "Require-all coalesce. ``canonical_connection_consumers`` keys consumers only on ``node.input`` "
-        "and ``output.name``; a require-all coalesce consumes >= 2 branch connections but ``NodeSpec`` "
-        "has a single ``input``, so every branch connection other than ``input`` (here ``path_b``) is "
-        "structurally orphaned and ``_build_projection`` raises ``guided proposal connection has no "
-        "canonical consumer``. The consumer model cannot represent a multi-branch coalesce."
-    ),
-}
-
-_GUIDED_STAGED_PARITY_FIXTURES = [fixture for fixture in PARITY_FIXTURES if fixture["class"] not in _GUIDED_STAGED_CAPABILITY_GAPS]
-
-# Explicit (surface, fixture) grid: all 9 fixtures on the two name-preserving
-# surfaces, and the 7 guided-staged-drivable fixtures on guided_staged = 25
-# real-path parity cases (the 2 gaps above are excluded and reported).
-_SURFACE_FIXTURE_PARAMS = [
-    (surface, fixture)
-    for surface in SURFACES
-    for fixture in (_GUIDED_STAGED_PARITY_FIXTURES if surface == "guided_staged" else PARITY_FIXTURES)
-]
+# Explicit (surface, fixture) grid: all 10 fixtures on all 3 surfaces = 30
+# real-path parity cases.
+_SURFACE_FIXTURE_PARAMS = [(surface, fixture) for surface in SURFACES for fixture in PARITY_FIXTURES]
 
 
 def _committed_nodes(state: Any) -> dict[str, dict[str, Any]]:
@@ -143,7 +88,17 @@ def _assert_semantic_expectations(state: Any, fixture: dict[str, Any]) -> None:
         node_id = expected["id"]
         assert node_id in nodes, f"{fixture['class']}: missing node {node_id!r}"
         actual = nodes[node_id]
-        for key in ("node_type", "plugin", "input", "on_success", "condition", "policy", "merge", "output_mode"):
+        for key in (
+            "node_type",
+            "plugin",
+            "input",
+            "on_success",
+            "condition",
+            "policy",
+            "merge",
+            "output_mode",
+            "timeout_seconds",
+        ):
             if key in expected:
                 assert actual.get(key) == expected[key], (
                     f"{fixture['class']}: node[{node_id}].{key} = {actual.get(key)!r} != {expected[key]!r}"
@@ -194,6 +149,23 @@ def _assert_guided_staged_naming(state: Any, fixture: dict[str, Any]) -> None:
     )
 
 
+def _assert_row_union_semantics(state: Any) -> None:
+    """Keep the correlated N-to-N contract exact even when staged names differ."""
+    committed = state.to_dict()
+    row_union = next(node for node in committed["nodes"] if node["node_type"] == "row_union")
+    assert row_union["plugin"] is None
+    assert row_union["timeout_seconds"] == 12.5
+    assert row_union.get("policy") is None
+    assert row_union.get("merge") is None
+    assert list(row_union["branches"]) == ["control_branch", "treatment_branch"]
+    assert list(row_union["branches"].values()) == ["control_scored", "treatment_scored"]
+    assert row_union["input"] == "control_scored"
+    downstream = next(node for node in committed["nodes"] if node["node_type"] == "aggregation")
+    assert downstream["input"] == row_union["on_success"]
+    gate = next(node for node in committed["nodes"] if node["node_type"] == "gate")
+    assert list(gate["fork_to"]) == list(row_union["branches"])
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("surface", "fixture"),
@@ -212,6 +184,8 @@ async def test_surface_derives_isomorphic_committed_graph(
     #    applied to every surface). Cross-surface parity is transitive: all
     #    three surfaces are anchored to the same per-fixture reference.
     assert_isomorphic(committed, reference, left=f"{surface}:{fixture['class']}", right="reference")
+    if fixture["class"] == "row_union":
+        _assert_row_union_semantics(committed)
 
     if surface in _NAME_PRESERVING_SURFACES:
         # 2. Public compiled-pipeline (runtime graph) semantics agree byte-exact

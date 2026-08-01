@@ -80,9 +80,35 @@ class BatchTopK(BaseTransform):
     name = "batch_top_k"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e66e55bfc71e3d82"
+    source_file_hash: str | None = "sha256:036001b0996472a6"
     config_model = BatchTopKConfig
     is_batch_aware = True
+    usage_when_to_use: str = (
+        "Use for type-aware scalar frequencies and top-k counts within each window. When configured, group_by "
+        "partitions one flushed batch and never accumulates a group across windows."
+    )
+    usage_when_not_to_use: str = (
+        "Not for numeric distribution profiling, quantiles, or continuous-density summaries; use "
+        "batch_distribution_profile for descriptive numeric statistics."
+    )
+    example_use: str = """aggregations:
+  - name: label_top_k
+    plugin: batch_top_k
+    input: labelled_rows
+    on_success: output
+    on_error: discard
+    trigger:
+      count: 100
+    output_mode: transform
+    options:
+      field: predicted_label
+      group_by: model
+      k: 5
+      include_missing: false
+      schema:
+        mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("batch", "frequency", "top-k")
 
     @classmethod
     def get_agent_assistance(cls, *, issue_code: str | None = None) -> PluginAssistance | None:

@@ -171,6 +171,7 @@ function makeProposalResponse(): GetGuidedResponse {
             node_type: "transform",
             plugin: { kind: "transform", id: "schema_guard" },
             behavior: { kind: "transform" },
+            node_options_summary: [],
           },
         ],
         outputs: [
@@ -470,7 +471,14 @@ describe("api/client guided functions", () => {
             label: "node-1",
             node_type: "gate",
             plugin: null,
-            behavior: { kind: "gate", route_aliases: ["Bearer-credential"], fork_branches: [] },
+            behavior: {
+              kind: "gate",
+              condition: "row['ok']",
+              route_aliases: ["Bearer-credential"],
+              routes: [{ alias: "Bearer-credential", key: "true" }],
+              fork_branches: [],
+            },
+            node_options_summary: [],
           };
           body.next_turn.payload.graph.edges[2].flow = {
             kind: "gate_route",
@@ -977,6 +985,8 @@ describe("api/client guided functions", () => {
     it.each([
       [{ status: "in_progress" }],
       [{ status: "failed", failure_code: "request_cancelled" }],
+      // F13-D: the permanent policy failure code is in the closed vocabulary.
+      [{ status: "failed", failure_code: "policy_blocked" }],
       [{ status: "completed", composition_state_id: "00000000-0000-4000-8000-000000000321" }],
     ])("POSTs without request content and decodes the exact closed result %#", async (body) => {
       fetchSpy.mockResolvedValue({ ok: true, status: 200, json: async () => body } as Response);

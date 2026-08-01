@@ -379,7 +379,7 @@ class TestCheckpointInterruptedProgress:
             orchestrator._checkpoints._checkpoint_config = _checkpoint_config(enabled=False)
 
             sink = _SinkSlice()
-            config = SimpleNamespace(sinks={"output": sink})
+            config = SimpleNamespace(sinks={"output": sink}, sink_effect_modes={"output": "write"})
 
             processor = _BarrierScalarsProcessor(BarrierScalars(aggregation={}, coalesce={}))
             on_token_written_factory = orchestrator._checkpoints.make_checkpoint_after_sink_factory("run-x", processor)
@@ -419,7 +419,7 @@ class TestCheckpointInterruptedProgress:
                     factory=SimpleNamespace(execution=object(), data_flow=object()),
                     run_id="run-x",
                     config=config,
-                    ctx=object(),
+                    ctx=SimpleNamespace(shutdown_event=None),
                     counters=ExecutionCounters(),
                     pending_tokens=pending_tokens,
                     sink_id_map={"output": "sink-output"},

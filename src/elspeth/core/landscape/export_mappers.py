@@ -42,7 +42,9 @@ def validate_artifact_publication_projection(
         expected = {"legacy_returned": True}
     else:
         expected = {"returned": True, "reconciled": True, "inherited": False, "virtual": False}
-    if not isinstance(publication_evidence_kind, str) or expected.get(publication_evidence_kind) is not publication_performed:
+    if not isinstance(publication_evidence_kind, str) or publication_evidence_kind not in expected:
+        raise AuditIntegrityError("Artifact publication evidence is invalid or contradictory — audit integrity violation")
+    if expected[publication_evidence_kind] is not publication_performed:
         raise AuditIntegrityError("Artifact publication evidence is invalid or contradictory — audit integrity violation")
 
 

@@ -30,7 +30,7 @@ from copy import deepcopy
 from threading import Lock
 from typing import Any, Final, NotRequired, Required, TypedDict
 
-from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSummary
 
@@ -97,6 +97,7 @@ class _ExemplarNode(TypedDict, total=False):
     branches: dict[str, str]
     policy: str
     merge: str
+    timeout_seconds: float
 
 
 class _ExemplarEdge(TypedDict):
@@ -146,6 +147,11 @@ class _ForkCoalesceAid(TypedDict):
     set_pipeline_exemplar: _SetPipelineExemplar
 
 
+class _ForkRowUnionAid(TypedDict):
+    rules: list[str]
+    set_pipeline_exemplar: _SetPipelineExemplar
+
+
 class _RulesAid(TypedDict):
     rules: list[str]
 
@@ -166,10 +172,12 @@ class _PlannerAuthoringAids(TypedDict, total=False):
     purpose: Required[str]
     source_custody: _SourceCustodyAid
     fork_coalesce: _ForkCoalesceAid
+    fork_row_union: _ForkRowUnionAid
     model_custody: _RulesAid
     llm_output_contract: _RulesAid
     review_registry: _ReviewRegistryAid
     prompt_shield: _RulesAid
+    content_safety: _RulesAid
     raw_html_cleanup: _RulesAid
     web_scrape_http_identity: _RulesAid
     discovery_digest: _DiscoveryDigestAid
@@ -246,25 +254,89 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
 
 _FORK_EXEMPLAR_CONTENT: Final[str] = "ticket_id,body\nT-1001,Cannot log in since the update\nT-1002,Invoice totals look wrong\n"
 
+_FORK_ROW_UNION_RULES: Final[tuple[str, ...]] = (
+    "Use row_union for require_all N-to-N reconvergence: every fork branch contributes its original rows, "
+    "and the barrier releases all of them in declared branch order without merging fields.",
+    "Key branches by the upstream gate's fork_to branch names. Each value is the unique connection published "
+    "by that branch's final transform.",
+    "Set input to the first branch connection exactly. It is an adapter placeholder; all branches values are the real consuming bindings.",
+    "Set on_success to a downstream processing connection, never directly to a sink. Omit plugin, options, "
+    "on_error, policy, merge, gate routing, and aggregation fields.",
+    "timeout_seconds is optional; when present it must be finite and greater than zero.",
+)
 
-def _prompt_shield_rules(*, shield_available: bool, untrusted_producers: tuple[str, ...]) -> list[str]:
+
+def _prompt_shield_rules(
+    *,
+    shield_plugin: str | None,
+    shield_required: bool = False,
+    shield_auto_wired: bool = False,
+    untrusted_producers: tuple[str, ...],
+) -> list[str]:
     """Shield-staging rules quoting the registered review constants verbatim.
 
-    The prompt-injection shield review is ADVISORY end-to-end (warnings only,
-    excluded from the blocking contract), so no rejection code ever teaches it
-    on a repair turn — these aids are the only lever. Tutorial finalizer
-    battery (dim_c under-flag): the replan planner non-deterministically
-    omitted the row on the scrape→summarize llm node. Constants are imported
-    from ``interpretation_state`` so the taught row can never drift from the
+    Required mode is auto-wired server-side (R2-F10, elspeth-f99655f540):
+    ``required_controls.wire_required_controls`` splices the selected shield
+    onto any uncovered llm input at proposal time and stages a
+    ``required_control_auto_wired`` disclosure card, so the aids teach the
+    guarantee instead of demanding manual wiring — and drop the
+    shield-recommendation row, whose exposure the wired shield removes.
+    Recommend mode stages the advisory review row whether or not an
+    implementation is selected, using the deployment-available draft when it
+    is. The review is ADVISORY end-to-end (warnings only, excluded from the
+    blocking contract), so no rejection code ever teaches it on a repair
+    turn — these aids are the only lever. Tutorial finalizer battery (dim_c
+    under-flag): the replan planner non-deterministically omitted the row on
+    the scrape→summarize llm node. Constants are imported from
+    ``interpretation_state`` so the taught row can never drift from the
     contract (the 52322ebe1 discipline); the draft is chosen by the LIVE
     snapshot's shield selection, mirroring the warning→available upgrade the
     server itself applies, and memoizes correctly because the aids cache is
     keyed by snapshot hash.
     """
-    draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_available else PROMPT_SHIELD_WARNING_DRAFT
     producers = " or ".join(sorted(untrusted_producers))
+    if shield_plugin is not None and shield_required and shield_auto_wired:
+        return [
+            f"This deployment REQUIRES a prompt-injection shield and has selected {shield_plugin}. "
+            "You do not need to wire it yourself: when a proposal's llm input is not already "
+            f"covered, ELSPETH automatically splices a {shield_plugin} transform onto that input "
+            "edge and stages a required_control_auto_wired disclosure card for the operator to "
+            f"acknowledge. You MAY wire a {shield_plugin} transform explicitly (between the "
+            f"{producers} producer and the llm node) when you want to control its placement; the "
+            "auto-wire pass leaves a covered graph untouched.",
+            "Auto-wiring can only scope the shield to PROVABLE prompt fields: keep every prompt "
+            "row access static ('{{ row.field }}', never '{{ row[key] }}') so the protected field "
+            "set can be derived.",
+            f"Do NOT stage the {PROMPT_SHIELD_USER_TERM} review row on those llm nodes — with the "
+            "shield wired (by you or by the auto-wire pass) the exposure it warns about no longer "
+            "exists.",
+        ]
+    if shield_plugin is not None and shield_required:
+        # REQUIRED and selected, but not auto-wirable: the selection is
+        # alias-less and its required service bindings only exist as
+        # placeholder exemplars, which must never become real node config. The
+        # manual-wiring mandate stays the teaching for this posture.
+        return [
+            f"An authorized prompt-injection shield is available in this deployment: {shield_plugin}. "
+            f"When an llm transform consumes externally-controlled content (any path from a {producers} "
+            f"output reaches its input), WIRE a {shield_plugin} transform between that producer node and "
+            "the llm node — its input is the producer node's on_success connection, and its on_success "
+            "is the llm node's input. This is required, not advisory: untrusted text must not "
+            "reach the model unshielded.",
+            "Load the shield's schema and assistance through the capability catalog before authoring "
+            "it, and configure it from that schema alone.",
+            f"With the shield wired, do NOT also stage the {PROMPT_SHIELD_USER_TERM} review row — the "
+            "exposure it warns about no longer exists.",
+        ]
+    draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_plugin is not None else PROMPT_SHIELD_WARNING_DRAFT
+    availability = (
+        f"The selected deployment implementation is {shield_plugin}. "
+        if shield_plugin is not None
+        else "No deployment implementation is selected. "
+    )
     return [
-        f"When an llm transform consumes externally-fetched content (any path from a {producers} "
+        availability,
+        f"When an llm transform consumes externally-controlled content (any path from a {producers} "
         "output reaches its input), stage the prompt-injection shield review ON THAT LLM NODE: "
         "add one pending pipeline_decision entry to its options.interpretation_requirements "
         "(a sibling of the node's other options).",
@@ -272,7 +344,63 @@ def _prompt_shield_rules(*, shield_available: bool, untrusted_producers: tuple[s
         "— copy the user_term and draft strings verbatim.",
         "The review is advisory and never blocks the pipeline, but omitting it hides a "
         "prompt-injection exposure decision from the operator's review cards.",
-        "Skip the row only when an authorized prompt-injection shield transform is already wired between the fetch step and the llm node.",
+        "Skip the row only when an authorized prompt-injection shield transform is already wired between that producer node and the llm node.",
+    ]
+
+
+def _content_safety_rules(*, safety_plugin: str, auto_wired: bool = True) -> list[str]:
+    """Wiring rules for the content-safety control this deployment selected.
+
+    Same regime as the shield's available branch, on the other side of the
+    model: the shield protects what goes IN, content safety screens what
+    comes OUT. Only the available branch exists today — there is no
+    registered ``pipeline_decision`` term for an absent content-safety
+    control, so a deployment without one gets no acknowledge card (unlike
+    the shield). That asymmetry is a known gap, not a decision.
+
+    Coverage is checked over EVERY output edge of the llm node, not just
+    ``on_success``, so the on_success-only framing this used to carry was a
+    half-truth that produced an unrepairable rejection: an author who wired the
+    control exactly as told and quarantined failures to a sink was rejected for
+    an edge these rules never mentioned.
+
+    Like the shield's required branch, the on_success edge is auto-wired
+    server-side (R2-F10) when the selection is actually deployable (an
+    operator profile alias, or direct options fully bound to real
+    deployment values): the aids then teach the guarantee and keep only the
+    on_error discipline, which the auto-wire pass cannot repair — no control
+    can sit on an error branch, so a quarantine sink stays an operator
+    decision. A selection whose required bindings only exist as placeholder
+    exemplars cannot be auto-wired, so that posture keeps the manual-wiring
+    mandate.
+    """
+    on_error_rule = (
+        f"Screening is checked on EVERY output edge of the llm node, not just on_success. An "
+        f"on_error edge names a SINK (or 'discard') and nothing else, so it cannot pass through "
+        f"{safety_plugin} — set the llm node's on_error to 'discard', and likewise for any "
+        f"transform between the llm node and {safety_plugin}. Only downstream OF the "
+        f"{safety_plugin} transform may on_error name a quarantine sink. Keeping failed llm rows "
+        "in a quarantine sink is an operator decision (relax the control mode, or run under the "
+        "CLI/batch runtime), never something to author around.",
+    )
+    if auto_wired:
+        return [
+            f"This deployment REQUIRES the {safety_plugin} content-safety control on every path "
+            "carrying llm output. You do not need to wire it yourself: when a proposal's llm "
+            f"on_success path is not already covered, ELSPETH automatically splices a {safety_plugin} "
+            "transform onto that edge and stages a required_control_auto_wired disclosure card for "
+            f"the operator to acknowledge. You MAY wire a {safety_plugin} transform explicitly when "
+            "you want to control its placement; the auto-wire pass leaves a covered graph untouched.",
+            *on_error_rule,
+        ]
+    return [
+        f"An authorized content-safety control is available in this deployment: {safety_plugin}. "
+        f"WIRE a {safety_plugin} transform on the llm node's on_success output — its input is the "
+        "llm node's on_success connection, and its on_success carries the screened rows onward. "
+        "This is required, not advisory: model-generated content must be screened before it is "
+        "written out.",
+        *on_error_rule,
+        "Load its schema and assistance through the capability catalog before authoring it, and configure it from that schema alone.",
     ]
 
 
@@ -375,6 +503,57 @@ _WEB_MULTI_QUERY_RETRY_RULE: Final[str] = (
     "or pool_size > 1."
 )
 
+# The on_error advice is control-mode conditional. Taught unconditionally, it
+# contradicted the required-output-control gate: it steered planners to route an
+# llm node's failures to a quarantine sink, which required_control_coverage then
+# (correctly) rejects as an uncontrolled write path. The two variants are
+# module constants so the gating is testable without asserting prose.
+_LLM_ON_ERROR_QUARANTINE_RULE: Final[str] = (
+    "on_error='discard' silently drops failed rows. When the user needs "
+    "failures retained or inspected, route on_error to a dedicated "
+    "quarantine sink instead of discard."
+)
+
+# Rendered with the deployment's selected output control. A quarantine sink is
+# genuinely unavailable to an llm node here: on_error may only name a sink or
+# 'discard' (core/dag/builder.py:1108), so no control transform can be
+# interposed on an error branch, and any sink it names is an uncontrolled write.
+_LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE: Final[str] = (
+    "This deployment REQUIRES the {control} control on every path carrying llm "
+    "output, so an llm node's on_error MUST be 'discard'. An on_error edge "
+    "names a SINK (or 'discard') and nothing else — no control transform can "
+    "sit on an error branch — so a quarantine sink for an llm node is an "
+    "uncontrolled write path and the pipeline is rejected. Do NOT try to wire "
+    "{control} onto the error branch; that connection has no producer and fails "
+    "graph construction. The same applies to any transform between the llm node "
+    "and the {control} transform; downstream OF that control, on_error may name "
+    "a quarantine sink normally, as may transforms that never carry llm output."
+)
+
+# The author cannot satisfy "retain the failed rows" here, so the rule names who
+# can. Without this the planner reads the requirement as a bug and burns its
+# repair budget re-attempting quarantine shapes.
+_LLM_ON_ERROR_CONTROLLED_TRADEOFF_TEMPLATE: Final[str] = (
+    "'discard' costs the failed row's CONTENT, not the record of it: nothing "
+    "reaches a sink to inspect later, while the audit trail still records the "
+    "row's terminal outcome and content hash. If the user needs failed llm rows "
+    "preserved in a quarantine sink, say plainly that this is an operator "
+    "decision, not something to author around — the operator relaxes the "
+    "{control} control mode to 'recommend', or the pipeline runs under the "
+    "CLI/batch runtime. Do not keep re-attempting quarantine shapes."
+)
+
+
+def _llm_on_error_rules(*, output_control: str | None) -> list[str]:
+    """Pick the on_error rules the deployment's control posture makes authorable."""
+    if output_control is None:
+        return [_LLM_ON_ERROR_QUARANTINE_RULE]
+    return [
+        _LLM_ON_ERROR_CONTROLLED_RULE_TEMPLATE.format(control=output_control),
+        _LLM_ON_ERROR_CONTROLLED_TRADEOFF_TEMPLATE.format(control=output_control),
+    ]
+
+
 _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "An llm node writes the model's reply as ONE raw string into the field "
     "named by options.response_field (default llm_response). Prompt text that "
@@ -405,9 +584,16 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "entry lands in <query_key>_<suffix>. Downstream mappers and sinks "
     "reference those exact prefixed names.",
     # run-4 E1: the CLOSED per-query key set + namespace arbitration.
-    "The ONLY per-query keys you author are input_fields (REQUIRED), "
-    "template, and output_fields. The mapping key supplies the query name. "
-    "There is NO per-query response_field or schema — output naming comes "
+    # run-5 P2 correction: the run-4 set omitted response_format, max_tokens,
+    # and list-form name — all valid QueryDefinition keys — so the rule
+    # forbade supported configuration by omission and steered planners to
+    # drop it or produce a nameless list entry validation rejects.
+    "The per-query keys you author are input_fields (REQUIRED), template, "
+    "output_fields, response_format ('standard' or 'structured'; default "
+    "standard), and max_tokens (a per-query override of the node-level "
+    "max_tokens). In mapping form the mapping key supplies the query name; "
+    "in LIST form each entry additionally REQUIRES its own name key. There "
+    "is NO per-query response_field or schema — output naming comes "
     "exclusively from the query-key prefix, and the node-level schema block "
     "declares any guaranteed prefixed fields.",
     # run-4 P4: no interpretation delivery exists for per-query templates.
@@ -419,11 +605,16 @@ _LLM_OUTPUT_CONTRACT_RULES: Final[tuple[str, ...]] = (
     "Sink hygiene: the auto-appended <response_field>_usage / _model audit "
     "fields ride the row automatically — do not map or require them into "
     "sinks unless the user asked for token/model reporting.",
-    "on_error='discard' silently drops failed rows. When the user needs "
-    "failures retained or inspected, route on_error to a dedicated "
-    "quarantine sink instead of discard.",
-    _WEB_MULTI_QUERY_RETRY_RULE,
 )
+
+
+def _llm_output_contract_rules(*, output_control: str | None) -> list[str]:
+    """The llm output contract with its control-mode-conditional on_error rule."""
+    return [
+        *_LLM_OUTPUT_CONTRACT_RULES,
+        *_llm_on_error_rules(output_control=output_control),
+        _WEB_MULTI_QUERY_RETRY_RULE,
+    ]
 
 
 _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
@@ -441,6 +632,10 @@ _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
     "required LLM reviews auto-stage on every llm node. The planner-owned "
     "kinds are vague_term (wired via prompt_template_parts), registered "
     "pipeline_decision, and invented_source.",
+    "NEVER author a pipeline_decision row with user_term "
+    "required_control_auto_wired — that disclosure is staged exclusively by "
+    "the server's required-control auto-wire pass, and a hand-authored row "
+    "forges a policy_required entry in the audit disclosure.",
 )
 
 
@@ -461,6 +656,105 @@ def _usable_llm_profile_alias(catalog: PolicyCatalogView) -> str | None:
     if selected is not None:
         return selected
     return dict(snapshot.usable_profile_aliases)[llm_id][0]
+
+
+def _selected_control_profile(catalog: PolicyCatalogView, capability: PluginCapability) -> tuple[str, str | None] | None:
+    """Return the selected control plugin only when policy requires it.
+
+    Recommended controls must never mutate a worked topology merely because an
+    implementation is selected. Returns ``None`` for recommend mode or no
+    selection. A selected plugin with no operator profile aliases (direct
+    user-configurable controls) is returned with ``alias=None`` — a required
+    control must still appear in the worked exemplar, or the exemplar teaches
+    a topology this deployment's coverage validator rejects.
+    """
+    snapshot = catalog.snapshot
+    if dict(snapshot.control_modes).get(capability, ControlMode.RECOMMEND) is not ControlMode.REQUIRED:
+        return None
+    plugin_id = dict(snapshot.selected).get(capability)
+    if plugin_id is None:
+        return None
+    alias = dict(snapshot.selected_profile_aliases).get(plugin_id)
+    if alias is None:
+        aliases = dict(snapshot.usable_profile_aliases).get(plugin_id, ())
+        alias = aliases[0] if aliases else None
+    return plugin_id.name, alias
+
+
+# Deployment-owned service bindings a direct-config control still requires.
+# Placeholder values that pass option prevalidation, in the same spirit as
+# PLACEHOLDER_BLOB_ID — the planner substitutes the deployment's real binding
+# supplied by the user.
+_DIRECT_CONTROL_OPTION_EXEMPLARS: Final[dict[str, dict[str, object]]] = {
+    "azure_prompt_shield": {"endpoint": "https://your-resource.cognitiveservices.azure.com"},
+    "azure_content_safety": {
+        "endpoint": "https://your-resource.cognitiveservices.azure.com",
+        # The plugin's documented example thresholds — an effective blocking
+        # posture (all-6 thresholds are a no-op the coverage validator rejects).
+        "thresholds": {"hate": 2, "violence": 2, "sexual": 2, "self_harm": 0},
+    },
+}
+
+
+def _direct_control_options(summaries: Mapping[str, list[PluginSummary]], plugin_name: str) -> dict[str, object]:
+    """Required direct-config options for an alias-less control node.
+
+    A required control selected without operator profile aliases is authored
+    directly, so the exemplar must carry the plugin's remaining required
+    options or ``set_pipeline`` prevalidation rejects it. Declared credential
+    fields are wired as ``{"secret_ref": NAME}`` markers using the plugin's
+    canonical inventory candidate — the supported inline new-node form; the
+    remaining required service bindings come from the placeholder table.
+    """
+    plugin = next(entry for entry in summaries["transform"] if entry.name == plugin_name)
+    candidates_by_field = {requirement.field: requirement.candidates for requirement in plugin.secret_requirements}
+    placeholders = _DIRECT_CONTROL_OPTION_EXEMPLARS.get(plugin_name, {})
+    options: dict[str, object] = {}
+    for field in plugin.config_fields:
+        if not field.required:
+            continue
+        candidates = candidates_by_field.get(field.name)
+        if candidates:
+            options[field.name] = {"secret_ref": candidates[0]}
+        elif field.name in placeholders:
+            options[field.name] = placeholders[field.name]
+    return options
+
+
+def _direct_control_options_are_deployable(summaries: Mapping[str, list[PluginSummary]], plugin_name: str) -> bool:
+    """Whether an alias-less control's required options are REAL deployment bindings.
+
+    ``_direct_control_options`` fills required fields from two sources: the
+    plugin's canonical secret-ref inventory (real deployment bindings — the
+    ref must exist for the plugin to be available) and the
+    ``_DIRECT_CONTROL_OPTION_EXEMPLARS`` placeholder table, which exists ONLY
+    so worked exemplars prevalidate — the planner is expected to substitute
+    the deployment's real value. A placeholder must never become persisted
+    node config: Azure endpoint validation is suffix-only, so a wired
+    ``https://your-resource...`` endpoint clears every gate while pointing a
+    live secret_ref at a third-party-registrable resource. Returns False when
+    any required field (beyond the ones the caller authors itself: fields /
+    schema / source) would come from the placeholder table or be left
+    unfilled — the auto-wire pass then treats the selection as
+    REQUIRED-but-unselected and the aids keep teaching manual wiring.
+    """
+    plugin = next(entry for entry in summaries["transform"] if entry.name == plugin_name)
+    candidates_by_field = {requirement.field: requirement.candidates for requirement in plugin.secret_requirements}
+    caller_authored = {"fields", "schema", "source"}
+    for field in plugin.config_fields:
+        if not field.required or field.name in caller_authored:
+            continue
+        if candidates_by_field.get(field.name):
+            continue
+        return False
+    return True
+
+
+def _plugin_declares_field(summaries: Mapping[str, list[PluginSummary]], plugin_name: str, field_name: str) -> bool:
+    """Return True when the named transform declares that config field."""
+    return any(
+        field.name == field_name for plugin in summaries["transform"] if plugin.name == plugin_name for field in plugin.config_fields
+    )
 
 
 def _plugin_summaries(catalog: PolicyCatalogView) -> dict[str, list[PluginSummary]]:
@@ -523,9 +817,22 @@ def discovery_digest(
         for alias in aliases
     )
     if llm_aliases:
+        # run-5 P2 correction: required_options above came from the RAW
+        # plugin schema (provider-form), never the operator profile's public
+        # schema. On a profile-bound deployment that advertised provider/
+        # model/credential fields as required even though
+        # ``_LLMProfileResolver`` rejects them outright on a profile-bound
+        # node (profiles.py's ``_LLM_PRIVATE_OPTIONS``/``lower_options``) —
+        # steering the planner into a guaranteed profile_unavailable /
+        # plugin_unavailable rejection. Project required_options through the
+        # live public schema so the digest teaches the form the planner is
+        # actually pushed toward.
+        public_schema = catalog.get_schema("transform", "llm")
+        public_required = [field["name"] for field in public_schema.knob_schema.get("fields", ()) if field.get("required")]
         for entry in digest["transforms"]:
             if entry["name"] == "llm":
                 entry["profile_aliases"] = llm_aliases
+                entry["required_options"] = public_required
     return digest
 
 
@@ -776,6 +1083,72 @@ def fork_coalesce_exemplar_args(
             "description": "Fan rows out to one transform per branch, rejoin with a coalesce, tidy, and save.",
         }
 
+    # Required-control coverage is proved per LLM node: the shield must dominate
+    # the node's prompt inputs and content safety must dominate every one of its
+    # output streams. A forked exemplar that modelled two bare llm branches would
+    # therefore teach a topology this deployment's validator rejects, so the
+    # controls are wired here whenever the deployment selected one. Placement is
+    # chosen so ONE node covers both branches: the shield sits upstream of the
+    # fork, content safety downstream of the rejoin. Only the LLM-branch variant
+    # needs them — the non-LLM fallback has no LLM node to cover.
+    gate_input = "rows"
+    tidy_input = "merge_branches"
+    control_nodes_before: list[_ExemplarNode] = []
+    control_nodes_after: list[_ExemplarNode] = []
+    if profile_alias is not None:
+        shield_control = _selected_control_profile(catalog, PluginCapability.PROMPT_SHIELD)
+        if shield_control is not None:
+            shield_plugin, shield_alias = shield_control
+            gate_input = "shielded_rows"
+            shield_options: dict[str, Any] = {
+                # Fields are exactly the branches' prompt inputs.
+                "fields": ["ticket_id", "body"],
+                "schema": {"mode": "observed"},
+            }
+            if shield_alias is not None:
+                # The operator-owned control binding stays behind the alias.
+                shield_options["profile"] = shield_alias
+            else:
+                shield_options.update(_direct_control_options(summaries, shield_plugin))
+            control_nodes_before.append(
+                {
+                    "id": "shield_ticket_text",
+                    "node_type": "transform",
+                    "plugin": shield_plugin,
+                    "input": "rows",
+                    "on_success": "shielded_rows",
+                    "on_error": "discard",
+                    "options": shield_options,
+                }
+            )
+        safety_control = _selected_control_profile(catalog, PluginCapability.CONTENT_SAFETY)
+        if safety_control is not None:
+            safety_plugin, safety_alias = safety_control
+            tidy_input = "screened_rows"
+            safety_options: dict[str, Any] = {
+                # Both branches' response fields — one node, both output streams.
+                "fields": ["sentiment", "urgency"],
+                "schema": {"mode": "observed"},
+            }
+            if safety_alias is not None:
+                # The operator-owned control binding stays behind the alias.
+                safety_options["profile"] = safety_alias
+            else:
+                safety_options.update(_direct_control_options(summaries, safety_plugin))
+            if _plugin_declares_field(summaries, safety_plugin, "source"):
+                safety_options["source"] = "OUTPUT"
+            control_nodes_after.append(
+                {
+                    "id": "screen_assessments",
+                    "node_type": "transform",
+                    "plugin": safety_plugin,
+                    "input": "merge_branches",
+                    "on_success": "screened_rows",
+                    "on_error": "discard",
+                    "options": safety_options,
+                }
+            )
+
     exemplar: _SetPipelineExemplar = {
         "source": {
             "plugin": "csv",
@@ -796,10 +1169,11 @@ def fork_coalesce_exemplar_args(
             },
         },
         "nodes": [
+            *control_nodes_before,
             {
                 "id": "fan_out",
                 "node_type": "gate",
-                "input": "rows",
+                "input": gate_input,
                 "condition": "True",
                 "routes": {"true": "fork", "false": "fork"},
                 "fork_to": ["branch_a", "branch_b"],
@@ -817,11 +1191,12 @@ def fork_coalesce_exemplar_args(
                 "merge": "union",
                 "options": {"schema": {"mode": "observed"}},
             },
+            *control_nodes_after,
             {
                 "id": "tidy_columns",
                 "node_type": "transform",
                 "plugin": "field_mapper",
-                "input": "merge_branches",
+                "input": tidy_input,
                 "on_success": "main",
                 "on_error": "discard",
                 "options": {
@@ -849,6 +1224,113 @@ def fork_coalesce_exemplar_args(
         "metadata": metadata,
     }
     return exemplar
+
+
+def fork_row_union_exemplar_args(
+    catalog: PolicyCatalogView,
+    *,
+    visible: Mapping[str, frozenset[str]] | None = None,
+) -> _SetPipelineExemplar | None:
+    """Complete ``set_pipeline`` args for forked rows released by row_union."""
+    if visible is None:
+        visible = _visible_plugin_names(catalog, _plugin_summaries(catalog))
+    if (
+        "csv" not in visible["source"]
+        or "json" not in visible["sink"]
+        or "passthrough" not in visible["transform"]
+        or "field_mapper" not in visible["transform"]
+    ):
+        return None
+
+    branches = {"branch_a": "branch_a_done", "branch_b": "branch_b_done"}
+    return {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["ticket_id: str", "body: str"],
+                    "guaranteed_fields": ["ticket_id", "body"],
+                }
+            },
+            "on_validation_failure": "discard",
+            "inline_blob": {
+                "filename": "support_tickets.csv",
+                "mime_type": "text/csv",
+                "content": _FORK_EXEMPLAR_CONTENT,
+                "description": "Literal rows the user pasted into chat",
+            },
+        },
+        "nodes": [
+            {
+                "id": "fan_out_variants",
+                "node_type": "gate",
+                "input": "rows",
+                "condition": "True",
+                "routes": {"true": "fork", "false": "fork"},
+                "fork_to": list(branches),
+            },
+            {
+                "id": "process_control",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "branch_a",
+                "on_success": "branch_a_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            {
+                "id": "process_treatment",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "branch_b",
+                "on_success": "branch_b_done",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            },
+            {
+                "id": "variant_union",
+                "node_type": "row_union",
+                "input": next(iter(branches.values())),
+                "branches": branches,
+                "on_success": "unioned_rows",
+                "timeout_seconds": 30.0,
+            },
+            {
+                "id": "tidy_unioned_rows",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "unioned_rows",
+                "on_success": "main",
+                "on_error": "discard",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "mapping": {"ticket_id": "ticket_id", "body": "body"},
+                    "select_only": True,
+                },
+            },
+        ],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "main",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/row_union_variants.json",
+                    "format": "json",
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            }
+        ],
+        "metadata": {
+            "name": "Fork and release row variants",
+            "description": "Fan rows through two independent branches, then release every correlated row with row_union.",
+        },
+    }
 
 
 # Payload memo keyed by plugin-policy snapshot hash. The aids depend only on
@@ -910,11 +1392,37 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
             "rules": list(_FORK_COALESCE_RULES),
             "set_pipeline_exemplar": fork_coalesce,
         }
+    fork_row_union = fork_row_union_exemplar_args(catalog, visible=visible)
+    if fork_row_union is not None:
+        aids["fork_row_union"] = {
+            "rules": list(_FORK_ROW_UNION_RULES),
+            "set_pipeline_exemplar": fork_row_union,
+        }
+    # Resolved before the llm aids because the on_error rule they carry is
+    # control-mode conditional. ``_selected_control_profile`` returns None for
+    # recommend mode or no selection, so this is the same gate the
+    # content_safety aid uses. Memo safety: control_modes feeds
+    # PluginAvailabilitySnapshot's canonical payload and therefore
+    # snapshot_hash, which keys _AIDS_MEMO — one deployment's posture can never
+    # be served to another.
+    required_safety = _selected_control_profile(catalog, PluginCapability.CONTENT_SAFETY)
+    required_output_control = required_safety[0] if required_safety is not None else None
+    # Auto-wirability mirrors required_controls.wire_required_controls exactly:
+    # an alias-backed selection, or a direct-config selection whose required
+    # bindings are all real (never placeholder exemplars), is auto-wired; the
+    # aids must not claim the guarantee for any other posture.
+    required_shield = _selected_control_profile(catalog, PluginCapability.PROMPT_SHIELD)
+    shield_auto_wired = required_shield is not None and (
+        required_shield[1] is not None or _direct_control_options_are_deployable(summaries, required_shield[0])
+    )
+    safety_auto_wired = required_safety is not None and (
+        required_safety[1] is not None or _direct_control_options_are_deployable(summaries, required_safety[0])
+    )
     if "llm" in visible["transform"]:
         aids["model_custody"] = {
             "rules": _model_custody_rules(_usable_llm_profile_alias(catalog)),
         }
-        aids["llm_output_contract"] = {"rules": list(_LLM_OUTPUT_CONTRACT_RULES)}
+        aids["llm_output_contract"] = {"rules": _llm_output_contract_rules(output_control=required_output_control)}
     aids["review_registry"] = {
         # Imported from interpretation_state so the taught vocabulary can
         # never drift from the resolve-time registry (52322ebe1 discipline).
@@ -922,13 +1430,24 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
         "rules": list(_REVIEW_REGISTRY_RULES),
     }
     visible_untrusted_producers = tuple(sorted(_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS & visible["transform"]))
+    control_modes = dict(catalog.snapshot.control_modes)
     if visible_untrusted_producers and "llm" in visible["transform"]:
         aids["prompt_shield"] = {
             "rules": _prompt_shield_rules(
-                shield_available=dict(catalog.snapshot.selected).get(PluginCapability.PROMPT_SHIELD) is not None,
+                # Whichever shield THIS deployment selected (aws_bedrock_prompt_shield,
+                # azure_prompt_shield, …) — never a hardcoded vendor.
+                shield_plugin=(
+                    selected_shield.name
+                    if (selected_shield := dict(catalog.snapshot.selected).get(PluginCapability.PROMPT_SHIELD))
+                    else None
+                ),
+                shield_required=control_modes.get(PluginCapability.PROMPT_SHIELD, ControlMode.RECOMMEND) is ControlMode.REQUIRED,
+                shield_auto_wired=shield_auto_wired,
                 untrusted_producers=visible_untrusted_producers,
             ),
         }
+    if "llm" in visible["transform"] and required_output_control is not None:
+        aids["content_safety"] = {"rules": _content_safety_rules(safety_plugin=required_output_control, auto_wired=safety_auto_wired)}
     if visible_untrusted_producers and "field_mapper" in visible["transform"]:
         aids["raw_html_cleanup"] = {"rules": _raw_html_cleanup_rules(untrusted_producers=visible_untrusted_producers)}
     if "web_scrape" in visible["transform"]:
@@ -945,5 +1464,6 @@ __all__ = [
     "build_planner_authoring_aids",
     "discovery_digest",
     "fork_coalesce_exemplar_args",
+    "fork_row_union_exemplar_args",
     "source_custody_exemplar_args",
 ]

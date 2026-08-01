@@ -14,7 +14,7 @@ from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.interpretation_state import AUTHORING_METADATA_OPTION_KEYS
-from elspeth.web.plugin_policy.coverage import control_coverage_findings
+from elspeth.web.plugin_policy.coverage import ControlCoverageFinding, control_coverage_findings
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry
 
@@ -35,6 +35,11 @@ class PluginPolicyFinding:
     component_type: str | None
     error_code: str
     message: str
+    # Per-finding remediation, set when the producer can diagnose the repair
+    # more precisely than the stage-level default (currently only
+    # ``_control_coverage_finding``, keyed on the coverage reason). ``None``
+    # falls back to the consumer's stage default suggestion.
+    suggestion: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,20 +131,139 @@ def validate_plugin_policy(
 
     for capability in required:
         for coverage in control_coverage_findings(state, capability):
-            findings.append(
-                PluginPolicyFinding(
-                    stage="required_control_coverage",
-                    component_id=coverage.component_id,
-                    component_type="transform",
-                    error_code="required_control_coverage",
-                    message=(
-                        f"Node '{coverage.component_id}' is not covered by the required "
-                        f"'{coverage.capability.value}' {coverage.role.value} control."
-                    ),
-                )
-            )
+            findings.append(_control_coverage_finding(coverage))
 
     return PluginPolicyValidationResult(executable_state=executable_state, findings=tuple(findings))
+
+
+# Per-diagnosis remediation for coverage findings, keyed on the finding's
+# ``reason`` — never on the stage. The three diagnoses have three different
+# repairs, and a stage-level string cannot be right for all of them: telling
+# an input-domination (prompt_shield) author to "set on_error to 'discard'"
+# names a repair that cannot address the finding, while the error-route
+# conflict has exactly that one authorable repair. Total over
+# ``ControlCoverageFinding.reason`` (pinned by test); a KeyError here means a
+# new reason was added without deciding its remediation.
+_CONTROL_COVERAGE_SUGGESTIONS: dict[str, str] = {
+    "input_not_dominated": (
+        "Interpose the required control transform upstream of the named node so every "
+        "path carrying data into it passes the control first: route the producer (or "
+        "source) through the control, then connect the control's output to this node. "
+        "Then validate again. If that layout is not possible, ask the operator to relax "
+        "the control mode to 'recommend' — it is not an authoring change."
+    ),
+    "input_fields_unprovable": (
+        "The wiring is already right — do not move the control. Set the control's "
+        "'fields' to 'all' so it scans every string field, or rewrite the node's "
+        "prompt template so every row access is static ('{{ row.field }}', never "
+        "'{{ row[key] }}') and list those exact fields in the control's 'fields'. "
+        "Then validate again."
+    ),
+    "output_not_post_dominated": (
+        "Wire the required control transform so it sits on every path that carries the "
+        "named node's output before any sink, then validate again. If a conforming "
+        "layout is not possible, ask the operator to relax the control mode to "
+        "'recommend' — it is not an authoring change."
+    ),
+    "output_error_route_not_post_dominated": (
+        "Set the named node's on_error to 'discard' — an on_error route is a separate "
+        "write path and no control can sit on it (on_error may only name a sink or "
+        "'discard'). Then validate again. If failed rows must be kept in a quarantine "
+        "sink, ask the operator to relax the control mode to 'recommend' — it is not an "
+        "authoring change."
+    ),
+}
+
+
+def _field_set(fields: tuple[str, ...]) -> str:
+    """Render a coverage field set for an author-facing message."""
+    return f"[{', '.join(fields)}]" if fields else "none provable"
+
+
+def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyFinding:
+    """Name the on_error conflict and its one authorable repair.
+
+    The bare "not covered" message told authors nothing about WHY an
+    otherwise-correct pipeline was rejected, and the on_error case is the one
+    that reads as a contradiction: the planner is taught to route failures to a
+    quarantine sink, then a required output control rejects the pipeline for
+    doing exactly that. The conflict is real and the rejection is correct — an
+    on_error edge writes rows to a sink without passing the control, so it is
+    an independent output path.
+
+    There is exactly ONE authoring repair. A transform's ``on_error`` may only
+    name a sink or the literal ``discard`` (``core/dag/builder.py:1108``,
+    mirrored at ``web/composer/state.py:1060``), and ``on_error`` is mandatory
+    (``transform_missing_on_error``) — so no control transform can sit on an
+    error branch. Do NOT offer interposing the control on the error branch: the
+    graph rejects that edge (``transform_on_error_unknown_sink`` at the composer
+    surface, ``No producer for connection`` when built), so a planner that
+    followed the advice would ping-pong between two rejections.
+
+    Preserving the failed rows is a real need with a real answer, but it lives
+    with the operator, not the author: ``on_error: <quarantine sink>`` builds
+    and runs fine, and only the *required* control mode rejects it. Naming that
+    escape hatch keeps the author from concluding the requirement is a bug. See
+    ``docs/reference/configuration.md`` — "Required controls and error routing".
+    """
+    if coverage.reason == "output_error_route_not_post_dominated" and coverage.uncovered_stream is not None:
+        message = (
+            f"Node '{coverage.component_id}' routes its on_error rows to the "
+            f"'{coverage.uncovered_stream}' sink, which is an independent output path: those rows "
+            f"are written without passing the required '{coverage.capability.value}' "
+            f"{coverage.role.value} control, so this node is not covered. A transform's on_error "
+            "may only name a sink or 'discard', so no control can be interposed on an error "
+            "branch — set this node's on_error to 'discard'. That drops the failed row's content "
+            "(nothing reaches a sink to inspect later) while the audit trail still records its "
+            "terminal outcome and content hash. Preserving failed rows in a quarantine sink is an "
+            f"operator decision, not an authoring workaround: it needs the "
+            f"'{coverage.capability.value}' control mode relaxed to 'recommend', or the pipeline "
+            "run under the CLI/batch runtime where web plugin policy does not apply."
+        )
+    elif coverage.reason == "input_fields_unprovable":
+        message = (
+            f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
+            f"{coverage.role.value} control upstream, but its own protected field set could not "
+            "be proven from its prompt template, so a control scoped to specific fields cannot be "
+            f"credited: protected fields {_field_set(coverage.protected_fields)}, control scans "
+            f"{_field_set(coverage.scanned_fields)}. An empty protected set is not proof that no "
+            "field needs protecting — a dynamic access such as row[key] extracts nothing either — "
+            "so only a control with fields: 'all' covers it. The wiring itself is correct; this is "
+            "a control-scope repair, not a layout repair."
+        )
+    else:
+        message = (
+            f"Node '{coverage.component_id}' is not covered by the required '{coverage.capability.value}' {coverage.role.value} control."
+        )
+        if coverage.protected_fields and coverage.scanned_fields:
+            message += (
+                f" It reads row fields {_field_set(coverage.protected_fields)}, while the nearest "
+                f"upstream control scans {_field_set(coverage.scanned_fields)}."
+            )
+    suggestion = _CONTROL_COVERAGE_SUGGESTIONS[coverage.reason]
+    if coverage.reason == "input_not_dominated" and coverage.protected_fields and coverage.scanned_fields:
+        # Both field sets are populated only when a control provably dominates
+        # the input (coverage.py decides that with the credit walk itself), so
+        # this rejection is a SCOPE mismatch on correct wiring. The keyed
+        # suggestion would send the author to interpose a control that is
+        # already interposed — a repair that re-emits the same topology and
+        # draws the same rejection.
+        suggestion = (
+            f"The control already covers every path into this node, so do not move it: it scans "
+            f"{_field_set(coverage.scanned_fields)} while the node reads row fields "
+            f"{_field_set(coverage.protected_fields)}. Extend the control's 'fields' to include every "
+            "field the node reads (or set it to 'all'), or change the node so it only reads fields the "
+            "control already scans. Then validate again. If neither is possible, ask the operator to "
+            "relax the control mode to 'recommend' — it is not an authoring change."
+        )
+    return PluginPolicyFinding(
+        stage="required_control_coverage",
+        component_id=coverage.component_id,
+        component_type="transform",
+        error_code="required_control_coverage",
+        message=message,
+        suggestion=suggestion,
+    )
 
 
 def _plugin_id(kind: Literal["source", "transform", "sink"], name: str) -> PluginId | None:

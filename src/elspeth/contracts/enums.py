@@ -100,6 +100,7 @@ class NodeType(StrEnum):
     GATE = "gate"
     AGGREGATION = "aggregation"
     COALESCE = "coalesce"
+    ROW_UNION = "row_union"
     SINK = "sink"
 
 

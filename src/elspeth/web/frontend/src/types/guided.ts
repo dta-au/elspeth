@@ -100,7 +100,10 @@ export interface ChatTurn {
   step: GuidedStep;
   ts_iso: string;
   assistant_message_kind: "assistant" | "synthetic_failure" | null;
-  synthetic_failure_reason: "quality_guard" | "unavailable" | "not_applied" | null;
+  /** Closed persisted reason. "model_defect": the provider answered but the
+   *  reply violated a tool contract — retry is the designed remedy, unlike
+   *  the deterministic "not_applied" causes (Retry is suppressed there). */
+  synthetic_failure_reason: "quality_guard" | "unavailable" | "not_applied" | "model_defect" | null;
 }
 
 /**
@@ -161,6 +164,9 @@ export type GuidedOperationFailureCode =
   | "provider_unavailable"
   | "provider_timeout"
   | "invalid_provider_response"
+  /** Permanent by construction: a deployment policy refused this pipeline.
+   *  Retry affordances must not invite a retry — only a revision can clear it. */
+  | "policy_blocked"
   | "stale_conflict"
   | "integrity_error"
   | "custody_error"
@@ -419,6 +425,8 @@ export interface SingleSelectPayload {
   question: string;
   options: Option[];
   allow_custom: boolean;
+  /** Server-owned subset of option IDs that may bind a ready session blob. */
+  source_blob_compatible_option_ids?: string[];
 }
 
 /** Wire: MultiSelectWithCustomPayload (protocol.py:46-50). */
@@ -472,6 +480,9 @@ export interface KnobField {
   name: string;
   label: string;
   description?: string;
+  /** Form-input shape hint for a free-text knob whose value has internal
+   *  structure (e.g. the schema knob's compact JSON example). */
+  placeholder?: string;
   kind: FieldKind;
   tier?: FieldTier;
   required: boolean;
@@ -480,6 +491,12 @@ export interface KnobField {
   enum?: string[];
   item_kind?: "text" | "number-int" | "number-float";
   visible_when?: VisibilityPredicate;
+  /** Conditional requiredness the plugin model itself cannot express: the field
+   *  is required when `required` is true OR this predicate holds against
+   *  current form state. Carries composer-owned rules such as "a local file
+   *  sink must choose a collision_policy under mode='write'" (R2-F2). Unlike
+   *  `visible_when` the target may appear LATER in `fields`. */
+  required_when?: VisibilityPredicate;
 }
 
 export interface KnobSchema {
@@ -553,13 +570,21 @@ export type ProposalFlow =
   | { kind: "gate_fork"; routes: string[]; branch: string }
   | { kind: "queue_continue"; branch: string | null }
   | { kind: "coalesce_success"; branch: string | null }
+  | { kind: "row_union_success"; branch: string | null }
   | { kind: "output_write_failure" };
 
 export type ProposalNodeBehavior =
   | { kind: "transform" }
   | {
       kind: "gate";
+      /** The authored predicate, verbatim (F11): without it the review
+       *  surfaces show only opaque route ordinals. */
+      condition: string;
       route_aliases: string[];
+      /** Binds each ordinal route alias to its author-visible route key
+       *  ("true"/"false" or an author label), bijective with route_aliases
+       *  in the same order (fork gates included). */
+      routes: Array<{ alias: string; key: string }>;
       fork_branches: Array<{ routes: string[]; branch: string }>;
     }
   | {
@@ -578,6 +603,13 @@ export type ProposalNodeBehavior =
       branch_aliases: string[];
       policy: "require_all" | "quorum" | "best_effort" | "first";
       merge: "union" | "nested" | "select";
+      timeout_seconds: number | null;
+    }
+  | {
+      kind: "row_union";
+      branch_aliases: string[];
+      policy: "require_all";
+      timeout_seconds: number | null;
     };
 
 export interface ProposePipelinePayload {
@@ -616,9 +648,16 @@ export interface ProposePipelinePayload {
   nodes: Array<{
     stable_id: string;
     label: string;
-    node_type: "transform" | "gate" | "aggregation" | "queue" | "coalesce";
+    node_type:
+      | "transform"
+      | "gate"
+      | "aggregation"
+      | "queue"
+      | "coalesce"
+      | "row_union";
     plugin: ProposalPluginRef | null;
     behavior: ProposalNodeBehavior;
+    node_options_summary: NodeOptionSummary[];
   }>;
   outputs: Array<{
     stable_id: string;
@@ -628,9 +667,24 @@ export interface ProposePipelinePayload {
   edit_targets: GuidedEditTarget[];
 }
 
+/** One allowlisted node option, pre-rendered server-side as display text.
+ *  The backend owns both the key vocabulary and the rendering (see
+ *  ``_NODE_OPTION_SUMMARY_ALLOWLIST``); the client only labels and prints. */
+export interface NodeOptionSummary {
+  key: string;
+  value: string;
+}
+
 export interface WireRowCardinality {
   input: "none" | "one" | "batch" | "branches" | "many_producers";
-  output: "one" | "zero_or_one" | "zero_or_many" | "one_per_item" | "one_per_branch_set" | "expected_count";
+  output:
+    | "one"
+    | "zero_or_one"
+    | "zero_or_many"
+    | "one_per_item"
+    | "one_per_branch"
+    | "one_per_branch_set"
+    | "expected_count";
   expected_output_count: string | null;
 }
 
@@ -682,6 +736,7 @@ export interface WireStageData {
     guaranteed_fields: string[];
     row_cardinality: WireRowCardinality;
     structured_output_fields: WireStructuredOutputField[];
+    node_options_summary: NodeOptionSummary[];
   }>;
   outputs: Array<{
     stable_id: string;

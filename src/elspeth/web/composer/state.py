@@ -10,11 +10,14 @@ Layer: L3 (application).
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from math import isfinite
 from pathlib import PurePosixPath
 from typing import Any, Literal, NotRequired, Self, TypedDict
 
+from jinja2 import TemplateSyntaxError
+from jinja2.meta import find_undeclared_variables
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -36,25 +39,29 @@ from elspeth.contracts.sink import (
     FILE_SINK_PLUGINS,
     LOCAL_RECOVERY_SINK_PLUGINS,
 )
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.contracts.wire_visible_identity import is_wire_visible_placeholder
 from elspeth.core.config import (
     _MAX_NODE_NAME_LENGTH,
     _RESERVED_EDGE_LABELS,
     _VALID_NODE_NAME_RE,
     TriggerConfig,
+    _validate_connection_or_sink_name,
     _validate_max_length,
     _validate_node_name_chars,
 )
 from elspeth.core.dag.coalesce_merge import merge_guaranteed_fields
+from elspeth.core.templates import extract_jinja2_field_usage
+from elspeth.plugins.infrastructure.templates import create_sandboxed_environment
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
-NodeType = Literal["transform", "gate", "aggregation", "coalesce", "queue"]
+NodeType = Literal["transform", "gate", "aggregation", "coalesce", "row_union", "queue"]
 EdgeType = Literal["on_success", "on_error", "route_true", "route_false", "fork"]
 CoalesceBranches = tuple[str, ...] | Mapping[str, str]
 
-COMPOSER_NODE_TYPES: frozenset[str] = frozenset(("aggregation", "coalesce", "gate", "queue", "transform"))
+COMPOSER_NODE_TYPES: frozenset[str] = frozenset(("aggregation", "coalesce", "gate", "queue", "row_union", "transform"))
 
 _DECLARED_INPUT_FIELDS_OPTION = "required_input_fields"
 _MISSING_DECLARED_INPUT_FIELDS = object()
@@ -151,12 +158,12 @@ class SourceSpec:
 
 @dataclass(frozen=True, slots=True)
 class NodeSpec:
-    """Transform, gate, aggregation, or coalesce node.
+    """Transform, gate, aggregation, coalesce, row_union, or queue node.
 
     Attributes:
         id: Unique node identifier within the pipeline.
-        node_type: One of "transform", "gate", "aggregation", "coalesce".
-        plugin: Plugin name. None for gates and coalesces.
+        node_type: One of the composer-supported node discriminators.
+        plugin: Plugin name. None for structural nodes.
         input: Named connection point this node reads from.
         on_success: Named connection point for successful output. None for gates.
         on_error: Named connection point for error output. None if not diverted.
@@ -164,12 +171,13 @@ class NodeSpec:
         condition: Gate expression. None for non-gates.
         routes: Gate route mapping. None for non-gates.
         fork_to: Fork destinations for fork gates. None for non-fork nodes.
-        branches: Branch inputs for coalesce nodes. None for non-coalesce nodes.
+        branches: Branch inputs for coalesce/row_union nodes. None otherwise.
         policy: Coalesce policy. None for non-coalesce nodes.
         merge: Coalesce merge strategy. None for non-coalesce nodes.
         trigger: Aggregation batch trigger config. None for non-aggregation nodes.
         output_mode: Aggregation output mode ("passthrough" or "transform"). None for non-aggregation nodes.
         expected_output_count: Aggregation expected output count. None for non-aggregation nodes.
+        timeout_seconds: Structural barrier timeout. None for other node types.
     """
 
     id: str
@@ -188,8 +196,15 @@ class NodeSpec:
     trigger: Mapping[str, Any] | None = None
     output_mode: str | None = None
     expected_output_count: int | None = None
+    timeout_seconds: float | None = None
 
     def __post_init__(self) -> None:
+        if self.node_type == "row_union" and self.branches is not None and not isinstance(self.branches, Mapping):
+            branch_tuple = tuple(self.branches)
+            normalized_branches: CoalesceBranches = (
+                branch_tuple if len(branch_tuple) != len(set(branch_tuple)) else {branch: branch for branch in branch_tuple}
+            )
+            object.__setattr__(self, "branches", normalized_branches)
         # Mapping fields must be deep-frozen. Scalar, enum, and tuple fields
         # are already immutable and need no guard.
         freeze_fields(self, "options")
@@ -205,13 +220,24 @@ class NodeSpec:
         """Reconstruct from a plain dict (inverse of to_dict serialisation).
 
         Optional fields (condition, routes, fork_to, branches, policy, merge,
-        trigger, output_mode, expected_output_count) default to None when
+        trigger, output_mode, expected_output_count, timeout_seconds) default to None when
         absent from the dict. fork_to is converted from list to tuple since
-        to_dict() serialises tuples as lists. branches preserves mapping form
-        for transformed coalesce branches and converts list form to tuple.
+        to_dict() serialises tuples as lists. Coalesce branches preserve their
+        list-vs-mapping semantics; row_union list branches normalize to the
+        runtime's ordered identity mapping.
         """
         fork_to = d["fork_to"] if "fork_to" in d else None
         branches = d["branches"] if "branches" in d else None
+        if d["node_type"] == "row_union" and branches is not None and not isinstance(branches, Mapping):
+            branch_tuple = tuple(branches)
+            # Preserve an invalid duplicate list long enough for validate() to
+            # reject it; a dict comprehension would silently erase the authoring
+            # error. Valid lists normalize to the runtime's identity mapping.
+            normalized_branches: CoalesceBranches | None = (
+                branch_tuple if len(branch_tuple) != len(set(branch_tuple)) else {branch: branch for branch in branch_tuple}
+            )
+        else:
+            normalized_branches = dict(branches) if isinstance(branches, Mapping) else tuple(branches) if branches is not None else None
         return cls(
             id=d["id"],
             node_type=d["node_type"],
@@ -223,12 +249,13 @@ class NodeSpec:
             condition=d["condition"] if "condition" in d else None,
             routes=d["routes"] if "routes" in d else None,
             fork_to=tuple(fork_to) if fork_to is not None else None,
-            branches=dict(branches) if isinstance(branches, Mapping) else tuple(branches) if branches is not None else None,
+            branches=normalized_branches,
             policy=d["policy"] if "policy" in d else None,
             merge=d["merge"] if "merge" in d else None,
             trigger=d["trigger"] if "trigger" in d else None,
             output_mode=d["output_mode"] if "output_mode" in d else None,
             expected_output_count=d["expected_output_count"] if "expected_output_count" in d else None,
+            timeout_seconds=d["timeout_seconds"] if "timeout_seconds" in d else None,
         )
 
 
@@ -275,6 +302,28 @@ def _serialize_branches(branches: CoalesceBranches) -> list[str] | dict[str, str
     return list(branches)
 
 
+def _timeout_seconds_is_invalid(value: object) -> bool:
+    """Return whether a structural barrier timeout violates runtime bounds.
+
+    Persisted session payloads reach this helper through ``NodeSpec.from_dict``
+    without crossing the Pydantic ``_StrictTimeoutSeconds`` tool boundary, and
+    JSON has no integer ceiling — so an arbitrary-precision int can arrive
+    here. ``float()`` raises ``OverflowError`` on those, which would abort
+    ``validate()`` instead of producing a rejection, so the conversion is
+    guarded and an unrepresentable magnitude is classified INVALID. Mirrors
+    ``yaml_importer._finite_positive_timeout``. The isinstance guard above
+    leaves ``int`` as the only value ``float()`` can reject, so OverflowError
+    is the only reachable failure.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return True
+    try:
+        normalized = float(value)
+    except OverflowError:
+        return True
+    return not isfinite(normalized) or normalized <= 0
+
+
 def queue_node_contract_error(node: NodeSpec) -> str | None:
     """Return the intrinsic (topology-free) contract violation for a queue node.
 
@@ -304,6 +353,7 @@ def queue_node_contract_error(node: NodeSpec) -> str | None:
         "trigger": node.trigger,
         "output_mode": node.output_mode,
         "expected_output_count": node.expected_output_count,
+        "timeout_seconds": node.timeout_seconds,
     }
     present = sorted(name for name, value in forbidden.items() if value is not None)
     if present:
@@ -421,6 +471,101 @@ class SchemaContractDetail:
         return result
 
 
+class RowUnionFieldSchemaDetailDict(TypedDict):
+    """One validated field declaration in row_union repair facts."""
+
+    name: str
+    field_type: str
+    required: bool
+    nullable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RowUnionFieldSchemaDetail:
+    """Redaction-safe field metadata from validated schema configuration."""
+
+    name: str
+    field_type: str
+    required: bool
+    nullable: bool
+
+    def to_dict(self) -> RowUnionFieldSchemaDetailDict:
+        return RowUnionFieldSchemaDetailDict(
+            name=self.name,
+            field_type=self.field_type,
+            required=self.required,
+            nullable=self.nullable,
+        )
+
+
+class RowUnionBranchSchemaDetailDict(TypedDict):
+    """One row_union branch's explicit schema declaration."""
+
+    branch: str
+    mode: Literal["fixed", "flexible"]
+    fields: list[RowUnionFieldSchemaDetailDict]
+
+
+@dataclass(frozen=True, slots=True)
+class RowUnionBranchSchemaDetail:
+    """Redaction-safe branch schema facts for planner repair."""
+
+    branch: str
+    mode: Literal["fixed", "flexible"]
+    fields: tuple[RowUnionFieldSchemaDetail, ...]
+
+    def to_dict(self) -> RowUnionBranchSchemaDetailDict:
+        return RowUnionBranchSchemaDetailDict(
+            branch=self.branch,
+            mode=self.mode,
+            fields=[field.to_dict() for field in self.fields],
+        )
+
+
+def _row_union_branch_schema_detail(
+    branch: str,
+    schema_config: SchemaConfig,
+) -> RowUnionBranchSchemaDetail:
+    """Project one already-proven explicit branch declaration."""
+    mode = schema_config.mode
+    assert mode in ("fixed", "flexible")
+    assert schema_config.fields is not None
+    return RowUnionBranchSchemaDetail(
+        branch=branch,
+        mode=mode,
+        fields=tuple(
+            RowUnionFieldSchemaDetail(
+                name=field.name,
+                field_type=field.field_type,
+                required=field.required,
+                nullable=field.nullable,
+            )
+            for field in schema_config.fields
+        ),
+    )
+
+
+class RowUnionSchemaDetailDict(TypedDict):
+    """Structured facts for a row_union schema incompatibility."""
+
+    branches: list[RowUnionBranchSchemaDetailDict]
+    conflicting_fields: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class RowUnionSchemaDetail:
+    """Exact validated branch declarations needed to repair a row_union."""
+
+    branches: tuple[RowUnionBranchSchemaDetail, ...]
+    conflicting_fields: tuple[str, ...]
+
+    def to_dict(self) -> RowUnionSchemaDetailDict:
+        return RowUnionSchemaDetailDict(
+            branches=[branch.to_dict() for branch in self.branches],
+            conflicting_fields=list(self.conflicting_fields),
+        )
+
+
 class ValidationEntryDict(TypedDict):
     """JSON representation of :class:`ValidationEntry`."""
 
@@ -429,6 +574,7 @@ class ValidationEntryDict(TypedDict):
     severity: Severity
     error_code: NotRequired[str]
     contract: NotRequired[SchemaContractDetailDict]
+    row_union_schema: NotRequired[RowUnionSchemaDetailDict]
 
 
 @dataclass(frozen=True, slots=True)
@@ -444,6 +590,7 @@ class ValidationEntry:
     severity: Severity
     error_code: str | None = None
     contract: SchemaContractDetail | None = None
+    row_union_schema: RowUnionSchemaDetail | None = None
 
     def to_dict(self) -> ValidationEntryDict:
         """Serialize to a plain dict for JSON responses."""
@@ -452,6 +599,8 @@ class ValidationEntry:
             result["error_code"] = self.error_code
         if self.contract is not None:
             result["contract"] = self.contract.to_dict()
+        if self.row_union_schema is not None:
+            result["row_union_schema"] = self.row_union_schema.to_dict()
         return result
 
 
@@ -801,11 +950,159 @@ def _runtime_connection_targets(
 
 def _runtime_consumer_connections(nodes: tuple[NodeSpec, ...]) -> set[str]:
     """Return connection names runtime can resolve to processing nodes."""
-    consumers = {node.input for node in nodes if node.node_type != "coalesce"}
+    consumers = {node.input for node in nodes if node.node_type not in ("coalesce", "row_union")}
     for node in nodes:
         if node.node_type == "coalesce" and node.branches is not None:
             consumers.update(_coalesce_branch_connections(node.branches))
+        elif node.node_type == "row_union" and node.branches is not None:
+            # NodeSpec.input is only the serialized adapter placeholder for a
+            # row_union. Every declared branch value is a real consuming
+            # binding, including identity branches.
+            consumers.update(_coalesce_branch_connections(node.branches))
     return consumers
+
+
+def _runtime_connection_is_downstream(
+    origin: str,
+    target: str,
+    sources: Mapping[str, SourceSpec],
+    nodes: tuple[NodeSpec, ...],
+) -> bool:
+    """Return whether ``target`` is exclusively derived from ``origin``."""
+    is_downstream, _lineage = _runtime_connection_lineage(origin, target, sources, nodes)
+    return is_downstream
+
+
+def _runtime_connection_lineage(
+    origin: str,
+    target: str,
+    sources: Mapping[str, SourceSpec],
+    nodes: tuple[NodeSpec, ...],
+) -> tuple[bool, tuple[NodeSpec, ...]]:
+    """Return exclusive lineage from ``origin`` to ``target``.
+
+    Ordinary connections have one producer (the duplicate-producer check owns
+    ambiguity), so one proven predecessor establishes lineage. A queue is the
+    deliberate exception: it can have many producers, and every predecessor
+    must derive from the mapped fork alias. Otherwise one valid branch path
+    could hide unrelated queue traffic and bypass row_union correlation.
+
+    The lineage excludes the producer of ``origin`` itself. For a fork alias,
+    this makes the originating fork gate the traversal boundary while retaining
+    every node inside the branch for row_union hazard checks.
+    """
+    from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id
+
+    resolver = ProducerResolver.build(
+        source=None,
+        sources=sources,
+        nodes=nodes,
+        sink_names=frozenset(),
+    )
+
+    def _producer_is_compatible(
+        producer: ProducerEntry,
+        *,
+        visiting: frozenset[str],
+    ) -> tuple[bool, frozenset[str]]:
+        if is_source_producer_id(producer.producer_id):
+            return False, frozenset()
+        producer_node = resolver.get_node(producer.producer_id)
+        if producer_node is None:
+            return False, frozenset()
+        if producer_node.node_type in ("coalesce", "row_union"):
+            dependencies = _coalesce_branch_connections(producer_node.branches)
+            if not dependencies:
+                return False, frozenset()
+            lineage = frozenset((producer_node.id,))
+            for dependency in dependencies:
+                is_compatible, dependency_lineage = _connection_is_compatible(dependency, visiting=visiting)
+                if not is_compatible:
+                    return False, frozenset()
+                lineage |= dependency_lineage
+            return True, lineage
+        if producer_node.node_type == "queue":
+            # Queue compatibility is resolved through every registered
+            # predecessor in _connection_is_compatible(), never through the
+            # queue's structural input placeholder.
+            return _connection_is_compatible(producer_node.id, visiting=visiting)
+        is_compatible, lineage = _connection_is_compatible(producer_node.input, visiting=visiting)
+        if not is_compatible:
+            return False, frozenset()
+        return True, lineage | {producer_node.id}
+
+    def _connection_is_compatible(
+        connection_name: str,
+        *,
+        visiting: frozenset[str],
+    ) -> tuple[bool, frozenset[str]]:
+        if connection_name == origin:
+            return True, frozenset()
+        if connection_name in visiting:
+            return False, frozenset()
+        next_visiting = visiting | {connection_name}
+        producer = resolver.find_producer_for(connection_name)
+        if producer is None:
+            return False, frozenset()
+        producer_node = resolver.get_node(producer.producer_id)
+        if producer_node is not None and producer_node.node_type == "queue":
+            predecessors = resolver.queue_predecessors(producer_node.id)
+            if not predecessors:
+                return False, frozenset()
+            lineage = frozenset((producer_node.id,))
+            for predecessor in predecessors:
+                is_compatible, predecessor_lineage = _producer_is_compatible(predecessor, visiting=next_visiting)
+                if not is_compatible:
+                    return False, frozenset()
+                lineage |= predecessor_lineage
+            return True, lineage
+        return _producer_is_compatible(producer, visiting=next_visiting)
+
+    is_compatible, lineage_ids = _connection_is_compatible(target, visiting=frozenset())
+    if not is_compatible:
+        return False, ()
+    return True, tuple(node for node in nodes if node.id in lineage_ids)
+
+
+def _runtime_nodes_downstream_of_connection(
+    connection_name: str,
+    nodes: tuple[NodeSpec, ...],
+) -> tuple[NodeSpec, ...]:
+    """Return processing nodes reachable from a runtime connection.
+
+    Mirrors the runtime builder's forward graph walk closely enough for the
+    row_union group-indivisibility guard: all success/error/route/fork outputs
+    are traversed, identity and mapped barrier inputs are both topology edges,
+    and structural queue placeholders are skipped.
+    """
+    reachable_connections = {connection_name}
+    reachable_node_ids: set[str] = set()
+    ordered_nodes: list[NodeSpec] = []
+    changed = True
+    while changed:
+        changed = False
+        for node in nodes:
+            if node.id in reachable_node_ids or node.node_type == "queue":
+                continue
+            inputs = _coalesce_branch_connections(node.branches) if node.node_type in ("coalesce", "row_union") else (node.input,)
+            if reachable_connections.isdisjoint(inputs):
+                continue
+            reachable_node_ids.add(node.id)
+            ordered_nodes.append(node)
+            changed = True
+            if node.node_type == "coalesce" and node.on_success is None:
+                reachable_connections.add(node.id)
+            elif node.on_success is not None:
+                reachable_connections.add(node.on_success)
+            if node.on_error is not None and node.on_error != _DISCARD_ROUTE_TARGET:
+                reachable_connections.add(node.on_error)
+            if node.routes is not None:
+                reachable_connections.update(
+                    target for target in node.routes.values() if target not in (_DISCARD_ROUTE_TARGET, _FORK_ROUTE_TARGET)
+                )
+            if node.fork_to is not None:
+                reachable_connections.update(node.fork_to)
+    return tuple(ordered_nodes)
 
 
 def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, Any]]:
@@ -888,6 +1185,106 @@ def coalesce_reachability_facts(state: CompositionState) -> dict[str, dict[str, 
     return facts
 
 
+class RouteDestinationFactDict(TypedDict):
+    """Redaction-safe repair facts for one unresolved route destination."""
+
+    dangling_on_success: NotRequired[str]
+    dangling_on_error: NotRequired[str]
+    declared_sinks: list[str]
+    consumable_connections: NotRequired[list[str]]
+
+
+def route_destination_facts(state: CompositionState) -> dict[str, RouteDestinationFactDict]:
+    """Redaction-safe wiring facts for dangling routing-destination rejections.
+
+    Maps each component whose ``on_success`` / ``on_error`` names a destination
+    that ``_validate_runtime_route_destinations`` cannot resolve — keyed exactly
+    as those validation entries name their component (``source`` /
+    ``source:<name>`` / ``node:<id>``) — to the facts a repair needs:
+    the dangling value itself, ``declared_sinks`` (the candidate's
+    ``outputs[].sink_name`` set), and for on_success failures
+    ``consumable_connections`` (the connections downstream nodes read as their
+    input). ``on_error`` and coalesce ``on_success`` may only target sinks, so
+    those facts deliberately omit ``consumable_connections``.
+
+    AWS acceptance runs 2026-07-30 (ticket elspeth-5904b1683a): the canonical
+    CSV-to-JSON prompt intermittently exhausted its repair budget on
+    ``source_on_success_dangling`` because the bare code names neither the
+    value that dangled nor the sink it should have matched, and the static
+    guidance pointed at ``get_pipeline_state`` — which reads the BASELINE
+    session state (empty on a fresh compose), not the rejected candidate.
+    Everything here is a sink name, node id, or connection name the planner
+    itself authored in the rejected candidate — the same redaction judgment as
+    :func:`coalesce_reachability_facts` — so forwarding it through the
+    message-stripped repair feedback does not re-open the redaction boundary.
+    """
+    output_names = {output.name for output in state.outputs}
+    consumer_connections = _runtime_consumer_connections(state.nodes)
+    declared_sinks = sorted(output_names)
+    consumable = sorted(consumer_connections)
+    facts: dict[str, RouteDestinationFactDict] = {}
+
+    def _merge(component: str, entry: RouteDestinationFactDict) -> None:
+        if component in facts:
+            facts[component].update(entry)
+        else:
+            facts[component] = entry
+
+    for source_name, source in state.sources.items():
+        target = source.on_success
+        if target not in output_names and target not in consumer_connections:
+            component = "source" if source_name == "source" else f"source:{source_name}"
+            _merge(
+                component,
+                {
+                    "dangling_on_success": target,
+                    "declared_sinks": declared_sinks,
+                    "consumable_connections": consumable,
+                },
+            )
+
+    for node in state.nodes:
+        component = f"node:{node.id}"
+        if node.node_type in ("transform", "aggregation", "row_union"):
+            if node.on_success is not None and node.on_success not in output_names and node.on_success not in consumer_connections:
+                _merge(
+                    component,
+                    {
+                        "dangling_on_success": node.on_success,
+                        "declared_sinks": declared_sinks,
+                        "consumable_connections": consumable,
+                    },
+                )
+            if (
+                node.node_type == "transform"
+                and node.on_error is not None
+                and node.on_error != "discard"
+                and node.on_error not in output_names
+            ):
+                _merge(
+                    component,
+                    {
+                        "dangling_on_error": node.on_error,
+                        "declared_sinks": declared_sinks,
+                    },
+                )
+        elif (
+            node.node_type == "coalesce"
+            and node.on_success is not None
+            and node.on_success not in output_names
+            and node.on_success not in consumer_connections
+        ):
+            # coalesce_on_success_unknown_sink: the destination must be a sink.
+            _merge(
+                component,
+                {
+                    "dangling_on_success": node.on_success,
+                    "declared_sinks": declared_sinks,
+                },
+            )
+    return facts
+
+
 def _validate_runtime_route_destinations(
     sources: Mapping[str, SourceSpec],
     nodes: tuple[NodeSpec, ...],
@@ -918,29 +1315,27 @@ def _validate_runtime_route_destinations(
             )
 
     # Mirror the engine's fork-branch destination rule: every gate fork_to
-    # name must be a key in some coalesce 'branches' mapping (arrival is
-    # tracked by FORK BRANCH NAME, not by the connection that reaches the
-    # coalesce) or match a sink name exactly. The engine rejects this at
-    # pre-run; without the mirror a committed fork/coalesce pipeline is
-    # valid-but-not-runnable.
-    coalesce_branch_names = {
+    # name must be a key in a correlated barrier's branches mapping (arrival
+    # is tracked by FORK BRANCH NAME, not by the connection that reaches the
+    # barrier) or match a sink name exactly.
+    barrier_branch_names = {
         str(branch_name)
         for candidate in nodes
-        if candidate.node_type == "coalesce" and candidate.branches is not None
+        if candidate.node_type in ("coalesce", "row_union") and candidate.branches is not None
         for branch_name in (candidate.branches.keys() if isinstance(candidate.branches, Mapping) else candidate.branches)
     }
     for node in nodes:
         if node.node_type == "gate" and node.fork_to:
             for branch in node.fork_to:
-                if branch not in coalesce_branch_names and branch not in output_names:
+                if branch not in barrier_branch_names and branch not in output_names:
                     errors.append(
                         _err(
                             f"node:{node.id}",
                             f"Gate '{node.id}' fork branch '{branch}' has no destination: it must be a key "
-                            "in some coalesce 'branches' mapping or match a sink name exactly. "
-                            f"Coalesce branch keys: {sorted(coalesce_branch_names)}; sinks: {sorted(output_names)}. "
-                            "Key coalesce branches by FORK BRANCH NAME, with each value naming the connection "
-                            "that arrives at the coalesce after any per-branch transforms.",
+                            "in some coalesce/row_union 'branches' mapping or match a sink name exactly. "
+                            f"Barrier branch keys: {sorted(barrier_branch_names)}; sinks: {sorted(output_names)}. "
+                            "Key barrier branches by FORK BRANCH NAME, with each value naming the connection "
+                            "that arrives at the barrier after any per-branch transforms.",
                             "high",
                             "fork_branch_no_destination",
                         )
@@ -1002,6 +1397,28 @@ def _validate_runtime_route_destinations(
                         "coalesce_on_success_unknown_sink",
                     )
                 )
+            continue
+
+        if node.node_type == "row_union":
+            if node.on_success in output_names:
+                errors.append(
+                    _err(
+                        f"node:{node.id}",
+                        f"row_union '{node.id}' on_success '{node.on_success}' names a sink. "
+                        "A released group must continue on a processing connection.",
+                        "high",
+                        "row_union_on_success_must_be_connection",
+                    )
+                )
+            elif node.on_success is not None and node.on_success not in consumer_connections:
+                errors.append(
+                    _err(
+                        f"node:{node.id}",
+                        f"row_union '{node.id}' on_success '{node.on_success}' is not a known processing connection.",
+                        "high",
+                        "row_union_on_success_dangling",
+                    )
+                )
 
     return tuple(errors)
 
@@ -1028,6 +1445,42 @@ def _validate_gate_expression(condition: str) -> str | None:
     except ExpressionSecurityError as e:
         return f"Forbidden construct in gate condition: {e}"
     return None
+
+
+def gate_condition_is_constant(condition: str) -> bool:
+    """Return whether a gate condition is a bare literal that reads no row data.
+
+    Diagnosis only — a constant condition is legal and is the documented
+    fan-out idiom. Syntactically invalid or forbidden conditions answer False;
+    ``_validate_gate_expression`` is the check that rejects those.
+    """
+    from elspeth.core.expression_parser import (
+        ExpressionParser,
+        ExpressionSecurityError,
+        ExpressionSyntaxError,
+    )
+
+    try:
+        return ExpressionParser(condition).is_constant_expression()
+    except (ExpressionSyntaxError, ExpressionSecurityError):
+        return False
+
+
+def gate_route_destinations(node: NodeSpec, route_target: str) -> frozenset[str]:
+    """Resolve one gate route target to the destinations it delivers rows to.
+
+    Mirrors the engine's gate route vocabulary (``core/config.py:768-770``,
+    whose composition-time counterpart is the fork-branch destination rule in
+    :func:`_validate_runtime_route_destinations`): ``discard`` delivers
+    nowhere, ``fork`` delivers to every ``fork_to`` branch, and any other value
+    is one named destination. Callers must not re-derive this — the reserved
+    keywords are not connection names.
+    """
+    if route_target == _DISCARD_ROUTE_TARGET:
+        return frozenset()
+    if route_target == _FORK_ROUTE_TARGET:
+        return frozenset(node.fork_to or ())
+    return frozenset({route_target})
 
 
 def _validate_gate_route_parity(condition: str, routes: Mapping[str, str] | None) -> str | None:
@@ -1096,7 +1549,7 @@ _RFC_RESERVED_DOMAIN_LABELS: tuple[str, ...] = (
 )
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="NodeSpec carrying web-authored web_scrape options (untrusted abuse_contact value)",
     source_param="node",
@@ -1106,7 +1559,6 @@ _RFC_RESERVED_DOMAIN_LABELS: tuple[str, ...] = (
         "RFC-reserved domain; absent, mistyped, or malformed values yield None (sibling "
         "plugin-schema rules report those) and never raise"
     ),
-    non_raising=True,
 )
 def _validate_web_scrape_abuse_contact_not_reserved(node: NodeSpec) -> ValidationEntry | None:
     """Reject web_scrape.http.abuse_contact values at RFC-reserved domains.
@@ -1152,7 +1604,7 @@ def _validate_web_scrape_abuse_contact_not_reserved(node: NodeSpec) -> Validatio
     return None
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="NodeSpec carrying web-authored web_scrape options (untrusted http identity fields)",
     source_param="node",
@@ -1162,7 +1614,6 @@ def _validate_web_scrape_abuse_contact_not_reserved(node: NodeSpec) -> Validatio
         "identity field; missing or mistyped options/http/field values are skipped "
         "(no entry) and never raised on"
     ),
-    non_raising=True,
 )
 def _validate_web_scrape_http_identity_not_placeholder(node: NodeSpec) -> tuple[ValidationEntry, ...]:
     """Reject placeholder values in web_scrape's wire-visible HTTP identity fields."""
@@ -1217,6 +1668,254 @@ def _validate_aggregation_trigger(node_id: str, trigger: Mapping[str, Any]) -> V
     return None
 
 
+# The names PromptTemplate.render actually supplies (templates.py builds the
+# context as exactly {"row": ..., "lookup": ...}) plus the Jinja2 environment
+# globals (range, namespace, ...) that resolve at render time. Any other
+# top-level template name hits StrictUndefined and raises TemplateError live.
+_PROMPT_TEMPLATE_CONTEXT_NAMES: frozenset[str] = frozenset({"row", "lookup"})
+_PROMPT_TEMPLATE_GLOBAL_NAMES: frozenset[str] = frozenset(create_sandboxed_environment().globals)
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying a web-authored prompt_template (untrusted Jinja2 text)",
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns a high-severity ValidationEntry only when a string prompt_template parses "
+        "and declares top-level names outside the render context; absent, mistyped, or "
+        "unparseable templates yield None (sibling rules report those) and never raise"
+    ),
+)
+def _validate_prompt_template_variable_bindings(node: NodeSpec) -> ValidationEntry | None:
+    """Reject prompt templates whose interpolations can never bind at render.
+
+    ``PromptTemplate.render`` supplies exactly ``row`` and ``lookup`` under
+    ``StrictUndefined``, so a bare ``{{ text }}`` raises ``TemplateError:
+    Undefined variable`` at runtime — the model receives none of the row's
+    data, and prompt-shield field-scope reasoning sees an empty protected set
+    (R2-F17 compounding finding). ``{{interpretation:<term>}}`` placeholders
+    are masked before parsing: they are resolved to operator-accepted text
+    upstream of rendering and are not Jinja2 variables.
+
+    Returns None when prompt_template is absent, not a string, or fails to
+    parse (other layers own those shapes), and for multi-query nodes: with
+    ``queries`` present, each query's ``input_fields`` maps template variables
+    to row columns directly (``build_template_context`` in multi_query.py), so
+    bare names are the documented idiom there — the same ``queries is None``
+    scoping as ``LLMConfig._validate_required_input_fields_appear_in_template``.
+    """
+    if node.options.get("queries") is not None:
+        return None
+    template = node.options.get("prompt_template")
+    if not isinstance(template, str):
+        return None
+    masked = INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)
+    try:
+        ast = create_sandboxed_environment().parse(masked)
+    except TemplateSyntaxError:
+        return None
+    unbound = sorted(find_undeclared_variables(ast) - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
+    if not unbound:
+        return None
+    names = ", ".join(f"'{name}'" for name in unbound)
+    return ValidationEntry(
+        component=f"node:{node.id}",
+        message=(
+            f"prompt_template references {names}, which the prompt render context does not define — "
+            "row data is only available as 'row.<field>' and lookup data as 'lookup.<key>', so "
+            "rendering fails with 'Undefined variable' at runtime and none of the row's data "
+            "reaches the model. Rewrite each name as '{{ row.<field> }}' (matching an upstream "
+            "schema field) or '{{ lookup.<key> }}', or remove the reference."
+        ),
+        severity="high",
+        error_code="prompt_template_unbound_variables",
+    )
+
+
+# The one name build_template_context injects beside the query's own
+# input_fields variables (multi_query.py): the full source row, reachable as
+# row.source_row.<column> inside a query template.
+_MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({"source_row"})
+
+
+def _parse_template_names(template: str) -> tuple[frozenset[str], frozenset[str]] | None:
+    """Parse a prompt template into (top-level names, first-level row fields).
+
+    ``{{interpretation:...}}`` placeholders are masked first — they resolve to
+    operator-accepted text upstream of rendering and are not Jinja2 names.
+    Returns None when the template does not parse; sibling rules own syntax
+    errors, so callers stay silent on that shape. Dynamic row accesses
+    (``row[expr]``) are unprovable at parse time and are deliberately not
+    reported — only the concrete field set is returned.
+    """
+    masked = INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)
+    try:
+        ast = create_sandboxed_environment().parse(masked)
+        usage = extract_jinja2_field_usage(masked)
+    except TemplateSyntaxError:
+        return None
+    return frozenset(find_undeclared_variables(ast)), usage.fields
+
+
+def _well_formed_query_entries(queries: Any) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+    """Extract (label, entry) pairs from an untrusted ``queries`` option.
+
+    Accepts the two authoring forms ``LLMConfig`` accepts (mapping keyed by
+    query name, or a list of named entries) and silently drops anything
+    malformed — entry shape is ``QueryDefinition``'s contract and is reported
+    by plugin schema validation, not double-reported here.
+    """
+    if isinstance(queries, Mapping):
+        return tuple((str(key), entry) for key, entry in queries.items() if isinstance(entry, Mapping))
+    if isinstance(queries, Sequence) and not isinstance(queries, (str, bytes)):
+        entries: list[tuple[str, Mapping[str, Any]]] = []
+        for index, item in enumerate(queries):
+            if not isinstance(item, Mapping):
+                continue
+            name = item.get("name")
+            entries.append((name if isinstance(name, str) and name else f"#{index}", item))
+        return tuple(entries)
+    return ()
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored multi-query options (untrusted queries entries and Jinja2 text)",
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "emits high-severity ValidationEntries only for parseable effective templates of "
+        "well-formed query entries (mapping entries with a string-keyed input_fields mapping); "
+        "absent, mistyped, or unparseable pieces are skipped (sibling rules report those) "
+        "and never raised on"
+    ),
+)
+def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[ValidationEntry, ...]:
+    """Reject multi-query templates whose interpolations can never bind at render.
+
+    Each query renders its effective template — its ``template`` override when
+    present, else the node-level ``prompt_template`` — with ``row`` bound to
+    the query's synthetic context (``build_template_context`` in
+    multi_query.py: the ``input_fields`` variables plus ``source_row``) and
+    ``lookup``, under StrictUndefined. Two compose-time-provable defects:
+
+    * a top-level name outside ``{row, lookup}`` + environment globals never
+      binds in any mode — the single-prompt failure shape, so it reuses
+      ``prompt_template_unbound_variables`` (covers the legacy positional
+      ``{{ input_N }}`` idiom, which is such a bare name);
+    * a ``row.<name>`` reference outside that query's ``input_fields`` keys +
+      ``{source_row}`` raises ``Undefined variable`` when that query renders
+      (``query_template_unbound_row_fields``).
+
+    The node-level template is checked once for top-level names — and only
+    when at least one well-formed query actually falls back to it: the shipped
+    multi-query examples carry a never-rendered ``prompt_template`` beside
+    all-override queries, and flagging dead text would be a false positive.
+    A query whose ``template`` is present but not a string is skipped whole
+    (its effective template is unknowable until the schema rejection lands).
+    """
+    queries = node.options.get("queries")
+    if queries is None:
+        return ()
+    entries = _well_formed_query_entries(queries)
+    if not entries:
+        return ()
+
+    node_template = node.options.get("prompt_template")
+    node_parse = _parse_template_names(node_template) if isinstance(node_template, str) else None
+
+    errors: list[ValidationEntry] = []
+    node_template_in_use = False
+
+    for label, entry in entries:
+        input_fields = entry.get("input_fields")
+        if not isinstance(input_fields, Mapping):
+            continue
+        bound = frozenset(key for key in input_fields if isinstance(key, str))
+        if not bound:
+            continue
+
+        override = entry.get("template")
+        if isinstance(override, str):
+            parsed = _parse_template_names(override)
+            source_desc = "its template override"
+        elif override is None:
+            if node_parse is None:
+                continue
+            parsed = node_parse
+            source_desc = "the node-level prompt_template"
+            node_template_in_use = True
+        else:
+            continue
+        if parsed is None:
+            continue
+        top_level_names, row_fields = parsed
+
+        if source_desc == "its template override":
+            unbound_names = sorted(top_level_names - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
+            if unbound_names:
+                names = ", ".join(f"'{name}'" for name in unbound_names)
+                errors.append(
+                    ValidationEntry(
+                        component=f"node:{node.id}",
+                        message=(
+                            f"Query '{label}' template references {names}, which the multi-query render "
+                            "context does not define — a query template sees only 'row' (this query's "
+                            "input_fields variables plus 'row.source_row') and 'lookup', so rendering fails "
+                            "with 'Undefined variable' at runtime. Rewrite each name as '{{ row.<variable> }}' "
+                            "where <variable> is one of this query's input_fields keys, or bind it in "
+                            "input_fields first."
+                        ),
+                        severity="high",
+                        error_code="prompt_template_unbound_variables",
+                    )
+                )
+
+        unbound_fields = sorted(row_fields - bound - _MULTI_QUERY_IMPLICIT_ROW_NAMES)
+        if unbound_fields:
+            fields = ", ".join(f"'{name}'" for name in unbound_fields)
+            bound_names = ", ".join(f"'{name}'" for name in sorted(bound))
+            errors.append(
+                ValidationEntry(
+                    component=f"node:{node.id}",
+                    message=(
+                        f"Query '{label}' renders {source_desc}, which references {fields} under 'row', "
+                        f"but this query's input_fields binds only {bound_names} (plus 'source_row'). At "
+                        "render the query context contains exactly its input_fields variables, so each "
+                        "unbound reference fails with 'Undefined variable' and the query errors for every "
+                        "row. Add the missing variables to input_fields (template variable → row column), "
+                        "rename the reference to a bound variable, or use 'row.source_row.<column>' for "
+                        "direct row access."
+                    ),
+                    severity="high",
+                    error_code="query_template_unbound_row_fields",
+                )
+            )
+
+    if node_template_in_use and node_parse is not None:
+        unbound_names = sorted(node_parse[0] - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
+        if unbound_names:
+            names = ", ".join(f"'{name}'" for name in unbound_names)
+            errors.append(
+                ValidationEntry(
+                    component=f"node:{node.id}",
+                    message=(
+                        f"prompt_template references {names}, which the multi-query render context does "
+                        "not define — queries without a template override render it with 'row' bound to "
+                        "their input_fields variables (plus 'row.source_row') and 'lookup', so rendering "
+                        "fails with 'Undefined variable' at runtime. Rewrite each name as "
+                        "'{{ row.<variable> }}' with <variable> an input_fields key of every query that "
+                        "uses this template, or give those queries template overrides."
+                    ),
+                    severity="high",
+                    error_code="prompt_template_unbound_variables",
+                )
+            )
+
+    return tuple(errors)
+
+
 def _locked_input_field_set(options: Mapping[str, Any], owner: str) -> frozenset[str] | None:
     """Return the consumer's accepted-input field set when its input is locked.
 
@@ -1257,7 +1956,7 @@ def _sink_locked_input_set(output: OutputSpec) -> frozenset[str] | None:
     return _locked_input_field_set(output.options, owner=f"output:{output.name}")
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="NodeSpecs carrying composer/LLM/user-authored options re-read from session state",
     source_param="nodes",
@@ -1267,7 +1966,6 @@ def _sink_locked_input_set(output: OutputSpec) -> frozenset[str] | None:
         "node config surfaces as blocking ValidationEntry results, never a raise (genuine "
         "engine defects crash through via the config-probe re-raise guards)"
     ),
-    non_raising=True,
 )
 def _check_schema_contracts(
     sources: Mapping[str, SourceSpec],
@@ -1288,10 +1986,10 @@ def _check_schema_contracts(
     contract_probe_failed_producers: set[str] = set()
     sink_names = {output.name for output in outputs}
     sink_names_frozen = frozenset(sink_names)
-    coalesce_branch_names = {
+    barrier_branch_names = {
         branch_name
         for node in nodes
-        if node.node_type == "coalesce" and node.branches is not None
+        if node.node_type in ("coalesce", "row_union") and node.branches is not None
         for branch_name in _coalesce_branch_names(node.branches)
     }
     internal_connection_names: set[str] = set()
@@ -1432,22 +2130,23 @@ def _check_schema_contracts(
             )
         )
 
-    # A queue reads its fan-in predecessors but republishes under the same id,
-    # so counting it as a consumer of its own connection would make the legal
-    # queue-then-consumer pattern read as a duplicate consumer
-    # (elspeth-a5b86149d4). Coalesce identity branches are direct COPY edges;
-    # mapped branches claim their input connection in the runtime registry and
-    # must do the same here (elspeth-3f4e63900f).
+    # Queue and row_union NodeSpec.input fields are structural placeholders,
+    # not consuming bindings. Coalesce/row_union identity branches are direct
+    # COPY edges; only mapped branches claim their input connection.
     consumer_claims: list[tuple[str, str, str]] = [
-        (node.input, node.id, f"node '{node.id}'") for node in nodes if node.node_type not in ("coalesce", "queue")
+        (node.input, node.id, f"node '{node.id}'") for node in nodes if node.node_type not in ("coalesce", "queue", "row_union")
     ]
     for node in nodes:
-        if node.node_type != "coalesce":
-            continue
-        consumer_claims.extend(
-            (connection_name, node.id, f"coalesce '{node.id}' mapped branch")
-            for connection_name in _coalesce_mapped_branch_connections(node.branches)
-        )
+        if node.node_type == "coalesce":
+            consumer_claims.extend(
+                (connection_name, node.id, f"coalesce '{node.id}' mapped branch")
+                for connection_name in _coalesce_mapped_branch_connections(node.branches)
+            )
+        elif node.node_type == "row_union":
+            consumer_claims.extend(
+                (connection_name, node.id, f"row_union '{node.id}' mapped branch")
+                for connection_name in _coalesce_mapped_branch_connections(node.branches)
+            )
     consumer_counts = Counter(connection_name for connection_name, _node_id, _desc in consumer_claims)
     duplicate_consumers = sorted(name for name, count in consumer_counts.items() if count > 1)
     for connection_name in duplicate_consumers:
@@ -1469,7 +2168,7 @@ def _check_schema_contracts(
     # Runtime fork routing resolves coalesce branch names before sink names.
     # A branch identity that also names a sink would make composer preview treat
     # the branch as direct-to-sink while execution sends it to coalesce.
-    internal_connection_names.update(coalesce_branch_names)
+    internal_connection_names.update(barrier_branch_names)
     overlap = sorted(internal_connection_names & sink_names)
     if overlap:
         errors.append(
@@ -1493,10 +2192,10 @@ def _check_schema_contracts(
         """Schema-specific walk-back with coalesce/fork warning emission.
 
         Differs from ``ProducerResolver.walk_to_real_producer`` in two
-        ways: it traverses fork gates and coalesce nodes only to emit
-        skip-with-warning entries (the resolver returns None silently),
-        and it stops at coalesce nodes because schema-contract
-        propagation through coalesce branches is out of scope here.
+        ways: it traverses structural producers to emit skip-with-warning
+        entries (the resolver returns or abstains silently), and it stops at
+        coalesce/row_union boundaries because branch-aware schema-contract
+        propagation is out of scope here.
         """
         visited_connections: set[str] = set()
         current_producer = producer
@@ -1526,6 +2225,16 @@ def _check_schema_contracts(
                     _warn(
                         f"node:{producer_node.id}",
                         f"Contract check skipped because connection '{connection_name}' is produced by queue node '{producer_node.id}' with observed schema.",
+                        "medium",
+                    )
+                )
+                return None
+            if producer_node.node_type == "row_union":
+                warnings.append(
+                    _warn(
+                        f"node:{producer_node.id}",
+                        f"Contract check skipped because connection '{connection_name}' is produced by "
+                        f"row_union node '{producer_node.id}' with observed schema.",
                         "medium",
                     )
                 )
@@ -1766,14 +2475,13 @@ def _check_schema_contracts(
         _participates, guarantees = _effective_producer_vote(producer)
         return guarantees
 
-    def _known_producer_schema_mode(producer: ProducerEntry) -> Literal["observed", "explicit"] | None:
-        """Return the runtime branch-schema mode when Composer can prove it.
+    def _known_producer_schema_config(producer: ProducerEntry) -> SchemaConfig | None:
+        """Return the runtime producer schema when Composer can prove it.
 
         The DAG builder assigns each transform/aggregation its computed output
         ``SchemaConfig`` and falls back to the raw declaration only when the
-        plugin has no computed output contract. Mirror that choice here. Draft
-        config/probe failures abstain: their existing validation paths own the
-        rejection, and a guessed mode must not create a false coalesce error.
+        plugin has no computed output contract. Draft config/probe failures
+        abstain: their existing validation paths own the rejection.
         """
         contract_options = producer.options
         contract_owner = _producer_owner(producer)
@@ -1809,6 +2517,13 @@ def _check_schema_contracts(
 
         if schema_config is None:
             return None
+        return schema_config
+
+    def _known_producer_schema_mode(producer: ProducerEntry) -> Literal["observed", "explicit"] | None:
+        """Return the runtime branch-schema mode when Composer can prove it."""
+        schema_config = _known_producer_schema_config(producer)
+        if schema_config is None:
+            return None
         if schema_config.is_observed:
             return "observed"
         return "explicit" if schema_config.fields is not None else None
@@ -1836,12 +2551,41 @@ def _check_schema_contracts(
         if producer_node.node_type == "queue":
             # Runtime assigns every structural queue an observed output schema.
             return "observed"
+        if producer_node.node_type == "row_union":
+            # Runtime assigns every row_union an observed output schema.
+            return "observed"
         if producer_node.node_type == "coalesce":
             # A nested coalesce's strategy-specific output schema is not
             # reconstructed by Composer preview. Preserve the existing
             # conservative abstention at that boundary.
             return None
         return _known_producer_schema_mode(producer)
+
+    def _known_connection_schema_config(
+        connection_name: str,
+        *,
+        visited: frozenset[str] = frozenset(),
+    ) -> SchemaConfig | None:
+        """Resolve a branch's known schema through structural producers."""
+        if connection_name in visited:
+            return None
+        producer = resolver.find_producer_for(connection_name)
+        if producer is None:
+            return None
+        if is_source_producer_id(producer.producer_id):
+            return _known_producer_schema_config(producer)
+
+        producer_node = node_by_id[producer.producer_id]
+        if producer_node.node_type == "gate":
+            return _known_connection_schema_config(
+                producer_node.input,
+                visited=visited | {connection_name},
+            )
+        if producer_node.node_type in ("queue", "row_union"):
+            return SchemaConfig(mode="observed", fields=None)
+        if producer_node.node_type == "coalesce":
+            return None
+        return _known_producer_schema_config(producer)
 
     # Runtime rejects a union coalesce whose known branch schemas mix observed
     # and explicit modes. Composer has enough information to mirror that rule
@@ -1876,6 +2620,57 @@ def _check_schema_contracts(
                 )
             )
 
+    # row_union publishes every branch row unchanged into one long-format
+    # stream. Exact fixed/fixed schemas need full mutual compatibility.
+    # Flexible declarations allow undeclared fields, so only conflicting types
+    # on fields both branches explicitly declare are provable. Observed/unknown
+    # branches abstain, but cannot hide a conflict between known declarations.
+    from itertools import combinations
+
+    from elspeth.core.dag.schema_validation import row_union_schema_configs_compatible
+
+    for row_union_node in nodes:
+        if row_union_node.node_type != "row_union" or not row_union_node.branches:
+            continue
+        explicit_branch_schemas: list[tuple[str, SchemaConfig]] = []
+        for branch_name, branch_connection in zip(
+            _coalesce_branch_names(row_union_node.branches),
+            _coalesce_branch_connections(row_union_node.branches),
+            strict=True,
+        ):
+            schema_config = _known_connection_schema_config(branch_connection)
+            if schema_config is None or schema_config.is_observed or schema_config.fields is None:
+                continue
+            explicit_branch_schemas.append((branch_name, schema_config))
+        if len(explicit_branch_schemas) < 2:
+            continue
+        for (first_branch, first_schema), (other_branch, other_schema) in combinations(explicit_branch_schemas, 2):
+            compatible, conflicting_fields, error_msg = row_union_schema_configs_compatible(first_schema, other_schema)
+            if compatible:
+                continue
+            branch_details = tuple(
+                _row_union_branch_schema_detail(branch_name, schema_config)
+                for branch_name, schema_config in (
+                    (first_branch, first_schema),
+                    (other_branch, other_schema),
+                )
+            )
+            errors.append(
+                _err(
+                    f"node:{row_union_node.id}",
+                    f"row_union '{row_union_node.id}' has incompatible branch schemas for its long-format stream: "
+                    f"branch '{first_branch}' and branch '{other_branch}'; "
+                    f"conflicting fields {list(conflicting_fields)}. {error_msg}",
+                    "high",
+                    "row_union_schema_incompatible",
+                    row_union_schema=RowUnionSchemaDetail(
+                        branches=branch_details,
+                        conflicting_fields=conflicting_fields,
+                    ),
+                )
+            )
+            break
+
     def _connection_propagation_vote(connection_name: str) -> tuple[bool, frozenset[str]]:
         """Resolve a connection's propagation vote across structural nodes.
 
@@ -1908,6 +2703,12 @@ def _check_schema_contracts(
             # required_input_fields must not be resolved against one of them
             # (elspeth-a5b86149d4). Abstaining here keeps explicit required
             # fields on a valid consumer from being falsely rejected.
+            return False, frozenset()
+
+        if producer_node.node_type == "row_union":
+            # Row union releases payloads without merging fields and publishes
+            # an observed schema. It must not invent guarantees from one or all
+            # branch predecessors.
             return False, frozenset()
 
         if producer_node.node_type == "coalesce":
@@ -2497,7 +3298,8 @@ class CompositionState:
 
     Attributes:
         sources: Named source roots keyed by stable composer/audit-visible name.
-        nodes: Ordered tuple of transform, gate, aggregation, coalesce nodes.
+        nodes: Ordered tuple of transform, gate, aggregation, coalesce,
+            row_union, and queue nodes.
         edges: Connections between nodes.
         outputs: Sink configurations.
         metadata: Pipeline name and description.
@@ -2695,6 +3497,8 @@ class CompositionState:
                 node_dict["output_mode"] = node.output_mode
             if node.expected_output_count is not None:
                 node_dict["expected_output_count"] = node.expected_output_count
+            if node.timeout_seconds is not None:
+                node_dict["timeout_seconds"] = node.timeout_seconds
             result["nodes"].append(node_dict)
 
         for edge in self.edges:
@@ -2752,6 +3556,7 @@ class CompositionState:
         """
         errors: list[ValidationEntry] = []
         _err = ValidationEntry  # local alias for brevity
+        invalid_row_union_branch_nodes: set[str] = set()
 
         # 1. Source exists
         if not self.sources:
@@ -2876,6 +3681,25 @@ class CompositionState:
                 errors.append(abuse_contact_error)
             errors.extend(_validate_web_scrape_http_identity_not_placeholder(node))
 
+            prompt_binding_error = _validate_prompt_template_variable_bindings(node)
+            if prompt_binding_error is not None:
+                errors.append(prompt_binding_error)
+            errors.extend(_validate_multi_query_template_variable_bindings(node))
+
+            # ``timeout_seconds`` is a top-level structural-barrier field.
+            # Queue rejects it through queue_node_contract_error below so every
+            # queue consumer shares the same canonical-shape guard.
+            if node.timeout_seconds is not None and node.node_type not in ("coalesce", "row_union", "queue"):
+                errors.append(
+                    _err(
+                        f"node:{node.id}",
+                        f"Node '{node.id}' of type '{node.node_type}' does not accept top-level timeout_seconds; "
+                        "only coalesce and row_union nodes accept that field.",
+                        "high",
+                        "node_timeout_unsupported",
+                    )
+                )
+
             if node.node_type == "gate":
                 if node.condition is None:
                     errors.append(
@@ -2995,6 +3819,156 @@ class CompositionState:
                             "coalesce_merge_invalid",
                         )
                     )
+                if node.timeout_seconds is not None and _timeout_seconds_is_invalid(node.timeout_seconds):
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"Coalesce '{node.id}' timeout_seconds must be a finite positive number or None.",
+                            "high",
+                            "coalesce_timeout_invalid",
+                        )
+                    )
+            elif node.node_type == "row_union":
+                try:
+                    if not node.id or not node.id.strip():
+                        raise ValueError("row_union name must not be empty")
+                    row_union_name = node.id
+                    _validate_max_length(
+                        row_union_name,
+                        field_label="row_union name",
+                        max_length=_MAX_NODE_NAME_LENGTH,
+                    )
+                    _validate_node_name_chars(row_union_name, field_label="row_union name")
+                    if row_union_name in _RESERVED_EDGE_LABELS:
+                        raise ValueError(f"row_union name '{row_union_name}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+                    if row_union_name.startswith("__"):
+                        raise ValueError(f"row_union name '{row_union_name}' starts with '__', which is reserved for system edges")
+                except ValueError as exc:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            str(exc),
+                            "high",
+                            "row_union_name_invalid",
+                        )
+                    )
+
+                forbidden = {
+                    "plugin": node.plugin,
+                    "on_error": node.on_error,
+                    "condition": node.condition,
+                    "routes": node.routes,
+                    "fork_to": node.fork_to,
+                    "policy": node.policy,
+                    "merge": node.merge,
+                    "trigger": node.trigger,
+                    "output_mode": node.output_mode,
+                    "expected_output_count": node.expected_output_count,
+                }
+                present = sorted(name for name, value in forbidden.items() if value is not None)
+                if node.options:
+                    present.append("options")
+                if present:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' does not accept field(s): {sorted(present)}.",
+                            "high",
+                            "row_union_config_invalid",
+                        )
+                    )
+
+                branch_names = _coalesce_branch_names(node.branches)
+                branch_connections = _coalesce_branch_connections(node.branches)
+                if len(branch_names) < 2:
+                    invalid_row_union_branch_nodes.add(node.id)
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' requires at least two ordered branches.",
+                            "high",
+                            "row_union_branches_invalid",
+                        )
+                    )
+                elif any(branch_name in branch_names[:index] for index, branch_name in enumerate(branch_names)):
+                    invalid_row_union_branch_nodes.add(node.id)
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' branch aliases must be unique.",
+                            "high",
+                            "row_union_branches_invalid",
+                        )
+                    )
+
+                for branch_name, connection_name in zip(branch_names, branch_connections, strict=True):
+                    for value, field_label in (
+                        (branch_name, "branch name"),
+                        (connection_name, f"branch '{branch_name}' input connection"),
+                    ):
+                        try:
+                            if type(value) is not str or not value.strip():
+                                raise ValueError(f"row_union {field_label} must be a non-empty string")
+                            _validate_connection_or_sink_name(
+                                value,
+                                field_label=f"row_union {field_label}",
+                            )
+                        except ValueError as exc:
+                            invalid_row_union_branch_nodes.add(node.id)
+                            errors.append(
+                                _err(
+                                    f"node:{node.id}",
+                                    str(exc),
+                                    "high",
+                                    "row_union_branch_invalid",
+                                )
+                            )
+
+                if branch_connections and node.input != branch_connections[0]:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' input must equal its first branch connection "
+                            f"'{branch_connections[0]}'; input is only a serialization placeholder.",
+                            "high",
+                            "row_union_input_mismatch",
+                        )
+                    )
+
+                if type(node.on_success) is not str or not node.on_success.strip():
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' requires a non-empty on_success processing connection.",
+                            "high",
+                            "row_union_on_success_invalid",
+                        )
+                    )
+                else:
+                    try:
+                        _validate_connection_or_sink_name(
+                            node.on_success,
+                            field_label="row_union on_success connection name",
+                        )
+                    except ValueError as exc:
+                        errors.append(
+                            _err(
+                                f"node:{node.id}",
+                                str(exc),
+                                "high",
+                                "row_union_on_success_invalid",
+                            )
+                        )
+
+                if node.timeout_seconds is not None and _timeout_seconds_is_invalid(node.timeout_seconds):
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' timeout_seconds must be a finite positive number or None.",
+                            "high",
+                            "row_union_timeout_invalid",
+                        )
+                    )
             elif node.node_type == "aggregation":
                 if not node.plugin:
                     errors.append(
@@ -3046,6 +4020,60 @@ class CompositionState:
 
         # 8. Connection completeness
         runtime_connections = _runtime_connection_targets(self.sources, self.nodes)
+        for candidate in self.nodes:
+            if candidate.node_type != "gate" or candidate.fork_to is None:
+                continue
+            duplicate_branches = sorted(branch for branch, count in Counter(candidate.fork_to).items() if count > 1)
+            if duplicate_branches:
+                errors.append(
+                    _err(
+                        f"node:{candidate.id}",
+                        f"Gate '{candidate.id}' has duplicate fork branches: {duplicate_branches}. Each fork branch name must be unique.",
+                        "high",
+                        "gate_duplicate_fork_branch",
+                    )
+                )
+        gate_fork_branches_by_id = {
+            candidate.id: frozenset(candidate.fork_to)
+            for candidate in self.nodes
+            if candidate.node_type == "gate" and candidate.fork_to is not None
+        }
+        gate_fork_branches = {branch for branches in gate_fork_branches_by_id.values() for branch in branches}
+
+        # Mirror the engine's one-barrier-per-fork-branch rule. The DAG builder
+        # raises GraphValidationError when a branch name is claimed twice —
+        # by two coalesces, by a coalesce and a row_union, or by two row_unions
+        # ("Each fork branch can only join at one barrier"): the branch's
+        # arrival is delivered to exactly one barrier's pending map, so a
+        # second claimant has no runtime meaning. The engine compares raw
+        # branch NAMES before any reachability reasoning, so this check is
+        # unconditional too — a dual claim is invalid whether or not the
+        # aliases resolve to a gate fork_to. This is a cross-node TOPOLOGY
+        # finding, so it carries its own code rather than either barrier's
+        # intrinsic node-shape code: completing one barrier from an unrelated
+        # node must not roll that node's mutation back.
+        barrier_claimants: dict[str, list[str]] = {}
+        for node in self.nodes:
+            if node.node_type not in ("coalesce", "row_union"):
+                continue
+            # dict.fromkeys dedupes within a single barrier: a repeated alias
+            # inside one node is that node's own intrinsic branches error.
+            for branch_alias in dict.fromkeys(_coalesce_branch_names(node.branches)):
+                barrier_claimants.setdefault(branch_alias, []).append(node.id)
+        for branch_alias, claimants in barrier_claimants.items():
+            if len(claimants) < 2:
+                continue
+            errors.append(
+                _err(
+                    f"node:{claimants[1]}",
+                    f"Fork branch '{branch_alias}' is claimed by more than one barrier: {claimants}. "
+                    "Each fork branch may join at exactly one coalesce or row_union. "
+                    "Drop the branch from every barrier but one, or fork a distinct branch name per barrier.",
+                    "high",
+                    "fork_branch_multiple_barriers",
+                )
+            )
+
         for node in self.nodes:
             if node.node_type == "coalesce":
                 missing_branches = sorted(
@@ -3060,6 +4088,157 @@ class CompositionState:
                             "coalesce_branch_unreachable",
                         )
                     )
+                continue
+            if node.node_type == "row_union":
+                # Intrinsic validation owns malformed external branch values.
+                # Do not pass them into topology set/sort/walk operations,
+                # which assume runtime-valid strings.
+                if node.id in invalid_row_union_branch_nodes:
+                    continue
+                branch_aliases = _coalesce_branch_names(node.branches)
+                branch_connections = _coalesce_branch_connections(node.branches)
+                missing_aliases = sorted(branch for branch in branch_aliases if branch not in gate_fork_branches)
+                if missing_aliases:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' branch aliases {missing_aliases} are not produced by any gate fork_to.",
+                            "high",
+                            "row_union_branch_alias_unreachable",
+                        )
+                    )
+                missing_branches = sorted(branch for branch in branch_connections if branch not in runtime_connections)
+                if missing_branches:
+                    errors.append(
+                        _err(
+                            f"node:{node.id}",
+                            f"row_union '{node.id}' branch connections {missing_branches} are not reachable from any runtime connection.",
+                            "high",
+                            "row_union_branch_unreachable",
+                        )
+                    )
+                # Correlation-origin and downstream-lineage checks. These are
+                # topology findings like their unreachable siblings above, so
+                # they carry their own codes: sharing the intrinsic
+                # ``row_union_branch_invalid`` code put them in the tool
+                # layer's mutation-blocking preflight, where completing the
+                # topology from an unrelated node rolled that node's mutation
+                # back with an error naming the mis-wired row_union.
+                if not missing_aliases and not missing_branches:
+                    common_gate_ids = sorted(
+                        gate_id
+                        for gate_id, fork_branches in gate_fork_branches_by_id.items()
+                        if set(branch_aliases).issubset(fork_branches)
+                    )
+                    if not common_gate_ids:
+                        alias_origins = ", ".join(
+                            f"'{alias}' from {sorted(gate_id for gate_id, branches in gate_fork_branches_by_id.items() if alias in branches)}"
+                            for alias in branch_aliases
+                        )
+                        errors.append(
+                            _err(
+                                f"node:{node.id}",
+                                f"row_union '{node.id}' branch aliases must all come from one common gate fork_to "
+                                f"so they share one correlation origin; observed {alias_origins}. "
+                                "Choose every alias from a single gate or create a separate row_union per fork.",
+                                "high",
+                                "row_union_branch_origin_invalid",
+                            )
+                        )
+                    else:
+                        branch_lineages: list[tuple[str, tuple[NodeSpec, ...]]] = []
+                        lineage_is_valid = True
+                        for branch_alias, branch_connection in zip(branch_aliases, branch_connections, strict=True):
+                            is_downstream, lineage = _runtime_connection_lineage(
+                                branch_alias,
+                                branch_connection,
+                                self.sources,
+                                self.nodes,
+                            )
+                            if is_downstream:
+                                branch_lineages.append((branch_alias, lineage))
+                                continue
+                            lineage_is_valid = False
+                            errors.append(
+                                _err(
+                                    f"node:{node.id}",
+                                    f"row_union '{node.id}' branch alias '{branch_alias}' maps to input connection "
+                                    f"'{branch_connection}', which is not downstream of that alias's fork edge. "
+                                    "Wire each branches[alias] value through processing that starts at the same gate fork branch.",
+                                    "high",
+                                    "row_union_branch_not_downstream",
+                                )
+                            )
+                        if lineage_is_valid:
+                            branch_aggregations: dict[str, tuple[NodeSpec, str]] = {}
+                            nested_forks: dict[str, tuple[NodeSpec, str]] = {}
+                            for branch_alias, lineage in branch_lineages:
+                                for ancestor in lineage:
+                                    if ancestor.node_type == "aggregation" and ancestor.output_mode in (None, "transform"):
+                                        branch_aggregations.setdefault(ancestor.id, (ancestor, branch_alias))
+                                    if ancestor.node_type == "gate" and ancestor.fork_to:
+                                        nested_forks.setdefault(ancestor.id, (ancestor, branch_alias))
+                            for aggregation, branch_alias in branch_aggregations.values():
+                                errors.append(
+                                    _err(
+                                        f"node:{node.id}",
+                                        f"Aggregation '{aggregation.id}' is inside fork branch '{branch_alias}' that feeds "
+                                        f"row_union '{node.id}' and uses output_mode 'transform' (the default). "
+                                        "A transform-mode flush emits its rows from a single buffered parent token, "
+                                        "so every emitted row carries that parent's row_id and the union group can never "
+                                        f"be satisfied. Set 'output_mode: passthrough' on '{aggregation.id}' so each row "
+                                        "keeps its own identity, or move the aggregation upstream of the originating fork.",
+                                        "high",
+                                        "row_union_branch_aggregation_invalid",
+                                    )
+                                )
+                            for nested_fork, branch_alias in nested_forks.values():
+                                errors.append(
+                                    _err(
+                                        f"node:{node.id}",
+                                        f"Fork gate '{nested_fork.id}' is nested inside fork branch '{branch_alias}' that "
+                                        f"feeds row_union '{node.id}'. A nested fork replaces the enclosing branch identity, "
+                                        "so the union group can never be satisfied. Move the nested fork before the fork "
+                                        f"that produces '{branch_alias}', or terminate that branch at a sink.",
+                                        "high",
+                                        "row_union_nested_fork_invalid",
+                                    )
+                                )
+                        for downstream in _runtime_nodes_downstream_of_connection(node.on_success or "", self.nodes):
+                            if downstream.node_type in ("coalesce", "row_union"):
+                                errors.append(
+                                    _err(
+                                        f"node:{node.id}",
+                                        f"{downstream.node_type} '{downstream.id}' is downstream of row_union '{node.id}' "
+                                        "with no intervening sink. row_union releases an indivisible N-to-N group, "
+                                        "and a correlated barrier cannot safely consume multiple tokens sharing one row_id. "
+                                        "Move the downstream barrier upstream of the fork or terminate the released group at a sink.",
+                                        "high",
+                                        "row_union_downstream_group_invalid",
+                                    )
+                                )
+                                break
+                            if downstream.node_type != "aggregation" or downstream.trigger is None:
+                                continue
+                            try:
+                                trigger = TriggerConfig.model_validate(deep_thaw(downstream.trigger))
+                            except PydanticValidationError:
+                                # The aggregation's intrinsic trigger validator
+                                # owns malformed external input.
+                                continue
+                            if trigger.has_count or trigger.has_timeout or trigger.has_condition:
+                                errors.append(
+                                    _err(
+                                        f"node:{node.id}",
+                                        f"Aggregation '{downstream.id}' is downstream of row_union '{node.id}' "
+                                        "but declares a count/timeout/condition trigger. Such triggers can fire "
+                                        "between variants of one source row, splitting an indivisible union group. "
+                                        "Use the implicit end_of_source trigger or move the aggregation upstream of the fork.",
+                                        "high",
+                                        "row_union_downstream_group_invalid",
+                                    )
+                                )
+                                break
                 continue
 
             if node.input not in runtime_connections:
@@ -3086,9 +4265,14 @@ class CompositionState:
         for node in self.nodes:
             if node.node_type != "queue":
                 continue
-            downstream_consumers = [n.id for n in self.nodes if n.node_type not in ("coalesce", "queue") and n.input == node.id]
+            downstream_consumers = [
+                n.id for n in self.nodes if n.node_type not in ("coalesce", "queue", "row_union") and n.input == node.id
+            ]
             downstream_consumers.extend(
                 n.id for n in self.nodes if n.node_type == "coalesce" and node.id in _coalesce_mapped_branch_connections(n.branches)
+            )
+            downstream_consumers.extend(
+                n.id for n in self.nodes if n.node_type == "row_union" and node.id in _coalesce_mapped_branch_connections(n.branches)
             )
             if not downstream_consumers:
                 errors.append(
@@ -3176,7 +4360,7 @@ class CompositionState:
                 )
 
         # W2: Source on_success target doesn't match any node input or output name
-        node_inputs = {n.input for n in self.nodes if n.input is not None}
+        node_inputs = _runtime_consumer_connections(self.nodes)
         for source_name, source in self.sources.items():
             source_on_success = source.on_success
             if source_on_success not in node_inputs and source_on_success not in output_names:

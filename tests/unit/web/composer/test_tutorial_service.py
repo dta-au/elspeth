@@ -97,6 +97,101 @@ def test_launch_blocker_names_empty_transforms_distinctly() -> None:
     assert "no transform" in detail.lower()
 
 
+def test_launch_blocker_admits_this_deployments_control_transforms() -> None:
+    """A control-required deployment can still run the tutorial.
+
+    The AWS scenario module sets prompt_shield/content_safety to
+    ``required``, which makes coverage a launch condition. Against a fixed
+    three-transform contract that was unsatisfiable in both directions:
+    adding the shield tripped ``tutorial_plugin_set``, omitting it tripped
+    ``required_control_coverage`` (live: run 06c9ec49, 2026-07-29). The
+    contract now admits the control plugins THIS snapshot selected, and
+    still rejects any other extra transform.
+    """
+    from unittest.mock import MagicMock
+
+    from elspeth.contracts.plugin_capabilities import PluginCapability
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.state import (
+        CompositionState,
+        NodeSpec,
+        OutputSpec,
+        PipelineMetadata,
+        SourceSpec,
+    )
+    from elspeth.web.plugin_policy import WebPluginPolicy
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+
+    def node(node_id: str, plugin: str, options: dict[str, object] | None = None) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin=plugin,
+            input="in",
+            on_success="out",
+            on_error="discard",
+            options=options or {},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def state_with(*plugins: str) -> CompositionState:
+        return CompositionState(
+            sources={
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="in",
+                    options={},
+                    on_validation_failure="discard",
+                )
+            },
+            nodes=tuple(
+                node(f"n{index}", plugin, {"profile": "tutorial-default"} if plugin == "llm" else None)
+                for index, plugin in enumerate(plugins)
+            ),
+            edges=(),
+            outputs=(OutputSpec(name="out", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    shield = PluginId("transform", "aws_bedrock_prompt_shield")
+    snapshot = MagicMock(spec=PluginAvailabilitySnapshot)
+    snapshot.selected = ((PluginCapability.PROMPT_SHIELD, shield),)
+    # Fail the NEXT gate so a passing plugin-set check is observable without
+    # standing up the whole policy stack.
+    snapshot.available = frozenset()
+
+    def blocker_for(state: CompositionState) -> tuple[str, str] | None:
+        return _tutorial_launch_blocker(
+            state=state,
+            policy=MagicMock(spec=WebPluginPolicy),
+            snapshot=snapshot,
+            tutorial_profile="tutorial-default",
+            profile_registry=MagicMock(spec=OperatorProfileRegistry),
+            catalog=MagicMock(spec=CatalogService),
+        )
+
+    with_shield = blocker_for(state_with("web_scrape", "llm", "field_mapper", "aws_bedrock_prompt_shield"))
+    assert with_shield is not None and with_shield[0] != "tutorial_plugin_set"
+
+    base_only = blocker_for(state_with("web_scrape", "llm", "field_mapper"))
+    assert base_only is not None and base_only[0] != "tutorial_plugin_set"
+
+    # An extra transform this deployment did NOT select for a control is still rejected.
+    unrelated = blocker_for(state_with("web_scrape", "llm", "field_mapper", "passthrough"))
+    assert unrelated is not None and unrelated[0] == "tutorial_plugin_set"
+
+    # A missing base transform is still rejected.
+    incomplete = blocker_for(state_with("web_scrape", "llm"))
+    assert incomplete is not None and incomplete[0] == "tutorial_plugin_set"
+
+
 def test_tutorial_recipe_authors_only_opaque_llm_profile() -> None:
     from elspeth.web.composer.recipes import apply_recipe, get_recipe
 

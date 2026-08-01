@@ -1,0 +1,138 @@
+# Row Union Example — Fork-Based A/B Experiment
+#
+# Demonstrates the row_union barrier: a correlated, same-row, N-to-N
+# UNION ALL join over fork branches.
+#
+#   source ─(routed)─> [variant_fork] ─┬─ control_branch ─> tag_control ───┐
+#                                       └─ treatment_branch ─> tag_treatment ┤
+#                                                                            ├─ [variant_union]
+#                                              ─(experiment_in)─> [prompt_experiment] ─> output
+#
+# Every ticket is forked into two variant branches. Each branch tags its own
+# `prompt_variant` and `score`, so the two tokens differ in CONTENT but share
+# a row_id. The row_union waits for both, then releases BOTH tokens as one
+# indivisible group — 8 tickets in, 16 scored rows out — in long format:
+#
+#     id  prompt_variant  score
+#      1  control          60.0
+#      1  treatment        75.0
+#      2  control          72.0
+#      ...
+#
+# `batch_experiment_compare` consumes exactly that shape and reports the
+# cross-variant statistics (means, delta, lift, confidence interval).
+#
+# WHY NOT COALESCE? Coalesce is an N-to-1 FIELD merge: it would collapse the
+# two variants into one wide row (control_score + treatment_score as separate
+# columns), which the batch statistics plugins cannot consume — they need one
+# row per observation with a discriminator column. row_union preserves
+# cardinality instead of collapsing it.
+#
+# WHY NOT A QUEUE? A queue is an UNCORRELATED fan-in: it interleaves whatever
+# arrives, with no guarantee that a ticket's two variants stay together. The
+# row_union correlates on row_id and releases the pair as one unit, so a batch
+# boundary can never fall between a ticket's control and treatment rows.
+#
+# In production the two branches would be LLM calls with different prompts.
+# They are deterministic expressions here so the example runs offline.
+#
+# NOTE ON THE TRIGGER: aggregations downstream of a row_union may only use the
+# implicit end-of-source trigger (`trigger: {}`). A count/timeout/condition
+# trigger could fire between a ticket's two variants and split the group, so
+# the graph builder rejects it at build time.
+
+sources:
+  primary:
+    plugin: csv
+    on_success: routed
+    options:
+      path: examples/row_union_ab_experiment/input.csv
+      schema:
+        mode: fixed
+        fields:
+        - 'id: int'
+        - 'ticket: str'
+        - 'baseline_quality: int'
+      on_validation_failure: discard
+
+gates:
+# Fork every ticket into the two experiment arms.
+- name: variant_fork
+  input: routed
+  condition: "True"
+  routes:
+    'true': fork
+    'false': output
+  fork_to:
+    - control_branch
+    - treatment_branch
+
+transforms:
+# Control arm: the incumbent prompt. Score is the baseline quality as-is.
+- name: tag_control
+  plugin: value_transform
+  input: control_branch
+  on_success: control_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prompt_variant
+      expression: "'control'"
+    - target: score
+      expression: "row['baseline_quality'] * 1.0"
+
+# Treatment arm: the candidate prompt, worth ~25% more on this sample.
+- name: tag_treatment
+  plugin: value_transform
+  input: treatment_branch
+  on_success: treatment_scored
+  on_error: discard
+  options:
+    schema:
+      mode: observed
+    operations:
+    - target: prompt_variant
+      expression: "'treatment'"
+    - target: score
+      expression: "row['baseline_quality'] * 1.25"
+
+row_unions:
+# Wait for BOTH arms of a ticket, then release both tokens as one group.
+# Declared branch order is the release order, so control precedes treatment
+# for every ticket.
+- name: variant_union
+  branches:
+    control_branch: control_scored
+    treatment_branch: treatment_scored
+  on_success: experiment_in
+
+aggregations:
+# Long-format cross-variant statistics over the whole unioned stream.
+- name: prompt_experiment
+  plugin: batch_experiment_compare
+  input: experiment_in
+  on_success: output
+  on_error: discard
+  trigger: {}
+  output_mode: transform
+  options:
+    schema:
+      mode: observed
+    variant_field: prompt_variant
+    score_field: score
+    baseline_variant: control
+
+sinks:
+  output:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/row_union_ab_experiment/output/experiment_comparison.json
+      format: jsonl
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/row_union_ab_experiment/runs/audit.db

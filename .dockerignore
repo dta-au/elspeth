@@ -98,10 +98,20 @@ worktrees/
 payloads/
 landscape.db
 
+# Terraform working data and operator-specific deployment inputs
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
 # Secrets (never include in image!)
 .env
 .env.*
 *.pem
+!deploy/aws-ecs/trust/global-bundle.pem
 *.key
 secrets/
 

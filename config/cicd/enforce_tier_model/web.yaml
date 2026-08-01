@@ -265,44 +265,44 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[8]/body[9]/body[1]/body[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:8d8c32140a86a2e9e262c9981765cd48021201663cd929aa3b676b9588ceb867'
-- key: web/secrets/service.py:R6:WebSecretService:check_user_ref_resolvable:fp=c1e9289fa7f9c2d9
+- key: web/secrets/service.py:R6:WebSecretService:check_user_ref_resolvable:fp=10b6ba219b62a2e6
   owner: john
   reason: |-
     check_user_ref_resolvable (line 262, and line 253 for the user-scope branch) catches SecretNotFoundError ONLY, converting genuine absence into a meaningful boolean (False), while deliberately letting FingerprintKeyMissingError and SecretDecryptionError propagate to the app-level HTTP handlers that map them to 503/409. This is a narrow, expected-typed EAFP catch used as a documented control-flow signal ('absent' → False), not defensive swallowing — the catch is exactly as broad as the semantic 'absent' meaning requires. It is the typed-error variant of has_ref for the /api/secrets/{name}/validate route; a broader catch would regress to silently reporting available=False and hide the deployment issue (the defect issue elspeth-e9b86eca8c closed). The existing rationale matches the current code. No fabrication or audit corruption.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:14:49.755149+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:02:07.542641+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.9
+  judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM. R6 fires on the except-return-False pattern, but the code catches exactly and only SecretNotFoundError — the narrow typed signal meaning 'absent' — and converts it to the method's documented boolean contract. FingerprintKeyMissingError and SecretDecryptionError are deliberately allowed to propagate to HTTP-level handlers (503/409), as the surrounding docstring and comments confirm. This is EAFP control-flow with a semantically-matched exception type, not silent swallowing; broadening the catch would be the actual defect the rationale describes.
+    RULE MISFIRES — the catch at line 289 handles only SecretNotFoundError and returns the explicit semantic result False, so it does not swallow an error without an explicit result as R6 assumes. The visible comments and control flow distinguish genuine absence from FingerprintKeyMissingError and SecretDecryptionError, which are deliberately left to propagate, making this a narrow typed EAFP control-flow case rather than silent recovery. The decorator alternative does not apply because the finding is R6, not R1 or R5.
   judge_signature_version: 2
   scope_fingerprint: e5d7310c242e6f08548a2c89108879312cfeffe3b6038d0e1d8d10bc0a3c424a
-  judge_transport: openrouter
-  ast_path: 'body[22]/body[5]/body[2]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:ca1b3bb6cd011cfb9ee4d8ed97eac924ed31024afca5d233dde010a5bb919618'
-- key: web/secrets/service.py:R6:WebSecretService:check_user_ref_resolvable:fp=d86f66826e90d353
+  judge_transport: codex_cli
+  ast_path: 'body[22]/body[6]/body[2]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:c8db12abf450ae80c5c3ad66ed47860bef3ce1f88d7f7fdf28a6b5cea19cfd7c'
+- key: web/secrets/service.py:R6:WebSecretService:check_user_ref_resolvable:fp=0fe0ecc2659a3fa2
   owner: john
   reason: |-
     In check_user_ref_resolvable (service.py:253), `except SecretNotFoundError:` returns False, catching one typed exception across the TOCTOU window between has_secret_record() and get_secret() (separate store calls). The documented contract is 'unresolvable -> False', so a concurrent delete landing between the probe and the fetch correctly collapses to False; the deliberately-distinct FingerprintKeyMissingError and SecretDecryptionError are allowed to propagate so HTTP handlers can map them to 503/409. This is offensive programming at a real concurrency boundary, narrowly scoped to one exception type, no fabrication. R6 is outside the {R1,R5} decorator set. Existing rationale verified and accurate.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:14:56.645320+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:02:22.302780+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.86
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM. R6 flags a catch that returns without re-raise, but the excerpt shows a narrowly-scoped `except SecretNotFoundError` sitting between a `has_secret_record` probe and a `get_secret` fetch — a genuine TOCTOU window between two separate store calls. Collapsing 'row vanished between probe and fetch' to `False` matches the documented contract ('unresolvable -> False'), while the deliberately-distinct FingerprintKeyMissingError and SecretDecryptionError propagate for HTTP mapping (503/409). This is meaning-preserving concurrency handling on one typed exception, not silent swallowing of a class of errors, and the docstring makes the routing intent explicit. R6 is outside the {R1,R5} decorator set, so the decorator nudge does not apply.
+    RULE MISFIRES — the narrowly caught SecretNotFoundError is translated into the method’s documented explicit domain result, False, meaning the reference is presently unresolvable. The visible probe-then-fetch sequence has a genuine TOCTOU window, and the handler at line 280 correctly represents a concurrent deletion without suppressing FingerprintKeyMissingError or SecretDecryptionError, which remain propagating typed failures. This is neither silent recovery nor fabrication, and R6 is not eligible for the trust-boundary decorator.
   judge_signature_version: 2
   scope_fingerprint: e5d7310c242e6f08548a2c89108879312cfeffe3b6038d0e1d8d10bc0a3c424a
-  judge_transport: openrouter
-  ast_path: 'body[22]/body[5]/body[1]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:936668be3989ce15991d2b85cb563e8b487fafeb0d458e61df6f5bdb24994bae'
+  judge_transport: codex_cli
+  ast_path: 'body[22]/body[6]/body[1]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:241ac6bd8d87440bcb045dd2226d9f3381f9580c8051580c962c17ba5799bda9'
 - key: web/auth/oidc.py:R1:JWKSTokenValidator:decode_token:fp=7f739b2cc0f07da8
   owner: john
   reason: |-
@@ -421,25 +421,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[5]/body[7]/handlers[1]'
   judge_metadata_signature: 'hmac-sha256:v2:139a2e701cad2bb7091b459b5405cf046db4ed599ac44d7102924ad54dc9aba9'
-- key: web/execution/service.py:R6:ExecutionServiceImpl:validate_state:_blob_get_metadata:fp=973b282bda15b45a
+- key: web/execution/service.py:R6:ExecutionServiceImpl:validate_state:_blob_get_metadata:fp=672f67622276b399
   owner: john
   reason: |-
     In _blob_get_metadata (service.py:812), `except BlobNotFoundError:` returns None, catching one typed exception while looking up inline-blob metadata for dry-run pipeline validation. The function's signature is `BlobRecord | None`, and a not-found blob is a meaningful, expected absence (the referenced blob may not exist for the projected/draft state being validated) — recording it as None lets validate_pipeline report the gap rather than crashing the read-only validation. The catch is narrow (not bare Exception); other store errors propagate. This is the record-absence-as-None pattern, no fabrication. R6 is outside the {R1,R5} decorator set. Entry was ALLOWLIST-FRESH; this rationale is written from the current code.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:17:36.817094+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:00:27.227688+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
+  judge_confidence: 0.94
   judge_rationale: |-
-    PRESCRIBED FORM. The rule fires on a narrow typed catch (`except BlobNotFoundError`) that returns None from a function whose signature is `BlobRecord | None` — 'not found' is a semantically meaningful absence being reported honestly as None to the validator, not a swallow of an unexpected error. The catch is narrow (one typed exception), other errors propagate, and this is the record-absence-as-None pattern rather than fabrication (None means 'unknown/missing', which is exactly what the caller uses to report gaps). R6 is outside the decorator's suppressible set {R1,R5}, so the trust_boundary refactor path does not apply.
+    RULE MISFIRES — the narrow `BlobNotFoundError` catch converts a failed metadata lookup into the function’s declared `BlobRecord | None` absence result, rather than silently fabricating metadata or masking unrelated storage failures. The visible code passes this optional lookup callback into dry-run pipeline validation, and the rationale plainly states that `None` preserves the missing-blob fact so validation can report the gap; other exceptions still propagate. R6 is not eligible for the `@trust_boundary` decorator mechanism.
   judge_signature_version: 2
   scope_fingerprint: d2a7378c1e7e89edf1984d60c1504e32e7353c2bd6bc0cb0caf10304e5af0703
-  judge_transport: openrouter
-  ast_path: 'body[60]/body[12]/body[3]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:c2a387c4bfa9ead39511ad4c54d05265d45dc002bb2637223091a42623eed5da'
+  judge_transport: codex_cli
+  ast_path: 'body[69]/body[15]/body[4]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:db9188a4f6b33676c5cb9c3a941f57cab370b05d831259d43ae798ca96373661'
 - key: web/sessions/schema.py:R2:_ddl_constraint_applies_to_dialect:fp=e43d24d0445b8247
   owner: john
   reason: |-
@@ -993,25 +993,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[10]/body[3]/body[3]/body[1]/value'
   judge_metadata_signature: 'hmac-sha256:v2:23ce721e5c553468dd428c00e9ec34041f967f022328bb818ebc9ed41cb59f03'
-- key: web/execution/service.py:R8:ExecutionServiceImpl:get_session_lock:fp=a9c6c2e61fd69bc5
+- key: web/execution/service.py:R8:ExecutionServiceImpl:get_session_lock:fp=49035424473d0432
   owner: john
   reason: |-
     This is an intentional lazy per-session lock cache in the web execution layer, not a Tier-1 audit-data read where a missing key must crash. The owning state is initialized as an empty ephemeral cache at `src/elspeth/web/execution/service.py:313` with `self._session_locks: dict[str, asyncio.Lock] = {}`, explicitly described at `src/elspeth/web/execution/service.py:310-312` as "Keyed by session_id string; lazily created, cleaned up on session deletion". The flagged site at `src/elspeth/web/execution/service.py:386` returns `self._session_locks.setdefault(session_id, asyncio.Lock())`, matching that local invariant: absence means this session has not yet needed a lock, not corrupted engine/audit state. Drift that changed this map into persisted run/audit data, or removed the documented lazy-cache/cleanup ownership, would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:50:34.669972+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:00:37.397401+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.9
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES. The R8 rule targets setdefault() used to paper over missing-key bugs in a schema/contract, but here the dict is explicitly an ephemeral lazy-cache of per-session asyncio.Lock objects owned by this service, initialized empty and cleaned up on session deletion. The setdefault() is being used for its correct semantic purpose — atomic get-or-create of a lock — not to hide a missing key from a contract that required one. Absence is the expected initial state, not corruption, and there is no upstream schema whose contract is being laundered.
+    RULE MISFIRES — the visible code establishes an intentionally sparse, ephemeral per-session lock cache: `cleanup_session_lock()` deliberately removes entries, and `get_session_lock()` lazily creates the missing lock. Therefore, a missing key is an expected cache state rather than a schema, audit-data, or first-party contract violation hidden by `setdefault()`. R8's missing-key-bug premise is false at this site, and R8 is not eligible for the `@trust_boundary` decorator.
   judge_signature_version: 2
   scope_fingerprint: d8962a4eeae7ccc370d5b00e697bd49f31635e33bb9a5349025f497322fb3226
-  judge_transport: openrouter
-  ast_path: 'body[60]/body[6]/body[1]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:e4ca0af68d57b66bb0cf53dd147c3d9fc6be9f8dbc4fd2839ddd94f3fcde5c2e'
+  judge_transport: codex_cli
+  ast_path: 'body[69]/body[9]/body[1]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:bcc53139413a58fe9a8f67e2fa720aecd6dcd6af7c29623f757f79593d2e0cac'
 - key: web/execution/service.py:R5:ExecutionServiceImpl:_execute_locked:fp=49e0a3c19b7b30d3
   owner: john
   reason: |-
@@ -1071,25 +1071,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[60]/body[9]/body[14]/body[2]/body[4]/body[0]/value'
   judge_metadata_signature: 'hmac-sha256:v2:f7375fc64ca42312380131dee3d6f731a513129fdc8a0c1d5c2a17136168c6ce'
-- key: web/execution/service.py:R1:ExecutionServiceImpl:cancel:fp=3a55ed36bef8cc88
+- key: web/execution/service.py:R1:ExecutionServiceImpl:cancel:fp=3480e7678e07c742
   owner: john
   reason: |-
     This is a modeled optional lookup in the cancel path, not a Tier-1 audit-data read that must crash. In `web/execution/service.py:1005`, `event = self._shutdown_events.get(str(run_id))` queries the in-memory shutdown-event registry after the run has already been resolved and cancellation state updated; the immediately following branch only signals an active runner when an event exists. A missing `_shutdown_events` entry means there is no currently running worker to signal for that `run_id` (for example, a pending or already non-active run), not corruption of persisted audit data. Drift should invalidate this suppression if the line stops being an optional active-run event lookup or if missing events become an invariant violation.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:51:14.644562+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:00:01.989425+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.88
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES. The `_shutdown_events` dict is an in-memory registry of active-run shutdown Events keyed by run_id string; absence is a semantically meaningful state (run is pending/terminal, no active worker to signal), not a missing-key bug. The docstring explicitly documents the three states (active/pending/terminal) and the `if event is not None` branch handles absence as first-class control flow, routing to the pending/terminal path. This is neither Tier-1 audit data nor a defensive shape-guard — it is a presence check on an optional registry entry, which is exactly what `dict.get` is for. Direct subscript would be wrong here because KeyError is not an invariant violation.
+    RULE MISFIRES — the process-local `_shutdown_events` registry deliberately models an optional association, and the visible `cancel` docstring and branch distinguish active runs with an event from pending or terminal runs without one. The lookup does not conceal a required key or persisted Tier-1 corruption: absence is immediately handled through the documented cancellation-state path rather than silently ignored or replaced with fabricated data. The decorator is inapplicable because the lookup is rooted at `self._shutdown_events`, not Tier-3 data flowing from an external function parameter.
   judge_signature_version: 2
   scope_fingerprint: 9f97485cd329fa8765c332b96f5fcb5af338ef72ca6b9099ec5d4855e8654c5a
-  judge_transport: openrouter
-  ast_path: 'body[60]/body[14]/body[1]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:a850f8aad520f142dd69ff2563eb72c87a838198fd0ab892f615f5d3e66f057f'
+  judge_transport: codex_cli
+  ast_path: 'body[69]/body[17]/body[1]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:4cb1fdd1cad238133d905b78a97558e7fe2feaff6fd9fc17cae2bde959a745b7'
 - key: web/execution/validation.py:R1:_reframe_settings_missing_parts:fp=d1df301fdf6d02cd
   owner: john
   reason: |-
@@ -1128,25 +1128,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[76]/body[2]/body[1]/value/values[0]'
   judge_metadata_signature: 'hmac-sha256:v2:9814ccb7b5f980d4f872fbeeb3a43343e31f8128f20de838982285a2579713ed'
-- key: web/execution/validation.py:R5:_reframe_settings_missing_parts:fp=2f877ce4fe434461
+- key: web/execution/validation.py:R5:_reframe_settings_missing_parts:fp=ae212348fbc36b12
   owner: john
   reason: |-
     This is a prescribed boundary discriminator in `web/execution/validation.py:_reframe_settings_missing_parts`, not a Tier-1 audit-data guard. The helper is reframing Pydantic/web validation error location parts for missing settings fields, and the flagged site only rewrites known string path components: `if isinstance(part, str) and part in _SETTINGS_MISSING_PART_REFRAMES:`. The type check is site-specific to a heterogeneous validation-error `loc` path where parts may be non-string indexes; non-matching parts are preserved instead of treated as corruption. If this code drifted to consume Landscape/audit records or to silently tolerate missing internal invariants, this suppression would no longer apply.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:51:47.705413+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:01:40.015643+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES. The `isinstance(part, str)` guard is on `loc[0]` from Pydantic's `exc.errors()`, where `loc` entries are documented as `int | str` (ints index list fields). This is a genuine heterogeneous-type discriminator on external-library-shaped data: Pydantic controls the `loc` tuple shape, and narrowing to `str` before a string-set membership test is the correct way to handle the union type. It is neither a defensive re-check of a first-party guaranteed shape nor a fabrication — non-matching parts are simply not added to `missing_parts`, and the caller falls back to `str(exc)` as documented. R5's concern (masking contract violations) does not apply because there is no first-party contract asserting `loc[0]` is a str.
+    RULE MISFIRES — `part` is drawn from Pydantic's structured validation-error `loc`, whose entries legitimately form a heterogeneous `int | str` path, so the `isinstance(part, str)` check discriminates valid variants rather than masking a contract violation. The visible comment and membership test establish that only top-level string keys are candidates for reframing, while non-string list indexes are intentionally preserved as non-matches and cause no fabricated value or silent recovery. The parameter is a structured `PydanticValidationError`, not a raw external-data parameter requiring a function-scoped Tier-3 decorator, so the decorator alternative does not apply.
   judge_signature_version: 2
   scope_fingerprint: 1a85aa7683af45246f991db81b7948e03e7cf4bd85a190edaa90727ac238a560
-  judge_transport: openrouter
-  ast_path: 'body[76]/body[2]/body[3]/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:9402b7fc04fb7f66904bc6f77831ae21e133555abaf6bd425fa86f231a471d44'
+  judge_transport: codex_cli
+  ast_path: 'body[93]/body[2]/body[3]/test/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:e4a22d22a5671f04dbfd7ccd9328a68e33f07e530d242ac22bc985198b2d99b6'
 - key: web/sessions/routes/_helpers.py:R5:_guided_source_commit_failure_detail:fp=de0839b7c3868a67
   owner: john
   reason: |-
@@ -1166,25 +1166,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[77]/body[2]/test'
   judge_metadata_signature: 'hmac-sha256:v2:164916b14e046278cf28c58d5fd134541125d336104dd57cbefe7368e8478d78'
-- key: web/sessions/routes/_helpers.py:R1:_guided_source_commit_failure_detail:fp=7e19b8b162bc8003
+- key: web/sessions/routes/_helpers.py:R1:_guided_source_commit_failure_detail:fp=621379bf820990b1
   owner: john
   reason: |-
     `src/elspeth/web/sessions/routes/_helpers.py:236-244` is a web-session response-shaping boundary for an optional `ToolResult.data` payload, not a Tier-1 Landscape/audit read. The function first reifies the envelope with `if type(tool_result) is not ToolResult:` and only then treats the payload as optional/heterogeneous: `raw_data = tool_result.data`, `if isinstance(raw_data, Mapping):`, `error = raw_data.get(_DATA_ERROR_KEY)`. The `.get()` is deliberately scoped to an optional `"error"` key used to translate one recognized source-path rejection into `_GUIDED_SOURCE_PATH_ALLOWLIST_DETAIL`; all absent, non-mapping, or unrecognized shapes return the generic `"Step 1 source commit failed"`. This suppression is valid only while this site remains user-facing failure-detail selection over optional `ToolResult.data`; if `data["error"]` becomes a required internal/audit invariant, the `.get()` must be replaced with direct indexing and allowed to crash.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:52:03.000962+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:05:26.918747+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.78
+  judge_confidence: 0.91
   judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM. `ToolResult.data` is typed as an optional heterogeneous payload whose contents originate from tool executions surfacing external/tool-side error strings — its shape is not a first-party guaranteed contract at this site. The function is a response-shaping boundary that selects a user-facing failure detail: it verifies the envelope type offensively (raises TypeError on wrong ToolResult), then uses isinstance(Mapping) + .get() on an optional 'error' key to recognize one specific rejection pattern, falling through to a generic message otherwise. This is meaning-preserving optional-key handling at a boundary, not silent recovery of a required invariant, and no default value is fabricated into downstream data.
+    RULE MISFIRES — `ToolResult.data` is explicitly declared `Any = None` at web/composer/tools/_common.py:718-757, so neither a mapping shape nor an `error` key is a required first-party invariant. At web/sessions/routes/_helpers.py:222-230, the helper enforces the `ToolResult` envelope and then uses mapping and string checks solely to select one optional recognized detail; absent or unrecognized data yields a truthful generic failure message without coercion or fabrication. The decorator does not apply because the function parameter is a first-party `ToolResult`, not external data entering through that parameter.
   judge_signature_version: 2
   scope_fingerprint: 89dadd5e550486e3a18008fda49357fcc97909207b66d2c9dfd0b7bb446ea171
-  judge_transport: openrouter
-  ast_path: 'body[77]/body[2]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:30f68387231163bd8c8c2be7b1e608ae0084fc38fad34231d3bfe878097ebecc'
+  judge_transport: codex_cli
+  ast_path: 'body[82]/body[2]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:2ffc2ec8bccdcbcf266749a60a0ec1cef68f5f4b69c33a3e586f12d57074a07e'
 - key: web/sessions/routes/_helpers.py:R5:_guided_source_commit_failure_detail:fp=c2e307ce9f51d64a
   owner: john
   reason: |-
@@ -1204,82 +1204,82 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[77]/body[2]/body[1]/test/values[0]'
   judge_metadata_signature: 'hmac-sha256:v2:aa750da1b08f0ae6781a3662659f776a2ab6f84d080fe492ac30ac33cf0487ba'
-- key: web/sessions/routes/_helpers.py:R6:_litellm_error_detail:fp=d47cf333f604d105
+- key: web/sessions/routes/_helpers.py:R6:_litellm_error_detail:fp=708f7cf27e28d8cd
   owner: john
   reason: |-
     `src/elspeth/web/sessions/routes/_helpers.py:504-518` is a prescribed Tier-3 SDK boundary, not a Tier-1 audit-data read. The function documents that the non-`_BadRequestLLMError` branch handles "a LiteLLM-native exception" whose `.status_code` surface is external provider/SDK data, then defensively probes it: `try: exc_attrs = vars(exc)` / `except TypeError: exc_attrs = {}`. The swallowed `TypeError` is narrowly scoped to the introspection operation on that external exception object, and the fallback explicitly means "no inspectable attributes", after which only an integer `status_code` is accepted: `raw_status_code = natural_status_code if type(natural_status_code) is int else None`. If this code drifts to catch broader exceptions, inspect engine-owned/audit data, or use the fallback to hide required internal state, this suppression should no longer apply.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:52:19.977989+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:10:13.636334+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.86
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM. The excerpt clearly shows a Tier-3 SDK boundary: the else-branch handles a LiteLLM-native exception whose attributes are external-provider data. `vars(exc)` can raise TypeError on objects without __dict__ (e.g., those using __slots__), and the narrow except captures exactly that introspection failure, substituting an empty dict that means 'no inspectable attributes' — not a fabricated value. The subsequent `type(...) is int else None` records absence as None rather than a fabricated status code, matching the Tier-3 'record what we got' pattern. Scope is tight (single-line vars() call, specific TypeError), and the rule R6 concern (silent swallow) is addressed by the honest None-recording downstream.
+    PRESCRIBED FORM — the visible code and site-specific rationale establish that the caught `TypeError` can arise only from `vars(exc)` while inspecting a LiteLLM-native, externally controlled exception object. The fallback represents the meaning-preserving fact that no attribute mapping is inspectable: `status_code` consequently remains absent rather than being fabricated, and any present value is accepted only when its exact type is `int`. The catch is narrowly scoped, does not conceal an engine or audit invariant, and the function still produces its explicit HTTP error-detail result. R6 is not supported by `@trust_boundary`, so no decorator remediation applies.
   judge_signature_version: 2
   scope_fingerprint: ff1db46318cdf1e3bbd3f5c0702aaf0e403db490ce67540b99c13801c9be3f97
-  judge_transport: openrouter
-  ast_path: 'body[93]/body[3]/orelse[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:d1a38562a7eb2436e48cdeb523cde73cc621b8b1b0d54c648e07a49426d24098'
-- key: web/sessions/routes/_helpers.py:R1:_litellm_error_detail:fp=2417b715a6cfe230
+  judge_transport: codex_cli
+  ast_path: 'body[98]/body[3]/orelse[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:99e25b3e7cad97a152544069879d55705a44a89dc083233e3819e59860054fd8'
+- key: web/sessions/routes/_helpers.py:R1:_litellm_error_detail:fp=1eab924c320fc94d
   owner: john
   reason: |-
     This is a genuine Tier-3 SDK-object boundary, not a Tier-1 audit-data read. In `web/sessions/routes/_helpers.py:504-507`, the enclosing function explicitly separates the project-owned `_BadRequestLLMError` carrier from “a LiteLLM-native exception” that “is a Tier-3 SDK object we probe defensively.” The flagged `.get()` occurs only in that external-exception branch after `vars(exc)` is attempted and normalized to `{}` on `TypeError`: `natural_status_code = exc_attrs.get("status_code")` at line 517. The next line reifies the only accepted value shape with `type(natural_status_code) is int`, otherwise discarding it, so future drift that moves this `.get()` onto the `_BadRequestLLMError` branch or other project-owned/audit data would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:52:29.525867+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:05:39.602465+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.9
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM. The .get() is on `exc_attrs = vars(exc)` where `exc` is a LiteLLM-native exception — a Tier-3 external SDK object whose attribute shape ELSPETH does not contract. The excerpt clearly shows the branch discriminator (`type(exc) is _BadRequestLLMError` guards the first-party carrier; the else branch handles the SDK object) and the code normalizes `vars(exc)` failures via TypeError→{}, then reifies the value with `type(natural_status_code) is int` before use, discarding anything else. This is the prescribed Tier-3 boundary form: probe an external shape, coerce/validate, record nothing fabricated. R1's concern (hidden schema drift on first-party dicts) does not apply here.
+    RULE MISFIRES — the visible exact-type branch separates the project-owned `_BadRequestLLMError` from a LiteLLM-native Tier-3 SDK exception, and the flagged `.get()` probes only `vars(exc)` in that external-object branch. Missing or non-exact-int `status_code` values become `None`, honestly recording absence rather than fabricating or coercing a value. Although R1 is decorator-suppressible, the excerpt does not show the enclosing function signature or decorators, so the structural-decorator test cannot be established from the supplied evidence.
   judge_signature_version: 2
   scope_fingerprint: ff1db46318cdf1e3bbd3f5c0702aaf0e403db490ce67540b99c13801c9be3f97
-  judge_transport: openrouter
-  ast_path: 'body[93]/body[3]/orelse[2]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:38329a97a594b47df361cdfcc0635d7f7a8657e945b6c80dec0586f25e3e6d79'
-- key: web/sessions/routes/_helpers.py:R5:_extract_runtime_model_snapshot:fp=c7a42ffc3485b7c0
+  judge_transport: codex_cli
+  ast_path: 'body[98]/body[3]/orelse[2]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:67faf41971c3f0e1de9e2c50440301319e1794f94863c213de23e26b3469fe4a'
+- key: web/sessions/routes/_helpers.py:R5:_extract_runtime_model_snapshot:fp=7c6485d3a506a6fe
   owner: john
   reason: |-
     `web/sessions/routes/_helpers.py:664` is a Tier-1 audit-shape assertion, not defensive recovery: after required-key reads (`node["id"]` at 661 and `node["options"]` at 663), the flagged check `if not isinstance(options, Mapping):` immediately crashes with `AuditIntegrityError` at 665-669 and states the writer-side invariant: `"writer guarantees an options mapping for LLM nodes."` This suppression is valid only while this site continues to raise on non-mapping `options` and does not coerce, default, skip, or return nullable audit data for that anomaly.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:52:36.078607+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:05:49.175113+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.88
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM. The site reads composition_state that ELSPETH itself wrote (Tier-1 audit data), and the isinstance check is an offensive shape assertion that immediately raises AuditIntegrityError with a maximally-informative message naming the writer-side invariant. This matches the policy's prescription for Tier-1 anomalies: crash on any shape violation rather than coerce or return NULL. The raised type is an audit-integrity error designed to bubble, consistent with the routing rules for Tier-1 corruption, and the surrounding docstring explicitly documents why isinstance-then-raise is the enforcement point here.
+    PRESCRIBED FORM: the flagged `isinstance(options, Mapping)` is an offensive Tier-1 integrity assertion that immediately raises a meaningful `AuditIntegrityError` when the writer-guaranteed audit shape is violated. The visible code neither coerces nor defaults the malformed value, and the rationale specifically ties the check to the writer-side mapping invariant. This is not a structural Tier-3 boundary case because `state.nodes` is described as first-party audit data rather than external data requiring promotion.
   judge_signature_version: 2
   scope_fingerprint: ea257ac8a9d24253fd6b944cb43009b7daa8edcef7eb4f51482268a5cee49502
-  judge_transport: openrouter
-  ast_path: 'body[97]/body[2]/body[2]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:34a03a4b0ad50383b62e05fc022708b9812f38f9a9062328e0aa3f07b6e36997'
-- key: web/sessions/routes/_helpers.py:R1:_extract_runtime_model_snapshot:fp=a1dd46422475f434
+  judge_transport: codex_cli
+  ast_path: 'body[104]/body[2]/body[2]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:e3925c97270b8f3e7cd43be58700dc4a1aa3276f904cca6af0a585376774e3a8'
+- key: web/sessions/routes/_helpers.py:R1:_extract_runtime_model_snapshot:fp=01d855c81ffa5739
   owner: john
   reason: |-
     `web/sessions/routes/_helpers.py:670` is a prescribed optional-field read, not defensive masking of a required Tier-1 invariant. The enclosing function explicitly treats `state.nodes` and `node["options"]` as Tier-1 audit data: required fields use crashing subscription (`node["id"]` at line 661 and `node["options"]` at line 663), and a malformed `options` container raises `AuditIntegrityError` at lines 664-669. The specific key at issue is documented as optional: lines 644-648 say "`options.model` and `options.model_version` are *optional* keys by design" and that returning `None` records "no runtime model pinned in composition state". Drift that made `model` required, removed the immediate type crash, or stopped treating non-string values as `AuditIntegrityError` would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:52:42.978959+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:02:34.770844+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.88
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM. The rule fires on `.get("model")` but the code and docstring establish these are contractually optional keys — recording `None` correctly reflects 'no runtime model pinned' without fabrication, which is the honest handling per the fabrication-decision test. Required keys use crashing subscription (`node["id"]`, `node["options"]`), the Mapping shape is enforced by an offensive isinstance→raise AuditIntegrityError, and non-string values at the optional keys also raise AuditIntegrityError rather than coerce. This is the prescribed shape for reading a nullable audit column: crash on shape/type anomalies, return None for genuine absence.
+    RULE MISFIRES — the flagged `.get()` reads a first-party contractually optional key, so absence is an expected state rather than a missing-key invariant failure. The excerpt independently documents that `options.model` is optional, maps its absence to the nullable audit value `None` without fabrication, uses crashing subscription for required `id` and `options` keys, and raises `AuditIntegrityError` for a present non-string model. The excerpt does not expose the enclosing function signature or decorators, so the structural decorator alternative cannot be established.
   judge_signature_version: 2
   scope_fingerprint: ea257ac8a9d24253fd6b944cb43009b7daa8edcef7eb4f51482268a5cee49502
-  judge_transport: openrouter
-  ast_path: 'body[97]/body[2]/body[3]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:146db5dcbcd3e70047d9975dc373ea99531697010db71051b2c85d71711ce1a3'
+  judge_transport: codex_cli
+  ast_path: 'body[104]/body[2]/body[3]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:b34eee0249a73f9d57388bbad00fe1b3e60cfaf9b32a3005be523ac483333d84'
 - key: web/sessions/routes/_helpers.py:R6:_state_data_from_composer_state:fp=4e5ed47a12a966c5
   owner: john
   reason: |-
@@ -1894,25 +1894,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[31]/body[1]/body[0]/orelse[0]/test/values[0]'
   judge_metadata_signature: 'hmac-sha256:v2:7b11a33554ad3d71263ea9502b5b429d3792996eb2ef0b44f9d3676b6c1b1b8b'
-- key: web/composer/tools/_dispatch.py:R5:_json_type_label:fp=8497d86446551f2e
+- key: web/composer/tools/_dispatch.py:R5:_json_type_label:fp=814874983450bb01
   owner: john
   reason: |-
     web/composer/tools/_dispatch.py:408 is part of the web composer tool-argument validation boundary, not a Tier-1 audit-data read. `_validate_tool_arguments` builds a `Draft202012Validator(schema)` and validates externally supplied `arguments`; on failure, `_schema_error_summary` formats the third-party `ValidationError` for a user-facing rejection. The flagged branch is specifically formatting JSON Schema's legal `"type"` shapes: line 406 handles a scalar type with `if isinstance(value, str):`, and line 408 handles the multi-type form with `if isinstance(value, Iterable):`, returning `" or ".join(str(item) for item in value)` at line 409. This suppression is valid only while `_json_type_label` is called from `_schema_error_summary` line 425 as `"_json_type_label(error.validator_value)"` for `error.validator == "type"` and while `_validate_tool_arguments` lines 451-457 remains the boundary that converts schema-validation failures on composer tool arguments into `ToolArgumentError` or `_failure_result`.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:01:41.768834+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T03:44:06.289121+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
+  judge_confidence: 0.94
   judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM. The `value` here is `error.validator_value` from jsonschema's `ValidationError` — a third-party library's field whose shape is not guaranteed by any first-party ELSPETH contract. JSON Schema's `type` keyword legally accepts either a string or an array of strings, so the isinstance branch is the boundary-normalization that formats an externally-shaped value into a user-facing error string. This is Tier-3 shape discrimination on third-party data, not a defensive re-check of first-party typed data, and it feeds a `ToolArgumentError` rejection path rather than silently coercing. Since `value` is not rooted at a function parameter of an external-boundary function (it's a jsonschema internal), the @trust_boundary decorator does not cleanly apply here.
+    RULE MISFIRES — the `isinstance(value, Iterable)` at line 427 is variant dispatch for JSON Schema’s legal scalar-or-multiple `type` representation, not defensive recovery that hides a contract violation. The excerpt confirms that `_schema_error_summary` calls `_json_type_label(error.validator_value)` only for a third-party validation error whose validator is `type`, and the preceding string branch distinguishes the scalar form before formatting the iterable form. The decorator alternative does not apply because `value` represents validator metadata derived from the schema, rather than externally supplied tool arguments rooted at this function parameter.
   judge_signature_version: 2
   scope_fingerprint: b685e66f9fa7452c6fdccd88fdaf6bc9b50911415d7f9135ed4c4f66b4a18895
-  judge_transport: openrouter
-  ast_path: 'body[32]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:e0c267ba3c1a2dbbdced8a6f54d6566fd1fc0ebfb92033d4fac5f069a0087968'
+  judge_transport: codex_cli
+  ast_path: 'body[33]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:1dbec85d8456bf5a67c6d74d9b38764bd6544fefabb1465b8b7eebf847290ffb'
 - key: web/composer/tools/_dispatch.py:R5:_schema_error_summary:fp=32635647a6fd3b85
   owner: john
   reason: |-
@@ -2407,25 +2407,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[23]/body[12]/value/keywords[3]/value/args[0]'
   judge_metadata_signature: 'hmac-sha256:v2:1a56282fac97cc5f1d0295894900654617a474a1726d340db2d95cbc566210c3'
-- key: web/execution/service.py:R9:ExecutionServiceImpl:cleanup_session_lock:fp=1e5b377ab72fdf77
+- key: web/execution/service.py:R9:ExecutionServiceImpl:cleanup_session_lock:fp=afd1bc91c7466116
   owner: john
   reason: |-
     This is a volatile, lazily-created per-session lock cache, not Tier-1 audit data. The site defines `_session_locks` as an internal asyncio lock map and documents that entries are "lazily created" and "cleaned up on session deletion" at `web/execution/service.py:310-313`. The flagged line is the deletion cleanup path: `web/execution/service.py:376-382` defines `cleanup_session_lock()` and calls `self._session_locks.pop(session_id, None)` after `archive_session()` completes. Because the map is lazy, a deleted session may legitimately have no cached lock entry to remove; the default is an idempotent cache-cleanup form, not a hidden missing audit key or corrupted engine invariant. Drift that makes every session require a pre-existing lock before deletion would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T15:05:24.383886+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:00:48.582084+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES. The map `_session_locks` is a lazily-populated cache — `get_session_lock` uses `setdefault`, so a lock entry exists only if someone called `execute` for that session. A session legitimately can be deleted without ever having acquired a lock, so `pop(session_id, None)` is idempotent cache cleanup, not a defensive suppression of a missing-key bug. This is process-local first-party state, not Tier-1 audit data; R9's concern (hiding a schema/contract bug) does not apply because there is no contract that every deleted session has a cached lock.
+    RULE MISFIRES — the visible code establishes that `_session_locks` is a lazily populated internal cache: `get_session_lock()` creates entries with `setdefault`, while `cleanup_session_lock()` removes an entry only if one exists. Therefore, absence of `session_id` during deletion cleanup is an expected state rather than a missing-key bug or Tier-1 invariant failure, and `pop(session_id, None)` provides legitimate idempotent cleanup without fabricating pipeline data or suppressing an integrity error. R9 is not eligible for the `@trust_boundary` structural alternative.
   judge_signature_version: 2
   scope_fingerprint: 6591459ca631565b76f8ff3aa620fa469c55e183a3707e08b45a8561bb9d45d1
-  judge_transport: openrouter
-  ast_path: 'body[60]/body[5]/body[1]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:5cac399eef2d0efe47be6d4fca53460c35fec13a06e54f68276c65c24a7e29f9'
+  judge_transport: codex_cli
+  ast_path: 'body[69]/body[8]/body[1]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:979ad62ef20f982f681d71c60721021bec65b578211b42ac660b1c315b895263'
 - key: web/sessions/routes/composer/guided.py:R5:_build_get_guided_turn:fp=171261f3ace3d727
   owner: john
   reason: |-
@@ -2884,25 +2884,25 @@ allow_hits:
   judge_transport: claude_agent_sdk
   ast_path: 'body[29]/body[11]/body[1]/test/values[1]/operand/args[0]/elt/left'
   judge_metadata_signature: 'hmac-sha256:v2:ead36f433c9db42c107474d24b6d81d3a2566d1c0ce2e87271f292f2c518e040'
-- key: web/provider_config_policy.py:R6:_positive_int_or_none:fp=eb985c87682a0989
+- key: web/provider_config_policy.py:R6:_positive_int_or_none:fp=ee7a080250af6eb3
   owner: john
   reason: |-
     R6 false-positive. `_positive_int_or_none` (web/provider_config_policy.py:81-88) parses a web-authored (Tier-3) transform-config value: `parsed = _INT_ADAPTER.validate_python(value)` (:83) wrapped by `except PydanticValidationError: return None` (:84-85). This is a Tier-3 boundary parse normalizing an un-parseable author value to explicit absence (None), never a fabricated default. Both consumers treat None as FAIL-CLOSED rejection: `web_llm_retry_budget_policy_error` does `pool_size = _positive_int_or_none(options.get('pool_size', 1)); if pool_size is None: return LLM_RETRY_BUDGET_POLICY_ERROR` (:98-100) and `max_retry_seconds = _positive_int_or_none(options.get('max_capacity_retry_seconds')); if max_retry_seconds is None or ...: return LLM_RETRY_BUDGET_POLICY_ERROR` (:104-106). A malformed value therefore makes the policy gate REJECT the web-authored config (the returned error string blocks the run) — the fail-closed outcome the doctrine prescribes for Tier-3 absence. Pydantic's TypeAdapter raises on invalid input and offers no non-exception tryparse, so the except IS the parse boundary. Invalidated if any future caller treats a None return as 'use a permissive default and proceed' (e.g. `_positive_int_or_none(...) or LARGE_DEFAULT`), converting fail-closed rejection into silent fabrication.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T22:15:25.639444+00:00'
-  judge_model: 'claude-opus-4-8[1m]'
+  judge_recorded_at: '2026-07-28T04:01:53.446851+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM. `_positive_int_or_none` is a Tier-3 boundary parse of a web-authored option value: `_INT_ADAPTER.validate_python` is Pydantic's only validation path and raises on invalid input, so the `except PydanticValidationError: return None` IS the parse boundary, not a swallowed error — it normalizes an un-parseable value to explicit absence (None), never a fabricated default (None -> 0 does not occur). I verified both and only consumers fail closed: web/provider_config_policy.py:124-125 (`if pool_size is None: return LLM_RETRY_BUDGET_POLICY_ERROR`) and :129-131 (`if max_retry_seconds is None or ... : return LLM_RETRY_BUDGET_POLICY_ERROR`), and grep confirms these are the sole call sites, so None is consumed as a rejection signal exactly as the coerce/validate-at-border doctrine prescribes. The decorator nudge does not apply because R6 is outside the decorator's suppressible set (R1/R5).
+    PRESCRIBED FORM — R6 applies syntactically, but the caught Pydantic validation failure is converted to an explicit `None` parse result at a Tier-3 boundary, and the visible consumer maps that result to `LLM_RETRY_BUDGET_POLICY_ERROR` rather than proceeding with fabricated data. The rationale specifically accounts for both consumers and establishes that malformed author-supplied values fail closed, while the code shown is consistent with that account. The decorator alternative does not apply because R6 is not one of the decorator-suppressible rules.
   judge_signature_version: 2
   scope_fingerprint: 644b70a7b41ff27d02f04cbc3a1191bb03c000d03084a66ca389db9bde8280b5
-  judge_transport: claude_agent_sdk
-  ast_path: 'body[17]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:32482aeac42f4566c3dcf0369ea972bdd581d2bc5885993811277d8242381b60'
+  judge_transport: codex_cli
+  ast_path: 'body[22]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:cf57afd03d033944d7177f91a7a03df8153167d36863495f9e9594017d07c36b'
 - key: web/sessions/routes/composer/state.py:R5:_reattach_guided_blob_refs:fp=f6e8425d9e013712
   owner: john
   reason: |-
@@ -3343,25 +3343,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[21]/body[2]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:8d8d948c1e501fe8591e65dd18c96a2b1b1c447c2a5cec23dd17f690125d6628'
-- key: web/composer/redaction.py:R5:_coerce_stringified_json_object:fp=a2994136e83c5700
+- key: web/composer/redaction.py:R5:_coerce_stringified_json_object:fp=265e3f640f52a772
   owner: john
   reason: |-
     Prescribed Tier-3 boundary coercion. In `web/composer/redaction.py:848-849`, `_coerce_stringified_json_object(value: Any)` is explicitly scoped as `"Tier-3 boundary deserialisation for LLM-supplied object arguments."` The finding at `web/composer/redaction.py:882` is the boundary type check after parsing an LLM-emitted JSON string: `return decoded if isinstance(decoded, dict) else value`. The surrounding code first limits coercion to string inputs (`line 876`), parses with `json.loads(value)` (`line 879`), and returns the original value for invalid JSON (`lines 880-881`) or non-object JSON (`line 882`) so downstream `dict[str, Any]` validation still rejects malformed input. This is not Tier-1 audit-data tolerance; it is a narrow Tier-3 LLM tool-call argument normalization, and drift away from LLM-supplied object arguments or fail-closed non-object handling would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:34:52.264431+00:00'
+  judge_recorded_at: '2026-07-28T03:41:44.597200+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
   judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM — the visible code and site-specific rationale establish a Tier-3 boundary normalization of LLM-supplied data, and the flagged `isinstance(decoded, dict)` limits coercion to JSON objects after parsing. Returning the original value for invalid JSON or decoded non-objects preserves malformed input for downstream `dict[str, Any]` validation to reject, while parsing a stringified object is meaning-preserving rather than fabrication. The excerpt also records that the raw pre-coercion input is captured in the audit envelope, satisfying the requirement to record what the external system supplied.
+    PRESCRIBED FORM. The visible code and site-specific rationale establish that `decoded` comes from parsing an LLM-supplied JSON string at a Tier-3 boundary, and the flagged `isinstance(decoded, dict)` restricts meaning-preserving coercion to JSON objects. Non-object or invalid JSON remains unchanged for downstream `dict[str, Any]` validation to reject, while the pre-coercion representation is recorded in the dispatch audit envelope, so the check neither fabricates data nor silently promotes malformed input. Because the excerpt does not show the function's decorator region, the decorator caveat requires the no-suggestion path.
   judge_signature_version: 2
   scope_fingerprint: 35e8d7def266321cb7f04726d7ac8ff2e9ec503f12c6b2c425be1a317ef32f24
   judge_transport: codex_cli
-  ast_path: 'body[45]/body[3]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:75c93be7f254b904220ed76fa6406fc5258fc4516f8a219e871b4276ac66386a'
+  ast_path: 'body[82]/body[3]/value/test'
+  judge_metadata_signature: 'hmac-sha256:v2:d9c694d39d4a0dcc4a6098e84bf2a197a4f4888f6fbbe93ba9777633e64797d3'
 - key: web/composer/redaction.py:R5:_coerce_stringified_json_object:fp=518c178399a9de8f
   owner: john
   reason: |-
@@ -3457,7 +3457,7 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[116]/body[3]/test'
   judge_metadata_signature: 'hmac-sha256:v2:f3637cdccd11b340099543b049848cc46db5b5a3a12b43a695cc30b95ca7030e'
-- key: web/composer/redaction.py:R5:redact_source_storage_path:_redact_one:fp=1f0c8f5f0439033b
+- key: web/composer/redaction.py:R5:redact_source_storage_path:_redact_one:fp=b444cff7e97f6e10
   owner: john
   reason: |-
     This is a prescribed Tier-3 redaction-boundary shape, not a Tier-1 audit-data read that must crash. The helper is explicitly an egress redactor for internal blob storage paths: `src/elspeth/web/composer/redaction.py:3095` defines `redact_source_storage_path(state_dict: dict[str, Any])`, and `src/elspeth/web/composer/redaction.py:3098-3101` says that when source options contain `blob_ref`, `path`/`file` point at an internal storage location that must not be exposed. The function then documents the exact polymorphic boundary contract at `src/elspeth/web/composer/redaction.py:3106-3118`: `state_dict` is a first-party serializer output, but `"source"`/`"options"` can legitimately be absent, and "The composer/LLM-authored VALUES inside ``options`` are Tier 3"; the redaction trigger is only the structural `"blob_ref"` marker.
@@ -3465,57 +3465,57 @@ allow_hits:
     The flagged guard at `src/elspeth/web/composer/redaction.py:3146` is therefore the boundary test that decides whether Tier-3-ish `options` is inspectable for the blob marker: `if options is None or not isinstance(options, Mapping) or "blob_ref" not in options:`. It does not hide a malformed first-party source object: that case is handled offensively just above at `src/elspeth/web/composer/redaction.py:3136-3142`, where present non-`Mapping` `source` raises `AuditIntegrityError`. The suppression is bound to this exact redaction-boundary contract: if the docstring no longer says option values are composer/LLM-authored Tier 3, or if `_redact_one` stops crashing on non-`Mapping` `source`, this justification should be considered stale.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:36:54.877714+00:00'
+  judge_recorded_at: '2026-07-28T04:27:18.485363+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.94
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance(options, Mapping)` tests composer/LLM-authored option contents whose shape is not guaranteed, so it is a legitimate Tier-3 boundary guard rather than a redundant check of Tier-1 serializer output. The visible code separately treats a present non-`Mapping` `source` as a first-party contract violation by raising `AuditIntegrityError`, while malformed or absent `options` is preserved unchanged and is neither coerced nor replaced with fabricated data. Because the excerpt does not show the enclosing function's decorators, the decorator alternative cannot safely be recommended.
+    RULE MISFIRES — the flagged `isinstance(options, Mapping)` is a Tier-3 boundary test over composer/LLM-authored option contents, even though those contents are carried within first-party serializer output. The visible code distinguishes this from a malformed first-party `source` shape, which raises `AuditIntegrityError`, while absent, non-mapping, or blob-ref-less options are explicitly documented as “nothing to redact” and are not relied upon as trusted mappings. The guard neither coerces nor fabricates data and only permits mapping operations after establishing the required shape. The excerpt does not show the enclosing function’s decorators, so the decorator alternative must not be presumed applicable.
   judge_signature_version: 2
   scope_fingerprint: 22c275ddb1207dc15aef5edb9f2c6b1b484832b1068af227050a2d6e733c208e
   judge_transport: codex_cli
-  ast_path: 'body[126]/body[1]/body[4]/test/values[1]/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:fcc8f236f2f06f90ea35a85a4a1643fb629691f1ca3ffd7e2361b660027778fc'
-- key: web/composer/redaction.py:R5:redact_source_storage_path:_redact_one:fp=500d0949fde5ec8a
+  ast_path: 'body[164]/body[1]/body[4]/test/values[1]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:f5ca94b470204a4cc591675bd8b813e7a194b8b07e6edca05d50176b0d77a705'
+- key: web/composer/redaction.py:R5:redact_source_storage_path:_redact_one:fp=2384787d76cd4d23
   owner: john
   reason: |-
     `src/elspeth/web/composer/redaction.py:3136` is not a Tier-1 defensive pass-through. `_redact_one` uses `if not isinstance(source, Mapping):` only to reify the serializer invariant and immediately crash at `src/elspeth/web/composer/redaction.py:3137` with `raise AuditIntegrityError(...)`. The site-specific invariant is stated directly above the finding: serialized `source` / named-source values from `CompositionState.to_dict`, `_serialize_source`, and `_serialize_full_pipeline_state` must be dict-like, and a non-Mapping could otherwise pass an unredacted internal storage path through this redaction surface. This suppression is valid only while the non-Mapping branch continues to raise `AuditIntegrityError` instead of returning or coercing the value.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:37:06.376940+00:00'
+  judge_recorded_at: '2026-07-28T03:42:09.317011+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM — the flagged `isinstance(source, Mapping)` is an offensive invariant assertion, not silent recovery: every non-`None`, non-Mapping value immediately raises `AuditIntegrityError` with detailed provenance. The rationale and adjacent comment specifically establish that `source` is first-party serializer output whose contract requires a mapping, while the visible branch neither coerces nor passes through a malformed value. The decorator alternative does not apply because `source` is described as first-party serialized state rather than external-origin data entering through a Tier-3 parameter.
+    PRESCRIBED FORM — the visible code establishes that every first-party serializer feeding this redaction surface produces source values as mappings, and the rationale specifically ties this check to that serializer invariant. The `isinstance` branch does not suppress, coerce, or fabricate: it immediately raises a meaningful `AuditIntegrityError` when system-owned code violates the contract, which is the policy-prescribed offensive response. This is not a decorator case because the rationale and excerpt identify `source` as first-party serializer output rather than an external-data parameter.
   judge_signature_version: 2
   scope_fingerprint: 22c275ddb1207dc15aef5edb9f2c6b1b484832b1068af227050a2d6e733c208e
   judge_transport: codex_cli
-  ast_path: 'body[126]/body[1]/body[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:5cdc51361590b9b1b71014f3bf596275f456031935b66fa025bcef6c748feec0'
-- key: web/composer/redaction.py:R9:_redact_via_policy:fp=348b643db69ef91b
+  ast_path: 'body[164]/body[1]/body[1]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:84ee6f7c90e65fb2e21aaa1c72b1e0996b348e9282ecefdcdf3c97905e0867d5'
+- key: web/composer/redaction.py:R9:_redact_via_policy:fp=35bb59f664135bcd
   owner: john
   reason: |-
     `src/elspeth/web/composer/redaction.py:1799-1804` is a Tier-3 redaction boundary for tool-call arguments, not a Tier-1 audit read. The function explicitly treats incoming `arguments` as externally shaped data: `redacted: dict[str, Any] = dict(arguments)` copies the caller payload, then `unknown_keys = [key for key in arguments if key not in known_argument_keys]` derives removable keys from that same external payload before `redacted.pop(key, None)`. The default is only used while pruning unknown external argument names under a closed argument allowlist; drift would invalidate this if `redacted` stopped being initialized from `dict(arguments)` immediately before the `unknown_keys` loop, or if `unknown_keys` stopped being derived from `arguments` in the same block.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:37:19.684753+00:00'
+  judge_recorded_at: '2026-07-28T03:42:32.935478+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — every `key` in `unknown_keys` comes directly from iterating `arguments`, while `redacted` was initialized immediately beforehand as `dict(arguments)`, so each key is guaranteed to exist when popped. The `None` default therefore cannot conceal a missing-key or schema bug at this site; it only accompanies removal from a copied Tier-3 payload. R9 is not eligible for the `@trust_boundary` structural alternative, which applies only to R1 and R5.
+    RULE MISFIRES: `redacted` is a fresh copy of Tier-3 `arguments`, and `unknown_keys` is derived from those same arguments immediately before deletion, so every selected key is present in `redacted`. The `pop` default therefore neither fabricates data nor conceals a missing-key contract violation; it participates only in pruning externally supplied keys outside the closed allowlist. R9 is not eligible for the `@trust_boundary` decorator, which suppresses only R1 and R5.
   judge_signature_version: 2
   scope_fingerprint: ddc0bd51934a0d701386ef1fbc25ea6f47769855edcad223b4f308cdbb1c2720
   judge_transport: codex_cli
-  ast_path: 'body[69]/body[2]/body[2]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:ab53f1ed491191c5ff169208c8f311bdf3a41616ee2873cb81d7d6224f98d543'
+  ast_path: 'body[106]/body[2]/body[2]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:259556c2cf1911770e88a443f539ad4a5e43579bdc96798b10bb3f91c88773c7'
 - key: web/composer/service.py:R4:ComposerServiceImpl:_run_advisor_checkpoint:fp=50c1a511a8289962
   owner: john
   reason: |-
@@ -3535,44 +3535,44 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[98]/body[49]/body[6]/body[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:d656a486bd8a75bf5893e7ed03e112cf990bc359d0376d91733f5a8806591dc9'
-- key: web/composer/service.py:R5:ComposerServiceImpl:_run_advisor_checkpoint:fp=bb6f86a7fc837665
+- key: web/composer/service.py:R5:ComposerServiceImpl:_run_advisor_checkpoint:fp=7d33fa026abd5d83
   owner: john
   reason: |-
     `web/composer/service.py:4300` is classifying `last_exc`, the exception captured from the advisor-checkpoint attempt inside `ComposerServiceImpl._run_advisor_checkpoint`, to decide whether the optional advisor path is unavailable. The suppression is legitimate only while this site remains the boundary check shown here: `if last_exc is not None and (isinstance(last_exc, _unavailable_types) or type(last_exc).__name__ in _unavailable_names):`. This is not a Tier-1 audit-data read or defensive validation of internal Landscape state; it is prescribed boundary exception classification for an external/optional service failure. If future code reuses this `isinstance()` check for persisted audit data, checkpoint JSON, internal DTO shape, or other engine-owned invariants, this rationale no longer applies and the finding must block.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:38:20.755553+00:00'
+  judge_recorded_at: '2026-07-28T03:43:01.370661+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.97
+  judge_confidence: 0.96
   judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance()` classifies a captured exception from the optional external advisor path; it is not defensively re-checking the shape of Tier-1 or Tier-2 data or masking a first-party contract violation. The visible code uses a tight allowlist of transport/authentication/availability exception types and names, while all parse, validation, shape, and unrecognised failures take the fail-closed `malformed` branch, so the check does not silently coerce or fabricate data. The finding is not shown to be rooted in an external-data function parameter, so the structural decorator criteria are not established.
+    RULE MISFIRES — the `isinstance()` does not defensively re-check Tier-2 data or conceal a first-party contract violation; it narrowly classifies a captured failure from an external optional advisor service. The visible code recognizes only explicit transport/unavailability types and names, while every unrecognized, parsing, validation, or shape failure is classified fail-closed as `malformed`, so it neither silently suppresses a bad shape nor fabricates data. The decorator alternative does not apply because the checked subject is the local exception `last_exc`, not external data rooted in a function parameter as established by the excerpt.
   judge_signature_version: 2
   scope_fingerprint: 0132d1dae882f68df0bfd40b38cef5c8e45a7bf2177740ee85f666c83d9a6dad
   judge_transport: codex_cli
-  ast_path: 'body[131]/body[55]/body[10]/test/values[1]/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:b46cf5a8f2667df8afd7d708d6c921a12faa9f0c2f1274b64bb4b9d5510c2f0d'
-- key: web/composer/source_inspection.py:R6:_redact_url_candidate:fp=429f11141b8a7a3d
+  ast_path: 'body[132]/body[55]/body[10]/test/values[1]/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:51b7b5942120f4de8adde52a0f93e4dbab5489e0daa9ccf37884915a85a696f3'
+- key: web/composer/source_inspection.py:R6:_redact_url_candidate:fp=a297512770a70c95
   owner: john
   reason: |-
     This is a legitimate Tier-3 boundary suppression. In `src/elspeth/web/composer/source_inspection.py:308`, `_redact_url_candidate(raw_url: str)` operates on a URL candidate extracted from arbitrary source/blob text, and its own contract says the guarded operation is over "arbitrary blob cell content" where `parts.port` raises on malformed external input. The suppression is site-specific to `src/elspeth/web/composer/source_inspection.py:321-325`: "`parts.port` RAISES `ValueError` on a malformed or out-of-range port" and "a bad port is simply dropped (host hint preserved) rather than propagated up through inspection." The caught `ValueError` at `333` is therefore not hiding Tier-1 audit corruption; it is normalizing malformed Tier-3 input into a redacted diagnostic host hint. This ACCEPT depends on the function remaining a URL-redaction/helper over arbitrary source text and continuing to drop only the invalid port while preserving the redacted scheme/host result.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:46:00.073014+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T03:43:13.900466+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.86
+  judge_confidence: 0.96
   judge_rationale: |-
-    RULE MISFIRES / PRESCRIBED FORM: the except catches ValueError from urllib's parts.port on a URL candidate extracted from arbitrary blob text — Tier-3 external data whose shape is not first-party-guaranteed. This is a narrow, typed catch on a documented raising operation at the redaction boundary; the meaning-preserving handling is to drop the malformed port while preserving the host hint, which the docstring explicitly commits to. It is not silent Tier-1 suppression, not fabrication (no synthetic port is invented — port becomes None), and the exception type caught matches the specific stdlib-raised type. Suppression scope is the single line and the rationale ties directly to R6's concern.
+    PRESCRIBED FORM — The excerpt establishes that `raw_url` is a URL candidate extracted from arbitrary external blob content, and `parts.port` can raise `ValueError` for malformed or out-of-range Tier-3 input. The helper deliberately produces a security-redacted host hint rather than preserving the source URL, so omitting an invalid port while retaining the scheme and host conforms to that documented representation and does not fabricate a port value. The catch is narrowly limited to the expected parsing failure and is consistent with the visible never-raise diagnostic-helper contract. R6 is not eligible for the structural `@trust_boundary` decorator.
   judge_signature_version: 2
   scope_fingerprint: 35078b395441db7532a329713a170788b614dcd5de9a871804aedf752c5e2166
-  judge_transport: openrouter
-  ast_path: 'body[38]/body[4]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:59dc2572ec30c4632f5e811597fc916a9fb1d9b7e1d950b0848f9773d2266589'
+  judge_transport: codex_cli
+  ast_path: 'body[46]/body[4]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:3f5d6fd3f99fb05254113d311016ca3d8890e1d059dfa1858e0615f06e60d9eb'
 - key: web/composer/source_inspection.py:R6:observed_columns_from_path:fp=ed87be75f8108281
   owner: john
   reason: |-
@@ -3630,25 +3630,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[61]/body[2]/body[2]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:db3c59c29a2f4479d1f605fb485b817dd765942759eb90d65576579a20a96093'
-- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=0d2791d269e2a5cf
+- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=2d74a5837a066cc4
   owner: john
   reason: |-
     RULE MISFIRES (legitimate AST type-dispatch). These isinstance() calls in `_row_fields_referenced_by_condition` are structural type-dispatch over a Python `ast` parse tree (`ast.walk(ast.parse(condition, mode="eval"))`), not defensive guards on first-party typed data. Classifying nodes by type — `isinstance(node, ast.Subscript)`, `isinstance(node.value, ast.Name)`, `isinstance(node.slice, ast.Constant)`, `isinstance(node, ast.Call)`, `isinstance(node.func, ast.Attribute)`, etc. — is the canonical, library-intended way to walk an AST, and the tier-model deep-dive skill explicitly endorses isinstance for type dispatch. There is no first-party typed contract being bypassed: the function extracts `row['field']` / `row.get('field')` references from the tree to report which row fields a gate condition touches. The `condition` string itself is Tier-3 (composer/operator-authored gate expression), but the isinstance checks classify Python AST node *types*, not the external value's shape. R5 is a purely syntactic detector that fires on every isinstance regardless of intent; this is a false positive, and a signed allowlist entry is the designed, auditable record that this particular isinstance is legitimate AST dispatch rather than defensive suppression. Rewriting to match/case would not improve correctness (the checks are correct), would mix structural patterns with the existing value guards (`node.value.id == "row"`, `node.func.attr == "get"`, `len(node.args) == 1`) awkwardly, and rests on an unverified assumption that class patterns escape R5 — so the honest signed suppression is the right disposition.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:16:01.596681+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T03:45:40.798894+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.9
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES. The isinstance() calls here are canonical AST node type-dispatch over the tree returned by ast.parse/ast.walk — classifying ast.Subscript, ast.Name, ast.Constant, ast.Call, ast.Attribute nodes to extract row['field'] / row.get('field') references from a gate expression. This is the library-intended pattern for AST traversal, not a defensive guard on first-party typed data nor a shape-check on Tier-3 value contents. R5 is a syntactic detector and fires regardless; the code excerpt independently confirms the AST-dispatch context. Duplicate rationale count is expected because the same function contains many such node-type checks and each carries its own fingerprint.
+    RULE MISFIRES — the flagged `isinstance(node.func.value, ast.Name)` is subtype dispatch over nodes produced by `ast.walk(ast.parse(...))`, not a defensive shape re-check that masks a contract violation. The visible conjunction uses AST node classes to recognize the specific syntax `row.get(...)`, and only then reads attributes appropriate to the recognized node variants. Although `condition` is external-origin text, this check classifies the parser-produced AST rather than guarding the external parameter's shape, so the `@trust_boundary` structural alternative does not apply; the duplicate rationale count does not undermine the independently clear code evidence.
   judge_signature_version: 2
   scope_fingerprint: 8334f8dde16d85ca8d79dad8c834fe69a8fb8401f97a5feceaacf45a589a7d10
-  judge_transport: openrouter
-  ast_path: 'body[58]/body[2]/body[1]/test/values[3]'
-  judge_metadata_signature: 'hmac-sha256:v2:e8079b7f934f9f6ec1c29f8f5a747199d2f50b91b27972c5a95dcea92b8050d6'
+  judge_transport: codex_cli
+  ast_path: 'body[61]/body[2]/body[1]/test/values[3]'
+  judge_metadata_signature: 'hmac-sha256:v2:576fe9fbda2147079b08be5f556cc5487f876ea7eba58c279bc59423b2ff0050'
 - key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=0078011d32d458e2
   owner: john
   reason: |-
@@ -3668,25 +3668,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[61]/body[2]/body[0]/test/values[3]'
   judge_metadata_signature: 'hmac-sha256:v2:a0fe88fe86dabc487c74828c4d82d631120ee29eb69a5837c49ddda8cd190737'
-- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=358af5618e399e1c
+- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=0fa7a425deaf7281
   owner: john
   reason: |-
     RULE MISFIRES (legitimate AST type-dispatch). These isinstance() calls in `_row_fields_referenced_by_condition` are structural type-dispatch over a Python `ast` parse tree (`ast.walk(ast.parse(condition, mode="eval"))`), not defensive guards on first-party typed data. Classifying nodes by type — `isinstance(node, ast.Subscript)`, `isinstance(node.value, ast.Name)`, `isinstance(node.slice, ast.Constant)`, `isinstance(node, ast.Call)`, `isinstance(node.func, ast.Attribute)`, etc. — is the canonical, library-intended way to walk an AST, and the tier-model deep-dive skill explicitly endorses isinstance for type dispatch. There is no first-party typed contract being bypassed: the function extracts `row['field']` / `row.get('field')` references from the tree to report which row fields a gate condition touches. The `condition` string itself is Tier-3 (composer/operator-authored gate expression), but the isinstance checks classify Python AST node *types*, not the external value's shape. R5 is a purely syntactic detector that fires on every isinstance regardless of intent; this is a false positive, and a signed allowlist entry is the designed, auditable record that this particular isinstance is legitimate AST dispatch rather than defensive suppression. Rewriting to match/case would not improve correctness (the checks are correct), would mix structural patterns with the existing value guards (`node.value.id == "row"`, `node.func.attr == "get"`, `len(node.args) == 1`) awkwardly, and rests on an unverified assumption that class patterns escape R5 — so the honest signed suppression is the right disposition.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:15:54.985138+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T03:45:51.965240+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.9
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES. The isinstance() calls classify Python `ast` node types while walking a parsed AST (`ast.walk(ast.parse(condition, mode='eval'))`) — this is the canonical, library-intended dispatch pattern for AST traversal, not a shape guard on first-party or external value data. The nodes being type-tested are constructed by CPython's `ast` module itself, whose class hierarchy is the contract; there is no Tier-2 typed contract being redundantly re-checked, and no Tier-3 value whose shape is being silently coerced. The code correctly identifies `row['field']` / `row.get('field')` references and returns the field names, letting the caller act on them. R5's syntactic detector fires on any isinstance regardless of intent, which is precisely the case the allowlist mechanism exists to record.
+    RULE MISFIRES — the flagged `isinstance(node.func, ast.Attribute)` is structural type dispatch over nodes produced by `ast.walk(ast.parse(...))`, not a defensive re-check that masks a first-party contract violation. The visible chain of AST-class checks distinguishes valid syntax forms before accessing subtype-specific attributes, which is required for heterogeneous Python AST nodes and does not suppress, coerce, or fabricate malformed data. Although `condition` is a function parameter, the finding concerns classification of the parser-produced AST rather than an R5 shape guard on the external parameter, so the structural trust-boundary decorator is not appropriate. The duplicated rationale wording supplies no supporting weight, but the code independently establishes the exemption.
   judge_signature_version: 2
   scope_fingerprint: 8334f8dde16d85ca8d79dad8c834fe69a8fb8401f97a5feceaacf45a589a7d10
-  judge_transport: openrouter
-  ast_path: 'body[58]/body[2]/body[1]/test/values[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:0280e263c1749a68887efa89cf3bca6c3d516f26a6ac3dd3381d79b4895f9cc4'
+  judge_transport: codex_cli
+  ast_path: 'body[61]/body[2]/body[1]/test/values[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:f17ebcf953eada4e10e8f0f92f4f821c862a490dcb1592416be78a13b411dac3'
 - key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=48fc4cdea4813b11
   owner: john
   reason: |-
@@ -3706,25 +3706,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[58]/body[2]/body[1]/test/values[0]'
   judge_metadata_signature: 'hmac-sha256:v2:a33331422be797ba387301717bdda6131b88cb96a1546b139c9014d23707497c'
-- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=a169bf17cd2a8355
+- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=9ca98b4467ec252c
   owner: john
   reason: |-
     RULE MISFIRES (legitimate AST type-dispatch). These isinstance() calls in `_row_fields_referenced_by_condition` are structural type-dispatch over a Python `ast` parse tree (`ast.walk(ast.parse(condition, mode="eval"))`), not defensive guards on first-party typed data. Classifying nodes by type — `isinstance(node, ast.Subscript)`, `isinstance(node.value, ast.Name)`, `isinstance(node.slice, ast.Constant)`, `isinstance(node, ast.Call)`, `isinstance(node.func, ast.Attribute)`, etc. — is the canonical, library-intended way to walk an AST, and the tier-model deep-dive skill explicitly endorses isinstance for type dispatch. There is no first-party typed contract being bypassed: the function extracts `row['field']` / `row.get('field')` references from the tree to report which row fields a gate condition touches. The `condition` string itself is Tier-3 (composer/operator-authored gate expression), but the isinstance checks classify Python AST node *types*, not the external value's shape. R5 is a purely syntactic detector that fires on every isinstance regardless of intent; this is a false positive, and a signed allowlist entry is the designed, auditable record that this particular isinstance is legitimate AST dispatch rather than defensive suppression. Rewriting to match/case would not improve correctness (the checks are correct), would mix structural patterns with the existing value guards (`node.value.id == "row"`, `node.func.attr == "get"`, `len(node.args) == 1`) awkwardly, and rests on an unverified assumption that class patterns escape R5 — so the honest signed suppression is the right disposition.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:16:17.637581+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:30:37.300912+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.9
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES. The isinstance() calls are type-dispatch over Python ast node classes returned by ast.walk(ast.parse(...)) — the canonical, library-intended way to classify AST nodes (Subscript, Name, Constant, Call, Attribute). This is not a defensive shape-guard on first-party typed data nor a Tier-3 value guard: it classifies node *types* to extract row field references from a parsed condition. R5 is firing purely syntactically; the code excerpt confirms the surrounding logic (node.value.id == 'row', node.func.attr == 'get', len(node.args) == 1) is standard AST walking. The high duplicate_count reflects that this same function contains many such checks, not that the rationale is boilerplate laundering — each is legitimately the same pattern.
+    RULE MISFIRES — the flagged expression classifies an `ast.Constant` payload while traversing the heterogeneous node hierarchy produced by `ast.walk`, rather than defensively re-checking data whose shape a first-party contract guarantees. The surrounding conjunction first establishes the relevant AST node forms and then uses the string-type test to identify literal field names, so the check neither suppresses a contract violation nor fabricates a value. Although the rationale is duplicated across several related findings, the visible code independently establishes legitimate AST type dispatch. The trust-boundary decorator is inappropriate because this finding concerns the structure of the parsed AST node, not a defensive shape guard directly applied to the external `condition` parameter.
   judge_signature_version: 2
   scope_fingerprint: 8334f8dde16d85ca8d79dad8c834fe69a8fb8401f97a5feceaacf45a589a7d10
-  judge_transport: openrouter
-  ast_path: 'body[58]/body[2]/body[1]/test/values[7]'
-  judge_metadata_signature: 'hmac-sha256:v2:ff85edfcc41b8bb6b0650006f3cb0fbc9a869088535b17cc158b982ddb0c400a'
+  judge_transport: codex_cli
+  ast_path: 'body[61]/body[2]/body[1]/test/values[7]'
+  judge_metadata_signature: 'hmac-sha256:v2:96151b4cd907e6e8eca4e2ac997b7d644f0e8802221e609d0ee0ffbb3f269ab4'
 - key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=f9f673c94ef78686
   owner: john
   reason: |-
@@ -3763,44 +3763,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[58]/body[2]/body[0]/test/values[4]'
   judge_metadata_signature: 'hmac-sha256:v2:6b9f883907e9f8f88577bc1d83fcba5f5f69c8aae0ccd11559bb3d10b97cc3c9'
-- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=fa0907bceaf54595
+- key: web/composer/tools/generation.py:R5:_row_fields_referenced_by_condition:fp=f0d27021afeaad67
   owner: john
   reason: |-
     RULE MISFIRES (legitimate AST type-dispatch). These isinstance() calls in `_row_fields_referenced_by_condition` are structural type-dispatch over a Python `ast` parse tree (`ast.walk(ast.parse(condition, mode="eval"))`), not defensive guards on first-party typed data. Classifying nodes by type — `isinstance(node, ast.Subscript)`, `isinstance(node.value, ast.Name)`, `isinstance(node.slice, ast.Constant)`, `isinstance(node, ast.Call)`, `isinstance(node.func, ast.Attribute)`, etc. — is the canonical, library-intended way to walk an AST, and the tier-model deep-dive skill explicitly endorses isinstance for type dispatch. There is no first-party typed contract being bypassed: the function extracts `row['field']` / `row.get('field')` references from the tree to report which row fields a gate condition touches. The `condition` string itself is Tier-3 (composer/operator-authored gate expression), but the isinstance checks classify Python AST node *types*, not the external value's shape. R5 is a purely syntactic detector that fires on every isinstance regardless of intent; this is a false positive, and a signed allowlist entry is the designed, auditable record that this particular isinstance is legitimate AST dispatch rather than defensive suppression. Rewriting to match/case would not improve correctness (the checks are correct), would mix structural patterns with the existing value guards (`node.value.id == "row"`, `node.func.attr == "get"`, `len(node.args) == 1`) awkwardly, and rests on an unverified assumption that class patterns escape R5 — so the honest signed suppression is the right disposition.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:16:08.977257+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T04:31:22.947869+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.92
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES. The isinstance() calls classify Python `ast` node types produced by `ast.parse(...)` — this is the library-intended, canonical way to walk and dispatch over an AST. R5's concern is defensive shape-guarding of first-party typed data or unvalidated Tier-3 payloads; neither applies here. The AST nodes are not external data being shape-checked before use as if they were guaranteed — they are a discriminated union whose type IS the semantic content, and isinstance is the correct discriminator. The rationale correctly identifies the pattern and the code excerpt confirms it (traversal of `ast.walk(tree)` with type-directed field extraction).
+    RULE MISFIRES. The excerpt independently establishes that `node.args[0]` is part of the heterogeneous Python AST produced by `ast.parse` and traversed by `ast.walk`; `isinstance(node.args[0], ast.Constant)` performs AST variant dispatch and does not conceal a violated first-party contract. Although `condition` may be externally authored, the flagged subject is a parser-created AST node rather than an external parameter whose shape is being defensively guarded, so the structural trust-boundary decorator is not applicable; the duplicated rationale does not alter the code-supported disposition.
   judge_signature_version: 2
   scope_fingerprint: 8334f8dde16d85ca8d79dad8c834fe69a8fb8401f97a5feceaacf45a589a7d10
-  judge_transport: openrouter
-  ast_path: 'body[58]/body[2]/body[1]/test/values[6]'
-  judge_metadata_signature: 'hmac-sha256:v2:585edd705056725fff204585f69243877750aca95df8cf969632612201a0a283'
-- key: web/composer/tools/generation.py:R5:_source_schema_mode:fp=5add5b902c5220ef
-  owner: john
-  reason: |-
-    PRESCRIBED FORM at a Tier-3 boundary. `schema = source.options["schema"]` is composer/operator-authored source configuration re-read from persisted session state. Per the custody doctrine, persistence does not promote external-origin values to Tier-1: we authored the SourceSpec container and the load-time validating schema, but the operator or composer LLM authored the values, the store is hand-editable, and the validating contract can drift between write and read — so this re-read is a FRESH Tier-3 boundary, not a Tier-1 invariant check. `isinstance(schema, Mapping)` is subtype-aware shape validation of that external-origin value before subscripting `schema["mode"]`: CompositionState options are deep-frozen, so a JSON object arrives as a MappingProxyType and a bare `type(schema) is dict` check would wrongly reject it. The function returns None on shape mismatch (honest absence recorded, no coercion, no fabrication), so it is a non-raising optional accessor for which the @trust_boundary decorator is genuinely infeasible — that decorator's contract (contracts/trust_boundary.py) requires test_ref to cite a raising-rejection test, and this function never raises by design. Per-line allowlist suppression is therefore the prescribed honest mechanism, matching the judge's prior adjudications of this exact shape in this file (web.yaml:553/1431/2850).
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:15:09.677205+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.78
-  judge_rationale: |-
-    PRESCRIBED FORM at a Tier-3 re-read boundary. `source.options` values are composer/operator-authored config re-read from persisted session state — per the custody doctrine, the values' contents are external-origin even though SourceSpec is our container, so shape-guarding at the read site is honest. The `isinstance(schema, Mapping)` check is subtype-aware validation before subscripting (accepting MappingProxyType from frozen state, which `type() is dict` would reject), and the function records honest absence as `None` with no coercion or fabrication. The @trust_boundary decorator is a poor fit here because this accessor returns None rather than raising, so its raising-rejection test contract doesn't apply; per-line suppression is the appropriate mechanism.
-  judge_signature_version: 2
-  scope_fingerprint: 73af8a89976d8fde03f69d82a770c4d87ae882787517344e18a8324f8913bc9d
-  judge_transport: openrouter
-  ast_path: 'body[56]/body[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:cf63b4297b03283d428533da6b35a19cf2acbb34475b433218333bfb95311745'
+  judge_transport: codex_cli
+  ast_path: 'body[61]/body[2]/body[1]/test/values[6]'
+  judge_metadata_signature: 'hmac-sha256:v2:ddbf5186543bc2ad5096b47d2c607b08beeca533bfea9ae019ed7ee682e71cd4'
 - key: web/composer/tools/generation.py:R5:_value_transform_preserves_field:fp=08d1162a997be02f
   owner: john
   reason: |-
@@ -3877,25 +3858,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[44]/body[1]/body[3]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:2b312b4fdbc65e22b2ab486d6cad14f42d05a7c6e14f8f5abc497acb6d8757a5'
-- key: web/composer/tutorial_service.py:R6:_read_audited_artifact_bytes:fp=c897336fad794f09
+- key: web/composer/tutorial_service.py:R6:_read_audited_artifact_bytes:fp=c01d744c30cfe47e
   owner: john
   reason: |-
     `web/composer/tutorial_service.py:331-334` is not hiding a missing audited artifact; it is probing one candidate path in a candidate set. The function builds `fs_paths` from `artifact.path_or_uri` at `web/composer/tutorial_service.py:318`, then iterates every candidate at `web/composer/tutorial_service.py:326`. The caught `FileNotFoundError` only skips the current candidate: `except FileNotFoundError:` / `continue`. The Tier-1 failure is reified after the candidate set is exhausted: `web/composer/tutorial_service.py:343-344` raises `TutorialRunIntegrityError(f"Tutorial run {run_id} artifact {artifact.artifact_id!r} is missing from disk")` when no allowed candidate exists. If a future edit removes `saw_existing`, changes the `continue` into a silent function return, or removes the post-loop `TutorialRunIntegrityError`, this suppression no longer applies.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:47:18.439620+00:00'
+  judge_recorded_at: '2026-07-28T03:50:00.888300+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — the caught FileNotFoundError only rejects one candidate path while the function continues searching equivalent candidates. The visible code records whether any candidate exists and, after exhaustion, raises TutorialRunIntegrityError for a missing audited artifact; existing but unverifiable candidates likewise produce an integrity error. Thus the exception is not silently suppressing a Tier-1 failure or fabricating a result.
+    RULE MISFIRES — the caught FileNotFoundError represents one unavailable path within a candidate search, not a missing audited artifact being silently suppressed. The visible code records whether any candidate exists and, after exhausting the set, raises TutorialRunIntegrityError for the missing-from-disk state; it separately raises for disallowed locations and audited-content mismatches. The rationale is site-specific and accurately explains the flagged control flow, while R6 is not eligible for the trust-boundary decorator.
   judge_signature_version: 2
   scope_fingerprint: 309b5b59a797654e3d01c4b8f0de7b450c9dea99c84fd4ab641ae8cc7bc71cb5
   judge_transport: codex_cli
-  ast_path: 'body[56]/body[5]/body[3]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:23dc1acac6f28dc4c8189914317f863dc456e9ff5937d0fffe46f7aacefaad3b'
+  ast_path: 'body[57]/body[5]/body[3]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:848088006c9d7adebda66f31a7ad2cdfb6b5699fefe2d52f3ac78ed9b5a73318'
 - key: web/composer/yaml_generator.py:R9:_strip_web_metadata:fp=11698fe330f21839
   owner: john
   reason: |-
@@ -3925,19 +3906,19 @@ allow_hits:
     This suppression is valid only while this site remains in the runtime YAML import boundary and `fork_to` remains an optional external YAML gate field validated at line 172; moving the same `.get()` onto persisted audit/engine state would invalidate this rationale and should BLOCK.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:47:54.067202+00:00'
+  judge_recorded_at: '2026-07-28T03:51:15.245967+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — the visible code places `_nodes_from_runtime_list` directly under `@trust_boundary` with `source_param="section"` and suppression of R1/R5, so this is an already-declared Tier-3 boundary rather than a first-party contract read. The `entry` mapping is derived from the untrusted `section`, and `fork_to` is an optional external field whose absence remains `None` while a present value is validated by `_string_tuple` before constructing `NodeSpec`; no silent default or fabricated value is introduced. Because the enclosing decorator is visible and already appropriate, this residual analyzer finding may be allowlisted without suggesting another decorator.
+    RULE MISFIRES — the visible code already marks `_nodes_from_runtime_list` as a Tier-3 boundary with `source_param="section"` and suppression of R1/R5, so no decorator nudge is appropriate. The flagged `entry.get("fork_to")` reads an optional field from mappings derived from that untrusted section, preserves absence as `None`, and validates any present value through `_string_tuple` before constructing `NodeSpec`. This is boundary validation of external-origin data, not defensive access to a first-party guaranteed shape or fabrication.
   judge_signature_version: 2
-  scope_fingerprint: 10c5e0f666c78abbb6027bb7ffefb151ff89fa3f67a93e3387a024d32228cab9
+  scope_fingerprint: 91e7b1ebe9dd8c8defc1e485d47de6381cc1da839469593ebf30f2c6f1e2212d
   judge_transport: codex_cli
   ast_path: 'body[23]/body[2]/body[2]/body[1]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:740e88e54d35b1f0db25d78a6efb750e8b4f30aaadcd254deb4961146db478a1'
+  judge_metadata_signature: 'hmac-sha256:v2:1689d3f9452440ec4e685817ba20a9cc84c1efce1ab219f624f6c45b8ddbae4c'
 - key: web/composer/yaml_importer.py:R1:_nodes_from_runtime_list:fp=cda8e1cbfbdb9a3c
   owner: john
   reason: |-
@@ -3963,57 +3944,57 @@ allow_hits:
     (2026-07-09: the enclosing/adjacent boundary functions in this file now carry @trust_boundary; this site is helper- or derived-rooted beyond the decorator's static dataflow walk, so a per-line entry is the prescribed remaining mechanism for it.) This is a legitimate Tier-3 import-boundary use, not a Tier-1 audit-data read. `composition_state_from_runtime_yaml` is explicitly marked as a trust boundary for `source="operator-supplied runtime pipeline YAML import request"` at `web/composer/yaml_importer.py:257-263`, and `_nodes_from_runtime_list` receives data parsed from that YAML via `doc.get("transforms")`, `doc.get("gates")`, and related sections at `web/composer/yaml_importer.py:305-309`. Inside the helper, the raw YAML list item is first reified as a mapping with `entry = _require_mapping(raw_entry, path)` at `web/composer/yaml_importer.py:157`. The flagged read, `expected_output_count = entry.get("expected_output_count")` at `web/composer/yaml_importer.py:212`, is reading an optional operator-supplied YAML field at that boundary and immediately validating it at `web/composer/yaml_importer.py:213-214` before constructing `NodeSpec`. Drift that removed the `@trust_boundary`, changed the caller away from parsed runtime YAML, or stopped the immediate integer validation would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:49:22.040847+00:00'
+  judge_recorded_at: '2026-07-28T03:51:03.572787+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
   judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM — The enclosing `_nodes_from_runtime_list` is already marked as a Tier-3 trust boundary for its `section` parameter at web/composer/yaml_importer.py:174-187, so no decorator nudge is appropriate. The external YAML item flows from `section` through iteration and `_require_mapping` at web/composer/yaml_importer.py:191-193, and the optional field read at web/composer/yaml_importer.py:248 is immediately type-validated with a typed failure at lines 249-250. Absence remains `None` in `NodeSpec`, so the code neither fabricates a value nor silently promotes malformed input.
+    RULE MISFIRES — `_nodes_from_runtime_list` is itself marked as a Tier-3 boundary for parameter `section`, with R1 explicitly suppressed and malformed optional fields covered by its invariant at web/composer/yaml_importer.py:174-187. The flagged `entry` is derived from `section` through sequence iteration and `_require_mapping` at web/composer/yaml_importer.py:191-193, so `entry.get("expected_output_count")` reads operator-authored external data rather than Tier-2 or Tier-1 data. The code preserves absence as `None` and immediately raises `RuntimeYamlImportError` when a present value is not an integer, establishing trust without fabrication or silent recovery. Because the enclosing helper already carries the appropriate decorator, no decorator nudge is warranted.
   judge_signature_version: 2
-  scope_fingerprint: 10c5e0f666c78abbb6027bb7ffefb151ff89fa3f67a93e3387a024d32228cab9
+  scope_fingerprint: 91e7b1ebe9dd8c8defc1e485d47de6381cc1da839469593ebf30f2c6f1e2212d
   judge_transport: codex_cli
   ast_path: 'body[23]/body[2]/body[5]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:cebaad169f05d85f5c8628dd9d7e37d8ae3c1a5ec368dd2f7839d0dc34193c41'
+  judge_metadata_signature: 'hmac-sha256:v2:adcbcb0f152335e1d22ed31dd0bb29adad8a6f43973ba19a463d516996df4e6d'
 - key: web/composer/yaml_importer.py:R1:_nodes_from_runtime_list:fp=2170149de7bc692b
   owner: john
   reason: |-
     (2026-07-09: the enclosing/adjacent boundary functions in this file now carry @trust_boundary; this site is helper- or derived-rooted beyond the decorator's static dataflow walk, so a per-line entry is the prescribed remaining mechanism for it.) ACCEPT as a genuine Tier-3 import-boundary validation site. The flagged code is inside `web/composer/yaml_importer.py:_nodes_from_runtime_list`, which is reached from `composition_state_from_runtime_yaml`; that entrypoint is explicitly declared as a Tier-3 trust boundary for `pipeline_yaml` at `web/composer/yaml_importer.py:257-263` with `source="operator-supplied runtime pipeline YAML import request"` and `suppresses=("R1", "R5")`. The parsed YAML is validated into mappings at the boundary (`doc = _require_mapping(parsed, "pipeline YAML")` at line 282, then `entry = _require_mapping(raw_entry, path)` at line 157). At the finding site, `trigger=dict(_optional_mapping(entry.get("trigger"), f"{path}.trigger")) if entry.get("trigger") is not None else None,` (line 230) is not reading Tier-1 audit data defensively; it is testing an optional user-supplied YAML field and immediately validating the present value through `_optional_mapping` / `_require_mapping`, which raises `RuntimeYamlImportError` on malformed input. If this helper is later used for Tier-1 persisted/audit data, or if line 230 stops routing present values through `_optional_mapping`, this suppression should go stale.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:50:03.701956+00:00'
+  judge_recorded_at: '2026-07-28T03:50:39.112887+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — this is Tier-3 boundary validation of operator-authored YAML, not defensive access to trusted pipeline or audit data. The enclosing `_nodes_from_runtime_list` already has `@trust_boundary` with `source_param="section"` and suppression of R1/R5 at web/composer/yaml_importer.py:174, while `entry` is derived from that parameter through `_require_sequence` and `_require_mapping` at lines 191-193. At line 266, absence remains `None`, while a present value passes through `_optional_mapping`, which raises `RuntimeYamlImportError` for a non-mapping value at lines 72-81; the code therefore validates or rejects rather than silently fabricating or recovering. Because the structural decorator is already present, no decorator nudge is appropriate.
+    RULE MISFIRES — this is required Tier-3 boundary validation, not defensive access to trusted data. The enclosing helper is already marked as a Tier-3 boundary for the external `section` parameter and suppresses R1/R5 at web/composer/yaml_importer.py:174-187; `entry` is derived from that parameter through sequence and mapping validation at lines 191-193. At line 281, an absent optional `trigger` is preserved as `None`, while a present value is validated by `_optional_mapping`, consistent with the decorator’s stated invariant at lines 179-182. Because the structural decorator already exists and appropriately covers this boundary, no decorator suggestion is warranted.
   judge_signature_version: 2
-  scope_fingerprint: 10c5e0f666c78abbb6027bb7ffefb151ff89fa3f67a93e3387a024d32228cab9
+  scope_fingerprint: 91e7b1ebe9dd8c8defc1e485d47de6381cc1da839469593ebf30f2c6f1e2212d
   judge_transport: codex_cli
   ast_path: 'body[23]/body[2]/body[7]/value/args[0]/keywords[13]/value/test/left'
-  judge_metadata_signature: 'hmac-sha256:v2:c796f85e1c2324f6f4a6c7ffa91c801b707e77525aed9b79e6d8f79bc4c56ae3'
+  judge_metadata_signature: 'hmac-sha256:v2:832c2dbec65aa3f3f675f44c3bddd117d57c486a48a9ccfd57f127be6aac7ca5'
 - key: web/composer/yaml_importer.py:R1:_nodes_from_runtime_list:fp=d59695958cb08cdf
   owner: john
   reason: |-
     (2026-07-09: the enclosing/adjacent boundary functions in this file now carry @trust_boundary; this site is helper- or derived-rooted beyond the decorator's static dataflow walk, so a per-line entry is the prescribed remaining mechanism for it.) This is a legitimate Tier-3 YAML import boundary, not Tier-1 audit-data access. The caller is explicitly marked `@trust_boundary(tier=3, source="operator-supplied runtime pipeline YAML import request", source_param="pipeline_yaml", suppresses=("R1", "R5"))` at web/composer/yaml_importer.py:257-265. The flagged site is inside `_nodes_from_runtime_list`, which receives parsed operator YAML entries from `composition_state_from_runtime_yaml` via `doc.get("aggregations")` and validates each raw item with `entry = _require_mapping(raw_entry, path)` at web/composer/yaml_importer.py:155-157. At web/composer/yaml_importer.py:230, `trigger=dict(_optional_mapping(entry.get("trigger"), f"{path}.trigger")) if entry.get("trigger") is not None else None,` is checking an optional user-supplied YAML field and immediately routing the present value through `_optional_mapping`, whose implementation at web/composer/yaml_importer.py:76-79 either accepts `None` or calls `_require_mapping` to raise `RuntimeYamlImportError` on malformed input. Future drift that removes the trust-boundary annotation, changes `entry` to Tier-1 persisted audit data, or stops validating the present `trigger` value through `_optional_mapping` would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:50:31.552216+00:00'
+  judge_recorded_at: '2026-07-28T03:53:39.711815+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — the flagged `.get()` is part of a Tier-3 YAML-import boundary, not defensive access to contract-guaranteed data. The enclosing `_nodes_from_runtime_list` is already marked for R1/R5 with `source_param="section"` at web/composer/yaml_importer.py:174-187, and `entry` is derived from that parameter through `_require_sequence` and `_require_mapping` at lines 191-193. At line 266, absence is preserved as `None`, while a present value passes through `_optional_mapping`, which raises `RuntimeYamlImportError` for malformed non-mappings at lines 78-81; no error is silently suppressed and no value is fabricated. Because the appropriate structural decorator is already present and its invariant expressly covers `trigger`, no additional decorator nudge applies.
+    RULE MISFIRES — `_nodes_from_runtime_list` is already marked as a Tier-3 trust boundary for the external `section` parameter, explicitly suppressing R1 and covering optional `trigger` validation in its invariant (web/composer/yaml_importer.py:174-187). The flagged `entry` is derived from that parameter through sequence and mapping validation (web/composer/yaml_importer.py:191-193), and a present `trigger` is passed through `_optional_mapping`, which raises `RuntimeYamlImportError` for a malformed shape (web/composer/yaml_importer.py:78-81,281). The visible decorator already provides the prescribed structural suppression, so no decorator nudge is appropriate.
   judge_signature_version: 2
-  scope_fingerprint: 10c5e0f666c78abbb6027bb7ffefb151ff89fa3f67a93e3387a024d32228cab9
+  scope_fingerprint: 91e7b1ebe9dd8c8defc1e485d47de6381cc1da839469593ebf30f2c6f1e2212d
   judge_transport: codex_cli
   ast_path: 'body[23]/body[2]/body[7]/value/args[0]/keywords[13]/value/body/args[0]/args[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:1af01b96ac263da1cd5ef5942f06548f5a56dff007955ca35aaa9d190b9a30f7'
+  judge_metadata_signature: 'hmac-sha256:v2:f0915ec811ee21b9888ba70a375a83c65f7995a5d26cd46a8c275f7256072eee'
 - key: web/composer/yaml_importer.py:R1:_nodes_from_runtime_list:fp=8dd3fff320a4cb10
   owner: john
   reason: |-
@@ -4039,38 +4020,38 @@ allow_hits:
     (2026-07-09: the enclosing/adjacent boundary functions in this file now carry @trust_boundary; this site is helper- or derived-rooted beyond the decorator's static dataflow walk, so a per-line entry is the prescribed remaining mechanism for it.) web/composer/yaml_importer.py:159 is inside `_nodes_from_runtime_list`, a web composer YAML/runtime import helper that is translating caller-provided node dictionaries rather than reading Tier-1 audit data. The specific access `routes = entry.get("routes")` is for an optional boundary field, and the next step validates shape before use with `if isinstance(routes, list):`. This is a legitimate Tier-3 import-boundary pattern: tolerate an absent optional `routes` key at ingestion, then only traverse it after type validation. If this code drifts into reading engine-owned/audit-owned node records, this suppression becomes invalid and the access should be reified or allowed to crash.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:51:05.937305+00:00'
+  judge_recorded_at: '2026-07-28T03:53:52.636789+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — `entry` is derived from the external `section` parameter inside the visibly decorated Tier-3 boundary, and the decorator explicitly documents permissive reads of optional `routes` followed by validation when present. The `.get("routes")` preserves an absent external field as `None`, while non-absent content is passed to `_string_mapping` for validation rather than silently fabricated or trusted. Because the enclosing function already has an appropriate `@trust_boundary` covering R1 and R5, no decorator nudge or additional structural remediation is warranted.
+    RULE MISFIRES — the visible decorator establishes `_nodes_from_runtime_list` as a Tier-3 boundary for the external `section` parameter and explicitly covers R1 plus optional `routes` handling. The flagged `entry` is derived from that parameter through sequence and mapping validation, and absence is preserved as `None` while a present value is passed to `_string_mapping` for validation before use. Because the function already carries the appropriate `@trust_boundary`, no decorator nudge or per-function structural change is warranted.
   judge_signature_version: 2
-  scope_fingerprint: 10c5e0f666c78abbb6027bb7ffefb151ff89fa3f67a93e3387a024d32228cab9
+  scope_fingerprint: 91e7b1ebe9dd8c8defc1e485d47de6381cc1da839469593ebf30f2c6f1e2212d
   judge_transport: codex_cli
   ast_path: 'body[23]/body[2]/body[2]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:9d7aa0f387fab1107d1648de126f924bfd564d9f315b24ed93cc3561f3bd01d7'
+  judge_metadata_signature: 'hmac-sha256:v2:6fb26ba17e61d2f9c90ff20d865404bc022390afcd4b0b444a354d0b6f9daf0f'
 - key: web/composer/yaml_importer.py:R1:_nodes_from_runtime_list:fp=81fefd86f81f7306
   owner: john
   reason: |-
     (2026-07-09: the enclosing/adjacent boundary functions in this file now carry @trust_boundary; this site is helper- or derived-rooted beyond the decorator's static dataflow walk, so a per-line entry is the prescribed remaining mechanism for it.) `src/elspeth/web/composer/yaml_importer.py:185` is inside the runtime YAML import boundary: `_nodes_from_runtime_list()` receives entries derived from operator-supplied YAML, first reifies each item with `entry = _require_mapping(raw_entry, path)` at line 157, then for coalesce nodes treats `branches` as an optional external field with `branches = entry.get("branches")` at line 185. The value is immediately validated/coerced in the same boundary block: mappings go through `_string_mapping(branches, f"{path}.branches")`, missing values become `None`, and all other provided values go through `_string_tuple(branches, f"{path}.branches")` at lines 187-192. This is a legitimate Tier-3 import-boundary optional-field read, not Tier-1 audit-data defensive programming.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:51:18.629427+00:00'
+  judge_recorded_at: '2026-07-28T03:51:52.500263+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — `entry` is reified from operator-supplied YAML and remains Tier-3 at this import boundary, so `entry.get("branches")` is a legitimate optional-field read rather than concealment of a first-party contract bug. The visible code records absence as `None` and validates every supplied value through `_string_mapping` or `_string_tuple`, rather than fabricating a default or silently passing malformed data onward. Although R1 is decorator-suppressible, the excerpt does not show the enclosing function's decorators, and the rationale specifically states that this helper/derived-rooted site lies beyond the decorator's static dataflow walk, so the policy's excerpt-visibility caveat requires no decorator suggestion.
+    RULE MISFIRES — web/composer/yaml_importer.py:174-187 marks `_nodes_from_runtime_list` as a Tier-3 trust boundary for an untrusted YAML section, and lines 191-193 derive `entry` from that parameter through required sequence and mapping validation. The `.get()` at line 221 reads an external optional field, while lines 223-230 validate its shape and raise `RuntimeYamlImportError` when it is absent, malformed, or too short, so no fabricated default or half-trusted value proceeds. The enclosing function already has `@trust_boundary` suppressing R1/R5, and this finding is on a helper-derived root beyond the decorator's direct data-flow scope, so no additional decorator nudge applies.
   judge_signature_version: 2
-  scope_fingerprint: 10c5e0f666c78abbb6027bb7ffefb151ff89fa3f67a93e3387a024d32228cab9
+  scope_fingerprint: 91e7b1ebe9dd8c8defc1e485d47de6381cc1da839469593ebf30f2c6f1e2212d
   judge_transport: codex_cli
   ast_path: 'body[23]/body[2]/body[3]/body[2]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:22e56a3b89b63dcbd3b3a14683b7756277d46d7ea9a4a909a927e93e520648f3'
+  judge_metadata_signature: 'hmac-sha256:v2:cf503e48a7052456bbdbe758140285d906c26e7144c7eb9936b02843148d30cb'
 - key: web/composer/yaml_importer.py:R1:_optional_str:fp=ea969a74d753d545
   owner: john
   reason: |-
@@ -4115,57 +4096,57 @@ allow_hits:
     (2026-07-09: the enclosing/adjacent boundary functions in this file now carry @trust_boundary; this site is helper- or derived-rooted beyond the decorator's static dataflow walk, so a per-line entry is the prescribed remaining mechanism for it.) `web/composer/yaml_importer.py:151` is the runtime YAML import boundary: `_nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeType)` accepts untyped YAML-derived data, then immediately reifies each list item with `entry = _require_mapping(raw_entry, path)` at line 157 before constructing `NodeSpec`. The flagged `isinstance()` at line 213 validates the user/YAML field `expected_output_count = entry.get("expected_output_count")` from line 212 and rejects non-`int` values plus `bool` before assigning it into `NodeSpec` at line 230. This is Tier-3 boundary validation/coercion shape, not defensive handling of Tier-1 audit data.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:52:32.682841+00:00'
+  judge_recorded_at: '2026-07-28T03:55:30.250253+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM — `web/composer/yaml_importer.py:174`-`186` already marks `_nodes_from_runtime_list` as a Tier-3 boundary for `section` and suppresses R5, so no decorator nudge is appropriate. The function derives `entry` from the untrusted `section` through sequence iteration and `_require_mapping` at lines 187-193, then lines 248-250 validate the optional YAML value’s exact integer shape, explicitly reject `bool`, and raise `RuntimeYamlImportError` before constructing `NodeSpec`. This is offensive boundary validation that promotes external-origin data without coercion, silent recovery, or fabrication, and the site-specific rationale explains why the decorator’s static dataflow walk did not cover this derived value.
+    PRESCRIBED FORM — the visible code validates YAML-derived Tier-3 data before assigning it to `NodeSpec`, rejecting non-integer values (including `bool`) with a meaningful `RuntimeYamlImportError`. Absence remains `None`, so the guard neither fabricates a value nor silently recovers from malformed input. Although the rationale's line numbers are stale, its described data flow exactly matches the visible `entry.get("expected_output_count")` check and assignment, and the excerpt does not expose the enclosing function's decorators, so the decorator nudge is not warranted.
   judge_signature_version: 2
-  scope_fingerprint: 10c5e0f666c78abbb6027bb7ffefb151ff89fa3f67a93e3387a024d32228cab9
+  scope_fingerprint: 91e7b1ebe9dd8c8defc1e485d47de6381cc1da839469593ebf30f2c6f1e2212d
   judge_transport: codex_cli
   ast_path: 'body[23]/body[2]/body[6]/test/values[1]/values[0]/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:e40cf34e1b16486747a2c36a07d46989cb1be37fe0f197451a9f8ae196d46176'
+  judge_metadata_signature: 'hmac-sha256:v2:7a8daaeadd58be0fcffb50e20d3474cb67de03384ce412315f2ce783869a9be5'
 - key: web/composer/yaml_importer.py:R5:_nodes_from_runtime_list:fp=85eaa058e8a9e55b
   owner: john
   reason: |-
     (2026-07-09: the enclosing/adjacent boundary functions in this file now carry @trust_boundary; this site is helper- or derived-rooted beyond the decorator's static dataflow walk, so a per-line entry is the prescribed remaining mechanism for it.) This `isinstance()` is inside the Tier-3 YAML import path, not a Tier-1 audit-data read. The public entrypoint is explicitly marked `@trust_boundary(tier=3, source="operator-supplied runtime pipeline YAML import request", source_param="pipeline_yaml", suppresses=("R1", "R5"))` at src/elspeth/web/composer/yaml_importer.py:257-265, parses untrusted YAML with `parsed = yaml.safe_load(pipeline_yaml)` at line 272, and then calls `_nodes_from_runtime_list(doc.get("coalesce"), "coalesce", "coalesce")` at line 309. Within that boundary, `_nodes_from_runtime_list` validates the user-supplied `branches` shape: `if isinstance(branches, Mapping):` at line 187 routes mapping-form coalesce branches into `_string_mapping(...)`, while `elif branches is None` and `else: branch_spec = _string_tuple(...)` handle absent/list forms. This is prescribed Tier-3 boundary validation/coercion of operator YAML, not defensive handling of engine-owned data.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:53:22.064927+00:00'
+  judge_recorded_at: '2026-07-28T03:55:17.196432+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
   judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM — The helper is already marked as a Tier-3 boundary for its external `section` parameter and explicitly suppresses R5 at web/composer/yaml_importer.py:174-187. The reported value is derived from that parameter through `_require_sequence`, `_require_mapping`, and `entry.get("branches")`; the Mapping branch is validated by `_string_mapping`, while other non-null forms pass to `_string_tuple`, whose validators raise `RuntimeYamlImportError` on malformed shapes or values at web/composer/yaml_importer.py:72-87 and 125-140. This is explicit validation of operator-authored YAML rather than a defensive re-check of a first-party contract, and no decorator nudge applies because the enclosing helper is already decorated.
+    RULE MISFIRES — web/composer/yaml_importer.py:174-187 already marks `_nodes_from_runtime_list` as a Tier-3 trust boundary rooted at `section`, suppressing R5. The untrusted value flows through `_require_sequence` and `_require_mapping` at lines 191-193 into `branches` at line 221; the check at line 223 distinguishes supported mapping and sequence forms, while lines 224-230 validate them and raise `RuntimeYamlImportError` for malformed, absent, or undersized input. Because the appropriate decorator already exists but its static dataflow walk did not reach this derived value, the site-specific suppression is justified and no decorator nudge is appropriate.
   judge_signature_version: 2
-  scope_fingerprint: 10c5e0f666c78abbb6027bb7ffefb151ff89fa3f67a93e3387a024d32228cab9
+  scope_fingerprint: 91e7b1ebe9dd8c8defc1e485d47de6381cc1da839469593ebf30f2c6f1e2212d
   judge_transport: codex_cli
   ast_path: 'body[23]/body[2]/body[3]/body[4]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:0a060cf6811f6bcac99388c16eb670fa8a2f74b734f2c188a51c45b91c05e0f0'
+  judge_metadata_signature: 'hmac-sha256:v2:25d6e9e680456c5f726437d8093a8253061e91e25cb275b547659ba1a5e9ad9b'
 - key: web/composer/yaml_importer.py:R5:_nodes_from_runtime_list:fp=796df4589c2fcc2a
   owner: john
   reason: |-
     This is a genuine Tier-3 boundary validation inside the signed `@trust_boundary` for operator-supplied runtime YAML. `src/elspeth/web/composer/yaml_importer.py:257-263` declares `composition_state_from_runtime_yaml` as `tier=3`, `source="operator-supplied runtime pipeline YAML import request"`, `source_param="pipeline_yaml"`, and `suppresses=("R1", "R5")`. The flagged helper is reached from that boundary at `src/elspeth/web/composer/yaml_importer.py:305-310`, where parsed YAML sections are converted into composer nodes. At `src/elspeth/web/composer/yaml_importer.py:212-214`, the code reads a YAML-derived field, `expected_output_count = entry.get("expected_output_count")`, and rejects malformed external input with `if expected_output_count is not None and (not isinstance(expected_output_count, int) or isinstance(expected_output_count, bool)):` followed by `raise RuntimeYamlImportError(...)`. This is not Tier-1 audit data or internal state defensive programming; it is immediate validation of an optional scalar from untrusted YAML before constructing `NodeSpec`.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-24'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-26T22:53:36.867850+00:00'
+  judge_recorded_at: '2026-07-28T03:54:35.262097+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
   judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM — the rationale specifically traces `entry` to operator-supplied runtime YAML entering through the signed Tier-3 boundary, and the visible code is consistent with immediate validation before constructing `NodeSpec`. The flagged `isinstance` checks reject a non-integer or boolean `expected_output_count` by raising `RuntimeYamlImportError`; they neither coerce nor fabricate a value nor silently recover from malformed input. Because the finding is in the helper `_nodes_from_runtime_list`, while the visible excerpt does not establish that this helper itself is an undecorated boundary function whose parameter should carry the decorator, no decorator nudge is warranted.
+    RULE MISFIRES — the rationale specifically traces `entry` and `expected_output_count` to operator-supplied runtime YAML, and the visible code validates that Tier-3 value before constructing `NodeSpec`. The `isinstance` checks reject non-integer values and the `bool` subclass edge case by raising `RuntimeYamlImportError`; they neither coerce, fabricate, nor silently recover. The excerpt does not show the flagged helper's definition or decorators, so the decorator-visibility caveat requires no structural decorator suggestion.
   judge_signature_version: 2
-  scope_fingerprint: 10c5e0f666c78abbb6027bb7ffefb151ff89fa3f67a93e3387a024d32228cab9
+  scope_fingerprint: 91e7b1ebe9dd8c8defc1e485d47de6381cc1da839469593ebf30f2c6f1e2212d
   judge_transport: codex_cli
   ast_path: 'body[23]/body[2]/body[6]/test/values[1]/values[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:65878a5c241c5a68715476687a65e170515a80e3b3519cca789597804770d1ab'
+  judge_metadata_signature: 'hmac-sha256:v2:9e88accce4a332c29e46dd5569d4bced142706a55a6a148f640303689c430433'
 - key: web/composer/yaml_importer.py:R5:_optional_str:fp=9d2b47cf4d343858
   owner: john
   reason: |-
@@ -4546,25 +4527,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[51]/body[5]/body[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:cd7e73b5868fbc061f6973222fb317dc60d9c6ce342e32d515fbfe752c3875b0'
-- key: web/execution/routes.py:R6:create_execution_router:websocket_run_progress:fp=09700e6c5bce83fc
+- key: web/execution/routes.py:R6:create_execution_router:websocket_run_progress:fp=4f3f4e0183236241
   owner: john
   reason: |-
     This is a Tier-3 WebSocket transport boundary, not Tier-1 audit data. In `web/execution/routes.py:1399-1408`, `websocket_run_progress` is already handling an external connection failure: `except (ConnectionError, OSError) as exc:` logs `"websocket_handler_error"`, then attempts to send a best-effort close frame with `await websocket.close(code=1011, reason="Internal server error")`. The flagged handler at `web/execution/routes.py:1407-1408` catches only close-frame transport failures from that cleanup attempt and records them explicitly with `slog.error("websocket_close_failed", run_id=run_id, error=str(close_err))`. Re-raising here would not protect an audit invariant; it would turn a failed client/server socket close into a handler crash after the primary error was already logged. The site-specific boundary is the external WebSocket close operation, and the cleanup still runs via `finally: broadcaster.unsubscribe(run_id, queue)` at `web/execution/routes.py:1409-1410`.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:49:47.205909+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T03:58:49.426950+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.83
+  judge_confidence: 0.94
   judge_rationale: |-
-    PRESCRIBED FORM. R6 fires on the bare-looking except, but the code is the policy-prescribed handling for a Tier-3 external transport boundary: the outer handler has already logged the primary websocket_handler_error to the structured log, the inner try wraps only a best-effort cleanup close-frame send to an already-failing socket, and the except records the cleanup failure explicitly via slog.error('websocket_close_failed', run_id=..., error=...) rather than swallowing it. Re-raising from cleanup would mask the original error and abort the finally-driven broadcaster.unsubscribe; recording-and-continuing is the correct disposition for a failed socket close, and the exception types are narrowed to transport errors (WebSocketDisconnect, ConnectionError, OSError). Nothing in the visible code contradicts the rationale.
+    PRESCRIBED FORM — the narrowly scoped handler covers failures from a best-effort close operation at an external WebSocket transport boundary, after the primary connection failure has already been explicitly recorded. The close failure is also recorded as `websocket_close_failed`, and control then reaches the unconditional broadcaster cleanup in `finally`; re-raising would only convert an already-failed transport cleanup into a handler crash, not protect Tier-1 audit integrity. R6 is not eligible for the `@trust_boundary` decorator mechanism.
   judge_signature_version: 2
   scope_fingerprint: 83f60eb3783033a0c8f77f6fbe28d16b631e737396d9c069574dd6989ce41bf0
-  judge_transport: openrouter
-  ast_path: 'body[80]/body[9]/body[10]/handlers[1]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:afc74134a82dc8579a0fe2a93ad51cb356f64513a3a768dd2a41391aecaf1250'
+  judge_transport: codex_cli
+  ast_path: 'body[82]/body[9]/body[10]/handlers[1]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:7f94e533b366ea5e4b8fb1e53a6e27b660f3dfdd758d24e0c1d78cd0f850bdd4'
 - key: web/execution/routes.py:R6:create_execution_router:websocket_run_progress:fp=9fa1e4319ca6fcf2
   owner: john
   reason: |-
@@ -4660,44 +4641,44 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[82]/body[9]/body[10]/handlers[1]'
   judge_metadata_signature: 'hmac-sha256:v2:811fc631610e2b16fda8a09a085b5d552be061bedc8621262f4779ba8bf0fe69'
-- key: web/execution/routes.py:R6:create_execution_router:websocket_run_progress:fp=788d8d6efa4a89e1
+- key: web/execution/routes.py:R6:create_execution_router:websocket_run_progress:fp=ebb0bb3cf474aee9
   owner: john
   reason: |-
     This is a prescribed external WebSocket boundary translation, not a silent suppression. In `src/elspeth/web/execution/routes.py:1321`, `websocket_run_progress` reads the authoritative status snapshot with `_load_run_status_snapshot_with_accounting(UUID(run_id), app=websocket.app, service=service)`. The flagged handler at `src/elspeth/web/execution/routes.py:1325` catches only `ValidationError` / `_RunStatusIntegrityError`, logs the operator-visible integrity detail with `"websocket_run_status_integrity_error"`, `phase="seed"`, and `error=str(integrity_exc)`, then sends an explicit WebSocket internal-error close: `await websocket.close(code=1011, reason="Run status failed internal accounting validation")` and returns before `current_snapshot.response` is used. The site-specific invariant is documented immediately above the handler: `"Tier-1 accounting projection failed integrity validation"` and `"the external client"` receives the close frame while `"the operator needs the detail"`. Future drift that removed the `slog.error(...)`, changed the `1011` internal-error close to a benign client close, or continued past the handler would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:48:54.931556+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
+  judge_recorded_at: '2026-07-28T03:59:17.296125+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.9
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM. The except catches specific typed exceptions (ValidationError, _RunStatusIntegrityError), logs the integrity detail via slog (the correct operator channel for audit-system failures), sends an explicit WebSocket 1011 internal-error close with a descriptive reason, and returns — no fall-through to code that would use the failed snapshot. This is the routed-outcome pattern for a WebSocket boundary: the exception is not swallowed, it is translated into the protocol-appropriate error frame while the operator-visible detail is preserved. R6's concern (silent swallow without re-raise or explicit error result) does not apply: the close frame IS the explicit error result for this transport.
+    RULE MISFIRES — the handler does not silently swallow the integrity exceptions: it records the specific failure and sends the external client an explicit WebSocket internal-error outcome with close code 1011 before returning. The visible control flow also prevents `current_snapshot.response` from being used after validation fails, directly satisfying R6's allowance for an explicit error result. The rationale is site-specific and consistent with the excerpt.
   judge_signature_version: 2
   scope_fingerprint: 83f60eb3783033a0c8f77f6fbe28d16b631e737396d9c069574dd6989ce41bf0
-  judge_transport: openrouter
-  ast_path: 'body[80]/body[9]/body[10]/body[0]/handlers[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:e84c91c2256d9c90b9dd98d7a2743e2816e3bd15bb0d3694578e57e80feb9796'
-- key: web/execution/routes.py:R6:create_execution_router:websocket_run_progress:fp=bf744a3a2001913b
+  judge_transport: codex_cli
+  ast_path: 'body[82]/body[9]/body[10]/body[0]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:ab1b6a174465775d23f6b223f4686107dcf6e843822a5ec59afba69dd4fd5c32'
+- key: web/execution/routes.py:R6:create_execution_router:websocket_run_progress:fp=88c0e2e19f9b61e8
   owner: john
   reason: |-
     This is a prescribed WebSocket protocol-boundary translation, not a silent Tier-1 suppression. In `websocket_run_progress`, the handler first performs the ownership check at `src/elspeth/web/execution/routes.py:1285-1289` with `run_ownership = await service.verify_run_ownership(user, run_id)` and maps ordinary absence to `await websocket.close(code=4004, reason="Run not found")`. The disputed handler at `src/elspeth/web/execution/routes.py:1290` is narrower: `except RunSessionIntegrityError as integrity_exc:`. The site-specific comment says the condition is "Tier-1 sessions-DB corruption" and explicitly rejects laundering it into not-found: "surfacing it as 4004 would launder internal referential corruption into a benign client response" (`src/elspeth/web/execution/routes.py:1291-1298`). The code then emits the operator-visible error event `slog.error("websocket_run_ownership_session_integrity_error", run_id=run_id, session_id=integrity_exc.session_id, error=str(integrity_exc))` at `src/elspeth/web/execution/routes.py:1299-1304` and closes the already-accepted external WebSocket with internal-error code `1011` at `src/elspeth/web/execution/routes.py:1305`. Future drift should invalidate this suppression if the catch widens beyond `RunSessionIntegrityError`, drops the `slog.error(...)` fields, maps the corruption to `4004`, or stops closing with `1011`.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-10-26'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T17:17:27.973405+00:00'
-  judge_model: 'claude-opus-4-8[1m]'
+  judge_recorded_at: '2026-07-28T03:59:35.567538+00:00'
+  judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM. R6 (silent-except) fires by shape, but this handler does not silently swallow: it catches the narrow, deliberately-typed RunSessionIntegrityError, emits a structured operator-channel `slog.error` with run_id/session_id, and returns an explicit error result by closing the WebSocket with 1011 — it does not proceed-as-normal and explicitly refuses to launder the corruption into a benign 4004. The exception definition at web/execution/errors.py:202-221 confirms the design intent verbatim: it is deliberately NOT a ValueError subclass precisely so the broad `except ValueError` (Tier-3 not-found → 4004) cannot collapse it, and its docstring states 'the route surfaces it via an internal-error close (1011) and operator-channel logging instead.' Per the crash-site-vs-crash-outcome principle, mandatory termination of the operation is met while the crash site is legitimately a graceful close on an already-accepted external WebSocket rather than an unhandled tear-down; slog is defensibly the operator channel since this sessions-DB referential breach is not a run-audit (Landscape) event. Duplicate count is 0 and the code + exception contract together establish conformance.
+    RULE MISFIRES — the narrow `RunSessionIntegrityError` handler does not silently suppress the failure: it records the integrity-specific context and returns an explicit WebSocket protocol error by closing the accepted connection with code 1011. The adjacent code and comments distinguish this Tier-1 sessions-DB corruption from ordinary absence, which is separately translated to 4004, so the corruption is not laundered into a benign result. R6 is not eligible for the `@trust_boundary` structural alternative.
   judge_signature_version: 2
   scope_fingerprint: 83f60eb3783033a0c8f77f6fbe28d16b631e737396d9c069574dd6989ce41bf0
-  judge_transport: claude_agent_sdk
-  ast_path: 'body[80]/body[9]/body[8]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:8afc70425817863087aff0c1af7736ef3371c8b8a1010442f0603ae974f9dec6'
+  judge_transport: codex_cli
+  ast_path: 'body[82]/body[9]/body[8]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:463cb49261d9db59f43cd50089e0e7ee0aaeaa118b758abee19345a70ec48001'
 - key: web/execution/routes.py:R6:create_execution_router:websocket_run_progress:fp=0a456c8636dea9b6
   owner: john
   reason: |-

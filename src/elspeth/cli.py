@@ -753,6 +753,7 @@ def run(
             gates=list(config.gates),
             coalesce_settings=list(config.coalesce) if config.coalesce else None,
             queues=config.queues,
+            row_union_settings=list(config.row_unions) if config.row_unions else None,
         )
         graph.validate()
     except GraphValidationError as e:
@@ -949,11 +950,24 @@ def run(
             typer.echo(traceback.format_exc(), err=True)
         raise typer.Exit(4) from e  # Exit 4: unknown errors during execution are likely framework bugs
 
+    # F17 (elspeth-83ad093154): propagate the engine's terminal status to the
+    # process exit code. The taxonomy is owned by cli_completion_for()
+    # (0=completed/empty, 1=partial, 2=failed, 3=interrupted) and was already
+    # emitted on the RunSummary event — but the command previously returned
+    # normally, so a run where every row failed still exited 0 and CI/cron/ECS
+    # wrappers banked total failure as success.
+    from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+    _, exit_code = cli_completion_for(execution_result["status"])
+
     # Emit final execution summary in JSON mode for machine consumption
     if output_format == "json":
         import json
 
-        typer.echo(json.dumps({"event": "execution_result", **execution_result}))
+        typer.echo(json.dumps({"event": "execution_result", **execution_result, "exit_code": exit_code}))
+
+    if exit_code != 0:
+        raise typer.Exit(exit_code)
 
 
 @app.command()
@@ -1448,8 +1462,8 @@ def _execute_pipeline_with_instances(
 
     audit_export_content_store = None
     audit_export_content_store_resolver = None
-    export_settings = getattr(config.landscape, "export", None)
-    if export_settings is not None and export_settings.enabled:
+    export_settings = config.landscape.export
+    if export_settings.enabled:
         from elspeth.core.audit_export_content_store import create_audit_export_content_store
 
         audit_export_content_store, audit_export_content_store_resolver = create_audit_export_content_store(export_settings)
@@ -1532,6 +1546,7 @@ def bootstrap_and_run(settings_path: Path) -> RunResult:
         gates=list(config.gates),
         queues=config.queues,
         coalesce_settings=list(config.coalesce) if config.coalesce else None,
+        row_union_settings=list(config.row_unions) if config.row_unions else None,
     )
     graph.validate()
 
@@ -1766,6 +1781,7 @@ def validate(
             gates=list(config.gates),
             coalesce_settings=list(config.coalesce) if config.coalesce else None,
             queues=config.queues,
+            row_union_settings=list(config.row_unions) if config.row_unions else None,
         )
         graph.validate()
     except GraphValidationError as e:
@@ -2232,6 +2248,7 @@ def _build_resume_graphs(
     """
     gate_settings = list(settings_config.gates)
     coalesce_settings = list(settings_config.coalesce) if settings_config.coalesce else None
+    row_union_settings = list(settings_config.row_unions) if settings_config.row_unions else None
 
     # Both resume graphs use the ORIGINAL source topology to match the topology
     # hash and source node IDs computed during the original run. The runtime
@@ -2247,6 +2264,7 @@ def _build_resume_graphs(
         gates=gate_settings,
         coalesce_settings=coalesce_settings,
         queues=settings_config.queues,
+        row_union_settings=row_union_settings,
     )
     validation_graph.validate()
 
@@ -2259,6 +2277,7 @@ def _build_resume_graphs(
         gates=gate_settings,
         coalesce_settings=coalesce_settings,
         queues=settings_config.queues,
+        row_union_settings=row_union_settings,
     )
     execution_graph.validate()
 
@@ -2775,6 +2794,14 @@ def resume(
                 typer.echo(traceback.format_exc(), err=True)
             raise typer.Exit(4) from e  # Exit 4: unknown errors during execution are likely framework bugs
 
+        # F17 (elspeth-83ad093154): same exit-code propagation as the `run`
+        # command — the resumed run's terminal status maps through the
+        # engine-owned taxonomy (0=completed/empty, 1=partial, 2=failed,
+        # 3=interrupted) instead of unconditionally exiting 0.
+        from elspeth.engine.orchestrator.run_status import cli_completion_for
+
+        _, resume_exit_code = cli_completion_for(result.status)
+
         if output_format == "json":
             import json as json_module
 
@@ -2787,6 +2814,7 @@ def resume(
                             "rows_succeeded": result.rows_succeeded,
                             "rows_failed": result.rows_failed,
                             "status": result.status.value,
+                            "exit_code": resume_exit_code,
                         },
                     },
                     indent=2,
@@ -2798,6 +2826,9 @@ def resume(
             typer.echo(f"  Rows succeeded: {result.rows_succeeded}")
             typer.echo(f"  Rows failed: {result.rows_failed}")
             typer.echo(f"  Status: {result.status.value}")
+
+        if resume_exit_code != 0:
+            raise typer.Exit(resume_exit_code)
 
     except (EmptyResumeStateError, IncompleteSourceResumeError, NonResumableRunError) as e:
         # ADR-025 §3: catches the empty-state raise from recovery's

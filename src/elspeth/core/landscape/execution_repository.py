@@ -44,6 +44,7 @@ from elspeth.contracts import (
     RoutingMode,
     RoutingReason,
     RoutingSpec,
+    RowUnionFailureReason,
     TriggerType,
 )
 from elspeth.contracts.call_data import CallPayload
@@ -253,7 +254,7 @@ class ExecutionRepository:
         *,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
-        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | None = None,
+        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         context_after: NodeStateContext | None = None,
     ) -> NodeStatePending: ...
 
@@ -265,7 +266,7 @@ class ExecutionRepository:
         *,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
-        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | None = None,
+        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
     ) -> NodeStateCompleted: ...
@@ -278,7 +279,7 @@ class ExecutionRepository:
         *,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
-        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | None = None,
+        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         context_after: NodeStateContext | None = None,
     ) -> NodeStateFailed: ...
 
@@ -289,7 +290,7 @@ class ExecutionRepository:
         *,
         output_data: Mapping[str, object] | list[Mapping[str, object]] | None = None,
         duration_ms: float | None = None,
-        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | None = None,
+        error: ExecutionError | TransformErrorReason | CoalesceFailureReason | RowUnionFailureReason | None = None,
         success_reason: TransformSuccessReason | None = None,
         context_after: NodeStateContext | None = None,
     ) -> NodeStatePending | NodeStateCompleted | NodeStateFailed:
@@ -342,6 +343,18 @@ class ExecutionRepository:
     def has_completed_row_for_node(self, *, run_id: str, node_id: str, row_id: str) -> bool:
         """Return whether one row completed at one node in one run."""
         return self.node_states.has_completed_row_for_node(run_id=run_id, node_id=node_id, row_id=row_id)
+
+    def get_released_row_ids_for_nodes(
+        self,
+        run_id: str,
+        node_ids: frozenset[str],
+    ) -> set[tuple[str, str]]:
+        """Get (node_id, row_id) pairs where a node_state completed as COMPLETED."""
+        return self.node_states.get_released_row_ids_for_nodes(run_id, node_ids)
+
+    def has_released_row_for_node(self, *, run_id: str, node_id: str, row_id: str) -> bool:
+        """Return whether one row completed as COMPLETED at one node in one run."""
+        return self.node_states.has_released_row_for_node(run_id=run_id, node_id=node_id, row_id=row_id)
 
     def record_routing_event(
         self,

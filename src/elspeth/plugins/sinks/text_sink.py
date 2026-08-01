@@ -93,13 +93,31 @@ class TextSink(BaseSink):
     name = "text"
     determinism = Determinism.IO_WRITE
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b84f2eb34c0f00c1"
+    source_file_hash: str | None = "sha256:6d72e7fd4eb21cc9"
     config_model = TextSinkConfig
     supports_resume = True
     effect_protocol_version = SINK_EFFECT_PROTOCOL_VERSION
     effect_call_type = CallType.FILESYSTEM
     supported_effect_modes = frozenset({"append", "write"})
     supported_effect_input_kinds = frozenset({SinkEffectInputKind.PIPELINE_MEMBERS})
+
+    usage_when_to_use: str = "Use when exactly one existing string field from each row should become one canonical LF-delimited text line."
+    usage_when_not_to_use: str = (
+        "Do not use for multi-field, nested, binary, or multiline values, or as a generic rejected-row sink that must "
+        "preserve the whole row."
+    )
+    example_use: str = """sinks:
+  lines:
+    plugin: text
+    options:
+      path: outputs/lines.txt
+      field: line_text
+      schema:
+        mode: fixed
+        fields:
+          - "line_text: str"
+"""
+    capability_tags: tuple[str, ...] = ("text", "file", "line-oriented", "single-field")
 
     @classmethod
     def _resolve_sink_effect_mode(

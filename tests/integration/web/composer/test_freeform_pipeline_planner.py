@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 import structlog
+from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import StaticPool
@@ -756,7 +757,12 @@ async def test_freeform_planner_manifest_mismatch_is_durable_before_failure(
         kwargs["messages"][0]["content"] += "\nprovider-side mutation"
         requests.append(kwargs)
         if provider_outcome == "error":
-            raise RuntimeError("provider unavailable")
+            raise LiteLLMAPIError(
+                status_code=503,
+                message="provider unavailable",
+                llm_provider="test-provider",
+                model="test/planner",
+            )
         if provider_outcome == "cancel":
             raise asyncio.CancelledError()
         return _terminal_response(tmp_path, str(session.id))

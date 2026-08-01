@@ -1050,6 +1050,35 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
         operation="sqlalchemy_insert_call",
         purpose="schema test exercises run_event_type CHECK chain (line 274); composition_state setup row required",
     ),
+    # ------ tests/unit/web/sessions/test_service.py — transcript single-connection listener pin (2 sites) ------
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_service.py",
+        enclosing_symbol="TestAddMessageWithTranscript.test_insert_and_transcript_select_share_one_connection_and_transaction",
+        table="chat_messages",
+        operation="raw_string_module",
+        purpose=(
+            "Docstring prose names the INSERT INTO chat_messages statement the "
+            "event-listener pin observes; not a write site. The test attaches "
+            "before_cursor_execute/commit listeners and asserts the production "
+            "add_message_with_transcript insert and transcript SELECT share one "
+            "DBAPI connection with no commit between them — it performs no "
+            "direct writes of its own."
+        ),
+    ),
+    ReviewedWriter(
+        path="tests/unit/web/sessions/test_service.py",
+        enclosing_symbol="TestAddMessageWithTranscript.test_insert_and_transcript_select_share_one_connection_and_transaction",
+        table="chat_messages",
+        operation="raw_string_in_startswith",
+        purpose=(
+            "READ-ONLY statement matcher: `statement.lstrip().upper()."
+            "startswith('INSERT INTO CHAT_MESSAGES')` classifies statements "
+            "observed via the engine event listener to locate the production "
+            "writer's own INSERT in the event log. The test issues no direct "
+            "insert; the matched statement is emitted by "
+            "SessionServiceImpl._insert_chat_message (allowlisted above)."
+        ),
+    ),
     # ------ tests/unit/web/sessions/test_interpretation_events_table.py — Phase 5b Task 2 schema tests (4 sites) ------
     ReviewedWriter(
         path="tests/unit/web/sessions/test_interpretation_events_table.py",
@@ -1318,14 +1347,14 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "the production tool handlers."
         ),
     ),
-    # ------ test_schema.py — epoch-37 coordination schema fixture ------
+    # ------ test_schema.py — epoch-42 coordination schema fixture ------
     ReviewedWriter(
         path="tests/unit/web/sessions/test_schema.py",
         enclosing_symbol="_seed_session_state",
         table="composition_states",
         operation="sqlalchemy_insert_call",
         purpose=(
-            "epoch-37 coordination schema fixture: seeds the parent "
+            "epoch-42 coordination schema fixture: seeds the parent "
             "composition_states row required by runs_table's composite FK so "
             "direct negative inserts can isolate the new coordination CHECK "
             "constraints. The test owns the in-memory SQLite engine and is "

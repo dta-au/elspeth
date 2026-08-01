@@ -5,15 +5,21 @@
 //   target="guided"   -> "Switch to guided"  (freeform body header)
 //   target="freeform" -> "Exit to freeform"  (guided body header)
 //
-// Switching converts the CURRENT session in place (enterGuided / exitToFreeform);
-// it is non-destructive — the server retains both modes' state on the session.
+// guided -> freeform (exitToFreeform) is always non-destructive: the server
+// retains the guided state on the session. freeform -> guided (enterGuided)
+// BRANCHES on the session's history (F10b): a session that previously exited
+// guided (terminal.kind === "exited_to_freeform") RESUMES its saved wizard via
+// reenterGuided, while any other session gets a FRESH wizard via convert (the
+// current pipeline is saved to version history first). The confirm copy must
+// name whichever of those the click will actually do — identical alarming
+// copy for the safe resume made users refuse a safe action.
 // Because a stray click still yanks the user out of an in-progress chat, the
 // switch is gated by a light two-step confirm WHEN the chat has work; an empty
-// chat switches on a single click. The two directions are symmetric.
+// chat switches on a single click.
 //
 // `hasWork` is computed once by ChatPanel (messages / guided turns / a non-empty
 // composition) and passed in, so this component needs no store-shape knowledge
-// beyond the two switch actions — and avoids importing ChatPanel's helpers back.
+// beyond the two switch actions and the resume/fresh discriminator read below.
 // ============================================================================
 
 import { useId, useState } from "react";
@@ -35,6 +41,12 @@ export function ModeSwitchButton({
   const [confirming, setConfirming] = useState(false);
   const enterGuided = useSessionStore((s) => s.enterGuided);
   const exitToFreeform = useSessionStore((s) => s.exitToFreeform);
+  // F10b: the same predicate enterGuided branches on — exited-guided sessions
+  // RESUME their saved wizard (reenterGuided); everything else converts to a
+  // fresh wizard. The confirm copy must describe the path this click takes.
+  const resumesSavedGuidedSession = useSessionStore(
+    (s) => s.guidedSession?.terminal?.kind === "exited_to_freeform",
+  );
   const reactId = useId();
   const disabledReasonId = `${reactId}-mode-switch-disabled-reason`;
   const confirmDescriptionId = `${reactId}-mode-switch-confirm-description`;
@@ -48,7 +60,9 @@ export function ModeSwitchButton({
     target === "guided" ? "Switch to guided mode?" : "Exit to freeform mode?";
   const confirmNote =
     target === "guided"
-      ? "Guided mode starts a fresh pipeline. Your current pipeline is saved to version history and can be restored."
+      ? resumesSavedGuidedSession
+        ? "You'll pick up your guided setup where you left it. Nothing is discarded."
+        : "Guided mode starts a fresh pipeline. Your current pipeline is saved to version history and can be restored."
       : "Your guided progress remains saved. You can continue in the freeform composer with the current pipeline context.";
 
   function doSwitch(): void {

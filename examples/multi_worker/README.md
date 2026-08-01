@@ -44,7 +44,16 @@ pass the **same** `settings.yaml`.
 
 # Scale to 3 followers (4-way pack)
 WORKERS=3 ./examples/multi_worker/run.sh
+
+# Opt in to retry/error-routing faults; this may end PARTIAL and fail the
+# launcher's clean-run assertion.
+ELSPETH_MULTI_WORKER_CHAOS_CONFIG=examples/multi_worker/chaos_config_faults.yaml \
+  ./examples/multi_worker/run.sh
 ```
+
+The default `chaos_config.yaml` adds latency but injects no terminal faults, so
+the self-verifying concurrency demonstration has a deterministic exit-0
+contract. `chaos_config_faults.yaml` retains the resilience profile separately.
 
 The follower invocation inside `run.sh` is:
 
@@ -66,9 +75,8 @@ OpenRouter credential or service is used.
 A follower can only attach while the run is `running`. The poll loop requires
 RUNNING *and* ≥1 `leased` token work item before launching followers, so the
 leader is demonstrably processing before any follower joins. The input is sized
-to 120 exploded items and `chaos_config.yaml` includes `slow_response_pct: 1.0`
-/ `slow_response_sec: [1, 3]` so the leader cannot drain the queue before
-followers attach under normal ChaosLLM latency.
+to 120 exploded items and `chaos_config.yaml` adds per-call latency, so the
+leader cannot drain the queue before followers attach under normal execution.
 
 If the assertion fails with "only 1 worker completed rows", the leader finished
 before the follower joined (fast-drain race). Do not add sleeps — raise
@@ -101,8 +109,9 @@ Per-worker attribution (scheduler_events grouped by from_lease_owner):
 ✓ PASS: leader + 1 follower(s) shared 120 rows across 2 workers
 ```
 
-Success: `output/results.json` (completed rows) and `output/quarantined.json`
-(rows that exhausted retries against ChaosLLM faults).
+Success: `output/results.json` contains all 120 completed rows. The optional
+fault profile may also create `output/quarantined.json` for retry-exhausted
+rows.
 
 ## Exit-code semantics (`elspeth join`)
 
@@ -132,5 +141,6 @@ retained here.*
 - **`json_explode`** — fans one JSONL record whose `items` array has 120
   elements into 120 individual work tokens, giving the pack enough shared work
   to demonstrate concurrent processing.
-- **ChaosLLM** (`chaosllm_sentiment` shape) — keyless mock LLM with configurable
-  latency and fault injection; `--workers 1` required (errorworks constraint).
+- **ChaosLLM** (`chaosllm_sentiment` shape) — keyless mock LLM with deterministic
+  default latency and a separate opt-in fault profile; `--workers 1` keeps the
+  local server single-process.

@@ -68,6 +68,14 @@ def test_manifest_schema_and_scenario_inventory_modules_exist() -> None:
     assert importlib.util.find_spec("elspeth.web._aws_ecs_acceptance.scenario_inventory") is not None
 
 
+def test_bound_scenario_loader_fails_loudly_for_invalid_manifest_contract() -> None:
+    with pytest.raises(TypeError, match="not subscriptable"):
+        scenario_inventory._load_bound_scenario_inventory(
+            {"scenarios": None, "aws": {}},
+            "A",
+        )
+
+
 def test_manifest_and_inventory_owners_are_facade_reexports_by_identity() -> None:
     for name in (
         "_load_retained_evidence",
@@ -1026,3 +1034,8 @@ def test_complete_retained_evidence_requires_paired_metric_and_trace_counts(tmp_
             require_complete=True,
             now=lambda: datetime(2026, 7, 14, 1, 2, tzinfo=UTC),
         )
+
+
+def test_mutable_manifest_check_fails_loudly_for_corrupt_final_evidence() -> None:
+    with pytest.raises(KeyError, match="phase"):
+        acceptance._require_mutable_control_manifest({"final_evidence": {}})

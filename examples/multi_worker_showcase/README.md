@@ -39,7 +39,16 @@ items; those committed children are what the followers can claim.
 ```bash
 ./examples/multi_worker_showcase/run.sh           # leader + 3 followers (4-way)
 WORKERS=1 ./examples/multi_worker_showcase/run.sh  # smaller swarm for quick dev
+
+# Opt in to retry/error-routing faults; this may end PARTIAL and fail the
+# launcher's clean-run assertion.
+ELSPETH_MULTI_WORKER_SHOWCASE_CHAOS_CONFIG=examples/multi_worker_showcase/chaos_config_faults.yaml \
+  ./examples/multi_worker_showcase/run.sh
 ```
+
+The default `chaos_config.yaml` adds latency but injects no terminal faults, so
+the self-verifying concurrency demonstration has a deterministic exit-0
+contract. `chaos_config_faults.yaml` retains the resilience profile separately.
 
 The script:
 1. Generates a process-scoped audit fingerprint key when the operator has not

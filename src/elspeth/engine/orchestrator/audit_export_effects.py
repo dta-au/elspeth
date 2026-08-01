@@ -246,7 +246,10 @@ def _manifest_verifier(
         if type(value) is not dict:
             raise TypeError("audit export final manifest must be an exact object")
         manifest = cast(dict[str, ClosedAuditExportJSON], value)
-        signature = manifest.pop("signature", None)
+        if "signature" in manifest:
+            signature = manifest.pop("signature")
+        else:
+            signature = None
         signing_body = C("audit-export-final-manifest-signing-body-v2", manifest)
         if signing_mode is AuditExportSigningMode.UNSIGNED:
             if signing_key is not None or signature is not None or descriptor.signature is not None:

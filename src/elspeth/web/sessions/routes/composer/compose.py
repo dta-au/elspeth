@@ -695,7 +695,10 @@ async def recompose(
             )
             raise HTTPException(
                 status_code=500,
-                detail="Server invariant violated. See application audit log for diagnostic detail.",
+                detail={
+                    "error_type": "server_invariant_violated",
+                    "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+                },
             ) from exc
         except asyncio.CancelledError as exc:
             # Mirror of send_message cancellation path. Join the durable

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 from contextlib import suppress
@@ -26,9 +27,9 @@ from elspeth.contracts.audit_export import (
 from elspeth.contracts.hashing import canonical_json
 from elspeth.core.config import AuditExportContentStoreSettings, LandscapeExportSettings
 
-_DIRECTORY_FLAGS: Final = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-_FILE_READ_FLAGS: Final = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-_FILE_CREATE_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+_DIRECTORY_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_FILE_READ_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW
+_FILE_CREATE_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
 _COPY_BYTES: Final = 64 * 1024
 # Explicit safe bound on orphan-marker size. A marker lists one canonical
 # "sha256:<64 hex>" reference per content object — at most
@@ -130,6 +131,36 @@ def _read_exact_file(parent_fd: int, name: str, descriptor: AuditExportContentDe
         os.close(file_fd)
 
 
+def _read_stable_bounded_file(parent_fd: int, name: str, *, max_bytes: int) -> bytes:
+    """Read one immutable store-owned marker without following links."""
+    file_fd = os.open(name, _FILE_READ_FLAGS, dir_fd=parent_fd)
+    try:
+        before = os.fstat(file_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+            raise OSError("audit-export marker size or type is invalid")
+        content = b""
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(file_fd, min(_COPY_BYTES, remaining))
+            if not chunk:
+                raise OSError("audit-export marker ended before its recorded size")
+            content += chunk
+            remaining -= len(chunk)
+        if os.read(file_fd, 1):
+            raise OSError("audit-export marker exceeds its recorded size")
+        after = os.fstat(file_fd)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+        ):
+            raise OSError("audit-export marker changed while it was read")
+        return content
+    finally:
+        os.close(file_fd)
+
+
 class _FilesystemContentReader:
     __slots__ = ("_registration", "_store")
 
@@ -215,7 +246,13 @@ class FilesystemAuditExportContentStore:
                 try:
                     try:
                         marker_fd = os.open(content_hash, _FILE_CREATE_FLAGS, 0o600, dir_fd=owned_fd)
-                    except FileExistsError:
+                    except FileExistsError as exc:
+                        try:
+                            existing_marker = _read_stable_bounded_file(owned_fd, content_hash, max_bytes=len(b"owned\n"))
+                        except OSError as marker_exc:
+                            raise OSError("existing audit-export owned marker is divergent") from marker_exc
+                        if existing_marker != b"owned\n":
+                            raise OSError("existing audit-export owned marker is divergent") from exc
                         return
                     try:
                         _write_all(marker_fd, b"owned\n")
@@ -319,6 +356,27 @@ class FilesystemAuditExportContentStore:
                 try:
                     marker_fd = os.open("orphan.json", _FILE_CREATE_FLAGS, 0o600, dir_fd=candidate_fd)
                 except FileExistsError:
+                    try:
+                        existing_bytes = _read_stable_bounded_file(
+                            candidate_fd,
+                            "orphan.json",
+                            max_bytes=MAX_AUDIT_EXPORT_ORPHAN_MARKER_BYTES,
+                        )
+                    except OSError as marker_exc:
+                        raise OSError("existing audit-export orphan marker is divergent") from marker_exc
+                    try:
+                        existing = json.loads(existing_bytes)
+                        expected_keys = {"candidate_id", "content_refs", "marked_at", "schema"}
+                        if (
+                            set(existing) != expected_keys
+                            or existing["schema"] != "elspeth.audit-export-orphan-candidate.v1"
+                            or existing["candidate_id"] != candidate_id
+                            or existing["content_refs"] != sorted({item.content_ref for item in descriptors})
+                        ):
+                            raise ValueError("orphan marker evidence differs")
+                        datetime.strptime(existing["marked_at"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
+                    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as marker_exc:
+                        raise OSError("existing audit-export orphan marker is divergent") from marker_exc
                     return
                 try:
                     _write_all(marker_fd, marker)

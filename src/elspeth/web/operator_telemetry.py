@@ -11,7 +11,7 @@ import asyncio
 import dataclasses
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 
@@ -23,8 +23,11 @@ from opentelemetry.metrics import Observation
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import MetricExporter, MetricExportResult, MetricsData, PeriodicExportingMetricReader
 from opentelemetry.sdk.resources import Resource
+from opentelemetry.util.types import Attributes
 
 from elspeth import __version__
+from elspeth.contracts.enums import CallStatus, CallType, RunStatus
+from elspeth.contracts.events import ExternalCallCompleted, RunFinished, TelemetryEvent
 from elspeth.core.config import ElspethSettings, ExporterSettings, TelemetrySettings
 from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS
 from elspeth.telemetry.resource_identity import is_aws_resource_label
@@ -33,6 +36,17 @@ from elspeth.web.config import WebSettings
 AWS_OTLP_ENDPOINT = "http://127.0.0.1:4317"
 _EXPORT_TIMEOUT_MILLIS = 5_000
 _SHUTDOWN_WALL_TIMEOUT_SECONDS = 5.5
+
+AWS_OPERATOR_PIPELINE_METRIC_NAMES: frozenset[str] = frozenset(
+    {
+        "run.failure",
+        "run.duration",
+        "external_call.failure",
+        "external_call.latency",
+        "llm.prompt_tokens",
+        "llm.completion_tokens",
+    }
+)
 
 # The task-local exporter removes every other point attribute before OTLP.
 # Resource identity is configured separately and is similarly bounded by
@@ -64,9 +78,47 @@ _log = structlog.get_logger(__name__)
 
 
 class _Provider(Protocol):
+    def get_meter(self, name: str, version: str) -> Any: ...
+
     def force_flush(self, timeout_millis: float = 10_000) -> bool: ...
 
     def shutdown(self, timeout_millis: float = 30_000) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _OperatorPipelineMetrics:
+    run_failure: Any
+    run_duration: Any
+    external_call_failure: Any
+    external_call_latency: Any
+    llm_prompt_tokens: Any
+    llm_completion_tokens: Any
+
+    def record(self, event: TelemetryEvent) -> None:
+        """Project only bounded aggregate facts from an already-audited event."""
+
+        if isinstance(event, RunFinished):
+            self.run_duration.record(event.duration_ms / 1_000)
+            if event.status in {
+                RunStatus.COMPLETED_WITH_FAILURES,
+                RunStatus.FAILED,
+                RunStatus.INTERRUPTED,
+            }:
+                self.run_failure.add(1)
+            return
+
+        if not isinstance(event, ExternalCallCompleted):
+            return
+        if event.latency_ms is not None:
+            self.external_call_latency.record(event.latency_ms / 1_000)
+        if event.status is CallStatus.ERROR:
+            self.external_call_failure.add(1)
+        if event.call_type is not CallType.LLM or event.token_usage is None:
+            return
+        if event.token_usage.prompt_tokens is not None:
+            self.llm_prompt_tokens.add(event.token_usage.prompt_tokens)
+        if event.token_usage.completion_tokens is not None:
+            self.llm_completion_tokens.add(event.token_usage.completion_tokens)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +126,7 @@ class OperatorTelemetryFactories:
     """Resettable construction seam used by bootstrap unit tests."""
 
     prometheus_reader: Callable[[], object]
-    otlp_exporter: Callable[..., object]
+    otlp_exporter: Callable[..., MetricExporter]
     periodic_reader: Callable[..., object]
     meter_provider: Callable[..., _Provider]
     set_meter_provider: Callable[[object], None]
@@ -127,7 +179,7 @@ class _ExportHealth:
             self._queue_drops += count
 
 
-def _safe_point_attributes(attributes: Mapping[str, object] | None) -> Mapping[str, object] | None:
+def _safe_point_attributes(attributes: Attributes) -> Attributes:
     if attributes is None:
         return None
     return {key: value for key, value in attributes.items() if key in SAFE_CLOUDWATCH_METRIC_ATTRIBUTES}
@@ -143,17 +195,19 @@ def _sanitize_metric_data(metrics_data: MetricsData) -> MetricsData:
             sanitized_metrics = []
             for metric in scope_metric.metrics:
                 data = metric.data
-                points = getattr(data, "data_points", None)
-                if points is None:
-                    sanitized_metrics.append(metric)
-                    continue
                 sanitized_points = []
-                for point in points:
-                    replacements: dict[str, object] = {"attributes": _safe_point_attributes(point.attributes)}
-                    if hasattr(point, "exemplars"):
-                        replacements["exemplars"] = ()
-                    sanitized_points.append(dataclasses.replace(point, **replacements))
-                sanitized_data = dataclasses.replace(cast(Any, data), data_points=tuple(sanitized_points))
+                for point in data.data_points:
+                    sanitized_points.append(
+                        dataclasses.replace(
+                            point,
+                            attributes=_safe_point_attributes(point.attributes),
+                            exemplars=(),
+                        )
+                    )
+                sanitized_data = dataclasses.replace(
+                    cast(Any, data),
+                    data_points=tuple(sanitized_points),
+                )
                 sanitized_metrics.append(dataclasses.replace(metric, data=sanitized_data))
             scope_metrics.append(dataclasses.replace(scope_metric, metrics=tuple(sanitized_metrics)))
         resource_metrics.append(dataclasses.replace(resource_metric, scope_metrics=tuple(scope_metrics)))
@@ -218,6 +272,7 @@ class OperatorTelemetryRuntime:
     readers: tuple[Any, ...]
     resource: Resource
     health: _ExportHealth
+    pipeline_metrics: _OperatorPipelineMetrics | None = None
     _shutdown_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _shutdown_complete: bool = False
 
@@ -274,10 +329,7 @@ def _required_aws_resource_identity(settings: WebSettings) -> dict[str, str]:
 
 
 def _wire_health_instruments(provider: _Provider, health: _ExportHealth) -> None:
-    get_meter = getattr(provider, "get_meter", None)
-    if get_meter is None:  # Narrow test-provider seam; real MeterProvider always exposes get_meter.
-        return
-    meter = get_meter("elspeth.web.operator_telemetry", __version__)
+    meter = provider.get_meter("elspeth.web.operator_telemetry", __version__)
     meter.create_observable_gauge(
         "operator.telemetry.last_success_age_seconds",
         callbacks=[
@@ -305,6 +357,40 @@ def _wire_health_instruments(provider: _Provider, health: _ExportHealth) -> None
     )
 
 
+def _wire_pipeline_instruments(provider: _Provider) -> _OperatorPipelineMetrics:
+    meter = provider.get_meter("elspeth.web.operator_pipeline", __version__)
+    return _OperatorPipelineMetrics(
+        run_failure=meter.create_counter(
+            "run.failure",
+            description="Audited pipeline runs with a non-clean terminal status.",
+        ),
+        run_duration=meter.create_histogram(
+            "run.duration",
+            description="Audited pipeline run duration.",
+            unit="s",
+        ),
+        external_call_failure=meter.create_counter(
+            "external_call.failure",
+            description="Audited external calls that completed with an error.",
+        ),
+        external_call_latency=meter.create_histogram(
+            "external_call.latency",
+            description="Audited external-call latency.",
+            unit="s",
+        ),
+        llm_prompt_tokens=meter.create_counter(
+            "llm.prompt_tokens",
+            description="Provider-reported audited LLM prompt tokens.",
+            unit="{token}",
+        ),
+        llm_completion_tokens=meter.create_counter(
+            "llm.completion_tokens",
+            description="Provider-reported audited LLM completion tokens.",
+            unit="{token}",
+        ),
+    )
+
+
 def record_operator_pipeline_queue_drops(count: int) -> None:
     """Add one completed pipeline manager's queue-only losses to operator health."""
 
@@ -329,7 +415,9 @@ def bootstrap_operator_telemetry(
         if _runtime is not None:
             return _runtime
 
-        selected = factories or _production_factories()
+        selected = factories
+        if selected is None:
+            selected = _production_factories()
         resource_attributes: dict[str, str] = {
             "service.name": settings.operator_telemetry_service_name,
             "service.version": __version__,
@@ -348,7 +436,7 @@ def bootstrap_operator_telemetry(
         health = _ExportHealth()
         if settings.operator_telemetry == "aws-otlp":
             raw_exporter = selected.otlp_exporter(endpoint=AWS_OTLP_ENDPOINT, insecure=True, headers={})
-            exporter = _HealthTrackingMetricExporter(raw_exporter, health) if isinstance(raw_exporter, MetricExporter) else raw_exporter
+            exporter = _HealthTrackingMetricExporter(raw_exporter, health)
             readers.append(
                 selected.periodic_reader(
                     exporter,
@@ -358,6 +446,10 @@ def bootstrap_operator_telemetry(
             )
 
         provider = selected.meter_provider(readers, resource=resource, views=())
+        pipeline_metrics = None
+        if settings.operator_telemetry == "aws-otlp":
+            _wire_health_instruments(provider, health)
+            pipeline_metrics = _wire_pipeline_instruments(provider)
         selected.set_meter_provider(provider)
         _runtime = OperatorTelemetryRuntime(
             mode=settings.operator_telemetry,
@@ -365,10 +457,29 @@ def bootstrap_operator_telemetry(
             readers=tuple(readers),
             resource=resource,
             health=health,
+            pipeline_metrics=pipeline_metrics,
         )
-        if settings.operator_telemetry == "aws-otlp":
-            _wire_health_instruments(provider, health)
         return _runtime
+
+
+def record_operator_pipeline_event(event: TelemetryEvent) -> None:
+    """Best-effort projection of an already-audited event into AWS metrics."""
+
+    with _runtime_lock:
+        runtime = _runtime
+    if runtime is None or runtime.mode != "aws-otlp" or runtime.pipeline_metrics is None:
+        return
+    try:
+        runtime.pipeline_metrics.record(event)
+    except Exception as exc:
+        # Operational metrics are subordinate to Landscape. Metric SDK or
+        # recorder failure must not replace the already-audited run/call
+        # outcome; retain only bounded class/type facts in the fallback log.
+        _log.error(
+            "operator_pipeline_metric_projection_failed",
+            event_type=type(event).__name__,
+            error_type=type(exc).__name__,
+        )
 
 
 def build_aws_operator_pipeline_telemetry(web_settings: WebSettings) -> TelemetrySettings:
@@ -421,6 +532,7 @@ def reset_operator_telemetry_for_tests() -> None:
 
 
 __all__ = [
+    "AWS_OPERATOR_PIPELINE_METRIC_NAMES",
     "AWS_OTLP_ENDPOINT",
     "SAFE_CLOUDWATCH_METRIC_ATTRIBUTES",
     "OperatorTelemetryFactories",
@@ -428,6 +540,7 @@ __all__ = [
     "apply_operator_pipeline_telemetry",
     "bootstrap_operator_telemetry",
     "build_aws_operator_pipeline_telemetry",
+    "record_operator_pipeline_event",
     "record_operator_pipeline_queue_drops",
     "reset_operator_telemetry_for_tests",
 ]

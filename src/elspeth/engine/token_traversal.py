@@ -29,7 +29,7 @@ from elspeth.contracts.enums import RoutingKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import MaxRetriesExceeded, OrchestrationInvariantError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.results import FailureInfo
-from elspeth.contracts.types import BranchName, CoalesceName, NodeID
+from elspeth.contracts.types import BranchName, CoalesceName, NodeID, RowUnionName
 from elspeth.core.config import GateSettings
 from elspeth.engine._best_effort import best_effort
 from elspeth.engine._error_hash import compute_error_hash
@@ -103,6 +103,7 @@ class TokenTraversalEngine:
         coalesce_name: CoalesceName | None,
         current_on_success_sink: str,
         attempt_offset: int = 0,
+        row_union_name: RowUnionName | None = None,
     ) -> _TransformOutcome:
         """Handle a single transform node: execute with retry, route errors, handle multi-row.
 
@@ -156,7 +157,7 @@ class TokenTraversalEngine:
                 path=TerminalPath.UNROUTED,
             )
             # Notify coalesce if this is a forked branch
-            sibling_results = self._processor._notify_coalesce_of_lost_branch(
+            sibling_results = self._processor._notify_barrier_of_lost_branch(
                 current_token,
                 "max_retries_exceeded",
                 child_items,
@@ -204,7 +205,7 @@ class TokenTraversalEngine:
                     outcome=TerminalOutcome.SUCCESS,
                     path=TerminalPath.FILTER_DROPPED,
                 )
-                sibling_results = self._processor._notify_coalesce_of_lost_branch(
+                sibling_results = self._processor._notify_barrier_of_lost_branch(
                     current_token,
                     "dropped_by_filter",
                     child_items,
@@ -246,12 +247,20 @@ class TokenTraversalEngine:
             # Children born during a re-drive get fresh token_ids with no prior node_states,
             # so they use the default resume_attempt_offset=0 / resume_checkpoint_id=None.
             for child_token in child_tokens:
-                child_coalesce_name = coalesce_name if coalesce_name is not None and child_token.branch_name is not None else None
+                on_branch = child_token.branch_name is not None
+                child_coalesce_name = coalesce_name if coalesce_name is not None and on_branch else None
+                # The barrier binding must survive expansion, exactly as the
+                # coalesce binding does. Dropping it lets the children walk
+                # through the structural barrier node and split their group
+                # silently; carrying it makes an unsatisfiable expansion
+                # (N children sharing one row_id) fail closed at the barrier.
+                child_row_union_name = row_union_name if row_union_name is not None and on_branch else None
                 child_items.append(
                     self._processor._work_items.create_continuation(
                         token=child_token,
                         current_node_id=node_id,
                         coalesce_name=child_coalesce_name,
+                        row_union_name=child_row_union_name,
                         on_success_sink=updated_sink,
                     )
                 )
@@ -309,7 +318,7 @@ class TokenTraversalEngine:
                 path=TerminalPath.QUARANTINED_AT_SOURCE,
             )
             # Notify coalesce if this is a forked branch
-            sibling_results = self._processor._notify_coalesce_of_lost_branch(
+            sibling_results = self._processor._notify_barrier_of_lost_branch(
                 current_token,
                 f"quarantined:{error_detail}",
                 child_items,
@@ -340,7 +349,7 @@ class TokenTraversalEngine:
             )
         error_detail = str(transform_result.reason)
 
-        sibling_results = self._processor._notify_coalesce_of_lost_branch(
+        sibling_results = self._processor._notify_barrier_of_lost_branch(
             current_token,
             f"error_routed:{error_detail}",
             child_items,
@@ -372,6 +381,8 @@ class TokenTraversalEngine:
         coalesce_node_id: NodeID | None,
         coalesce_name: CoalesceName | None,
         current_on_success_sink: str,
+        row_union_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
     ) -> _GateOutcome:
         """Handle a gate node: evaluate, then fork/route/divert/continue.
 
@@ -415,7 +426,7 @@ class TokenTraversalEngine:
             # NOTE: Do NOT record ROUTED outcome here - the token hasn't been written yet.
             # SinkExecutor.write() records the outcome AFTER sink durability is achieved.
             # Notify coalesce if this is a forked branch
-            sibling_results = self._processor._notify_coalesce_of_lost_branch(
+            sibling_results = self._processor._notify_barrier_of_lost_branch(
                 current_token,
                 f"gate_routed_to_sink:{outcome.sink_name}",
                 child_items,
@@ -449,7 +460,7 @@ class TokenTraversalEngine:
                     outcome=TerminalOutcome.SUCCESS,
                     path=TerminalPath.GATE_DISCARDED,
                 )
-            sibling_results = self._processor._notify_coalesce_of_lost_branch(
+            sibling_results = self._processor._notify_barrier_of_lost_branch(
                 current_token,
                 "gate_discarded",
                 child_items,
@@ -486,21 +497,26 @@ class TokenTraversalEngine:
             if resolved_sink is not None:
                 updated_sink = resolved_sink
 
-            # Re-validate coalesce ordering invariant after gate jump.
+            # Re-validate barrier ordering invariants after gate jump.
             # The initial check at entry only validates the starting node.
-            # A gate jump can move the token past its coalesce node,
-            # which would silently bypass join handling.
+            # A gate jump can move the token past its coalesce or row_union
+            # node, which would silently bypass barrier handling.
             #
             # IMPORTANT: Use outcome.next_node_id (not the caller's node_id param)
             # because we're validating the JUMP TARGET, not the current position.
-            if coalesce_node_id is not None:
-                jump_target_step = self._processor._node_step_map[outcome.next_node_id]
-                coalesce_barrier_step = self._processor._node_step_map[coalesce_node_id]
-                if jump_target_step > coalesce_barrier_step:
+            jump_target_step = self._processor._node_step_map[outcome.next_node_id]
+            for barrier_node_id, barrier_name, barrier_kind in (
+                (coalesce_node_id, coalesce_name, "coalesce"),
+                (row_union_node_id, row_union_name, "row_union"),
+            ):
+                if barrier_node_id is None or barrier_name is None:
+                    continue
+                barrier_step = self._processor._node_step_map[barrier_node_id]
+                if jump_target_step > barrier_step:
                     raise OrchestrationInvariantError(
                         f"Gate jump moved token '{current_token.token_id}' to node '{outcome.next_node_id}' "
-                        f"(step {jump_target_step}) which is past its coalesce node '{coalesce_node_id}' "
-                        f"(step {coalesce_barrier_step}). This would bypass join handling."
+                        f"(step {jump_target_step}) which is past its {barrier_kind} node '{barrier_node_id}' "
+                        f"(step {barrier_step}). This would bypass barrier handling."
                     )
 
             return _GateContinue(
@@ -540,17 +556,25 @@ class TokenTraversalEngine:
             _GateTerminal with FORKED outcome for the parent token.
         """
         for child_token in outcome.child_tokens:
-            # Look up coalesce info for this branch
+            # Look up barrier info for this branch (coalesce or row_union)
             cfg_branch_name = child_token.branch_name
             cfg_coalesce_name: CoalesceName | None = None
+            cfg_row_union_name: RowUnionName | None = None
 
             if cfg_branch_name and BranchName(cfg_branch_name) in self._processor._branch_to_coalesce:
                 cfg_coalesce_name = self._processor._branch_to_coalesce[BranchName(cfg_branch_name)]
+            elif cfg_branch_name and BranchName(cfg_branch_name) in self._processor._branch_to_row_union:
+                cfg_row_union_name = self._processor._branch_to_row_union[BranchName(cfg_branch_name)]
 
             # See config gate fork handler above for routing logic.
             # Children born during a re-drive get fresh token_ids with no prior node_states,
             # so they use the default resume_attempt_offset=0 / resume_checkpoint_id=None.
-            if cfg_coalesce_name is None and cfg_branch_name and BranchName(cfg_branch_name) in self._processor._branch_to_sink:
+            if (
+                cfg_coalesce_name is None
+                and cfg_row_union_name is None
+                and cfg_branch_name
+                and BranchName(cfg_branch_name) in self._processor._branch_to_sink
+            ):
                 child_items.append(
                     self._processor._work_items.create(
                         token=child_token,
@@ -563,6 +587,7 @@ class TokenTraversalEngine:
                         token=child_token,
                         current_node_id=node_id,
                         coalesce_name=cfg_coalesce_name,
+                        row_union_name=cfg_row_union_name,
                     )
                 )
 
@@ -577,6 +602,39 @@ class TokenTraversalEngine:
             )
         )
 
+    def validate_barrier_ordering(
+        self,
+        token: TokenInfo,
+        current_node_id: NodeID | None,
+        barrier_node_id: NodeID | None,
+        barrier_name: str | None,
+        barrier_kind: str,
+    ) -> None:
+        """Reject work items that start downstream of their configured barrier.
+
+        Barrier handling triggers only on exact node equality. A malformed work
+        item starting past either barrier would therefore skip it silently.
+
+        Raises:
+            OrchestrationInvariantError: If the token starts downstream of its barrier.
+        """
+        if (
+            barrier_node_id is not None
+            and current_node_id is not None
+            and barrier_name is not None
+            and current_node_id != barrier_node_id
+            and current_node_id in self._processor._node_step_map
+            and barrier_node_id in self._processor._node_step_map
+        ):
+            current_step = self._processor._node_step_map[current_node_id]
+            barrier_step = self._processor._node_step_map[barrier_node_id]
+            if current_step > barrier_step:
+                raise OrchestrationInvariantError(
+                    f"Token {token.token_id} started at node '{current_node_id}' (step {current_step}), "
+                    f"which is downstream of {barrier_kind} '{barrier_name}' (step {barrier_step}). "
+                    f"Work items with {barrier_kind} metadata must start at or before the barrier."
+                )
+
     def validate_coalesce_ordering(
         self,
         token: TokenInfo,
@@ -584,30 +642,8 @@ class TokenTraversalEngine:
         coalesce_node_id: NodeID | None,
         coalesce_name: CoalesceName | None,
     ) -> None:
-        """Validate that tokens with coalesce metadata don't start downstream of their coalesce point.
-
-        A malformed work item starting past the coalesce node would silently skip coalesce handling
-        because _maybe_coalesce_token only triggers on exact node equality.
-
-        Raises:
-            OrchestrationInvariantError: If the token's starting node is downstream of its coalesce barrier.
-        """
-        if (
-            coalesce_node_id is not None
-            and current_node_id is not None
-            and coalesce_name is not None
-            and current_node_id != coalesce_node_id
-            and current_node_id in self._processor._node_step_map
-            and coalesce_node_id in self._processor._node_step_map
-        ):
-            current_step = self._processor._node_step_map[current_node_id]
-            coalesce_step = self._processor._node_step_map[coalesce_node_id]
-            if current_step > coalesce_step:
-                raise OrchestrationInvariantError(
-                    f"Token {token.token_id} started at node '{current_node_id}' (step {current_step}), "
-                    f"which is downstream of coalesce '{coalesce_name}' (step {coalesce_step}). "
-                    f"Work items with coalesce metadata must start at or before the coalesce point."
-                )
+        """Compatibility wrapper for the original coalesce-only helper."""
+        self.validate_barrier_ordering(token, current_node_id, coalesce_node_id, coalesce_name, "coalesce")
 
     def handle_terminal_token(
         self,
@@ -665,6 +701,8 @@ class TokenTraversalEngine:
         coalesce_name: CoalesceName | None = None,
         on_success_sink: str | None = None,
         attempt_offset: int = 0,
+        row_union_node_id: NodeID | None = None,
+        row_union_name: RowUnionName | None = None,
     ) -> tuple[RowResult | tuple[RowResult, ...] | None, list[WorkItem]]:
         """Process a single token through processing nodes starting at node_id.
 
@@ -717,7 +755,11 @@ class TokenTraversalEngine:
                     context=f"start of token processing for token '{token.token_id}'",
                 )
 
-        self.validate_coalesce_ordering(token, current_node_id, coalesce_node_id, coalesce_name)
+        for barrier_node_id, barrier_name, barrier_kind in (
+            (coalesce_node_id, coalesce_name, "coalesce"),
+            (row_union_node_id, row_union_name, "row_union"),
+        ):
+            self.validate_barrier_ordering(token, current_node_id, barrier_node_id, barrier_name, barrier_kind)
 
         node_id: NodeID | None = current_node_id
         max_inner_iterations = len(self._processor._node_to_next) + 1
@@ -741,6 +783,15 @@ class TokenTraversalEngine:
                 coalesce_node_id=coalesce_node_id,
                 coalesce_name=coalesce_name,
                 child_items=child_items,
+            )
+            if handled:
+                return (result, child_items)
+
+            handled, result = self._processor._maybe_row_union_token(
+                current_token,
+                current_node_id=node_id,
+                row_union_node_id=row_union_node_id,
+                row_union_name=row_union_name,
             )
             if handled:
                 return (result, child_items)
@@ -805,6 +856,7 @@ class TokenTraversalEngine:
                     coalesce_name,
                     last_on_success_sink,
                     attempt_offset,
+                    row_union_name=row_union_name,
                 )
                 if isinstance(transform_outcome, _TransformTerminal):
                     return transform_outcome.result, child_items
@@ -821,6 +873,8 @@ class TokenTraversalEngine:
                     coalesce_node_id,
                     coalesce_name,
                     last_on_success_sink,
+                    row_union_node_id,
+                    row_union_name,
                 )
                 if isinstance(gate_outcome, _GateTerminal):
                     return gate_outcome.result, child_items

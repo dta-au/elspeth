@@ -354,6 +354,7 @@ def build_scenario(
         aggregations=bundle.aggregations,
         gates=list(settings.gates),
         coalesce_settings=list(settings.coalesce) if settings.coalesce else None,
+        row_union_settings=list(settings.row_unions) if settings.row_unions else None,
         queues=settings.queues,
     )
     graph.validate()
@@ -442,6 +443,25 @@ def _semantic_run_settings(raw_settings: object) -> dict[str, object]:
     if not isinstance(raw_settings, Mapping):
         raise AssertionError("DAG corpus run lacks material settings")
     settings = json.loads(json.dumps(raw_settings))
+    # Schema-growth stability: the settings material is a full model dump, so
+    # a settings field added AFTER a pin was authored appears as its empty
+    # default in every run and would rotate every pinned
+    # semantic_settings_sha256 with no semantic change to the pipeline.
+    # Fields listed here entered the schema after the v1 pins; drop them when
+    # they hold their type's own empty default — non-empty declarations still
+    # enter the hash. NOTE: each field's empty default has its own shape
+    # (`[]` for a list-typed catalog like row_unions, `{}` for a Mapping-typed
+    # catalog like llm_profiles, `None` for a scalar like default_llm_profile)
+    # — comparing every entry against a single literal (e.g. `== []`) would
+    # silently no-op for the others and let their pins rotate anyway.
+    _post_pin_empty_defaults: dict[str, object] = {
+        "row_unions": [],
+        "llm_profiles": {},
+        "default_llm_profile": None,
+    }
+    for post_pin_section, empty_default in _post_pin_empty_defaults.items():
+        if settings.get(post_pin_section) == empty_default:
+            settings.pop(post_pin_section, None)
     for section in ("sources", "sinks"):
         declarations = settings.get(section)
         if not isinstance(declarations, dict):
@@ -968,7 +988,7 @@ def _stable_projection(records: list[dict[str, Any]], *, source: str = "projecti
             status=str(record["status"]),
             context_after=(
                 _normalize_node_state_json(record.get("context_after_json"), field="context_after_json")
-                if node_keys[str(record["node_id"])].startswith("coalesce:")
+                if node_keys[str(record["node_id"])].startswith(("coalesce:", "row_union:"))
                 else None
             ),
             error=(

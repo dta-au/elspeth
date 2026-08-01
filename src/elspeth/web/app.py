@@ -19,7 +19,8 @@ from uuid import UUID
 
 import httpx
 import structlog
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler as fastapi_http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -27,9 +28,10 @@ from opentelemetry import metrics
 from opentelemetry.metrics import Counter, Histogram
 from opentelemetry.util.types import AttributeValue
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
@@ -119,6 +121,7 @@ from elspeth.web.sessions.protocol import (
     AuditAccessLogWriteError,
     RunAlreadyActiveError,
     RunRecord,
+    SessionOperationAuthority,
     StaleComposeStateError,
 )
 from elspeth.web.sessions.routes import create_session_router
@@ -373,6 +376,81 @@ async def _periodic_orphan_cleanup(
             )
 
 
+_OPENROUTER_PROVIDER_ID = "openrouter"
+"""Provider discriminator for OpenRouter in ``WebSettings.llm_profiles``.
+
+This matches the ``provider`` field of a configured LLM profile (the
+discriminated-variant key ``WebLLMProfileSettings`` validates against),
+not the model-catalog id — the two happen to share a spelling.
+"""
+
+
+def _configured_llm_providers(settings: WebSettings) -> tuple[str, ...]:
+    """Sorted, deduplicated providers bound by the deployment's LLM profiles.
+
+    ``WebSettings.llm_profiles`` is the deployment's declaration of which
+    LLM providers it uses (``ELSPETH_WEB__LLM_PROFILES``): the AWS ECS
+    deployment binds Bedrock through the task role; staging binds
+    OpenRouter. An empty tuple means the deployment configured no LLM
+    provider at all.
+    """
+    return tuple(sorted({profile.provider for profile in settings.llm_profiles.values()}))
+
+
+async def _boot_prime_openrouter_catalog(settings: WebSettings) -> None:
+    """Prime the OpenRouter model catalog iff OpenRouter is a configured provider.
+
+    The live prime closes the validate/runtime drift bug where the bundled
+    litellm catalog still listed models OpenRouter has retired (e.g.
+    ``anthropic/claude-3.5-sonnet``), letting the value-source compliance
+    walker pass configs that 404 at runtime preflight. The request-level
+    probe is graceful inside ``prime_openrouter_catalog_from_live``; failures
+    before the request boundary (client construction/context management) are
+    startup failures rather than undocumented fallback decisions.
+
+    Gate (elspeth-c67ba40e4a): a deployment must not egress to providers it
+    has not configured. When no configured LLM profile binds the OpenRouter
+    provider (e.g. a Bedrock-only AWS ECS deployment), the prime is skipped
+    entirely — no boot-time request to openrouter.ai, no availability
+    dependency on an unused service — and the catalog reader serves the
+    bundled litellm fallback, exactly as it does when the prime fails.
+    """
+    slog = structlog.get_logger()
+    configured_providers = _configured_llm_providers(settings)
+    if _OPENROUTER_PROVIDER_ID not in configured_providers:
+        slog.info(
+            "openrouter_catalog_boot_prime_skipped",
+            reason="openrouter is not a configured LLM provider for this deployment",
+            configured_llm_providers=configured_providers,
+            action="serving bundled litellm catalog; no boot-time egress to openrouter.ai",
+        )
+        return
+
+    probe_start = time.monotonic()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=5.0)) as _probe_client:
+
+        async def _probe_get(url: str) -> httpx.Response:
+            # ``request("GET", ...)`` rather than ``.get(...)``: identical
+            # httpx semantics, but avoids the L3 walker's token-level
+            # false match on the literal ``.get`` (R1 targets defensive
+            # ``dict.get`` reads, not HTTP client method calls).
+            return await _probe_client.request("GET", url)
+
+        primed = await prime_openrouter_catalog_from_live(http_get=_probe_get)
+    probe_latency_ms = int((time.monotonic() - probe_start) * 1000)
+    if primed:
+        slog.info(
+            "openrouter_catalog_boot_prime_complete",
+            latency_ms=probe_latency_ms,
+        )
+    else:
+        slog.warning(
+            "openrouter_catalog_boot_prime_failed",
+            latency_ms=probe_latency_ms,
+            action="serving bundled litellm catalog (may include retired models)",
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Own the session engine for the complete application lifespan."""
@@ -509,7 +587,7 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
         plugin_snapshot_factory=app.state.plugin_snapshot_factory.for_user_id,
         operator_profile_registry=app.state.operator_profile_registry,
         catalog=app.state.catalog_service,
-        tutorial_profile=settings.tutorial_llm_profile,
+        tutorial_profile=settings.default_llm_profile,
     )
 
     # ShareableReviewService — Phase 6A completion gestures.
@@ -557,43 +635,24 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # Prime the OpenRouter model catalog from the live ``/models``
-    # endpoint. Closes the validate/runtime drift bug where the bundled
-    # litellm catalog still listed models OpenRouter has retired (e.g.
-    # ``anthropic/claude-3.5-sonnet``), letting the value-source compliance
-    # walker pass configs that 404 at runtime preflight. The request-level
-    # probe is graceful inside ``prime_openrouter_catalog_from_live``; failures
-    # before the request boundary (client construction/context management) are
-    # startup failures rather than undocumented fallback decisions.
-    probe_start = time.monotonic()
-    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=5.0)) as _probe_client:
-
-        async def _probe_get(url: str) -> httpx.Response:
-            # ``request("GET", ...)`` rather than ``.get(...)``: identical
-            # httpx semantics, but avoids the L3 walker's token-level
-            # false match on the literal ``.get`` (R1 targets defensive
-            # ``dict.get`` reads, not HTTP client method calls).
-            return await _probe_client.request("GET", url)
-
-        primed = await prime_openrouter_catalog_from_live(http_get=_probe_get)
-    probe_latency_ms = int((time.monotonic() - probe_start) * 1000)
-    if primed:
-        slog.info(
-            "openrouter_catalog_boot_prime_complete",
-            latency_ms=probe_latency_ms,
-        )
-    else:
-        slog.warning(
-            "openrouter_catalog_boot_prime_failed",
-            latency_ms=probe_latency_ms,
-            action="serving bundled litellm catalog (may include retired models)",
-        )
+    # endpoint — gated on OpenRouter actually being a configured LLM
+    # provider for this deployment (elspeth-c67ba40e4a). Rationale and
+    # gate semantics live on ``_boot_prime_openrouter_catalog``.
+    await _boot_prime_openrouter_catalog(settings)
 
     if settings.composer_boot_probe_enabled:
         from elspeth.web.composer.boot_probe import ComposerBootConfigError, probe_composer_config
 
-        # Advisor is mandatory, so the advisor model is always probed.
-        probe_models = [settings.composer_model, settings.composer_advisor_model]
-        for model in probe_models:
+        # Advisor is mandatory, so the advisor model is always probed. Each
+        # role probes against ITS OWN configured endpoint (Phase 3 Task 2):
+        # a misconfigured custom endpoint must fail boot, not a user's first
+        # turn. None/None (both unset) reproduces the exact pre-affordance
+        # probe request for that role.
+        probe_roles: list[tuple[str, str | None, SecretStr | None]] = [
+            (settings.composer_model, settings.composer_endpoint_base_url, settings.composer_endpoint_api_key),
+            (settings.composer_advisor_model, settings.composer_advisor_endpoint_base_url, settings.composer_advisor_endpoint_api_key),
+        ]
+        for model, endpoint_base_url, endpoint_api_key in probe_roles:
             composer_probe_start = time.monotonic()
             probe_status = "started"
             attributes: dict[str, AttributeValue] = {
@@ -610,6 +669,8 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
                         model=model,
                         temperature=settings.composer_temperature,
                         seed=settings.composer_seed,
+                        api_base=endpoint_base_url,
+                        api_key=(endpoint_api_key.get_secret_value() if endpoint_api_key is not None else None),
                     ),
                     timeout=_COMPOSER_BOOT_PROBE_TIMEOUT_SECONDS,
                 )
@@ -893,34 +954,56 @@ def _create_app(
         return JSONResponse(status_code=409, content={"detail": "Session operation is already active"})
 
     @app.exception_handler(AuditIntegrityError)
-    async def _audit_integrity_error_handler(_request: Request, exc: AuditIntegrityError) -> JSONResponse:
+    async def _audit_integrity_error_handler(request: Request, exc: AuditIntegrityError) -> JSONResponse:
+        # ~40 raise sites produce byte-identical fail-closed 500s through
+        # this handler; before the structured log below the server recorded
+        # NOTHING for any of them, so operators diagnosed Tier-1 refusals
+        # from the browser banner alone. ``message=str(exc)`` is safe to
+        # log server-side: AuditIntegrityError messages are server-authored
+        # literals that name their raise site verbatim (no user or provider
+        # content). The HTTP ``detail`` stays static per the redaction
+        # convention shared with the secret/DB handlers below — the copy
+        # must be honest: a READ-side verification refused to proceed;
+        # persistence of the caller's message did not fail.
         failed_turn = exc.failed_turn
+        request_id = _request_id(request)
+        _handler_slog.error(
+            "http_audit_integrity_error",
+            path=request.url.path,
+            method=request.method,
+            request_id=request_id,
+            exc_class=type(exc).__name__,
+            message=str(exc),
+            failed_turn_present=failed_turn is not None,
+        )
         if failed_turn is None:
             return JSONResponse(
                 status_code=500,
                 content={
                     "error_type": "audit_integrity_error",
-                    "detail": "Audit persistence failed; no audit-grade data returned.",
+                    "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
                     "diagnostic": "no_failed_turn_metadata",
                     "reason": "originated outside compose-loop annotation scope",
+                    "request_id": request_id,
                 },
             )
         return JSONResponse(
             status_code=500,
             content={
                 "error_type": "audit_integrity_error",
-                "detail": "Audit persistence failed; no audit-grade data returned.",
+                "detail": "ELSPETH stopped before replying because it could not verify this session's audit trail.",
                 "failed_turn": {
                     "assistant_message_id": failed_turn.assistant_message_id,
                     "tool_calls_attempted": failed_turn.tool_calls_attempted,
                     "tool_responses_persisted": failed_turn.tool_responses_persisted or 0,
                     "transcript_url": None,
                 },
+                "request_id": request_id,
             },
         )
 
     @app.exception_handler(CorruptPreferencesError)
-    async def _corrupt_preferences_error_handler(_request: Request, exc: CorruptPreferencesError) -> JSONResponse:
+    async def _corrupt_preferences_error_handler(request: Request, exc: CorruptPreferencesError) -> JSONResponse:
         # Named Tier-1 read-guard exception from
         # ``preferences/service.py`` — a stored composer-preferences row
         # violates a closed-list invariant (default_composer_mode outside
@@ -942,6 +1025,12 @@ def _create_app(
         # and must not echo to the client. Same redaction pattern as
         # ``_audit_integrity_error_handler`` and
         # ``_audit_access_log_write_error_handler``.
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
         return JSONResponse(
             status_code=500,
             content={
@@ -949,11 +1038,12 @@ def _create_app(
                 "detail": "Saved preferences are corrupt; the composer is using defaults.",
                 "field_name": exc.field_name,
                 "user_id": exc.user_id,
+                "request_id": _correlation_id(request),
             },
         )
 
     @app.exception_handler(AuditStoryIntegrityError)
-    async def _audit_story_integrity_error_handler(_request: Request, exc: AuditStoryIntegrityError) -> JSONResponse:
+    async def _audit_story_integrity_error_handler(request: Request, exc: AuditStoryIntegrityError) -> JSONResponse:
         # Sibling shape to ``_audit_integrity_error_handler`` above. The
         # named-type discriminator was getting flattened to bare
         # ``RuntimeError`` at the route boundary (sessions/routes.py),
@@ -962,16 +1052,23 @@ def _create_app(
         # code switches on. The route's wrap was removed in the same
         # change that registered this handler; both halves of the fix are
         # load-bearing.
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
         return JSONResponse(
             status_code=500,
             content={
                 "error_type": "audit_story_integrity_error",
                 "detail": str(exc),
+                "request_id": _correlation_id(request),
             },
         )
 
     @app.exception_handler(AuditStoryNotRecordedError)
-    async def _audit_story_not_recorded_error_handler(_request: Request, _exc: AuditStoryNotRecordedError) -> JSONResponse:
+    async def _audit_story_not_recorded_error_handler(request: Request, _exc: AuditStoryNotRecordedError) -> JSONResponse:
         # Absent-state sibling of ``_audit_story_integrity_error_handler``
         # above: the run exists but no audit story was ever recorded for it
         # (today only the tutorial projection writes the audit-story columns,
@@ -979,31 +1076,52 @@ def _create_app(
         # 404 with a stable machine code; the detail is fixed plain language —
         # the internal exception text (which names Landscape run ids) is
         # deliberately not echoed.
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
         return JSONResponse(
             status_code=404,
             content={
                 "error_type": "audit_story_not_recorded",
                 "detail": "No audit story was recorded for this run.",
+                "request_id": _correlation_id(request),
             },
         )
 
     @app.exception_handler(StaleComposeStateError)
-    async def _stale_compose_state_error_handler(_request: Request, _exc: StaleComposeStateError) -> JSONResponse:
+    async def _stale_compose_state_error_handler(request: Request, _exc: StaleComposeStateError) -> JSONResponse:
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
         return JSONResponse(
             status_code=409,
             content={
                 "error_type": "stale_compose_state",
                 "detail": "The session changed while the compose turn was running.",
+                "request_id": _correlation_id(request),
             },
         )
 
     @app.exception_handler(AuditAccessLogWriteError)
-    async def _audit_access_log_write_error_handler(_request: Request, _exc: AuditAccessLogWriteError) -> JSONResponse:
+    async def _audit_access_log_write_error_handler(request: Request, _exc: AuditAccessLogWriteError) -> JSONResponse:
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
         return JSONResponse(
             status_code=500,
             content={
                 "error_type": "audit_access_log_write_failed",
                 "detail": "Audit-grade transcript access could not be recorded; no audit-grade data returned.",
+                "request_id": _correlation_id(request),
             },
         )
 
@@ -1185,6 +1303,7 @@ def _create_app(
         mutation_authority=user_preference_authority,
     )
 
+    session_operation_authority: SessionOperationAuthority
     if session_engine.dialect.name == "sqlite":
         session_operation_authority = SQLiteLocalSessionOperationAuthority(session_engine)
     elif session_engine.dialect.name == "postgresql":
@@ -1332,9 +1451,15 @@ def _create_app(
         request: Request,
         exc: RunAlreadyActiveError,
     ) -> JSONResponse:
+        # R2-F16b: this handler renders its ``JSONResponse`` directly, so it
+        # never reaches the app-level ``HTTPException`` boundary that injects
+        # the correlation id — it sources the id itself, top-level, matching
+        # this envelope's flat shape and ``_audit_integrity_error_handler``.
+        # Read leniently: an app assembled without ``RequestIdMiddleware``
+        # must still render its error rather than fail inside the handler.
         return JSONResponse(
             status_code=409,
-            content={"detail": str(exc), "error_type": "run_already_active"},
+            content={"detail": str(exc), "error_type": "run_already_active", "request_id": _correlation_id(request)},
         )
 
     # --- Secret-subsystem typed error translation ---
@@ -1374,6 +1499,22 @@ def _create_app(
         sentinel. Mirrors the direct read in ``web/auth/audit.py``.
         """
         request_id: str = request.state.request_id
+        return request_id
+
+    def _correlation_id(request: Request) -> str | None:
+        """Lenient sibling of :func:`_request_id` for the direct-render handlers.
+
+        Same value, weaker contract. ``_request_id`` is used where a missing
+        id would mean the middleware contract is broken *on a path that
+        already reached a route*. The handlers that call this one render a
+        ``JSONResponse`` directly and are the last line of defence for a
+        request that has already failed: raising ``AttributeError`` while
+        gathering a correlation field would replace a well-classified,
+        redacted error body with an uncorrelated bare 500 — strictly worse
+        for the operator this field exists to serve. A None here is honest
+        ("no middleware stamped an id"), not fabricated.
+        """
+        request_id: str | None = getattr(getattr(request, "state", None), "request_id", None)
         return request_id
 
     @app.exception_handler(FingerprintKeyMissingError)
@@ -1493,6 +1634,45 @@ def _create_app(
     ) -> JSONResponse:
         safe_errors = [{k: v for k, v in error.items() if k in _SAFE_VALIDATION_ERROR_KEYS} for error in exc.errors()]
         return JSONResponse(status_code=422, content={"detail": safe_errors})
+
+    # --- request_id on every structured error envelope (all routes) ---
+    # ``RequestIdMiddleware`` stamps ``X-Request-ID`` on every response and
+    # the named-exception handlers above put the same id in their bodies —
+    # but the guided routes consume their terminal exception in-route
+    # (settling the operation first) and re-raise a CLOSED ``HTTPException``
+    # via ``raise_guided_operation_failure``. Those envelopes reached the
+    # client through FastAPI's default renderer, which knows nothing about
+    # the correlation id, so the header a user could quote back correlated
+    # to nothing (R2-F16b).
+    #
+    # Fixing that at the ~40 dict-detail raise sites would regress the first
+    # time a new one is added, so the injection lives at the ONE boundary
+    # every ``HTTPException`` already passes through. It is registered
+    # against ``starlette.exceptions.HTTPException`` — the same key FastAPI's
+    # ``setup()`` uses — so this REPLACES the default renderer rather than
+    # forking the boundary in two; registering against ``fastapi``'s
+    # subclass instead would leave router-raised 404s on the old path.
+    # Rendering itself is still delegated to FastAPI's handler, which owns
+    # the bodiless-status (204/304) and ``headers`` behaviour.
+    #
+    # Only dict details are touched. A bare ``detail="..."`` string is a
+    # plain-language message, not an envelope; wrapping it would change the
+    # response contract of every string raise site in the app.
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
+        # Starlette narrows ``detail`` to ``str``; FastAPI's subclass widens it
+        # to ``Any`` and every structured envelope in this app is a dict raised
+        # through that subclass. Read it as ``object`` so the discrimination
+        # below is a real runtime check rather than statically dead code.
+        detail: object = exc.detail
+        if not isinstance(detail, dict) or "request_id" in detail:
+            return await fastapi_http_exception_handler(request, exc)
+        correlated = HTTPException(
+            status_code=exc.status_code,
+            detail={**detail, "request_id": _request_id(request)},
+            headers=exc.headers,
+        )
+        return await fastapi_http_exception_handler(request, correlated)
 
     @app.get("/api/health")
     async def health() -> dict[str, str]:

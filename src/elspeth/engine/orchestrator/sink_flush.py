@@ -176,6 +176,10 @@ class SinkFlushCoordinator:
                 routed_destinations=dict(counters.routed_destinations),
             )
 
+        effect_modes = config.sink_effect_modes
+        if set(effect_modes) != set(config.sinks):
+            raise OrchestrationInvariantError("Pipeline sink effect modes must exactly cover the runtime sink names")
+
         sink_executor = SinkExecutor(
             factory.execution,
             factory.data_flow,
@@ -183,13 +187,12 @@ class SinkFlushCoordinator:
             run_id,
             factory=factory,
             worker_id=worker_id,
-            shutdown_event=getattr(ctx, "shutdown_event", None),
+            shutdown_event=ctx.shutdown_event,
             check_coordination_latch=check_coordination_latch,
             make_shutdown_error=_shutdown_during_sink_effect_wait,
         )
         step = sink_step
         total_diversions = DiversionCounts()
-        effect_modes = getattr(config, "sink_effect_modes", {})
 
         def consume_group(
             live_pairs: list[tuple[TokenInfo, PendingOutcome | None]], group_pairs: list[tuple[TokenInfo, PendingOutcome | None]]
@@ -272,6 +275,9 @@ class SinkFlushCoordinator:
                 on_token_written: CheckpointAfterSinkCallback | None = (
                     _CompositeAfterSinkCallback(tuple(after_sink_callbacks)) if after_sink_callbacks else None
                 )
+                failsink_effect_mode = None
+                if failsink_config_name is not None:
+                    failsink_effect_mode = effect_modes[failsink_config_name]
                 _, diversion_counts = sink_executor.write(
                     sink=sink,
                     tokens=group_tokens,
@@ -279,10 +285,10 @@ class SinkFlushCoordinator:
                     step_in_pipeline=step,
                     sink_name=sink_name,
                     pending_outcome=pending_outcome,
-                    effect_mode=effect_modes.get(sink_name),
+                    effect_mode=effect_modes[sink_name],
                     failsink=failsink,
                     failsink_name=failsink_config_name,
-                    failsink_effect_mode=None if failsink_config_name is None else effect_modes.get(failsink_config_name),
+                    failsink_effect_mode=failsink_effect_mode,
                     failsink_edge_id=failsink_edge_id,
                     on_token_written=on_token_written,
                 )

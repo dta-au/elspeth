@@ -1108,6 +1108,31 @@ def test_nonraising_clean_returns_no_findings(tmp_path: Path) -> None:
     assert findings == [], f"Clean non_raising boundary must pass; got: {[(f.rule_id, f.message[:80]) for f in findings]}"
 
 
+def test_observation_boundary_alias_uses_nonraising_honesty_check(tmp_path: Path) -> None:
+    """The distinct marker implies non-raising semantics even when imported under an alias."""
+    findings = _analyze_at(
+        """
+        from elspeth.contracts.trust_boundary import observation_boundary as observes
+
+        @observes(
+            tier=3,
+            source="LLM tool-call arguments",
+            source_param="arguments",
+            suppresses=("R5",),
+            invariant="returns None on malformed input",
+        )
+        def extract(arguments):
+            source = arguments["source"] if "source" in arguments else None
+            if source is None:
+                return None
+            return source
+        """,
+        repo_root=tmp_path,
+    )
+
+    assert findings == []
+
+
 def test_nonraising_raise_on_source_param_guard_is_flagged(tmp_path: Path) -> None:
     """A raise gated by a source_param-derived check contradicts the non_raising claim."""
     findings = _analyze_at(
@@ -1130,6 +1155,29 @@ def test_nonraising_raise_on_source_param_guard_is_flagged(tmp_path: Path) -> No
         """,
         repo_root=tmp_path,
     )
+    assert [f.rule_id for f in findings] == [RULE_NONRAISING_RAISES]
+
+
+def test_observation_boundary_raise_on_source_param_guard_is_flagged(tmp_path: Path) -> None:
+    findings = _analyze_at(
+        """
+        from elspeth.contracts.trust_boundary import observation_boundary
+
+        @observation_boundary(
+            tier=3,
+            source="LLM tool-call arguments",
+            source_param="arguments",
+            suppresses=("R5",),
+            invariant="returns None on malformed input",
+        )
+        def extract(arguments):
+            if arguments.get("source") is None:
+                raise ValueError("missing source")
+            return arguments["source"]
+        """,
+        repo_root=tmp_path,
+    )
+
     assert [f.rule_id for f in findings] == [RULE_NONRAISING_RAISES]
 
 

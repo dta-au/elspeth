@@ -43,6 +43,7 @@ from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
+from elspeth.web.execution.completion_gates import parse_completion_gates
 from elspeth.web.execution.diagnostics import llm_safe_diagnostics_snapshot, load_run_diagnostics_for_settings
 from elspeth.web.execution.errors import (
     BlobSourcePathMismatchError,
@@ -889,6 +890,7 @@ def create_execution_router() -> APIRouter:
                 session_operation_context=lease.context,
                 user_id=user.user_id,
                 session_id=session_id,
+                completion_gates=parse_completion_gates(state_record.composer_meta),
             )
         finally:
             await lease.close()

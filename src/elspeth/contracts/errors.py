@@ -210,6 +210,46 @@ class ExecutionError:
 
 
 @dataclass(frozen=True, slots=True)
+class RowUnionFailureReason:
+    """Frozen DTO for row_union barrier failure payloads.
+
+    Used by RowUnionExecutor when recording fork-branch UNION ALL barrier
+    failures. v1 is require_all with no partial release, so every failure
+    consumes the whole pending group: any timeout, lost branch, or
+    end-of-source flush of an incomplete group fails all held branches.
+    """
+
+    failure_reason: str  # Why the union failed (e.g., "row_union_timeout")
+    expected_branches: tuple[str, ...]  # Branches declared for the union
+    branches_arrived: tuple[str, ...]  # Branches held when the failure fired
+    timeout_ms: int | None = None  # Timeout that triggered failure (if applicable)
+
+    def __post_init__(self) -> None:
+        """Validate row_union failure record invariants."""
+        if not self.failure_reason:
+            raise ValueError("RowUnionFailureReason.failure_reason must not be empty")
+        if not self.expected_branches:
+            raise ValueError("RowUnionFailureReason.expected_branches must not be empty")
+        if self.timeout_ms is not None and self.timeout_ms < 0:
+            raise ValueError(f"RowUnionFailureReason.timeout_ms must be non-negative, got {self.timeout_ms}")
+        freeze_fields(self, "expected_branches", "branches_arrived")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to audit-trail dict.
+
+        Omits None-valued optional fields for compact JSON.
+        """
+        d: dict[str, Any] = {
+            "failure_reason": self.failure_reason,
+            "expected_branches": list(self.expected_branches),
+            "branches_arrived": list(self.branches_arrived),
+        }
+        if self.timeout_ms is not None:
+            d["timeout_ms"] = self.timeout_ms
+        return d
+
+
+@dataclass(frozen=True, slots=True)
 class CoalesceFailureReason:
     """Frozen DTO for coalesce/barrier failure payloads.
 
@@ -527,6 +567,14 @@ TransformErrorCategory = Literal[
     "poll_timeout",  # async analyze operation did not reach a terminal status within budget
     "operation_location_missing",  # 202 response lacked the Operation-Location header
     "operation_location_untrusted",  # Operation-Location host != configured endpoint (security)
+    # Amazon Textract asynchronous document analysis
+    "submit_failed",
+    "poll_failed",
+    "partial_success",
+    "pagination_cycle",
+    "pagination_limit_exceeded",
+    "too_many_blocks",
+    "result_too_large",
 ]
 
 
@@ -635,6 +683,7 @@ class TransformErrorReason(TypedDict):
     field: NotRequired[str]
     error_type: NotRequired[str]
     message: NotRequired[str]
+    code: NotRequired[str]
     url: NotRequired[str]
     blob_ref: NotRequired[str]
     encoding: NotRequired[str]

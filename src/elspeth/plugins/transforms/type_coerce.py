@@ -280,8 +280,30 @@ class TypeCoerce(BaseTransform):
     name = "type_coerce"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f6735afbb2dc53db"
+    source_file_hash: str | None = "sha256:5248c4c350387ce4"
     config_model = TypeCoerceConfig
+    usage_when_to_use: str = (
+        "Use for explicit field-by-field type normalization when values such as CSV strings must become "
+        "integers, floats, booleans, or strings before downstream processing."
+    )
+    usage_when_not_to_use: str = (
+        "Not for arbitrary calculation or implicit best-effort conversion: use value_transform for "
+        "derived values, and declare only the conversions whose failure should be visible."
+    )
+    example_use: str = """transform:
+  plugin: type_coerce
+  options:
+    conversions:
+      - field: price
+        to: float
+      - field: quantity
+        to: int
+      - field: in_stock
+        to: bool
+    schema:
+      mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("types", "coercion", "normalization")
     passes_through_input = True
 
     def __init__(self, config: dict[str, Any]) -> None:

@@ -107,6 +107,33 @@ class ComposerLLMCall:
     assistant chat content. Missing fields stay ``None`` rather than being
     fabricated.
 
+    ``finish_reason`` is the provider's own termination signal for the call,
+    stored as the **raw provider string, verbatim** — never normalised,
+    mapped, or coerced into an ELSPETH vocabulary. It is the only audit
+    evidence that distinguishes a completed answer (``stop``) from one the
+    provider truncated (``length``) or refused (``content_filter``); without
+    it a truncated composer turn is indistinguishable from a short one.
+    Recording the string as-received means an unrecognised or newly
+    introduced provider value survives to the audit trail intact rather than
+    being flattened into a known bucket. A response that carries no finish
+    reason stays ``None`` — the same fabrication policy the cache and
+    reasoning fields follow. This field is *evidence only*: unlike the
+    pipeline LLM transform, the composer does not treat a non-``stop`` value
+    as an error, so it makes truncation visible without changing control flow.
+
+    Provider-authored strings (``model_returned``, ``provider_request_id``,
+    ``finish_reason``, ``error_message``, ``reasoning_content``) arrive
+    already bounded: ``web/composer/llm_response_parsing.build_llm_call_record``
+    is the sole construction site in ``src`` and caps each one at extraction,
+    so the envelope, the rendered summary, and the sidecar all inherit one
+    bounded value. This contract deliberately does **not** re-check their
+    length. Rejecting an oversized field would raise instead of recording —
+    discarding the very evidence that the endpoint misbehaved — and a second
+    bound in a second place would be a second limit to keep in sync. The
+    guarantee is therefore capture-point-enforced, not contract-enforced: a
+    record constructed directly (a test, or future code that bypasses
+    ``build_llm_call_record``) is not bounded by anything here.
+
     ``temperature`` and ``seed`` capture the sampling parameters actually sent
     on composer LLM requests. Both are operator-set
     (``WebSettings.composer_temperature`` / ``composer_seed``) and recorded as
@@ -132,6 +159,7 @@ class ComposerLLMCall:
     error_message: str | None
     temperature: float | None
     seed: int | None
+    finish_reason: str | None = None
     cached_prompt_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
@@ -151,6 +179,10 @@ class ComposerLLMCall:
         _require_non_empty_str(self.model_requested, "model_requested")
         _require_non_empty_str(self.model_returned, "model_returned", optional=True)
         _require_non_empty_str(self.provider_request_id, "provider_request_id", optional=True)
+        # An empty/whitespace finish_reason is not "the provider said nothing"
+        # — absence is ``None``. A blank string reaching here is a defect in
+        # the extraction site, not provider data worth recording.
+        _require_non_empty_str(self.finish_reason, "finish_reason", optional=True)
         _require_non_empty_str(self.messages_hash, "messages_hash")
         _require_non_empty_str(self.tools_spec_hash, "tools_spec_hash", optional=True)
         if type(self.declared_tool_names) is not tuple:

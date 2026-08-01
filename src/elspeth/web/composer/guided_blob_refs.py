@@ -1,4 +1,14 @@
-"""Pure validation for blob references retained by guided review snapshots."""
+"""Pure readers and validators over guided reviewed-source option mappings.
+
+Every guided review snapshot carries one untrusted option mapping per reviewed
+component. Provider projections (chat revision context, planner context) and
+the RESPOND transitions all have to answer the same questions about it — is it
+bound to server-held blob storage, and what fields does its schema declare —
+and each answer must be derived from ONE contract here rather than
+re-implemented per projection. Three hand-maintained copies of these reads is
+exactly how a projection came to report absence as fact (see
+``reviewed_source_is_blob_bound``).
+"""
 
 from __future__ import annotations
 
@@ -6,8 +16,10 @@ from collections.abc import Mapping, Sequence
 from uuid import UUID
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 
 GUIDED_REVIEWED_BLOB_PATH_KEYS = ("path", "file")
+GUIDED_REVIEWED_EXPLICIT_SCHEMA_MODES = ("fixed", "flexible")
 
 
 def validate_guided_reviewed_blob_ref(value: object) -> str:
@@ -67,3 +79,98 @@ def validate_guided_reviewed_blob_source_mapping(
         ]
         if len(candidates) != 1:
             raise AuditIntegrityError("guided blob source mapping is inconsistent")
+
+
+def reviewed_source_is_blob_bound(options: Mapping[str, object]) -> bool:
+    """Report whether a reviewed source reads server-held blob storage.
+
+    Two writer families bind a reviewed source to a blob, and a projection that
+    knows only one of them reports the other as unbound. Freeform / import /
+    copy paths retain an explicit ``blob_ref`` custody key; every guided-native
+    path instead carries the ``blob:<id>`` sentinel in a path knob (the guided
+    emitters mint it, and the proposal custody boundary refuses a caller-
+    supplied ``blob_ref``). Both are the same fact to a provider.
+
+    Returns a bare boolean by design: the reference, the storage path, and the
+    blob id are all withheld from provider-visible projections
+    (elspeth-0762539db5), so this is the whole of what may be projected.
+    """
+    if "blob_ref" in options:
+        return True
+    for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
+        if key not in options:
+            continue
+        value = options[key]
+        if type(value) is str and value.startswith(BLOB_REF_PATH_PREFIX):
+            return True
+    return False
+
+
+def reviewed_schema_mode(schema: object) -> str | None:
+    """Return a reviewed source schema's declared mode, or ``None`` if unstated.
+
+    ``schema`` is an untrusted authored option value, so a non-mapping schema
+    or a non-string mode is honest absence rather than an error: callers
+    project ``None`` rather than inventing a mode.
+    """
+    if not isinstance(schema, Mapping):
+        return None
+    mode = schema.get("mode")
+    if type(mode) is not str:
+        return None
+    return mode
+
+
+def reviewed_schema_declared_field_names(schema: object) -> tuple[str, ...]:
+    """Return the ordered distinct field names an explicit schema declares.
+
+    Explicit schemas (``mode`` ``fixed`` or ``flexible``) carry their field
+    inventory under ``fields``, and those declared fields are implicitly
+    guaranteed (see :class:`elspeth.contracts.schema.SchemaConfig`) — a
+    projection that reads only ``guaranteed_fields`` therefore reports an
+    explicit schema as having no fields at all. Observed schemas declare no
+    fields here and legitimately return ``()``.
+
+    Non-raising by contract: this feeds provider projections of untrusted
+    authored options, so a malformed member is dropped rather than raised on.
+    That is the one difference from ``source_inspection._declared_field_name``,
+    which asserts against the same authoring shapes at the inspection
+    boundary. Name extraction mirrors ``_normalize_field_spec``'s precedence
+    exactly — an explicit ``name``/``type`` or ``name``/``field_type`` spec
+    first, then the single-key YAML form — so a spec keyed literally ``name``
+    resolves to the same field the config loader would build. Only the name is
+    extracted: a raw ``"field: type"`` spec would match neither the observed
+    columns nor the alias registry.
+    """
+    if reviewed_schema_mode(schema) not in GUIDED_REVIEWED_EXPLICIT_SCHEMA_MODES:
+        return ()
+    if not isinstance(schema, Mapping):  # pragma: no cover - a mode implies a mapping
+        return ()
+    fields = schema.get("fields")
+    if not isinstance(fields, Sequence) or type(fields) is str:
+        return ()
+    names: list[str] = []
+    for spec in fields:
+        name = _declared_field_spec_name(spec)
+        if name is not None and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def _declared_field_spec_name(spec: object) -> str | None:
+    """Extract one declared field's name, or ``None`` for a malformed spec."""
+    if type(spec) is str:
+        return spec.split(":", 1)[0].strip() or None
+    if not isinstance(spec, Mapping):
+        return None
+    if "name" in spec and ("type" in spec or "field_type" in spec):
+        name = spec["name"]
+        if type(name) is not str:
+            return None
+        return name.strip() or None
+    if len(spec) == 1:
+        key = next(iter(spec))
+        if type(key) is not str:
+            return None
+        return key.strip() or None
+    return None

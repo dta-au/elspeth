@@ -371,5 +371,13 @@ export function isAmbiguousGuidedRetryFailure(error: unknown): boolean {
   const record = error as { error_type?: unknown; name?: unknown; status?: unknown };
   if (record.name === "AbortError" || record.name === "TimeoutError") return true;
   if (record.error_type === "guided_operation_terminal_failure") return false;
+  // A server-invariant 500 is a DETERMINISTIC pre-reservation rejection, not
+  // transport ambiguity: the server refused before any durable staging, so
+  // retaining custody wedges the surface for the whole page load — every
+  // different-body follow-up conflicts against a replay that can only fail
+  // the same way (inv-f6 F7b). The structured envelope
+  // ({"error_type": "server_invariant_violated"}) exists precisely so this
+  // classifier can settle custody immediately.
+  if (record.error_type === "server_invariant_violated") return false;
   return typeof record.status === "number" && record.status >= 500 && record.status <= 599;
 }

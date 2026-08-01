@@ -229,6 +229,8 @@ export async function parseResponse<T>(
     // responses.
     let detail = response.statusText;
     let errorType: string | undefined;
+    let requestId: string | undefined;
+    let failureCode: string | undefined;
     let componentId: string | undefined;
     let pluginId: string | undefined;
     let nestedSnapshotFingerprint: string | undefined;
@@ -237,6 +239,9 @@ export async function parseResponse<T>(
     let fanoutGuard: ExecutionFanoutGuard | undefined;
     let validationErrors: ApiError["validation_errors"];
     let errors: ApiError["errors"];
+    let reason: string | undefined;
+    let recoveryText: ApiError["recovery_text"];
+    let timeoutSeconds: number | undefined;
     let partialState: ApiError["partial_state"];
     let failedTurn: ApiError["failed_turn"];
     let partialStateSaveFailed: ApiError["partial_state_save_failed"];
@@ -252,6 +257,27 @@ export async function parseResponse<T>(
         [body, nestedDetail],
         ["error_type", "error_code", "code", "kind"],
       );
+
+      requestId = firstStringField([body, nestedDetail], ["request_id"]);
+      failureCode = firstStringField([body, nestedDetail], ["failure_code"]);
+
+      // Convergence discriminator + its recovery copy. Kept off `detail` so
+      // the SPA branches on the taxonomy rather than parsing prose.
+      reason = firstStringField([body, nestedDetail], ["reason"]);
+      recoveryText = firstStringField([body, nestedDetail], ["recovery_text"]);
+
+      const rawTimeoutSeconds = firstDefined(
+        ownField(body, "timeout_seconds"),
+        ownField(nestedDetail, "timeout_seconds"),
+      );
+      // Finite and positive or absent — error copy must not name a number the
+      // response did not actually stand behind.
+      timeoutSeconds =
+        typeof rawTimeoutSeconds === "number" &&
+        Number.isFinite(rawTimeoutSeconds) &&
+        rawTimeoutSeconds > 0
+          ? rawTimeoutSeconds
+          : undefined;
 
       const rawComponentId = firstDefined(
         ownField(body, "component_id"),
@@ -362,8 +388,13 @@ export async function parseResponse<T>(
       status: response.status,
       detail,
       error_type: errorType,
+      request_id: requestId,
+      failure_code: failureCode,
       component_id: componentId,
       plugin_id: pluginId,
+      reason,
+      recovery_text: recoveryText,
+      timeout_seconds: timeoutSeconds,
       partial_state: partialState,
       failed_turn: failedTurn,
       partial_state_save_failed: partialStateSaveFailed,

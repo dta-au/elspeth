@@ -67,6 +67,18 @@ _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE = (
     _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _PREFLIGHT_NOTICE_HEADER + "\n\n" + _PREFLIGHT_NOTICE_FOOTER
 )
 
+# R2-F14 (elspeth-5403f346c0): the advisor end gate used to borrow
+# ``_PREFLIGHT_NOTICE_HEADER`` for a sign-off that never rendered, telling the
+# user "Runtime preflight failed" on a build whose preflight had just PASSED
+# (green side rail, contradictory note). This notice is the honest alternative:
+# it states what actually happened and what to do, and — unlike the preflight
+# wrapper — carries no interpolated diagnostic, so the whole suffix is fixed
+# operator-authored prose.
+_ADVISOR_SIGNOFF_PENDING_NOTICE: Final = (
+    "Advisor sign-off could not be completed — built and validated; final sign-off pending. Retry to complete."
+)
+_ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_NOTICE
+
 _MAX_INTENT_CLASSIFICATION_CHARS: Final = 4_096
 _MUTATION_ACTION_PATTERN: Final = (
     r"(?:set\s+(?:this|it)\s+up|set\s+up|setup|build|create|make|wire|add|update|modify|change|run|execute|process|route|split|save)"
@@ -125,6 +137,29 @@ _MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR: Final = (
     rf"(?:(?:{_FIRST_PERSON_REQUEST_GRAMMAR})|(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?))?"
     rf"{_POSITIVE_LEAD_GRAMMAR}"
 )
+_DATA_SOURCE_FORMAT_GRAMMAR: Final = r"(?:csv|jsonl?|parquet)"
+_DATA_SOURCE_REFERENCE_GRAMMAR: Final = (
+    rf"(?:"
+    rf"[a-z0-9_./-]+\.{_DATA_SOURCE_FORMAT_GRAMMAR}\b|"
+    rf".+?\s+from\s+(?:(?:an?|the|named)\s+)*{_DATA_SOURCE_FORMAT_GRAMMAR}\b|"
+    rf".*?\b{_DATA_SOURCE_FORMAT_GRAMMAR}\s+(?:inputs?|files?|rows?)\b"
+    rf")(?=\s*(?:[,;:.]|\u2013|\u2014|\b(?:and|then)\b))"
+)
+_PIPELINE_OPERATION_GRAMMAR: Final = (
+    r"(?:aggregate|batch|coerce|collect|expand|fan(?:\s+out)?|hand(?:\s+off)?|"
+    r"interleave|merge|pass|process|route|send|transform|wait|write)"
+)
+_PIPELINE_OPERATION_OBJECT_GRAMMAR: Final = (
+    r"(?:"
+    r"(?:(?:a|an|the|this|these|those|each|every|both|all|one|two)\s+)?"
+    r"(?:(?:combined|aggregated|transformed|expanded|input|output|source|typed|numeric)\s+)*"
+    r"(?:rows?|records?|data|streams?|results?|outputs?|sinks?|sources?|inputs?|nodes?|edges?|batches?|fields?|values?|price)|"
+    r"each(?=\s+through\b)|"
+    r"[a-z0-9_./-]+\.(?:csv|jsonl?|parquet)\b|"
+    r"(?:it|them)\s+(?:to|into|through)\s+"
+    r"(?:(?:a|an|the|one)\s+)?(?:(?:csv|jsonl?|parquet)\s+)?(?:output|sink|file|path)"
+    r")"
+)
 _MULTI_CLAUSE_PIPELINE_BUILD_PATTERN: Final = re.compile(
     rf"{_MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR}"
     r"(?:build|create|make)\s+(?:a|an|the|this)\s+"
@@ -133,18 +168,33 @@ _MULTI_CLAUSE_PIPELINE_BUILD_PATTERN: Final = re.compile(
     re.IGNORECASE,
 )
 _MULTI_CLAUSE_PIPELINE_READ_PATTERN: Final = re.compile(
-    rf"{_MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR}read\s+.+?\b(?:csv|jsonl?|parquet)\b.+",
+    rf"{_MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR}read\s+{_DATA_SOURCE_REFERENCE_GRAMMAR}.+",
     re.IGNORECASE,
 )
 _MULTI_CLAUSE_PIPELINE_OPERATION_PATTERN: Final = re.compile(
-    r"\b(?:aggregat|batch|coerc|collect|expand|fan|hand|interleav|merg|pass|process|rout|send|transform|wait|writ)\w*\b",
+    rf"(?:[,;:.]|\u2013|\u2014|\b(?:and|then)\b)\s*"
+    rf"(?:(?:and|then)\s+)?{_PIPELINE_OPERATION_GRAMMAR}\b\s+"
+    rf"{_PIPELINE_OPERATION_OBJECT_GRAMMAR}",
     re.IGNORECASE,
+)
+_NEGATED_DO_GRAMMAR: Final = r"(?:do\s+not|don(?:'|\u2019)t)"
+_WHOLE_REQUEST_ACTION_GRAMMAR: Final = r"(?:build|change|create|execute|make|process|run|save|update)"
+_WHOLE_REQUEST_TARGET_GRAMMAR: Final = (
+    r"(?:anything|any\s+changes?|it|this|that|(?:(?:this|that|the|my)\s+)?(?:request|build|pipeline|workflow|automation))"
+)
+_WHOLE_REQUEST_ACTION_CLAUSE_GRAMMAR: Final = (
+    rf"{_WHOLE_REQUEST_ACTION_GRAMMAR}"
+    rf"(?:\s+{_WHOLE_REQUEST_TARGET_GRAMMAR})?"
+    r"\s*(?:[.!;]|$)"
 )
 _REQUEST_REVOCATION_PATTERN: Final = re.compile(
     rf"(?:"
-    rf"\b(?:do\s+not|don't|never)\s+{_MUTATION_ACTION_PATTERN}\b|"
-    rf"\b(?:do\s+not|don't)\s+want\s+(?:you\s+)?to\s+{_MUTATION_ACTION_PATTERN}\b|"
-    r"\b(?:actually,\s*)?(?:do\s+not|don't)\s*(?:[.!;]|$)|"
+    rf"\b(?:{_NEGATED_DO_GRAMMAR}|never)\s+{_WHOLE_REQUEST_ACTION_CLAUSE_GRAMMAR}|"
+    rf"\b(?:{_NEGATED_DO_GRAMMAR}|never)\s+do\s+(?:that|this|it|so)\s*(?:[.!;]|$)|"
+    rf"\b{_NEGATED_DO_GRAMMAR}\s+want\s+(?:you\s+)?to\s+{_WHOLE_REQUEST_ACTION_CLAUSE_GRAMMAR}|"
+    rf"\bi\s+{_NEGATED_DO_GRAMMAR}\s+want\s+(?:that|this|it)\s*(?:[.!;]|$)|"
+    rf"\b(?:actually,\s*)?{_NEGATED_DO_GRAMMAR}\s*(?:[.!;]|$)|"
+    rf"\b(?:please\s+)?{_NEGATED_DO_GRAMMAR}\s+(?:proceed|continue)\s*(?:[.!;]|$)|"
     r"\bshould\s+not\s+be\s+(?:built|created|made|run|executed)\b|"
     r"\bcancel\s+(?:(?:that|this|the|my)\s+)?(?:request|build|pipeline)\b|"
     r"\bforget\s+(?:(?:that|this|the|my)\s+)?(?:request|build|pipeline)\b|"
@@ -152,9 +202,10 @@ _REQUEST_REVOCATION_PATTERN: Final = re.compile(
     r"\bi\s+no\s+longer\s+(?:want|need)\b|"
     r"\bonly\s+an?\s+example\b|"
     r"\binstead,\s+(?:please\s+)?(?:describe|explain|show|tell)\b|"
-    r"\b(?:never\s+mind|cancel\s+that|scratch\s+that|forget\s+it|undo\s+that|revert\s+that|"
+    r"\b(?:never\s+mind|cancel\s+(?:that|this|it)|scratch\s+that|forget\s+it|undo\s+that|revert\s+that|"
     r"belay\s+that|hold\s+off|ignore\s+that|withdraw\s+that\s+request|i\s+take\s+that\s+back|"
     r"i\s+changed\s+my\s+mind|on\s+second\s+thought|skip\s+it|without\s+changing\s+anything)\b|"
+    r"\b(?:please\s+)?(?:stop|cancel)\s*(?:[.!;]|$)|"
     r"\babort\b"
     rf")",
     re.IGNORECASE,
@@ -279,6 +330,8 @@ def _canonical_trusted_suffix_segments(suffix: str) -> tuple[VisibleMessageSegme
     )
     if empty_with_blocker is not None:
         return empty_with_blocker
+    if suffix == _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX:
+        return (TrustedSystemNoticeSegment(_ADVISOR_SIGNOFF_PENDING_NOTICE),)
     if suffix == _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE:
         return (TrustedSystemNoticeSegment(f"{_PREFLIGHT_NOTICE_HEADER}\n\n{_PREFLIGHT_NOTICE_FOOTER}"),)
     preflight_with_diagnostic = _split_wrapped_diagnostic(
@@ -382,6 +435,20 @@ def compose_preflight_failure_message(content: str, *, runtime_result: Validatio
     if not content:
         return suffix.lstrip("\n").lstrip("-").lstrip()
     return content + suffix
+
+
+def compose_advisor_signoff_pending_message(content: str) -> str:
+    """Build the user-facing message for a validated-but-unsigned build.
+
+    Deliberately NOT ``compose_preflight_failure_message``: the runtime
+    preflight passed, so a "Runtime preflight failed" header would be a false
+    statement about the user's pipeline (R2-F14, elspeth-5403f346c0). The
+    suffix is entirely fixed prose — no validator detail is interpolated,
+    because there is no validator objection to report.
+    """
+    if not content:
+        return _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX.lstrip("\n").lstrip("-").lstrip()
+    return content + _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX
 
 
 def _strip_quoted_text(message: str) -> tuple[str, bool, bool]:

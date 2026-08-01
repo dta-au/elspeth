@@ -201,6 +201,34 @@ async def _create_test_composition_proposal(
         )
 
 
+async def _create_test_pipeline_composition_proposal(
+    service: SessionServiceImpl,
+    *,
+    session_id: uuid.UUID,
+    **kwargs: Any,
+) -> CompositionProposalRecord:
+    async with _compose_session_operation_context(service, session_id) as context:
+        return await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            session_operation_context=context,
+            **kwargs,
+        )
+
+
+async def _update_test_composer_preferences(
+    service: SessionServiceImpl,
+    *,
+    session_id: uuid.UUID,
+    **kwargs: Any,
+) -> None:
+    async with _compose_session_operation_context(service, session_id) as context:
+        await service.update_composer_preferences(
+            session_id,
+            session_operation_context=context,
+            **kwargs,
+        )
+
+
 def _guided_chat_body(guided_response: Mapping[str, Any], message: str) -> dict[str, Any]:
     turn = guided_response["next_turn"]
     assert turn is not None
@@ -495,6 +523,35 @@ class _ProgressRouteSessionService:
         )
         self.messages.append(message)
         return message
+
+    async def add_message_with_transcript(
+        self,
+        session_id: uuid.UUID,
+        role: ChatMessageRole,
+        content: str,
+        *,
+        writer_principal: str,
+        tool_calls=None,
+        composition_state_id: uuid.UUID | None = None,
+        raw_content: str | None = None,
+        tool_call_id: str | None = None,
+        parent_assistant_id: uuid.UUID | None = None,
+    ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
+        # In-memory double: append + snapshot are trivially one atomic
+        # step, mirroring the production single-transaction contract
+        # (transcript ends at the inserted record by construction).
+        record = await self.add_message(
+            session_id,
+            role,
+            content,
+            writer_principal=writer_principal,
+            tool_calls=tool_calls,
+            composition_state_id=composition_state_id,
+            raw_content=raw_content,
+            tool_call_id=tool_call_id,
+            parent_assistant_id=parent_assistant_id,
+        )
+        return record, list(self.messages)
 
     async def get_messages(
         self,
@@ -925,6 +982,48 @@ def test_accept_proposal_executes_tool_and_commits_state(tmp_path, monkeypatch) 
     assert provenance == "tool_call"
 
 
+def test_accept_schema_stale_proposal_returns_422_and_rejects(tmp_path) -> None:
+    app, service = _make_app(tmp_path)
+    client = TestClient(app, raise_server_exceptions=False)
+    session = client.post("/api/sessions", json={"title": "Stale proposal"}).json()
+    session_id = uuid.UUID(session["id"])
+    arguments: dict[str, Any] = {}
+    proposal = asyncio.run(
+        _create_test_composition_proposal(
+            service,
+            session_id=session_id,
+            tool_call_id="call_stale_set_metadata",
+            tool_name="set_metadata",
+            summary="Update pipeline metadata.",
+            rationale="Persisted before the current tool schema was deployed.",
+            affects=("metadata",),
+            arguments_json=arguments,
+            arguments_redacted_json=arguments,
+            base_state_id=None,
+            actor="composer-web:user:alice",
+            composer_model_identifier="test-model",
+            composer_model_version="test-model-v1",
+            composer_provider="test",
+            composer_skill_hash="a" * 64,
+            tool_arguments_hash=stable_hash(arguments),
+        )
+    )
+
+    response = client.post(f"/api/sessions/{session_id}/proposals/{proposal.id}/accept")
+
+    persisted = asyncio.run(
+        service.get_authoritative_composition_proposal(
+            session_id=session_id,
+            proposal_id=proposal.id,
+            reviewed_facts=None,
+        )
+    ).row
+    assert (response.status_code, persisted.status) == (422, "rejected"), response.text
+    assert response.json()["detail"]["error_type"] == "proposal_validation_failed"
+    assert response.json()["detail"]["tool_name"] == "set_metadata"
+    assert asyncio.run(service.get_current_state(session_id)) is None
+
+
 async def _create_canonical_pipeline_route_proposal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -980,7 +1079,8 @@ async def _create_canonical_pipeline_route_proposal(
         covered_deferred_intent_ids=(),
         supersedes_draft_hash=None,
     )
-    row = await service.create_pipeline_composition_proposal(
+    row = await _create_test_pipeline_composition_proposal(
+        service,
         session_id=session_id,
         plan=PipelinePlanResult(
             proposal=proposal,
@@ -1064,8 +1164,9 @@ def test_send_message_explicit_approval_leaves_canonical_pipeline_pending(tmp_pa
         _create_canonical_pipeline_route_proposal(tmp_path, monkeypatch, tool_call_id="send-explicit-pipeline")
     )
     asyncio.run(
-        service.update_composer_preferences(
-            session_id,
+        _update_test_composer_preferences(
+            service,
+            session_id=session_id,
             trust_mode="explicit_approve",
             density_default="high",
             actor="user:alice",
@@ -1553,7 +1654,8 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
         provider="test",
     )
     row = asyncio.run(
-        service.create_pipeline_composition_proposal(
+        _create_test_pipeline_composition_proposal(
+            service,
             session_id=session_id,
             plan=plan,
             summary="Replace the pipeline.",
@@ -1730,7 +1832,8 @@ def test_generic_accept_rejects_guided_pipeline_surfaces_before_dispatch(tmp_pat
     session = client.post("/api/sessions", json={"title": "Guided pipeline"}).json()
     session_id = uuid.UUID(session["id"])
     row = asyncio.run(
-        service.create_pipeline_composition_proposal(
+        _create_test_pipeline_composition_proposal(
+            service,
             session_id=session_id,
             plan=plan,
             summary="Replace the pipeline.",
@@ -1815,7 +1918,8 @@ def test_malformed_canonical_creation_event_fails_closed_without_legacy_fallback
     session = client.post("/api/sessions", json={"title": "Malformed canonical"}).json()
     session_id = uuid.UUID(session["id"])
     row = asyncio.run(
-        service.create_pipeline_composition_proposal(
+        _create_test_pipeline_composition_proposal(
+            service,
             session_id=session_id,
             plan=plan,
             summary="Replace the pipeline.",
@@ -4951,6 +5055,7 @@ class TestMessageRoutes:
                             sample_rows=({"name": raw_row_secret, "value": "1"},),
                             on_validation_failure="discard",
                         ),
+                        deferred_action=None,
                     )
                 ),
             ),
@@ -5757,6 +5862,90 @@ class TestRecomposeConvergencePartialState:
                 "re-introduce the elspeth-5030f7373d split-brain symptom at a different layer."
             )
 
+    def test_wall_clock_timeout_body_carries_turn_context_and_the_elapsed_budget(self, tmp_path) -> None:
+        """R2-F9 (elspeth-114dd261bc): the timeout 422 must be self-sufficient.
+
+        The handler already persists the salvaged partial pipeline, but the
+        body used to describe the failure as "within 0 turns" with no
+        ``failed_turn`` (which is what the SPA's RecoveryPanel gates on) and
+        no way for the SPA to name the budget that actually elapsed. All
+        three now ride the same body.
+        """
+        from elspeth.contracts.errors import FailedTurnMetadata
+        from elspeth.web.composer.protocol import ComposerConvergenceError
+
+        partial = CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=2,
+        )
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerConvergenceError(
+                max_turns=4,
+                budget_exhausted="timeout",
+                partial_state=partial,
+                failed_turn=FailedTurnMetadata(
+                    assistant_message_id=None,
+                    tool_calls_attempted=3,
+                    tool_responses_persisted=3,
+                ),
+            ),
+        )
+
+        app, _service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        session_id = client.post("/api/sessions", json={"title": "timeout"}).json()["id"]
+        response = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "Build me a pipeline"},
+        )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert detail["reason"] == "convergence_wall_clock_timeout"
+        assert detail["turns_used"] == 4, "the body must report the turns actually spent, not 0"
+        assert detail["failed_turn"]["tool_calls_attempted"] == 3
+        # _make_app pins composer_timeout_seconds=85.0; the SPA needs the
+        # server-authoritative budget to name it honestly in the error copy.
+        assert detail["timeout_seconds"] == 85.0
+        assert "partial_state" in detail
+
+    def test_budget_convergence_body_omits_the_timeout_budget(self, tmp_path) -> None:
+        """``timeout_seconds`` is meaningless for the two turn-budget causes."""
+        from elspeth.web.composer.protocol import ComposerConvergenceError
+
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerConvergenceError(
+                max_turns=15,
+                budget_exhausted="composition",
+                partial_state=None,
+            ),
+        )
+
+        app, _service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        session_id = client.post("/api/sessions", json={"title": "budget"}).json()["id"]
+        response = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "Build me a pipeline"},
+        )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert detail["reason"] == "convergence_composition_budget"
+        assert "timeout_seconds" not in detail
+
     def test_convergence_redacts_blob_path_from_response_but_preserves_in_db(self, tmp_path) -> None:
         """When partial_state has a blob-backed source, the HTTP response must
         redact the internal storage path while the DB copy retains it."""
@@ -5985,6 +6174,88 @@ class TestRecomposeConvergencePartialState:
         assert detail["partial_state_save_failed"] is True
         # The diagnostic field carries ONLY the exception class name.
         assert detail.get("partial_state_save_error") == "OperationalError"
+
+    def test_convergence_body_does_not_disclose_blob_storage_path(self, tmp_path) -> None:
+        """elspeth-b5180a9630 (R2-F11): the 422 body must not carry a blob's
+        internal storage path.
+
+        ``partial_state`` is ``_state_response(...)``, whose ``sources`` view is
+        redacted by ``redact_source_storage_path``. But the same absolute path
+        was ALSO flattened verbatim into
+        ``composer_meta.implicit_decisions.entries[].value`` at write time by
+        ``merge_implicit_decisions_meta``, downstream of that projection and
+        outside the guided-only ``private_path_projections`` pass. The leak is
+        not 422-specific — every state response for a freeform blob-backed
+        source carried it — but the 422 is the widest reachable surface, so it
+        is the regression anchor.
+
+        Canary: a synthetic segment inside a blobs-root-shaped path. Its
+        presence anywhere in the serialised body is the leak.
+        """
+        import asyncio
+
+        from elspeth.contracts.freeze import deep_freeze
+        from elspeth.web.composer.protocol import ComposerConvergenceError
+
+        blob_ref = "3c9f1e27-8a4d-4b6f-9e21-7d5c0a8b6f34"
+        path_canary = "__CANARY_BLOB_STORAGE_PATH_SEGMENT__"
+        storage_path = f"/var/lib/elspeth/blobs/{blob_ref}/{path_canary}.csv"
+
+        partial = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                options=deep_freeze(
+                    {
+                        "blob_ref": blob_ref,
+                        "path": storage_path,
+                        "schema": {"mode": "fixed", "fields": ["url: str"]},
+                    }
+                ),
+                on_success="rows",
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=2,
+        )
+
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerConvergenceError(
+                max_turns=5,
+                budget_exhausted="composition",
+                partial_state=partial,
+            ),
+        )
+
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        resp = client.post("/api/sessions", json={"title": "Blob leak"})
+        session_id = resp.json()["id"]
+
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(
+            service.add_message(uuid.UUID(session_id), "user", "Summarise my upload", writer_principal="route_user_message")
+        )
+        loop.close()
+
+        recompose_resp = client.post(f"/api/sessions/{session_id}/recompose")
+
+        assert recompose_resp.status_code == 422, recompose_resp.text
+        body_text = json.dumps(recompose_resp.json())
+        assert path_canary not in body_text, "blob storage path leaked into the convergence 422 body"
+        assert "/var/lib/elspeth/blobs/" not in body_text, "blob storage root leaked into the convergence 422 body"
+
+        # Positive contract: the disclosure entry still exists and names the
+        # blob by its wire sentinel, so the report stays auditable.
+        entries = recompose_resp.json()["detail"]["partial_state"]["composer_meta"]["implicit_decisions"]["entries"]
+        by_path = {entry["path"]: entry for entry in entries}
+        assert by_path["source.path"]["value"] == f"blob:{blob_ref}"
 
     def test_send_message_convergence_threads_user_id_to_preflight(self, tmp_path) -> None:
         """I3 regression: _handle_convergence_error MUST pass the authenticated
@@ -6334,10 +6605,14 @@ class TestRevertEndpoint:
         # Create session and two state versions via the service
         session = await service.create_session("alice", "Pipeline", "local")
         v1 = await service.save_composition_state(
-            session.id, CompositionStateData(source={"type": "csv"}, is_valid=True), provenance="session_seed"
+            session.id,
+            CompositionStateData(source={"plugin": "csv"}, is_valid=True),
+            provenance="session_seed",
         )
         await service.save_composition_state(
-            session.id, CompositionStateData(source={"type": "api"}, is_valid=True), provenance="session_seed"
+            session.id,
+            CompositionStateData(source={"plugin": "json"}, is_valid=True),
+            provenance="session_seed",
         )
 
         # Revert to v1
@@ -6350,7 +6625,7 @@ class TestRevertEndpoint:
         body = resp.json()
         assert body["version"] == 3
         # Should match v1's source, not v2's
-        assert body["sources"] == {"source": {"type": "csv"}}
+        assert body["sources"] == {"source": {"plugin": "csv"}}
         # Lineage: new version derives from v1
         assert body["derived_from_state_id"] == str(v1.id)
 
@@ -6567,6 +6842,102 @@ sinks:
         assert "profile: task-role" in exported_yaml
         assert "bedrock" not in exported_yaml
         assert "credential" not in exported_yaml
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("malformed_component", ["source", "transform", "output"])
+    async def test_saved_malformed_plugin_policy_component_fails_loudly(
+        self,
+        tmp_path: Path,
+        malformed_component: str,
+    ) -> None:
+        """A corrupt component must not disappear from a mixed persisted cohort."""
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        sources: dict[str, dict[str, Any]] = {
+            "valid_source": {
+                "plugin": "csv",
+                "on_success": "valid_node",
+                "options": {},
+                "on_validation_failure": "discard",
+            }
+        }
+        nodes: list[dict[str, Any]] = [
+            {
+                "id": "valid_node",
+                "node_type": "transform",
+                "plugin": "llm",
+            }
+        ]
+        outputs: list[dict[str, Any]] = [{"name": "valid_output", "plugin": "json"}]
+        if malformed_component == "source":
+            sources["corrupt_source"] = {}
+        elif malformed_component == "transform":
+            nodes.append({"id": "corrupt_node", "node_type": "transform"})
+        else:
+            # ``sink_name`` belonged to the retired runtime-event shape. A
+            # persisted composition output has one canonical identity key.
+            outputs.append({"sink_name": "corrupt_output", "plugin": "json"})
+
+        app, service = _make_app(tmp_path)
+        client = TestClient(app)
+        session = await service.create_session("alice", "Corrupt plugin projection", "local")
+        await service.save_composition_state(
+            session.id,
+            CompositionStateData(
+                sources=sources,
+                nodes=nodes,
+                outputs=outputs,
+                is_valid=False,
+            ),
+            provenance="session_seed",
+        )
+
+        with pytest.raises(AuditIntegrityError, match=malformed_component):
+            client.get(f"/api/sessions/{session.id}/state")
+
+    def test_plugin_policy_projection_preserves_legacy_source_and_node_variants(self, tmp_path: Path) -> None:
+        """The legacy source bridge is explicit; structural nodes are not plugins."""
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
+        from elspeth.web.sessions.routes._helpers import _plugin_policy_findings
+
+        app, _service = _make_app(tmp_path)
+        snapshot = _install_restricted_plugin_policy(app)
+        catalog = PolicyCatalogView(
+            app.state.catalog_service,
+            snapshot,
+            app.state.operator_profile_registry,
+        )
+        state = CompositionStateRecord(
+            id=uuid.uuid4(),
+            session_id=uuid.uuid4(),
+            version=1,
+            source={"plugin": "missing_source"},
+            sources=None,
+            nodes=[
+                {"id": "transform_node", "node_type": "transform", "plugin": "missing_transform"},
+                {"id": "aggregation_node", "node_type": "aggregation", "plugin": "missing_aggregation"},
+                {"id": "gate_node", "node_type": "gate", "plugin": None},
+                {"id": "coalesce_node", "node_type": "coalesce", "plugin": None},
+                {"id": "row_union_node", "node_type": "row_union", "plugin": None},
+                {"id": "queue_node", "node_type": "queue", "plugin": None},
+            ],
+            edges=None,
+            outputs=[{"name": "missing_output", "plugin": "missing_sink"}],
+            metadata_=None,
+            is_valid=False,
+            validation_errors=None,
+            created_at=datetime.now(UTC),
+            derived_from_state_id=None,
+        )
+
+        findings = _plugin_policy_findings(state, catalog)
+
+        assert [(finding.component_id, finding.plugin_id, finding.reason_code) for finding in findings] == [
+            ("source", "source:missing_source", "plugin_not_installed"),
+            ("transform_node", "transform:missing_transform", "plugin_not_installed"),
+            ("aggregation_node", "transform:missing_aggregation", "plugin_not_installed"),
+            ("missing_output", "sink:missing_sink", "plugin_not_installed"),
+        ]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("invalid_component", ["source", "sink"])
@@ -8650,9 +9021,14 @@ class TestRunAlreadyActiveError:
             request,
             exc: RunAlreadyActiveError,
         ) -> JSONResponse:
+            # Mirrors ``create_app``'s handler, including ``request_id``.
             return JSONResponse(
                 status_code=409,
-                content={"detail": str(exc), "error_type": "run_already_active"},
+                content={
+                    "detail": str(exc),
+                    "error_type": "run_already_active",
+                    "request_id": getattr(getattr(request, "state", None), "request_id", None),
+                },
             )
 
         # Add a test endpoint that triggers the error
@@ -8671,6 +9047,8 @@ class TestRunAlreadyActiveError:
         body = resp.json()
         assert body["error_type"] == "run_already_active"
         assert "detail" in body
+        # R2-F16b: the envelope correlates to the response's X-Request-ID.
+        assert "request_id" in body
 
 
 class TestNewStateHasNoLineage:
@@ -8683,7 +9061,9 @@ class TestNewStateHasNoLineage:
 
         session = await service.create_session("alice", "Pipeline", "local")
         await service.save_composition_state(
-            session.id, CompositionStateData(source={"type": "csv"}, is_valid=True), provenance="session_seed"
+            session.id,
+            CompositionStateData(source={"plugin": "csv"}, is_valid=True),
+            provenance="session_seed",
         )
 
         resp = client.get(f"/api/sessions/{session.id}/state")
@@ -10150,6 +10530,151 @@ def test_state_data_carries_structured_errors_before_save_for_atomicity() -> Non
     assert "exception_class=AttributeError" in errors
     assert any(e.startswith("exception_message=") for e in errors)
     assert any(e.startswith("frame=") for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Completion-gate persistence: every compose-preflight save writes the
+# ``completion_gates`` key so a withheld advisor sign-off survives reload.
+# Spec: docs-archive/specs/2026-08-01-composer-completion-gate-persistence-design.md
+# ---------------------------------------------------------------------------
+
+
+def _advisor_blocked_preflight(state: CompositionState) -> ValidationResultModel:
+    """Green build whose completion is withheld by the advisor gate (R2-F14 shape)."""
+    from elspeth.web.execution.schemas import ADVISOR_SIGNOFF_BLOCKED_CODE, ValidationReadinessBlocker
+
+    del state  # fingerprint is derived by the writer, not baked in here
+    return ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=True,
+            completion_ready=False,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code=ADVISOR_SIGNOFF_BLOCKED_CODE,
+                    component_id="pipeline",
+                    component_type="pipeline",
+                    detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                )
+            ],
+        ),
+    )
+
+
+async def _state_data_with_preflight(
+    state: CompositionState,
+    runtime_preflight: ValidationResultModel | None,
+    composer_meta: Mapping[str, Any] | None = None,
+    prior_completion_gates: Mapping[str, Any] | None = None,
+):
+    from elspeth.web.sessions.routes import _state_data_from_composer_state
+
+    state_data, _validation = await _state_data_from_composer_state(
+        state,
+        settings=object(),
+        secret_service=None,
+        user_id="alice",
+        session_id="session-123",
+        plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service()),
+        profile_registry=MagicMock(spec=OperatorProfileRegistry),
+        catalog=create_catalog_service(),
+        runtime_preflight=runtime_preflight,
+        preflight_exception_policy="raise",
+        initial_version=None,
+        telemetry_source="compose",
+        composer_meta=composer_meta,
+        prior_completion_gates=prior_completion_gates,
+    )
+    return state_data
+
+
+@pytest.mark.asyncio
+async def test_state_data_writes_blocked_completion_gate() -> None:
+    from elspeth.web.execution.completion_gates import completion_gate_fingerprint
+
+    state = _make_authoring_valid_partial("gate-blocked")
+    state_data = await _state_data_with_preflight(state, _advisor_blocked_preflight(state))
+
+    assert state_data.composer_meta is not None
+    gates = state_data.composer_meta["completion_gates"]
+    assert gates["advisor_signoff"]["status"] == "blocked"
+    assert gates["advisor_signoff"]["detail"] == ("The advisor sign-off could not be obtained; the pipeline cannot complete.")
+    assert gates["advisor_signoff"]["for_graph"] == completion_gate_fingerprint(state)
+    # The blocked sign-off gates COMPLETION only — the persisted validity
+    # stays graph-truth (R2-F14 honest-surfacing posture).
+    assert state_data.is_valid is True
+
+
+@pytest.mark.asyncio
+async def test_state_data_writes_empty_gates_on_clean_preflight() -> None:
+    state = _make_authoring_valid_partial("gate-clean")
+    state_data = await _state_data_with_preflight(state, ValidationResult(is_valid=True, checks=[], errors=[]))
+
+    assert state_data.composer_meta is not None
+    assert state_data.composer_meta["completion_gates"] == {}
+
+
+@pytest.mark.asyncio
+async def test_state_data_overwrites_carried_forward_gate() -> None:
+    """A clean compose turn must clear a stale blocked fact riding composer_meta."""
+    state = _make_authoring_valid_partial("gate-overwrite")
+    stale_meta = {
+        "repair_turns_used": 2,
+        "completion_gates": {"advisor_signoff": {"status": "blocked", "detail": "stale verdict", "for_graph": "0" * 64}},
+    }
+    state_data = await _state_data_with_preflight(
+        state,
+        ValidationResult(is_valid=True, checks=[], errors=[]),
+        composer_meta=stale_meta,
+    )
+
+    assert state_data.composer_meta is not None
+    assert state_data.composer_meta["completion_gates"] == {}
+    # Unrelated envelope keys are carried forward untouched.
+    assert state_data.composer_meta["repair_turns_used"] == 2
+
+
+@pytest.mark.asyncio
+async def test_state_data_preserves_prior_gate_on_non_adjudicating_save(monkeypatch) -> None:
+    """A recovery persist (runtime_preflight=None, plain preflight re-derived
+    internally) carries a durable blocked advisor fact forward instead of
+    erasing it — the re-derived preflight can never adjudicate the advisor,
+    so its empty gate envelope is absence of evidence, not a clean verdict."""
+    from elspeth.web.sessions.routes import _helpers as routes
+
+    state = _make_authoring_valid_partial("gate-preserve")
+    prior_gates = {"advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64}}
+
+    async def fake_preflight(*args: Any, **kwargs: Any) -> ValidationResult:
+        del args, kwargs
+        return ValidationResult(is_valid=True, checks=[], errors=[])
+
+    monkeypatch.setattr(routes, "_runtime_preflight_for_state", fake_preflight)
+
+    state_data = await _state_data_with_preflight(state, None, prior_completion_gates=prior_gates)
+
+    assert state_data.composer_meta is not None
+    assert state_data.composer_meta["completion_gates"] == prior_gates
+
+
+@pytest.mark.asyncio
+async def test_state_data_adjudicated_clean_save_still_clears_prior_gate() -> None:
+    """An adjudicated clean compose result overwrites: offering a prior fact
+    must not make a blocked verdict sticky across a clean advisor turn."""
+    state = _make_authoring_valid_partial("gate-clear-adjudicated")
+    prior_gates = {"advisor_signoff": {"status": "blocked", "detail": "durable verdict", "for_graph": "0" * 64}}
+
+    state_data = await _state_data_with_preflight(
+        state,
+        ValidationResult(is_valid=True, checks=[], errors=[]),
+        prior_completion_gates=prior_gates,
+    )
+
+    assert state_data.composer_meta is not None
+    assert state_data.composer_meta["completion_gates"] == {}
 
 
 @pytest.mark.asyncio
@@ -12150,3 +12675,135 @@ def test_composition_state_provenance_python_and_sql_enums_agree() -> None:
     assert sql_values == COMPOSITION_STATE_PROVENANCE_VALUES, (
         f"CHECK enum {sorted(sql_values)} drifted from CompositionStateProvenance Literal {sorted(COMPOSITION_STATE_PROVENANCE_VALUES)}"
     )
+
+
+class TestSendMessageTranscriptSnapshot:
+    """F-1: the send_message snapshot never consults a second connection.
+
+    The freeform-500 defect: ``add_message`` committed the user row on
+    one pooled connection while the follow-up ``get_messages`` snapshot
+    read on another; a stale reader returned a pre-insert transcript and
+    the Tier-1 guard 500'd every send. Post-fix the route consumes the
+    transcript returned by ``add_message_with_transcript`` (single
+    write-locked transaction) and never re-calls ``get_messages`` on
+    that path.
+    """
+
+    def test_send_message_proceeds_when_get_messages_returns_stale_pre_insert_snapshot(self, tmp_path) -> None:
+        """T2 (structural): a stale get_messages cannot 500 the send path.
+
+        The wrapper simulates the worst structural case — every
+        ``get_messages`` call returns the pre-insert snapshot (empty).
+        Pre-fix the route's guard read through it and raised
+        ``AuditIntegrityError``; post-fix the route never consults it.
+        """
+        mock_composer = _make_composer_mock(response_text="Got it!")
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+
+        class _StaleGetMessagesService:
+            def __init__(self, inner: SessionServiceImpl) -> None:
+                self._inner = inner
+                self.get_messages_calls = 0
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            async def get_messages(self, session_id, limit=100, offset=0):
+                self.get_messages_calls += 1
+                return []
+
+        wrapper = _StaleGetMessagesService(service)
+        app.state.session_service = wrapper
+        client = TestClient(app)
+        session_id = client.post("/api/sessions", json={"title": "Stale snapshot"}).json()["id"]
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "hello"},
+        )
+
+        assert resp.status_code == 200, (
+            f"send_message must not consult get_messages for its transcript snapshot; got {resp.status_code}: {resp.text!r}"
+        )
+        assert resp.json()["message"]["content"] == "Got it!"
+        # Structural pin: the send path issued ZERO get_messages calls.
+        assert wrapper.get_messages_calls == 0
+
+    def test_trailing_audit_row_does_not_trip_send_message_guard(self, tmp_path) -> None:
+        """T-scoping: audit rows share the sequence range (Reading B).
+
+        The guard comparison is conversation-scoped (parity with
+        /recompose): an audit sidecar row trailing the inserted user
+        message is not interleaved conversation history and must not
+        produce a Tier-1 refusal. Constructed via a service wrapper
+        because the real combined method cannot return a trailing row —
+        its snapshot is taken inside the insert's own transaction.
+        """
+        mock_composer = _make_composer_mock(response_text="Still fine")
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+
+        class _TrailingAuditRowService:
+            def __init__(self, inner: SessionServiceImpl) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            async def add_message_with_transcript(self, *args: Any, **kwargs: Any):
+                record, transcript = await self._inner.add_message_with_transcript(*args, **kwargs)
+                assert record.sequence_no is not None
+                trailing_audit_row = ChatMessageRecord(
+                    id=uuid.uuid4(),
+                    session_id=record.session_id,
+                    role="audit",
+                    content=json.dumps({"_kind": "llm_call_audit"}),
+                    raw_content=None,
+                    tool_calls=[{"_kind": "llm_call_audit", "call": {}}],
+                    created_at=record.created_at,
+                    sequence_no=record.sequence_no + 1,
+                    composition_state_id=None,
+                    writer_principal="compose_loop",
+                    tool_call_id=None,
+                    parent_assistant_id=None,
+                )
+                return record, [*transcript, trailing_audit_row]
+
+        app.state.session_service = _TrailingAuditRowService(service)
+        client = TestClient(app)
+        session_id = client.post("/api/sessions", json={"title": "Trailing audit"}).json()["id"]
+
+        resp = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "hello"},
+        )
+
+        assert resp.status_code == 200, (
+            f"a trailing audit row must not trip the conversation-scoped snapshot guard; got {resp.status_code}: {resp.text!r}"
+        )
+        assert resp.json()["message"]["content"] == "Still fine"
+
+    def test_send_message_transcript_snapshot_contains_prior_turns(self, tmp_path) -> None:
+        """The combined method feeds real history to the composer.
+
+        Two sends: the second compose call must receive the first turn's
+        user+assistant messages as chat history (minus the just-inserted
+        user message, which travels separately as ``body.content``).
+        """
+        mock_composer = _make_composer_mock(response_text="Reply")
+        app, _service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app)
+        session_id = client.post("/api/sessions", json={"title": "History"}).json()["id"]
+
+        first = client.post(f"/api/sessions/{session_id}/messages", json={"content": "first turn"})
+        assert first.status_code == 200
+        second = client.post(f"/api/sessions/{session_id}/messages", json={"content": "second turn"})
+        assert second.status_code == 200
+
+        second_call_history = mock_composer.compose.call_args_list[1].args[1]
+        assert [(m["role"], m["content"]) for m in second_call_history] == [
+            ("user", "first turn"),
+            ("assistant", "Reply"),
+        ]

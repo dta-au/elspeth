@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from elspeth.contracts.auth import AuthProviderType
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.landscape.auth_audit_repository import AUTH_AUDIT_PRINCIPAL_MAX_LENGTH
 from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
 from elspeth.web.async_workers import run_sync_in_worker
@@ -176,7 +176,7 @@ def _route_auth_failure(
     return HTTPException(status_code=401, detail=detail)
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="browser-supplied Origin request header",
     source_param="request",
@@ -185,7 +185,6 @@ def _route_auth_failure(
         "returns None on an absent, non-allowlisted, non-HTTPS-safe, or non-bare-origin "
         "Origin header; only a normalised, allowlisted, credential-safe origin is returned"
     ),
-    non_raising=True,
 )
 def _trusted_request_origin(settings: WebSettings, request: Request) -> str | None:
     origin = request.headers.get("origin")

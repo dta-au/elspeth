@@ -63,12 +63,13 @@ def test_docker_guide_explains_the_container_database_boundary() -> None:
     assert "PostgreSQL clients, not a PostgreSQL server" in normalized
     assert "postgresql+psycopg://" in text
     assert "postgresql+psycopg2://" in text
-    assert "Compose is the only shipped bundle that provisions PostgreSQL" in normalized
+    assert "Compose provisions a PostgreSQL container" in normalized
+    assert "tracked AWS ECS Terraform package provisions Aurora PostgreSQL outside the application task" in normalized
     assert "one web process" in text
     assert "payload persistence" in text.lower()
     assert "database persistence" in text.lower()
     assert "AWS, an Azure Ubuntu VM, or BYO Kubernetes manifests must connect" not in normalized
-    assert "AWS ECS, Azure production, and BYO Kubernetes deployments require external PostgreSQL" in normalized
+    assert "Azure production and BYO Kubernetes deployments require operator-provided external PostgreSQL" in normalized
     assert "Azure VM SQLite is supported only for explicitly non-production use on one persistent host" in normalized
     assert "Native Linux may use SQLite on one persistent host" in normalized
 

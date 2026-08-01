@@ -205,6 +205,7 @@ def _composition_state_record(
     session_id: UUID,
     state_id: UUID,
     version: int = 7,
+    composer_meta: dict | None = None,
 ) -> CompositionStateRecord:
     return CompositionStateRecord(
         id=state_id,
@@ -219,6 +220,7 @@ def _composition_state_record(
         created_at=datetime.now(UTC),
         derived_from_state_id=None,
         sources={},
+        composer_meta=composer_meta,
     )
 
 
@@ -287,9 +289,14 @@ def _create_test_app(
 
     @app.exception_handler(RunAlreadyActiveError)
     async def handle_run_already_active(request: FastAPIRequest, exc: RunAlreadyActiveError) -> JSONResponse:
+        # Mirrors ``create_app``'s handler, including ``request_id``.
         return JSONResponse(
             status_code=409,
-            content={"detail": str(exc), "error_type": "run_already_active"},
+            content={
+                "detail": str(exc),
+                "error_type": "run_already_active",
+                "request_id": getattr(getattr(request, "state", None), "request_id", None),
+            },
         )
 
     return app
@@ -442,6 +449,50 @@ class TestValidateEndpoint:
         assert validated_state.version == 7
 
     @pytest.mark.asyncio
+    async def test_validate_state_id_passes_persisted_completion_gates(self) -> None:
+        """The state_id branch parses the record's completion-gate envelope."""
+        from elspeth.web.execution.completion_gates import AdvisorSignoffGateFact, CompletionGateFacts
+
+        state_id = uuid4()
+        svc = _execution_service()
+        svc.validate_state = AsyncMock(
+            spec=ExecutionService.validate_state,
+            return_value=ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness()),
+        )
+        app = _create_test_app(execution_service=svc)
+        session_id = app.state.route_session_id
+        app.state.session_service.get_state = AsyncMock(
+            spec=SessionServiceProtocol.get_state,
+            return_value=_composition_state_record(
+                session_id=session_id,
+                state_id=state_id,
+                composer_meta={
+                    "completion_gates": {
+                        "advisor_signoff": {
+                            "status": "blocked",
+                            "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                            "for_graph": "0" * 64,
+                        }
+                    }
+                },
+            ),
+        )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                f"/api/sessions/{session_id}/validate",
+                params={"state_id": str(state_id)},
+            )
+            assert resp.status_code == 200
+
+        svc.validate_state.assert_awaited_once()
+        assert svc.validate_state.await_args.kwargs["completion_gates"] == CompletionGateFacts(
+            advisor_signoff=AdvisorSignoffGateFact(
+                detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                for_graph="0" * 64,
+            )
+        )
+
+    @pytest.mark.asyncio
     async def test_validate_state_id_hides_missing_state(self) -> None:
         """Missing state_id returns the same 404 shape as inaccessible states."""
         state_id = uuid4()
@@ -552,6 +603,8 @@ class TestExecuteEndpoint:
             # Seam Contract D: flat envelope, not nested
             assert body["error_type"] == "run_already_active"
             assert "detail" in body
+            # R2-F16b: the envelope correlates to the response's X-Request-ID.
+            assert "request_id" in body
 
     @pytest.mark.asyncio
     async def test_execute_returns_canonical_blob_source_path_error(self) -> None:

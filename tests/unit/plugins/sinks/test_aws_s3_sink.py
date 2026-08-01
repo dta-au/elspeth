@@ -5,9 +5,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from typing import Any
+from datetime import UTC, datetime
+from io import BytesIO
+from typing import Any, ClassVar
 
 import pytest
+from botocore.exceptions import ClientError, EndpointConnectionError
 
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 
@@ -92,8 +95,8 @@ class TestAWSS3SinkConfig:
     def test_maximum_boundaries(self, field: str, accepted: Any, rejected: Any) -> None:
         from elspeth.plugins.sinks.aws_s3_sink import AWSS3SinkConfig
 
-        cfg = AWSS3SinkConfig.from_dict(_base_config(**{field: accepted}), plugin_name="aws_s3")
-        assert getattr(cfg, field) == accepted
+        values = AWSS3SinkConfig.from_dict(_base_config(**{field: accepted}), plugin_name="aws_s3").model_dump()
+        assert values[field] == accepted
         with pytest.raises(PluginConfigError):
             AWSS3SinkConfig.from_dict(_base_config(**{field: rejected}), plugin_name="aws_s3")
 
@@ -101,7 +104,8 @@ class TestAWSS3SinkConfig:
     def test_positive_size_boundaries(self, field: str) -> None:
         from elspeth.plugins.sinks.aws_s3_sink import AWSS3SinkConfig
 
-        assert getattr(AWSS3SinkConfig.from_dict(_base_config(**{field: 1})), field) == 1
+        values = AWSS3SinkConfig.from_dict(_base_config(**{field: 1})).model_dump()
+        assert values[field] == 1
         with pytest.raises(PluginConfigError):
             AWSS3SinkConfig.from_dict(_base_config(**{field: 0}))
 
@@ -171,6 +175,46 @@ class TestAWSS3SinkConfig:
             _render_key_template("{{ run_id * 1000000000 }}", run_id=run_id, timestamp="2026-07-14T00:00:00+00:00")
 
         assert run_id.multiplied is False
+
+    def test_sink_compiles_key_template_once_during_initialization(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import elspeth.plugins.sinks.aws_s3_sink as module
+        from elspeth.contracts.sink_effects import RestrictedSinkEffectContext
+
+        sink = module.AWSS3Sink(_base_config())
+
+        def unexpected_recompile(_source: str) -> Any:
+            raise AssertionError("template was recompiled after initialization")
+
+        monkeypatch.setattr(module, "_compile_key_template", unexpected_recompile)
+        ctx = RestrictedSinkEffectContext(
+            run_id="run-1",
+            run_started_at=datetime(2026, 7, 28, tzinfo=UTC),
+            operation_id="operation-1",
+            sink_node_id="sink-1",
+        )
+
+        assert sink._effect_key(ctx) == "runs/run-1/output.csv"
+
+    @pytest.mark.parametrize("fault", [AssertionError("programmer fault"), GeneratorExit()])
+    def test_key_template_programmer_and_process_control_faults_escape(self, fault: BaseException) -> None:
+        from elspeth.contracts.sink_effects import RestrictedSinkEffectContext
+        from elspeth.plugins.sinks.aws_s3_sink import AWSS3Sink
+
+        class FaultingTemplate:
+            def render(self, **_values: str) -> str:
+                raise fault
+
+        sink = AWSS3Sink(_base_config())
+        sink._key_template = FaultingTemplate()
+        ctx = RestrictedSinkEffectContext(
+            run_id="run-1",
+            run_started_at=datetime(2026, 7, 28, tzinfo=UTC),
+            operation_id="operation-1",
+            sink_node_id="sink-1",
+        )
+
+        with pytest.raises(type(fault), match="programmer fault" if isinstance(fault, AssertionError) else None):
+            sink._effect_key(ctx)
 
     def test_csv_options_and_headers_match_existing_sink_contract(self) -> None:
         from elspeth.contracts.header_modes import HeaderMode
@@ -305,6 +349,15 @@ class TestSerialization:
         assert captured.value.__cause__ is None
         assert captured.value.__context__ is None
 
+    def test_csv_sparse_rows_serialize_missing_optional_field_as_empty_cell(self) -> None:
+        serialized = _serialize(
+            [{"id": 1}, {"id": 2, "name": "present"}],
+            format="csv",
+            fieldnames=["id", "name"],
+        )
+        assert serialized.body.read() == b"id,name\r\n1,\r\n2,present\r\n"
+        serialized.close()
+
     def test_stateful_csv_encoding_uses_one_incremental_encoder_and_one_bom(self) -> None:
         serialized = _serialize(
             [{"id": 1, "name": "Ada"}, {"id": 2, "name": "Grace"}],
@@ -408,8 +461,11 @@ class TestSerialization:
                 writes.append(len(data))
                 return self._spool.write(data)
 
-            def __getattr__(self, name: str) -> Any:
-                return getattr(self._spool, name)
+            def seek(self, offset: int, whence: int = 0) -> int:
+                return self._spool.seek(offset, whence)
+
+            def close(self) -> None:
+                self._spool.close()
 
         monkeypatch.setattr(module.tempfile, "SpooledTemporaryFile", TrackingSpool)
         serialized = _serialize([{"id": 1, "name": "x" * 200_000}], format="json", max_record_chars=300_000)
@@ -420,3 +476,221 @@ class TestSerialization:
     def test_json_output_is_valid_without_whole_document_formatting(self) -> None:
         with _serialize([{"id": 1, "name": "Ada"}], format="json") as serialized:
             assert json.load(serialized.body) == [{"id": 1, "name": "Ada"}]
+
+
+class TestProviderBoundaries:
+    @staticmethod
+    def _sink() -> Any:
+        from elspeth.plugins.sinks.aws_s3_sink import AWSS3Sink
+
+        return AWSS3Sink(_base_config())
+
+    def test_arbitrary_exception_cannot_masquerade_as_missing_s3_object(self) -> None:
+        class MasqueradingError(Exception):
+            response: ClassVar[dict[str, object]] = {
+                "Error": {"Code": "NoSuchKey"},
+                "ResponseMetadata": {"HTTPStatusCode": 404},
+            }
+
+        class Client:
+            def head_object(self, **_kwargs: object) -> object:
+                raise MasqueradingError
+
+        sink = self._sink()
+        sink._s3_client = Client()
+
+        with pytest.raises(MasqueradingError):
+            sink._observe_effect_target("object.csv")
+
+    def test_actual_client_error_can_report_missing_s3_object(self) -> None:
+        class Client:
+            def head_object(self, **_kwargs: object) -> object:
+                raise ClientError(
+                    {
+                        "Error": {"Code": "NoSuchKey", "Message": "missing"},
+                        "ResponseMetadata": {"HTTPStatusCode": 404},
+                    },
+                    "HeadObject",
+                )
+
+        sink = self._sink()
+        sink._s3_client = Client()
+
+        observation = sink._observe_effect_target("object.csv")
+
+        assert observation.exists is False
+
+    @pytest.mark.parametrize(
+        ("code", "status", "expected"),
+        [
+            ("PreconditionFailed", 412, "conditional"),
+            ("AccessDenied", 403, "rejected"),
+            ("InternalError", 500, "unknown"),
+        ],
+    )
+    def test_only_validated_client_error_evidence_is_classified(
+        self,
+        code: str,
+        status: int,
+        expected: str,
+    ) -> None:
+        from elspeth.plugins.sinks.aws_s3_sink import _provider_failure_kind
+
+        error = ClientError(
+            {
+                "Error": {"Code": code, "Message": "provider message"},
+                "ResponseMetadata": {"HTTPStatusCode": status},
+            },
+            "PutObject",
+        )
+
+        assert _provider_failure_kind(error) == expected
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {},
+            {"Error": {"Code": "AccessDenied"}},
+            {"Error": [], "ResponseMetadata": {"HTTPStatusCode": 403}},
+            {"Error": {"Code": 7}, "ResponseMetadata": {"HTTPStatusCode": 403}},
+            {"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": "403"}},
+        ],
+    )
+    def test_malformed_client_error_evidence_is_not_classified(self, response: object) -> None:
+        from elspeth.plugins.sinks.aws_s3_sink import _provider_failure_kind
+
+        error = ClientError(
+            {
+                "Error": {"Code": "InternalError", "Message": "provider message"},
+                "ResponseMetadata": {"HTTPStatusCode": 500},
+            },
+            "PutObject",
+        )
+        error.response = response
+
+        assert _provider_failure_kind(error) == "unknown"
+
+    def test_non_client_botocore_error_has_unknown_write_outcome(self) -> None:
+        from elspeth.plugins.sinks.aws_s3_sink import _provider_failure_kind
+
+        error = EndpointConnectionError(endpoint_url="https://example.invalid")
+
+        assert _provider_failure_kind(error) == "unknown"
+
+    def test_client_resolution_fault_escapes_before_head_dispatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        sink = self._sink()
+
+        def fail_resolution() -> Any:
+            raise AssertionError("client wiring fault")
+
+        monkeypatch.setattr(sink, "_get_s3_client", fail_resolution)
+
+        with pytest.raises(AssertionError, match="client wiring fault"):
+            sink._observe_effect_target("object.csv")
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {"ContentLength": "1"},
+            {"ETag": 7},
+            {"Metadata": []},
+            {"Metadata": {"elspeth-content-sha256": 7}},
+            {"Metadata": {"elspeth-effect-id": 7}},
+            {"Metadata": {"elspeth-plan-hash": 7}},
+            {"Metadata": {"elspeth-protocol-version": 7}},
+            {"ChecksumSHA256": 7},
+            {"ChecksumSHA256": "not-base64"},
+            {
+                "Metadata": {"elspeth-content-sha256": "0" * 64},
+                "ChecksumSHA256": base64.b64encode(b"\x01" * 32).decode("ascii"),
+            },
+        ],
+    )
+    def test_present_malformed_head_evidence_is_rejected(self, response: dict[str, object]) -> None:
+        from elspeth.plugins.sinks._remote_object_effects import RemoteObjectPreconditionError
+
+        with pytest.raises(RemoteObjectPreconditionError, match=r"malformed|diverges"):
+            self._sink()._observation_from_head(response)
+
+    def test_sparse_well_formed_head_evidence_preserves_explicit_absence(self) -> None:
+        observation = self._sink()._observation_from_head(
+            {
+                "ContentLength": 0,
+                "ETag": '"etag"',
+                "Metadata": {},
+            }
+        )
+
+        assert observation.exists is True
+        assert observation.size_bytes == 0
+        assert observation.etag == '"etag"'
+        assert observation.content_hash is None
+        assert observation.checksum_b64 is None
+
+    def test_put_programmer_fault_escapes_provider_outcome_handling(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import elspeth.plugins.sinks.aws_s3_sink as module
+        from elspeth.contracts.sink_effects import RestrictedSinkEffectContext
+
+        class Plan:
+            effect_id = "a" * 64
+            plan_hash = "b" * 64
+
+        class Evidence:
+            target = "s3://example-bucket/runs/run-1/output.csv"
+            staged_size = 0
+            staged_hash = "0" * 64
+            precondition = "if_none_match"
+            predecessor_etag = None
+
+        class Stage:
+            def open(self, _mode: str) -> BytesIO:
+                return BytesIO()
+
+        class Client:
+            def put_object(self, **_kwargs: object) -> object:
+                raise AssertionError("put wiring fault")
+
+        def validated_plan(_plan: object, *, provider: str, require_stage: bool) -> tuple[Evidence, Stage]:
+            assert provider == "aws_s3"
+            assert require_stage is True
+            return Evidence(), Stage()
+
+        sink = self._sink()
+        sink._s3_client = Client()
+        monkeypatch.setattr(module, "validate_remote_plan", validated_plan)
+        ctx = RestrictedSinkEffectContext(
+            run_id="run-1",
+            run_started_at=datetime(2026, 7, 28, tzinfo=UTC),
+            operation_id="operation-1",
+            sink_node_id="sink-1",
+        )
+
+        with pytest.raises(AssertionError, match="put wiring fault"):
+            sink.commit_effect(Plan(), ctx)
+
+    def test_provider_close_failure_is_redacted(self) -> None:
+        from elspeth.plugins.sinks.aws_s3_sink import S3ClientCloseError
+
+        class Client:
+            def close(self) -> None:
+                raise EndpointConnectionError(endpoint_url="https://secret.example")
+
+        sink = self._sink()
+        sink._s3_client = Client()
+
+        with pytest.raises(S3ClientCloseError, match="EndpointConnectionError") as captured:
+            sink.close()
+
+        assert "secret.example" not in str(captured.value)
+
+    @pytest.mark.parametrize("fault", [AssertionError("close wiring fault"), GeneratorExit()])
+    def test_close_programmer_and_process_control_faults_escape(self, fault: BaseException) -> None:
+        class Client:
+            def close(self) -> None:
+                raise fault
+
+        sink = self._sink()
+        sink._s3_client = Client()
+
+        with pytest.raises(type(fault), match="close wiring fault" if isinstance(fault, AssertionError) else None):
+            sink.close()

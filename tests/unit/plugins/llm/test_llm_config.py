@@ -1896,3 +1896,159 @@ class TestStructuredQueryProbeClassification:
         )
         config = LLMConfig.from_dict(good, plugin_name="llm")
         assert config.queries is not None
+
+
+# ---------------------------------------------------------------------------
+# Template variable bindings (config-time parity with the composer guards)
+# ---------------------------------------------------------------------------
+
+
+class TestTemplateVariableBindings:
+    """Config-time rejection of templates whose interpolations can never bind.
+
+    ``PromptTemplate.render`` supplies exactly ``{row, lookup}`` under
+    StrictUndefined; in multi-query mode ``row`` carries the query's
+    ``input_fields`` variables plus ``source_row`` (``build_template_context``
+    → ``render`` wraps the synthetic context under ``row``). The former
+    ``validate_prompt_template`` only compile-checked syntax, so a bare-name
+    template passed config validation and crashed every row at render — the
+    YAML-authoring twin of the composer's ``prompt_template_unbound_variables``
+    / ``query_template_unbound_row_fields`` guards (elspeth-bea314a89b
+    follow-up).
+    """
+
+    def _single(self, template: str, **overrides: Any) -> LLMConfig:
+        kwargs: dict[str, Any] = {
+            "provider": "azure",
+            "prompt_template": template,
+            "schema_config": _OBSERVED_SCHEMA,
+            "required_input_fields": [],
+        }
+        kwargs.update(overrides)
+        return LLMConfig(**kwargs)
+
+    def _multi(self, queries: Any, template: str = "Assess: {{ row.input_1 }}") -> LLMConfig:
+        return LLMConfig(
+            provider="azure",
+            prompt_template=template,
+            schema_config=_OBSERVED_SCHEMA,
+            required_input_fields=[],
+            queries=queries,
+        )
+
+    # ── Single-prompt mode ──────────────────────────────────────────────
+
+    def test_single_prompt_bare_name_rejected(self) -> None:
+        """The acceptance-run defect shape, now caught at YAML/config time."""
+        with pytest.raises(ValidationError, match="prompt render context does not define") as exc_info:
+            self._single("Classify: {{ text }}")
+        message = str(exc_info.value)
+        assert "'text'" in message
+        assert "row." in message
+
+    def test_single_prompt_names_all_offenders_sorted(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            self._single("{{ zeta }} then {{ alpha }}")
+        message = str(exc_info.value)
+        assert message.index("'alpha'") < message.index("'zeta'")
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "Classify: {{ row.text }}",
+            'Classify: {{ row["Original Header"] }}',
+            "Instructions: {{ lookup.instructions }}",
+            "Static prompt with no interpolation at all.",
+            "{% set t = row.text %}Classify: {{ t }}",
+            "{{ range(3) | join(', ') }}",
+        ],
+    )
+    def test_single_prompt_bound_or_static_accepted(self, template: str) -> None:
+        assert self._single(template).prompt_template == template
+
+    def test_dynamic_access_error_keeps_primacy(self) -> None:
+        """``{{ row.get(k) }}`` is both dynamic AND has an unbound ``k`` — the
+        dynamic-access validator is defined first and must keep firing, or its
+        opt-out guidance (required_input_fields: []) disappears behind the
+        binding error."""
+        with pytest.raises(ValidationError, match="dynamic row field access"):
+            self._single("Secret: {{ row.get(k) }}", required_input_fields=["text"])
+
+    # ── Multi-query mode ────────────────────────────────────────────────
+
+    def test_query_override_bare_name_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="multi-query render context does not define") as exc_info:
+            self._multi({"q1": {"input_fields": {"text": "body", "input_1": "body"}, "template": "Classify {{ text }}"}})
+        message = str(exc_info.value)
+        assert "'q1'" in message
+        assert "'text'" in message
+        assert "input_fields" in message
+
+    def test_query_override_unbound_row_field_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="input_fields binds only") as exc_info:
+            self._multi(
+                {"diagnosis": {"input_fields": {"input_1": "background"}, "template": "BG: {{ row.input_1 }} SYM: {{ row.input_2 }}"}}
+            )
+        message = str(exc_info.value)
+        assert "'diagnosis'" in message
+        assert "'input_2'" in message
+        assert "'input_1'" in message
+        assert "source_row" in message
+
+    def test_query_override_bound_row_fields_accepted(self) -> None:
+        config = self._multi(
+            {
+                "q1": {
+                    "input_fields": {"input_1": "background", "input-2": "symptoms"},
+                    "template": (
+                        "{{ row.input_1 }} / {{ row['input-2'] }} / {{ row.source_row.raw_column }}"
+                        " / {{ lookup.rubric }} / {{ range(3) | join(', ') }}"
+                    ),
+                }
+            }
+        )
+        assert config.queries is not None
+
+    def test_node_template_bare_name_used_by_query_rejected(self) -> None:
+        """The legacy positional idiom ``{{ input_1 }}`` never binds — the
+        render context wraps input_fields variables under ``row``."""
+        with pytest.raises(ValidationError, match="multi-query render context does not define") as exc_info:
+            self._multi({"q1": {"input_fields": {"input_1": "col_a"}}}, template="Assess: {{ input_1 }}")
+        assert "'input_1'" in str(exc_info.value)
+
+    def test_node_template_used_by_no_query_is_not_checked(self) -> None:
+        """Every query overrides the template, so the node-level slot never
+        renders — the shipped multi-query examples carry exactly this dead
+        template and must keep validating."""
+        config = self._multi(
+            {"q1": {"input_fields": {"text": "body"}, "template": "Classify {{ row.text }}"}},
+            template="Assess: {{ input_1 }}",
+        )
+        assert config.queries is not None
+
+    def test_shared_node_template_checked_against_each_querys_bindings(self) -> None:
+        with pytest.raises(ValidationError, match="input_fields binds only") as exc_info:
+            self._multi(
+                {
+                    "ok_query": {"input_fields": {"input_1": "col_a"}},
+                    "broken_query": {"input_fields": {"text": "col_b"}},
+                },
+                template="Assess: {{ row.input_1 }}",
+            )
+        message = str(exc_info.value)
+        assert "'broken_query'" in message
+
+    def test_from_dict_wraps_binding_error_as_plugin_config_error(self) -> None:
+        """The web/probe path must see the redacted-safe §5.3 category, not a
+        bare ValueError escaping as a 500."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        bad = {
+            "provider": "azure",
+            "prompt_template": "Assess: {{ row.input_1 }}",
+            "schema": {"mode": "observed"},
+            "required_input_fields": [],
+            "queries": {"q1": {"input_fields": {"input_1": "col"}, "template": "{{ row.nope }}"}},
+        }
+        with pytest.raises(PluginConfigError, match="input_fields binds only"):
+            LLMConfig.from_dict(bad, plugin_name="llm")

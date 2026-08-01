@@ -5,6 +5,8 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
+
 ROOT = Path(__file__).resolve().parents[3]
 CURRENT_VERSION = "0.7.2"
 
@@ -32,6 +34,21 @@ def test_current_release_indexes_name_release_072() -> None:
     roadmap = _text("docs/product/roadmap.md")
     assert "Ship the 0.7.2 line" in roadmap
     assert "`release/0.7.2`" in roadmap
+
+
+def test_current_state_names_the_live_session_epoch() -> None:
+    """Bind the product resume brief's epoch claim to the live constant.
+
+    Every other release surface (README, CHANGELOG, website, both runbooks,
+    sharing guide) is already pinned to ``SESSION_SCHEMA_EPOCH``.
+    ``current-state.md`` stated the number in prose with nothing checking it,
+    so an epoch bump could — and did — leave it a whole epoch behind.
+    """
+    current_state = _text("docs/product/current-state.md")
+    normalized = " ".join(current_state.split())
+
+    assert f"`SESSION_SCHEMA_EPOCH` is {SESSION_SCHEMA_EPOCH}, guided checkpoint schema is 10" in current_state
+    assert "compatible-generation session-operation coordination schema" in normalized
 
 
 def test_current_container_examples_require_a_confirmed_published_tag() -> None:
@@ -73,12 +90,17 @@ def test_current_operator_runbooks_use_072_candidate_and_071_baseline() -> None:
 
     sharing = _text("docs/guides/sharing-pipelines.md")
     assert "For 0.7.2" in sharing
-    assert "SESSION_SCHEMA_EPOCH=37" in sharing
-    assert "SQLITE_SCHEMA_EPOCH=29" in sharing
+    assert f"SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}" in sharing
+    assert "SQLITE_SCHEMA_EPOCH=30" in sharing
+    assert "compatible-generation session-operation coordination" in sharing
 
     aws = _text("docs/runbooks/aws-ecs-deployment.md")
     assert "elspeth:ecs-0.7.2-closeout" in aws
     assert '"candidate_package_version": "0.7.2"' in aws
     assert '"previous_package_version": "0.7.1"' in aws
     assert '"previous": {"session_epoch": 35, "landscape_epoch": 29' in aws
-    assert '"structural_changes": "session_epoch_35_to_37_coordination_schema"' in aws
+    assert (
+        '"structural_changes": '
+        f'"session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_30_'
+        'blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema"'
+    ) in aws

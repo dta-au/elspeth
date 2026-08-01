@@ -32,20 +32,28 @@ from unittest.mock import Mock
 import pytest
 
 from elspeth.contracts import TokenInfo, TransformProtocol
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath, TriggerType
+from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.enums import NodeStateStatus, TerminalOutcome, TerminalPath, TriggerType
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.results import RowResult
 from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.contracts.types import CoalesceName, NodeID
-from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
+from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
+from elspeth.core.config import RowUnionSettings
+from elspeth.core.landscape.data_flow_repository import DataFlowRepository
+from elspeth.core.landscape.execution_repository import ExecutionRepository
+from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
+from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository, token_from_journal_item
 from elspeth.engine.barrier_coordination import (
     BarrierIntakeCoordinator,
     BarrierIntakeDispositionKind,
+    BarrierJournalRestoreContext,
+    BarrierRecoveryCoordinator,
     _LiveBarrierHold,
 )
 from elspeth.engine.clock import MockClock
-from elspeth.engine.coalesce_executor import CoalesceOutcome
+from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
+from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome
 from elspeth.engine.work_items import WorkItem, WorkItemFactory
 
 _CONTRACT = SchemaContract(mode="OBSERVED", fields=(), locked=True)
@@ -62,7 +70,15 @@ def _token(token_id: str = "tok-1", row_id: str = "row-1") -> TokenInfo:
     return TokenInfo(row_id=row_id, token_id=token_id, row_data=PipelineRow({"id": 1}, _CONTRACT))
 
 
-def _blocked_row(*, barrier_key: str, token_id: str = "tok-1", row_id: str = "row-1") -> TokenWorkItem:
+def _blocked_row(
+    *,
+    barrier_key: str,
+    token_id: str = "tok-1",
+    row_id: str = "row-1",
+    branch_name: str | None = None,
+    adopted_epoch: int | None = None,
+    blocked_at: datetime | None = _NOW,
+) -> TokenWorkItem:
     return TokenWorkItem(
         work_item_id=f"wi-{token_id}",
         run_id="run-1",
@@ -78,17 +94,21 @@ def _blocked_row(*, barrier_key: str, token_id: str = "tok-1", row_id: str = "ro
         created_at=_NOW,
         updated_at=_NOW,
         barrier_key=barrier_key,
-        barrier_blocked_at=_NOW,
+        barrier_blocked_at=blocked_at,
+        barrier_adopted_epoch=adopted_epoch,
+        branch_name=branch_name,
         coalesce_name=barrier_key if barrier_key == str(_COALESCE) else None,
+        row_union_name=barrier_key if barrier_key == "variant_union" else None,
     )
 
 
 class RecordingScheduler:
     """Scheduler fake recording the fenced-verb call sequence."""
 
-    def __init__(self, *, pending: list[TokenWorkItem], adopted: bool = True) -> None:
+    def __init__(self, *, pending: list[TokenWorkItem], adopted: bool = True, losses: list[object] | None = None) -> None:
         self.pending = pending
         self.adopted = adopted
+        self.losses = losses or []
         self.calls: list[str] = []
         self.release_contexts: list[dict[str, object]] = []
 
@@ -107,7 +127,7 @@ class RecordingScheduler:
         return len(tuple(token_ids))
 
     def list_unadopted_coalesce_branch_losses(self, *, run_id: str) -> list[object]:
-        return []
+        return list(self.losses)
 
     def adopt_coalesce_branch_losses(self, **kwargs: object) -> None:
         self.calls.append("adopt_losses")
@@ -148,6 +168,19 @@ class RecordingCoalesceExecutor:
         return None
 
 
+class RecordingRowUnionExecutor:
+    def __init__(self, outcome: RowUnionOutcome | None) -> None:
+        self.outcome = outcome
+        self.notifications: list[dict[str, object]] = []
+
+    def has_recorded_branch_loss(self, row_union_name: str, row_id: str, branch_name: str) -> bool:
+        return False
+
+    def notify_branch_lost(self, **kwargs: object) -> RowUnionOutcome | None:
+        self.notifications.append(dict(kwargs))
+        return self.outcome
+
+
 _DEFAULT_NEXT_NODE = NodeID("after-merge")
 
 
@@ -175,6 +208,7 @@ def _make_coordinator(
     scheduler: RecordingScheduler,
     aggregation_executor: RecordingAggregationExecutor | None = None,
     coalesce_executor: RecordingCoalesceExecutor | None = None,
+    row_union_executor: RecordingRowUnionExecutor | None = None,
     nav: FakeNav | None = None,
     live_holds: dict[str, _LiveBarrierHold] | None = None,
     flush_calls: list[tuple[NodeID, TriggerType]] | None = None,
@@ -230,6 +264,10 @@ def _make_coordinator(
         terminal_coalesce_row_result=_terminal_coalesce_row_result,
         emit_token_completed=lambda token, *, outcome, path, sink_name=None: None,
         mark_coalesce_consumed_terminal=lambda *, coalesce_name, consumed_tokens: None,
+        row_union_executor=row_union_executor,
+        row_union_node_ids=({RowUnionName("variant_union"): NodeID("row_union::variant_union")} if row_union_executor is not None else {}),
+        complete_row_union_fire=lambda **kwargs: None,
+        released_row_union_items=lambda **kwargs: (),
     )
 
 
@@ -385,3 +423,955 @@ class TestIntakeFailClosed:
 
         with pytest.raises(AuditIntegrityError, match="orphan barrier_key"):
             coordinator.run_intake_pass(_ctx())
+
+
+class TestRowUnionLossReplay:
+    def test_follower_loss_fails_leader_held_sibling(self) -> None:
+        held = _token(token_id="held-token", row_id="row-1")
+        loss = SimpleNamespace(
+            loss_id="loss-1",
+            coalesce_name="variant_union",
+            row_id="row-1",
+            branch_name="control",
+            reason="error_routed",
+        )
+        scheduler = RecordingScheduler(pending=[], losses=[loss])
+        row_union = RecordingRowUnionExecutor(
+            RowUnionOutcome(
+                held=False,
+                consumed_tokens=(held,),
+                failure_reason="row_union_branch_lost",
+                row_union_name="variant_union",
+                outcomes_recorded=True,
+            )
+        )
+        coordinator = _make_coordinator(scheduler=scheduler, row_union_executor=row_union)
+
+        outcome = coordinator.run_intake_pass(_ctx())
+
+        assert row_union.notifications == [
+            {
+                "row_union_name": "variant_union",
+                "row_id": "row-1",
+                "lost_branch": "control",
+                "reason": "error_routed",
+            }
+        ]
+        assert [item.kind for item in outcome.dispositions] == [BarrierIntakeDispositionKind.TERMINAL]
+        assert [result.token.token_id for result in outcome.results] == ["held-token"]
+
+
+class TestRowUnionRecovery:
+    def test_mixed_topology_scopes_loss_restore_read_to_configured_coalesces(self) -> None:
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = []
+        scheduler.list_coalesce_branch_losses.return_value = []
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        coalesce = Mock(spec=CoalesceExecutor)
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=coalesce,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={_COALESCE: NodeID("coalesce-node")},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        scheduler.list_coalesce_branch_losses.assert_called_once_with(
+            run_id="run-1",
+            coalesce_names=frozenset({"merge"}),
+        )
+
+    def test_intake_pending_row_union_group_is_left_for_next_intake(self) -> None:
+        row = _blocked_row(barrier_key="variant_union")
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = [row]
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(
+                resume_checkpoint_id="ckpt-1",
+                barrier_scalars=None,
+                batch_id_remap={},
+            )
+        )
+
+        reads.get_open_node_state_ids.assert_not_called()
+
+    def test_adopted_holdless_row_is_reset_for_journal_first_intake(self) -> None:
+        row = _blocked_row(barrier_key="variant_union", branch_name="control", adopted_epoch=1)
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = [row]
+        scheduler.list_coalesce_branch_losses.return_value = []
+        scheduler.reset_adoption_marker_to_pending.return_value = 1
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 0}
+        reads.get_open_node_state_ids.return_value = {}
+        # Adoption crash: accept() never ran, so no terminal outcome exists.
+        reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset()
+        reads.get_released_row_ids_for_nodes.return_value = frozenset()
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        scheduler.reset_adoption_marker_to_pending.assert_called_once_with(
+            work_item_ids=[row.work_item_id],
+            run_id="run-1",
+        )
+        row_union.restore_from_journal.assert_called_once_with(entries=[])
+
+    def test_failed_closure_holdless_group_resets_to_intake_instead_of_release_reconcile(self) -> None:
+        # Crash window: _fail_pending committed FAILED node states (which have
+        # completed_at) but the BLOCKED scheduler rows were never terminalized
+        # AND no terminal outcomes were recorded yet. These holdless rows must
+        # NOT classify as a released group — reconcile_released_group would
+        # refuse them and wedge the resume. With no recorded outcome, the safe
+        # disposition is reset-to-intake so the live arm replays state +
+        # outcome + release on re-accept.
+        rows = [
+            _blocked_row(barrier_key="variant_union", token_id="tok-control", branch_name="control", adopted_epoch=1),
+            _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
+        ]
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = rows
+        scheduler.list_coalesce_branch_losses.return_value = []
+        scheduler.reset_adoption_marker_to_pending.return_value = 2
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 1 for row in rows}
+        reads.get_open_node_state_ids.return_value = {}
+        reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset()
+        # FAILED closures are completed_at-stamped but not released.
+        reads.get_released_row_ids_for_nodes.return_value = frozenset()
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        row_union.reconcile_released_group.assert_not_called()
+        scheduler.reset_adoption_marker_to_pending.assert_called_once_with(
+            work_item_ids=[row.work_item_id for row in rows],
+            run_id="run-1",
+        )
+        row_union.restore_from_journal.assert_called_once_with(entries=[])
+
+    def test_already_terminal_holdless_rows_journal_release_instead_of_reset(self) -> None:
+        # elspeth-e18928f7cb: _fail_pending committed FAILED node states AND
+        # terminal (FAILURE, UNROUTED) outcomes, but the process died before
+        # mark_blocked_barrier_terminal released the BLOCKED journal rows.
+        # Resetting these already-terminal holds re-drives accept() at the
+        # closed key, whose late-arrival arm records a SECOND terminal outcome
+        # — an ix_token_outcomes_terminal_unique IntegrityError on every
+        # resume attempt. They must be journal-released here instead.
+        rows = [
+            _blocked_row(barrier_key="variant_union", token_id="tok-control", branch_name="control", adopted_epoch=1),
+            _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
+        ]
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = rows
+        scheduler.mark_blocked_barrier_terminal.return_value = 1
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 1 for row in rows}
+        reads.get_open_node_state_ids.return_value = {}
+        reads.get_released_row_ids_for_nodes.return_value = frozenset()
+        reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset({"tok-control", "tok-treatment"})
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        scheduler.reset_adoption_marker_to_pending.assert_not_called()
+        row_union.reconcile_released_group.assert_not_called()
+        released_calls = scheduler.mark_blocked_barrier_terminal.call_args_list
+        assert [call.kwargs["token_ids"] for call in released_calls] == [("tok-control",), ("tok-treatment",)]
+        for call in released_calls:
+            assert call.kwargs["barrier_key"] == "variant_union"
+            assert call.kwargs["release_context"]["restore_reconcile"] is True
+        row_union.restore_from_journal.assert_called_once_with(entries=[])
+
+    def test_mixed_terminal_and_unrecorded_holdless_rows_split_release_and_reset(self) -> None:
+        # Crash inside _fail_pending's per-entry loop: the first entry's
+        # complete_node_state + record_token_outcome both committed; the crash
+        # hit before the second entry recorded. The terminal row is
+        # journal-released; only the unrecorded row is reset for the live
+        # replay path.
+        rows = [
+            _blocked_row(barrier_key="variant_union", token_id="tok-control", branch_name="control", adopted_epoch=1),
+            _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
+        ]
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = rows
+        scheduler.mark_blocked_barrier_terminal.return_value = 1
+        scheduler.reset_adoption_marker_to_pending.return_value = 1
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 1 for row in rows}
+        reads.get_open_node_state_ids.return_value = {}
+        reads.get_released_row_ids_for_nodes.return_value = frozenset()
+        reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset({"tok-control"})
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        released_calls = scheduler.mark_blocked_barrier_terminal.call_args_list
+        assert [call.kwargs["token_ids"] for call in released_calls] == [("tok-control",)]
+        scheduler.reset_adoption_marker_to_pending.assert_called_once_with(
+            work_item_ids=["wi-tok-treatment"],
+            run_id="run-1",
+        )
+        row_union.restore_from_journal.assert_called_once_with(entries=[])
+
+    def test_late_arrival_residual_is_journal_released_not_replayed_as_group(self) -> None:
+        # Crash window: a surplus branch token failed late after its group
+        # released (_fail_late_arrival committed the FAILED node state and the
+        # terminal FAILURE/UNROUTED outcome) but the process died before
+        # mark_blocked_barrier_terminal. Release evidence for the shared row id
+        # must NOT reconstruct the lone residual as the original group —
+        # reconcile_released_group would refuse the incomplete branch set and
+        # wedge the resume. The residual's audit trail is already terminal;
+        # only its BLOCKED journal row still needs releasing.
+        row = _blocked_row(barrier_key="variant_union", token_id="tok-late", branch_name="control", adopted_epoch=1)
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = [row]
+        scheduler.list_coalesce_branch_losses.return_value = []
+        scheduler.mark_blocked_barrier_terminal.return_value = 1
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 1}
+        reads.get_open_node_state_ids.return_value = {}
+        reads.get_released_row_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "row-1")})
+        reads.find_released_node_state_token_ids.return_value = frozenset()
+        reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset({"tok-late"})
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        row_union.reconcile_released_group.assert_not_called()
+        scheduler.reset_adoption_marker_to_pending.assert_not_called()
+        scheduler.mark_blocked_barrier_terminal.assert_called_once()
+        call = scheduler.mark_blocked_barrier_terminal.call_args
+        assert call.kwargs["barrier_key"] == "variant_union"
+        assert call.kwargs["token_ids"] == ("tok-late",)
+        assert call.kwargs["release_context"]["late_arrival"] is True
+        assert call.kwargs["release_context"]["restore_reconcile"] is True
+        assert call.kwargs["release_context"]["scope_row_id"] == "row-1"
+        row_union.restore_from_journal.assert_called_once_with(entries=[])
+
+    def test_late_arrival_residual_without_terminal_outcome_resets_to_intake(self) -> None:
+        # Narrower slice of the same window: the FAILED node state committed
+        # but the process died before record_token_outcome (or adoption
+        # committed and accept() never ran at all). The token holds no
+        # COMPLETED state so it is not a member of the released group, and its
+        # audit trail is incomplete, so the journal row must NOT be
+        # terminalized here — reset it to intake-pending and let the live
+        # late-arrival arm replay state + outcome + release on re-accept.
+        row = _blocked_row(barrier_key="variant_union", token_id="tok-late", branch_name="control", adopted_epoch=1)
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = [row]
+        scheduler.list_coalesce_branch_losses.return_value = []
+        scheduler.reset_adoption_marker_to_pending.return_value = 1
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 1}
+        reads.get_open_node_state_ids.return_value = {}
+        reads.get_released_row_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "row-1")})
+        reads.find_released_node_state_token_ids.return_value = frozenset()
+        reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset()
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        row_union.reconcile_released_group.assert_not_called()
+        scheduler.mark_blocked_barrier_terminal.assert_not_called()
+        scheduler.reset_adoption_marker_to_pending.assert_called_once_with(
+            work_item_ids=[row.work_item_id],
+            run_id="run-1",
+        )
+        row_union.restore_from_journal.assert_called_once_with(entries=[])
+
+    def test_residual_partition_preserves_genuine_released_group_reconcile(self) -> None:
+        # A genuine post-release crash group (row-1: every branch row is still
+        # journalled because complete_barrier never committed) and a stranded
+        # late-arrival residual (row-2) restored together: the group must
+        # reconcile exactly as before and the residual must be journal-released
+        # without contaminating the group's entries.
+        group_rows = [
+            _blocked_row(barrier_key="variant_union", token_id="tok-control", branch_name="control", adopted_epoch=1),
+            _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
+        ]
+        residual = _blocked_row(
+            barrier_key="variant_union",
+            token_id="tok-late",
+            row_id="row-2",
+            branch_name="control",
+            adopted_epoch=1,
+        )
+        rows = [*group_rows, residual]
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = rows
+        scheduler.list_coalesce_branch_losses.return_value = []
+        scheduler.mark_blocked_barrier_terminal.return_value = 1
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 0 for row in rows}
+        reads.get_open_node_state_ids.return_value = {}
+        reads.get_released_row_ids_for_nodes.return_value = frozenset(
+            {("row_union::variant_union", "row-1"), ("row_union::variant_union", "row-2")}
+        )
+        reads.find_released_node_state_token_ids.return_value = frozenset({"tok-control", "tok-treatment"})
+        reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset({"tok-late"})
+        row_union = Mock(spec=RowUnionExecutor)
+        restored_tokens = tuple(token_from_journal_item(row, attempt_offset=1, resume_checkpoint_id="ckpt-1") for row in group_rows)
+        row_union.reconcile_released_group.return_value = RowUnionOutcome(
+            held=False,
+            released_tokens=restored_tokens,
+            consumed_tokens=restored_tokens,
+            row_union_name="variant_union",
+        )
+        row_union.restore_from_journal.return_value = ()
+        completions: list[dict[str, object]] = []
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+            released_row_union_items=lambda **kwargs: (),
+            complete_row_union_fire=lambda **kwargs: completions.append(dict(kwargs)),
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        row_union.reconcile_released_group.assert_called_once()
+        entries = row_union.reconcile_released_group.call_args.kwargs["entries"]
+        assert {entry.token.token_id for entry in entries} == {"tok-control", "tok-treatment"}
+        scheduler.mark_blocked_barrier_terminal.assert_called_once()
+        assert scheduler.mark_blocked_barrier_terminal.call_args.kwargs["token_ids"] == ("tok-late",)
+        assert scheduler.mark_blocked_barrier_terminal.call_args.kwargs["release_context"]["scope_row_id"] == "row-2"
+        scheduler.reset_adoption_marker_to_pending.assert_not_called()
+        assert len(completions) == 1
+        assert completions[0]["consumed_tokens"] == restored_tokens
+
+    def test_residual_membership_is_scoped_to_its_own_union_node(self) -> None:
+        # Chained unions: released tokens keep their token ids downstream, so
+        # a token that released at an upstream union holds a COMPLETED state
+        # there. When it strands as a late-arrival residual at a DOWNSTREAM
+        # union, membership classification must consult only the downstream
+        # union's node — the upstream state must not promote the residual
+        # into the released group.
+        row = _blocked_row(barrier_key="union_b", token_id="tok-chained", branch_name="control", adopted_epoch=1)
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = [row]
+        scheduler.list_coalesce_branch_losses.return_value = []
+        scheduler.mark_blocked_barrier_terminal.return_value = 1
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 1}
+        reads.get_open_node_state_ids.return_value = {}
+        reads.get_released_row_ids_for_nodes.return_value = frozenset({("row_union::union_b", "row-1")})
+
+        def _members_at(run_id: str, *, node_ids: list[str], token_ids: list[str]) -> frozenset[str]:
+            # tok-chained's COMPLETED state lives at upstream union A only.
+            return frozenset({"tok-chained"}) if "row_union::union_a" in node_ids else frozenset()
+
+        reads.find_released_node_state_token_ids.side_effect = _members_at
+        reads.find_failed_unrouted_terminal_token_ids.return_value = frozenset({"tok-chained"})
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={
+                RowUnionName("union_a"): NodeID("row_union::union_a"),
+                RowUnionName("union_b"): NodeID("row_union::union_b"),
+            },
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        reads.find_released_node_state_token_ids.assert_called_once()
+        assert reads.find_released_node_state_token_ids.call_args.kwargs["node_ids"] == ["row_union::union_b"]
+        row_union.reconcile_released_group.assert_not_called()
+        scheduler.mark_blocked_barrier_terminal.assert_called_once()
+        assert scheduler.mark_blocked_barrier_terminal.call_args.kwargs["barrier_key"] == "union_b"
+
+    def test_post_release_crash_reconciles_completed_group_and_continuation(self) -> None:
+        rows = [
+            _blocked_row(barrier_key="variant_union", token_id="tok-control", branch_name="control", adopted_epoch=1),
+            _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
+        ]
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = rows
+        scheduler.list_coalesce_branch_losses.return_value = []
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 0 for row in rows}
+        reads.get_open_node_state_ids.return_value = {}
+        reads.get_released_row_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "row-1")})
+        reads.find_released_node_state_token_ids.return_value = frozenset({"tok-control", "tok-treatment"})
+        row_union = Mock(spec=RowUnionExecutor)
+        restored_tokens = tuple(token_from_journal_item(row, attempt_offset=1, resume_checkpoint_id="ckpt-1") for row in rows)
+        row_union.reconcile_released_group.return_value = RowUnionOutcome(
+            held=False,
+            released_tokens=restored_tokens,
+            consumed_tokens=restored_tokens,
+            row_union_name="variant_union",
+        )
+        row_union.restore_from_journal.return_value = ()
+        completions: list[dict[str, object]] = []
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+            released_row_union_items=lambda **kwargs: (),
+            complete_row_union_fire=lambda **kwargs: completions.append(dict(kwargs)),
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        row_union.reconcile_released_group.assert_called_once()
+        assert len(completions) == 1
+        assert completions[0]["consumed_tokens"] == restored_tokens
+
+    def test_released_group_item_with_null_barrier_blocked_at_raises(self) -> None:
+        # The sibling restore loop below (and journal_restore / barrier.py)
+        # refuse NULL barrier_blocked_at on the same journal-row shape; the
+        # released-group reconcile loop must not silently substitute "now".
+        rows = [
+            _blocked_row(
+                barrier_key="variant_union",
+                token_id="tok-control",
+                branch_name="control",
+                adopted_epoch=1,
+                blocked_at=None,
+            ),
+            _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
+        ]
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = rows
+        scheduler.list_coalesce_branch_losses.return_value = []
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 0 for row in rows}
+        reads.get_open_node_state_ids.return_value = {}
+        reads.get_released_row_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "row-1")})
+        reads.find_released_node_state_token_ids.return_value = frozenset({"tok-control", "tok-treatment"})
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+            released_row_union_items=lambda **kwargs: (),
+            complete_row_union_fire=lambda **kwargs: None,
+        )
+
+        with pytest.raises(AuditIntegrityError, match="NULL barrier_blocked_at"):
+            coordinator.restore_from_journal(
+                BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+            )
+
+    def test_released_group_reconciles_without_preloading_the_loss_ledger(self) -> None:
+        # Durable release evidence is authoritative during recovery. The
+        # coordinator must reconcile it without loading the append-only loss
+        # history into the executor at all.
+        rows = [
+            _blocked_row(barrier_key="variant_union", token_id="tok-control", branch_name="control", adopted_epoch=1),
+            _blocked_row(barrier_key="variant_union", token_id="tok-treatment", branch_name="treatment", adopted_epoch=1),
+        ]
+        loss = SimpleNamespace(
+            coalesce_name="variant_union",
+            row_id="row-1",
+            branch_name="treatment",
+            reason="error_routed",
+        )
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = rows
+        scheduler.list_coalesce_branch_losses.return_value = [loss]
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 0 for row in rows}
+        reads.get_open_node_state_ids.return_value = {}
+        reads.get_released_row_ids_for_nodes.return_value = frozenset({("row_union::variant_union", "row-1")})
+        reads.find_released_node_state_token_ids.return_value = frozenset({"tok-control", "tok-treatment"})
+        row_union = RowUnionExecutor(
+            Mock(spec=ExecutionRepository),
+            object(),
+            "run-1",
+            step_resolver=lambda node_id: 5,
+            clock=MockClock(start=100.0),
+            data_flow=Mock(spec=DataFlowRepository),
+            barrier_restore_reads=reads,
+        )
+        row_union.register_row_union(
+            RowUnionSettings(name="variant_union", branches=["control", "treatment"], on_success="union_out"),
+            NodeID("row_union::variant_union"),
+        )
+        completions: list[dict[str, object]] = []
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+            released_row_union_items=lambda **kwargs: (),
+            complete_row_union_fire=lambda **kwargs: completions.append(dict(kwargs)),
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        scheduler.list_coalesce_branch_losses.assert_not_called()
+        assert row_union.has_recorded_branch_loss("variant_union", "row-1", "treatment") is False
+        assert len(completions) == 1
+        assert {token.token_id for token in completions[0]["consumed_tokens"]} == {"tok-control", "tok-treatment"}
+
+    def test_durable_loss_fails_restored_sibling_and_emits_completion(self) -> None:
+        row = _blocked_row(barrier_key="variant_union", branch_name="control", adopted_epoch=1)
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = [row]
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 0}
+        reads.get_open_node_state_ids.return_value = {row.token_id: "state-1"}
+        reads.has_branch_loss_for_group.return_value = True
+        # The group never closed: no completed rows exist at the union node,
+        # so restore's closed-key classification must fall through to the
+        # durable-loss point read.
+        reads.has_completed_row_for_node.return_value = False
+        execution = Mock(spec=ExecutionRepository)
+        data_flow = Mock(spec=DataFlowRepository)
+        row_union = RowUnionExecutor(
+            execution,
+            object(),
+            "run-1",
+            step_resolver=lambda node_id: 5,
+            clock=MockClock(start=100.0),
+            data_flow=data_flow,
+            barrier_restore_reads=reads,
+        )
+        row_union.register_row_union(
+            RowUnionSettings(name="variant_union", branches=["control", "treatment"], on_success="union_out"),
+            NodeID("row_union::variant_union"),
+        )
+        completions: list[dict[str, object]] = []
+        emitted: list[tuple[str, TerminalOutcome | None, TerminalPath]] = []
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=execution,
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+            complete_row_union_fire=lambda **kwargs: completions.append(dict(kwargs)),
+            emit_token_completed=lambda token, *, outcome, path: emitted.append((token.token_id, outcome, path)),
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        scheduler.list_coalesce_branch_losses.assert_not_called()
+        reads.has_branch_loss_for_group.assert_called_once_with(
+            run_id="run-1",
+            barrier_name="variant_union",
+            row_id="row-1",
+        )
+        assert len(completions) == 1
+        assert emitted == [(row.token_id, TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
+
+    def test_open_state_late_arrival_residual_fails_at_restore_with_release_reason(self) -> None:
+        # elspeth-6d37341e45: _fail_late_arrival crashed between
+        # begin_node_state and complete_node_state. The residual still holds an
+        # OPEN hold state, so it is NOT holdless and the released-group
+        # residual partition (elspeth-d9e244a5cb) cannot classify it. The
+        # executor restore must fail it against the durable closure instead of
+        # reopening the released key as a pending group that later dies by
+        # timeout/EOF flush under an untruthful reason.
+        row = _blocked_row(barrier_key="variant_union", branch_name="control", adopted_epoch=1)
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = [row]
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 0}
+        reads.get_open_node_state_ids.return_value = {row.token_id: "state-1"}
+        reads.has_branch_loss_for_group.return_value = False
+        reads.has_completed_row_for_node.return_value = True
+        reads.has_released_row_for_node.return_value = True
+        execution = Mock(spec=ExecutionRepository)
+        data_flow = Mock(spec=DataFlowRepository)
+        row_union = RowUnionExecutor(
+            execution,
+            object(),
+            "run-1",
+            step_resolver=lambda node_id: 5,
+            clock=MockClock(start=100.0),
+            data_flow=data_flow,
+            barrier_restore_reads=reads,
+        )
+        row_union.register_row_union(
+            RowUnionSettings(name="variant_union", branches=["control", "treatment"], on_success="union_out"),
+            NodeID("row_union::variant_union"),
+        )
+        completions: list[dict[str, object]] = []
+        emitted: list[tuple[str, TerminalOutcome | None, TerminalPath]] = []
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=execution,
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+            complete_row_union_fire=lambda **kwargs: completions.append(dict(kwargs)),
+            emit_token_completed=lambda token, *, outcome, path: emitted.append((token.token_id, outcome, path)),
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(resume_checkpoint_id="ckpt-1", barrier_scalars=None, batch_id_remap={})
+        )
+
+        # The residual's hold is completed FAILED with the true closure reason,
+        # its terminal outcome is recorded exactly once (the begin-crash window
+        # never recorded one), and its journal row is committed through the
+        # completion seam — not reset to intake, not reopened as pending.
+        assert len(completions) == 1
+        assert emitted == [(row.token_id, TerminalOutcome.FAILURE, TerminalPath.UNROUTED)]
+        assert execution.complete_node_state.call_args.kwargs["state_id"] == "state-1"
+        assert execution.complete_node_state.call_args.kwargs["status"] is NodeStateStatus.FAILED
+        assert execution.complete_node_state.call_args.kwargs["error"].failure_reason == "late_arrival_after_release"
+        data_flow.record_token_outcome.assert_called_once()
+        scheduler.reset_adoption_marker_to_pending.assert_not_called()
+
+    def test_adopted_partial_group_restores_executor_memory(self) -> None:
+        row = _blocked_row(
+            barrier_key="variant_union",
+            branch_name="control",
+            adopted_epoch=1,
+        )
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = [row]
+        scheduler.list_coalesce_branch_losses.return_value = []
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 0}
+        reads.get_open_node_state_ids.return_value = {row.token_id: "state-1"}
+        row_union = Mock(spec=RowUnionExecutor)
+        row_union.restore_from_journal.return_value = ()
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(
+                resume_checkpoint_id="ckpt-1",
+                barrier_scalars=None,
+                batch_id_remap={},
+            )
+        )
+
+        row_union.restore_from_journal.assert_called_once()
+        entries = row_union.restore_from_journal.call_args.kwargs["entries"]
+        assert len(entries) == 1
+        assert entries[0].token.token_id == row.token_id
+        assert entries[0].token.resume_attempt_offset == 1
+        assert entries[0].state_id == "state-1"
+        scheduler.list_coalesce_branch_losses.assert_not_called()
+        row_union.restore_branch_losses.assert_not_called()
+
+    def test_fully_adopted_group_commits_released_continuations(self) -> None:
+        rows = [
+            _blocked_row(
+                barrier_key="variant_union",
+                token_id="tok-control",
+                branch_name="control",
+                adopted_epoch=1,
+            ),
+            _blocked_row(
+                barrier_key="variant_union",
+                token_id="tok-treatment",
+                branch_name="treatment",
+                adopted_epoch=1,
+            ),
+        ]
+        scheduler = Mock(spec=TokenSchedulerRepository)
+        scheduler.list_blocked_barrier_items.return_value = rows
+        scheduler.list_coalesce_branch_losses.return_value = []
+        reads = Mock(spec=BarrierRestoreReadModel)
+        reads.find_duplicate_live_buffered_acceptances.return_value = []
+        reads.get_max_node_state_attempts.return_value = {row.token_id: 0 for row in rows}
+        reads.get_open_node_state_ids.return_value = {row.token_id: f"state-{row.token_id}" for row in rows}
+        row_union = Mock(spec=RowUnionExecutor)
+        restored_tokens = tuple(token_from_journal_item(row, attempt_offset=1, resume_checkpoint_id="ckpt-1") for row in rows)
+        row_union.restore_from_journal.return_value = (
+            RowUnionOutcome(
+                held=False,
+                released_tokens=restored_tokens,
+                consumed_tokens=restored_tokens,
+                row_union_name="variant_union",
+            ),
+        )
+        releases: list[tuple[str, ...]] = []
+        completions: list[dict[str, object]] = []
+
+        coordinator = BarrierRecoveryCoordinator(
+            run_id="run-1",
+            scheduler=scheduler,
+            barrier_restore_reads=reads,
+            execution=Mock(spec=ExecutionRepository),
+            aggregation_executor=RecordingAggregationExecutor(),
+            coalesce_executor=None,
+            clock=MockClock(start=100.0),
+            aggregation_settings={},
+            coalesce_node_ids={},
+            coordination_token=CoordinationToken(run_id="run-1", worker_id="worker-1", leader_epoch=1),
+            scheduler_lease_owner="worker-1",
+            row_union_executor=row_union,
+            row_union_node_ids={RowUnionName("variant_union"): NodeID("row_union::variant_union")},
+            released_row_union_items=lambda *, row_union_name, released_tokens: (
+                releases.append(tuple(token.token_id for token in released_tokens)) or ()
+            ),
+            complete_row_union_fire=lambda **kwargs: completions.append(dict(kwargs)),
+        )
+
+        coordinator.restore_from_journal(
+            BarrierJournalRestoreContext(
+                resume_checkpoint_id="ckpt-1",
+                barrier_scalars=None,
+                batch_id_remap={},
+            )
+        )
+
+        assert releases == [("tok-control", "tok-treatment")]
+        assert len(completions) == 1
+        assert completions[0]["consumed_tokens"] == restored_tokens

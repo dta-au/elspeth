@@ -33,6 +33,7 @@ from elspeth.web.audit_readiness.models import (
 )
 from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.execution.completion_gates import CompletionGateFacts, parse_completion_gates
 from elspeth.web.execution.schemas import (
     CHECK_OUTCOME_SECRET_REFS_NO_REFS,
     CHECK_OUTCOME_SECRET_REFS_RESOLVED,
@@ -161,6 +162,11 @@ def build_plugin_policy_readiness(
     )
 
     unavailable = {item.plugin_id: item.reason for item in snapshot.unavailable}
+    # Tier note: the two ``.get()`` probes below read policy/availability
+    # snapshot mappings where absence is the ordinary healthy state — a
+    # plugin missing from ``unavailable`` is available, a capability missing
+    # from ``selected`` is unselected. Neither is a Tier-1 read where a miss
+    # must crash.
     missing_local_optional = tuple(
         sorted(
             plugin_id
@@ -234,6 +240,9 @@ def build_plugin_policy_readiness(
         )
 
     llm_id = PluginId("transform", "llm")
+    # Tier note: snapshot probe with an empty default — a deployment with no
+    # usable LLM profile aliases is a legal configuration this row exists to
+    # report (it resolves to "error" below), not audit-data corruption.
     usable_aliases = dict(snapshot.usable_profile_aliases).get(llm_id, ())
     tutorial_profile_status: ReadinessStatus
     if tutorial_profile is None:
@@ -301,7 +310,7 @@ def build_boot_plugin_policy_readiness(
     """
     llm_id = PluginId("transform", "llm")
     configured_aliases = tuple(alias for alias, _profile in settings.llm_profiles)
-    tutorial_profile = settings.tutorial_llm_profile
+    tutorial_profile = settings.default_llm_profile
     selected_by_capability = dict(policy.preferences)
     implementations: dict[PluginCapability, list[PluginId]] = {capability: [] for capability in PluginCapability}
     plugin_classes = _plugin_catalog_snapshot()
@@ -444,6 +453,7 @@ class _ExecutionServiceLike(Protocol):
         user_id: str | None = None,
         session_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
+        completion_gates: CompletionGateFacts | None = None,
     ) -> ValidationResult: ...
 
 
@@ -534,11 +544,16 @@ class ReadinessService:
         # that the llm_interpretations row scopes its event lookup to.
         composition_state_id: UUID = record.id
         state: CompositionState = self._state_from_record(record)
+        # Persisted composer completion-gate facts (advisor sign-off, R2-F14)
+        # ride the record's composer_meta; the graph recompute below cannot
+        # rediscover them, so they are threaded into validate_state and merged
+        # into the readiness this snapshot reports.
         validation = await self._execution_service.validate_state(
             state,
             user_id=user_id,
             session_id=session_id,
             session_operation_context=session_operation_context,
+            completion_gates=parse_completion_gates(record.composer_meta),
         )
         # Pre-fetch interpretation-event signal for the llm_interpretations
         # row. Two separate reads because:

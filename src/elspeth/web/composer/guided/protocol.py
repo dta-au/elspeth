@@ -9,7 +9,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
 from elspeth.web.catalog.knob_schema import SchemaFormPayload as SchemaFormPayload
@@ -57,6 +57,7 @@ class SingleSelectPayload(TypedDict):
     question: str
     options: Sequence[_Option]
     allow_custom: bool
+    source_blob_compatible_option_ids: NotRequired[Sequence[str]]
 
 
 class MultiSelectWithCustomPayload(TypedDict):
@@ -177,6 +178,11 @@ class _CoalesceSuccessFlow(TypedDict):
     branch: str | None
 
 
+class _RowUnionSuccessFlow(TypedDict):
+    kind: Literal["row_union_success"]
+    branch: str | None
+
+
 class _OutputWriteFailureFlow(TypedDict):
     kind: Literal["output_write_failure"]
 
@@ -190,6 +196,7 @@ _ProposalFlow = (
     | _GateForkFlow
     | _QueueContinueFlow
     | _CoalesceSuccessFlow
+    | _RowUnionSuccessFlow
     | _OutputWriteFailureFlow
 )
 
@@ -210,9 +217,18 @@ class _TransformBehavior(TypedDict):
     kind: Literal["transform"]
 
 
+class _GateRouteBinding(TypedDict):
+    """One ordinal route alias bound to its author-visible route key."""
+
+    alias: str
+    key: str
+
+
 class _GateBehavior(TypedDict):
     kind: Literal["gate"]
+    condition: str
     route_aliases: Sequence[str]
+    routes: Sequence[_GateRouteBinding]
     fork_branches: Sequence[Mapping[str, Any]]
 
 
@@ -234,17 +250,29 @@ class _CoalesceBehavior(TypedDict):
     branch_aliases: Sequence[str]
     policy: Literal["require_all", "quorum", "best_effort", "first"]
     merge: Literal["union", "nested", "select"]
+    timeout_seconds: float | None
 
 
-_ProposalNodeBehavior = _TransformBehavior | _GateBehavior | _AggregationBehavior | _QueueBehavior | _CoalesceBehavior
+class _RowUnionBehavior(TypedDict):
+    kind: Literal["row_union"]
+    branch_aliases: Sequence[str]
+    policy: Literal["require_all"]
+    timeout_seconds: float | None
+
+
+_ProposalNodeBehavior = _TransformBehavior | _GateBehavior | _AggregationBehavior | _QueueBehavior | _CoalesceBehavior | _RowUnionBehavior
 
 
 class _ProposalNodeSummary(TypedDict):
     stable_id: str
     label: str
-    node_type: Literal["transform", "gate", "aggregation", "queue", "coalesce"]
+    node_type: Literal["transform", "gate", "aggregation", "queue", "coalesce", "row_union"]
     plugin: _ProposalPluginRef | None
     behavior: _ProposalNodeBehavior
+    # Allowlisted key options as pre-rendered display pairs; see
+    # ``_NODE_OPTION_SUMMARY_ALLOWLIST``. Empty for a structural node or an
+    # unlisted plugin — the key itself is always present.
+    node_options_summary: Sequence[_NodeOptionSummary]
 
 
 class _ProposalOutputSummary(TypedDict):
@@ -264,9 +292,14 @@ class ProposePipelinePayload(TypedDict):
     """Redacted display/audit projection of a durable pipeline proposal.
 
     This projection is deliberately non-executable: it contains only
-    catalog-authoritative plugin identities, never component names, options,
-    prompts, paths, inline content, secret references, or model-authored
-    rationale. Exact canonical arguments remain in private proposal custody.
+    catalog-authoritative plugin identities, never component names, prompts,
+    paths, inline content, secret references, or model-authored rationale.
+    Exact canonical arguments remain in private proposal custody. The sole
+    authored values it publishes are the ones a human must see to accept the
+    proposal at all, each drawn from a closed server-owned allowlist: gate
+    behavior (the predicate and its trigger thresholds) and, per
+    ``_NODE_OPTION_SUMMARY_ALLOWLIST``, a node's key options rendered as
+    display text. Everything outside those allowlists stays private.
     Human copy is selected from exact server-owned template ids; structural
     labels are deterministic ordinals rather than canonical route, branch, or
     component names. Task 4 must validate catalog and private-proposal
@@ -295,7 +328,7 @@ class ProposePipelinePayload(TypedDict):
 
 class _WireRowCardinality(TypedDict):
     input: Literal["none", "one", "batch", "branches", "many_producers"]
-    output: Literal["one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch_set", "expected_count"]
+    output: Literal["one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch", "one_per_branch_set", "expected_count"]
     expected_output_count: str | None
 
 
@@ -332,6 +365,7 @@ class _WireNodeReview(TypedDict):
     guaranteed_fields: Sequence[str]
     row_cardinality: _WireRowCardinality
     structured_output_fields: Sequence[_WireStructuredOutputField]
+    node_options_summary: Sequence[_NodeOptionSummary]
 
 
 class _WireBusinessSchema(TypedDict):
@@ -468,8 +502,11 @@ class ChatTurn:
     persisted discriminator. User turns require both fields to be ``None``.
     Assistant turns require a kind; real replies require a ``None`` reason,
     while synthetic failures require one closed reason: quality rejection,
-    provider unavailability, or a safe response that was deliberately not
-    applied. There is no nested compatibility reader for omitted fields.
+    provider unavailability, a safe response that was deliberately not
+    applied, or a model-output defect (the provider answered but the reply
+    violated a tool's argument contract — retrying the same message is the
+    designed remedy, unlike the deterministic ``not_applied`` causes).
+    There is no nested compatibility reader for omitted fields.
     """
 
     role: ChatRole
@@ -478,7 +515,7 @@ class ChatTurn:
     step: GuidedStep
     ts_iso: str
     assistant_message_kind: Literal["assistant", "synthetic_failure"] | None = None
-    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied"] | None = None
+    synthetic_failure_reason: Literal["quality_guard", "unavailable", "not_applied", "model_defect"] | None = None
 
     def __post_init__(self) -> None:
         if type(self.role) is not ChatRole:
@@ -495,9 +532,10 @@ class ChatTurn:
             "quality_guard",
             "unavailable",
             "not_applied",
+            "model_defect",
         ):
             raise ValueError(
-                "synthetic_failure_reason must be 'quality_guard', 'unavailable', 'not_applied', or None; "
+                "synthetic_failure_reason must be 'quality_guard', 'unavailable', 'not_applied', 'model_defect', or None; "
                 f"got {self.synthetic_failure_reason!r}"
             )
         if self.synthetic_failure_reason is not None and self.assistant_message_kind != "synthetic_failure":
@@ -639,7 +677,7 @@ _REQUIRED_KEYS: Mapping[TurnType, frozenset[str]] = {
 
 _ALLOWED_KEYS: Mapping[TurnType, frozenset[str]] = {
     TurnType.INSPECT_AND_CONFIRM: frozenset({"observed"}),
-    TurnType.SINGLE_SELECT: frozenset({"question", "options", "allow_custom"}),
+    TurnType.SINGLE_SELECT: frozenset({"question", "options", "allow_custom", "source_blob_compatible_option_ids"}),
     TurnType.MULTI_SELECT_WITH_CUSTOM: frozenset({"question", "options", "default_chosen", "escape_label"}),
     TurnType.SCHEMA_FORM: frozenset({"mode", "knobs", "prefilled", "plugin"}),
     TurnType.REVIEW_COMPONENTS: _REQUIRED_KEYS[TurnType.REVIEW_COMPONENTS],
@@ -668,6 +706,17 @@ _PROPOSAL_BLOCKER_CATEGORY: Mapping[str, str] = {
 }
 PROPOSAL_SUMMARY_TEMPLATE = "guided.proposal.summary.full_graph.v1"
 PROPOSAL_RATIONALE_TEMPLATE = "guided.proposal.rationale.review_required.v1"
+# Transcript custody (R2-F6): the transform-stage prose revision and the
+# wire-stage correction are author-written instructions that drive a full
+# re-plan, but they arrived through ``/guided/respond`` and so never reached
+# ``GuidedSession.chat_history`` — the transcript the operator reads back.
+# The settlement branches append the author's verbatim instruction plus one
+# of these server-authored outcome lines, so the conversation reads as a
+# request and its answer rather than an unexplained new proposal. Named
+# constants (not inline literals) so the assertion in the integration tests
+# binds the exact rendered text.
+GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT = "I re-planned the whole pipeline with that instruction. Review the updated proposal below."
+GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT = "I re-planned the pipeline with that wiring correction. Review the updated wiring below."
 _PROPOSAL_BLOCKER_SUMMARY: Mapping[str, str] = {
     "pipeline_invalid": "guided.proposal.blocker.pipeline_invalid.v1",
     "policy_review_required": "guided.proposal.blocker.policy_review_required.v1",
@@ -675,7 +724,7 @@ _PROPOSAL_BLOCKER_SUMMARY: Mapping[str, str] = {
     "interpretation_required": "guided.proposal.blocker.interpretation_required.v1",
 }
 _COMPONENT_KINDS = frozenset({"source", "node", "edge", "output"})
-_NODE_TYPES = frozenset({"transform", "gate", "aggregation", "queue", "coalesce"})
+_NODE_TYPES = frozenset({"transform", "gate", "aggregation", "queue", "coalesce", "row_union"})
 _FLOW_KINDS = frozenset(
     {
         "source_success",
@@ -686,6 +735,7 @@ _FLOW_KINDS = frozenset(
         "gate_fork",
         "queue_continue",
         "coalesce_success",
+        "row_union_success",
         "output_write_failure",
     }
 )
@@ -718,6 +768,109 @@ def proposal_structural_label(kind: Literal["route", "branch"], index: int) -> s
     if type(index) is not int or index < 0 or index >= _MAX_PROPOSAL_LABELS:
         raise ValueError("proposal structural label index is outside the bounded range")
     return f"{kind}-{index + 1}"
+
+
+# ── Key transform options at the review surfaces (R2-F3) ─────────────────────
+#
+# Both review cards used to render only the behavior discriminant, so every
+# transform read as "transforms each incoming item" — a field_mapper's renames
+# and its drop-the-rest projection were invisible on the surfaces an operator
+# accepts. This projects those knobs as pre-rendered {key, value} text.
+#
+# The allowlist is a CLOSED server-owned vocabulary keyed by plugin, and it is
+# enforced by the validator, not just by the projector — same hygiene rationale
+# as ``_wire_schema``: path-, credential-, and prompt-adjacent options must
+# never reach a public projection, so adding a plugin here is a deliberate
+# per-option decision rather than a whole-options dump.
+_NODE_OPTION_SUMMARY_ALLOWLIST: Mapping[str, tuple[str, ...]] = {
+    "field_mapper": ("mapping", "select_only"),
+}
+_MAX_NODE_OPTION_SUMMARY_PAIRS = 20
+_MAX_NODE_OPTION_SUMMARY_VALUE = 240
+
+
+class _NodeOptionSummary(TypedDict):
+    key: str
+    value: str
+
+
+def _rendered_mapping(value: object) -> str:
+    """Render ``{source: target}`` renames as bounded "src → dst" display text."""
+
+    if not isinstance(value, Mapping):
+        return ""
+    pairs = [f"{source} → {target}" for source, target in value.items() if type(source) is str and type(target) is str]
+    if not pairs:
+        return ""
+    shown = pairs[:_MAX_NODE_OPTION_SUMMARY_PAIRS]
+    remaining = len(pairs) - len(shown)
+    rendered = ", ".join(shown) + (f", +{remaining} more" if remaining > 0 else "")
+    if len(rendered) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+        return rendered[: _MAX_NODE_OPTION_SUMMARY_VALUE - 1] + "…"
+    return rendered
+
+
+def _rendered_select_only(value: object) -> str:
+    """Name the consequence of the projection flag, not the flag's literal."""
+
+    if value is True:
+        return "only the mapped fields are kept"
+    if value is False:
+        return "unmapped fields pass through"
+    return ""
+
+
+_NODE_OPTION_SUMMARY_RENDERERS: Mapping[str, Callable[[object], str]] = {
+    "mapping": _rendered_mapping,
+    "select_only": _rendered_select_only,
+}
+
+
+def node_options_summary(plugin: str | None, options: Mapping[str, Any]) -> list[_NodeOptionSummary]:
+    """Project one node's allowlisted key options as bounded display pairs.
+
+    Returns ``[]`` for a structural node, an unlisted plugin, or an allowlisted
+    knob whose authored value renders to nothing — the review surfaces render
+    an empty summary as "no key options", never as a missing section.
+    """
+
+    keys = _NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", ())
+    if not keys or not isinstance(options, Mapping):
+        return []
+    summary: list[_NodeOptionSummary] = []
+    for key in keys:
+        if key not in options:
+            continue
+        value = _NODE_OPTION_SUMMARY_RENDERERS[key](options[key])
+        if value:
+            summary.append({"key": key, "value": value})
+    return summary
+
+
+def _node_options_summary_error(value: object, path: str, *, plugin: str | None) -> str | None:
+    """Reject any option pair outside the plugin's server-owned allowlist."""
+
+    items, error = _current_sequence(value, path)
+    if error is not None:
+        return error
+    assert items is not None
+    allowed = _NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", ())
+    seen: set[str] = set()
+    for index, item in enumerate(items):
+        item_path = f"{path}[{index}]"
+        if (error := _exact_nested_keys(item, frozenset({"key", "value"}), item_path)) is not None:
+            return error
+        assert isinstance(item, Mapping)
+        if item["key"] not in allowed:
+            return f"{item_path}.key is outside the node option summary allowlist"
+        if item["key"] in seen:
+            return f"{item_path}.key duplicates another projected option"
+        seen.add(item["key"])
+        if (error := _current_text_error(item["value"], f"{item_path}.value", nonempty=True)) is not None:
+            return error
+        if len(cast(str, item["value"])) > _MAX_NODE_OPTION_SUMMARY_VALUE:
+            return f"{item_path}.value exceeds the bounded option summary length"
+    return None
 
 
 def _exact_nested_keys(value: object, expected: frozenset[str], path: str) -> str | None:
@@ -900,10 +1053,21 @@ def _validate_inspect_payload(payload: Mapping[str, Any]) -> str | None:
 def _validate_single_select_payload(payload: Mapping[str, Any]) -> str | None:
     if (error := _current_text_error(payload["question"], "payload.question", nonempty=True)) is not None:
         return error
-    if (error := _validate_options(payload["options"], "payload.options")[1]) is not None:
+    option_ids, error = _validate_options(payload["options"], "payload.options")
+    if error is not None:
         return error
     if type(payload["allow_custom"]) is not bool:
         return "payload.allow_custom must be a bool"
+    compatible_ids, error = _current_string_sequence(
+        payload.get("source_blob_compatible_option_ids", ()),
+        "payload.source_blob_compatible_option_ids",
+        unique=True,
+    )
+    if error is not None:
+        return error
+    assert option_ids is not None and compatible_ids is not None
+    if not set(compatible_ids).issubset(option_ids):
+        return "payload.source_blob_compatible_option_ids must reference declared option ids"
     return None
 
 
@@ -978,8 +1142,15 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
     assert fields is not None
     seen_names: set[str] = set()
     visibility_gated: set[str] = set()
+    # ``required_when`` targets may be declared LATER in the field list, so the
+    # whole name set is collected up front rather than accumulated as we go
+    # (``collision_policy`` lives on ``LocalFileSinkConfig`` while its target
+    # ``mode`` lives on the concrete sink subclass and therefore lowers after
+    # it). Malformed entries are dropped here and rejected by the per-field
+    # checks below.
+    all_names = {item["name"] for item in fields if isinstance(item, Mapping) and type(item.get("name")) is str}
     required = frozenset({"name", "label", "kind", "required", "nullable"})
-    optional = frozenset({"description", "tier", "default", "enum", "item_kind", "visible_when"})
+    optional = frozenset({"description", "tier", "default", "enum", "item_kind", "visible_when", "placeholder", "required_when"})
     for index, item in enumerate(fields):
         field_path = f"{path}.fields[{index}]"
         if not isinstance(item, Mapping):
@@ -1002,6 +1173,8 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
         if type(item["required"]) is not bool or type(item["nullable"]) is not bool:
             return f"{field_path}.required and nullable must be bools"
         if "description" in item and (error := _current_text_error(item["description"], f"{field_path}.description")) is not None:
+            return error
+        if "placeholder" in item and (error := _current_text_error(item["placeholder"], f"{field_path}.placeholder")) is not None:
             return error
         if "tier" in item and (type(item["tier"]) is not str or item["tier"] not in _FIELD_TIERS):
             return f"{field_path}.tier is outside the closed tier vocabulary"
@@ -1033,6 +1206,21 @@ def _validate_knob_schema(value: object, path: str) -> str | None:
             if (error := _public_json_error(predicate["equals"], f"{field_path}.visible_when.equals")) is not None:
                 return error
             visibility_gated.add(name)
+        if "required_when" in item:
+            predicate = item["required_when"]
+            if (error := _exact_nested_keys(predicate, frozenset({"field", "equals"}), f"{field_path}.required_when")) is not None:
+                return error
+            assert isinstance(predicate, Mapping)
+            target = predicate["field"]
+            # Deliberately weaker than the visible_when rule above: no
+            # earlier-field and no ungated requirement. required_when never
+            # gates RENDERING — the field is always drawn and the form reads
+            # sibling state — so declaration order carries no meaning here, and
+            # enforcing it would reject the only shape this key exists for.
+            if type(target) is not str or target not in all_names or target == name:
+                return f"{field_path}.required_when.field must reference another field on this schema"
+            if (error := _public_json_error(predicate["equals"], f"{field_path}.required_when.equals")) is not None:
+                return error
         seen_names.add(name)
     return None
 
@@ -1072,9 +1260,16 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
         return "payload.draft_hash must be 64 lowercase hexadecimal characters"
     cardinality_keys = frozenset({"input", "output", "expected_output_count"})
     cardinality_inputs = frozenset({"none", "one", "batch", "branches", "many_producers"})
-    cardinality_outputs = frozenset({"one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch_set", "expected_count"})
+    cardinality_outputs = frozenset(
+        {"one", "zero_or_one", "zero_or_many", "one_per_item", "one_per_branch", "one_per_branch_set", "expected_count"}
+    )
 
-    def validate_cardinality(value: object, path: str) -> str | None:
+    def validate_cardinality(
+        value: object,
+        path: str,
+        *,
+        owner_node_type: object | None = None,
+    ) -> str | None:
         if (nested_error := _exact_nested_keys(value, cardinality_keys, path)) is not None:
             return nested_error
         assert isinstance(value, Mapping)
@@ -1085,6 +1280,12 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
             return nested_error
         if (count is not None) != (value["output"] == "expected_count"):
             return f"{path}.expected_output_count must exactly bind expected_count"
+        if value["output"] == "one_per_branch" and owner_node_type != "row_union":
+            return f"{path}.output 'one_per_branch' is only valid for row_union nodes"
+        if owner_node_type == "row_union" and value["input"] != "branches":
+            return f"{path}.input must be 'branches' for row_union nodes"
+        if owner_node_type == "row_union" and value["output"] != "one_per_branch":
+            return f"{path}.output must be 'one_per_branch' for row_union nodes"
         return None
 
     sources, error = _current_sequence(payload["sources"], "payload.sources")
@@ -1131,6 +1332,7 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
             "guaranteed_fields",
             "row_cardinality",
             "structured_output_fields",
+            "node_options_summary",
         }
     )
     for index, node in enumerate(nodes):
@@ -1152,9 +1354,23 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
         for name in ("required_fields", "guaranteed_fields"):
             if (error := _current_string_sequence(node[name], f"{path}.{name}")[1]) is not None:
                 return error
-        if (error := validate_cardinality(node["row_cardinality"], f"{path}.row_cardinality")) is not None:
+        if (
+            error := validate_cardinality(
+                node["row_cardinality"],
+                f"{path}.row_cardinality",
+                owner_node_type=node["node_type"],
+            )
+        ) is not None:
             return error
         if (error := _public_json_error(node["structured_output_fields"], f"{path}.structured_output_fields")) is not None:
+            return error
+        if (
+            error := _node_options_summary_error(
+                node["node_options_summary"],
+                f"{path}.node_options_summary",
+                plugin=node["plugin"] if type(node["plugin"]) is str else None,
+            )
+        ) is not None:
             return error
 
     output_keys = frozenset({"stable_id", "label", "plugin", "on_write_failure", "required_fields", "business_schema"})
@@ -1326,14 +1542,39 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
     if node_type in ("transform", "queue"):
         return _exact_nested_keys(behavior, frozenset({"kind"}), behavior_path)
     if node_type == "gate":
-        expected = frozenset({"kind", "route_aliases", "fork_branches"})
+        expected = frozenset({"kind", "condition", "route_aliases", "routes", "fork_branches"})
         if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
+            return error
+        # The authored predicate is bounded non-empty text and NOTHING MORE:
+        # no re-parsing or classification here — expression validity and
+        # route/condition parity are validated upstream at candidate
+        # validation (state.py), and a third ExpressionParser site would
+        # drift (elspeth-224fab9702).
+        if (error := _current_text_error(behavior["condition"], f"{behavior_path}.condition", nonempty=True)) is not None:
             return error
         route_aliases, error = _validate_alias_sequence(
             behavior["route_aliases"], kind="route", path=f"{behavior_path}.route_aliases", minimum=1
         )
         if error is not None:
             return error
+        assert route_aliases is not None
+        # ``routes`` binds each ordinal alias to its author-visible route key,
+        # bijective with ``route_aliases`` in the same order (fork gates
+        # included — both lists derive from the same ordered route walk).
+        route_bindings, error = _sequence_of_mappings(behavior["routes"], f"{behavior_path}.routes")
+        if error is not None:
+            return error
+        assert route_bindings is not None
+        if len(route_bindings) != len(route_aliases):
+            return f"{behavior_path}.routes must bind route_aliases one-to-one in the same order"
+        for index, binding in enumerate(route_bindings):
+            binding_path = f"{behavior_path}.routes[{index}]"
+            if (error := _exact_nested_keys(binding, frozenset({"alias", "key"}), binding_path)) is not None:
+                return error
+            if binding["alias"] != route_aliases[index]:
+                return f"{behavior_path}.routes must bind route_aliases one-to-one in the same order"
+            if (error := _current_text_error(binding["key"], f"{binding_path}.key", nonempty=True)) is not None:
+                return error
         fork_branches, error = _sequence_of_mappings(behavior["fork_branches"], f"{behavior_path}.fork_branches")
         if error is not None:
             return error
@@ -1398,7 +1639,28 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
         ):
             return error
         return None
-    expected = frozenset({"kind", "branch_aliases", "policy", "merge"})
+    if node_type == "row_union":
+        expected = frozenset({"kind", "branch_aliases", "policy", "timeout_seconds"})
+        if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
+            return error
+        _, error = _validate_alias_sequence(
+            behavior["branch_aliases"],
+            kind="branch",
+            path=f"{behavior_path}.branch_aliases",
+            minimum=2,
+        )
+        if error is not None:
+            return error
+        if behavior["policy"] != "require_all":
+            return f"{behavior_path}.policy must be 'require_all'"
+        timeout_seconds = behavior["timeout_seconds"]
+        if (
+            timeout_seconds is not None
+            and (error := _finite_positive_number_error(timeout_seconds, f"{behavior_path}.timeout_seconds")) is not None
+        ):
+            return error
+        return None
+    expected = frozenset({"kind", "branch_aliases", "policy", "merge", "timeout_seconds"})
     if (error := _exact_nested_keys(behavior, expected, behavior_path)) is not None:
         return error
     _, error = _validate_alias_sequence(behavior["branch_aliases"], kind="branch", path=f"{behavior_path}.branch_aliases", minimum=2)
@@ -1408,6 +1670,18 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
         return f"{behavior_path}.policy is outside the closed vocabulary"
     if behavior["merge"] not in _COALESCE_MERGES:
         return f"{behavior_path}.merge is outside the closed vocabulary"
+    timeout_seconds = behavior["timeout_seconds"]
+    if (
+        timeout_seconds is not None
+        and (
+            error := _finite_positive_number_error(
+                timeout_seconds,
+                f"{behavior_path}.timeout_seconds",
+            )
+        )
+        is not None
+    ):
+        return error
     return None
 
 
@@ -1442,7 +1716,7 @@ def _validate_proposal_flow(value: object, path: str) -> str | None:
     kind = value.get("kind")
     if kind not in _FLOW_KINDS:
         return f"{path}.kind is outside the closed flow vocabulary"
-    if kind in ("source_success", "node_success", "queue_continue", "coalesce_success"):
+    if kind in ("source_success", "node_success", "queue_continue", "coalesce_success", "row_union_success"):
         if (error := _exact_nested_keys(value, frozenset({"kind", "branch"}), path)) is not None:
             return error
         branch = value["branch"]
@@ -1566,7 +1840,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     assert nodes is not None
     for index, node in enumerate(nodes):
         path = f"payload.nodes[{index}]"
-        expected = frozenset({"stable_id", "label", "node_type", "plugin", "behavior"})
+        expected = frozenset({"stable_id", "label", "node_type", "plugin", "behavior", "node_options_summary"})
         if (error := _exact_nested_keys(node, expected, path)) is not None:
             return error
         if (error := _canonical_uuid_error(node["stable_id"], f"{path}.stable_id")) is not None:
@@ -1580,6 +1854,14 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
                 return error
         elif node["plugin"] is not None:
             return f"{path}.plugin must be null for a structural node"
+        if (
+            error := _node_options_summary_error(
+                node["node_options_summary"],
+                f"{path}.node_options_summary",
+                plugin=(node["plugin"]["id"] if isinstance(node["plugin"], Mapping) and type(node["plugin"].get("id")) is str else None),
+            )
+        ) is not None:
+            return error
 
     outputs, error = _sequence_of_mappings(payload["outputs"], "payload.outputs")
     if error is not None:
@@ -1644,7 +1926,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     gate_routes: dict[str, list[str]] = {}
     gate_forks: dict[str, list[tuple[tuple[str, ...], str]]] = {}
     branch_origins: dict[str, list[str]] = {}
-    branch_adjacency: dict[str, dict[str, set[str]]] = {}
+    branch_origin_gates: dict[str, list[str]] = {}
     branch_uses: list[tuple[str, str, str, str]] = []
 
     for index, edge in enumerate(edges):
@@ -1683,6 +1965,7 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
                 "gate": frozenset({"gate_route", "gate_fork"}),
                 "queue": frozenset({"queue_continue"}),
                 "coalesce": frozenset({"coalesce_success"}),
+                "row_union": frozenset({"row_union_success"}),
             }
             if flow_kind not in legal_node_flows[node_type]:
                 return f"{path}.flow is not legal for its node_type"
@@ -1695,15 +1978,18 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             "gate_fork": frozenset({"node", "output"}),
             "queue_continue": frozenset({"node", "output"}),
             "coalesce_success": frozenset({"node", "output"}),
+            "row_union_success": frozenset({"node"}),
             "output_write_failure": frozenset({"output", "discard"}),
         }
+        if flow_kind == "row_union_success" and to_kind != "node":
+            return f"{path}.row_union_success must target an ordinary processing or queue node"
         if to_kind not in legal_to_kinds[flow_kind]:
             return f"{path}.flow is not legal for its to_endpoint kind"
         if from_stable_id == to_stable_id:
             return f"{path} is a self-loop"
         branch = flow.get("branch")
-        if to_kind == "node" and node_by_id[to_stable_id]["node_type"] == "coalesce" and branch is None:
-            return f"{path}.flow into a coalesce node requires a branch alias"
+        if to_kind == "node" and node_by_id[to_stable_id]["node_type"] in ("coalesce", "row_union") and branch is None:
+            return f"{path}.flow into a correlated barrier node requires a branch alias"
         adjacency[from_stable_id].add(to_stable_id)
         reverse_adjacency[to_stable_id].add(from_stable_id)
         outgoing_flows.setdefault(from_stable_id, []).append(flow)
@@ -1713,11 +1999,69 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
         elif flow_kind == "gate_fork":
             gate_forks.setdefault(from_stable_id, []).append((tuple(flow["routes"]), flow["branch"]))
             branch_origins.setdefault(flow["branch"], []).append(to_stable_id)
+            branch_origin_gates.setdefault(flow["branch"], []).append(from_stable_id)
         if branch is not None:
-            branch_graph = branch_adjacency.setdefault(branch, {})
-            branch_graph.setdefault(from_stable_id, set()).add(to_stable_id)
-            branch_graph.setdefault(to_stable_id, set())
             branch_uses.append((branch, from_stable_id, flow_kind, path))
+
+    def branch_downstream_ids(branch: str) -> set[str]:
+        """Components reachable from ``branch``'s authoritative gate_fork origin.
+
+        The origin is already the branch-specific target of its gate_fork edge.
+        From there, follow all directed routing, including descendant forks.
+        Outer siblings remain excluded because their gate_fork edges leave the
+        shared parent gate and are not reachable backwards from this origin.
+        """
+
+        frontier = list(branch_origins.get(branch, ()))
+        visited = set(frontier)
+        while frontier:
+            current = frontier.pop()
+            routed: set[str] = adjacency.get(current, set())
+            for target_id in routed - visited:
+                visited.add(target_id)
+                frontier.append(target_id)
+        return visited
+
+    def branch_producer_is_compatible(
+        branch: str,
+        producer_id: str,
+        *,
+        visiting: frozenset[str] = frozenset(),
+    ) -> bool:
+        """Return whether one projected producer is exclusively branch-derived.
+
+        Ordinary nodes have one authoritative input, so one compatible
+        predecessor proves lineage. Queues and correlated barriers are fan-in
+        boundaries: every predecessor must derive from the branch, recursively.
+        This mirrors state._runtime_connection_is_downstream() and prevents one
+        valid queue path from hiding unrelated traffic.
+        """
+
+        if producer_id in visiting:
+            return False
+        node = node_by_id.get(producer_id)
+        if node is None:
+            return False
+        predecessors = incoming_edges.get(producer_id, ())
+        if not predecessors:
+            return False
+        next_visiting = visiting | {producer_id}
+        origin_gates = branch_origin_gates.get(branch, ())
+        origins = branch_origins.get(branch, ())
+
+        def predecessor_is_compatible(predecessor_id: str, flow: Mapping[str, Any]) -> bool:
+            if flow["kind"] == "gate_fork" and flow["branch"] == branch and predecessor_id in origin_gates and producer_id in origins:
+                return True
+            return branch_producer_is_compatible(
+                branch,
+                predecessor_id,
+                visiting=next_visiting,
+            )
+
+        compatibility = (predecessor_is_compatible(predecessor_id, flow) for predecessor_id, flow in predecessors)
+        if node["node_type"] in ("queue", "coalesce", "row_union"):
+            return all(compatibility)
+        return any(compatibility)
 
     for node in nodes:
         behavior = node["behavior"]
@@ -1737,7 +2081,17 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             projected_routes = tuple(dict.fromkeys([*direct_routes, *fork_routes]))
             if projected_routes != tuple(behavior["route_aliases"]):
                 return "payload gate route aliases do not match its projected flows"
-            if tuple(gate_forks.get(stable_id, ())) != tuple((tuple(item["routes"]), item["branch"]) for item in behavior["fork_branches"]):
+            # Bind each fork branch by ALIAS, not by edge position. A row_union
+            # releases in its authored ``branches`` order, so planning.py orders
+            # the barrier's incoming edges by that order — and when a gate forks
+            # STRAIGHT into the row_union those are the very gate_fork edges read
+            # here. Both orderings are authored and legitimate, and one edge list
+            # cannot express both, so compare the fork set by identity. The
+            # behavior's own ``fork_branches`` order still carries the authored
+            # ``fork_to`` order; only this cross-check stops reading position.
+            projected_forks = sorted(gate_forks.get(stable_id, ()))
+            declared_forks = sorted((tuple(item["routes"]), item["branch"]) for item in behavior["fork_branches"])
+            if projected_forks != declared_forks:
                 return "payload gate fork branches do not match its projected flows"
         elif node["node_type"] == "queue":
             if flow_kinds != ("queue_continue",):
@@ -1753,6 +2107,21 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             incoming_branches = tuple(flow["branch"] for _, flow in incoming_edges.get(stable_id, ()) if flow.get("branch") is not None)
             if incoming_branches != tuple(behavior["branch_aliases"]):
                 return "payload coalesce branch aliases do not match its incoming flows"
+        elif node["node_type"] == "row_union":
+            if flow_kinds != ("row_union_success",):
+                return "payload row_union node requires exactly one row_union_success flow"
+            incoming_branches = tuple(flow["branch"] for _, flow in incoming_edges.get(stable_id, ()) if flow.get("branch") is not None)
+            if incoming_branches != tuple(behavior["branch_aliases"]):
+                return "payload row_union branch aliases do not match its incoming flows"
+            target_ids = adjacency[stable_id]
+            if len(target_ids) != 1:
+                return "payload row_union node requires exactly one ordinary processing or queue target"
+            target_id = next(iter(target_ids))
+            if target_id not in node_by_id or node_by_id[target_id]["node_type"] not in ("transform", "gate", "aggregation", "queue"):
+                return "payload row_union success must target one ordinary processing or queue node"
+            origin_gates = {gate_id for branch in behavior["branch_aliases"] for gate_id in branch_origin_gates.get(branch, ())}
+            if len(origin_gates) != 1:
+                return "payload row_union branches must originate under one gate_fork"
 
     for source in sources:
         flow_kinds = tuple(flow["kind"] for flow in outgoing_flows.get(source["stable_id"], ()))
@@ -1784,17 +2153,17 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
     if branch_aliases != expected_branches or any(len(origins) != 1 for origins in branch_origins.values()):
         return "payload fork branch aliases must be globally unique server ordinals"
 
-    branch_coalesce_owner: dict[str, str] = {}
+    branch_barrier_owner: dict[str, str] = {}
     for node in nodes:
-        if node["node_type"] != "coalesce":
+        if node["node_type"] not in ("coalesce", "row_union"):
             continue
         behavior = node["behavior"]
         assert isinstance(behavior, Mapping)
         for branch in behavior["branch_aliases"]:
-            existing_owner = branch_coalesce_owner.get(branch)
+            existing_owner = branch_barrier_owner.get(branch)
             if existing_owner is not None and existing_owner != node["stable_id"]:
-                return "payload fork branch alias cannot be consumed by more than one coalesce node"
-            branch_coalesce_owner[branch] = node["stable_id"]
+                return "payload fork branch alias cannot be consumed by more than one coalesce/row_union node"
+            branch_barrier_owner[branch] = node["stable_id"]
 
     for branch, from_stable_id, flow_kind, path in branch_uses:
         origins = branch_origins.get(branch)
@@ -1802,36 +2171,20 @@ def _validate_propose_pipeline_payload(payload: Mapping[str, Any]) -> str | None
             return f"{path}.flow branch alias has no unique authoritative gate_fork origin"
         if flow_kind == "gate_fork":
             continue
-        branch_graph = branch_adjacency[branch]
-        frontier = list(origins)
-        visited = set(frontier)
-        while frontier:
-            current = frontier.pop()
-            for target_id in branch_graph.get(current, set()) - visited:
-                visited.add(target_id)
-                frontier.append(target_id)
-        if from_stable_id not in visited:
+        if not branch_producer_is_compatible(branch, from_stable_id):
             return f"{path}.flow branch alias is not downstream of its authoritative gate_fork origin"
 
     for node in nodes:
-        if node["node_type"] != "coalesce":
+        if node["node_type"] not in ("coalesce", "row_union"):
             continue
         behavior = node["behavior"]
         assert isinstance(behavior, Mapping)
         for branch in behavior["branch_aliases"]:
             origins = branch_origins.get(branch)
             if origins is None:
-                return "payload coalesce branch alias has no authoritative gate_fork origin"
-            branch_graph = branch_adjacency[branch]
-            frontier = list(origins)
-            visited = set(frontier)
-            while frontier:
-                current = frontier.pop()
-                for target_id in branch_graph.get(current, set()) - visited:
-                    visited.add(target_id)
-                    frontier.append(target_id)
-            if node["stable_id"] not in visited:
-                return "payload coalesce branch is not connected to its gate_fork origin"
+                return "payload correlated barrier branch alias has no authoritative gate_fork origin"
+            if node["stable_id"] not in branch_downstream_ids(branch):
+                return "payload correlated barrier branch is not connected to its gate_fork origin"
 
     indegree = dict.fromkeys(component_kind_by_id, 0)
     for from_id, target_ids in adjacency.items():

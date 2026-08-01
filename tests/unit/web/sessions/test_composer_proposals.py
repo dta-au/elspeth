@@ -159,9 +159,13 @@ async def _get_test_blob(
         return await blob_service.get_blob(blob_id, session_operation_context=context)
 
 
-def _pipeline_plan_result(*, tool_call_id: str = "call_pipeline") -> PipelinePlanResult:
+def _pipeline_plan_result(
+    *,
+    tool_call_id: str = "call_pipeline",
+    pipeline: dict[str, object] | None = None,
+) -> PipelinePlanResult:
     proposal = PipelineProposal.create(
-        pipeline={"sources": {}, "nodes": [], "edges": [], "outputs": []},
+        pipeline=pipeline if pipeline is not None else {"sources": {}, "nodes": [], "edges": [], "outputs": []},
         base=AbsentBase(),
         reviewed_facts={},
         surface=PlannerSurface.FREEFORM,
@@ -186,6 +190,32 @@ def _pipeline_public_arguments() -> dict[str, object]:
         {"sources": {}, "nodes": [], "edges": [], "outputs": []},
         telemetry=NoopRedactionTelemetry(),
     )
+
+
+def _row_union_pipeline(branch_order: tuple[str, ...]) -> dict[str, object]:
+    connections = {
+        "a": "a_in",
+        "b": "b_in",
+        "c": "c_in",
+    }
+    return {
+        "sources": {},
+        "nodes": [
+            {
+                "id": "union",
+                "node_type": "row_union",
+                "plugin": None,
+                "input": "a_in",
+                "on_success": "union_out",
+                "on_error": None,
+                "options": {},
+                "branches": {alias: connections[alias] for alias in branch_order},
+                "timeout_seconds": 30.0,
+            }
+        ],
+        "edges": [],
+        "outputs": [],
+    }
 
 
 def test_session_preferences_columns_exist(engine) -> None:
@@ -487,6 +517,47 @@ async def test_create_pipeline_proposal_writes_closed_bound_creation_event_and_r
     assert restored.proposal == plan.proposal
     assert restored.custody_result == "not_required"
     assert restored.supersedes_proposal_id is None
+
+
+@pytest.mark.asyncio
+async def test_authoritative_pipeline_restore_rejects_non_first_row_union_order_tampering(service) -> None:
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    original = _row_union_pipeline(("a", "b", "c"))
+    tampered = _row_union_pipeline(("a", "c", "b"))
+    plan = _pipeline_plan_result(pipeline=original)
+    public_arguments = redact_tool_call_arguments(
+        "set_pipeline",
+        original,
+        telemetry=NoopRedactionTelemetry(),
+    )
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        row = await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=plan,
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_redacted_json=public_arguments,
+            actor="composer-web:user-alice",
+            composer_model_identifier="planner-model",
+            composer_model_version="planner-model-v1",
+            composer_provider="provider",
+            session_operation_context=context,
+        )
+
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(composition_proposals_table).where(composition_proposals_table.c.id == str(row.id)).values(arguments_json=tampered)
+        )
+
+    with pytest.raises(AuditIntegrityError, match="private arguments binding mismatch"):
+        await service.get_authoritative_pipeline_proposal(
+            session_id=session_id,
+            proposal_id=row.id,
+            reviewed_facts={},
+        )
 
 
 @pytest.mark.asyncio

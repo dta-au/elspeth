@@ -7,10 +7,13 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
+from botocore.exceptions import ClientError
+
 from elspeth.contracts import ArtifactDescriptor
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.sink_effects import (
     RestrictedSinkEffectContext,
+    SinkEffectDescriptorMode,
     SinkEffectInspectionRequest,
     SinkEffectMember,
     SinkEffectPipelineMembersInput,
@@ -18,21 +21,20 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReconcileKind,
 )
 from elspeth.plugins.aws_s3_common import build_s3_client
-from elspeth.plugins.sinks.aws_s3_sink import AWSS3Sink
+from elspeth.plugins.sinks.aws_s3_sink import AWSS3Sink, S3ConditionalWriteRejectedError
 from elspeth.plugins.sources.aws_s3_source import AWSS3Source
 
 from .contracts import (
     _SHA256_PATTERN,
     FORBIDDEN_AWS_OVERRIDE_ENV,
     AcceptanceCheckError,
-    AcceptanceInputError,
-    _canonical_uuid,
-    _resolve_aws_region,
+    _resolve_acceptance_s3_location,
     _sha256,
 )
 
 _S3_ACCEPTANCE_ROW: dict[str, object] = {"id": 1, "name": "elspeth-s3-acceptance"}
 _S3_ACCEPTANCE_BYTES = b'{"id":1,"name":"elspeth-s3-acceptance"}\n'
+_S3_COLLISION_PROBE_ROW: dict[str, object] = {"id": 1, "name": "elspeth-s3-acceptance-collision-probe"}
 _S3_MAX_OBJECT_BYTES = 4096
 _S3_MAX_RECORD_CHARS = 256
 
@@ -67,26 +69,9 @@ class _S3AcceptanceContext:
 
 
 def _resolve_s3_acceptance_inputs(env: Mapping[str, str]) -> tuple[str, str, str]:
-    bucket = env.get("ELSPETH_ACCEPTANCE_S3_BUCKET")
-    prefix = env.get("ELSPETH_ACCEPTANCE_S3_PREFIX")
     if any(name in env for name in FORBIDDEN_AWS_OVERRIDE_ENV):
         raise AcceptanceCheckError("s3_aws_override")
-    if type(bucket) is not str or not bucket.strip() or len(bucket) > 2048:
-        raise AcceptanceCheckError("s3_input")
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in bucket):
-        raise AcceptanceCheckError("s3_input")
-    if type(prefix) is not str or not prefix or prefix != prefix.strip("/"):
-        raise AcceptanceCheckError("s3_input")
-    segments = prefix.split("/")
-    if any(not segment or segment in {".", ".."} for segment in segments):
-        raise AcceptanceCheckError("s3_input")
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in prefix):
-        raise AcceptanceCheckError("s3_input")
-    try:
-        _canonical_uuid(segments[-1], label="S3 prefix identity")
-    except AcceptanceInputError:
-        raise AcceptanceCheckError("s3_input") from None
-    region = _resolve_aws_region(env, check="s3_input")
+    bucket, prefix, region = _resolve_acceptance_s3_location(env, check="s3_input")
     key = f"{prefix}/verify-s3.jsonl"
     if len(key.encode("utf-8")) > 1024:
         raise AcceptanceCheckError("s3_input")
@@ -94,9 +79,9 @@ def _resolve_s3_acceptance_inputs(env: Mapping[str, str]) -> tuple[str, str, str
 
 
 def _s3_not_found(error: BaseException) -> bool:
-    response = getattr(error, "response", None)
-    if not isinstance(response, Mapping):
+    if not isinstance(error, ClientError):
         return False
+    response = error.response
     error_payload = response.get("Error")
     code = error_payload.get("Code") if isinstance(error_payload, Mapping) else None
     metadata = response.get("ResponseMetadata")
@@ -140,10 +125,11 @@ def _drive_s3_acceptance_effect(
     region: str,
     expected_hash: str,
     require_existing: bool,
+    row_payload: Mapping[str, object] = _S3_ACCEPTANCE_ROW,
 ) -> tuple[ArtifactDescriptor, bool]:
     """Exercise only the effect protocol; never call legacy write/flush."""
     effect_id = _s3_acceptance_effect_id(bucket=bucket, key=key, region=region, content_hash=expected_hash)
-    row = dict(_S3_ACCEPTANCE_ROW)
+    row = dict(row_payload)
     lineage_json = canonical_json([{"row_id": "verify-s3-row", "token_id": "verify-s3-token"}])
     member = SinkEffectMember(
         ordinal=0,
@@ -170,6 +156,22 @@ def _drive_s3_acceptance_effect(
     prepare_request = SinkEffectPrepareRequest(effect_id=effect_id, effect_input=effect_input, inspection=inspection)
     plan = sink.prepare_effect(prepare_request, context)  # type: ignore[attr-defined]
     prepare_request.validate_plan(plan)
+    if plan.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION:
+        # Mirror the real orchestrator's short-circuit (executors/sink_effects.py):
+        # a virtual/inherited/reaffirmed plan never reaches lease, commit, or
+        # reconcile. Driving reconcile_effect against it here would be a
+        # harness-only deviation from production behavior — and for a
+        # reaffirmed plan specifically, it would mis-observe the effect_id/
+        # plan_hash-scoped exact-match branch as a fresh "still absent" or
+        # "predecessor_unchanged" NOT_APPLIED result instead of the no-op it is.
+        if plan.expected_descriptor is None:
+            raise AcceptanceCheckError("s3_collision" if require_existing else "s3_sink_write")
+        if not require_existing:
+            # The primary lane must prove this invocation published the
+            # object. A reaffirmed/pre-existing descriptor is not owned by
+            # the harness and must never enable cleanup.
+            raise _S3EffectFailure(cleanup_owned=False)
+        return plan.expected_descriptor, True
     reconciliation = sink.reconcile_effect(plan, context)  # type: ignore[attr-defined]
 
     if reconciliation.kind is SinkEffectReconcileKind.UNKNOWN:
@@ -178,6 +180,8 @@ def _drive_s3_acceptance_effect(
         descriptor = reconciliation.descriptor
         if descriptor is None:
             raise AcceptanceCheckError("s3_collision" if require_existing else "s3_sink_write")
+        if not require_existing:
+            raise _S3EffectFailure(cleanup_owned=False)
         return descriptor, True
     if require_existing:
         raise AcceptanceCheckError("s3_collision")
@@ -224,13 +228,16 @@ def verify_s3(
     sink_config = {**common_config, "overwrite": False}
     source_config = {**common_config, "on_validation_failure": "discard"}
     expected_hash = _sha256(_S3_ACCEPTANCE_BYTES)
+    divergent_hash = _sha256(canonical_json(_S3_COLLISION_PROBE_ROW).encode("utf-8"))
     primary_sink: Any | None = None
     source: Any | None = None
     collision_sink: Any | None = None
+    probe_sink: Any | None = None
     failure_check: str | None = None
     resource_close_failed = False
     cleanup_failed = False
     cleanup_owned = False
+    collision_rejected = False
     source_hash: str | None = None
 
     try:
@@ -266,7 +273,7 @@ def verify_s3(
                 failure_check = "s3_source_read"
             else:
                 source_hash = _s3_source_hash(source_context)
-                materialized = [getattr(row, "row", None) for row in rows]
+                materialized = [row.row for row in rows]
                 if materialized != [_S3_ACCEPTANCE_ROW]:
                     failure_check = "s3_source_rows"
                 elif source_hash != expected_hash or source_hash != sink_hash:
@@ -288,16 +295,35 @@ def verify_s3(
             else:
                 if not reconciled or collision_descriptor != primary_descriptor:
                     failure_check = "s3_collision"
+
+        if failure_check is None:
+            # A genuine collision probe: same key, different content, still
+            # no overwrite/predecessor authority. This must be rejected at
+            # prepare, not silently accepted — today's acceptance harness
+            # never exercised a real collision without this probe.
+            try:
+                probe_sink = sink_factory(dict(sink_config))
+                _drive_s3_acceptance_effect(
+                    probe_sink,
+                    bucket=bucket,
+                    key=key,
+                    region=region,
+                    expected_hash=divergent_hash,
+                    require_existing=True,
+                    row_payload=_S3_COLLISION_PROBE_ROW,
+                )
+            except S3ConditionalWriteRejectedError:
+                collision_rejected = True
+            except Exception:
+                failure_check = "s3_collision"
+            else:
+                failure_check = "s3_collision"
     finally:
-        for resource in (source, collision_sink, primary_sink):
+        for resource in (source, collision_sink, probe_sink, primary_sink):
             if resource is None:
                 continue
-            close = getattr(resource, "close", None)
-            if not callable(close):
-                resource_close_failed = True
-                continue
             try:
-                close()
+                resource.close()
             except Exception:
                 resource_close_failed = True
 
@@ -319,14 +345,10 @@ def verify_s3(
                     cleanup_failed = True
             else:
                 cleanup_failed = True
-            close = getattr(cleanup_client, "close", None)
-            if not callable(close):
+            try:
+                cleanup_client.close()
+            except Exception:
                 cleanup_failed = True
-            else:
-                try:
-                    close()
-                except Exception:
-                    cleanup_failed = True
 
     if cleanup_failed:
         raise AcceptanceCheckError("s3_cleanup")
@@ -339,6 +361,6 @@ def verify_s3(
         "object_count": 1,
         "source_sha256": source_hash,
         "sink_sha256": expected_hash,
-        "collision_rejected": True,
+        "collision_rejected": collision_rejected,
         "cleanup_succeeded": True,
     }

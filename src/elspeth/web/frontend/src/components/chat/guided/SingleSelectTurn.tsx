@@ -87,17 +87,26 @@ export function SingleSelectTurn({
 }: SingleSelectTurnProps) {
   const [customText, setCustomText] = useState("");
   const [selectedSourceBlobId, setSelectedSourceBlobId] = useState("");
+  const sourceBlobCompatibleOptionIds = new Set(
+    payload.source_blob_compatible_option_ids ?? [],
+  );
+  const hasSourceBlobCompatibleOption = sourceBlobCompatibleOptionIds.size > 0;
 
   useEffect(() => {
     if (
       selectedSourceBlobId !== "" &&
-      !sourceBlobCandidates.some(
-        (candidate) => candidate.id === selectedSourceBlobId,
-      )
+      (!hasSourceBlobCompatibleOption ||
+        !sourceBlobCandidates.some(
+          (candidate) => candidate.id === selectedSourceBlobId,
+        ))
     ) {
       setSelectedSourceBlobId("");
     }
-  }, [selectedSourceBlobId, sourceBlobCandidates]);
+  }, [
+    hasSourceBlobCompatibleOption,
+    selectedSourceBlobId,
+    sourceBlobCandidates,
+  ]);
 
   // useId scopes DOM IDs per-instance so multiple SingleSelectTurns rendered
   // simultaneously (e.g. active turn + GuidedHistory replay in Task 7.9) don't
@@ -109,24 +118,33 @@ export function SingleSelectTurn({
   const sourceFileHintId = `${reactId}-source-file-hint`;
   const hintIdFor = (optionId: string) => `${reactId}-hint-${optionId}`;
 
-  const validSelectedSourceBlobId = sourceBlobCandidates.some(
-    (candidate) => candidate.id === selectedSourceBlobId,
-  )
-    ? selectedSourceBlobId
-    : "";
+  const validSelectedSourceBlobId =
+    hasSourceBlobCompatibleOption &&
+    sourceBlobCandidates.some(
+      (candidate) => candidate.id === selectedSourceBlobId,
+    )
+      ? selectedSourceBlobId
+      : "";
   const explicitSourceBlobChoiceRequired =
-    sourceBlobChoiceRequired || sourceBlobCandidates.length > 1;
-  const sourceBlobId =
-    sourceBlobCandidates.length === 1 && !explicitSourceBlobChoiceRequired
+    hasSourceBlobCompatibleOption &&
+    (sourceBlobChoiceRequired || sourceBlobCandidates.length > 1);
+  const sourceBlobId = hasSourceBlobCompatibleOption
+    ? sourceBlobCandidates.length === 1 && !explicitSourceBlobChoiceRequired
       ? sourceBlobCandidates[0].id
-      : validSelectedSourceBlobId || undefined;
+      : validSelectedSourceBlobId || undefined
+    : undefined;
   const sourceFileChoiceRequired =
     explicitSourceBlobChoiceRequired && sourceBlobId === undefined;
 
   function handleOptionClick(optionId: string) {
+    const optionSourceBlobId = sourceBlobCompatibleOptionIds.has(optionId)
+      ? sourceBlobId
+      : undefined;
     onSubmit({
       chosen: [optionId],
-      ...(sourceBlobId === undefined ? {} : { source_blob_id: sourceBlobId }),
+      ...(optionSourceBlobId === undefined
+        ? {}
+        : { source_blob_id: optionSourceBlobId }),
       edited_values: null,
       custom_inputs: null,
       proposal_id: null,
@@ -152,8 +170,9 @@ export function SingleSelectTurn({
 
   return (
     <div className="guided-turn guided-single-select">
-      {(sourceBlobCandidates.length > 1 ||
-        (sourceBlobChoiceRequired && sourceBlobCandidates.length > 0)) && (
+      {hasSourceBlobCompatibleOption &&
+        (sourceBlobCandidates.length > 1 ||
+          (sourceBlobChoiceRequired && sourceBlobCandidates.length > 0)) && (
         <div className="guided-source-file-choice">
           <label htmlFor={sourceFileSelectId} className="guided-custom-label">
             Source file
@@ -199,6 +218,8 @@ export function SingleSelectTurn({
           {payload.options.map((option) => {
             const hintId =
               option.hint !== null ? hintIdFor(option.id) : undefined;
+            const optionCanBindSourceBlob =
+              sourceBlobCompatibleOptionIds.has(option.id);
             return (
               <div key={option.id} className="guided-chip-item">
                 <button
@@ -207,7 +228,9 @@ export function SingleSelectTurn({
                   onClick={() => handleOptionClick(option.id)}
                   aria-describedby={hintId}
                   disabled={
-                    disabled || sourceUploadPending || sourceFileChoiceRequired
+                    disabled ||
+                    (optionCanBindSourceBlob &&
+                      (sourceUploadPending || sourceFileChoiceRequired))
                   }
                 >
                   {option.label}

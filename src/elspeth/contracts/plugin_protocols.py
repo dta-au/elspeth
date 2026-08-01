@@ -27,14 +27,16 @@ from elspeth.contracts.schema import SchemaConfig
 if TYPE_CHECKING:
     from elspeth.contracts.contexts import LifecycleContext, SinkContext, SourceContext, TransformContext
     from elspeth.contracts.data import PluginSchema
-    from elspeth.contracts.diversion import SinkWriteResult
+    from elspeth.contracts.diversion import RowDiversion, SinkWriteResult
     from elspeth.contracts.plugin_assistance import PluginAssistance
     from elspeth.contracts.results import SourceRow, TransformResult
     from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
     from elspeth.contracts.sink import OutputValidationResult
     from elspeth.contracts.sink_effects import (
+        ResolvedSinkEffectMode,
         RestrictedSinkEffectContext,
         SinkEffectCommitResult,
+        SinkEffectExecutionPurpose,
         SinkEffectInputKind,
         SinkEffectInspection,
         SinkEffectInspectionRequest,
@@ -746,6 +748,10 @@ class SinkProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
         """Clear diversion log before each write() call."""
         ...
 
+    def _get_diversions(self) -> tuple["RowDiversion", ...]:
+        """Return the exact in-memory diversion log after a write."""
+        ...
+
     def __init__(self, config: dict[str, Any]) -> None:
         """Initialize with configuration."""
         ...
@@ -881,12 +887,40 @@ class SinkProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
 
 
 class SinkEffectProtocol(SinkProtocol, Protocol):
-    """Explicit opt-in contract for recoverable sink publication effects."""
+    """Explicit opt-in contract for recoverable sink publication effects.
+
+    Optional execution authorities are nominal, not structural. A sink that
+    publishes one effect per member must inherit
+    ``MemberSinkEffectCapability``; a sink that can rebuild a missing stage
+    must inherit ``RestagingSinkEffectCapability``. Merely exposing methods or
+    legacy boolean flags never grants either authority. Admission,
+    fingerprinting, and execution all use those same nominal identities.
+    """
 
     effect_protocol_version: ClassVar[str]
     effect_call_type: ClassVar[CallType]
     supported_effect_modes: ClassVar[frozenset[str]]
     supported_effect_input_kinds: ClassVar[frozenset["SinkEffectInputKind"]]
+    effect_mode_remediation: ClassVar[str | None]
+
+    @classmethod
+    def _resolve_sink_effect_mode(
+        cls,
+        config: Mapping[str, object],
+        *,
+        purpose: "SinkEffectExecutionPurpose",
+    ) -> "ResolvedSinkEffectMode | None":
+        """Resolve the adapter-owned effect mode from validated options."""
+        raise NotImplementedError
+
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: "SinkEffectInputKind",
+    ) -> None:
+        """Validate instance configuration against the admitted effect mode."""
+        raise NotImplementedError
 
     def inspect_effect(
         self,

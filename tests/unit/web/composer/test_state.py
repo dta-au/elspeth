@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from typing import Any
 
@@ -999,6 +1000,129 @@ class TestStage1Validation:
         result = state.validate()
 
         assert result.is_valid, result.errors
+
+    def test_coalesce_timeout_survives_serialization_round_trip(self) -> None:
+        state = self._coalesce_route_state(on_success="main")
+        coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
+        state = state.with_node(replace(coalesce, timeout_seconds=5.0))
+
+        restored = CompositionState.from_dict(state.to_dict())
+
+        assert restored == state
+        assert next(node for node in restored.nodes if node.node_type == "coalesce").timeout_seconds == 5.0
+
+    @pytest.mark.parametrize(
+        "timeout_seconds",
+        # 10**400 and its negation are only reachable from a persisted session
+        # payload (JSON has no integer ceiling and NodeSpec.from_dict does not
+        # cross the Pydantic tool boundary). float() overflows on them, which
+        # used to abort validate() with OverflowError instead of rejecting.
+        [True, float("nan"), float("inf"), 0.0, -1.0, 10**400, -(10**400)],
+    )
+    def test_coalesce_rejects_invalid_timeout(self, timeout_seconds: object) -> None:
+        state = self._coalesce_route_state(on_success="main")
+        coalesce = next(node for node in state.nodes if node.node_type == "coalesce")
+        state = state.with_node(replace(coalesce, timeout_seconds=timeout_seconds))
+
+        result = state.validate()
+
+        assert any(error.error_code == "coalesce_timeout_invalid" for error in result.errors)
+
+    @pytest.mark.parametrize(
+        ("node", "error_code"),
+        [
+            pytest.param(
+                NodeSpec(
+                    id="transform_1",
+                    node_type="transform",
+                    plugin="passthrough",
+                    input="transform_1",
+                    on_success="main",
+                    on_error="discard",
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=5.0,
+                ),
+                "node_timeout_unsupported",
+                id="transform",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="gate_1",
+                    node_type="gate",
+                    plugin=None,
+                    input="gate_1",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="True",
+                    routes={"true": "main", "false": "main"},
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=5.0,
+                ),
+                "node_timeout_unsupported",
+                id="gate",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="aggregation_1",
+                    node_type="aggregation",
+                    plugin="batch_counter",
+                    input="aggregation_1",
+                    on_success="main",
+                    on_error="discard",
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    trigger={"count": 100, "timeout_seconds": 5.0},
+                    timeout_seconds=5.0,
+                ),
+                "node_timeout_unsupported",
+                id="aggregation",
+            ),
+            pytest.param(
+                NodeSpec(
+                    id="queue_1",
+                    node_type="queue",
+                    plugin=None,
+                    input="queue_1",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                    timeout_seconds=5.0,
+                ),
+                "queue_config_invalid",
+                id="queue",
+            ),
+        ],
+    )
+    def test_only_barrier_nodes_accept_top_level_timeout(self, node: NodeSpec, error_code: str) -> None:
+        state = self._empty_state()
+        state = state.with_source(self._make_source(on_success=node.input))
+        state = state.with_node(node)
+        state = state.with_output(self._make_output("main"))
+
+        result = state.validate()
+
+        assert any(error.error_code == error_code and "timeout_seconds" in error.message for error in result.errors), result.errors
 
     def test_multiple_fork_gates_do_not_collide_on_fork_route_keyword(self) -> None:
         """Two gates routing to the reserved 'fork' keyword are not duplicate producers.
@@ -2232,8 +2356,8 @@ class TestStage1Validation:
         assert not result.is_valid
         assert any("output_mode" in e.message and "agg1" in e.message for e in result.errors)
 
-    def test_validate_aggregation_with_trigger_passes(self) -> None:
-        """Aggregation with all required fields passes validation."""
+    def test_validate_aggregation_with_trigger_timeout_passes(self) -> None:
+        """Aggregation keeps its nested trigger timeout when top-level timeout is forbidden."""
         state = self._empty_state()
         state = state.with_source(self._make_source(on_success="agg1"))
         node = NodeSpec(
@@ -2250,7 +2374,7 @@ class TestStage1Validation:
             branches=None,
             policy=None,
             merge=None,
-            trigger={"count": 100},
+            trigger={"count": 100, "timeout_seconds": 5.0},
         )
         state = state.with_node(node)
         state = state.with_output(self._make_output("main"))
@@ -2652,6 +2776,402 @@ class TestWebScrapeAbuseContactValidation:
         state = self._state_with_web_scrape("ops@somecompany.gov.au")
         messages = self._web_scrape_identity_error_messages(state)
         assert not messages
+
+
+class TestPromptTemplateUnboundVariables:
+    """LLM prompt templates render with exactly ``{row, lookup}`` under
+    StrictUndefined (``PromptTemplate.render``), so a bare ``{{ text }}``
+    raises ``TemplateError: Undefined variable`` at runtime and the model
+    receives none of the row's data. Composer validation must reject such
+    templates with the closed, repairable ``prompt_template_unbound_variables``
+    code instead of letting the pipeline crash live (R2-F17 compounding
+    finding, elspeth-bea314a89b).
+    """
+
+    def _state_with_llm(self, prompt_template: str) -> CompositionState:
+        node = NodeSpec(
+            id="classify",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="classified",
+            on_error="discard",
+            options={"prompt_template": prompt_template, "model": "test-model"},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _unbound_errors(self, state: CompositionState) -> list[ValidationEntry]:
+        return [e for e in state.validate().errors if e.error_code == "prompt_template_unbound_variables"]
+
+    def test_rejects_bare_variable_template(self) -> None:
+        """The acceptance-run shape: every interpolation is an unbound bare name."""
+        state = self._state_with_llm("Classify: {{ text }}")
+        errors = self._unbound_errors(state)
+        assert errors, "Expected prompt_template_unbound_variables for bare {{ text }}"
+        entry = errors[0]
+        assert entry.component == "node:classify"
+        assert entry.severity == "high"
+        assert "'text'" in entry.message
+        assert "row." in entry.message
+
+    def test_rejects_mixed_template_with_unbound_name(self) -> None:
+        """A template can reference row fields AND still crash on a stray bare
+        name — StrictUndefined raises on the unbound one regardless."""
+        state = self._state_with_llm("Compare {{ row.summary }} against {{ reference }}")
+        errors = self._unbound_errors(state)
+        assert errors
+        assert "'reference'" in errors[0].message
+        assert "'summary'" not in errors[0].message
+
+    def test_names_all_unbound_variables_sorted(self) -> None:
+        state = self._state_with_llm("{{ zeta }} then {{ alpha }}")
+        errors = self._unbound_errors(state)
+        assert errors
+        assert errors[0].message.index("'alpha'") < errors[0].message.index("'zeta'")
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "Classify: {{ row.text }}",
+            'Classify: {{ row["Original Header"] }}',
+            "Instructions: {{ lookup.instructions }}",
+            "Rate how {{interpretation:cool}} this row is.",
+            "Rate how {{ interpretation: primary colour }} this page is.",
+            "Static prompt with no interpolation at all.",
+            "{% set t = row.text %}Classify: {{ t }}",
+            "{% for x in row %}{{ x }}{% endfor %}",
+            "{{ range(3) | join(', ') }}",  # env global, defined at render time
+            "",
+        ],
+    )
+    def test_accepts_bound_or_static_templates(self, template: str) -> None:
+        state = self._state_with_llm(template)
+        assert not self._unbound_errors(state), f"False positive for {template!r}"
+
+    def test_masked_interpretation_placeholder_does_not_hide_unbound_names(self) -> None:
+        """Placeholders are masked before parsing, but bare names elsewhere in
+        the same template must still be caught."""
+        state = self._state_with_llm("Rate how {{interpretation:cool}} this {{ item }} is.")
+        errors = self._unbound_errors(state)
+        assert errors
+        assert "'item'" in errors[0].message
+
+    def test_syntax_error_template_is_not_this_rules_business(self) -> None:
+        """Unparseable templates are reported by other layers; this rule must
+        stay silent rather than mask the syntax problem."""
+        state = self._state_with_llm("Classify: {{ text")
+        assert not self._unbound_errors(state)
+
+    def test_skips_nodes_without_prompt_template(self) -> None:
+        node = NodeSpec(
+            id="rename",
+            node_type="transform",
+            plugin="field_mapper",
+            input="rows",
+            on_success="renamed",
+            on_error="discard",
+            options={"mapping": {"a": "b"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        assert not self._unbound_errors(state)
+
+    def test_multi_query_nodes_are_owned_by_the_multi_query_rule(self) -> None:
+        """With ``queries`` present the multi-query sibling rule owns the node.
+
+        A bare ``{{ text }}`` is unbound in multi-query mode too —
+        ``PromptTemplate.render`` wraps the per-query context under ``row``
+        (transform.py ``_execute_one_query`` → templates.py ``render``), so the
+        binding idiom is ``{{ row.text }}`` with ``text`` an ``input_fields``
+        key. The error must therefore still surface, emitted by
+        ``_validate_multi_query_template_variable_bindings`` (see
+        ``TestMultiQueryTemplateVariableBindings``)."""
+        state = self._state_with_llm("Classify {{ text }}.")
+        options = dict(state.nodes[0].options)
+        options["queries"] = [{"name": "classify", "input_fields": {"text": "body"}}]
+        node = replace(state.nodes[0], options=options)
+        state = replace(state, nodes=(node,))
+        errors = self._unbound_errors(state)
+        assert errors, "Bare names crash multi-query renders too — the sibling rule must flag them"
+        assert "'text'" in errors[0].message
+
+    def test_skips_non_string_prompt_template(self) -> None:
+        """A mistyped prompt_template is the plugin schema's problem — this
+        rule only reasons about string templates."""
+        state = self._state_with_llm("Classify: {{ row.text }}")
+        options = dict(state.nodes[0].options)
+        options["prompt_template"] = {"not": "a-string"}
+        node = replace(state.nodes[0], options=options)
+        state = replace(state, nodes=(node,))
+        assert not self._unbound_errors(state)
+
+
+class TestMultiQueryTemplateVariableBindings:
+    """Multi-query LLM templates render with ``row`` bound to the query's
+    synthetic context (``build_template_context``: input_fields variables plus
+    ``source_row``) and ``lookup`` — under StrictUndefined. Two distinct
+    defects must be caught at compose time (elspeth-bea314a89b follow-up):
+
+    * a top-level name outside ``{row, lookup}`` + environment globals never
+      binds (same failure as single-prompt; code
+      ``prompt_template_unbound_variables``);
+    * a ``row.<name>`` reference outside that query's ``input_fields`` keys +
+      ``{source_row}`` raises ``Undefined variable`` when that query renders
+      (new code ``query_template_unbound_row_fields``).
+
+    Each query's effective template is its ``template`` override when present,
+    else the node-level ``prompt_template`` — a node-level template used by no
+    well-formed query never renders and must not be flagged.
+    """
+
+    def _state(self, prompt_template: str, queries: Any) -> CompositionState:
+        node = NodeSpec(
+            id="assess",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="assessed",
+            on_error="discard",
+            options={"prompt_template": prompt_template, "model": "test-model", "queries": queries},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _errors(self, state: CompositionState, code: str) -> list[ValidationEntry]:
+        return [e for e in state.validate().errors if e.error_code == code]
+
+    def test_bare_name_in_query_override_is_rejected(self) -> None:
+        """The task-shaped defect: an override interpolating a bare input_fields
+        variable — the binding idiom is ``{{ row.text }}``, never ``{{ text }}``."""
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [{"name": "classify", "input_fields": {"text": "body", "input_1": "body"}, "template": "Classify {{ text }}"}],
+        )
+        errors = self._errors(state, "prompt_template_unbound_variables")
+        assert errors, "Expected prompt_template_unbound_variables for bare {{ text }} in a query override"
+        entry = errors[0]
+        assert entry.component == "node:assess"
+        assert entry.severity == "high"
+        assert "'classify'" in entry.message
+        assert "'text'" in entry.message
+        assert "input_fields" in entry.message
+
+    def test_legacy_positional_bare_name_in_node_template_flagged_once(self) -> None:
+        """The legacy positional idiom ``{{ input_1 }}`` is a bare top-level
+        name; a shared node-level template must yield ONE entry, not one per
+        query that falls back to it."""
+        state = self._state(
+            "Assess: {{ input_1 }}",
+            {
+                "q1": {"input_fields": {"input_1": "col_a"}},
+                "q2": {"input_fields": {"input_1": "col_b"}},
+            },
+        )
+        errors = self._errors(state, "prompt_template_unbound_variables")
+        assert len(errors) == 1
+        assert "'input_1'" in errors[0].message
+
+    def test_node_template_used_by_no_query_is_not_flagged(self) -> None:
+        """When every query overrides the template, the node-level
+        prompt_template never renders — flagging it would be a false positive
+        (the shipped multi-query examples carry exactly this dead slot)."""
+        state = self._state(
+            "Assess: {{ input_1 }}",
+            [{"name": "q1", "input_fields": {"text": "body"}, "template": "Classify {{ row.text }}"}],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_unbound_row_field_in_override_is_rejected(self) -> None:
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [
+                {
+                    "name": "diagnose",
+                    "input_fields": {"input_1": "background"},
+                    "template": "Background: {{ row.input_1 }} Symptoms: {{ row.input_2 }}",
+                }
+            ],
+        )
+        errors = self._errors(state, "query_template_unbound_row_fields")
+        assert errors, "Expected query_template_unbound_row_fields for row.input_2 outside input_fields"
+        entry = errors[0]
+        assert entry.component == "node:assess"
+        assert entry.severity == "high"
+        assert "'diagnose'" in entry.message
+        assert "'input_2'" in entry.message
+        assert "'input_1'" in entry.message  # names the bound set so the repair is obvious
+        assert "source_row" in entry.message
+
+    def test_bound_variables_source_row_lookup_and_globals_accepted(self) -> None:
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [
+                {
+                    "name": "q1",
+                    "input_fields": {"input_1": "background", "input-2": "symptoms"},
+                    "template": (
+                        "{{ row.input_1 }} / {{ row['input-2'] }} / {{ row.source_row.raw_column }} "
+                        "/ {{ lookup.rubric }} / {{ range(3) | join(', ') }}"
+                    ),
+                }
+            ],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_shared_node_template_checked_against_each_querys_bindings(self) -> None:
+        """The same node-level template can be fine for one query and broken
+        for another — the row-field check is per query."""
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            {
+                "ok_query": {"input_fields": {"input_1": "col_a"}},
+                "broken_query": {"input_fields": {"text": "col_b"}},
+            },
+        )
+        errors = self._errors(state, "query_template_unbound_row_fields")
+        assert len(errors) == 1
+        assert "'broken_query'" in errors[0].message
+        assert "'ok_query'" not in errors[0].message
+
+    def test_mapping_form_query_override_is_checked(self) -> None:
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            {"classify": {"input_fields": {"input_1": "body"}, "template": "{{ row.nope }}"}},
+        )
+        errors = self._errors(state, "query_template_unbound_row_fields")
+        assert errors
+        assert "'classify'" in errors[0].message
+        assert "'nope'" in errors[0].message
+
+    def test_malformed_query_entries_are_skipped(self) -> None:
+        """Entry shape is QueryDefinition's contract; this rule stays silent on
+        malformed entries rather than double-reporting them."""
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [
+                "not-a-mapping",
+                {"name": "bad_fields", "input_fields": "oops", "template": "{{ row.x }}"},
+                {"name": "no_fields", "template": "{{ row.y }}"},
+            ],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_queries_of_unexpected_shape_are_skipped(self) -> None:
+        state = self._state("Assess: {{ row.input_1 }}", "not-a-collection")
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_syntax_error_override_is_not_this_rules_business(self) -> None:
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [{"name": "q1", "input_fields": {"input_1": "body"}, "template": "Classify {{ row.input_1"}],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_non_string_override_skips_the_query(self) -> None:
+        """A mistyped ``template`` is QueryDefinition's problem; the query is
+        skipped outright — guessing that it falls back to the node template
+        would flag a template the (invalid) config never declared it to use."""
+        state = self._state(
+            "Assess: {{ input_1 }}",
+            [{"name": "q1", "input_fields": {"input_1": "body"}, "template": 42}],
+        )
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_interpretation_placeholder_masked_in_node_template(self) -> None:
+        """``{{interpretation:...}}`` placeholders are resolved upstream of
+        rendering and must not parse as Jinja2 names — but real defects beside
+        them must still be caught."""
+        state = self._state(
+            "Rate how {{interpretation:severe}} this is: {{ row.input_1 }} vs {{ row.missing }}",
+            {"q1": {"input_fields": {"input_1": "body"}}},
+        )
+        errors = self._errors(state, "query_template_unbound_row_fields")
+        assert errors
+        assert "'missing'" in errors[0].message
+        assert "interpretation" not in errors[0].message
+
+    def test_dynamic_row_access_is_not_flagged(self) -> None:
+        """``row[expr]`` cannot be proven unbound at parse time — only the
+        concrete names feeding it are checked (here ``selector`` is bound)."""
+        state = self._state(
+            "Assess: {{ row.input_1 }}",
+            [{"name": "q1", "input_fields": {"input_1": "body", "selector": "kind"}, "template": "{{ row[row.selector] }}"}],
+        )
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_single_prompt_nodes_are_not_this_rules_business(self) -> None:
+        """Without ``queries`` the single-prompt sibling rule owns the node —
+        this rule must not double-report."""
+        node_options = {"prompt_template": "Classify {{ text }}", "model": "test-model"}
+        node = NodeSpec(
+            id="classify",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="out",
+            on_error="discard",
+            options=node_options,
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        errors = self._errors(state, "prompt_template_unbound_variables")
+        assert len(errors) == 1  # from the single-prompt rule, exactly once
+        assert not self._errors(state, "query_template_unbound_row_fields")
 
 
 class TestSchemaContractValidation:
@@ -6195,6 +6715,7 @@ class TestCompositionStateQueue:
             ("trigger", {"kind": "count"}),
             ("output_mode", "passthrough"),
             ("expected_output_count", 2),
+            ("timeout_seconds", 5.0),
         ):
             error = queue_node_contract_error(self._queue(**{field: value}))
             assert error is not None and field in error, f"{field} not rejected: {error}"
@@ -6411,6 +6932,18 @@ def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:
                 policy="require_all",
                 merge="union",
             ),
+            _node(
+                id="row_union",
+                node_type="row_union",
+                plugin=None,
+                input="tone_out",
+                on_success="union_out",
+                on_error=None,
+                branches={"branch_a": "tone_out", "other_branch": "usage_out"},
+                policy=None,
+                merge=None,
+            ),
+            _node(id="after_union", input="union_out", on_success="out"),
             _node(id="finalize", input="reconcile", on_success="out"),
         ),
         edges=(),
@@ -6422,6 +6955,962 @@ def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:
     result = state.validate()
     entries = [(e.component, e.error_code) for e in result.errors]
     assert ("node:fork_rows", "fork_branch_no_destination") in entries, entries
-    offending = next(e for e in result.errors if e.error_code == "fork_branch_no_destination")
-    assert "branch_a" in offending.message
-    assert "tone_out" in offending.message
+    offending = [e for e in result.errors if e.error_code == "fork_branch_no_destination"]
+    assert len(offending) == 1, offending
+    assert "branch_b" in offending[0].message
+    assert "fork branch 'branch_a'" not in offending[0].message
+    assert "tone_out" in offending[0].message
+
+
+class TestCompositionStateRowUnion:
+    """Composer parity for the plugin-free correlated row_union barrier."""
+
+    def _source(self, on_success: str = "fork_in", *, schema: dict[str, Any] | None = None) -> SourceSpec:
+        return SourceSpec(
+            plugin="csv",
+            on_success=on_success,
+            options={"schema": schema or {"mode": "observed"}},
+            on_validation_failure="discard",
+        )
+
+    def _gate(self, **overrides: Any) -> NodeSpec:
+        defaults: dict[str, Any] = {
+            "id": "fork_rows",
+            "node_type": "gate",
+            "plugin": None,
+            "input": "fork_in",
+            "on_success": None,
+            "on_error": None,
+            "options": {},
+            "condition": "True",
+            "routes": {"true": "fork", "false": "fork"},
+            "fork_to": ("control_branch", "treatment_branch"),
+            "branches": None,
+            "policy": None,
+            "merge": None,
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def _transform(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        options: dict[str, Any] | None = None,
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="passthrough",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options=options or {"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _aggregation(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        output_mode: str | None,
+    ) -> NodeSpec:
+        return NodeSpec(
+            id=node_id,
+            node_type="aggregation",
+            plugin="batch_stats",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={
+                "schema": {"mode": "observed"},
+                "value_field": "value",
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+            trigger={},
+            output_mode=output_mode,
+        )
+
+    def _row_union(self, **overrides: Any) -> NodeSpec:
+        defaults: dict[str, Any] = {
+            "id": "variant_union",
+            "node_type": "row_union",
+            "plugin": None,
+            # Serialized adapter placeholder: the first branch connection.
+            "input": "control_done",
+            "on_success": "union_out",
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": {
+                "control_branch": "control_done",
+                "treatment_branch": "treatment_done",
+            },
+            "policy": None,
+            "merge": None,
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def _output(self, name: str = "output") -> OutputSpec:
+        return OutputSpec(
+            name=name,
+            plugin="json",
+            options={"schema": {"mode": "observed"}},
+            on_write_failure="discard",
+        )
+
+    def _state(
+        self,
+        *,
+        row_union: NodeSpec | None = None,
+        gate: NodeSpec | None = None,
+        extra_nodes: tuple[NodeSpec, ...] = (),
+        tail_options: dict[str, Any] | None = None,
+    ) -> CompositionState:
+        return CompositionState(
+            source=self._source(),
+            nodes=(
+                gate or self._gate(),
+                self._transform("control", "control_branch", "control_done"),
+                self._transform("treatment", "treatment_branch", "treatment_done"),
+                row_union or self._row_union(),
+                self._transform("after_union", "union_out", "output", options=tail_options),
+                *extra_nodes,
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def test_row_union_survives_serialization_round_trip(self) -> None:
+        state = self._state(row_union=self._row_union(timeout_seconds=2.5))
+
+        payload = state.to_dict()
+        restored = CompositionState.from_dict(payload)
+
+        assert payload["nodes"][3]["timeout_seconds"] == 2.5
+        assert restored == state
+        assert restored.nodes[3].timeout_seconds == 2.5
+
+    def test_from_dict_normalizes_row_union_branch_list_to_identity_mapping(self) -> None:
+        node = NodeSpec.from_dict(
+            {
+                "id": "variant_union",
+                "node_type": "row_union",
+                "plugin": None,
+                "input": "control_branch",
+                "on_success": "union_out",
+                "on_error": None,
+                "options": {},
+                "branches": ["control_branch", "treatment_branch"],
+            }
+        )
+
+        assert node.branches == {
+            "control_branch": "control_branch",
+            "treatment_branch": "treatment_branch",
+        }
+
+    def test_direct_row_union_branch_list_normalizes_before_round_trip(self) -> None:
+        row_union = self._row_union(
+            input="control_branch",
+            branches=("control_branch", "treatment_branch"),
+        )
+        state = self._state(row_union=row_union)
+
+        assert row_union.branches == {
+            "control_branch": "control_branch",
+            "treatment_branch": "treatment_branch",
+        }
+        assert CompositionState.from_dict(state.to_dict()) == state
+
+    def test_from_dict_does_not_hide_duplicate_row_union_branch_aliases(self) -> None:
+        row_union = NodeSpec.from_dict(
+            {
+                "id": "variant_union",
+                "node_type": "row_union",
+                "plugin": None,
+                "input": "control_branch",
+                "on_success": "union_out",
+                "on_error": None,
+                "options": {},
+                "branches": ["control_branch", "treatment_branch", "control_branch"],
+            }
+        )
+
+        result = self._state(row_union=row_union).validate()
+
+        assert any(error.error_code == "row_union_branches_invalid" for error in result.errors)
+
+    def test_valid_row_union_topology(self) -> None:
+        result = self._state().validate()
+
+        assert result.is_valid, result.errors
+
+    @pytest.mark.parametrize("output_mode", [None, "transform"])
+    def test_row_union_rejects_transform_mode_aggregation_inside_branch(self, output_mode: str | None) -> None:
+        state = self._state()
+        branch_aggregation = self._aggregation(
+            "control",
+            "control_branch",
+            "control_done",
+            output_mode=output_mode,
+        )
+        state = replace(
+            state,
+            nodes=tuple(branch_aggregation if node.id == "control" else node for node in state.nodes),
+        )
+
+        result = state.validate()
+
+        error = next(error for error in result.errors if error.error_code == "row_union_branch_aggregation_invalid")
+        assert error.component == "node:variant_union"
+        assert "control" in error.message
+        assert "row_id" in error.message
+        assert "passthrough" in error.message
+
+    def test_row_union_accepts_passthrough_aggregation_inside_branch(self) -> None:
+        state = self._state()
+        branch_aggregation = self._aggregation(
+            "control",
+            "control_branch",
+            "control_done",
+            output_mode="passthrough",
+        )
+        state = replace(
+            state,
+            nodes=tuple(branch_aggregation if node.id == "control" else node for node in state.nodes),
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_row_union_accepts_transform_mode_aggregation_before_fork(self) -> None:
+        state = self._state()
+        pre_fork_aggregation = self._aggregation(
+            "pre_fork_batch",
+            "pre_fork_in",
+            "fork_in",
+            output_mode="transform",
+        )
+        state = replace(
+            state,
+            sources={"source": self._source(on_success="pre_fork_in")},
+            nodes=(pre_fork_aggregation, *state.nodes),
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_row_union_rejects_nested_fork_inside_branch(self) -> None:
+        nested_gate = self._gate(
+            id="nested_fork",
+            input="control_branch",
+            fork_to=("nested_a", "nested_b"),
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._gate(),
+                nested_gate,
+                self._transform("control", "nested_a", "control_done"),
+                self._transform("treatment", "treatment_branch", "treatment_done"),
+                self._row_union(),
+                self._transform("after_union", "union_out", "output"),
+            ),
+            edges=(),
+            outputs=(self._output(), self._output("nested_b")),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        error = next(error for error in result.errors if error.error_code == "row_union_nested_fork_invalid")
+        assert error.component == "node:variant_union"
+        assert "nested_fork" in error.message
+        assert "control_branch" in error.message
+
+    def test_gate_fork_aliases_must_be_unique_before_row_union_origin_resolution(self) -> None:
+        state = self._state(
+            gate=self._gate(
+                fork_to=("control_branch", "control_branch", "treatment_branch"),
+            )
+        )
+
+        result = state.validate()
+
+        error = next(error for error in result.errors if error.error_code == "gate_duplicate_fork_branch")
+        assert error.component == "node:fork_rows"
+        assert "control_branch" in error.message
+
+    @pytest.mark.parametrize(
+        "node_id",
+        [
+            "bad name",
+            "a" * 39,
+            "fork",
+            "__private",
+            " variant_union ",
+        ],
+    )
+    def test_row_union_name_matches_runtime_identifier_contract(self, node_id: str) -> None:
+        result = self._state(row_union=self._row_union(id=node_id)).validate()
+
+        error = next(error for error in result.errors if error.error_code == "row_union_name_invalid")
+        assert error.component == f"node:{node_id}"
+
+    def test_malformed_row_union_branch_values_return_errors_without_sorting_type_error(self) -> None:
+        payload = json.loads(json.dumps(self._state().to_dict()))
+        row_union = next(node for node in payload["nodes"] if node["node_type"] == "row_union")
+        row_union["branches"] = {
+            "control_branch": 123,
+            "treatment_branch": "missing",
+        }
+        row_union["input"] = 123
+
+        result = CompositionState.from_dict(payload).validate()
+
+        assert not result.is_valid
+        assert any(error.error_code == "row_union_branch_invalid" for error in result.errors)
+
+    def test_row_union_rejects_branch_aliases_from_multiple_fork_gates(self) -> None:
+        second_gate = self._gate(
+            id="fork_treatment",
+            input="second_fork_in",
+            fork_to=("treatment_branch", "treatment_overflow"),
+        )
+        state = CompositionState(
+            sources={
+                "control_source": self._source(on_success="fork_in"),
+                "treatment_source": self._source(on_success="second_fork_in"),
+            },
+            nodes=(
+                self._gate(fork_to=("control_branch", "control_overflow")),
+                second_gate,
+                self._transform("control", "control_branch", "control_done"),
+                self._transform("control_overflow", "control_overflow", "control_overflow_done"),
+                self._transform("treatment", "treatment_branch", "treatment_done"),
+                self._transform("treatment_overflow", "treatment_overflow", "treatment_overflow_done"),
+                self._row_union(),
+                self._transform("after_union", "union_out", "output"),
+            ),
+            edges=(),
+            outputs=(
+                self._output(),
+                self._output("control_overflow_done"),
+                self._output("treatment_overflow_done"),
+            ),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        origin_error = next(error for error in result.errors if error.error_code == "row_union_branch_origin_invalid")
+        assert "one common gate fork_to" in origin_error.message
+        assert "fork_rows" in origin_error.message
+        assert "fork_treatment" in origin_error.message
+        # A step-8 topology finding, not the intrinsic node-shape code the
+        # mutation preflight blocks on.
+        assert "row_union_branch_invalid" not in {error.error_code for error in result.errors}
+
+    def test_row_union_rejects_branch_connection_from_a_different_alias(self) -> None:
+        row_union = self._row_union(
+            input="treatment_done",
+            branches={
+                "control_branch": "treatment_done",
+                "treatment_branch": "control_done",
+            },
+        )
+
+        result = self._state(row_union=row_union).validate()
+
+        mapping_error = next(error for error in result.errors if error.error_code == "row_union_branch_not_downstream")
+        assert "control_branch" in mapping_error.message
+        assert "treatment_done" in mapping_error.message
+        assert "not downstream" in mapping_error.message
+        # A step-8 topology finding, not the intrinsic node-shape code the
+        # mutation preflight blocks on.
+        assert "row_union_branch_invalid" not in {error.error_code for error in result.errors}
+
+    def test_row_union_rejects_queue_branch_with_unrelated_producer(self) -> None:
+        queue = NodeSpec(
+            id="control_done",
+            node_type="queue",
+            plugin=None,
+            input="control_done",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = self._state(extra_nodes=(queue,))
+        state = replace(
+            state,
+            sources={
+                "primary": self._source(),
+                "contaminant": self._source(on_success="control_done"),
+            },
+        )
+
+        result = state.validate()
+
+        lineage_error = next(error for error in result.errors if error.error_code == "row_union_branch_not_downstream")
+        assert "control_branch" in lineage_error.message
+        assert "control_done" in lineage_error.message
+
+    @pytest.mark.parametrize(
+        ("control_fields", "treatment_fields", "is_compatible"),
+        [
+            (["id: str", "score: float"], ["id: str", "score: float"], True),
+            (["id: str", "score: float"], ["id: str", "label: str"], False),
+        ],
+    )
+    def test_row_union_requires_compatible_known_fixed_branch_schemas(
+        self,
+        control_fields: list[str],
+        treatment_fields: list[str],
+        is_compatible: bool,
+    ) -> None:
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={"schema": {"mode": "fixed", "fields": control_fields}},
+            )
+            if node.id == "control"
+            else replace(
+                node,
+                options={"schema": {"mode": "fixed", "fields": treatment_fields}},
+            )
+            if node.id == "treatment"
+            else node
+            for node in state.nodes
+        )
+
+        result = replace(state, nodes=nodes).validate()
+        schema_errors = [
+            error
+            for error in result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_schema_incompatible"
+            and "incompatible" in error.message
+        ]
+
+        assert bool(schema_errors) is not is_compatible, result.errors
+        if not is_compatible:
+            detail = schema_errors[0].row_union_schema
+            assert detail is not None
+            assert detail.conflicting_fields == ("label", "score")
+            assert tuple(branch.branch for branch in detail.branches) == (
+                "control_branch",
+                "treatment_branch",
+            )
+
+    def test_row_union_observed_branch_abstains_against_fixed_branch(self) -> None:
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={"schema": {"mode": "fixed", "fields": ["id: str", "score: float"]}},
+            )
+            if node.id == "treatment"
+            else node
+            for node in state.nodes
+        )
+
+        result = replace(state, nodes=nodes).validate()
+
+        assert not any(
+            error.component == "node:variant_union"
+            and error.error_code == "row_union_schema_incompatible"
+            and "incompatible" in error.message
+            for error in result.errors
+        ), result.errors
+
+    def test_row_union_accepts_disjoint_flexible_branch_declarations(self) -> None:
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["score: float"] if node.id == "control" else ["label: str"],
+                    }
+                },
+            )
+            if node.id in {"control", "treatment"}
+            else node
+            for node in state.nodes
+        )
+
+        result = replace(state, nodes=nodes).validate()
+
+        assert not any(error.error_code == "row_union_schema_incompatible" for error in result.errors), result.errors
+
+    def test_row_union_flexible_shared_type_conflict_carries_repair_facts(self) -> None:
+        from elspeth.web.composer.pipeline_planner import _allowlisted_candidate_feedback
+        from elspeth.web.composer.tools import ToolResult
+
+        state = self._state()
+        nodes = tuple(
+            replace(
+                node,
+                options={
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["id: str"] if node.id == "control" else ["id: int"],
+                    }
+                },
+            )
+            if node.id in {"control", "treatment"}
+            else node
+            for node in state.nodes
+        )
+        candidate = replace(state, nodes=nodes)
+
+        result = candidate.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "row_union_schema_incompatible")
+        detail = entry.row_union_schema
+        assert detail is not None
+        assert detail.conflicting_fields == ("id",)
+        assert [
+            {
+                "branch": branch.branch,
+                "mode": branch.mode,
+                "fields": tuple((field.name, field.field_type) for field in branch.fields),
+            }
+            for branch in detail.branches
+        ] == [
+            {
+                "branch": "control_branch",
+                "mode": "flexible",
+                "fields": (("id", "str"),),
+            },
+            {
+                "branch": "treatment_branch",
+                "mode": "flexible",
+                "fields": (("id", "int"),),
+            },
+        ]
+
+        tool_result = ToolResult(
+            success=False,
+            updated_state=candidate,
+            validation=result,
+            affected_nodes=(),
+        )
+        projected = next(
+            error
+            for error in _allowlisted_candidate_feedback(tool_result)["validation"]["errors"]
+            if error["error_code"] == "row_union_schema_incompatible"
+        )
+        assert "message" not in projected
+        assert projected["row_union_schema"] == detail.to_dict()
+        assert projected["suggested_fix"]
+
+    def _coalesce(self, **overrides: Any) -> NodeSpec:
+        defaults: dict[str, Any] = {
+            "id": "dup_merge",
+            "node_type": "coalesce",
+            "plugin": None,
+            "input": "join",
+            "on_success": "output",
+            "on_error": None,
+            "options": {},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            # Identity branches: direct gate->barrier COPY edges that claim no
+            # ordinary connection consumer, so the duplicate-consumer check
+            # cannot mask the barrier-ownership conflict under test.
+            "branches": ("control_branch", "treatment_branch"),
+            "policy": "require_all",
+            "merge": "nested",
+        }
+        defaults.update(overrides)
+        return NodeSpec(**defaults)
+
+    def test_fork_branch_claimed_by_a_coalesce_and_a_row_union_is_rejected(self) -> None:
+        """Composer/runtime parity for the engine's one-barrier-per-branch rule.
+
+        The DAG builder raises ``GraphValidationError`` ("Each fork branch can
+        only join at one barrier") when a coalesce and a row_union both declare
+        the same branch, because the branch's arrival is delivered to exactly
+        one barrier's pending map. validate() used to pass this composition, so
+        generate_yaml handed the runtime a graph it refuses to build.
+        """
+        result = self._state(extra_nodes=(self._coalesce(),)).validate()
+
+        codes = {error.error_code for error in result.errors}
+        assert "fork_branch_multiple_barriers" in codes, result.errors
+        # composer_mcp.server gates generate_yaml on is_valid, so a red
+        # validate() is what stops the runtime-invalid YAML being exported.
+        assert not result.is_valid
+        conflict = next(error for error in result.errors if error.error_code == "fork_branch_multiple_barriers")
+        assert "control_branch" in conflict.message
+        assert "variant_union" in conflict.message
+        assert "dup_merge" in conflict.message
+        # A cross-node topology finding, not either barrier's intrinsic
+        # node-shape code the mutation preflight blocks on.
+        assert "row_union_branch_invalid" not in codes
+
+    def test_fork_branch_claimed_by_two_coalesces_is_rejected(self) -> None:
+        """The same engine rule covers coalesce/coalesce claims."""
+        result = self._state(
+            extra_nodes=(self._coalesce(), self._coalesce(id="second_merge")),
+        ).validate()
+
+        assert any(error.error_code == "fork_branch_multiple_barriers" for error in result.errors), result.errors
+
+    def test_fork_branch_claimed_by_two_row_unions_is_rejected(self) -> None:
+        """And row_union/row_union claims, which the engine rejects too."""
+        second_union = self._row_union(id="second_union", on_success="second_union_out")
+        result = self._state(
+            extra_nodes=(second_union, self._transform("after_second", "second_union_out", "output")),
+        ).validate()
+
+        assert any(error.error_code == "fork_branch_multiple_barriers" for error in result.errors), result.errors
+
+    def test_valid_topology_does_not_report_a_barrier_conflict(self) -> None:
+        """A single barrier per branch stays clean — the rule is not a blanket ban."""
+        result = self._state().validate()
+
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "fork_branch_multiple_barriers" for error in result.errors)
+
+    def test_row_union_output_feeds_ordinary_node_without_placeholder_consumer(self) -> None:
+        state = self._state()
+
+        result = state.validate()
+
+        assert any(node.id == "after_union" and node.input == "union_out" for node in state.nodes)
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "duplicate_connection_consumer" for error in result.errors)
+
+    def test_queue_output_feeds_row_union_branch_without_placeholder_consumer(self) -> None:
+        queue = NodeSpec(
+            id="control_done",
+            node_type="queue",
+            plugin=None,
+            input="control_done",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = self._state(extra_nodes=(queue,))
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        assert not any(error.error_code == "duplicate_connection_consumer" for error in result.errors)
+
+    def test_identity_row_union_branch_does_not_consume_same_named_queue(self) -> None:
+        queue = NodeSpec(
+            id="control_branch",
+            node_type="queue",
+            plugin=None,
+            input="control_branch",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        row_union = self._row_union(
+            input="control_branch",
+            branches={
+                "control_branch": "control_branch",
+                "treatment_branch": "treatment_branch",
+            },
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(
+                self._gate(),
+                queue,
+                row_union,
+                self._transform("after_union", "union_out", "output"),
+            ),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        assert any(error.error_code == "queue_no_consumer" and error.component == "node:control_branch" for error in result.errors)
+
+    def test_row_union_rejects_downstream_aggregation_with_early_trigger(self) -> None:
+        aggregation = NodeSpec(
+            id="after_union",
+            node_type="aggregation",
+            plugin="batch_stats",
+            input="union_out",
+            on_success="output",
+            on_error="discard",
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+            trigger={"count": 2},
+            output_mode="transform",
+        )
+        state = self._state()
+        state = replace(
+            state,
+            nodes=tuple(aggregation if node.id == "after_union" else node for node in state.nodes),
+        )
+
+        result = state.validate()
+
+        group_error = next(
+            error
+            for error in result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_downstream_group_invalid"
+            and "indivisible" in error.message
+        )
+        assert "count/timeout/condition trigger" in group_error.message
+
+    @pytest.mark.parametrize("barrier_type", ["coalesce", "row_union"])
+    def test_row_union_rejects_downstream_correlated_barrier(self, barrier_type: str) -> None:
+        post_union_gate = self._gate(
+            id="post_union_fork",
+            input="union_out",
+            fork_to=("downstream_a", "downstream_b"),
+        )
+        if barrier_type == "coalesce":
+            downstream_barrier = self._coalesce(
+                id="downstream_barrier",
+                input="downstream_a",
+                branches=("downstream_a", "downstream_b"),
+            )
+            tail: tuple[NodeSpec, ...] = ()
+        else:
+            downstream_barrier = self._row_union(
+                id="downstream_barrier",
+                input="downstream_a",
+                branches={
+                    "downstream_a": "downstream_a",
+                    "downstream_b": "downstream_b",
+                },
+                on_success="downstream_out",
+            )
+            tail = (self._transform("after_downstream", "downstream_out", "output"),)
+
+        state = self._state()
+        state = replace(
+            state,
+            nodes=(
+                *(node for node in state.nodes if node.id != "after_union"),
+                post_union_gate,
+                downstream_barrier,
+                *tail,
+            ),
+        )
+
+        result = state.validate()
+
+        group_error = next(
+            error
+            for error in result.errors
+            if error.component == "node:variant_union"
+            and error.error_code == "row_union_downstream_group_invalid"
+            and "correlated barrier" in error.message
+        )
+        assert barrier_type in group_error.message
+        assert "downstream_barrier" in group_error.message
+
+    @pytest.mark.parametrize("branches", [None, (), ("only_branch",), {"only_branch": "control_done"}])
+    def test_row_union_requires_at_least_two_branches(self, branches: object) -> None:
+        result = self._state(row_union=self._row_union(branches=branches)).validate()
+
+        assert any(error.error_code == "row_union_branches_invalid" for error in result.errors)
+
+    @pytest.mark.parametrize("on_success", [None, "", "   "])
+    def test_row_union_requires_non_empty_on_success(self, on_success: object) -> None:
+        result = self._state(row_union=self._row_union(on_success=on_success)).validate()
+
+        assert any(error.error_code == "row_union_on_success_invalid" for error in result.errors)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("plugin", "passthrough"),
+            ("options", {"schema": {"mode": "observed"}}),
+            ("on_error", "discard"),
+            ("condition", "True"),
+            ("routes", {"true": "union_out"}),
+            ("fork_to", ("branch",)),
+            ("policy", "require_all"),
+            ("merge", "union"),
+            ("trigger", {"kind": "count"}),
+            ("output_mode", "passthrough"),
+            ("expected_output_count", 2),
+        ],
+    )
+    def test_row_union_rejects_fields_owned_by_other_node_kinds(self, field: str, value: object) -> None:
+        result = self._state(row_union=self._row_union(**{field: value})).validate()
+
+        assert any(error.error_code == "row_union_config_invalid" and field in error.message for error in result.errors), result.errors
+
+    @pytest.mark.parametrize(
+        "timeout_seconds",
+        # The two oversized ints are unrepresentable as float; classifying them
+        # INVALID must not regress the bool / NaN / inf / non-positive verdicts.
+        [True, False, float("nan"), float("inf"), 0.0, -1.0, 10**400, -(10**400)],
+    )
+    def test_row_union_rejects_invalid_timeout(self, timeout_seconds: object) -> None:
+        result = self._state(row_union=self._row_union(timeout_seconds=timeout_seconds)).validate()
+
+        assert any(error.error_code == "row_union_timeout_invalid" for error in result.errors)
+
+    def test_oversized_persisted_timeout_rejects_instead_of_overflowing(self) -> None:
+        """An oversized int from a restored session must reject, not crash.
+
+        ``timeout_seconds`` reaches ``NodeSpec.from_dict`` straight from the
+        persisted session payload, bypassing the Pydantic
+        ``_StrictTimeoutSeconds`` tool boundary. JSON has no integer ceiling,
+        so ``10**400`` survives the round trip as an ``int`` that ``float()``
+        cannot represent — ``math.isfinite`` used to raise ``OverflowError``
+        out of ``validate()`` instead of producing a rejection.
+        """
+        payload = json.loads(
+            json.dumps(
+                {
+                    "id": "variant_union",
+                    "node_type": "row_union",
+                    "plugin": None,
+                    "input": "control_done",
+                    "on_success": "union_out",
+                    "on_error": None,
+                    "options": {},
+                    "branches": {"control_branch": "control_done", "treatment_branch": "treatment_done"},
+                    "timeout_seconds": 10**400,
+                }
+            )
+        )
+        assert isinstance(payload["timeout_seconds"], int)
+
+        result = self._state(row_union=NodeSpec.from_dict(payload)).validate()
+
+        assert any(error.error_code == "row_union_timeout_invalid" for error in result.errors)
+
+    def test_row_union_input_is_only_first_branch_placeholder(self) -> None:
+        result = self._state(row_union=self._row_union(input="treatment_done")).validate()
+
+        assert any(error.error_code == "row_union_input_mismatch" for error in result.errors)
+
+    @pytest.mark.parametrize(
+        "branches",
+        [
+            {"__control": "control_done", "treatment_branch": "treatment_done"},
+            {"control_branch": "__control_done", "treatment_branch": "treatment_done"},
+        ],
+    )
+    def test_row_union_branch_aliases_and_connections_obey_connection_name_rules(
+        self,
+        branches: dict[str, str],
+    ) -> None:
+        row_union = self._row_union(input=next(iter(branches.values())), branches=branches)
+        result = self._state(row_union=row_union).validate()
+
+        assert any(error.error_code == "row_union_branch_invalid" for error in result.errors)
+
+    def test_row_union_requires_each_branch_alias_and_value_to_be_reachable(self) -> None:
+        row_union = self._row_union(
+            branches={
+                "control_branch": "control_done",
+                "unforked_branch": "missing_connection",
+            }
+        )
+        result = self._state(row_union=row_union).validate()
+        codes = {error.error_code for error in result.errors}
+
+        assert "row_union_branch_alias_unreachable" in codes
+        assert "row_union_branch_unreachable" in codes
+
+    def test_row_union_claims_every_branch_value_as_a_consumer(self) -> None:
+        competing = self._transform("competing", "treatment_done", "unused")
+        state = self._state(
+            extra_nodes=(competing,),
+        )
+
+        result = state.validate()
+
+        assert any(error.error_code == "duplicate_connection_consumer" for error in result.errors)
+
+    def test_row_union_on_success_must_feed_a_processing_node(self) -> None:
+        row_union = self._row_union(on_success="output")
+        result = self._state(row_union=row_union).validate()
+
+        assert any(error.error_code == "row_union_on_success_must_be_connection" for error in result.errors)
+
+    def test_row_union_output_schema_is_observed_and_abstains_from_guarantee_propagation(self) -> None:
+        state = self._state(
+            tail_options={
+                "required_input_fields": ["id"],
+                "schema": {"mode": "observed"},
+            }
+        )
+        state = replace(
+            state,
+            sources={
+                "source": self._source(
+                    schema={
+                        "mode": "fixed",
+                        "fields": ["id: str"],
+                        "guaranteed_fields": ["id"],
+                    }
+                )
+            },
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+        assert not any(contract.to_id == "after_union" for contract in result.edge_contracts)
+        assert any("row_union" in warning.message and "observed schema" in warning.message for warning in result.warnings)

@@ -192,19 +192,29 @@ class IncompleteTokenSpec:
 
     def __post_init__(self) -> None:
         """Validate Tier-1 identity invariants at construction time."""
-        for field_name in ("token_id", "row_id"):
-            value = getattr(self, field_name)
-            if not isinstance(value, str):
-                raise TypeError(f"IncompleteTokenSpec.{field_name} must be str, got {type(value).__name__}: {value!r}")
-            if not value:
+        for field_name, identity_value in (
+            ("token_id", self.token_id),
+            ("row_id", self.row_id),
+        ):
+            if not isinstance(identity_value, str):
+                raise TypeError(f"IncompleteTokenSpec.{field_name} must be str, got {type(identity_value).__name__}: {identity_value!r}")
+            if not identity_value:
                 raise ValueError(f"IncompleteTokenSpec.{field_name} must not be empty")
-        for field_name in ("branch_name", "fork_group_id", "join_group_id", "expand_group_id", "token_data_ref"):
-            value = getattr(self, field_name)
-            if value is not None:
-                if not isinstance(value, str):
-                    raise TypeError(f"IncompleteTokenSpec.{field_name} must be str or None, got {type(value).__name__}: {value!r}")
-                if not value:
-                    raise ValueError(f"IncompleteTokenSpec.{field_name} must be None or non-empty string, got {value!r}")
+        for field_name, optional_identity_value in (
+            ("branch_name", self.branch_name),
+            ("fork_group_id", self.fork_group_id),
+            ("join_group_id", self.join_group_id),
+            ("expand_group_id", self.expand_group_id),
+            ("token_data_ref", self.token_data_ref),
+        ):
+            if optional_identity_value is not None:
+                if not isinstance(optional_identity_value, str):
+                    raise TypeError(
+                        f"IncompleteTokenSpec.{field_name} must be str or None, "
+                        f"got {type(optional_identity_value).__name__}: {optional_identity_value!r}"
+                    )
+                if not optional_identity_value:
+                    raise ValueError(f"IncompleteTokenSpec.{field_name} must be None or non-empty string, got {optional_identity_value!r}")
 
 
 @dataclass(frozen=True, slots=True)

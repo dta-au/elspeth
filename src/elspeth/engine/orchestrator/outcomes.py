@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.contracts.results import RowResult
     from elspeth.engine.coalesce_executor import CoalesceExecutor, CoalesceOutcome
+    from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome
 
 
 def _require_sink_name(result: RowResult) -> str:
@@ -399,6 +400,64 @@ def handle_coalesce_timeouts(
                 counters.rows_coalesce_failed += 1
                 counters.rows_failed += len(consumed_tokens)
                 _emit_failed_coalesce_telemetry(ctx, consumed_tokens)
+
+
+def _handle_failed_row_union_outcome(
+    outcome: RowUnionOutcome,
+    processor: CoalesceCompletionPort,
+    ctx: PluginContext,
+    counters: ExecutionCounters,
+) -> None:
+    """Reconcile one fail-closed row_union outcome with the durable journal.
+
+    v1 row_union has no partial release, so timeout/EOF sweeps only ever
+    fail whole groups — a release from these arms is an executor bug.
+    The executor already recorded the FAILED node states and FAILURE token
+    outcomes (outcomes_recorded=True); this arm consumes the group's
+    BLOCKED journal rows and updates run counters.
+    """
+    if outcome.released_tokens:
+        raise OrchestrationInvariantError(
+            "RowUnionOutcome from check_timeouts/flush_pending released tokens; v1 require_all barriers must fail closed from sweep arms."
+        )
+    if not outcome.consumed_tokens:
+        return
+    if outcome.row_union_name is None:
+        raise AuditIntegrityError(
+            "Failed RowUnionOutcome has consumed tokens but no row_union_name; cannot reconcile durable scheduler barrier rows."
+        )
+    _mark_barrier_tokens_terminal(
+        processor,
+        barrier_key=str(outcome.row_union_name),
+        consumed_tokens=tuple(outcome.consumed_tokens),
+    )
+    counters.rows_failed += len(outcome.consumed_tokens)
+    counters.rows_coalesce_failed += 1
+    for token in outcome.consumed_tokens:
+        _emit_failed_token_completed(ctx, token)
+
+
+def handle_row_union_timeouts(
+    row_union_executor: RowUnionExecutor,
+    processor: CoalesceCompletionPort,
+    ctx: PluginContext,
+    counters: ExecutionCounters,
+) -> None:
+    """Sweep row_union barriers for timed-out groups and fail them closed."""
+    for row_union_name in row_union_executor.get_registered_names():
+        for outcome in row_union_executor.check_timeouts(row_union_name):
+            _handle_failed_row_union_outcome(outcome, processor, ctx, counters)
+
+
+def flush_row_union_pending(
+    row_union_executor: RowUnionExecutor,
+    processor: CoalesceCompletionPort,
+    ctx: PluginContext,
+    counters: ExecutionCounters,
+) -> None:
+    """Fail every incomplete row_union group closed at end-of-source (v1)."""
+    for outcome in row_union_executor.flush_pending():
+        _handle_failed_row_union_outcome(outcome, processor, ctx, counters)
 
 
 def flush_coalesce_pending(

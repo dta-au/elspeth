@@ -20,11 +20,37 @@ from .contracts import (
     AcceptanceCheckError,
     AcceptanceHttpError,
     AcceptanceInputError,
+    acceptance_step,
     normalize_acceptance_origin,
 )
 from .state import AcceptanceCredentials
 
 _NO_BODY = object()
+
+# Operator-supplied trust-bundle environment variables the underlying HTTP
+# stack honors.  An unreadable bundle otherwise only surfaces as an opaque
+# connect failure (or an internal error at client construction), which cost
+# real debugging time during the 2026-07-30 cold install (F12).
+# HTTPX consumes SSL_CERT_FILE through its trust-environment handling. The
+# requests-specific REQUESTS_CA_BUNDLE variable must not block this client.
+_CA_BUNDLE_ENV_VARS = ("SSL_CERT_FILE",)
+
+
+def _require_readable_ca_bundle(env: Mapping[str, str]) -> None:
+    """Fail closed with a named code when a declared CA bundle is unreadable."""
+
+    for name in _CA_BUNDLE_ENV_VARS:
+        value = env.get(name)
+        if not value:
+            continue
+        try:
+            with open(value, "rb") as handle:
+                handle.read(1)
+        except OSError:
+            raise AcceptanceHttpError(
+                f"acceptance CA bundle named by {name} is not readable",
+                error_code="ca_unreadable",
+            ) from None
 
 
 class AcceptanceHttpClient:
@@ -40,17 +66,27 @@ class AcceptanceHttpClient:
         self.origin = origin
         self.credentials = credentials
         self._bearer_token = credentials.bearer_token
-        self._client = httpx.Client(
-            base_url=origin,
-            follow_redirects=False,
-            timeout=httpx.Timeout(
-                connect=CONNECT_TIMEOUT_SECONDS,
-                read=READ_TIMEOUT_SECONDS,
-                write=WRITE_TIMEOUT_SECONDS,
-                pool=POOL_TIMEOUT_SECONDS,
-            ),
-            transport=transport,
-        )
+        with acceptance_step("client_setup"):
+            try:
+                self._client = httpx.Client(
+                    base_url=origin,
+                    follow_redirects=False,
+                    timeout=httpx.Timeout(
+                        connect=CONNECT_TIMEOUT_SECONDS,
+                        read=READ_TIMEOUT_SECONDS,
+                        write=WRITE_TIMEOUT_SECONDS,
+                        pool=POOL_TIMEOUT_SECONDS,
+                    ),
+                    transport=transport,
+                )
+            except OSError:
+                # The only filesystem the client touches at construction is
+                # the TLS trust store; an unreadable operator CA bundle is
+                # the known cause (F12).
+                raise AcceptanceHttpError(
+                    "acceptance TLS trust store could not be loaded",
+                    error_code="ca_unreadable",
+                ) from None
 
     @classmethod
     def from_env(
@@ -59,8 +95,10 @@ class AcceptanceHttpClient:
         *,
         transport: httpx.BaseTransport | None = None,
     ) -> Self:
-        origin = normalize_acceptance_origin(env.get("ELSPETH_ACCEPTANCE_BASE_URL", ""))
-        credentials = AcceptanceCredentials.from_env(env)
+        with acceptance_step("client_setup"):
+            _require_readable_ca_bundle(env)
+            origin = normalize_acceptance_origin(env.get("ELSPETH_ACCEPTANCE_BASE_URL", ""))
+            credentials = AcceptanceCredentials.from_env(env)
         return cls(origin=origin, credentials=credentials, transport=transport)
 
     def __enter__(self) -> Self:
@@ -111,7 +149,10 @@ class AcceptanceHttpClient:
         try:
             return status, json.loads(content)
         except (json.JSONDecodeError, UnicodeDecodeError):
-            raise AcceptanceHttpError("acceptance response contained malformed JSON") from None
+            raise AcceptanceHttpError(
+                "acceptance response contained malformed JSON",
+                error_code="response_shape_invalid",
+            ) from None
 
     def request_multipart_json(
         self,
@@ -131,7 +172,10 @@ class AcceptanceHttpClient:
         try:
             return json.loads(content)
         except (json.JSONDecodeError, UnicodeDecodeError):
-            raise AcceptanceHttpError("acceptance response contained malformed JSON") from None
+            raise AcceptanceHttpError(
+                "acceptance response contained malformed JSON",
+                error_code="response_shape_invalid",
+            ) from None
 
     def request_bytes(self, method: str, path: str, *, expected_statuses: set[int]) -> bytes:
         _status, content = self._request_bounded(
@@ -155,22 +199,24 @@ class AcceptanceHttpClient:
             raise AcceptanceInputError("local acceptance authentication is incomplete")
 
         if register:
-            status, body = self.request_json_with_status(
+            with acceptance_step("register"):
+                status, body = self.request_json_with_status(
+                    "POST",
+                    "/api/auth/register",
+                    expected_statuses={200, 409},
+                    json_body={"username": username, "password": password, "display_name": username},
+                )
+                if status == 200:
+                    self._accept_auth_token(body)
+                    return
+        with acceptance_step("login"):
+            body = self.request_json(
                 "POST",
-                "/api/auth/register",
-                expected_statuses={200, 409},
-                json_body={"username": username, "password": password, "display_name": username},
+                "/api/auth/login",
+                expected_statuses={200},
+                json_body={"username": username, "password": password},
             )
-            if status == 200:
-                self._accept_auth_token(body)
-                return
-        body = self.request_json(
-            "POST",
-            "/api/auth/login",
-            expected_statuses={200},
-            json_body={"username": username, "password": password},
-        )
-        self._accept_auth_token(body)
+            self._accept_auth_token(body)
 
     def _accept_auth_token(self, body: object) -> None:
         if not isinstance(body, dict):
@@ -212,16 +258,20 @@ class AcceptanceHttpClient:
                 self.validate_response_origin(response.request.url)
                 content = self._read_bounded(response, limit=limit)
                 if response.status_code not in expected_statuses:
-                    raise AcceptanceHttpError("acceptance request returned an unexpected HTTP status")
+                    raise AcceptanceHttpError(
+                        "acceptance request returned an unexpected HTTP status",
+                        error_code="unexpected_http_status",
+                        status=response.status_code,
+                    )
                 status = response.status_code
             finally:
                 response.close()
         except AcceptanceHttpError:
             raise
         except httpx.TimeoutException:
-            raise AcceptanceHttpError("acceptance request timeout") from None
+            raise AcceptanceHttpError("acceptance request timeout", error_code="request_timeout") from None
         except httpx.HTTPError:
-            raise AcceptanceHttpError("acceptance HTTP transport failed") from None
+            raise AcceptanceHttpError("acceptance HTTP transport failed", error_code="connection_failed") from None
         return status, content
 
     def validate_response_origin(self, url: httpx.URL) -> None:
@@ -230,9 +280,9 @@ class AcceptanceHttpClient:
         try:
             response_origin = normalize_acceptance_origin(f"{url.scheme}://{url.netloc.decode('ascii')}")
         except AcceptanceInputError:
-            raise AcceptanceHttpError("acceptance response was cross-origin") from None
+            raise AcceptanceHttpError("acceptance response was cross-origin", error_code="cross_origin_response") from None
         if response_origin != self.origin:
-            raise AcceptanceHttpError("acceptance response was cross-origin")
+            raise AcceptanceHttpError("acceptance response was cross-origin", error_code="cross_origin_response")
 
     @staticmethod
     def _read_bounded(response: httpx.Response, *, limit: int) -> bytes:
@@ -241,6 +291,6 @@ class AcceptanceHttpClient:
         for chunk in response.iter_bytes():
             size += len(chunk)
             if size > limit:
-                raise AcceptanceHttpError("acceptance response body was too large")
+                raise AcceptanceHttpError("acceptance response body was too large", error_code="response_too_large")
             chunks.append(chunk)
         return b"".join(chunks)

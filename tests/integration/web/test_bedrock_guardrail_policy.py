@@ -109,6 +109,7 @@ def _guardrail_settings(**overrides: object) -> WebSettings:
                 "region_name": "us-east-1",
             }
         },
+        "default_llm_profile": "llm-default",
     }
     values.update(overrides)
     return _settings(**values)

@@ -9,6 +9,7 @@ import pytest
 from pydantic import SecretBytes
 
 from elspeth.web import deployment_contract
+from elspeth.web.aws_rds_trust import AWS_RDS_GLOBAL_BUNDLE_PATH
 from elspeth.web.config import WebSettings
 from elspeth.web.deployment_contract import ContractCheck, validate_aws_ecs_settings, validate_external_postgresql_settings
 
@@ -16,7 +17,7 @@ _SQLITE_SESSION_URL = "sqlite+pysqlite:///session.db"
 _SQLITE_LANDSCAPE_URL = "sqlite:///landscape.db"
 _POSTGRESQL_SESSION_URL = "postgresql://session_user:session_password@db/session"  # secret-scan: allow-this-line
 _POSTGRESQL_LANDSCAPE_URL = "postgresql+future_driver://landscape_user:landscape_password@db/landscape"
-_AWS_TLS_QUERY = "?sslmode=verify-full&sslrootcert=system"
+_AWS_TLS_QUERY = f"?sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"
 
 
 def _base_kwargs() -> dict[str, Any]:
@@ -415,9 +416,13 @@ def test_aws_ecs_accepts_verified_postgresql_tls_across_supported_drivers(
     settings = _external_settings(
         tmp_path,
         target="aws-ecs",
-        session_db_url=(f"{driver}://session_user:session_password@db.example/session_database?sslmode=verify-full&sslrootcert=system"),
+        session_db_url=(
+            f"{driver}://session_user:session_password@db.example/session_database"
+            f"?sslmode=verify-full&sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}"
+        ),
         landscape_url=(
-            f"{driver}://landscape_user:landscape_password@db.example/landscape_database?sslrootcert=system&sslmode=verify-full"
+            f"{driver}://landscape_user:landscape_password@db.example/landscape_database"
+            f"?sslrootcert={AWS_RDS_GLOBAL_BUNDLE_PATH}&sslmode=verify-full"
         ),
     )
 
@@ -449,6 +454,26 @@ def test_aws_ecs_rejects_incomplete_or_conflicting_postgresql_tls_parameters(
     check = {item.name: item for item in validate_aws_ecs_settings(settings)}["session_db_url"]
 
     assert check.ok is False
+
+
+@pytest.mark.parametrize(
+    "alternate",
+    [
+        "system",
+        "/var/lib/elspeth/rds-global-bundle.pem",
+        "/tmp/rds-global-bundle.pem",
+        "/etc/ssl/certs/ca-certificates.crt",
+    ],
+)
+def test_aws_ecs_rejects_every_noncanonical_trust_root(alternate: str) -> None:
+    settings = _external_settings(
+        Path("/tmp"),
+        target="aws-ecs",
+        session_db_url=(f"postgresql+psycopg://user:password@db/session?sslmode=verify-full&sslrootcert={alternate}"),
+    )
+    check = {item.name: item for item in validate_aws_ecs_settings(settings)}["session_db_url"]
+    assert check.ok is False
+    assert alternate not in check.detail
 
 
 @pytest.mark.parametrize(

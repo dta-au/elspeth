@@ -95,6 +95,7 @@ def _interactive_config() -> SimpleNamespace:
             dump_to_jsonl_fail_on_error=False,
             dump_to_jsonl_include_payloads=False,
             dump_to_jsonl_payload_base_path=None,
+            export=SimpleNamespace(enabled=False),
         ),
         payload_store=SimpleNamespace(
             backend="filesystem",
@@ -220,6 +221,22 @@ def test_cli_runtime_threads_audit_export_store_resources_to_orchestrator() -> N
 
     assert _FakeOrchestrator.last_run_kwargs["audit_export_content_store"] is content_store
     assert _FakeOrchestrator.last_run_kwargs["audit_export_content_store_resolver"] is resolver
+
+
+def test_cli_runtime_requires_the_landscape_export_contract() -> None:
+    from elspeth.cli import _execute_pipeline_with_instances
+
+    db = _CloseOk()
+    run_result = SimpleNamespace(run_id="run-1", status="completed", rows_processed=1)
+    config = _interactive_config()
+    del config.landscape.export
+
+    with _patched_interactive_execution(db, run_result), pytest.raises(AttributeError, match="export"):
+        _execute_pipeline_with_instances(
+            config,
+            graph=object(),
+            plugins=object(),
+        )
 
 
 def test_explain_exit_not_masked_by_db_close_failure():

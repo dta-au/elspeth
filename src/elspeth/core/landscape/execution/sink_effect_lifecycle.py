@@ -246,7 +246,13 @@ class SinkEffectLifecycle:
                         .order_by(sink_effect_members_table.c.ordinal)
                     ).fetchall()
                 )
-                durable_ordinals = tuple(int(member.ordinal) for member in member_rows)
+                durable_ordinals_list: list[int] = []
+                for member in member_rows:
+                    ordinal = member.ordinal
+                    if type(ordinal) is not int:
+                        raise LandscapeRecordError("durable sink effect member ordinal must be an integer")
+                    durable_ordinals_list.append(ordinal)
+                durable_ordinals = tuple(durable_ordinals_list)
                 accepted, diverted, reason_hashes = self._planned_member_partition(plan, durable_ordinals)
                 for ordinal in accepted:
                     conn.execute(
@@ -270,7 +276,7 @@ class SinkEffectLifecycle:
                         )
                         .values(
                             prepared_disposition="diverted",
-                            reason_hash=reason_hashes.get(ordinal),
+                            reason_hash=reason_hashes[ordinal],
                             member_state=SinkEffectState.PREPARED.value,
                         )
                     )
@@ -287,10 +293,14 @@ class SinkEffectLifecycle:
         evidence = deep_thaw(plan.safe_evidence)
         if type(evidence) is not dict:
             raise LandscapeRecordError("sink effect plan evidence must be an object")
-        raw_accepted = evidence.get("accepted_ordinals")
-        raw_diverted = evidence.get("diverted_ordinals")
-        if raw_accepted is None and raw_diverted is None:
+        has_accepted = "accepted_ordinals" in evidence
+        has_diverted = "diverted_ordinals" in evidence
+        if not has_accepted and not has_diverted:
             return durable_ordinals, (), {}
+        if has_accepted != has_diverted:
+            raise LandscapeRecordError("planned accepted/diverted ordinals must both be present")
+        raw_accepted = evidence["accepted_ordinals"]
+        raw_diverted = evidence["diverted_ordinals"]
         if type(raw_accepted) is not list or type(raw_diverted) is not list:
             raise LandscapeRecordError("planned accepted/diverted ordinals must both be lists")
         accepted = tuple(raw_accepted)
@@ -301,7 +311,10 @@ class SinkEffectLifecycle:
         if tuple(sorted((*accepted, *diverted))) != durable_ordinals:
             raise LandscapeRecordError("planned accepted/diverted ordinals must exactly partition durable members")
         reason_hashes: dict[int, str] = {}
-        raw_attribution = evidence.get("diversion_attribution", [])
+        if "diversion_attribution" in evidence:
+            raw_attribution = evidence["diversion_attribution"]
+        else:
+            raw_attribution = []
         if type(raw_attribution) is not list:
             raise LandscapeRecordError("planned diversion attribution must be a list")
         for item in raw_attribution:
@@ -314,14 +327,14 @@ class SinkEffectLifecycle:
                 type(ordinal) is not int
                 or ordinal not in diverted
                 or ordinal in reason_hashes
-                or not isinstance(reason_hash, str)
+                or type(reason_hash) is not str
                 or _LOWER_HEX_64.fullmatch(reason_hash) is None
-                or not isinstance(error_hash, str)
+                or type(error_hash) is not str
                 or re.fullmatch(r"[0-9a-f]{16}", error_hash) is None
             ):
                 raise LandscapeRecordError("planned diversion attribution is invalid")
             reason_hashes[ordinal] = reason_hash
-        if raw_attribution and set(reason_hashes) != set(diverted):
+        if set(reason_hashes) != set(diverted):
             raise LandscapeRecordError("planned diversion attribution must cover every diverted member")
         return accepted, diverted, reason_hashes
 
@@ -678,16 +691,21 @@ class SinkEffectLifecycle:
         """
         if not isinstance(result, SinkEffectCommitResult) or member_ordinal not in set(result.diverted_ordinals):
             return "accepted", None
-        raw_attribution = deep_thaw(result.evidence).get("diversion_attribution")
+        evidence = deep_thaw(result.evidence)
+        if type(evidence) is not dict:
+            raise LandscapeRecordError("diverted member result evidence must be an object")
+        raw_attribution = None
+        if "diversion_attribution" in evidence:
+            raw_attribution = evidence["diversion_attribution"]
         if type(raw_attribution) is not list:
             raise LandscapeRecordError("diverted member result requires diversion attribution evidence")
         for item in raw_attribution:
             if (
                 type(item) is not dict
                 or set(item) != {"error_hash", "ordinal", "reason_hash"}
-                or not isinstance(item["reason_hash"], str)
+                or type(item["reason_hash"]) is not str
                 or _LOWER_HEX_64.fullmatch(item["reason_hash"]) is None
-                or not isinstance(item["error_hash"], str)
+                or type(item["error_hash"]) is not str
                 or re.fullmatch(r"[0-9a-f]{16}", item["error_hash"]) is None
             ):
                 raise LandscapeRecordError("diverted member result attribution is invalid")
@@ -780,9 +798,9 @@ class SinkEffectLifecycle:
             .with_for_update()
         ).fetchall()
         by_id = {row.effect_id: row for row in rows}
-        row = by_id.get(effect_id)
-        if row is None:
+        if effect_id not in by_id:
             raise LandscapeRecordError("sink effect disappeared while locking")
+        row = by_id[effect_id]
         self._after_effect_lock(self._backend_pid(conn), effect_id)
         return row
 

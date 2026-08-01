@@ -26,6 +26,7 @@ from elspeth.web.sessions.models import (
     guided_operation_events_table,
     guided_operations_table,
     proposal_events_table,
+    session_operation_fences_table,
 )
 from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationCompleted
 from elspeth.web.sessions.routes._helpers import (
@@ -201,6 +202,92 @@ def test_guided_full_provider_owned_cancelled_error_is_operation_failed(
     assert operation["failure_code"] == "operation_failed"
 
 
+def test_guided_full_escape_hatch_decline_is_an_ordinary_assistant_message_not_a_failure(
+    composer_test_client,
+) -> None:
+    """PlannerDeclined on the guided-full surface must not become operation_failed.
+
+    Mirrors the freeform surface's PlannerDeclined handling
+    (ComposerServiceImpl.compose): an honest decline from the escape-hatch
+    advisor is a conversational outcome, so the guided-full operation
+    completes with the advisor's own words persisted as an ordinary
+    assistant chat message — never routed through GuidedOperationFailureCode.
+    """
+    from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+    decline_text = "I could not find a source plugin that reads this format."
+
+    class _DecliningPlanner:
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            return GuidedPlannerDecline(decline_text=decline_text)
+
+    composer_test_client.app.state.composer_service = _DecliningPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "guided full decline"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000056"
+
+    response = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={"operation_id": operation_id, "intent": "Build a pipeline from an unsupported format."},
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["outcome"] == "declined"
+    assert payload["message"]["role"] == "assistant"
+    assert payload["message"]["content"] == decline_text
+
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+        assistant_rows = conn.execute(
+            select(chat_messages_table.c.id, chat_messages_table.c.content, chat_messages_table.c.writer_principal).where(
+                chat_messages_table.c.role == "assistant"
+            )
+        ).all()
+        user_rows = conn.execute(
+            select(chat_messages_table.c.content, chat_messages_table.c.writer_principal).where(chat_messages_table.c.role == "user")
+        ).all()
+        assert conn.scalar(select(func.count()).select_from(composition_proposals_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(proposal_events_table)) == 0
+
+    # Not a failure: completed, no failure_code, no proposal.
+    assert operation.status == "completed"
+    assert operation.failure_code is None
+    assert operation.result_kind == "declined"
+    assert operation.proposal_id is None
+    assert operation.result_state_id is not None
+    assert len(assistant_rows) == 1
+    decline_message_id = assistant_rows[0].id
+    assert assistant_rows[0].content == decline_text
+    assert assistant_rows[0].writer_principal == "compose_loop"
+    assert user_rows == [("Build a pipeline from an unsupported format.", "route_user_message")]
+
+    # A later assistant turn may legitimately retain the same unchanged
+    # composition-state association. Replay must use the immutable decline
+    # message locator, not scan by that non-unique state.
+    asyncio.run(
+        composer_test_client.app.state.session_service.add_message(
+            UUID(session["id"]),
+            "assistant",
+            "Later assistant turn with unchanged composition.",
+            writer_principal="compose_loop",
+            composition_state_id=UUID(operation.result_state_id),
+        )
+    )
+    replay = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={"operation_id": operation_id, "intent": "Build a pipeline from an unsupported format."},
+    )
+    assert replay.status_code == 200
+    assert replay.json() == payload
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        replay_operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+    assert replay_operation.result_message_id == decline_message_id
+
+
 def test_guided_full_failure_atomically_retains_sanitized_audit_without_a_checkpoint(
     composer_test_client,
 ) -> None:
@@ -337,7 +424,7 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
     )
     real_stage = service.stage_guided_full_pipeline_proposal
 
-    async def stage_mismatched_state(command):
+    async def stage_mismatched_state(command, *, session_operation_context):
         mismatched_state = replace(command.state, metadata_={"name": "different checkpoint bytes"})
         mismatched_hash = _composition_state_data_content_hash(mismatched_state)
         mismatched_proposal = PipelineProposal.create(
@@ -358,7 +445,8 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
                 command,
                 state=mismatched_state,
                 plan=replace(command.plan, proposal=mismatched_proposal),
-            )
+            ),
+            session_operation_context=session_operation_context,
         )
 
     monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", stage_mismatched_state)
@@ -431,15 +519,15 @@ def test_guided_full_replay_fails_closed_on_persisted_authority_tamper(
     engine = composer_test_client.app.state.session_engine
     service = composer_test_client.app.state.session_service
     if tamper == "response_hash":
-        reserve = service.reserve_guided_operation
+        get_operation = service.get_guided_operation
 
-        async def tampered_reserve(*args, **kwargs):
-            outcome = await reserve(*args, **kwargs)
+        async def tampered_get_operation(*args, **kwargs):
+            outcome = await get_operation(*args, **kwargs)
             if isinstance(outcome, GuidedOperationCompleted):
                 return replace(outcome, response_hash="0" * 64)
             return outcome
 
-        monkeypatch.setattr(service, "reserve_guided_operation", tampered_reserve)
+        monkeypatch.setattr(service, "get_guided_operation", tampered_get_operation)
     else:
         get_messages = service.get_messages
 
@@ -573,6 +661,26 @@ def test_guided_full_planner_failure_mapping_is_closed(
     expected: str,
 ) -> None:
     assert _guided_full_failure_code(PipelinePlannerError("safe", code=code)) == expected
+
+
+@pytest.mark.parametrize("code", ("VALIDATION_FAILED", "REPAIR_EXHAUSTED", "COMPOSITION_EXHAUSTED"))
+@pytest.mark.parametrize("policy_code", ("aws_s3_source_not_allowed", "plugin_not_allowed_on_web"))
+def test_guided_full_policy_refusal_outranks_the_planner_code(code: str, policy_code: str) -> None:
+    """A categorical policy refusal is permanent, whatever code it exhausted under.
+
+    The same refusal arrives as VALIDATION_FAILED from the server-derived
+    pass-through gate and as REPAIR_EXHAUSTED once the model has burnt its repair
+    budget re-authoring the prohibited component. Both are permanent, so the
+    classification is keyed on the rejection's closed detail codes rather than the
+    planner code — otherwise the user is told to retry a request that can never
+    succeed (guided S3, 2026-07-31).
+    """
+    exc = PipelinePlannerError("safe", code=code, detail_codes=(policy_code,))
+
+    assert _guided_full_failure_code(exc) == "policy_blocked"
+    # Without the policy code the same planner code stays a retryable provider
+    # fault — the split must not swallow ordinary exhaustion.
+    assert _guided_full_failure_code(PipelinePlannerError("safe", code=code)) == "invalid_provider_response"
 
 
 @pytest.mark.parametrize(
@@ -762,6 +870,15 @@ def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
                         "session_id": session["id"],
                         "operation_id": operation_id,
                     },
+                )
+                # A takeover owns both authorities. Expiring only the guided
+                # row while the original COMPOSE fence remains live must fail;
+                # release that exact session-operation generation too so the
+                # test models an actually abandoned worker.
+                conn.execute(
+                    session_operation_fences_table.update()
+                    .where(session_operation_fences_table.c.session_id == session["id"])
+                    .values(released_at=datetime.now(UTC))
                 )
             winner = asyncio.create_task(client.post(f"/api/sessions/{session['id']}/guided/plan", json=body))
             await asyncio.wait_for(planner.takeover_started.wait(), timeout=3)

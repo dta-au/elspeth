@@ -131,6 +131,7 @@ class TokenSchedulerRepository:
         expand_group_id: str | None = None,
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
+        row_union_name: str | None = None,
         worker_id: str | None = None,
     ) -> TokenWorkItem:
         """Persist a READY token continuation (see :meth:`SchedulerQueueRepository.enqueue_ready`)."""
@@ -153,6 +154,7 @@ class TokenSchedulerRepository:
             expand_group_id=expand_group_id,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
+            row_union_name=row_union_name,
             worker_id=worker_id,
         )
 
@@ -180,6 +182,7 @@ class TokenSchedulerRepository:
         expand_group_id: str | None = None,
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
+        row_union_name: str | None = None,
     ) -> TokenWorkItem:
         """Persist and claim READY work for an active registered worker."""
         return self.queue.enqueue_ready_claimed(
@@ -204,6 +207,7 @@ class TokenSchedulerRepository:
             expand_group_id=expand_group_id,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
+            row_union_name=row_union_name,
         )
 
     def enqueue_ready_claimed_legacy_unfenced(
@@ -230,6 +234,7 @@ class TokenSchedulerRepository:
         expand_group_id: str | None = None,
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
+        row_union_name: str | None = None,
     ) -> TokenWorkItem:
         """Compatibility enqueue-and-claim for N=0 repository test fixtures."""
         return self.queue.enqueue_ready_claimed_legacy_unfenced(
@@ -254,6 +259,7 @@ class TokenSchedulerRepository:
             expand_group_id=expand_group_id,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
+            row_union_name=row_union_name,
         )
 
     def ingest_row_with_initial_claim(
@@ -279,6 +285,7 @@ class TokenSchedulerRepository:
         expand_group_id: str | None = None,
         coalesce_node_id: str | None = None,
         coalesce_name: str | None = None,
+        row_union_name: str | None = None,
     ) -> tuple[Row, Token, TokenWorkItem]:
         """Fenced leader INGEST (see :meth:`SchedulerQueueRepository.ingest_row_with_initial_claim`)."""
         return self.queue.ingest_row_with_initial_claim(
@@ -302,6 +309,7 @@ class TokenSchedulerRepository:
             expand_group_id=expand_group_id,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
+            row_union_name=row_union_name,
         )
 
     def _ready_work_item_values(
@@ -325,6 +333,7 @@ class TokenSchedulerRepository:
         expand_group_id: str | None,
         coalesce_node_id: str | None,
         coalesce_name: str | None,
+        row_union_name: str | None = None,
     ) -> dict[str, object]:
         """Historical test seam over :func:`ready_work_item_values`."""
         return ready_work_item_values(
@@ -346,6 +355,7 @@ class TokenSchedulerRepository:
             expand_group_id=expand_group_id,
             coalesce_node_id=coalesce_node_id,
             coalesce_name=coalesce_name,
+            row_union_name=row_union_name,
         )
 
     # ------------------------------------------------------------------
@@ -797,9 +807,14 @@ class TokenSchedulerRepository:
         """Branch-loss rows not yet replayed into leader memory (SE.5 intake read)."""
         return self.branch_losses.list_unadopted_coalesce_branch_losses(run_id=run_id)
 
-    def list_coalesce_branch_losses(self, *, run_id: str) -> list[CoalesceBranchLoss]:
+    def list_coalesce_branch_losses(
+        self,
+        *,
+        run_id: str,
+        coalesce_names: frozenset[str] | None = None,
+    ) -> list[CoalesceBranchLoss]:
         """ALL branch-loss rows, adopted or not (SE.4 takeover restore read)."""
-        return self.branch_losses.list_coalesce_branch_losses(run_id=run_id)
+        return self.branch_losses.list_coalesce_branch_losses(run_id=run_id, coalesce_names=coalesce_names)
 
     def adopt_coalesce_branch_losses(
         self,

@@ -690,6 +690,28 @@ def _queue(queue_id: str = "inbound") -> NodeSpec:
     )
 
 
+def _row_union(
+    *,
+    branches: dict[str, str],
+    on_success: str = "inbound",
+) -> NodeSpec:
+    return NodeSpec(
+        id="variant_union",
+        node_type="row_union",
+        plugin=None,
+        input=next(iter(branches.values())),
+        on_success=on_success,
+        on_error=None,
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=branches,
+        policy=None,
+        merge=None,
+    )
+
+
 def _web_scrape(node_id: str, *, input_stream: str, on_success: str) -> NodeSpec:
     return NodeSpec(
         id=node_id,
@@ -699,6 +721,24 @@ def _web_scrape(node_id: str, *, input_stream: str, on_success: str) -> NodeSpec
         on_success=on_success,
         on_error="stop",
         options={"url_field": "url", "content_field": "content"},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+def _textract(node_id: str, *, input_stream: str, on_success: str) -> NodeSpec:
+    return NodeSpec(
+        id=node_id,
+        node_type="transform",
+        plugin="aws_textract_document_analysis",
+        input=input_stream,
+        on_success=on_success,
+        on_error="stop",
+        options={"bucket_field": "bucket", "key_field": "key", "feature_types": ["TABLES"], "text_field": "content"},
         condition=None,
         routes=None,
         fork_to=None,
@@ -810,6 +850,73 @@ def test_queue_fan_in_untrusted_on_any_predecessor_marks_downstream_untrusted() 
     assert "consumes externally-fetched content from a web_scrape upstream" in message
 
 
+# ── Document-extraction producers are untrusted too ──────────────────────
+# Text extracted from an uploaded document is attacker-controlled in exactly
+# the way scraped web content is: the author does not write it, and it lands
+# in an LLM prompt. Classifying it as trusted let a
+# source -> textract -> llm pipeline claim it consumed no untrusted content.
+
+
+def test_textract_upstream_marks_downstream_llm_as_consuming_untrusted_content() -> None:
+    """Document-extracted text is externally controlled, so it taints a downstream LLM."""
+    state = _state(
+        (
+            _textract("extract", input_stream="rows", on_success="inbound"),
+            _llm(),
+        )
+    )
+
+    warning_pairs = prompt_shield_recommendation_warning_pairs(state)
+
+    assert warning_pairs
+    message = next(msg for component, msg in warning_pairs if component == "node:classify")
+    assert "consumes externally-fetched content from a aws_textract_document_analysis upstream" in message
+
+
+def test_untrusted_producer_lead_names_the_actual_producer_not_web_scrape() -> None:
+    """The advisory must name the producer it found — never assert a web_scrape that is absent."""
+    state = _state(
+        (
+            _textract("extract", input_stream="rows", on_success="inbound"),
+            _llm(),
+        )
+    )
+
+    message = next(msg for component, msg in prompt_shield_recommendation_warning_pairs(state) if component == "node:classify")
+
+    assert "web_scrape" not in message
+
+
+def test_web_scrape_untrusted_lead_is_unchanged() -> None:
+    """Regression guard: the web_scrape wording is pinned by the tutorial e2e spec."""
+    state = _state(
+        (
+            _web_scrape("scrape", input_stream="rows", on_success="inbound"),
+            _llm(),
+        )
+    )
+
+    message = next(msg for component, msg in prompt_shield_recommendation_warning_pairs(state) if component == "node:classify")
+
+    assert (
+        "consumes externally-fetched content from a web_scrape upstream without an authorized prompt-injection shield between them. "
+        in message
+    )
+
+
+def test_shield_between_textract_and_llm_is_silent() -> None:
+    """An authorized shield downstream of the extraction sanitizes it (State A)."""
+    state = _state(
+        (
+            _textract("extract", input_stream="rows", on_success="extracted"),
+            _shield("shield", input_stream="extracted", on_success="inbound"),
+            _llm(),
+        )
+    )
+
+    assert prompt_shield_recommendation_warning_pairs(state) == ()
+
+
 def test_queue_fan_in_shield_authorized_only_when_all_predecessors_shielded() -> None:
     """A shield on one predecessor is not enough: an unshielded path still warns (ALL-path rule)."""
     # Order: shield_a registers LAST, so the pre-fix single-producer map would
@@ -843,6 +950,64 @@ def test_queue_fan_in_shield_authorized_only_when_all_predecessors_shielded() ->
     )
 
     assert prompt_shield_recommendation_warning_pairs(fully_shielded) == ()
+
+
+def test_row_union_requires_every_branch_to_be_prompt_shielded() -> None:
+    branches = {"control": "control_done", "treatment": "treatment_done"}
+    partially_shielded = _state(
+        (
+            _web_scrape("control_scrape", input_stream="control_url", on_success="control_raw"),
+            _shield("control_shield", input_stream="control_raw", on_success="control_done"),
+            _web_scrape("treatment_scrape", input_stream="treatment_url", on_success="treatment_done"),
+            _row_union(branches=branches),
+            _llm(),
+        )
+    )
+
+    warning_pairs = prompt_shield_recommendation_warning_pairs(partially_shielded)
+
+    assert warning_pairs
+    assert "web_scrape upstream" in next(message for component, message in warning_pairs if component == "node:classify")
+
+    fully_shielded = _state(
+        (
+            _web_scrape("control_scrape", input_stream="control_url", on_success="control_raw"),
+            _shield("control_shield", input_stream="control_raw", on_success="control_done"),
+            _web_scrape("treatment_scrape", input_stream="treatment_url", on_success="treatment_raw"),
+            _shield("treatment_shield", input_stream="treatment_raw", on_success="treatment_done"),
+            _row_union(branches=branches),
+            _llm(),
+        )
+    )
+
+    assert prompt_shield_recommendation_warning_pairs(fully_shielded) == ()
+
+
+def test_row_union_artifact_hash_covers_every_branch_path() -> None:
+    def build(treatment_id: str) -> CompositionState:
+        return _state(
+            (
+                _web_scrape("control_scrape", input_stream="control_url", on_success="control_done"),
+                _web_scrape(treatment_id, input_stream="treatment_url", on_success="treatment_done"),
+                _row_union(branches={"control": "control_done", "treatment": "treatment_done"}),
+                _llm(),
+            )
+        )
+
+    baseline = build("treatment_scrape")
+    changed = build("treatment_scrape_changed")
+    baseline_llm = next(node for node in baseline.nodes if node.plugin == "llm")
+    changed_llm = next(node for node in changed.nodes if node.plugin == "llm")
+
+    assert pipeline_decision_artifact_hash(
+        baseline_llm,
+        baseline.nodes,
+        user_term=PROMPT_SHIELD_USER_TERM,
+    ) != pipeline_decision_artifact_hash(
+        changed_llm,
+        changed.nodes,
+        user_term=PROMPT_SHIELD_USER_TERM,
+    )
 
 
 def test_queue_fan_in_one_unknown_predecessor_emits_conservative_warning() -> None:

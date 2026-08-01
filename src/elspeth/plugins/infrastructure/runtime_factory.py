@@ -226,9 +226,8 @@ def _expand_env_placeholders_for_raw_preflight(
             if var_name in deferrable_env_vars:
                 fully_resolved = False
                 return match.group(0)
-            env_value = os.environ.get(var_name)
-            if env_value is not None:
-                return env_value
+            if var_name in os.environ:
+                return os.environ[var_name]
             if default is not None:
                 return default
             raise ValueError(
@@ -287,7 +286,9 @@ def validate_sink_effect_eligibility_from_raw_config(
         raise TypeError("Sink effect eligibility deferrable_env_vars must be an exact frozenset of strings")
     if deferrable_env_vars and not expand_env_placeholders:
         raise ValueError("Sink effect eligibility deferrable_env_vars requires expand_env_placeholders=True")
-    raw_sinks = raw_config.get("sinks")
+    if "sinks" not in raw_config:
+        raise ValueError("'sinks' must be a mapping/object for sink effect eligibility")
+    raw_sinks = raw_config["sinks"]
     if not isinstance(raw_sinks, Mapping):
         raise ValueError("'sinks' must be a mapping/object for sink effect eligibility")
 
@@ -313,10 +314,15 @@ def validate_sink_effect_eligibility_from_raw_config(
         component = raw_sinks[sink_name]
         if not isinstance(component, Mapping):
             raise ValueError(f"Sink {sink_name!r} must be a mapping/object")
-        plugin_name = component.get("plugin")
+        if "plugin" not in component:
+            raise ValueError(f"Sink {sink_name!r} plugin must be a non-empty string")
+        plugin_name = component["plugin"]
         if not isinstance(plugin_name, str) or not plugin_name:
             raise ValueError(f"Sink {sink_name!r} plugin must be a non-empty string")
-        raw_options = component.get("options", {})
+        if "options" in component:
+            raw_options = component["options"]
+        else:
+            raw_options = {}
         if not isinstance(raw_options, Mapping):
             raise ValueError(f"Sink {sink_name!r} options must be a mapping/object")
         options = dict(raw_options)
@@ -358,14 +364,14 @@ def validate_landscape_export_settings_from_raw_config(raw_config: Mapping[str, 
     """Normalize bounded raw export settings through the authoritative model."""
     from elspeth.core.config import LandscapeExportSettings
 
-    raw_landscape = raw_config.get("landscape")
-    if raw_landscape is None:
+    if "landscape" not in raw_config:
         return LandscapeExportSettings()
+    raw_landscape = raw_config["landscape"]
     if not isinstance(raw_landscape, Mapping):
         raise ValueError("'landscape' must be a mapping/object before sink effect eligibility")
-    raw_export = raw_landscape.get("export")
-    if raw_export is None:
+    if "export" not in raw_landscape:
         return LandscapeExportSettings()
+    raw_export = raw_landscape["export"]
     if not isinstance(raw_export, Mapping):
         raise ValueError("'landscape.export' must be a mapping/object before sink effect eligibility")
     return LandscapeExportSettings.model_validate(dict(raw_export))
@@ -405,14 +411,17 @@ def make_sink_factory(config: ElspethSettings) -> Callable[[str], SinkEffectRunt
         sink._on_write_failure = sink_config.on_write_failure
         from elspeth.plugins.infrastructure.base import BaseSink
 
-        resolved_mode = (
-            sink_cls._resolve_sink_effect_mode(
+        is_base_sink = isinstance(sink_cls, type) and issubclass(sink_cls, BaseSink)
+        resolved_mode = None
+        publication_preflight = None
+        if is_base_sink:
+            base_sink_type = cast(type[BaseSink], sink_cls)
+            resolved_mode = base_sink_type._resolve_sink_effect_mode(
                 dict(sink_config.options),
                 purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
             )
-            if isinstance(sink_cls, type) and issubclass(sink_cls, BaseSink)
-            else None
-        )
+            export_format = AuditExportFormat(config.landscape.export.format)
+            publication_preflight = cast(BaseSink, sink)._resolve_audit_export_publication_preflight(export_format)
         if resolved_mode is not None and type(resolved_mode) is not ResolvedSinkEffectMode:
             raise TypeError("Sink _resolve_sink_effect_mode must return ResolvedSinkEffectMode or None")
         return SinkEffectRuntimeBinding(
@@ -422,6 +431,7 @@ def make_sink_factory(config: ElspethSettings) -> Callable[[str], SinkEffectRunt
             config_fingerprint=stable_hash(dict(sink_config.options)),
             purpose=SinkEffectExecutionPurpose.AUDIT_EXPORT,
             effect_mode=resolved_mode,
+            audit_export_publication_preflight=publication_preflight,
         )
 
     return factory

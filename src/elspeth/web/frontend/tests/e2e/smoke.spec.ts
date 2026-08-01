@@ -6,7 +6,7 @@
 //   2. Both webServer instances came up healthy on the Playwright-assigned
 //      backend and frontend ports.
 //   3. The frontend SPA loads, restores auth from localStorage, completes
-//      session bootstrap, and renders the stable application shell.
+//      session bootstrap, and renders the authenticated application shell.
 //   4. The backend's /api/sessions endpoint accepts the bearer token and
 //      can create + delete a session.
 //
@@ -30,8 +30,8 @@ import {
 } from "./helpers/api";
 import { ComposerPage } from "./page-objects/composer-page";
 
-test.describe("smoke — boot + auth + session shell", () => {
-  test("frontend completes bootstrap and renders the session shell", async ({
+test.describe("smoke — boot + auth + application shell", () => {
+  test("frontend completes bootstrap and renders the authenticated shell", async ({
     page,
   }) => {
     const composer = new ComposerPage(page);
@@ -56,6 +56,7 @@ test.describe("smoke — boot + auth + session shell", () => {
     await expect(
       page.getByRole("button", { name: /session switcher:/i }),
     ).toBeVisible();
+    await expect(page.getByRole("main")).toBeVisible();
   });
 
   test("backend accepts authed token and round-trips a session", async ({

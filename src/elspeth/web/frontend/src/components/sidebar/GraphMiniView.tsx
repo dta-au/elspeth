@@ -34,10 +34,29 @@ export function GraphMiniView({
   compositionStateOverride,
 }: GraphMiniViewProps = {}): JSX.Element {
   const storeCompositionState = useSessionStore((s) => s.compositionState);
+  // R2-F5 (elspeth-139a345050): `compositionState === null` is ambiguous —
+  // it means both "the session's composition fetch is still in flight" and
+  // "loaded, and this session genuinely has no pipeline yet". Without this
+  // discriminator the mini view showed "No pipeline yet" during load, which
+  // read as a false defect during acceptance review (see sessionStore's
+  // `compositionStateLoaded` doc comment for the same ambiguity at the
+  // store level). The override path (SharedInspectView's frozen snapshot)
+  // never subscribes to session-load state, so it is exempt.
+  const storeCompositionStateLoaded = useSessionStore((s) => s.compositionStateLoaded);
+  const isLoading =
+    compositionStateOverride === undefined && !storeCompositionStateLoaded;
   const compositionState =
     compositionStateOverride !== undefined
       ? compositionStateOverride
       : storeCompositionState;
+
+  if (isLoading) {
+    return (
+      <div className="graph-mini graph-mini--empty" data-testid="graph-mini-loading">
+        <span>Loading pipeline…</span>
+      </div>
+    );
+  }
 
   if (!hasCompositionContent(compositionState)) {
     return (

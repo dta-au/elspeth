@@ -19,8 +19,10 @@ from elspeth.contracts.payload_store import PayloadNotFoundError, PayloadStore
 from elspeth.web.composer.guided.profile import EMPTY_PROFILE
 from elspeth.web.composer.guided.protocol import ChatRole, GuidedStep, validate_current_turn
 from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.composer.no_tool_policy import visible_message_segments
 from elspeth.web.composer.redaction import redact_guided_snapshot_storage_paths, redact_source_storage_path
 from elspeth.web.sessions.protocol import (
+    ChatMessageRecord,
     CompositionProposalRecord,
     CompositionStateData,
     CompositionStateRecord,
@@ -29,11 +31,14 @@ from elspeth.web.sessions.protocol import (
     PreparedGuidedJsonPayload,
 )
 from elspeth.web.sessions.schemas import (
+    ChatMessageResponse,
+    ChatMessageSegmentResponse,
     ChatTurnResponse,
     CompositionProposalResponse,
     CompositionStateResponse,
     GetGuidedResponse,
     GuidedChatResponse,
+    GuidedPlanDeclinedResponse,
     GuidedRespondResponse,
     GuidedSessionResponse,
     PipelineProposalMetadataResponse,
@@ -81,6 +86,40 @@ def project_composition_proposal(record: CompositionProposalRecord) -> Compositi
         ),
         created_at=record.created_at,
         updated_at=record.updated_at,
+    )
+
+
+def project_guided_full_decline(message: ChatMessageRecord) -> GuidedPlanDeclinedResponse:
+    """Project a persisted escape-hatch decline onto the guided-full response.
+
+    Sibling of ``project_composition_proposal`` for the guided-full planner's
+    other outcome: a decline creates no proposal, only the persisted
+    assistant chat message. Deliberately duplicates the small
+    ``ChatMessageRecord`` -> ``ChatMessageResponse`` projection that
+    ``routes/_helpers.py::_message_response`` also performs, rather than
+    importing it — routes depend on the service layer (which calls this
+    module), never the reverse.
+    """
+
+    return GuidedPlanDeclinedResponse(
+        outcome="declined",
+        message=ChatMessageResponse(
+            id=str(message.id),
+            session_id=str(message.session_id),
+            role=message.role,
+            content=message.content,
+            raw_content=None,
+            segments=[
+                ChatMessageSegmentResponse(kind=segment.kind, content=segment.content)
+                for segment in visible_message_segments(content=message.content, raw_content=None)
+            ],
+            tool_calls=None,
+            created_at=message.created_at,
+            composition_state_id=(str(message.composition_state_id) if message.composition_state_id is not None else None),
+            tool_call_id=message.tool_call_id,
+            parent_assistant_id=(str(message.parent_assistant_id) if message.parent_assistant_id is not None else None),
+            sequence_no=message.sequence_no,
+        ),
     )
 
 
@@ -419,6 +458,7 @@ __all__ = [
     "load_guided_json_payload",
     "parse_guided_response_descriptor",
     "project_composition_proposal",
+    "project_guided_full_decline",
     "project_guided_response",
     "response_json",
     "validation_errors_for_composer_surface",

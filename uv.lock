@@ -879,6 +879,7 @@ all = [
     { name = "bcrypt" },
     { name = "boto3" },
     { name = "botocore", extra = ["crt"] },
+    { name = "cryptography" },
     { name = "elspeth-lints" },
     { name = "errorworks" },
     { name = "fastapi" },
@@ -921,6 +922,7 @@ all = [
 aws = [
     { name = "boto3" },
     { name = "botocore", extra = ["crt"] },
+    { name = "cryptography" },
     { name = "ijson" },
     { name = "jinja2" },
 ]
@@ -1022,6 +1024,8 @@ requires-dist = [
     { name = "botocore", extras = ["crt"], marker = "extra == 'all'", specifier = ">=1.40,<2" },
     { name = "botocore", extras = ["crt"], marker = "extra == 'aws'", specifier = ">=1.40,<2" },
     { name = "chromadb", specifier = ">=1.5,<2" },
+    { name = "cryptography", marker = "extra == 'all'", specifier = ">=49,<50" },
+    { name = "cryptography", marker = "extra == 'aws'", specifier = ">=49,<50" },
     { name = "deepdiff", specifier = ">=8.6.2,<9" },
     { name = "dynaconf", specifier = ">=3.2.13,<4" },
     { name = "elspeth", extras = ["azure", "tracing-langfuse"], marker = "extra == 'tracing'" },

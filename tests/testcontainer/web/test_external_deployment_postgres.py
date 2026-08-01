@@ -348,6 +348,7 @@ def _assert_ddl_denied(url: str) -> None:
         engine.dispose()
 
 
+@pytest.mark.usefixtures("aws_rds_trust_test_override")
 @pytest.mark.parametrize("target", _RUNTIME_CONTRACT_TARGETS)
 def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
     tmp_path: Path,

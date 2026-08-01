@@ -388,6 +388,8 @@ async def test_endpoint_fails_closed_when_audit_access_log_write_fails(
     assert response.status_code == 500
     body = response.json()
     assert body.get("error_type") == "audit_access_log_write_failed"
+    # R2-F16b: the fail-closed envelope correlates to the response's X-Request-ID.
+    assert "request_id" in body
     assert "messages" not in body
     assert observed_value(sessions_service._telemetry.audit_access_log_write_failed_total) == 1
 
@@ -409,6 +411,8 @@ async def test_endpoint_fails_closed_when_audit_access_log_write_fails_for_non_t
     assert response.status_code == 500
     body = response.json()
     assert body.get("error_type") == "audit_access_log_write_failed"
+    # R2-F16b: the fail-closed envelope correlates to the response's X-Request-ID.
+    assert "request_id" in body
     assert "messages" not in body
     assert observed_value(sessions_service._telemetry.audit_access_log_write_failed_total) == 1
 

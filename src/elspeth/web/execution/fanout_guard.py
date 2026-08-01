@@ -381,8 +381,11 @@ def _trace_upstream_fanout(
         if marker is not None:
             markers.append(marker)
 
-        if node.node_type == "coalesce":
-            if node.input:
+        if node.node_type in ("coalesce", "row_union"):
+            # Coalesce keeps its legacy adapter input traversal. A row_union's
+            # input is only the schema-required alias of its first branch, so
+            # every real consuming path comes from branches.
+            if node.node_type == "coalesce" and node.input:
                 walk_label(node.input)
             for branch in _coalesce_branch_connections(node.branches):
                 walk_label(branch)

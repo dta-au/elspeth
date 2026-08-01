@@ -12,7 +12,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from ipaddress import ip_address
 from time import time_ns
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import structlog
@@ -20,6 +20,7 @@ from opentelemetry.sdk.trace.export import SpanExportResult
 
 from elspeth.contracts.events import RunFinished, RunStarted
 from elspeth.telemetry.errors import TELEMETRY_TRANSPORT_ERRORS, TelemetryExporterError
+from elspeth.telemetry.protocols import ExporterDeliveryMetrics
 from elspeth.telemetry.resource_identity import is_aws_ecs_name, is_aws_resource_label, is_aws_task_revision, is_release_identity
 from elspeth.telemetry.serialization import (
     SyntheticReadableSpan,
@@ -38,19 +39,6 @@ logger = structlog.get_logger(__name__)
 _MAX_RESOURCE_IDENTITY_CHARS = 128
 _MAX_BATCH_SIZE = 10_000
 _MAX_TRACKED_TRACE_RUNS = 10_000
-
-
-class OTLPDeliveryMetrics(TypedDict):
-    """Bounded operational delivery facts for one exporter instance."""
-
-    attempted: int
-    delivered: int
-    failed: int
-    dropped: int
-    pending: int
-    consecutive_failures: int
-    last_success_unix_nano: int | None
-    lifecycle_failures: int
 
 
 def _configuration_error(field: str, check: str) -> TelemetryExporterError:
@@ -164,7 +152,7 @@ class OTLPExporter:
         return self._resource
 
     @property
-    def delivery_metrics(self) -> OTLPDeliveryMetrics:
+    def delivery_metrics(self) -> ExporterDeliveryMetrics:
         """Return a copy of delivery accounting; buffered is never delivered."""
         return {
             "attempted": self._attempted,

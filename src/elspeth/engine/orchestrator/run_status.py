@@ -18,7 +18,6 @@ testable without constructing an Orchestrator instance.
 
 from __future__ import annotations
 
-from dataclasses import fields
 from typing import TYPE_CHECKING
 
 from elspeth.contracts import RunStatus
@@ -221,14 +220,19 @@ derive_resume_terminal_status_from_audit = derive_terminal_status_from_audit
 #
 # routed_destinations is compared separately as a plain dict below because
 # RunResult stores a frozen Mapping while ExecutionCounters stores a Counter.
-_PARITY_EXCLUDED_FIELDS: frozenset[str] = frozenset(
-    {
-        "rows_coalesce_failed",
-        "routed_destinations",
-    }
-)
-_PARITY_STRICT_FIELDS: tuple[str, ...] = tuple(
-    field.name for field in fields(ExecutionCounters) if field.name not in _PARITY_EXCLUDED_FIELDS
+_PARITY_EXCLUDED_FIELDS: frozenset[str] = frozenset({"rows_coalesce_failed", "routed_destinations"})
+_PARITY_STRICT_FIELDS: tuple[str, ...] = (
+    "rows_processed",
+    "rows_succeeded",
+    "rows_failed",
+    "rows_routed_success",
+    "rows_routed_failure",
+    "rows_quarantined",
+    "rows_forked",
+    "rows_coalesced",
+    "rows_expanded",
+    "rows_buffered",
+    "rows_diverted",
 )
 
 
@@ -237,17 +241,29 @@ def assert_terminal_counter_parity(*, live: RunResult, audit: ExecutionCounters,
 
     ADR-030 §D: the audit-derived counters ARE the terminal record; the live
     accumulator survives only as this assertion. Any divergence outside the
-    two documented ``rows_coalesce_failed`` arms (see
-    ``_PARITY_STRICT_FIELDS``) means one of the two bookkeepers is broken —
+    two documented ``rows_coalesce_failed`` arms means one of the two bookkeepers is broken —
     crash loudly rather than record an unexplained terminal status.
 
     Raises:
         OrchestrationInvariantError: on any strict-field mismatch.
     """
-    mismatches = {
-        field: {"live": getattr(live, field), "audit": getattr(audit, field)}
-        for field in _PARITY_STRICT_FIELDS
-        if getattr(live, field) != getattr(audit, field)
+    strict_fields = (
+        ("rows_processed", live.rows_processed, audit.rows_processed),
+        ("rows_succeeded", live.rows_succeeded, audit.rows_succeeded),
+        ("rows_failed", live.rows_failed, audit.rows_failed),
+        ("rows_routed_success", live.rows_routed_success, audit.rows_routed_success),
+        ("rows_routed_failure", live.rows_routed_failure, audit.rows_routed_failure),
+        ("rows_quarantined", live.rows_quarantined, audit.rows_quarantined),
+        ("rows_forked", live.rows_forked, audit.rows_forked),
+        ("rows_coalesced", live.rows_coalesced, audit.rows_coalesced),
+        ("rows_expanded", live.rows_expanded, audit.rows_expanded),
+        ("rows_buffered", live.rows_buffered, audit.rows_buffered),
+        ("rows_diverted", live.rows_diverted, audit.rows_diverted),
+    )
+    mismatches: dict[str, dict[str, object]] = {
+        field_name: {"live": live_value, "audit": audit_value}
+        for field_name, live_value, audit_value in strict_fields
+        if live_value != audit_value
     }
     if dict(live.routed_destinations) != dict(audit.routed_destinations):
         mismatches["routed_destinations"] = {

@@ -127,6 +127,7 @@ class SinkEffectRuntimeBinding:
     config_fingerprint: str
     purpose: SinkEffectExecutionPurpose
     effect_mode: ResolvedSinkEffectMode | None
+    audit_export_publication_preflight: Callable[[], None] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.sink_name, str) or not self.sink_name.strip():
@@ -289,8 +290,7 @@ def _freeze_canonical_row_value(value: object, path: str) -> object:
 
 
 def _contains_restricted_reader(value: object) -> bool:
-    reader_type = globals().get("RestrictedAuditExportSnapshotReader")
-    if isinstance(reader_type, type) and isinstance(value, reader_type):
+    if isinstance(value, RestrictedAuditExportSnapshotReader):
         return True
     if isinstance(value, Mapping):
         return any(_contains_restricted_reader(key) or _contains_restricted_reader(item) for key, item in value.items())
@@ -362,10 +362,12 @@ class SinkEffectMember:
     def __post_init__(self) -> None:
         require_int(self.ordinal, "ordinal", min_value=0)
         require_int(self.ingest_sequence, "ingest_sequence", min_value=0)
-        for field_name in ("token_id", "row_id", "lineage_json"):
-            _require_nonempty_string(getattr(self, field_name), field_name)
-        for field_name in ("lineage_hash", "payload_hash", "pending_identity_hash"):
-            _require_lower_hex_64(getattr(self, field_name), field_name)
+        _require_nonempty_string(self.token_id, "token_id")
+        _require_nonempty_string(self.row_id, "row_id")
+        _require_nonempty_string(self.lineage_json, "lineage_json")
+        _require_lower_hex_64(self.lineage_hash, "lineage_hash")
+        _require_lower_hex_64(self.payload_hash, "payload_hash")
+        _require_lower_hex_64(self.pending_identity_hash, "pending_identity_hash")
         try:
             lineage = json.loads(self.lineage_json)
         except json.JSONDecodeError as exc:
@@ -376,10 +378,10 @@ class SinkEffectMember:
             raise ValueError("lineage_json exceeds the 64 KiB limit")
         if sha256(self.lineage_json.encode("utf-8")).hexdigest() != self.lineage_hash:
             raise ValueError("lineage_hash must bind exact lineage_json")
-        for field_name in ("member_effect_id", "primary_effect_id"):
-            value = getattr(self, field_name)
-            if value is not None:
-                _require_lower_hex_64(value, field_name)
+        if self.member_effect_id is not None:
+            _require_lower_hex_64(self.member_effect_id, "member_effect_id")
+        if self.primary_effect_id is not None:
+            _require_lower_hex_64(self.primary_effect_id, "primary_effect_id")
         frozen_row = _freeze_canonical_row_value(self.row, "row")
         if not isinstance(frozen_row, Mapping):
             raise TypeError("row must be a mapping")
@@ -588,8 +590,8 @@ class SinkEffectFinalizeRequest:
         require_no_artifact_uri_credentials(self.descriptor.path_or_uri)
         if type(self.publication_performed) is not bool:
             raise TypeError("publication_performed must be exact bool")
-        expected_performed = _EVIDENCE_PERFORMED.get(self.publication_evidence_kind)
-        if expected_performed is None or expected_performed is not self.publication_performed:
+        expected_performed = _EVIDENCE_PERFORMED[self.publication_evidence_kind]
+        if expected_performed is not self.publication_performed:
             raise ValueError("publication evidence kind contradicts publication_performed")
         accepted = tuple(self.accepted_ordinals)
         diverted = tuple(self.diverted_ordinals)
@@ -649,21 +651,18 @@ class SinkEffectIdentity:
     final_manifest_identity_hash: str | None = None
 
     def __post_init__(self) -> None:
-        for field_name in (
-            "effect_id",
-            "artifact_id",
-            "artifact_idempotency_key",
-            "stream_id",
-            "config_hash",
-            "requested_target_hash",
-            "membership_or_manifest_hash",
-            "group_payload_hash",
-        ):
-            _require_lower_hex_64(getattr(self, field_name), field_name)
-        for field_name in ("snapshot_hash", "final_manifest_identity_hash"):
-            value = getattr(self, field_name)
-            if value is not None:
-                _require_lower_hex_64(value, field_name)
+        _require_lower_hex_64(self.effect_id, "effect_id")
+        _require_lower_hex_64(self.artifact_id, "artifact_id")
+        _require_lower_hex_64(self.artifact_idempotency_key, "artifact_idempotency_key")
+        _require_lower_hex_64(self.stream_id, "stream_id")
+        _require_lower_hex_64(self.config_hash, "config_hash")
+        _require_lower_hex_64(self.requested_target_hash, "requested_target_hash")
+        _require_lower_hex_64(self.membership_or_manifest_hash, "membership_or_manifest_hash")
+        _require_lower_hex_64(self.group_payload_hash, "group_payload_hash")
+        if self.snapshot_hash is not None:
+            _require_lower_hex_64(self.snapshot_hash, "snapshot_hash")
+        if self.final_manifest_identity_hash is not None:
+            _require_lower_hex_64(self.final_manifest_identity_hash, "final_manifest_identity_hash")
         _require_exact_enum(self.input_kind, SinkEffectInputKind, "input_kind")
         members = tuple(self.members)
         member_ids = tuple(self.member_ids)
@@ -1100,8 +1099,9 @@ class SinkEffectAuditExportSnapshotInput:
     def __post_init__(self) -> None:
         _require_lower_hex_64(self.snapshot_id, "snapshot_id")
         _require_nonempty_string(self.source_run_id, "source_run_id")
-        for field_name in ("registry_key_hash", "manifest_hash", "snapshot_hash"):
-            _require_lower_hex_64(getattr(self, field_name), field_name)
+        _require_lower_hex_64(self.registry_key_hash, "registry_key_hash")
+        _require_lower_hex_64(self.manifest_hash, "manifest_hash")
+        _require_lower_hex_64(self.snapshot_hash, "snapshot_hash")
         if self.serialization_version != _AUDIT_EXPORT_SERIALIZATION_VERSION:
             raise ValueError(f"serialization_version must equal {_AUDIT_EXPORT_SERIALIZATION_VERSION!r}")
         _require_exact_enum(self.export_format, AuditExportFormat, "export_format")
@@ -1226,8 +1226,9 @@ class SinkEffectPlan:
     safe_evidence: Mapping[str, object]
 
     def __post_init__(self) -> None:
-        for field_name in ("effect_id", "plan_hash", "payload_hash"):
-            _require_nonempty_string(getattr(self, field_name), field_name)
+        _require_nonempty_string(self.effect_id, "effect_id")
+        _require_nonempty_string(self.plan_hash, "plan_hash")
+        _require_nonempty_string(self.payload_hash, "payload_hash")
         if self.protocol_version != SINK_EFFECT_PROTOCOL_VERSION:
             raise ValueError(f"protocol_version must equal {SINK_EFFECT_PROTOCOL_VERSION!r}")
         _require_exact_enum(self.input_kind, SinkEffectInputKind, "input_kind")
@@ -1244,9 +1245,11 @@ class SinkEffectPlan:
             raise ValueError(f"{self.descriptor_mode.value} descriptor_mode must not claim an expected_descriptor")
         frozen_evidence = _freeze_bounded_evidence(self.safe_evidence, "safe_evidence")
         if self.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION:
-            publication_kind = frozen_evidence.get("publication_kind")
-            if publication_kind not in {"inherited", "virtual"}:
-                raise ValueError("NO_PUBLICATION safe_evidence requires publication_kind inherited or virtual")
+            if "publication_kind" not in frozen_evidence:
+                raise ValueError("NO_PUBLICATION safe_evidence requires publication_kind inherited, virtual, or reaffirmed")
+            publication_kind = frozen_evidence["publication_kind"]
+            if publication_kind not in {"inherited", "virtual", "reaffirmed"}:
+                raise ValueError("NO_PUBLICATION safe_evidence requires publication_kind inherited, virtual, or reaffirmed")
         object.__setattr__(self, "safe_evidence", deep_freeze(frozen_evidence))
 
 
@@ -1337,10 +1340,57 @@ class RestrictedSinkEffectContext:
     sink_node_id: str
 
     def __post_init__(self) -> None:
-        for field_name in ("run_id", "operation_id", "sink_node_id"):
-            _require_nonempty_string(getattr(self, field_name), field_name)
+        _require_nonempty_string(self.run_id, "run_id")
+        _require_nonempty_string(self.operation_id, "operation_id")
+        _require_nonempty_string(self.sink_node_id, "sink_node_id")
         if not isinstance(self.run_started_at, datetime):
             raise TypeError("run_started_at must be datetime")
+
+
+class SinkEffectContract:
+    """Nominal participation marker for the recoverable effect contract.
+
+    Runtime plugin classes cross a genuine unknown-code boundary. Admission
+    uses this identity once, then trusts the declared contract directly and
+    fails loudly when any required declaration or method is missing.
+    """
+
+
+class MemberSinkEffectCapability:
+    """Nominal opt-in for sinks that publish one durable effect per member."""
+
+    def commit_member_effect(
+        self,
+        plan: SinkEffectPlan,
+        member: SinkEffectMember,
+        effect_input: SinkEffectPipelineMembersInput,
+        ctx: RestrictedSinkEffectContext,
+    ) -> SinkEffectCommitResult:
+        """Commit one member effect."""
+        raise NotImplementedError
+
+    def reconcile_member_effect(
+        self,
+        plan: SinkEffectPlan,
+        member: SinkEffectMember,
+        effect_input: SinkEffectPipelineMembersInput,
+        ctx: RestrictedSinkEffectContext,
+    ) -> SinkEffectReconcileResult:
+        """Reconcile one member effect."""
+        raise NotImplementedError
+
+
+class RestagingSinkEffectCapability:
+    """Nominal opt-in for sinks that can reconstruct a lost staged body."""
+
+    def restage_effect(
+        self,
+        plan: SinkEffectPlan,
+        effect_input: SinkEffectPipelineMembersInput,
+        ctx: RestrictedSinkEffectContext,
+    ) -> None:
+        """Rebuild and verify a staged body from durable input."""
+        raise NotImplementedError
 
 
 __all__ = [
@@ -1349,7 +1399,9 @@ __all__ = [
     "AuditExportSignedManifestInput",
     "AuditExportSigningMode",
     "AuditExportSnapshotChunkInput",
+    "MemberSinkEffectCapability",
     "ResolvedSinkEffectMode",
+    "RestagingSinkEffectCapability",
     "RestrictedAuditExportSnapshotReader",
     "RestrictedSinkEffectContext",
     "SinkEffectAttemptAction",
@@ -1358,6 +1410,7 @@ __all__ = [
     "SinkEffectAttemptState",
     "SinkEffectAuditExportSnapshotInput",
     "SinkEffectCommitResult",
+    "SinkEffectContract",
     "SinkEffectDescriptorMode",
     "SinkEffectExecutionPurpose",
     "SinkEffectFinalizationMember",

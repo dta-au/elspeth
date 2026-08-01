@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 README = REPO_ROOT / "README.md"
 
@@ -15,6 +17,7 @@ def _readme_text() -> str:
 
 def test_readme_advertises_current_release_surface() -> None:
     text = _readme_text()
+    normalized = " ".join(text.split())
 
     # Current release line is shown, not a stale RC badge.
     assert "Status: 0.7.2" in text
@@ -23,10 +26,11 @@ def test_readme_advertises_current_release_surface() -> None:
     assert "## What Changed In 0.7.2" in text
     assert "Current 0.7.2 behaviour:" in text
     assert "Current 0.7.1 behaviour:" not in text
-    assert "session store moves\nfrom epoch 35 to 37" in text
-    assert "coordination schema" in text
+    assert f"session store moves\nfrom epoch 35 to {SESSION_SCHEMA_EPOCH}" in text
+    assert "compatible-generation coordination" in normalized
+    assert "persistent session-operation authority" in normalized
     assert "guided schema remains at 10" in text
-    assert "Landscape remains at epoch 29" in text
+    assert "Landscape moves from epoch\n29 to 30" in text
 
     # Key evaluator-facing release references remain.
     assert "[Audit and Lineage Guarantees](docs/release/guarantees.md)" in text

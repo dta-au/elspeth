@@ -4,6 +4,7 @@ import { useBlobStore } from "./blobStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
 import type {
+  ApiError,
   ChatMessage,
   ComposerPreferences,
   ComposerRecoveryError,
@@ -143,6 +144,32 @@ function makeRecoveryError(
       tool_responses_persisted: 1,
       transcript_url: null,
     },
+  };
+}
+
+// ── R2-F9: wall-clock timeout 422 (elspeth-114dd261bc) ─────────────────────
+//
+// The route handler persists the salvaged partial pipeline as a NEW
+// composition-state version and the next turn resumes from it, so the partial
+// IS the session's current state. Leaving the pre-request graph on screen —
+// under copy that says nothing was kept — is a lie the user acts on.
+function makeTimeoutError(overrides: Partial<ApiError> = {}): ApiError {
+  return {
+    status: 422,
+    error_type: "convergence",
+    detail: "Composer did not converge within 6 turns (budget exhausted: timeout).",
+    reason: "convergence_wall_clock_timeout",
+    recovery_text:
+      "Retry once the provider responds faster, or ask an operator to raise the composer wall-clock budget.",
+    timeout_seconds: 240,
+    partial_state: makeCompositionState(6),
+    failed_turn: {
+      assistant_message_id: "assistant-9",
+      tool_calls_attempted: 3,
+      tool_responses_persisted: 3,
+      transcript_url: null,
+    },
+    ...overrides,
   };
 }
 
@@ -608,6 +635,183 @@ describe("sessionStore", () => {
 
       const state = useSessionStore.getState();
       expect(state.error).toContain("couldn't complete the composition");
+    });
+
+    it("names the elapsed budget and the salvaged draft on a wall-clock timeout", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        makeTimeoutError(),
+      );
+
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(5),
+      });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.error).toContain(
+        "ELSPETH ran out of time (240s). Your partial pipeline was saved — continue from it or retry.",
+      );
+      // The body's own recovery_text names the next practical action.
+      expect(state.error).toContain(
+        "ask an operator to raise the composer wall-clock budget",
+      );
+      expect(state.error).not.toContain("after multiple attempts");
+    });
+
+    it("shows the salvaged partial pipeline instead of the stale graph", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      const timeoutError = makeTimeoutError();
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        timeoutError,
+      );
+
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: makeCompositionState(5),
+      });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.compositionState).toBe(timeoutError.partial_state);
+      // The recovery panel is now reachable (failed_turn rides the 422)...
+      expect(state.recoveryError).toBe(timeoutError);
+      // ...and its apply-confirmation gate exists to catch a CONCURRENT
+      // third-party edit. Our own fold-in of the partial is not one, so the
+      // baseline moves with the store rather than firing a false alarm.
+      expect(state.recoveryStartedCompositionVersion).toBe(6);
+    });
+
+    it("does not claim a saved draft when the timeout salvaged nothing", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        makeTimeoutError({ partial_state: null, failed_turn: null }),
+      );
+
+      const before = makeCompositionState(5);
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        compositionState: before,
+      });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.error).toContain("ELSPETH ran out of time (240s).");
+      expect(state.error).not.toContain("partial pipeline was saved");
+      expect(state.compositionState).toBe(before);
+    });
+
+    it("omits the elapsed budget when the 422 did not report one", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        makeTimeoutError({ timeout_seconds: undefined }),
+      );
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      // Never name a number the response did not stand behind.
+      expect(useSessionStore.getState().error).toContain(
+        "ELSPETH ran out of time. Your partial pipeline was saved",
+      );
+    });
+
+    it("keeps the turn-budget copy for the non-timeout convergence causes", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 422,
+        error_type: "convergence",
+        detail: "ignored",
+        reason: "convergence_composition_budget",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.error).toContain("after multiple attempts");
+      expect(state.error).not.toContain("ran out of time");
+    });
+
+    it("threads failure_code onto the failed optimistic message for policy_blocked (S1)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      // policy_blocked is permanent by construction — a deployment policy
+      // refused the pipeline — so the failed row must carry the code for
+      // the Retry affordance to suppress itself (MessageBubble).
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 403,
+        detail: "This pipeline is not permitted by deployment policy.",
+        failure_code: "policy_blocked",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.isComposing).toBe(false);
+      expect(state.messages[0].local_status).toBe("failed");
+      expect(state.messages[0].local_failure_code).toBe("policy_blocked");
+    });
+
+    it("leaves local_failure_code unset when the send failure carries no failure_code (S1)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 500,
+        detail: "Something went wrong.",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.messages[0].local_status).toBe("failed");
+      expect(state.messages[0].local_failure_code).toBeUndefined();
+    });
+
+    it("renders the honest audit-integrity banner and keeps the saved user row un-failed (F-4b)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      // The fail-closed audit-integrity 500 is a READ-side verification
+      // refusal: the user row was committed before every raise site, so the
+      // banner must say "your message was saved" (with the request id as the
+      // support reference) and the optimistic row must NOT be marked failed —
+      // a failed marker invites re-sending a duplicate of a committed row.
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 500,
+        error_type: "audit_integrity_error",
+        detail:
+          "ELSPETH stopped before replying because it could not verify this session's audit trail.",
+        request_id: "req-0123456789ab",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.isComposing).toBe(false);
+      expect(state.error).toContain("ELSPETH stopped before replying");
+      expect(state.error).toContain("Your message was saved.");
+      expect(state.error).toContain("Reload the session");
+      expect(state.error).toContain("req-0123456789ab");
+      expect(state.messages[0].local_status).toBeUndefined();
+      expect(state.messages[0].local_error).toBeUndefined();
+    });
+
+    it("omits the request-id reference when the audit-integrity envelope carries none (F-4b)", async () => {
+      const { sendMessage: mockSendMessage } = await import("@/api/client");
+      (mockSendMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+        status: 500,
+        error_type: "audit_integrity_error",
+        detail: "ignored",
+      });
+
+      useSessionStore.setState({ activeSessionId: "session-1" });
+      await useSessionStore.getState().sendMessage("hello");
+
+      const state = useSessionStore.getState();
+      expect(state.error).toContain("Your message was saved.");
+      expect(state.error).not.toContain("request ID");
+      expect(state.messages[0].local_status).toBeUndefined();
     });
 
     it("maps a client-side AbortError to the compose-timeout copy, not the generic fallback", async () => {
@@ -2422,6 +2626,40 @@ describe("sessionStore", () => {
       expect(state.error).not.toContain("Failed to send message");
       expect(state.messages[0].local_status).toBe("failed");
       expect(state.messages[0].local_error).toBe(state.error);
+    });
+
+    it("surfaces the timeout copy and the salvaged draft on the recompose path (R2-F9)", async () => {
+      // The 422 handler is shared by send_message and recompose, so the
+      // store's two catch arms must not drift apart.
+      const { recompose: mockRecompose } = await import("@/api/client");
+      const timeoutError = makeTimeoutError();
+      (mockRecompose as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        timeoutError,
+      );
+
+      const userMessage: ChatMessage = {
+        id: "user-1",
+        session_id: "session-1",
+        role: "user",
+        content: "hello",
+        tool_calls: null,
+        created_at: new Date().toISOString(),
+      };
+      useSessionStore.setState({
+        activeSessionId: "session-1",
+        messages: [userMessage],
+        compositionState: makeCompositionState(5),
+      });
+
+      await useSessionStore.getState().retryMessage("user-1");
+
+      const state = useSessionStore.getState();
+      expect(state.error).toContain(
+        "ELSPETH ran out of time (240s). Your partial pipeline was saved — continue from it or retry.",
+      );
+      expect(state.compositionState).toBe(timeoutError.partial_state);
+      expect(state.recoveryError).toBe(timeoutError);
+      expect(state.recoveryStartedCompositionVersion).toBe(6);
     });
 
     it("resyncs durable server state after an aborted retry (elspeth-06a23adfcc)", async () => {

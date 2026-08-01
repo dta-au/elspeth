@@ -12,6 +12,7 @@ import weakref
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -30,9 +31,11 @@ import elspeth.web.app as app_module
 import elspeth.web.deployment_contract as deployment_contract_module
 from elspeth.contracts import RunStatus
 from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
+from elspeth.web import aws_rds_trust as aws_rds_trust_module
 from elspeth.web.app import (
     _BodySizeLimitMiddleware,
     _BrowserDocumentHeadersMiddleware,
@@ -57,6 +60,29 @@ from elspeth.web.sessions.protocol import (
 )
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+
+
+@pytest.fixture(autouse=True)
+def _verified_aws_rds_trust_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the immutable RDS trust-root verification for app-factory tests.
+
+    The image-baked trust bundle at ``aws_rds_trust.AWS_RDS_GLOBAL_BUNDLE_PATH``
+    only exists inside the built container, not in the unit-test environment.
+    These tests exercise startup validation ordering unrelated to that
+    verification, so stub a passing report the same way
+    ``tests/unit/web/test_aws_ecs_startup.py::_verified_trust_root`` does; no
+    test in this module asserts on the trust-root failure path itself.
+    """
+    monkeypatch.setattr(
+        aws_rds_trust_module,
+        "verify_aws_rds_trust_bundle",
+        lambda: aws_rds_trust_module.AwsRdsTrustBundleReport(
+            path=str(aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_PATH),
+            expected_sha256=aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_SHA256,
+            actual_sha256=aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_SHA256,
+            certificate_count=108,
+        ),
+    )
 
 
 def _settings(tmp_path: Path, **overrides) -> WebSettings:
@@ -84,13 +110,23 @@ def _external_settings(tmp_path: Path, deployment_target: str, **overrides: obje
     for directory in (data_dir, data_dir / "blobs", payload_dir):
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         directory.chmod(0o700)
+    if deployment_target == "aws-ecs":
+        # aws-ecs uniquely requires authenticated TLS pinned to the immutable
+        # RDS trust root (deployment_contract._has_approved_aws_ecs_tls_query).
+        tls_query = f"sslmode=verify-full&sslrootcert={aws_rds_trust_module.AWS_RDS_GLOBAL_BUNDLE_PATH}"
+    else:
+        # Non-aws external targets still exercise authenticated TLS, but may
+        # trust the platform's certificate store.
+        tls_query = "sslmode=verify-full&sslrootcert=system"
+    session_db_url = f"postgresql+psycopg://runtime:session-secret@db/session?{tls_query}"
+    landscape_url = f"postgresql+psycopg://runtime:landscape-secret@db/landscape?{tls_query}"
     values: dict[str, object] = {
         "deployment_target": deployment_target,
         "deployment_state_mode": "external-postgresql",
         "host": "0.0.0.0" if deployment_target in {"docker-compose", "aws-ecs", "azure-container-apps", "kubernetes"} else "127.0.0.1",
         "payload_store_path": payload_dir,
-        "session_db_url": ("postgresql+psycopg://runtime:session-secret@db/session?sslmode=verify-full&sslrootcert=system"),
-        "landscape_url": ("postgresql+psycopg://runtime:landscape-secret@db/landscape?sslmode=verify-full&sslrootcert=system"),
+        "session_db_url": session_db_url,
+        "landscape_url": landscape_url,
         "secret_key": "this-app-external-startup-secret-is-long-enough",
         "shareable_link_signing_key": SecretBytes(bytes(range(32))),
     }
@@ -615,7 +651,7 @@ class TestSystemStatusEndpoint:
                         "region_name": "ap-southeast-2",
                     }
                 },
-                tutorial_llm_profile="tutorial-default",
+                default_llm_profile="tutorial-default",
             )
         )
         response = TestClient(app).get("/api/system/status")
@@ -1378,9 +1414,28 @@ class TestLifespanShutdown:
         session_service = app.state.session_service
         session = await session_service.create_session("alice", "Pipeline", "local")
         state = await session_service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        web_run = await session_service.create_run(session.id, state.id)
         landscape_run_id = "lscp-startup-orphan"
-        await session_service.update_run_status(web_run.id, "running", landscape_run_id=landscape_run_id)
+        authority = session_service.session_operation_authority
+        execute_context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=session_service.session_operation_owner_instance_id,
+            lease_seconds=session_service.session_operation_lease_seconds,
+        )
+        try:
+            web_run = await session_service.create_run(
+                session.id,
+                state.id,
+                session_operation_context=execute_context,
+            )
+            await session_service.update_run_status(
+                web_run.id,
+                "running",
+                landscape_run_id=landscape_run_id,
+                session_operation_context=execute_context,
+            )
+        finally:
+            authority.release(execute_context)
 
         with LandscapeDB.from_url(app.state.settings.get_landscape_url()) as db:
             RecorderFactory(db).run_lifecycle.begin_run(
@@ -1420,8 +1475,27 @@ class TestLifespanShutdown:
         service = app.state.session_service
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        web_run = await service.create_run(session.id, state.id)
-        await service.update_run_status(web_run.id, "running", landscape_run_id="RAW_ABSENT_ANCHOR_SENTINEL")
+        authority = service.session_operation_authority
+        execute_context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        try:
+            web_run = await service.create_run(
+                session.id,
+                state.id,
+                session_operation_context=execute_context,
+            )
+            await service.update_run_status(
+                web_run.id,
+                "running",
+                landscape_run_id="RAW_ABSENT_ANCHOR_SENTINEL",
+                session_operation_context=execute_context,
+            )
+        finally:
+            authority.release(execute_context)
 
         with capture_logs() as logs, patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
             async with lifespan(app):
@@ -1454,7 +1528,21 @@ class TestLifespanShutdown:
         service = app.state.session_service
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        web_run = await service.create_run(session.id, state.id)
+        authority = service.session_operation_authority
+        execute_context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        try:
+            web_run = await service.create_run(
+                session.id,
+                state.id,
+                session_operation_context=execute_context,
+            )
+        finally:
+            authority.release(execute_context)
 
         real_finalize = app_module._finalize_orphaned_landscape_runs
 
@@ -1476,9 +1564,28 @@ class TestLifespanShutdown:
         service = app.state.session_service
         session = await service.create_session("alice", "Pipeline", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        web_run = await service.create_run(session.id, state.id)
         landscape_run_id = "landscape-marker-retry"
-        await service.update_run_status(web_run.id, "running", landscape_run_id=landscape_run_id)
+        authority = service.session_operation_authority
+        execute_context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+        try:
+            web_run = await service.create_run(
+                session.id,
+                state.id,
+                session_operation_context=execute_context,
+            )
+            await service.update_run_status(
+                web_run.id,
+                "running",
+                landscape_run_id=landscape_run_id,
+                session_operation_context=execute_context,
+            )
+        finally:
+            authority.release(execute_context)
         with LandscapeDB.from_url(app.state.settings.get_landscape_url()) as db:
             RecorderFactory(db).run_lifecycle.begin_run(
                 config={},
@@ -1558,6 +1665,79 @@ class TestLifespanShutdown:
             assert attributes["probe_status"] == "success"
 
     @pytest.mark.asyncio
+    async def test_lifespan_probes_each_role_against_its_own_endpoint(self, monkeypatch, tmp_path) -> None:
+        """Phase 3 Task 2: each role probes ITS OWN configured endpoint — a
+        misconfigured custom endpoint must fail boot, not a user's first turn.
+        The primary and advisor endpoints are deliberately different here to
+        prove there is no cross-role mixup.
+        """
+        app = create_app(
+            _settings(
+                tmp_path,
+                composer_boot_probe_enabled=True,
+                composer_advisor_model="anthropic/claude-sonnet-4-6",
+                composer_endpoint_base_url="https://primary-gateway.example.test/v1",
+                composer_endpoint_api_key="primary-bearer-token",  # secret-scan: allow-this-line
+                composer_advisor_endpoint_base_url="https://advisor-gateway.example.test/v1",
+                composer_advisor_endpoint_api_key="advisor-bearer-token",  # secret-scan: allow-this-line
+            )
+        )
+        probed: list[dict[str, object]] = []
+        counter = _RecordingCounter()
+        latency = _RecordingHistogram()
+
+        async def _probe(**kwargs: object) -> bool:
+            probed.append(kwargs)
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
+
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                pass
+
+        assert len(probed) == 2
+        primary_call, advisor_call = probed
+        assert primary_call["model"] == "gpt-5.5"
+        assert primary_call["api_base"] == "https://primary-gateway.example.test/v1"
+        assert primary_call["api_key"] == "primary-bearer-token"  # secret-scan: allow-this-line
+        assert advisor_call["model"] == "anthropic/claude-sonnet-4-6"
+        assert advisor_call["api_base"] == "https://advisor-gateway.example.test/v1"
+        assert advisor_call["api_key"] == "advisor-bearer-token"  # secret-scan: allow-this-line
+
+    @pytest.mark.asyncio
+    async def test_lifespan_probe_omits_endpoint_kwargs_when_unset(self, monkeypatch, tmp_path) -> None:
+        app = create_app(
+            _settings(
+                tmp_path,
+                composer_boot_probe_enabled=True,
+                composer_advisor_model="anthropic/claude-sonnet-4-6",
+            )
+        )
+        probed: list[dict[str, object]] = []
+        counter = _RecordingCounter()
+        latency = _RecordingHistogram()
+
+        async def _probe(**kwargs: object) -> bool:
+            probed.append(kwargs)
+            return True
+
+        monkeypatch.setattr("elspeth.web.composer.boot_probe.probe_composer_config", _probe)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_COUNTER", counter)
+        monkeypatch.setattr("elspeth.web.app._COMPOSER_BOOT_CONFIG_PROBE_LATENCY", latency)
+
+        with patch("httpx.AsyncClient", return_value=_StaticAsyncClient([])):
+            async with lifespan(app):
+                pass
+
+        assert len(probed) == 2
+        for call in probed:
+            assert call["api_base"] is None
+            assert call["api_key"] is None
+
+    @pytest.mark.asyncio
     async def test_lifespan_records_transient_failure_when_composer_probe_times_out(self, monkeypatch, tmp_path) -> None:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=True))
         counter = _RecordingCounter()
@@ -1623,8 +1803,27 @@ class TestLifespanShutdown:
 
     @pytest.mark.asyncio
     async def test_lifespan_propagates_catalog_client_context_failure(self, tmp_path) -> None:
-        """Outer HTTP-client construction failures are startup failures, not fallback decisions."""
-        app = create_app(_settings(tmp_path))
+        """Outer HTTP-client construction failures are startup failures, not fallback decisions.
+
+        The catalog prime is gated on OpenRouter being a configured LLM
+        provider (elspeth-c67ba40e4a), so the deployment must bind an
+        ``openrouter`` profile for the probe client to be constructed at
+        all — without one the prime (and this failure mode) never runs.
+        """
+        app = create_app(
+            _settings(
+                tmp_path,
+                llm_profiles={
+                    "tutorial": {
+                        "provider": "openrouter",
+                        "model": "openai/gpt-5-mini",
+                        "credential_scope": "server",
+                        "credential_ref": "OPENROUTER_API_KEY",
+                    }
+                },
+                default_llm_profile="tutorial",
+            )
+        )
 
         with (
             patch("httpx.AsyncClient", return_value=_EnteringAsyncClientRaises()),
@@ -1794,7 +1993,7 @@ class TestSettingsFromEnv:
             "ELSPETH_WEB__LLM_PROFILES",
             '{"tutorial": {"provider": "bedrock", "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0"}}',
         )
-        monkeypatch.setenv("ELSPETH_WEB__TUTORIAL_LLM_PROFILE", "tutorial")
+        monkeypatch.setenv("ELSPETH_WEB__DEFAULT_LLM_PROFILE", "tutorial")
 
         settings = settings_from_env()
 
@@ -3400,3 +3599,108 @@ class TestAwsEcsValidateOnlyStartup:
         assert (data_dir / "runs").is_dir()
         assert initialize_calls == 1
         app.state.session_engine.dispose()
+
+
+class TestBootPrimeOpenRouterCatalogGate:
+    """elspeth-c67ba40e4a: boot catalog prime follows configured LLM providers.
+
+    A deployment must not egress to providers it has not configured: the
+    boot-time OpenRouter ``/models`` prime runs only when a configured LLM
+    profile binds the ``openrouter`` provider. Bedrock-only (AWS ECS via
+    the task role) and profile-less deployments skip the prime entirely —
+    no request to openrouter.ai — and serve the bundled litellm fallback.
+    """
+
+    _OPENROUTER_PROFILE: ClassVar[dict[str, str]] = {
+        "provider": "openrouter",
+        "model": "openai/gpt-5-mini",
+        "credential_scope": "server",
+        "credential_ref": "OPENROUTER_API_KEY",
+    }
+    _BEDROCK_PROFILE: ClassVar[dict[str, str]] = {
+        "provider": "bedrock",
+        "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+        "region_name": "ap-southeast-2",
+    }
+
+    def _run_boot_prime(self, settings: WebSettings, monkeypatch, *, prime_result: bool = True) -> tuple[int, list[dict]]:
+        """Run the boot-prime helper with the live prime mocked out.
+
+        Returns ``(prime_call_count, captured_logs)``. The mock replaces
+        ``prime_openrouter_catalog_from_live`` on the app module so no
+        real HTTP request can occur regardless of the gate's decision.
+        """
+        calls: list[object] = []
+
+        async def _fake_prime(*, http_get: object) -> bool:
+            calls.append(http_get)
+            return prime_result
+
+        monkeypatch.setattr(app_module, "prime_openrouter_catalog_from_live", _fake_prime)
+        with capture_logs() as logs:
+            asyncio.run(app_module._boot_prime_openrouter_catalog(settings))
+        return len(calls), logs
+
+    def _event(self, logs: list[dict], event: str) -> dict:
+        matches = [entry for entry in logs if entry["event"] == event]
+        assert len(matches) == 1, f"expected exactly one {event!r} log, got {logs!r}"
+        return matches[0]
+
+    def test_bedrock_only_deployment_skips_prime(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(
+            tmp_path,
+            llm_profiles={"llm-default": dict(self._BEDROCK_PROFILE)},
+            default_llm_profile="llm-default",
+        )
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch)
+
+        assert prime_calls == 0
+        skipped = self._event(logs, "openrouter_catalog_boot_prime_skipped")
+        assert skipped["configured_llm_providers"] == ("bedrock",)
+        assert not any(entry["event"] == "openrouter_catalog_boot_prime_complete" for entry in logs)
+
+    def test_no_llm_profiles_skips_prime(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(tmp_path)
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch)
+
+        assert prime_calls == 0
+        skipped = self._event(logs, "openrouter_catalog_boot_prime_skipped")
+        assert skipped["configured_llm_providers"] == ()
+
+    def test_openrouter_deployment_primes(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(
+            tmp_path,
+            llm_profiles={"tutorial": dict(self._OPENROUTER_PROFILE)},
+            default_llm_profile="tutorial",
+        )
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch)
+
+        assert prime_calls == 1
+        self._event(logs, "openrouter_catalog_boot_prime_complete")
+        assert not any(entry["event"] == "openrouter_catalog_boot_prime_skipped" for entry in logs)
+
+    def test_mixed_providers_primes_once(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(
+            tmp_path,
+            llm_profiles={
+                "tutorial": dict(self._OPENROUTER_PROFILE),
+                "bedrock-task-role": dict(self._BEDROCK_PROFILE),
+            },
+            default_llm_profile="tutorial",
+        )
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch)
+
+        assert prime_calls == 1
+        self._event(logs, "openrouter_catalog_boot_prime_complete")
+
+    def test_failed_prime_logs_fallback_warning(self, tmp_path, monkeypatch) -> None:
+        settings = _settings(
+            tmp_path,
+            llm_profiles={"tutorial": dict(self._OPENROUTER_PROFILE)},
+            default_llm_profile="tutorial",
+        )
+        prime_calls, logs = self._run_boot_prime(settings, monkeypatch, prime_result=False)
+
+        assert prime_calls == 1
+        failed = self._event(logs, "openrouter_catalog_boot_prime_failed")
+        assert failed["log_level"] == "warning"

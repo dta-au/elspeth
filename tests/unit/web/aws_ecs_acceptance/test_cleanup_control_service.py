@@ -37,6 +37,43 @@ def test_facade_reexports_cleanup_and_control_service_owners_by_identity() -> No
         assert getattr(acceptance, name) is getattr(control_service, name)
 
 
+def test_control_manifest_validate_fails_loudly_for_corrupt_final_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest: dict[str, object] = {
+        "acceptance_run_id": "run-1",
+        "candidate_sha": "a" * 40,
+        "teardown_deadline_utc": "2026-07-14T01:00:00Z",
+        "cleanup_required": False,
+        "cleanup_states": {},
+        "deadline_failure_recorded": False,
+        "final_evidence": {},
+    }
+    monkeypatch.setattr(control_service, "_read_control_manifest", lambda _path: manifest)
+
+    with pytest.raises(KeyError, match="phase"):
+        control_service.control_manifest_validate(
+            tmp_path / "control.json",
+            cleanup_only=True,
+            require_cleanup_cleared=True,
+            now=lambda: datetime(2026, 7, 14, 1, 1, tzinfo=UTC),
+        )
+
+
+def test_committed_cleanup_replay_fails_loudly_for_corrupt_internal_state(tmp_path: Path) -> None:
+    with pytest.raises(TypeError):
+        cleanup._validate_committed_cleanup_replay(
+            tmp_path / "control.json",
+            {
+                "final_evidence": "corrupt",
+                "cleanup_required": False,
+            },
+            {},
+            receipts_sha256="a" * 64,
+        )
+
+
 def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(tmp_path: Path) -> None:
     manifest_path = tmp_path / "control.json"
     _init_control_manifest(manifest_path)
@@ -82,8 +119,11 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
                 "landscape_epoch": 29,
                 "run_web_plugin_policy_present": True,
             },
-            "structural_changes": "session_epoch_35_to_37_coordination_schema",
-            "semantics_only_changes": "none",
+            "structural_changes": (
+                f"session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}"
+                "_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema"
+            ),
+            "semantics_only_changes": "guided_coalesce_timeout_seconds_and_node_options_summary_required",
             "archive_export_decision": "required_before_forward_migration",
             "destructive_reset_required": False,
         },
@@ -141,7 +181,10 @@ def test_compatibility_record_is_bound_to_resolved_scenario_and_stored_by_hash(t
         (("schema_facts", "previous", "session_epoch"), 34),
         (
             ("schema_facts", "structural_changes"),
-            "session_epoch_34_to_37_coordination_schema",
+            (
+                f"session_epoch_34_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_{SQLITE_SCHEMA_EPOCH}"
+                "_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema"
+            ),
         ),
     ):
         mutated = json.loads(json.dumps(record))
@@ -336,7 +379,11 @@ def test_cleanup_evidence_finalize_is_two_phase_refuses_pending_and_clears_only_
         assert final_receipt.read_bytes() == committed_receipt_bytes
 
     version_directory = tmp_path / "version-2"
+    # _validate_control_parent requires a private (no group/other bits)
+    # manifest parent; a bare mkdir() inherits umask-widened modes, so pin
+    # the mode explicitly after creation.
     version_directory.mkdir()
+    os.chmod(version_directory, 0o700)
     versioned_manifest_path = version_directory / "control.json"
     _init_control_manifest(
         versioned_manifest_path,

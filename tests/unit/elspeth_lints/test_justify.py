@@ -2246,6 +2246,7 @@ def test_call_judge_static_policy_sections_not_accidentally_dropped(tmp_path: Pa
     fake_client = client_class.return_value
     create_call = fake_client.chat.completions.create.call_args
     sys_text = create_call.kwargs["messages"][0]["content"][0]["text"]
+    normalized = " ".join(sys_text.split())
 
     # Tier-model vocabulary
     assert "Tier 1: Our Data" in sys_text
@@ -2254,10 +2255,11 @@ def test_call_judge_static_policy_sections_not_accidentally_dropped(tmp_path: Pa
     assert "FULL TRUST" in sys_text
     assert "ZERO TRUST" in sys_text
 
-    # Persistence / second-order boundary rule (a validated value re-read from
-    # our own store is Tier-3 again — load-bearing for the persisted-config
-    # misclassification the judge must catch).
-    assert "Validation is in-flight, not permanent" in sys_text
+    # Serialization is a courier, not an author. It must not demote Tier 1 or
+    # promote unowned content merely because either crossed storage.
+    assert "Serialization preserves authorship and trust tier" in sys_text
+    assert "Serialization never demotes Tier 1" in sys_text
+    assert "Trace who authored the value and whether a declared boundary contract promoted it" in normalized
 
     # Fabrication-decision test (load-bearing for §6 of the heuristic)
     assert "fabrication-decision test" in sys_text
@@ -2282,7 +2284,6 @@ def test_call_judge_static_policy_sections_not_accidentally_dropped(tmp_path: Pa
     # Wrap-insensitive: this canonical phrase can straddle a line break, so
     # check it against whitespace-normalized text (a drop-guard should detect
     # presence, not pin the exact reflow).
-    normalized = " ".join(sys_text.split())
     assert "conservative prior: lean toward BLOCKED" in normalized
     assert "rationale_duplicate_count" in sys_text
 

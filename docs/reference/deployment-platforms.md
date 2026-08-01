@@ -5,10 +5,11 @@ artifacts. The image contains PostgreSQL clients, not a PostgreSQL server or
 `psql`. These clients are the psycopg v3 and psycopg2 Python drivers; both
 `postgresql+psycopg://` and `postgresql+psycopg2://` URLs work. The final
 runtime is a pinned non-root distroless image with no package manager. Compose
-is the only shipped bundle that provisions PostgreSQL. AWS ECS, Azure
-production, and Kubernetes BYO deployments require operator-provided external
-PostgreSQL. Native Linux may instead use SQLite on one persistent host or
-external PostgreSQL.
+provisions a PostgreSQL container; the tracked AWS ECS Terraform package
+provisions Aurora PostgreSQL outside the application task. Azure production
+and Kubernetes BYO deployments require operator-provided external PostgreSQL.
+Native Linux may instead use SQLite on one persistent host or external
+PostgreSQL.
 
 Use an immutable, release-specific image tag or digest. ELSPETH web currently
 supports one web process or replica. Payload persistence is separate from
@@ -19,14 +20,14 @@ database persistence: preserve both stores across every replacement.
 | Profile | Database | Payload storage | Deployment entry point | Status |
 | --- | --- | --- | --- | --- |
 | Docker Compose | Bundled PostgreSQL sidecar, or operator external PostgreSQL; SQLite remains suitable for CLI/local work | Named `elspeth_state` volume | [Docker guide](../guides/docker.md) and [`deploy/compose`](../../deploy/compose) three-file bundle | Maintained |
-| AWS ECS | External Aurora PostgreSQL or PostgreSQL | EFS or another external filesystem | [Existing-service redeploy](../runbooks/aws-ecs-existing-service-redeploy.md); [full disposable acceptance](../runbooks/aws-ecs-deployment.md) | Maintained |
+| AWS ECS | Terraform-provisioned Aurora PostgreSQL for a cold install, or the existing service's external PostgreSQL | Terraform-provisioned EFS for a cold install, or the existing service's persistent filesystem | [Cold install](../runbooks/aws-ecs-cold-install.md) with [`deploy/aws-ecs/terraform`](../../deploy/aws-ecs/terraform); [existing-service redeploy](../runbooks/aws-ecs-existing-service-redeploy.md); [full disposable acceptance](../runbooks/aws-ecs-deployment.md) | Maintained disposable single-replica package |
 | Azure Ubuntu VM | External Azure Database for PostgreSQL in production; SQLite only for explicitly non-production use on one persistent host | Persistent host storage | [Native Linux/Azure VM runbook](../runbooks/ansible-ubuntu-deployment.md) using [`deploy/linux-systemd/elspeth-web.service`](../../deploy/linux-systemd/elspeth-web.service) | Maintained as exactly one Azure Ubuntu VM |
 | Kubernetes (BYO manifests) | External PostgreSQL | Operator-provided persistent payload storage | BYO manifests only | Runtime contract only; no maintained bundle in this release |
 | Native Linux | SQLite on one single host, or external PostgreSQL | Persistent host directory | [Native Linux/Azure VM runbook](../runbooks/ansible-ubuntu-deployment.md) and [portable systemd unit](../../deploy/linux-systemd/elspeth-web.service) | Maintained |
 
 There is no generated deployment-profile schema in this release. The tracked
-deployment artifacts are the Compose and portable systemd bundles plus the AWS
-acceptance/deployment controller described by its runbook.
+deployment artifacts are the Compose and portable systemd bundles, the AWS ECS
+Terraform package, and the release-specific AWS acceptance controller.
 
 ## Shared production contract
 
@@ -55,20 +56,27 @@ state volumes have independent lifecycles.
 
 ## AWS ECS
 
-AWS uses one ECS task, external Aurora PostgreSQL/PostgreSQL, and durable EFS
-paths. For an everyday image/config replacement, follow the
+For a new stack, follow the
+[AWS ECS cold-install runbook](../runbooks/aws-ecs-cold-install.md). Its tracked
+[Terraform package](../../deploy/aws-ecs/terraform) creates a VPC, Aurora
+PostgreSQL, separate session and Landscape databases and roles, EFS/S3
+storage, the ECS/Fargate service and ALB, CloudWatch/X-Ray monitoring, Bedrock
+guardrails, and bounded task roles. The service remains disabled until a
+schema-owner doctor and then the least-privilege runtime doctor both pass.
+
+For an everyday image/config replacement on an existing service, follow the
 [existing-service redeploy runbook](../runbooks/aws-ecs-existing-service-redeploy.md).
 It discovers the current service, publishes an immutable ECR image, requires
 the registry scan, clones the selected task definition narrowly, runs a
 one-shot doctor, and proves the candidate task and both probes.
 
 The exhaustive [full acceptance runbook](../runbooks/aws-ecs-deployment.md)
-provisions and destroys a disposable two-scenario environment using an
-external Terraform package. It is not the everyday redeploy procedure. That
-program's operator supplies candidate, doctor, and previous task-definition
-ARNs; the controller validates them and enforces `minimumHealthyPercent=0`,
-`maximumPercent=100`, and `desiredCount=1` so replacement is deliberately
-zero-overlap.
+provisions, exercises, and destroys a disposable two-scenario release
+qualification environment. It is neither the cold-install path nor the
+everyday redeploy procedure. Its acceptance controller consumes explicitly
+selected candidate, doctor, and previous task-definition ARNs and enforces
+`minimumHealthyPercent=0`, `maximumPercent=100`, and `desiredCount=1` so
+replacement is deliberately zero-overlap.
 
 ## Azure
 

@@ -17,6 +17,8 @@ import structlog
 from sqlalchemy import event, func, insert, select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
     ArchiveManifestRelation,
@@ -49,8 +51,10 @@ from elspeth.web.sessions.archive_quarantine import (
 )
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
+    chat_messages_table,
     composer_completion_events_table,
     composition_states_table,
+    guided_operation_events_table,
     run_events_table,
     runs_table,
     session_operation_fences_table,
@@ -63,6 +67,7 @@ from elspeth.web.sessions.protocol import (
     ChatMessageRecord,
     CompositionStateData,
     CompositionStateRecord,
+    GuidedOperationClaimed,
     RunAlreadyActiveError,
     RunRecord,
     SessionGuidedOperationInProgressError,
@@ -2889,3 +2894,292 @@ class TestPruneStateVersions:
         assert v1.id in remaining_ids, "v1 must survive — v3.derived_from_state_id"
         assert v3.id in remaining_ids, "v3 must survive — v5.derived_from_state_id"
         assert v5.id in remaining_ids, "v5 must survive — latest version"
+
+
+class TestAddMessageWithTranscript:
+    """Single-transaction write+read for the freeform send snapshot (F-1).
+
+    ``add_message`` + ``get_messages`` as a pair reads the transcript on a
+    DIFFERENT pooled connection than the insert; a stale reader (pinned
+    snapshot, read/write-splitting proxy) then returns a transcript that
+    does not yet contain the committed row, and the route's Tier-1
+    snapshot guard fires as a false 500. ``add_message_with_transcript``
+    performs both on one connection in one write-locked transaction, so
+    the returned transcript ends at the inserted row by construction.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_inserted_record_and_full_ordered_transcript(self, service) -> None:
+        session = await service.create_session("alice", "Combined", "local")
+        await service.add_message(session.id, "user", "First", writer_principal="route_user_message")
+        await service.add_message(session.id, "assistant", "Second", writer_principal="compose_loop")
+
+        record, transcript = await service.add_message_with_transcript(
+            session.id,
+            "user",
+            "Third",
+            writer_principal="route_user_message",
+        )
+
+        assert record.role == "user"
+        assert record.content == "Third"
+        assert record.writer_principal == "route_user_message"
+        assert [message.content for message in transcript] == ["First", "Second", "Third"]
+        assert transcript[-1].id == record.id
+        sequence_numbers = [message.sequence_no for message in transcript]
+        assert sequence_numbers == sorted(sequence_numbers)
+        # The transcript is exactly what a fresh get_messages would return.
+        assert await service.get_messages(session.id, limit=None) == transcript
+
+    @pytest.mark.asyncio
+    async def test_persists_pre_send_state_provenance(self, service) -> None:
+        session = await service.create_session("alice", "Provenance", "local")
+        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+
+        record, transcript = await service.add_message_with_transcript(
+            session.id,
+            "user",
+            "hello",
+            composition_state_id=state.id,
+            writer_principal="route_user_message",
+        )
+
+        assert record.composition_state_id == state.id
+        assert transcript[-1].composition_state_id == state.id
+
+    @pytest.mark.asyncio
+    async def test_rejects_cross_session_composition_state(self, service) -> None:
+        """Parity with add_message: the _assert_state_in_session guard fires."""
+        s1 = await service.create_session("alice", "One", "local")
+        s2 = await service.create_session("alice", "Two", "local")
+        foreign_state = await service.save_composition_state(s2.id, CompositionStateData(is_valid=True), provenance="session_seed")
+
+        with pytest.raises(RuntimeError, match="add_message_with_transcript"):
+            await service.add_message_with_transcript(
+                s1.id,
+                "user",
+                "hello",
+                composition_state_id=foreign_state.id,
+                writer_principal="route_user_message",
+            )
+
+        assert await service.get_messages(s1.id, limit=None) == []
+
+    @pytest.mark.asyncio
+    async def test_bumps_session_updated_at(self, service) -> None:
+        session = await service.create_session("alice", "Updated", "local")
+
+        await service.add_message_with_transcript(session.id, "user", "hello", writer_principal="route_user_message")
+
+        refreshed = await service.get_session(session.id)
+        assert refreshed.updated_at >= session.updated_at
+
+    @pytest.mark.asyncio
+    async def test_combined_read_sees_its_own_write_despite_pinned_stale_snapshot(self, tmp_path) -> None:
+        """T1 (SQLite WAL variant of the pinned-snapshot stale reader).
+
+        A second connection holds an open read transaction whose WAL
+        snapshot predates the write. That stale view stays stale across
+        the commit — the faithful reproduction of the production read-
+        after-write split — while the combined method's same-transaction
+        read contains its own insert. Asserting on the combined method's
+        OWN read (not on the stale reader healing) is the non-vacuous
+        post-fix contract.
+        """
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'stale-reader-sessions.db'}")
+        initialize_session_schema(engine)
+        try:
+            service = SessionServiceImpl(
+                engine,
+                telemetry=build_sessions_telemetry(),
+                log=structlog.get_logger("test.stale-reader"),
+            )
+            session = await service.create_session("alice", "Stale", "local")
+            await service.add_message(session.id, "user", "seed", writer_principal="route_user_message")
+
+            def _count(conn) -> int:
+                return conn.execute(
+                    select(func.count()).select_from(chat_messages_table).where(chat_messages_table.c.session_id == str(session.id))
+                ).scalar_one()
+
+            stale_reader = engine.connect()
+            try:
+                # First read opens the deferred transaction and pins the
+                # WAL snapshot at one seed row.
+                assert _count(stale_reader) == 1
+
+                record, transcript = await service.add_message_with_transcript(
+                    session.id,
+                    "user",
+                    "hello",
+                    writer_principal="route_user_message",
+                )
+
+                # The pinned snapshot still cannot see the committed
+                # insert — the stale-reader condition is real...
+                assert _count(stale_reader) == 1
+                # ...and irrelevant: the combined method read its own
+                # write inside the insert's transaction.
+                assert [message.content for message in transcript] == ["seed", "hello"]
+                assert transcript[-1].id == record.id
+            finally:
+                stale_reader.rollback()
+                stale_reader.close()
+        finally:
+            engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_insert_and_transcript_select_share_one_connection_and_transaction(self, tmp_path) -> None:
+        """Pin the MECHANISM, not just the outcome: one connection, one txn.
+
+        The sibling tests prove the returned transcript contains the insert;
+        this one proves HOW — the ``INSERT INTO chat_messages`` and the
+        transcript ``SELECT`` execute on the same DBAPI connection with no
+        commit between them. A regression that reintroduced a second pooled
+        connection (or committed the insert before reading) could still pass
+        the outcome tests on dialects without a stale reader; this listener
+        pin goes red on the split itself.
+        """
+        engine = create_session_engine(f"sqlite:///{tmp_path / 'one-conn-sessions.db'}")
+        initialize_session_schema(engine)
+        try:
+            service = SessionServiceImpl(
+                engine,
+                telemetry=build_sessions_telemetry(),
+                log=structlog.get_logger("test.one-conn"),
+            )
+            session = await service.create_session("alice", "OneConn", "local")
+            await service.add_message(session.id, "user", "seed", writer_principal="route_user_message")
+
+            # One ordered event log: cursor executions tagged with their
+            # DBAPI connection id, interleaved with commit markers.
+            events: list[tuple[str, int, str]] = []
+
+            def record_statement(conn, cursor, statement, parameters, context, executemany) -> None:
+                events.append(("execute", id(conn.connection.dbapi_connection), statement))
+
+            def record_commit(conn) -> None:
+                events.append(("commit", id(conn.connection.dbapi_connection), "COMMIT"))
+
+            event.listen(engine, "before_cursor_execute", record_statement)
+            event.listen(engine, "commit", record_commit)
+            try:
+                record, transcript = await service.add_message_with_transcript(
+                    session.id,
+                    "user",
+                    "hello",
+                    writer_principal="route_user_message",
+                )
+            finally:
+                event.remove(engine, "before_cursor_execute", record_statement)
+                event.remove(engine, "commit", record_commit)
+
+            assert transcript[-1].id == record.id  # sanity: the outcome still holds
+
+            insert_indices = [
+                index
+                for index, (kind, _conn_id, statement) in enumerate(events)
+                if kind == "execute" and statement.lstrip().upper().startswith("INSERT INTO CHAT_MESSAGES")
+            ]
+            assert len(insert_indices) == 1, [entry[2] for entry in events]
+            insert_index = insert_indices[0]
+            transcript_select_indices = [
+                index
+                for index, (kind, _conn_id, statement) in enumerate(events)
+                if kind == "execute"
+                and statement.lstrip().upper().startswith("SELECT")
+                and "chat_messages" in statement
+                and "ORDER BY chat_messages.sequence_no" in statement
+            ]
+            assert len(transcript_select_indices) == 1, [entry[2] for entry in events]
+            select_index = transcript_select_indices[0]
+
+            # The read follows the write...
+            assert insert_index < select_index
+            # ...on the SAME DBAPI connection...
+            assert events[insert_index][1] == events[select_index][1]
+            # ...with no commit in between: the SELECT ran inside the
+            # insert's own transaction, which is the read-your-own-write
+            # guarantee the docstring claims.
+            between = events[insert_index + 1 : select_index]
+            assert all(kind != "commit" for kind, _conn_id, _statement in between), [entry[:2] for entry in between]
+        finally:
+            engine.dispose()
+
+
+class TestGuidedFailureCohortPoisonPill:
+    """T5: a mismatched failure cohort fails closed with a DISTINCT message."""
+
+    @pytest.mark.asyncio
+    async def test_mismatched_cohort_rejects_reads_with_message_distinct_from_snapshot_guard(
+        self,
+        engine,
+        service,
+        session_operation_contexts,
+    ) -> None:
+        session = await service.create_session("alice", "Poison", "local")
+        compose_context = session_operation_contexts.acquire(
+            service,
+            session.id,
+            SessionOperationKind.COMPOSE,
+        )
+        claim = await service.reserve_guided_operation(
+            session_id=session.id,
+            operation_id="poison-op",
+            kind="guided_start",
+            request_hash="a" * 64,
+            actor="worker",
+            lease_seconds=30,
+            session_operation_context=compose_context,
+        )
+        assert isinstance(claim, GuidedOperationClaimed)
+        # One structurally valid failed event whose cohort commits a
+        # fabricated evidence row that has no durable counterpart. The
+        # events table is UPDATE/DELETE-protected by trigger, so the
+        # poison pill is injected as the operation's single terminal
+        # event directly.
+        fabricated_row = {
+            "message_id": str(uuid.uuid4()),
+            "sequence_no": 1,
+            "content_hash": stable_hash("fabricated-evidence"),
+            "tool_calls_hash": stable_hash([]),
+        }
+        authority: dict[str, object] = {
+            "schema": "guided_failure_audit_cohort.v1",
+            "count": 1,
+            "rows": [fabricated_row],
+        }
+        poisoned_cohort = {**authority, "aggregate_digest": stable_hash(authority)}
+        with engine.begin() as conn:
+            conn.execute(
+                insert(guided_operation_events_table).values(
+                    session_id=str(session.id),
+                    operation_id="poison-op",
+                    sequence=2,
+                    event_kind="failed",
+                    actor="tamper",
+                    attempt=claim.fence.attempt,
+                    prior_attempt=None,
+                    lease_expires_at=None,
+                    request_hash="a" * 64,
+                    failure_audit_cohort=poisoned_cohort,
+                    occurred_at=datetime.now(UTC),
+                )
+            )
+
+        with pytest.raises(AuditIntegrityError, match="does not match the exact durable evidence rows") as excinfo:
+            await service.get_messages(session.id, limit=None)
+        # The http_audit_integrity_error handler logs message=str(exc);
+        # this phrasing must stay distinguishable from the send_message
+        # transcript snapshot guard's copy.
+        assert "does not end at inserted user" not in str(excinfo.value)
+
+        # The combined write+read path applies the same fail-closed
+        # verification over the same rows.
+        with pytest.raises(AuditIntegrityError, match="does not match the exact durable evidence rows"):
+            await service.add_message_with_transcript(
+                session.id,
+                "user",
+                "hello",
+                writer_principal="route_user_message",
+            )

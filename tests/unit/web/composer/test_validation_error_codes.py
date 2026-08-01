@@ -40,10 +40,13 @@ from elspeth.web.composer.state import (
     ValidationEntry,
     ValidationSummary,
 )
+from elspeth.web.composer.tools._common import _PLUGIN_UNAVAILABLE_EXPLANATIONS
 from elspeth.web.composer.tools.generation import (
     _CLOSED_VALIDATION_ERROR_CODES,
+    _PLUGIN_UNAVAILABLE_FIXES,
     explain_validation_code,
 )
+from elspeth.web.plugin_policy.models import PluginUnavailableReason
 
 
 def _empty_state() -> CompositionState:
@@ -281,6 +284,15 @@ class TestStructuralRejectionCodes:
 
 
 class TestClosedCodeCatalogueInvariants:
+    def test_unknown_node_type_guidance_includes_row_union_n_to_n_reconvergence(self) -> None:
+        guidance = explain_validation_code("unknown_node_type")
+
+        assert guidance is not None
+        explanation, fix = guidance
+        assert "row_union" in explanation
+        assert "row_union" in fix
+        assert "N-to-N" in fix
+
     def test_schema_contract_codes_are_registered_and_explainable(self) -> None:
         for code in (
             "schema_contract_violation",
@@ -296,12 +308,110 @@ class TestClosedCodeCatalogueInvariants:
             "aggregation_missing_on_error",
             "coalesce_branch_unreachable",
             "coalesce_schema_mode_mixed",
+            "row_union_config_invalid",
+            "row_union_name_invalid",
+            "row_union_branches_invalid",
+            "row_union_branch_invalid",
+            "row_union_input_mismatch",
+            "row_union_on_success_invalid",
+            "row_union_timeout_invalid",
+            "row_union_branch_alias_unreachable",
+            "row_union_branch_unreachable",
+            "row_union_branch_origin_invalid",
+            "row_union_branch_not_downstream",
+            "row_union_branch_aggregation_invalid",
+            "row_union_nested_fork_invalid",
+            "row_union_downstream_group_invalid",
+            "row_union_schema_incompatible",
+            "row_union_on_success_must_be_connection",
+            "row_union_on_success_dangling",
+            "fork_branch_multiple_barriers",
+            "gate_duplicate_fork_branch",
         ):
             assert code in _CLOSED_VALIDATION_ERROR_CODES, code
             guidance = explain_validation_code(code)
             assert guidance is not None, f"{code} does not resolve to catalogue guidance"
             explanation, fix = guidance
             assert explanation and fix
+
+    def test_row_union_topology_codes_resolve_to_topology_guidance(self) -> None:
+        """The new codes must not fall through to the intrinsic entry.
+
+        ``explain_validation_code`` returns the first matching pattern, so a
+        mis-ordered catalogue entry would silently route a topology code to
+        the node-shape guidance ("give every branch a non-empty unique
+        alias") — the exact mis-advice the code split removes.
+        """
+        intrinsic = explain_validation_code("row_union_branch_invalid")
+        assert intrinsic is not None
+
+        origin = explain_validation_code("row_union_branch_origin_invalid")
+        assert origin is not None
+        assert origin != intrinsic
+        assert "gate" in origin[0] or "gate" in origin[1]
+
+        downstream = explain_validation_code("row_union_branch_not_downstream")
+        assert downstream is not None
+        assert downstream != intrinsic
+        assert downstream != origin
+        assert "downstream" in downstream[0] or "downstream" in downstream[1]
+
+        branch_aggregation = explain_validation_code("row_union_branch_aggregation_invalid")
+        assert branch_aggregation is not None
+        assert branch_aggregation not in (intrinsic, origin, downstream)
+        assert "passthrough" in branch_aggregation[1]
+        assert "trigger" not in branch_aggregation[1]
+
+        nested_fork = explain_validation_code("row_union_nested_fork_invalid")
+        assert nested_fork is not None
+        assert nested_fork not in (intrinsic, origin, downstream, branch_aggregation)
+        assert "nested fork" in nested_fork[0].lower()
+        assert "before" in nested_fork[1] or "terminate" in nested_fork[1]
+
+        invalid_name = explain_validation_code("row_union_name_invalid")
+        assert invalid_name is not None
+        assert "name" in invalid_name[0].lower()
+        assert "letters" in invalid_name[1].lower()
+
+        downstream_group = explain_validation_code("row_union_downstream_group_invalid")
+        assert downstream_group is not None
+        assert downstream_group not in (intrinsic, origin, downstream, branch_aggregation, nested_fork)
+        assert "indivisible" in downstream_group[0] or "indivisible" in downstream_group[1]
+        assert "end_of_source" in downstream_group[1]
+        assert "branches" not in downstream_group[1]
+
+        schema_incompatible = explain_validation_code("row_union_schema_incompatible")
+        assert schema_incompatible is not None
+        assert schema_incompatible not in (intrinsic, origin, downstream, downstream_group)
+        assert "long-format" in schema_incompatible[0]
+        assert "row_union_schema" in schema_incompatible[1]
+
+        # The cross-node barrier-ownership code sits in the same cluster and
+        # must not fall through to any row_union node-shape entry either.
+        multiple_barriers = explain_validation_code("fork_branch_multiple_barriers")
+        assert multiple_barriers is not None
+        assert multiple_barriers not in (intrinsic, origin, downstream)
+        assert "barrier" in multiple_barriers[0]
+
+    def test_query_template_unbound_row_fields_resolves_to_multi_query_guidance(self) -> None:
+        """The multi-query row-binding code must not fall through to the
+        single-prompt unbound-variables entry: the repair is different (bind
+        the variable in that query's input_fields, or use row.source_row),
+        and the single-prompt advice ("rewrite as row.<field>") would send
+        the planner in a circle — the reference already IS row.<field>."""
+        assert "query_template_unbound_row_fields" in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code("query_template_unbound_row_fields")
+        assert guidance is not None, "query_template_unbound_row_fields does not resolve to catalogue guidance"
+        explanation, fix = guidance
+        assert explanation and fix
+        assert "input_fields" in explanation
+        assert "input_fields" in fix
+        assert "source_row" in fix
+
+        single_prompt = explain_validation_code("prompt_template_unbound_variables")
+        assert single_prompt is not None
+        assert guidance != single_prompt
 
     def test_codes_are_containment_free(self) -> None:
         """No closed code may be a substring of another.
@@ -420,12 +530,13 @@ class TestPlannerFeedbackCarriesStructuralFacts:
         assert [entry["component"] for entry in feedback["validation"]["errors"]] == ["rejected_mutation"]
         assert _candidate_rejection_codes(result) == ("validation_error",)
 
-    def test_validated_candidate_rejections_pass_through_ungated(self) -> None:
+    def test_validated_candidate_rejections_pass_through_ungated(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Without a rejected_mutation entry, every real error must survive.
 
         Guards the instance-1 class (built candidate validated, real errors,
         e.g. coalesce_branch_unreachable) against over-gating.
         """
+        import elspeth.web.composer.pipeline_planner as planner_module
         from elspeth.web.composer.pipeline_planner import (
             _allowlisted_candidate_feedback,
             _candidate_rejection_codes,
@@ -442,11 +553,17 @@ class TestPlannerFeedbackCarriesStructuralFacts:
             validation=ValidationSummary(is_valid=False, errors=entries, warnings=(), suggestions=()),
             affected_nodes=(),
         )
+        monkeypatch.setattr(
+            planner_module,
+            "coalesce_reachability_facts",
+            lambda _state: {"merge": {"produced_connections": ["left", "right"]}},
+        )
         feedback = _allowlisted_candidate_feedback(result)
         assert [entry["error_code"] for entry in feedback["validation"]["errors"]] == [
             "coalesce_branch_unreachable",
             "node_input_not_reachable",
         ]
+        assert feedback["validation"]["errors"][0]["connectivity"] == {"produced_connections": ["left", "right"]}
         assert _candidate_rejection_codes(result) == ("coalesce_branch_unreachable", "node_input_not_reachable")
 
     def test_rejection_trail_codes_never_empty_when_entries_exist(self) -> None:
@@ -668,6 +785,80 @@ class TestCoalesceReachabilityFacts:
         )
         feedback = _allowlisted_candidate_feedback(result)
         assert "connectivity" not in feedback["validation"]["errors"][0]
+
+
+class TestPluginUnavailabilityFamilyIsExplainable:
+    """Every plugin-unavailability reason must resolve to actionable guidance.
+
+    ``_plugin_policy_failure`` emits each ``PluginUnavailableReason`` value as a
+    tool ``error_code``, so any of them can reach the planner's redacted repair
+    feedback — where the code is the ONLY surviving signal. Until this sweep the
+    whole family resolved to nothing through ``explain_validation_code``: the
+    model saw a bare token like ``credential_unavailable`` with no way to learn
+    whether to pick a different plugin, wait for an operator, or stop trying, and
+    so re-emitted the same rejected selection until its budget ran out. Same
+    failure shape as the coded-but-unexplained rejections the rest of this module
+    pins, one layer up.
+    """
+
+    def test_every_reason_is_in_the_closed_catalogue_and_resolves(self) -> None:
+        for reason in PluginUnavailableReason:
+            assert reason.value in _CLOSED_VALIDATION_ERROR_CODES, reason
+            guidance = explain_validation_code(reason.value)
+            assert guidance is not None, f"{reason.value} does not resolve to catalogue guidance"
+            explanation, fix = guidance
+            assert explanation and fix
+
+    def test_explanations_are_reused_from_the_tool_copy_not_restated(self) -> None:
+        """One source of truth: the tool failure and the explain entry cannot drift.
+
+        The tool's own message already carries a plain-language cause per reason
+        (``_PLUGIN_UNAVAILABLE_EXPLANATIONS``). Transcribing it into the explain
+        catalogue would let the two answers to "why can't I use this plugin?"
+        diverge silently, which is how a model ends up told to repair something
+        an operator must fix (or vice versa).
+        """
+        for reason in PluginUnavailableReason:
+            guidance = explain_validation_code(reason.value)
+            assert guidance is not None
+            explanation, _fix = guidance
+            assert _PLUGIN_UNAVAILABLE_EXPLANATIONS[reason] in explanation, reason
+
+    def test_fix_table_is_total_over_the_enum(self) -> None:
+        """A new reason joins both halves or fails at import, never half-wired."""
+        assert set(_PLUGIN_UNAVAILABLE_FIXES) == set(PluginUnavailableReason)
+        assert all(_PLUGIN_UNAVAILABLE_FIXES[reason].strip() for reason in PluginUnavailableReason)
+
+    def test_web_surface_prohibition_tells_the_planner_the_refusal_is_categorical(self) -> None:
+        """The one reason with NO repair must say so, or the budget burns.
+
+        Every other reason names something an operator could change.
+        ``WEB_SURFACE_PROHIBITED`` names something nothing can change, so the fix
+        must forbid re-emission outright rather than suggest another attempt.
+        """
+        guidance = explain_validation_code(PluginUnavailableReason.WEB_SURFACE_PROHIBITED.value)
+        assert guidance is not None
+        _explanation, fix = guidance
+        lowered = fix.lower()
+
+        assert "categorical" in lowered
+        assert "do not re-emit" in lowered
+
+    def test_reason_codes_do_not_shadow_an_unrelated_catalogue_entry(self) -> None:
+        """Exact-code patterns only: these codes are short and generic.
+
+        A loose alternation here would make an unrelated full validation message
+        resolve to a plugin-policy explanation. Every other closed code must keep
+        resolving to its own guidance with the family added.
+        """
+        family = {reason.value for reason in PluginUnavailableReason}
+        for code in _CLOSED_VALIDATION_ERROR_CODES:
+            if code in family:
+                continue
+            guidance = explain_validation_code(code)
+            assert guidance is not None, code
+            explanation, _fix = guidance
+            assert "cannot be used in this deployment" not in explanation, code
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -191,12 +191,17 @@ def register_message_routes(router: APIRouter) -> None:
                 _guided.terminal if (_guided is not None and _guided.terminal is not None and not _guided.transition_consumed) else None
             )
 
-            # 2. Persist user message with pre-send provenance.
-            # Keep the inserted row so the subsequent snapshot can prove
-            # it is composing against the transcript that actually ends
-            # at this request's user turn.
             progress_registry = _get_composer_progress_registry(request)
-            user_msg = await service.add_message(
+            # 2. Persist user message with pre-send provenance AND take the
+            # transcript snapshot in the SAME write-locked transaction.
+            # A separate get_messages call here read on a different pooled
+            # connection; behind a read/write-splitting proxy or a pinned
+            # snapshot that stale read did not yet contain the committed
+            # insert and the Tier-1 snapshot guard below fired as a false
+            # 500 on every send. The combined method returns a transcript
+            # that ends at the inserted row BY CONSTRUCTION — never
+            # re-call get_messages for this snapshot.
+            user_msg, records = await service.add_message_with_transcript(
                 session.id,
                 "user",
                 body.content,
@@ -242,21 +247,34 @@ def register_message_routes(router: APIRouter) -> None:
 
                 _COMPOSER_REQUESTS_INFLIGHT.add(1, {"endpoint": "send_message"})
                 inflight_tally_started = True
-                # 3. Pre-fetch chat history as plain dicts (seam contract B)
-                # Pass limit=None to fetch the full conversation — the default
-                # limit=100 would silently drop recent context once a session
-                # exceeds 100 turns, causing the LLM to lose conversation state.
-                # Exclude the just-persisted user message — the composer receives
-                # it separately via body.content and appends it in _build_messages.
-                records = await service.get_messages(session.id, limit=None)
-                if not records or records[-1].id != user_msg.id:
+                # 3. Transcript snapshot guard + chat history.
+                # ``records`` is the same-transaction transcript returned by
+                # add_message_with_transcript above — full conversation, no
+                # limit (the old default limit=100 silently dropped recent
+                # context past 100 turns).
+                #
+                # The guard compares against CONVERSATION rows only (parity
+                # with /recompose): audit sidecar rows share the
+                # chat_messages sequence range, so a trailing audit row is
+                # not interleaved conversation history and must not trip a
+                # Tier-1 refusal. The guard stays INSIDE this try so a
+                # failure is still covered by the "starting" progress event,
+                # the in-flight counter, and terminal-status accounting.
+                conversation_records = _composer_conversation_messages(records)
+                if not conversation_records or conversation_records[-1].id != user_msg.id:
                     raise AuditIntegrityError(
                         "Tier 1 audit anomaly: send_message transcript snapshot "
                         f"for session {session.id} does not end at inserted user "
                         f"message {user_msg.id}. Refusing to compose against "
                         "interleaved session history."
                     )
-                chat_messages = _composer_chat_history(records[:-1])
+                # Exclude the just-persisted user message — the composer
+                # receives it separately via body.content and appends it in
+                # _build_messages. _composer_chat_history takes the FULL
+                # transcript (not the conversation-scoped list) because it
+                # decodes role="audit" provider-control rows back into
+                # prompt history itself.
+                chat_messages = _composer_chat_history([record for record in records if record.id != user_msg.id])
 
                 # 3b. First-message auto-titling.
                 #
@@ -283,6 +301,15 @@ def register_message_routes(router: APIRouter) -> None:
                             model=settings.composer_model,
                             temperature=settings.composer_temperature,
                             seed=settings.composer_seed,
+                            # Auto-title uses the PRIMARY composer role only
+                            # (Phase 3 Task 2 endpoint affordance) — never
+                            # the advisor's endpoint.
+                            api_base=settings.composer_endpoint_base_url,
+                            api_key=(
+                                settings.composer_endpoint_api_key.get_secret_value()
+                                if settings.composer_endpoint_api_key is not None
+                                else None
+                            ),
                         )
                     )
 
@@ -920,7 +947,10 @@ def register_message_routes(router: APIRouter) -> None:
                 )
                 raise HTTPException(
                     status_code=500,
-                    detail="Server invariant violated. See application audit log for diagnostic detail.",
+                    detail={
+                        "error_type": "server_invariant_violated",
+                        "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+                    },
                 ) from exc
             except asyncio.CancelledError as exc:
                 # Client-disconnect or operator cancel during the

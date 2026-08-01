@@ -46,7 +46,7 @@ CORPUS_DIR = REPO_ROOT / "evals" / "composer-parity"
 FIXTURES_DIR = CORPUS_DIR / "fixtures"
 README = CORPUS_DIR / "README.md"
 
-# The nine canonical capability classes (design §8.1). Exactly one JSON fixture
+# The ten canonical capability classes. Exactly one JSON fixture
 # per class; a glob miss or a stray/renamed fixture fails loudly here rather
 # than passing vacuously.
 EXPECTED_CLASSES = frozenset(
@@ -58,6 +58,7 @@ EXPECTED_CLASSES = frozenset(
         "multi_source_queue",
         "aggregation",
         "row_expansion",
+        "row_union",
         "error_routing",
         "structured_llm",
     }
@@ -126,8 +127,8 @@ def _readme_hashes() -> dict[str, str]:
     return hashes
 
 
-def test_corpus_has_exactly_nine_class_fixtures() -> None:
-    """Exactly nine JSON fixtures, one per declared capability class."""
+def test_corpus_has_exactly_ten_class_fixtures() -> None:
+    """Exactly ten JSON fixtures, one per declared capability class."""
     paths = _json_fixture_paths()
     assert len(paths) == len(EXPECTED_CLASSES), f"expected {len(EXPECTED_CLASSES)} json fixtures, found {[p.name for p in paths]}"
     classes = {_load_fixture(path)["class"] for path in paths}

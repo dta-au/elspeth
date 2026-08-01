@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import ast
+import json
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
+    MemberSinkEffectCapability,
+    RestagingSinkEffectCapability,
     RestrictedSinkEffectContext,
     SinkEffectAttemptAction,
     SinkEffectCommitResult,
@@ -24,11 +27,13 @@ from elspeth.contracts.sink_effects import (
     SinkEffectInspection,
     SinkEffectInspectionMode,
     SinkEffectInspectionRequest,
+    SinkEffectMember,
     SinkEffectPipelineMembersInput,
     SinkEffectPlan,
     SinkEffectPrepareRequest,
     SinkEffectReconcileResult,
 )
+from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution import sink_effect_lifecycle
 from elspeth.core.landscape.execution.sink_effect_attempt_results import encode_sink_effect_returned_result
 from elspeth.core.landscape.execution.sink_effect_finalization import SinkEffectFinalizationMember
@@ -180,6 +185,13 @@ class _PrecomputedDivertingSink(_CumulativeObservableSink):
             safe_evidence={
                 **dict(plan.safe_evidence),
                 "accepted_ordinals": [0],
+                "diversion_attribution": [
+                    {
+                        "error_hash": "b" * 16,
+                        "ordinal": 1,
+                        "reason_hash": "a" * 64,
+                    }
+                ],
                 "diverted_ordinals": [1],
             },
         )
@@ -247,6 +259,13 @@ class _ResultDerivedReconciledSink(_CumulativeObservableSink):
                     "path_or_uri": descriptor.path_or_uri,
                     "size_bytes": descriptor.size_bytes,
                 },
+                "diversion_attribution": [
+                    {
+                        "error_hash": "b" * 16,
+                        "ordinal": 1,
+                        "reason_hash": "a" * 64,
+                    }
+                ],
                 "diverted_ordinals": [1],
             },
             accepted_ordinals=(0,),
@@ -284,6 +303,81 @@ def _execution_request(run_id: str, sink_id: str, members: tuple[object, ...]) -
             for member in identity.members
         ),
     )
+
+
+def test_sink_effect_capabilities_cannot_be_forged_by_attributes() -> None:
+    class _CapabilityPretender(_CumulativeObservableSink):
+        supports_member_effects = True
+
+        def restage_effect(self, *args: object) -> None:
+            del args
+
+        def commit_member_effect(self, *args: object) -> SinkEffectCommitResult:
+            del args
+            raise AssertionError("capability probe must not invoke the pretender")
+
+        def reconcile_member_effect(self, *args: object) -> SinkEffectReconcileResult:
+            del args
+            raise AssertionError("capability probe must not invoke the pretender")
+
+    db = make_landscape_db()
+    try:
+        factory = make_factory(db)
+        run_id, sink_id, members = _pipeline_members(factory, 1)
+        effect_input = _execution_request(run_id, sink_id, members).effect_input
+        pretender = _CapabilityPretender(_CumulativeTarget())
+
+        assert not SinkEffectCoordinator._is_restaging_adapter(pretender, effect_input)
+        assert not SinkEffectCoordinator._is_member_effect_adapter(pretender, effect_input)
+    finally:
+        db.close()
+
+
+def test_sink_effect_capabilities_require_nominal_opt_in() -> None:
+    class _DeclaredCapabilities(
+        _CumulativeObservableSink,
+        MemberSinkEffectCapability,
+        RestagingSinkEffectCapability,
+    ):
+        def restage_effect(
+            self,
+            plan: SinkEffectPlan,
+            effect_input: SinkEffectPipelineMembersInput,
+            ctx: RestrictedSinkEffectContext,
+        ) -> None:
+            del plan, effect_input, ctx
+
+        def commit_member_effect(
+            self,
+            plan: SinkEffectPlan,
+            member: SinkEffectMember,
+            effect_input: SinkEffectPipelineMembersInput,
+            ctx: RestrictedSinkEffectContext,
+        ) -> SinkEffectCommitResult:
+            del plan, member, effect_input, ctx
+            raise AssertionError("capability probe must not invoke the adapter")
+
+        def reconcile_member_effect(
+            self,
+            plan: SinkEffectPlan,
+            member: SinkEffectMember,
+            effect_input: SinkEffectPipelineMembersInput,
+            ctx: RestrictedSinkEffectContext,
+        ) -> SinkEffectReconcileResult:
+            del plan, member, effect_input, ctx
+            raise AssertionError("capability probe must not invoke the adapter")
+
+    db = make_landscape_db()
+    try:
+        factory = make_factory(db)
+        run_id, sink_id, members = _pipeline_members(factory, 1)
+        effect_input = _execution_request(run_id, sink_id, members).effect_input
+        adapter = _DeclaredCapabilities(_CumulativeTarget())
+
+        assert SinkEffectCoordinator._is_restaging_adapter(adapter, effect_input)
+        assert SinkEffectCoordinator._is_member_effect_adapter(adapter, effect_input)
+    finally:
+        db.close()
 
 
 def _production_calls(path: str, method: str) -> list[int]:
@@ -469,6 +563,58 @@ def test_second_preparer_refuses_while_preparation_claim_is_live() -> None:
         # The rival never mutated staging: no inspect, prepare, or commit calls.
         assert (rival_sink.inspect_calls, rival_sink.prepare_calls, rival_sink.commit_calls) == (0, 0, 0)
         assert target.published_rows == [[{"ordinal": 0}]]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("missing_container", "missing_key"),
+    [
+        ("plan", "expected_descriptor"),
+        ("descriptor", "metadata"),
+    ],
+)
+def test_load_plan_rejects_missing_required_durable_fields(
+    missing_container: str,
+    missing_key: str,
+) -> None:
+    db = make_landscape_db()
+    try:
+        factory = make_factory(db)
+        run_id, sink_id, members = _pipeline_members(factory, 1)
+
+        def fail_before_effect(seam: SinkEffectExecutionSeam) -> None:
+            if seam is SinkEffectExecutionSeam.BEFORE_EFFECT:
+                raise SinkEffectInjectedFault(seam)
+
+        with pytest.raises(SinkEffectInjectedFault):
+            SinkEffectCoordinator(
+                factory=factory,
+                worker_id="worker-a",
+                fault_hook=fail_before_effect,
+            ).execute(
+                _execution_request(run_id, sink_id, members),
+                _CumulativeObservableSink(_CumulativeTarget()),
+            )
+
+        effects = factory.execution.sink_effects.get_effects_for_run(run_id)
+        assert len(effects) == 1
+        assert effects[0].plan_json is not None
+        payload = json.loads(effects[0].plan_json)
+        assert type(payload) is dict
+        if missing_container == "plan":
+            del payload[missing_key]
+        else:
+            descriptor = payload["expected_descriptor"]
+            assert type(descriptor) is dict
+            del descriptor[missing_key]
+
+        malformed = replace(effects[0], plan_json=json.dumps(payload))
+        with pytest.raises(LandscapeRecordError, match="durable plan is incomplete or divergent") as exc_info:
+            SinkEffectCoordinator._load_plan(malformed)
+
+        assert isinstance(exc_info.value.__cause__, KeyError)
+        assert exc_info.value.__cause__.args == (missing_key,)
     finally:
         db.close()
 

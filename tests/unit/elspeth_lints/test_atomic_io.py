@@ -36,6 +36,7 @@ import pytest
 from elspeth_lints.core.atomic_io import (
     AtomicWriteConflictError,
     AtomicWriteShortWriteError,
+    AtomicWriteSymlinkError,
     _lock_path_for,
     _temp_path_for,
     atomic_update_text,
@@ -213,6 +214,57 @@ def test_missing_parent_directory_raises(tmp_path: Path) -> None:
     target = tmp_path / "does_not_exist" / "allowlist.yaml"
     with pytest.raises(FileNotFoundError):
         atomic_write_text(target, "payload\n")
+
+
+def test_symlinked_parent_directory_is_refused(tmp_path: Path) -> None:
+    """A symlinked parent would place the lock, temp, and target off-path."""
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    link_dir = tmp_path / "link"
+    link_dir.symlink_to(real_dir, target_is_directory=True)
+
+    with pytest.raises(AtomicWriteSymlinkError):
+        atomic_write_text(link_dir / "allowlist.yaml", "allow_hits: []\n")
+
+    # Refused before ``_acquire_lock_fd`` planted the sibling lock file.
+    assert sorted(p.name for p in real_dir.iterdir()) == []
+
+
+def test_symlinked_target_is_refused(tmp_path: Path) -> None:
+    """``os.replace`` acts on the link itself; refuse rather than unlink it."""
+    real_target = tmp_path / "real.yaml"
+    real_target.write_text("OLD\n")
+    link_target = tmp_path / "allowlist.yaml"
+    link_target.symlink_to(real_target)
+
+    with pytest.raises(AtomicWriteSymlinkError):
+        atomic_write_text(link_target, "NEW\n")
+
+    assert link_target.is_symlink()
+    assert real_target.read_text() == "OLD\n"
+
+
+def test_atomic_update_text_refuses_symlinked_target(tmp_path: Path) -> None:
+    """The read-modify-write helper must not read through a link it then replaces."""
+    real_target = tmp_path / "real.yaml"
+    real_target.write_text("OLD\n")
+    link_target = tmp_path / "allowlist.yaml"
+    link_target.symlink_to(real_target)
+
+    with pytest.raises(AtomicWriteSymlinkError):
+        atomic_update_text(link_target, lambda current: "NEW\n")
+
+    assert link_target.is_symlink()
+    assert real_target.read_text() == "OLD\n"
+
+
+def test_symlink_guard_leaves_ordinary_writes_working(tmp_path: Path) -> None:
+    """The guard is inert for a real directory and a real (or absent) target."""
+    target = tmp_path / "allowlist.yaml"
+    atomic_write_text(target, "first\n")
+    atomic_write_text(target, "second\n")
+    atomic_update_text(target, lambda current: f"{current}third\n")
+    assert target.read_text() == "second\nthird\n"
 
 
 def test_mid_write_kill_leaves_original_intact(tmp_path: Path) -> None:

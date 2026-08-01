@@ -1651,3 +1651,34 @@ def _encoded_action() -> dict[str, object]:
 def test_deferred_intent_management_decoder_rejects_every_malformed_shape(payload: object) -> None:
     with pytest.raises(DeferredIntentManagementActionShapeError):
         deferred_intent_management_action_from_dict(payload)
+
+
+def test_create_deferred_clarification_intent_is_constraint_free_and_prose_free() -> None:
+    """Last-resort retention (R2-F15): durable, unclaimable, no user prose.
+
+    The empty constraint set keeps the intent permanently unclaimable
+    (``evaluate_deferred_intent_coverage`` rejects claims on constraint-free
+    intents — pinned in test_deferred_intent_coverage), so it stays visibly
+    pending until the user cancels it or edits it into a structural intent.
+    """
+    from elspeth.web.composer.guided.deferred_intents import create_deferred_clarification_intent
+
+    private_prose = "Later do the private-needle thing."
+    intent = create_deferred_clarification_intent(
+        receiving_stage="source",
+        intent_id="00000000-0000-4000-8000-000000000777",
+        originating_message_id="00000000-0000-4000-8000-000000000778",
+        originating_message_content=private_prose,
+    )
+
+    assert intent.receiving_stage == "source"
+    assert intent.target_stage == "wire_review"
+    assert intent.constraints == ()
+    assert intent.catalog_kind is None
+    assert intent.catalog_name is None
+    assert "private-needle" not in intent.redacted_summary
+    assert intent.message_content_hash == stable_hash(private_prose)
+    # The management surface must be able to list/select it.
+    option = intent_management_module.deferred_intent_management_option(intent)
+    assert option.intent_id == intent.intent_id
+    assert option.structural_constraints == ()

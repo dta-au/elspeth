@@ -230,6 +230,7 @@ secrets/
 credentials.json
 *.pem
 *.key
+!deploy/aws-ecs/trust/global-bundle.pem
 
 # Jupyter
 .ipynb_checkpoints/
@@ -371,8 +372,6 @@ docs-archive/
 docs/audit/triage/
 notes/resign/*
 
-AGENTS.md
-CLAUDE.md
 .loomweave/loomweave.lock
 .agents/skills/loomweave-workflow/.fingerprint
 .agents/skills/loomweave-workflow/SKILL.md

@@ -52,7 +52,9 @@ from elspeth.web.composer.guided.protocol import (
     _WireSchemaField,
     _WireSourceReview,
     _WireStructuredOutputField,
+    node_options_summary,
 )
+from elspeth.web.composer.guided.stage_transitions import source_plugin_accepts_blob_inspection
 from elspeth.web.composer.tools._common import _semantic_contracts_payload
 
 if TYPE_CHECKING:
@@ -255,6 +257,7 @@ def build_step_2_single_select_turn(
         "question": "What format should the output be in?",
         "options": options,
         "allow_custom": False,
+        "source_blob_compatible_option_ids": [],
     }
     return Turn(
         type=TurnType.SINGLE_SELECT.value,
@@ -289,10 +292,11 @@ def build_step_2_schema_form_turn(
     prefilled: dict[str, Any] = {"schema": {"mode": "observed"}}
     if prefilled_options is not None:
         prefilled.update(deep_thaw(prefilled_options))
+    prefilled.setdefault("on_write_failure", "discard")
     payload: SchemaFormPayload = {
         "mode": "plugin_options",
         "plugin": plugin,
-        "knobs": cast(KnobSchema, schema_info.knob_schema),
+        "knobs": _sink_knobs_with_write_failure(cast(KnobSchema, schema_info.knob_schema)),
         "prefilled": prefilled,
     }
     return Turn(
@@ -300,6 +304,24 @@ def build_step_2_schema_form_turn(
         step_index=_step_index(GuidedStep.STEP_2_SINK),
         payload=payload,
     )
+
+
+def _sink_knobs_with_write_failure(knobs: KnobSchema) -> KnobSchema:
+    """Expose the sink wrapper's write-failure route beside plugin knobs."""
+
+    fields = list(knobs["fields"])
+    if not any(field["name"] == "on_write_failure" for field in fields):
+        fields.append(
+            {
+                "name": "on_write_failure",
+                "label": "On Write Failure",
+                "description": "Sink name for rows that cannot be written, or 'discard' for explicit drop",
+                "kind": "text",
+                "required": False,
+                "nullable": False,
+            }
+        )
+    return {"fields": fields}
 
 
 def build_component_review_turn(
@@ -414,7 +436,7 @@ def build_step_2_schema_form_turn_from_resolved(
     payload: SchemaFormPayload = {
         "mode": "plugin_options",
         "plugin": output.plugin,
-        "knobs": cast(KnobSchema, schema_info.knob_schema),
+        "knobs": _sink_knobs_with_write_failure(cast(KnobSchema, schema_info.knob_schema)),
         "prefilled": prefilled,
     }
     return Turn(
@@ -573,6 +595,26 @@ def _structured_output_fields(options: Mapping[str, Any]) -> list[_WireStructure
     return projected
 
 
+def _is_cardinality_probe_config_failure(exc: Exception) -> bool:
+    """Return True only for expected draft/config failures from probe construction.
+
+    Mirrors the ``_is_config_probe_exception`` taxonomy nested inside
+    ``elspeth.web.composer.state`` (not importable from there): plugin
+    config/lookup/template failures are expected when the wire review renders
+    an authored-only fallback state — e.g. operator-profile options that were
+    never lowered because authored validation already errs. Anything else is a
+    genuine engine defect and must crash through.
+    """
+    from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    from elspeth.plugins.infrastructure.manager import PluginNotFoundError
+    from elspeth.plugins.infrastructure.templates import TemplateError
+    from elspeth.plugins.infrastructure.validation import UnknownPluginTypeError
+
+    if isinstance(exc, (PluginConfigError, PluginNotFoundError, TemplateError, UnknownPluginTypeError)):
+        return True
+    return type(exc) is ValueError and str(exc).startswith("Invalid configuration for transform ")
+
+
 def _node_cardinality(node: Any, executable_node: Any) -> _WireRowCardinality:
     if node.node_type == "aggregation":
         if node.expected_output_count is not None:
@@ -580,6 +622,8 @@ def _node_cardinality(node: Any, executable_node: Any) -> _WireRowCardinality:
         return {"input": "batch", "output": "zero_or_many", "expected_output_count": None}
     if node.node_type == "coalesce":
         return {"input": "branches", "output": "one_per_branch_set", "expected_output_count": None}
+    if node.node_type == "row_union":
+        return {"input": "branches", "output": "one_per_branch", "expected_output_count": None}
     if node.node_type == "queue":
         return {"input": "many_producers", "output": "one_per_item", "expected_output_count": None}
     if node.node_type == "gate":
@@ -589,10 +633,18 @@ def _node_cardinality(node: Any, executable_node: Any) -> _WireRowCardinality:
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
     from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 
-    transform = get_shared_plugin_manager().create_transform(
-        executable_node.plugin,
-        prepare_validation_probe_options(executable_node.options),
-    )
+    try:
+        transform = get_shared_plugin_manager().create_transform(
+            executable_node.plugin,
+            prepare_validation_probe_options(executable_node.options),
+        )
+    except Exception as exc:
+        if not _is_cardinality_probe_config_failure(exc):
+            raise
+        # Conservative fallback: render the weakest honest row-cardinality
+        # claim instead of crashing the whole wire review over a config the
+        # validation summary already reports as unrunnable.
+        return {"input": "one", "output": "zero_or_many", "expected_output_count": None}
     try:
         output: Literal["one", "zero_or_one", "zero_or_many"]
         if transform.creates_tokens:
@@ -660,6 +712,10 @@ def _build_wire_projection(
             "guaranteed_fields": fields_for(public["stable_id"], produced=True),
             "row_cardinality": _node_cardinality(node, executable_nodes[node.id]),
             "structured_output_fields": _structured_output_fields(node.options) if node.plugin == "llm" else [],
+            # Derived from the same authored options the proposal projection
+            # reads, so the two review surfaces cannot disagree about what a
+            # node does (R2-F3).
+            "node_options_summary": node_options_summary(node.plugin, node.options),
         }
         for public, node in zip(public_nodes, state.nodes, strict=True)
     ]
@@ -745,6 +801,7 @@ def _build_step_1_single_select_turn(
         "question": "Which data source would you like to use?",
         "options": options,
         "allow_custom": False,
+        "source_blob_compatible_option_ids": [option["id"] for option in options if source_plugin_accepts_blob_inspection(option["id"])],
     }
     return Turn(
         type=TurnType.SINGLE_SELECT.value,

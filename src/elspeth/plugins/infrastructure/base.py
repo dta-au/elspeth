@@ -34,7 +34,7 @@ Lifecycle Contract (all hooks called on main thread by orchestrator):
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from elspeth.contracts import (
@@ -66,7 +66,13 @@ if TYPE_CHECKING:
     from elspeth.contracts.sink import OutputValidationResult
     from elspeth.plugins.infrastructure.config_base import PluginConfig, TransformDataConfig
 
-from elspeth.contracts.sink_effects import ResolvedSinkEffectMode, SinkEffectExecutionPurpose, SinkEffectInputKind
+from elspeth.contracts.sink_effects import (
+    AuditExportFormat,
+    ResolvedSinkEffectMode,
+    SinkEffectContract,
+    SinkEffectExecutionPurpose,
+    SinkEffectInputKind,
+)
 from elspeth.plugins.infrastructure.results import (
     TransformResult,
 )
@@ -164,16 +170,15 @@ class BaseTransform(ABC):
     plugin_version: str = "0.0.0"
     source_file_hash: str | None = None
 
-    # ── Reference content (Phase 7A) ────────────────────────────────────
+    # ── Catalogue reference content ─────────────────────────────────────
     # These fields populate the catalog's reference cards. They are
     # documentation, not configuration — authors fill them in to explain
     # to a human reader (compliance, research, ops) what this plugin
     # does, when it's the right choice, when it isn't, and what audit
-    # characteristics it has. Empty / None values render as a generic
-    # "see the technical description" fallback in the catalog UI rather
-    # than blocking display. See docs/composer/ux-redesign-2026-05/
-    # 08-catalog-reshape.md for the per-field semantics and the
-    # canonical csv_source.py example.
+    # characteristics it has. Base defaults remain optional for third-party
+    # and legacy compatibility; repository tests require every registered
+    # built-in to be complete. See
+    # docs/contracts/plugin-catalogue-reference-content.md.
 
     usage_when_to_use: str | None = None
     """Persona-facing prose. One short paragraph answering "when should I
@@ -183,17 +188,14 @@ class BaseTransform(ABC):
 
     usage_when_not_to_use: str | None = None
     """Persona-facing prose. One short paragraph answering "when should I
-    *not* pick this plugin?" — gracefully redirecting users with the
-    wrong shape of problem to the right plugin. The Marcus persona (per
-    project_composer_personas) reads this to discover the plugin isn't
-    a fit for his Zapier-shaped expectations."""
+    *not* pick this plugin?" State a hard limitation or unsafe fit and
+    redirect the reader to a concrete alternative where one exists."""
 
     example_use: str | None = None
-    """One-or-two-line YAML snippet showing realistic use. Format
-    matches the pipeline YAML so a developer (Dev persona) can copy and
-    paste into a composer session as a starting point. Indent under
-    `source:` / `transform:` / `sink:` as appropriate for the plugin
-    kind. Renders inside a <pre> block in the UI; preserve whitespace."""
+    """One bounded YAML component fragment with realistic options and
+    non-secret values. Use top-level ``sources`` for sources, ``transform``
+    for ordinary transforms, ``aggregations`` for batch-aware transforms,
+    and ``sinks`` for sinks. Preserve whitespace for preformatted rendering."""
 
     capability_tags: tuple[str, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
@@ -202,7 +204,7 @@ class BaseTransform(ABC):
     """Short lowercase tags that drive catalog filter chips and fuzzy
     search. Examples: ("csv", "file", "batch") for csv_source;
     ("http", "network", "scraping") for a web-scrape transform. Tags
-    are non-exhaustive; pick the two or three most useful for a user
+    are non-exhaustive; pick the two to six most useful for a user
     who is searching the catalog.
 
     **Open vocabulary — deliberate.** ``capability_tags`` is typed as
@@ -264,7 +266,7 @@ class BaseTransform(ABC):
         options: Mapping[str, object],
     ) -> bool:
         """Evaluate whether this concrete config can enforce a declared control."""
-        if options.get("detect_only") is True:
+        if "detect_only" in options and options["detect_only"] is True:
             return False
         return any(
             declaration.capability is capability and declaration.control_role is role and declaration.blocks_positive_detection
@@ -887,7 +889,7 @@ class BaseTransform(ABC):
         return ()
 
 
-class BaseSink(ABC):
+class BaseSink(ABC, SinkEffectContract):
     """Base class for sink plugins.
 
     Subclass and implement write(), flush(), close().
@@ -958,7 +960,6 @@ class BaseSink(ABC):
     supported_effect_modes: ClassVar[frozenset[str]] = frozenset()
     supported_effect_input_kinds: ClassVar[frozenset[SinkEffectInputKind]] = frozenset()
     effect_mode_remediation: ClassVar[str | None] = None
-    supports_member_effects: ClassVar[bool] = False
 
     @classmethod
     def _resolve_sink_effect_mode(
@@ -971,16 +972,38 @@ class BaseSink(ABC):
         del cls, config, purpose
         return None
 
-    # ── Reference content (Phase 7A) ────────────────────────────────────
+    def _validate_sink_effect_capability_configuration(
+        self,
+        *,
+        mode: str,
+        required_input_kind: SinkEffectInputKind,
+    ) -> None:
+        """Validate adapter-specific state against effect admission.
+
+        Adapters whose live state can diverge from their resolved options
+        override this hook. The base implementation is an explicit no-op for
+        adapters whose validated configuration has no second representation.
+        """
+        del mode, required_input_kind
+
+    def _resolve_audit_export_publication_preflight(
+        self,
+        export_format: AuditExportFormat,
+    ) -> Callable[[], None] | None:
+        """Bind any plugin-owned publication probe from validated instance state."""
+        if type(export_format) is not AuditExportFormat:
+            raise TypeError("audit export format must be an exact AuditExportFormat")
+        return None
+
+    # ── Catalogue reference content ─────────────────────────────────────
     # These fields populate the catalog's reference cards. They are
     # documentation, not configuration — authors fill them in to explain
     # to a human reader (compliance, research, ops) what this plugin
     # does, when it's the right choice, when it isn't, and what audit
-    # characteristics it has. Empty / None values render as a generic
-    # "see the technical description" fallback in the catalog UI rather
-    # than blocking display. See docs/composer/ux-redesign-2026-05/
-    # 08-catalog-reshape.md for the per-field semantics and the
-    # canonical csv_source.py example.
+    # characteristics it has. Base defaults remain optional for third-party
+    # and legacy compatibility; repository tests require every registered
+    # built-in to be complete. See
+    # docs/contracts/plugin-catalogue-reference-content.md.
 
     usage_when_to_use: str | None = None
     """Persona-facing prose. One short paragraph answering "when should I
@@ -990,17 +1013,14 @@ class BaseSink(ABC):
 
     usage_when_not_to_use: str | None = None
     """Persona-facing prose. One short paragraph answering "when should I
-    *not* pick this plugin?" — gracefully redirecting users with the
-    wrong shape of problem to the right plugin. The Marcus persona (per
-    project_composer_personas) reads this to discover the plugin isn't
-    a fit for his Zapier-shaped expectations."""
+    *not* pick this plugin?" State a hard limitation or unsafe fit and
+    redirect the reader to a concrete alternative where one exists."""
 
     example_use: str | None = None
-    """One-or-two-line YAML snippet showing realistic use. Format
-    matches the pipeline YAML so a developer (Dev persona) can copy and
-    paste into a composer session as a starting point. Indent under
-    `source:` / `transform:` / `sink:` as appropriate for the plugin
-    kind. Renders inside a <pre> block in the UI; preserve whitespace."""
+    """One bounded YAML component fragment with realistic options and
+    non-secret values. Use top-level ``sources`` for sources, ``transform``
+    for ordinary transforms, ``aggregations`` for batch-aware transforms,
+    and ``sinks`` for sinks. Preserve whitespace for preformatted rendering."""
 
     capability_tags: tuple[str, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
@@ -1008,7 +1028,7 @@ class BaseSink(ABC):
     """Short lowercase tags that drive catalog filter chips and fuzzy
     search. Examples: ("csv", "file", "batch") for csv_source;
     ("http", "network", "scraping") for a web-scrape transform. Tags
-    are non-exhaustive; pick the two or three most useful for a user
+    are non-exhaustive; pick the two to six most useful for a user
     who is searching the catalog.
 
     See ``BaseTransform.capability_tags`` for the open-vocabulary
@@ -1374,16 +1394,15 @@ class BaseSource(ABC):
     plugin_version: str = "0.0.0"
     source_file_hash: str | None = None
 
-    # ── Reference content (Phase 7A) ────────────────────────────────────
+    # ── Catalogue reference content ─────────────────────────────────────
     # These fields populate the catalog's reference cards. They are
     # documentation, not configuration — authors fill them in to explain
     # to a human reader (compliance, research, ops) what this plugin
     # does, when it's the right choice, when it isn't, and what audit
-    # characteristics it has. Empty / None values render as a generic
-    # "see the technical description" fallback in the catalog UI rather
-    # than blocking display. See docs/composer/ux-redesign-2026-05/
-    # 08-catalog-reshape.md for the per-field semantics and the
-    # canonical csv_source.py example.
+    # characteristics it has. Base defaults remain optional for third-party
+    # and legacy compatibility; repository tests require every registered
+    # built-in to be complete. See
+    # docs/contracts/plugin-catalogue-reference-content.md.
 
     usage_when_to_use: str | None = None
     """Persona-facing prose. One short paragraph answering "when should I
@@ -1393,17 +1412,14 @@ class BaseSource(ABC):
 
     usage_when_not_to_use: str | None = None
     """Persona-facing prose. One short paragraph answering "when should I
-    *not* pick this plugin?" — gracefully redirecting users with the
-    wrong shape of problem to the right plugin. The Marcus persona (per
-    project_composer_personas) reads this to discover the plugin isn't
-    a fit for his Zapier-shaped expectations."""
+    *not* pick this plugin?" State a hard limitation or unsafe fit and
+    redirect the reader to a concrete alternative where one exists."""
 
     example_use: str | None = None
-    """One-or-two-line YAML snippet showing realistic use. Format
-    matches the pipeline YAML so a developer (Dev persona) can copy and
-    paste into a composer session as a starting point. Indent under
-    `source:` / `transform:` / `sink:` as appropriate for the plugin
-    kind. Renders inside a <pre> block in the UI; preserve whitespace."""
+    """One bounded YAML component fragment with realistic options and
+    non-secret values. Use top-level ``sources`` for sources, ``transform``
+    for ordinary transforms, ``aggregations`` for batch-aware transforms,
+    and ``sinks`` for sinks. Preserve whitespace for preformatted rendering."""
 
     capability_tags: tuple[str, ...] = ()
     web_config_authority: WebConfigAuthority = WebConfigAuthority.USER_CONFIGURABLE
@@ -1411,7 +1427,7 @@ class BaseSource(ABC):
     """Short lowercase tags that drive catalog filter chips and fuzzy
     search. Examples: ("csv", "file", "batch") for csv_source;
     ("http", "network", "scraping") for a web-scrape transform. Tags
-    are non-exhaustive; pick the two or three most useful for a user
+    are non-exhaustive; pick the two to six most useful for a user
     who is searching the catalog.
 
     See ``BaseTransform.capability_tags`` for the open-vocabulary

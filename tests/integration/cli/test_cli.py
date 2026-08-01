@@ -77,8 +77,9 @@ class TestCLIIntegration:
                     },
                 },
             },
-            # Use temp-path DB to avoid polluting CWD during tests
+            # Use temp-path DB and payload store to avoid polluting CWD during tests
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         config_file = tmp_path / "settings.yaml"
         config_file.write_text(yaml.dump(config))
@@ -205,6 +206,7 @@ class TestSourceQuarantineRouting:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         config_file = tmp_path / "settings.yaml"
         config_file.write_text(yaml.dump(config))
@@ -220,12 +222,19 @@ class TestSourceQuarantineRouting:
 
         This is the key acceptance test for the source quarantine routing feature.
         Before this fix, route_to_sink() was a stub and invalid rows were dropped.
+
+        F17 (elspeth-83ad093154): a run with quarantined rows terminates
+        COMPLETED_WITH_FAILURES, which maps to exit 1 (PARTIAL) — automation
+        boundaries must see that not every row succeeded, even when quarantine
+        is the designed-for outcome. Wrappers that accept quarantine can accept
+        exit 1 explicitly; exit 2 remains reserved for total failure.
         """
         from elspeth.cli import app
 
         # Run the pipeline
         result = runner.invoke(app, ["run", "-s", str(quarantine_pipeline_config), "--execute"])
-        assert result.exit_code == 0
+        assert result.exit_code == 1, f"PARTIAL run must exit 1, got {result.exit_code}: {result.output}"
+        assert "PARTIAL" in result.output
 
         # Check valid rows went to default output
         output_file = tmp_path / "output.json"
@@ -270,6 +279,7 @@ class TestSourceQuarantineRouting:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
         config_file = tmp_path / "settings.yaml"
         config_file.write_text(yaml.dump(config))
@@ -283,6 +293,203 @@ class TestSourceQuarantineRouting:
         output_file = tmp_path / "output.json"
         data = json.loads(output_file.read_text())
         assert len(data) == 2  # alice and carol only
+
+
+class TestRunExitCodes:
+    """F17 (elspeth-83ad093154): `run --execute` exit code reflects the terminal status.
+
+    The contract is the engine-owned ``cli_completion_for`` taxonomy:
+
+    * COMPLETED and EMPTY -> exit 0 (empty input is a clean exit; the Web
+      layer carries the structural distinction),
+    * COMPLETED_WITH_FAILURES (PARTIAL — any uncaught row failure OR any
+      quarantined row, including all-rows-quarantined) -> exit 1,
+    * FAILED (no row reached success or quarantine) -> exit 2,
+    * INTERRUPTED -> exit 3 (via the GracefulShutdownError path),
+    * exit 4 stays reserved for framework bugs / audit integrity.
+
+    Before this fix the run command returned normally regardless of terminal
+    status, so "Run PARTIAL/FAILED" banners still exited 0 and CI/cron/ECS
+    wrappers banked total failure as success.
+    """
+
+    def _write_config(self, tmp_path: Path, config: dict) -> Path:
+        config_file = tmp_path / "settings.yaml"
+        config_file.write_text(yaml.dump(config))
+        return config_file
+
+    def _base_config(self, tmp_path: Path, csv_path: Path) -> dict:
+        return {
+            "sources": {
+                "primary": {
+                    "plugin": "csv",
+                    "on_success": "default",
+                    "options": {
+                        "path": str(csv_path),
+                        "on_validation_failure": "discard",
+                        "schema": {"mode": "observed"},
+                    },
+                }
+            },
+            "sinks": {
+                "default": {
+                    "plugin": "json",
+                    "on_write_failure": "discard",
+                    "options": {
+                        "path": str(tmp_path / "output.json"),
+                        "schema": {"mode": "observed"},
+                    },
+                },
+            },
+            "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
+        }
+
+    def _failing_coerce_transform(self, *, on_error: str = "discard") -> dict:
+        """Transform that fails any row whose ``score`` is not int-coercible.
+
+        ``on_error: discard`` records the failure as a quarantine (clean
+        determination -> PARTIAL); ``on_error: <sink>`` records ON_ERROR_ROUTED
+        (uncaught failure -> FAILED when no row succeeds).
+        """
+        return {
+            "name": "coerce_score",
+            "plugin": "type_coerce",
+            "input": "coerce_input",
+            "on_success": "default",
+            "on_error": on_error,
+            "options": {
+                "schema": {"mode": "observed"},
+                "conversions": [{"field": "score", "to": "int"}],
+            },
+        }
+
+    def _errors_sink(self, tmp_path: Path) -> dict:
+        return {
+            "plugin": "json",
+            "on_write_failure": "discard",
+            "options": {
+                "path": str(tmp_path / "errors.json"),
+                "schema": {"mode": "observed"},
+            },
+        }
+
+    def test_all_rows_failed_exits_2(self, tmp_path: Path) -> None:
+        """Total failure: every row fails uncaught -> FAILED -> exit 2.
+
+        ``on_error`` routes to an error sink (not ``discard``): ON_ERROR_ROUTED
+        counts as an uncaught failure, and with zero successes and zero
+        quarantines the terminal status is FAILED.
+        """
+        from elspeth.cli import app
+
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("id,name,score\n1,alice,bad\n2,bob,worse\n")
+        config = self._base_config(tmp_path, csv_file)
+        config["sources"]["primary"]["on_success"] = "coerce_input"
+        config["transforms"] = [self._failing_coerce_transform(on_error="errors")]
+        config["sinks"]["errors"] = self._errors_sink(tmp_path)
+        config_file = self._write_config(tmp_path, config)
+
+        result = runner.invoke(app, ["run", "-s", str(config_file), "--execute"])
+        assert result.exit_code == 2, f"All-rows-failed run must exit 2, got {result.exit_code}: {result.output}"
+        assert "FAILED" in result.output
+
+    def test_partial_success_exits_1(self, tmp_path: Path) -> None:
+        """Mixed outcome: some rows succeed, some fail uncaught -> PARTIAL -> exit 1."""
+        from elspeth.cli import app
+
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("id,name,score\n1,alice,95\n2,bob,bad\n3,carol,92\n")
+        config = self._base_config(tmp_path, csv_file)
+        config["sources"]["primary"]["on_success"] = "coerce_input"
+        config["transforms"] = [self._failing_coerce_transform(on_error="errors")]
+        config["sinks"]["errors"] = self._errors_sink(tmp_path)
+        config_file = self._write_config(tmp_path, config)
+
+        result = runner.invoke(app, ["run", "-s", str(config_file), "--execute"])
+        assert result.exit_code == 1, f"PARTIAL run must exit 1, got {result.exit_code}: {result.output}"
+        assert "PARTIAL" in result.output
+
+    def test_all_rows_quarantined_exits_1(self, tmp_path: Path) -> None:
+        """The literal F17 case: 0 succeeded, all rows quarantined -> exit 1.
+
+        Evidence: docs-archive/2026-07-30-aws-greenfield-cold-install-friction.md
+        F17 — "Run PARTIAL: 1 rows processed | 0 succeeded | 1 failed |
+        1 quarantined" exited 0 and the ECS one-shot banked it as success.
+        """
+        from elspeth.cli import app
+
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("id,name,score\n1,alice,bad\n")
+        config = self._base_config(tmp_path, csv_file)
+        config["sources"]["primary"]["options"]["on_validation_failure"] = "quarantine"
+        config["sources"]["primary"]["options"]["schema"] = {
+            "mode": "fixed",
+            "fields": ["id: int", "name: str", "score: int"],
+        }
+        config["sinks"]["quarantine"] = {
+            "plugin": "json",
+            "on_write_failure": "discard",
+            "options": {
+                "path": str(tmp_path / "quarantine.json"),
+                "schema": {"mode": "observed"},
+            },
+        }
+        config_file = self._write_config(tmp_path, config)
+
+        result = runner.invoke(app, ["run", "-s", str(config_file), "--execute"])
+        assert result.exit_code == 1, f"All-quarantined run must exit 1, got {result.exit_code}: {result.output}"
+        assert "PARTIAL" in result.output
+        assert "0 succeeded" in result.output
+
+    def test_empty_source_exits_0(self, tmp_path: Path) -> None:
+        """Zero rows from the source is a clean exit (EMPTY -> 0), distinct
+        from all-rows-failed (FAILED -> 2)."""
+        from elspeth.cli import app
+
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("id,name,score\n")  # headers only
+        config_file = self._write_config(tmp_path, self._base_config(tmp_path, csv_file))
+
+        result = runner.invoke(app, ["run", "-s", str(config_file), "--execute"])
+        assert result.exit_code == 0, f"Empty-source run must exit 0, got {result.exit_code}: {result.output}"
+
+    def test_all_rows_succeeded_exits_0(self, tmp_path: Path) -> None:
+        """Pure success keeps exit 0."""
+        from elspeth.cli import app
+
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("id,name,score\n1,alice,95\n2,bob,87\n")
+        config_file = self._write_config(tmp_path, self._base_config(tmp_path, csv_file))
+
+        result = runner.invoke(app, ["run", "-s", str(config_file), "--execute"])
+        assert result.exit_code == 0, f"Fully-successful run must exit 0, got {result.exit_code}: {result.output}"
+        assert "COMPLETED" in result.output
+
+    def test_json_format_reports_exit_code_and_exits_nonzero(self, tmp_path: Path) -> None:
+        """--format json: the execution_result event carries the exit code the
+        process then exits with (machine consumers get both signals)."""
+        from elspeth.cli import app
+
+        csv_file = tmp_path / "data.csv"
+        csv_file.write_text("id,name,score\n1,alice,bad\n2,bob,worse\n")
+        config = self._base_config(tmp_path, csv_file)
+        config["sources"]["primary"]["on_success"] = "coerce_input"
+        config["transforms"] = [self._failing_coerce_transform(on_error="errors")]
+        config["sinks"]["errors"] = self._errors_sink(tmp_path)
+        config_file = self._write_config(tmp_path, config)
+
+        result = runner.invoke(app, ["run", "-s", str(config_file), "--execute", "--format", "json"])
+        assert result.exit_code == 2, f"All-rows-failed run must exit 2, got {result.exit_code}: {result.output}"
+
+        events = [json.loads(line) for line in result.output.splitlines() if line.strip().startswith("{")]
+        execution_results = [e for e in events if e.get("event") == "execution_result"]
+        assert len(execution_results) == 1, f"Expected one execution_result event, got {events!r}"
+        assert execution_results[0]["exit_code"] == 2
+        assert execution_results[0]["status"] == "failed"
+        run_completed = [e for e in events if e.get("event") == "run_completed"]
+        assert run_completed and run_completed[0]["exit_code"] == 2
 
 
 class TestTransformErrorSinkRouting:
@@ -338,6 +545,7 @@ class TestTransformErrorSinkRouting:
                 },
             },
             "landscape": {"url": f"sqlite:///{tmp_path / 'landscape.db'}"},
+            "payload_store": {"backend": "filesystem", "base_path": str(tmp_path / "payloads")},
         }
 
         config_path = tmp_path / "settings.yaml"

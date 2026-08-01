@@ -6,8 +6,9 @@ import json
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
+from botocore.exceptions import ClientError
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -30,16 +31,15 @@ _CTX = RestrictedSinkEffectContext(
 )
 
 
-class _Missing(Exception):
-    response: ClassVar[dict[str, object]] = {
-        "Error": {"Code": "NoSuchKey"},
-        "ResponseMetadata": {"HTTPStatusCode": 404},
-    }
-
-
 class _InspectClient:
     def head_object(self, **_kwargs: object) -> None:
-        raise _Missing
+        raise ClientError(
+            {
+                "Error": {"Code": "NoSuchKey", "Message": "missing"},
+                "ResponseMetadata": {"HTTPStatusCode": 404},
+            },
+            "HeadObject",
+        )
 
 
 def _member(ordinal: int, row: dict[str, Any]) -> SinkEffectMember:

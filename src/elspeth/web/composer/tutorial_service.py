@@ -19,6 +19,7 @@ from fastapi import HTTPException, Request
 from sqlalchemy import func, select, update
 
 from elspeth.contracts import CallType
+from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.schema import (
     artifacts_table,
@@ -40,6 +41,8 @@ from elspeth.web.composer.tutorial_models import (
     TutorialRunResponse,
 )
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.errors import UnresolvedInterpretationPlaceholderError
 from elspeth.web.execution.outputs import filesystem_path_candidates
 from elspeth.web.execution.protocol import ExecutionService
@@ -76,6 +79,28 @@ _TUTORIAL_BASE_TRANSFORMS = frozenset(
         PluginId("transform", "field_mapper"),
     }
 )
+# Capabilities a deployment may declare `required` (WebSettings.plugin_control_modes).
+# The tutorial scrapes untrusted remote pages into an LLM, so it is exactly the
+# shape those controls exist for.
+_TUTORIAL_CONTROL_CAPABILITIES = frozenset({PluginCapability.PROMPT_SHIELD, PluginCapability.CONTENT_SAFETY})
+
+
+def _tutorial_control_transforms(snapshot: PluginAvailabilitySnapshot) -> frozenset[PluginId]:
+    """Control transforms a tutorial pipeline may carry beyond its base set.
+
+    A deployment that sets prompt_shield/content_safety to ``required``
+    (the AWS scenario module does) makes coverage a launch condition, while
+    a fixed three-transform contract makes satisfying it impossible: adding
+    the shield trips ``tutorial_plugin_set``, omitting it trips
+    ``required_control_coverage``. The tutorial admits whichever control
+    plugins THIS deployment selected, so a compliant pipeline exists
+    wherever the controls do — and where they do not, the run proceeds and
+    the composer's standing prompt-injection recommendation teaches why the
+    exposure matters.
+    """
+    return frozenset(
+        plugin_id for capability, plugin_id in snapshot.selected if capability in _TUTORIAL_CONTROL_CAPABILITIES and plugin_id is not None
+    )
 
 
 class TutorialRunIntegrityError(RuntimeError):
@@ -99,6 +124,30 @@ class _LiveTutorialRun:
 class _VerifiedArtifactBytes:
     path: Path
     content: bytes
+
+
+async def _close_tutorial_execute_lease_before_transfer(lease: SessionOperationLease) -> None:
+    """Join exact lease cleanup even when request cancellation repeats."""
+    close_task = asyncio.create_task(
+        lease.close(),
+        name="tutorial-execution-pretransfer-lease-close",
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not close_task.done():
+        try:
+            await asyncio.shield(close_task)
+        except asyncio.CancelledError as error:
+            if cancellation is None:
+                cancellation = error
+            continue
+    try:
+        close_task.result()
+    except BaseException as close_error:
+        if cancellation is None:
+            raise
+        cancellation.add_note(f"Tutorial execution pre-transfer lease close also failed with {type(close_error).__name__}.")
+    if cancellation is not None:
+        raise cancellation from None
 
 
 def _tutorial_launch_blocker(
@@ -131,11 +180,15 @@ def _tutorial_launch_blocker(
             "tutorial_transforms_missing",
             "The saved tutorial pipeline has no transform steps — it wires the source directly to the sink.",
         )
+    # The base three are mandatory; this deployment's own control transforms are
+    # additionally admitted so a control-required policy stays satisfiable.
+    transform_set = set(transform_ids)
     if (
         not source_valid
         or not output_valid
-        or len(transform_ids) != len(_TUTORIAL_BASE_TRANSFORMS)
-        or set(transform_ids) != _TUTORIAL_BASE_TRANSFORMS
+        or len(transform_ids) != len(transform_set)
+        or not transform_set >= _TUTORIAL_BASE_TRANSFORMS
+        or not (transform_set - _TUTORIAL_BASE_TRANSFORMS) <= _tutorial_control_transforms(snapshot)
         or any(node.plugin is None for node in state.nodes)
     ):
         return ("tutorial_plugin_set", "The saved tutorial pipeline does not match the supported tutorial plugin set.")
@@ -199,7 +252,7 @@ async def _require_tutorial_launch_readiness(
         state=state,
         policy=request.app.state.web_plugin_policy,
         snapshot=snapshot,
-        tutorial_profile=settings.tutorial_llm_profile,
+        tutorial_profile=settings.default_llm_profile,
         profile_registry=request.app.state.operator_profile_registry,
         catalog=request.app.state.catalog_service,
     )
@@ -268,13 +321,23 @@ async def _run_live_tutorial(
     session_service: SessionServiceProtocol,
 ) -> _LiveTutorialRun:
     execution_service: ExecutionService = request.app.state.execution_service
+    lease = await SessionOperationLease.acquire(
+        session_service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.EXECUTE,
+        owner_instance_id=session_service.session_operation_owner_instance_id,
+        lease_seconds=session_service.session_operation_lease_seconds,
+    )
+    transferred = False
     try:
         run_id = await execution_service.execute(
             session_id,
             state_id=state_id,
+            session_operation_lease=lease,
             user_id=user.user_id,
             auth_provider_type=settings.auth_provider,
         )
+        transferred = True
     except UnresolvedInterpretationPlaceholderError as exc:
         # A pending interpretation review (e.g. the planner-authored LLM
         # prompt awaiting its Accept card) is a launch blocker in the
@@ -297,6 +360,9 @@ async def _run_live_tutorial(
                 ),
             },
         ) from exc
+    finally:
+        if not transferred:
+            await _close_tutorial_execute_lease_before_transfer(lease)
     run_timeout_seconds = settings.composer_transport_idle_ceiling_seconds - settings.composer_transport_headroom_seconds
     run_record = await _wait_for_terminal_run(
         session_service,

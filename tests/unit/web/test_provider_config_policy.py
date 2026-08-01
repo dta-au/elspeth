@@ -8,6 +8,11 @@ from typing import Any
 
 import pytest
 
+from elspeth.web.composer.tools._common import (
+    _PLUGIN_UNAVAILABLE_EXPLANATIONS,
+    _plugin_unavailable_message,
+)
+from elspeth.web.plugin_policy.models import PluginUnavailableReason
 from elspeth.web.provider_config_policy import (
     AWS_S3_ENDPOINT_URL_POLICY_ERROR,
     AWS_S3_SOURCE_POLICY_ERROR,
@@ -29,6 +34,34 @@ class TestWebAwsS3SourcePolicy:
         assert error == AWS_S3_SOURCE_POLICY_ERROR
         assert "prod-confidential-bucket" not in error
         assert "payroll/ssn.csv" not in error
+
+
+class TestWebSurfaceProhibitionExplanation:
+    """The prohibition must arrive as plain language, not a bare policy code.
+
+    ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED`` is the snapshot-level
+    declaration of this module's aws_s3-source ban; the composer renders it
+    through ``_PLUGIN_UNAVAILABLE_EXPLANATIONS``, which is keyed by reason and
+    read with a total lookup.
+    """
+
+    def test_every_unavailable_reason_has_an_explanation(self) -> None:
+        """A reason without an entry raises KeyError mid-tool-call.
+
+        The lookup in ``_plugin_unavailable_message`` is deliberately total, so
+        adding an enum member without its copy turns an honest decline into a
+        500. This pins the pair together.
+        """
+        assert set(_PLUGIN_UNAVAILABLE_EXPLANATIONS) == set(PluginUnavailableReason)
+
+    def test_prohibition_message_carries_the_policy_reason_and_its_cause(self) -> None:
+        message = _plugin_unavailable_message("source", PluginUnavailableReason.WEB_SURFACE_PROHIBITED)
+
+        assert PluginUnavailableReason.WEB_SURFACE_PROHIBITED.value in message
+        # The single source of truth is reused, so the two copies cannot drift.
+        assert AWS_S3_SOURCE_POLICY_ERROR in message
+        # It must not read as an operator-repairable gap (the other reasons do).
+        assert "no operator setting can enable it here" in message
 
 
 class TestWebAwsS3EndpointUrlPolicy:

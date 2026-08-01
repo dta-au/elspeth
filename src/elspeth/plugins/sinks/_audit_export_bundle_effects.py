@@ -15,13 +15,13 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import sys
-import tempfile
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 from tempfile import TemporaryFile
 from typing import IO, Final, cast
@@ -368,10 +368,10 @@ def _inspection_target(request: SinkEffectPrepareRequest, target_path: Path) -> 
     evidence = request.inspection.evidence
     if set(evidence) != {"effect_id", "schema", "target_kind", "target_path"}:
         raise AuditExportBundleInputError("bundle inspection evidence is not closed")
-    if evidence.get("schema") != INSPECTION_SCHEMA or evidence.get("effect_id") != request.effect_id:
+    if evidence["schema"] != INSPECTION_SCHEMA or evidence["effect_id"] != request.effect_id:
         raise AuditExportBundleInputError("bundle inspection evidence is divergent")
     target = _absolute_path(target_path)
-    if evidence.get("target_path") != str(target):
+    if evidence["target_path"] != str(target):
         raise AuditExportBundleInputError("bundle prepare target differs from inspection")
     return target
 
@@ -387,10 +387,13 @@ def _csv_relative_path(record_type: object, seen: dict[str, str]) -> str:
     _validate_relative_name(relative_path)
     if relative_path.casefold() == AUDIT_MANIFEST_NAME.casefold():
         raise AuditExportBundleInputError("generated CSV filename collides with the reserved audit manifest")
-    prior = seen.get(relative_path.casefold())
+    folded_path = relative_path.casefold()
+    prior: str | None = None
+    if folded_path in seen:
+        prior = seen[folded_path]
     if prior is not None and prior != relative_path:
         raise AuditExportBundleInputError("generated CSV filenames contain a case-fold collision")
-    seen[relative_path.casefold()] = relative_path
+    seen[folded_path] = relative_path
     return relative_path
 
 
@@ -407,6 +410,7 @@ def _parse_verified_records(
     spools: dict[str, _RecordSpool] = {}
     seen_names: dict[str, str] = {}
     observed_records = 0
+    completed = False
     try:
         for chunk in effect_input.reader.iter_verified_chunks():
             if type(chunk) is not bytes or not chunk.endswith(b"\n"):
@@ -424,10 +428,12 @@ def _parse_verified_records(
                 if type(value) is not dict or canonical_json(value).encode("utf-8") != frame:
                     raise AuditExportBundleInputError("verified data records must be exact canonical JSON objects")
                 record = cast(dict[str, object], value)
-                relative_path = _csv_relative_path(record.get("record_type"), seen_names)
+                relative_path = _csv_relative_path(record["record_type"], seen_names)
                 flattened = formatter.format(record)
                 safe_record = {key: _neutralize_csv_formula(item) for key, item in flattened.items()}
-                spool = spools.get(relative_path)
+                spool: _RecordSpool | None = None
+                if relative_path in spools:
+                    spool = spools[relative_path]
                 if spool is None:
                     if len(spools) >= MAX_BUNDLE_FILES - 1:
                         raise AuditExportBundleInputError("CSV record types exceed the bounded bundle-file limit")
@@ -444,10 +450,7 @@ def _parse_verified_records(
             raise AuditExportBundleInputError("CSV bundle observed record count differs from the registered snapshot")
         if not spools:
             raise AuditExportBundleInputError("CSV audit export requires at least one data record type")
-        try:
-            manifest_bytes = effect_input.reader.read_verified_signed_manifest()
-        except Exception as exc:
-            raise AuditExportBundleInputError("final audit manifest is missing or failed verification") from exc
+        manifest_bytes = effect_input.reader.read_verified_signed_manifest()
         if manifest_bytes.endswith(b"\n"):
             raise AuditExportBundleInputError("final audit manifest must not carry a trailing newline")
         try:
@@ -456,113 +459,118 @@ def _parse_verified_records(
             raise AuditExportBundleInputError("final audit manifest is not valid JSON") from exc
         if (
             type(manifest) is not dict
-            or manifest.get("record_type") != "manifest"
-            or manifest.get("schema") != "elspeth.audit-export-manifest.v2"
+            or manifest["record_type"] != "manifest"
+            or manifest["schema"] != "elspeth.audit-export-manifest.v2"
             or canonical_json(manifest).encode("utf-8") != manifest_bytes
         ):
             raise AuditExportBundleInputError("final audit manifest is non-final or non-canonical")
+        completed = True
         return spools, manifest_bytes
-    except BaseException:
-        for spool in spools.values():
-            spool.stream.close()
-        raise
+    finally:
+        if not completed:
+            for spool in spools.values():
+                spool.stream.close()
 
 
-def _write_csv_file(path: Path, spool: _RecordSpool) -> BundleFileEntry:
-    digest = hashlib.sha256()
-    with path.open("x", encoding="utf-8", newline="") as text:
-        os.chmod(path, 0o600)
+def _open_owned_output(directory_fd: int, name: str, owned_names: list[str]) -> int:
+    _validate_relative_name(name)
+    descriptor = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    owned_names.append(name)
+    completed = False
+    try:
+        os.fchmod(descriptor, 0o600)
+        completed = True
+        return descriptor
+    finally:
+        if not completed:
+            os.close(descriptor)
+
+
+def _hash_regular_file_at(directory_fd: int, name: str, expected_identity: os.stat_result) -> tuple[str, int]:
+    descriptor = os.open(name, _regular_file_read_flags(), dir_fd=directory_fd)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_dev != expected_identity.st_dev or before.st_ino != expected_identity.st_ino:
+            raise AuditExportBundlePreconditionError("bundle output changed identity before hashing")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, _COPY_CHUNK_BYTES):
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+            or before.st_size != after.st_size
+            or before.st_mtime_ns != after.st_mtime_ns
+            or observed.st_dev != after.st_dev
+            or observed.st_ino != after.st_ino
+        ):
+            raise AuditExportBundlePreconditionError("bundle output changed while it was hashed")
+        return digest.hexdigest(), after.st_size
+    finally:
+        os.close(descriptor)
+
+
+def _write_csv_file_at(
+    directory_fd: int,
+    name: str,
+    spool: _RecordSpool,
+    owned_names: list[str],
+) -> BundleFileEntry:
+    descriptor = _open_owned_output(directory_fd, name, owned_names)
+    identity = os.fstat(descriptor)
+    with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as text:
         writer = csv.DictWriter(text, fieldnames=sorted(spool.fieldnames), lineterminator="\r\n")
         writer.writeheader()
         spool.stream.seek(0)
         for line in spool.stream:
             value = json.loads(line)
             if type(value) is not dict:
-                raise AuditExportBundleInputError("CSV private spool contains a non-object record")
+                raise AuditExportBundlePreconditionError("CSV private spool contains a non-object record")
             writer.writerow(value)
         text.flush()
         os.fsync(text.fileno())
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(_COPY_CHUNK_BYTES), b""):
-            digest.update(chunk)
-    return BundleFileEntry(path.name, digest.hexdigest(), path.stat().st_size)
+    content_hash, size_bytes = _hash_regular_file_at(directory_fd, name, identity)
+    return BundleFileEntry(name, content_hash, size_bytes)
 
 
-def _write_exact_file(path: Path, content: bytes) -> BundleFileEntry:
-    with path.open("xb") as stream:
-        os.chmod(path, 0o600)
-        stream.write(content)
+def _write_exact_file_at(
+    directory_fd: int,
+    name: str,
+    content: bytes,
+    owned_names: list[str],
+) -> BundleFileEntry:
+    descriptor = _open_owned_output(directory_fd, name, owned_names)
+    identity = os.fstat(descriptor)
+    with os.fdopen(descriptor, "wb") as stream:
+        written = stream.write(content)
+        if written != len(content):
+            raise AuditExportBundlePreconditionError("bundle output accepted a partial write")
         stream.flush()
         os.fsync(stream.fileno())
-    return BundleFileEntry(path.name, hashlib.sha256(content).hexdigest(), len(content))
+    content_hash, size_bytes = _hash_regular_file_at(directory_fd, name, identity)
+    return BundleFileEntry(name, content_hash, size_bytes)
 
 
-def _tree_matches(path: Path, files: Sequence[BundleFileEntry]) -> bool:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        directory_fd = os.open(path, flags)
-    except OSError:
-        return False
-    try:
-        try:
-            names = os.listdir(directory_fd)
-        except OSError:
-            return False
-        expected_names = {entry.relative_path for entry in files}
-        if set(names) != expected_names or len(names) != len(expected_names):
-            return False
-        if len({name.casefold() for name in names}) != len(names):
-            return False
-        for entry in files:
-            file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-            try:
-                descriptor = os.open(entry.relative_path, file_flags, dir_fd=directory_fd)
-            except OSError:
-                return False
-            try:
-                before = os.fstat(descriptor)
-                if not stat.S_ISREG(before.st_mode) or before.st_size != entry.size_bytes:
-                    return False
-                digest = hashlib.sha256()
-                while chunk := os.read(descriptor, _COPY_CHUNK_BYTES):
-                    digest.update(chunk)
-                after = os.fstat(descriptor)
-                if (
-                    before.st_dev != after.st_dev
-                    or before.st_ino != after.st_ino
-                    or before.st_size != after.st_size
-                    or before.st_mtime_ns != after.st_mtime_ns
-                    or digest.hexdigest() != entry.content_hash
-                ):
-                    return False
-            finally:
-                os.close(descriptor)
-        return True
-    finally:
-        os.close(directory_fd)
+def _directory_read_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
 
-def _remove_exact_tree(path: Path, files: Sequence[BundleFileEntry]) -> bool:
-    if not _tree_matches(path, files):
-        return False
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+def _regular_file_read_flags() -> int:
+    return os.O_RDONLY | os.O_NOFOLLOW
+
+
+def _require_secure_open_flags() -> None:
     try:
-        directory_fd = os.open(path, flags)
-    except OSError:
-        return False
-    try:
-        for entry in files:
-            os.unlink(entry.relative_path, dir_fd=directory_fd)
-    except OSError:
-        return False
-    finally:
-        os.close(directory_fd)
-    try:
-        os.rmdir(path)
-        _fsync_directory(path.parent)
-    except OSError:
-        return False
-    return True
+        _directory_read_flags()
+        _regular_file_read_flags()
+    except AttributeError as exc:
+        raise AuditExportBundlePreflightError("CSV audit-export bundles require os.O_DIRECTORY and os.O_NOFOLLOW") from exc
 
 
 @dataclass(slots=True)
@@ -592,25 +600,33 @@ def _open_pinned_bundle_parent(target: Path) -> _PinnedBundleParent:
     parent = target.parent
     if not parent.is_absolute():
         raise AuditExportBundlePreconditionError("bundle target parent must be absolute")
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _directory_read_flags()
     current = os.open(parent.anchor, flags)
     parts = parent.parts[1:]
     if not parts:
         anchor = os.dup(current)
         identity = os.fstat(current)
         return _PinnedBundleParent(parent, current, anchor, ".", identity)
+    completed = False
     try:
         for index, part in enumerate(parts):
             child = os.open(part, flags, dir_fd=current)
             if index == len(parts) - 1:
-                identity = os.fstat(child)
-                return _PinnedBundleParent(parent, child, current, part, identity)
+                child_completed = False
+                try:
+                    identity = os.fstat(child)
+                    completed = True
+                    child_completed = True
+                    return _PinnedBundleParent(parent, child, current, part, identity)
+                finally:
+                    if not child_completed:
+                        os.close(child)
             os.close(current)
             current = child
-    except BaseException:
-        os.close(current)
-        raise
-    raise AssertionError("absolute bundle parent traversal must terminate")
+        raise AssertionError("absolute bundle parent traversal must terminate")
+    finally:
+        if not completed:
+            os.close(current)
 
 
 def _directory_fd_matches(directory_fd: int, files: Sequence[BundleFileEntry]) -> bool:
@@ -624,7 +640,7 @@ def _directory_fd_matches(directory_fd: int, files: Sequence[BundleFileEntry]) -
     if len({name.casefold() for name in names}) != len(names):
         return False
     for entry in files:
-        file_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        file_flags = _regular_file_read_flags()
         try:
             descriptor = os.open(entry.relative_path, file_flags, dir_fd=directory_fd)
         except OSError:
@@ -651,7 +667,7 @@ def _directory_fd_matches(directory_fd: int, files: Sequence[BundleFileEntry]) -
 
 
 def _tree_matches_at(parent_fd: int, name: str, files: Sequence[BundleFileEntry]) -> bool:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _directory_read_flags()
     try:
         directory_fd = os.open(name, flags, dir_fd=parent_fd)
     except OSError:
@@ -675,7 +691,7 @@ def _target_kind_at(parent_fd: int, name: str) -> str:
 
 
 def _remove_exact_tree_at(parent_fd: int, name: str, files: Sequence[BundleFileEntry]) -> bool:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _directory_read_flags()
     try:
         directory_fd = os.open(name, flags, dir_fd=parent_fd)
     except OSError:
@@ -702,7 +718,7 @@ def _remove_exact_tree_at(parent_fd: int, name: str, files: Sequence[BundleFileE
 
 
 def _fsync_tree_at(parent_fd: int, name: str, files: Sequence[BundleFileEntry]) -> bool:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _directory_read_flags()
     try:
         directory_fd = os.open(name, flags, dir_fd=parent_fd)
     except OSError:
@@ -714,6 +730,60 @@ def _fsync_tree_at(parent_fd: int, name: str, files: Sequence[BundleFileEntry]) 
         return True
     finally:
         os.close(directory_fd)
+
+
+def _create_private_building_tree_at(parent_fd: int, target_name: str, effect_id: str) -> tuple[str, int]:
+    prefix = f".{target_name}.elspeth-{effect_id}.building-"
+    for _attempt in range(16):
+        name = f"{prefix}{uuid4().hex}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        descriptor = os.open(name, _directory_read_flags(), dir_fd=parent_fd)
+        completed = False
+        try:
+            os.fchmod(descriptor, 0o700)
+            identity = os.fstat(descriptor)
+            observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if observed.st_dev != identity.st_dev or observed.st_ino != identity.st_ino:
+                raise AuditExportBundlePreconditionError("private bundle building directory changed during creation")
+            completed = True
+            return name, descriptor
+        finally:
+            if not completed:
+                os.close(descriptor)
+                with suppress(OSError):
+                    os.rmdir(name, dir_fd=parent_fd)
+    raise AuditExportBundlePreconditionError("could not allocate a unique private bundle building directory")
+
+
+def _remove_owned_building_tree_at(
+    parent_fd: int,
+    name: str,
+    directory_fd: int,
+    owned_names: Sequence[str],
+) -> bool:
+    expected_names = set(owned_names)
+    try:
+        identity = os.fstat(directory_fd)
+        names = os.listdir(directory_fd)
+        if set(names) != expected_names or len(names) != len(expected_names):
+            return False
+        for child_name in names:
+            os.unlink(child_name, dir_fd=directory_fd)
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if observed.st_dev != identity.st_dev or observed.st_ino != identity.st_ino:
+            return False
+        os.rmdir(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except OSError:
+        return False
+    return True
+
+
+def _before_prepare_install(_building: Path, _staging: Path) -> None:
+    """Race-test seam after building fsync and before effect-stage install."""
 
 
 def prepare_audit_export_bundle(
@@ -730,25 +800,38 @@ def prepare_audit_export_bundle(
         raise AuditExportBundleInputError("CSV directory bundle requires a CSV audit snapshot")
     target = _inspection_target(request, target_path)
     _assert_no_symlink_components(target)
-    if not target.parent.is_dir():
-        raise AuditExportBundlePreflightError("bundle target parent must already exist")
     staging = _staging_path(target, request.effect_id)
-    building = Path(
-        tempfile.mkdtemp(
-            prefix=f".{target.name}.elspeth-{request.effect_id}.building-",
-            dir=target.parent,
-        )
-    )
-    os.chmod(building, 0o700)
+    try:
+        parent = _open_pinned_bundle_parent(target)
+    except OSError as exc:
+        raise AuditExportBundlePreflightError("bundle target parent must already exist without symlink components") from exc
+    building_name = ""
+    building_descriptor = -1
     spools: dict[str, _RecordSpool] = {}
     installed = False
+    building_removed = False
+    written_names: list[str] = []
     files: tuple[BundleFileEntry, ...] = ()
+    completed = False
     try:
+        if not parent.is_still_bound():
+            raise AuditExportBundlePreconditionError("bundle target parent changed before preparation")
+        building_name, building_descriptor = _create_private_building_tree_at(
+            parent.descriptor,
+            target.name,
+            request.effect_id,
+        )
+        building = target.parent / building_name
         spools, manifest_bytes = _parse_verified_records(effect_input)
         entries: list[BundleFileEntry] = []
         for relative_path in sorted(spools):
-            entries.append(_write_csv_file(building / relative_path, spools[relative_path]))
-        manifest_entry = _write_exact_file(building / AUDIT_MANIFEST_NAME, manifest_bytes)
+            entries.append(_write_csv_file_at(building_descriptor, relative_path, spools[relative_path], written_names))
+        manifest_entry = _write_exact_file_at(
+            building_descriptor,
+            AUDIT_MANIFEST_NAME,
+            manifest_bytes,
+            written_names,
+        )
         if (
             manifest_entry.content_hash != effect_input.signed_manifest.content_hash
             or manifest_entry.size_bytes != effect_input.signed_manifest.size_bytes
@@ -756,44 +839,46 @@ def prepare_audit_export_bundle(
             raise AuditExportBundleInputError("written final manifest differs from its registered descriptor")
         entries.append(manifest_entry)
         files = tuple(sorted(entries, key=lambda entry: entry.relative_path))
-        _fsync_directory(building)
+        os.fsync(building_descriptor)
+        _before_prepare_install(building, staging)
+        if not parent.is_still_bound():
+            raise AuditExportBundlePreconditionError("bundle target parent changed before staging install")
         try:
-            _rename_noreplace(building, staging)
+            _rename_noreplace_at(parent.descriptor, building_name, staging.name)
             installed = True
         except OSError as exc:
-            if exc.errno != errno.EEXIST or not _tree_matches(staging, files):
+            if exc.errno != errno.EEXIST or not _tree_matches_at(parent.descriptor, staging.name, files):
                 raise AuditExportBundlePreconditionError("effect-addressed staging directory is divergent") from exc
-            shutil.rmtree(building)
-        if not _tree_matches(staging, files):
+            building_removed = _remove_owned_building_tree_at(
+                parent.descriptor,
+                building_name,
+                building_descriptor,
+                written_names,
+            )
+            if not building_removed:
+                raise AuditExportBundlePreconditionError("private bundle building directory could not be removed") from exc
+        if not parent.is_still_bound():
+            raise AuditExportBundlePreconditionError("bundle target parent changed during staging install")
+        if not _tree_matches_at(parent.descriptor, staging.name, files):
             raise AuditExportBundlePreconditionError("installed staging tree changed before plan durability")
-        _fsync_directory(target.parent)
-    except BaseException:
-        if building.exists():
-            shutil.rmtree(building, ignore_errors=True)
-        if installed and files:
-            _remove_exact_tree(staging, files)
-        raise
-    finally:
-        for spool in spools.values():
-            spool.stream.close()
+        os.fsync(parent.descriptor)
 
-    bundle_size = sum(entry.size_bytes for entry in files)
-    bundle_hash = _bundle_hash(files)
-    evidence_value = BundlePlanEvidence(
-        target_path=str(target),
-        staging_path=str(staging),
-        snapshot_id=effect_input.snapshot_id,
-        manifest_content_ref=effect_input.signed_manifest.content_ref,
-        manifest_content_hash=effect_input.signed_manifest.content_hash,
-        manifest_size_bytes=effect_input.signed_manifest.size_bytes,
-        bundle_hash=bundle_hash,
-        bundle_size_bytes=bundle_size,
-        files=files,
-    )
-    evidence = evidence_value.as_mapping()
-    descriptor = ArtifactDescriptor.for_file(path=str(target), content_hash=bundle_hash, size_bytes=bundle_size)
-    try:
-        return SinkEffectPlan(
+        bundle_size = sum(entry.size_bytes for entry in files)
+        bundle_hash = _bundle_hash(files)
+        evidence_value = BundlePlanEvidence(
+            target_path=str(target),
+            staging_path=str(staging),
+            snapshot_id=effect_input.snapshot_id,
+            manifest_content_ref=effect_input.signed_manifest.content_ref,
+            manifest_content_hash=effect_input.signed_manifest.content_hash,
+            manifest_size_bytes=effect_input.signed_manifest.size_bytes,
+            bundle_hash=bundle_hash,
+            bundle_size_bytes=bundle_size,
+            files=files,
+        )
+        evidence = evidence_value.as_mapping()
+        descriptor = ArtifactDescriptor.for_file(path=str(target), content_hash=bundle_hash, size_bytes=bundle_size)
+        plan = SinkEffectPlan(
             effect_id=request.effect_id,
             protocol_version=SINK_EFFECT_PROTOCOL_VERSION,
             input_kind=SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT,
@@ -805,9 +890,24 @@ def prepare_audit_export_bundle(
             expected_descriptor=descriptor,
             safe_evidence=evidence,
         )
-    except BaseException:
-        _remove_exact_tree(staging, files)
-        raise
+        completed = True
+        return plan
+    finally:
+        if not completed:
+            if installed and files:
+                _remove_exact_tree_at(parent.descriptor, staging.name, files)
+            elif building_descriptor >= 0 and building_name and not building_removed:
+                _remove_owned_building_tree_at(
+                    parent.descriptor,
+                    building_name,
+                    building_descriptor,
+                    written_names,
+                )
+        if building_descriptor >= 0:
+            os.close(building_descriptor)
+        for spool in spools.values():
+            spool.stream.close()
+        parent.close()
 
 
 def _parse_plan(plan: SinkEffectPlan) -> tuple[BundlePlanEvidence, Path, Path, ArtifactDescriptor]:
@@ -915,8 +1015,8 @@ def commit_audit_export_bundle(plan: SinkEffectPlan) -> SinkEffectCommitResult:
 
 def reconcile_audit_export_bundle(plan: SinkEffectPlan) -> SinkEffectReconcileResult:
     """Classify the target using the closed exact/not-applied/unknown set."""
+    evidence, target, staging, descriptor = _parse_plan(plan)
     try:
-        evidence, target, staging, descriptor = _parse_plan(plan)
         parent = _open_pinned_bundle_parent(target)
         try:
             if not parent.is_still_bound():
@@ -933,18 +1033,19 @@ def reconcile_audit_export_bundle(plan: SinkEffectPlan) -> SinkEffectReconcileRe
             return SinkEffectReconcileResult.unknown(evidence={"staging": "divergent", "target": target_kind})
         finally:
             parent.close()
-    except (AuditExportBundleError, OSError, ValueError, TypeError) as exc:
+    except OSError as exc:
         return SinkEffectReconcileResult.unknown(evidence={"reason": type(exc).__name__})
 
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
-_RENAMEAT2 = getattr(_LIBC, "renameat2", None)
 
 
 def _rename_noreplace(source: Path, destination: Path) -> None:
-    if _RENAMEAT2 is None:
-        raise OSError(errno.ENOSYS, "libc does not expose renameat2")
-    result = _RENAMEAT2(
+    try:
+        renameat2 = _LIBC.renameat2
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "libc does not expose renameat2") from exc
+    result = renameat2(
         ctypes.c_int(_AT_FDCWD),
         ctypes.c_char_p(os.fsencode(source)),
         ctypes.c_int(_AT_FDCWD),
@@ -957,9 +1058,11 @@ def _rename_noreplace(source: Path, destination: Path) -> None:
 
 
 def _rename_noreplace_at(parent_fd: int, source_name: str, destination_name: str) -> None:
-    if _RENAMEAT2 is None:
-        raise OSError(errno.ENOSYS, "libc does not expose renameat2")
-    result = _RENAMEAT2(
+    try:
+        renameat2 = _LIBC.renameat2
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "libc does not expose renameat2") from exc
+    result = renameat2(
         ctypes.c_int(parent_fd),
         ctypes.c_char_p(os.fsencode(source_name)),
         ctypes.c_int(parent_fd),
@@ -972,9 +1075,10 @@ def _rename_noreplace_at(parent_fd: int, source_name: str, destination_name: str
 
 
 def _statfs_type(path: Path) -> int:
-    statfs = getattr(_LIBC, "statfs", None)
-    if statfs is None:
-        raise OSError(errno.ENOSYS, "libc does not expose statfs")
+    try:
+        statfs = _LIBC.statfs
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "libc does not expose statfs") from exc
     buffer = ctypes.create_string_buffer(512)
     result = statfs(ctypes.c_char_p(os.fsencode(path)), ctypes.byref(buffer))
     if result != 0:
@@ -988,7 +1092,7 @@ def _device_id(path: Path) -> int:
 
 
 def _fsync_regular_file(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = _regular_file_read_flags()
     descriptor = os.open(path, flags)
     try:
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
@@ -999,7 +1103,7 @@ def _fsync_regular_file(path: Path) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    flags = _directory_read_flags()
     descriptor = os.open(path, flags)
     try:
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
@@ -1009,15 +1113,46 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def _remove_probe_path(path: Path) -> None:
+def _before_stale_scratch_remove(_parent: Path, _candidate_name: str) -> None:
+    """Race-test seam after anchored classification and before deletion."""
+
+
+def _remove_scratch_path_at(parent_fd: int, name: str) -> bool:
     try:
-        result = path.lstat()
+        result = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return
+        return False
     if stat.S_ISLNK(result.st_mode) or not stat.S_ISDIR(result.st_mode):
-        path.unlink(missing_ok=True)
-    else:
-        shutil.rmtree(path, ignore_errors=True)
+        try:
+            os.unlink(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except OSError:
+            return False
+        return True
+
+    try:
+        directory_fd = os.open(name, _directory_read_flags(), dir_fd=parent_fd)
+    except OSError:
+        return False
+    try:
+        identity = os.fstat(directory_fd)
+        child_names = os.listdir(directory_fd)
+        for child_name in child_names:
+            child = os.stat(child_name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISDIR(child.st_mode):
+                return False
+        for child_name in child_names:
+            os.unlink(child_name, dir_fd=directory_fd)
+        observed = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        if observed.st_dev != identity.st_dev or observed.st_ino != identity.st_ino:
+            return False
+        os.rmdir(name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except OSError:
+        return False
+    finally:
+        os.close(directory_fd)
+    return True
 
 
 def cleanup_stale_audit_export_bundle_scratch(
@@ -1035,27 +1170,44 @@ def cleanup_stale_audit_export_bundle_scratch(
     """
     if older_than_seconds < 0 or type(max_entries) is not int or max_entries < 0:
         raise ValueError("stale scratch cleanup bounds must be non-negative")
-    current_time = time.time() if now is None else now
+    current_time = time.time()
+    if now is not None:
+        current_time = now
     removed = 0
-    scratch = {*parent.glob(f"{_PROBE_PREFIX}*"), *parent.glob(_BUILDING_GLOB)}
-    for path in sorted(scratch, key=lambda candidate: candidate.name):
-        if removed >= max_entries:
-            break
+    absolute_parent = _absolute_path(parent)
+    try:
+        pinned = _open_pinned_bundle_parent(absolute_parent / ".elspeth-scratch-cleanup-anchor")
+    except OSError:
+        return 0
+    try:
         try:
-            age = current_time - path.lstat().st_mtime
-        except FileNotFoundError:
-            continue
-        if age < older_than_seconds:
-            continue
-        _remove_probe_path(path)
-        removed += 1
-    return removed
+            names = sorted(os.listdir(pinned.descriptor))
+        except OSError:
+            return 0
+        for name in names:
+            if removed >= max_entries:
+                break
+            if not name.startswith(_PROBE_PREFIX) and not fnmatchcase(name, _BUILDING_GLOB):
+                continue
+            try:
+                observed = os.stat(name, dir_fd=pinned.descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if current_time - observed.st_mtime < older_than_seconds:
+                continue
+            _before_stale_scratch_remove(absolute_parent, name)
+            if _remove_scratch_path_at(pinned.descriptor, name):
+                removed += 1
+        return removed
+    finally:
+        pinned.close()
 
 
 def preflight_audit_export_bundle(target_path: Path) -> AuditExportBundlePreflight:
     """Exercise the exact Linux/filesystem durability primitive before reservation."""
     if sys.platform != "linux":
         raise AuditExportBundlePreflightError("CSV audit-export bundles require Linux renameat2 semantics")
+    _require_secure_open_flags()
     target = _absolute_path(target_path)
     if not target.name:
         raise AuditExportBundlePreflightError("bundle target must name a child directory")
@@ -1087,8 +1239,18 @@ def preflight_audit_export_bundle(target_path: Path) -> AuditExportBundlePreflig
     try:
         source.mkdir(mode=0o700)
         probe_file = source / "probe"
-        probe_file.write_bytes(b"elspeth-bundle-probe-v1")
-        os.chmod(probe_file, 0o600)
+        probe_descriptor = os.open(
+            probe_file,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+        )
+        try:
+            os.fchmod(probe_descriptor, 0o600)
+            probe_bytes = b"elspeth-bundle-probe-v1"
+            if os.write(probe_descriptor, probe_bytes) != len(probe_bytes):
+                raise OSError(errno.EIO, "bundle probe accepted a partial write")
+        finally:
+            os.close(probe_descriptor)
         _fsync_regular_file(probe_file)
         _fsync_directory(source)
         try:
@@ -1119,7 +1281,14 @@ def preflight_audit_export_bundle(target_path: Path) -> AuditExportBundlePreflig
         raise AuditExportBundlePreflightError("bundle regular-file/directory/parent fsync probe failed") from exc
     finally:
         for path in paths:
-            _remove_probe_path(path)
+            try:
+                pinned = _open_pinned_bundle_parent(path)
+            except OSError:
+                continue
+            try:
+                _remove_scratch_path_at(pinned.descriptor, path.name)
+            finally:
+                pinned.close()
     return AuditExportBundlePreflight(
         target_path=str(target),
         filesystem_magic=filesystem_magic,

@@ -2236,6 +2236,15 @@
   stroke-dasharray: 5 4;
 }
 
+.guided-readonly-graph__edge-label {
+  fill: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+  paint-order: stroke;
+  stroke: var(--color-surface);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
 .guided-readonly-graph__node {
   fill: var(--color-surface-elevated);
   stroke: var(--color-border-strong);
@@ -2245,6 +2254,12 @@
 .guided-readonly-graph__node--source,
 .guided-readonly-graph__node--output {
   stroke: var(--color-accent);
+}
+
+.guided-readonly-graph__node--row_union {
+  fill: var(--color-badge-row-union-bg);
+  stroke: var(--color-badge-row-union);
+  stroke-width: 2;
 }
 
 .guided-readonly-graph__node--discard {

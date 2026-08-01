@@ -26,6 +26,55 @@ function stripInlineMarkdown(line: string): string {
 }
 
 /**
+ * Openers that mean the line is chat prose, not a decision name
+ * (elspeth-bc8a35c1ab). The headline must say WHAT was decided; "Here is an
+ * updated proposal." and "Great — you've given me the exact rows…" say
+ * nothing, and echoing them into the h2 duplicates the bubble directly below.
+ *
+ * These are display sanitisers on the same footing as `stripInlineMarkdown`:
+ * rejecting is always safe because the caller falls back to the static step
+ * purpose, so they lean toward rejecting a marginal line rather than letting
+ * conversational filler occupy the decision card.
+ */
+
+/** "Here is/Here's/Here are …" — announces a thing without naming it. */
+const PRESENTATION_OPENER = /^here(?:['’]s| is| are)\b/i;
+
+/**
+ * A social interjection ("Great —", "Sure,", "Perfect."). Anchored on trailing
+ * punctuation so it only fires on the interjection use: "Good rows land in the
+ * sink." is a headline, "Good. Rows land in the sink." is chat.
+ */
+const ACKNOWLEDGEMENT_OPENER =
+  /^(?:great|sure|thanks|thank you|perfect|excellent|awesome|nice|good|got it|ok|okay|alright|absolutely|certainly|of course|no problem|understood|happy to|glad to)(?:\s*[,.!?]|\s+[-–—]|$)/i;
+
+/**
+ * Future-intent narration ("Let me…", "I'll…"). Past-tense first person
+ * ("I've set the source to inline CSV") is deliberately NOT here — that
+ * reports a completed decision and makes a legitimate headline.
+ */
+const INTENT_OPENER =
+  /^(?:let me|let['’]?s|i['’]?ll|i will|i ?a?m going to|i can|i['’]?d|i would|now i|next i)\b/i;
+
+/**
+ * Two or more sentences on the line — a paragraph, not a headline. Matches a
+ * terminator followed by whitespace and more content, so a single trailing
+ * full stop ("Sink set.") and inline decimals ("Uses v1.2 of the schema.")
+ * both pass.
+ */
+const MULTIPLE_SENTENCES = /[.!?]["'’)\]]?\s+\S/;
+
+/** True when the line reads as conversation rather than a named decision. */
+function isConversationalProse(line: string): boolean {
+  return (
+    PRESENTATION_OPENER.test(line) ||
+    ACKNOWLEDGEMENT_OPENER.test(line) ||
+    INTENT_OPENER.test(line) ||
+    MULTIPLE_SENTENCES.test(line)
+  );
+}
+
+/**
  * The current step's latest assistant rationale (the LLM's "what I built"
  * summary), used as the prominent decision headline. Highest-seq assistant
  * turn whose step matches the active step; null when none OR when the turn
@@ -72,5 +121,9 @@ export function latestAssistantRationale(session: GuidedSession): string | null 
     .find((line) => line !== "");
   if (firstLine === undefined || firstLine.length > RATIONALE_MAX_LENGTH) return null;
   if (/<\/?tool_(call|response)/i.test(firstLine)) return null;
-  return stripInlineMarkdown(firstLine);
+  const headline = stripInlineMarkdown(firstLine);
+  // Checked AFTER unwrapping so "**Here is** an updated proposal." is caught
+  // by the same predicate as its unformatted twin.
+  if (isConversationalProse(headline)) return null;
+  return headline;
 }

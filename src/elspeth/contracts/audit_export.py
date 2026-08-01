@@ -119,22 +119,23 @@ class AuditExportSnapshotRegistryKey:
     per_chunk_byte_limit: int
 
     def __post_init__(self) -> None:
-        for field_name in (
-            "source_run_id",
-            "exporter_version",
-            "serialization_version",
-            "signer_key_id",
-            "chunking_algorithm_version",
+        for field_name, value in (
+            ("source_run_id", self.source_run_id),
+            ("exporter_version", self.exporter_version),
+            ("serialization_version", self.serialization_version),
+            ("signer_key_id", self.signer_key_id),
+            ("chunking_algorithm_version", self.chunking_algorithm_version),
         ):
-            value = getattr(self, field_name)
             if type(value) is not str or not value:
                 raise ValueError(f"{field_name} must be a non-empty exact string")
         if type(self.export_format) is not AuditExportFormat:
             raise TypeError("export_format must be exact AuditExportFormat")
         if type(self.signing_mode) is not AuditExportSigningMode:
             raise TypeError("signing_mode must be exact AuditExportSigningMode")
-        for field_name in ("public_export_config_hash", "registry_key_hash"):
-            value = getattr(self, field_name)
+        for field_name, value in (
+            ("public_export_config_hash", self.public_export_config_hash),
+            ("registry_key_hash", self.registry_key_hash),
+        ):
             if type(value) is not str or _LOWER_HEX_64.fullmatch(value) is None:
                 raise ValueError(f"{field_name} must be lowercase SHA-256 hex")
         _require_positive_bounded(self.per_chunk_record_limit, "per_chunk_record_limit", AUDIT_EXPORT_MAX_CHUNK_RECORDS)
@@ -224,14 +225,14 @@ class AuditExportSnapshotReadLimits:
     max_chunk_records: int = AUDIT_EXPORT_MAX_CHUNK_RECORDS
 
     def __post_init__(self) -> None:
-        for field_name, maximum in (
-            ("max_total_bytes", AUDIT_EXPORT_MAX_TOTAL_BYTES),
-            ("max_total_records", AUDIT_EXPORT_MAX_TOTAL_RECORDS),
-            ("max_chunks", AUDIT_EXPORT_MAX_CHUNKS),
-            ("max_chunk_bytes", AUDIT_EXPORT_MAX_CHUNK_BYTES),
-            ("max_chunk_records", AUDIT_EXPORT_MAX_CHUNK_RECORDS),
+        for field_name, value, maximum in (
+            ("max_total_bytes", self.max_total_bytes, AUDIT_EXPORT_MAX_TOTAL_BYTES),
+            ("max_total_records", self.max_total_records, AUDIT_EXPORT_MAX_TOTAL_RECORDS),
+            ("max_chunks", self.max_chunks, AUDIT_EXPORT_MAX_CHUNKS),
+            ("max_chunk_bytes", self.max_chunk_bytes, AUDIT_EXPORT_MAX_CHUNK_BYTES),
+            ("max_chunk_records", self.max_chunk_records, AUDIT_EXPORT_MAX_CHUNK_RECORDS),
         ):
-            _require_positive_bounded(getattr(self, field_name), field_name, maximum)
+            _require_positive_bounded(value, field_name, maximum)
 
 
 def _object(value: object, *, fields: frozenset[str], path: str) -> dict[str, object]:
@@ -430,7 +431,7 @@ def _validate_chunk_seal(payload: object) -> None:
     if type(predecessor) is not dict:
         raise TypeError("predecessor must be an exact object")
     assert isinstance(predecessor, dict)
-    if predecessor.get("kind") == "genesis":
+    if "kind" in predecessor and predecessor["kind"] == "genesis":
         _object(predecessor, fields=frozenset({"kind"}), path="predecessor")
     else:
         pred = _object(predecessor, fields=frozenset({"hash", "kind"}), path="predecessor")
@@ -774,7 +775,6 @@ class RegisteredAuditExportContent:
             raise TypeError("descriptor must be AuditExportContentDescriptor")
 
 
-@runtime_checkable
 class BoundAuditExportContentReader(Protocol):
     """No-arbitrary-ref reader returned only for registered content."""
 
@@ -813,8 +813,7 @@ class AuditExportContentStoreResolver:
         validate_content_namespace(store.namespace)
         if not store.is_durable():
             raise ValueError("audit-export content store must prove durability")
-        current = self._stores.get(store_id)
-        if current is not None and current is not store:
+        if store_id in self._stores and self._stores[store_id] is not store:
             raise ValueError(f"content_store_id {store_id!r} is already registered to a different store")
         self._stores[store_id] = store
 
@@ -1010,7 +1009,7 @@ def _detached_record(record: Mapping[str, object]) -> dict[str, ClosedAuditExpor
         raise TypeError("audit export records must be exact string-keyed dictionaries")
     if "signature" in record:
         raise ValueError("audit export input records must not predeclare the reserved signature field")
-    if record.get("record_type") == "manifest":
+    if "record_type" in record and record["record_type"] == "manifest":
         raise ValueError("audit export input records must not contain a manifest")
     # Round-tripping through the committed canonical encoder proves the value
     # tree is detached JSON data and rejects datetimes/bytes/custom authority.

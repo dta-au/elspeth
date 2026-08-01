@@ -60,6 +60,17 @@ class _FailingCountCollection:
         raise self.error
 
 
+@dataclass
+class _RawCountCollection:
+    value: object
+
+    def count(self) -> object:
+        return self.value
+
+    def query(self, **_kwargs: object) -> object:
+        raise AssertionError("query must not run after malformed count evidence")
+
+
 def _fake_execution() -> _FakeExecutionRecorder:
     return _FakeExecutionRecorder()
 
@@ -422,6 +433,24 @@ class TestChromaSearchProvider:
         provider = self._make_provider()
         provider.close()
 
+    def test_close_calls_owned_client_instance(self):
+        provider = self._make_provider()
+
+        class OwnedClient:
+            def __init__(self) -> None:
+                self.close_count = 0
+
+            def close(self) -> None:
+                self.close_count += 1
+
+        client = OwnedClient()
+        provider._client = client  # type: ignore[assignment]
+
+        provider.close()
+
+        assert client.close_count == 1
+        assert provider._client is None
+
     def test_is_retrieval_provider(self):
         from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalProvider
 
@@ -654,6 +683,60 @@ class TestTier3ResultBoundary:
             pytest.raises(RetrievalError),
         ):
             provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+
+    @pytest.mark.parametrize(
+        "results",
+        [
+            {
+                "ids": [["doc1"], ["ignored"]],
+                "documents": [["test doc"], ["ignored"]],
+                "distances": [[0.1], [0.2]],
+                "metadatas": [[{}], [{}]],
+            },
+            {
+                "ids": [("doc1",)],
+                "documents": [("test doc",)],
+                "distances": [(0.1,)],
+                "metadatas": [({},)],
+            },
+            {
+                "ids": [[1]],
+                "documents": [["test doc"]],
+                "distances": [[0.1]],
+                "metadatas": [[{}]],
+            },
+            {
+                "ids": [[""]],
+                "documents": [["test doc"]],
+                "distances": [[0.1]],
+                "metadatas": [[{}]],
+            },
+            {
+                "ids": [["doc1"]],
+                "documents": [["test doc"]],
+                "distances": [[0.1]],
+                "metadatas": [[[]]],
+            },
+        ],
+    )
+    def test_query_parallel_arrays_ids_and_metadata_require_exact_shapes(self, results: object) -> None:
+        unique_name = f"t3x-{uuid.uuid4().hex[:12]}"
+        _precreate_collection(unique_name)
+        execution = _fake_execution()
+        provider = ChromaSearchProvider(
+            config=ChromaSearchProviderConfig(collection=unique_name, mode="ephemeral"),
+            execution=execution,
+            run_id="test-run",
+        )
+        provider._collection.add(documents=["test doc"], ids=["doc1"])
+
+        with (
+            patch.object(provider._collection, "query", return_value=results),
+            pytest.raises(RetrievalError, match=r"structure|metadata|document ID"),
+        ):
+            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+
+        assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
 
 class TestNonFiniteDistanceHandling:
@@ -936,6 +1019,35 @@ class TestPostQueryFailureAudit:
 
         assert execution.only_recorded_call()["status"] == CallStatus.ERROR
 
+    @pytest.mark.parametrize("metadata", [0, []])
+    def test_falsy_non_mapping_metadata_records_error_call(self, metadata: object) -> None:
+        unique_name = f"pqfm-{uuid.uuid4().hex[:12]}"
+        _precreate_collection(unique_name)
+        execution = _fake_execution()
+        provider = ChromaSearchProvider(
+            config=ChromaSearchProviderConfig(collection=unique_name, mode="ephemeral"),
+            execution=execution,
+            run_id="test-run",
+        )
+        provider._collection.add(documents=["doc a"], ids=["doc1"])
+
+        with (
+            patch.object(
+                provider._collection,
+                "query",
+                return_value={
+                    "ids": [["doc1"]],
+                    "documents": [["doc a"]],
+                    "distances": [[0.1]],
+                    "metadatas": [[metadata]],
+                },
+            ),
+            pytest.raises(RetrievalError, match="metadata"),
+        ):
+            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+
+        assert execution.only_recorded_call()["status"] == CallStatus.ERROR
+
 
 class TestDocTypeValidation:
     """Tests for elspeth-aaa99db4be: doc type unchecked."""
@@ -1077,6 +1189,17 @@ class TestChromaSearchProviderReadiness:
         with pytest.raises(TypeError, match="unexpected type"):
             provider.check_readiness()
 
+    @pytest.mark.parametrize("bad_count", [True, -1, 1.5, "1"])
+    def test_malformed_count_is_not_ready(self, bad_count: object) -> None:
+        provider = self._make_provider()
+        provider._collection = _RawCountCollection(bad_count)
+
+        result = provider.check_readiness()
+
+        assert result.reachable is False
+        assert result.count is None
+        assert "malformed" in result.message
+
 
 class TestCountErrorBoundary:
     """B3.4 -- count() outside the guard in search() must produce audit record + RetrievalError.
@@ -1146,3 +1269,44 @@ class TestCountErrorBoundary:
 
         with pytest.raises(TypeError, match="bad argument"):
             provider.search("query", top_k=5, min_score=0.0, state_id="s1", token_id=None)
+
+    @pytest.mark.parametrize("bad_count", [True, -1, 1.5, "1"])
+    def test_malformed_count_is_audited_retrieval_error(self, bad_count: object) -> None:
+        provider, execution = self._make_provider_with_execution()
+        provider._collection = _RawCountCollection(bad_count)
+
+        with pytest.raises(RetrievalError, match="count"):
+            provider.search("query", top_k=5, min_score=0.0, state_id="s1", token_id=None)
+
+        assert execution.only_recorded_call()["status"] == CallStatus.ERROR
+
+
+class TestNegativeL2DistanceBoundary:
+    @pytest.mark.parametrize("distance", [-1, -0.5])
+    def test_negative_l2_distance_is_audited_retrieval_error(self, distance: float) -> None:
+        unique_name = f"nl2-{uuid.uuid4().hex[:12]}"
+        _precreate_collection(unique_name, "l2")
+        execution = _fake_execution()
+        provider = ChromaSearchProvider(
+            config=ChromaSearchProviderConfig(collection=unique_name, mode="ephemeral", distance_function="l2"),
+            execution=execution,
+            run_id="test-run",
+        )
+        provider._collection.add(documents=["doc a"], ids=["doc1"])
+
+        with (
+            patch.object(
+                provider._collection,
+                "query",
+                return_value={
+                    "ids": [["doc1"]],
+                    "documents": [["doc a"]],
+                    "distances": [[distance]],
+                    "metadatas": [[{}]],
+                },
+            ),
+            pytest.raises(RetrievalError, match="negative"),
+        ):
+            provider.search("test", top_k=1, min_score=0.0, state_id="s1", token_id=None)
+
+        assert execution.only_recorded_call()["status"] == CallStatus.ERROR

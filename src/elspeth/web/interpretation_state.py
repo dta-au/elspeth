@@ -20,7 +20,7 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
-from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec
+from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec, _coalesce_branch_connections
 from elspeth.web.plugin_policy.coverage import (
     OutputStreamGraph as _OutputStreamGraph,
 )
@@ -46,6 +46,7 @@ REGISTERED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = frozenset(
         "drop_raw_html_fields",
         "web_scrape_http_identity",
         "prompt_injection_shield_recommendation",
+        "required_control_auto_wired",
     }
 )
 # Sink-neutral wording (pack pressure-suite run 2, G6): the old "JSON output"
@@ -54,6 +55,11 @@ REGISTERED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = frozenset(
 RAW_HTML_CLEANUP_REVIEW_DRAFT: Final[str] = "Drop the scraped raw HTML and fingerprint fields before saving the output."
 WEB_SCRAPE_HTTP_IDENTITY_USER_TERM: Final[str] = "web_scrape_http_identity"
 PROMPT_SHIELD_USER_TERM: Final[str] = "prompt_injection_shield_recommendation"
+# Acknowledgeable disclosure for a control node the server spliced into the
+# graph because deployment policy makes that control REQUIRED (R2-F10,
+# elspeth-f99655f540). The row rides on the INSERTED node, staged pending by
+# ``web.composer.required_controls.wire_required_controls``.
+REQUIRED_CONTROL_AUTO_WIRED_USER_TERM: Final[str] = "required_control_auto_wired"
 PROMPT_SHIELD_WARNING_DRAFT: Final[str] = (
     "Recommend inserting azure_prompt_shield (or the deployment equivalent prompt-injection shield) "
     "between the external-content fetch step and this LLM. The current draft routes "
@@ -62,11 +68,11 @@ PROMPT_SHIELD_WARNING_DRAFT: Final[str] = (
     "[user_term: prompt_injection_shield_recommendation]"
 )
 PROMPT_SHIELD_AVAILABLE_DRAFT: Final[str] = (
-    "An authorized prompt-injection shield (azure_prompt_shield) IS available in "
-    "this deployment. Wire it between the external-content fetch step and this LLM: "
-    "untrusted remote text routed straight into the LLM is a prompt-injection "
-    "exposure, and the shield is configured and ready to use. Wiring it in is "
-    "strongly recommended, but you may proceed without it. "
+    "An authorized prompt-injection shield IS available in this deployment. Wire "
+    "it between the external-content fetch step and this LLM: untrusted remote "
+    "text routed straight into the LLM is a prompt-injection exposure, and the "
+    "shield is configured and ready to use. Wiring it in is strongly recommended, "
+    "but you may proceed without it. "
     "[user_term: prompt_injection_shield_recommendation]"
 )
 
@@ -82,8 +88,17 @@ RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX: Final[str] = "Raw-html cleanup review d
 
 # Transform plugins whose output is externally-controlled remote content for
 # prompt-injection-defence purposes. web_scrape returns whatever the fetched
-# page served, which is by definition untrusted.
-_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS: Final[frozenset[str]] = frozenset({"web_scrape"})
+# page served, which is by definition untrusted. Document extraction is the
+# same threat class: aws_textract_document_analysis returns whatever text the
+# uploaded document contained, the pipeline author never writes it, and it
+# lands in an LLM prompt.
+#
+# Membership here is FAIL-OPEN by construction — an unlisted producer is
+# treated as trusted (see _producer_reaches_untrusted, which falls through to
+# its own upstream). A new plugin that surfaces externally-controlled text
+# must be added here, or every downstream LLM silently reports that it
+# consumes no untrusted content.
+_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS: Final[frozenset[str]] = frozenset({"web_scrape", "aws_textract_document_analysis"})
 
 AUTHORING_METADATA_OPTION_KEYS: frozenset[str] = frozenset(
     {
@@ -341,40 +356,49 @@ def prompt_shield_recommendation_warning_pairs(
         if _llm_has_shield_recommendation(node):
             continue  # review already staged on this node
         draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_available is True else PROMPT_SHIELD_WARNING_DRAFT
-        consumes_untrusted = _llm_consumes_untrusted_remote_content(node, graph)
-        lead = (
-            f"LLM node {node.id!r} consumes externally-fetched content from a web_scrape upstream "
-            "without an authorized prompt-injection shield between them. "
-            if consumes_untrusted
-            else f"LLM node {node.id!r} has no authorized prompt-injection shield in front of it. "
-        )
+        untrusted_producers = _llm_untrusted_remote_content_producers(node, graph)
+        if untrusted_producers:
+            # Name the producer actually found. Hardcoding "web_scrape" made the
+            # sentence assert a plugin that need not be in the pipeline at all.
+            named = " and ".join(sorted(untrusted_producers))
+            lead = (
+                f"LLM node {node.id!r} consumes externally-fetched content from a {named} upstream "
+                "without an authorized prompt-injection shield between them. "
+            )
+        else:
+            lead = f"LLM node {node.id!r} has no authorized prompt-injection shield in front of it. "
         warnings.append((f"node:{node.id}", f"{lead}{draft}"))
     return tuple(warnings)
 
 
-def _llm_consumes_untrusted_remote_content(
+def _llm_untrusted_remote_content_producers(
     node: NodeSpec,
     graph: _OutputStreamGraph,
-) -> bool:
-    """Return True iff ANY predecessor path reaches an untrusted producer without a shield.
+) -> frozenset[str]:
+    """Return the untrusted producer plugins any predecessor path reaches unshielded.
 
-    The asymmetry is deliberate and security-critical: a single tainted
-    predecessor of a queue fan-in taints the downstream LLM. A missing producer
-    ends that path without reaching an untrusted producer.
+    Empty means no such path exists, so the set is truthy exactly where the
+    former boolean was True. The asymmetry is deliberate and security-critical:
+    a single tainted predecessor of a queue fan-in taints the downstream LLM. A
+    missing producer ends that path without reaching an untrusted producer.
+
+    Returning the plugin NAMES rather than a bool keeps the advisory honest: it
+    must name the producer it actually found, never assert a web_scrape that is
+    not in the pipeline.
     """
 
     if node.plugin != "llm":
-        return False
+        return frozenset()
     return _stream_reaches_untrusted(node.input, graph, frozenset())
 
 
-def _stream_reaches_untrusted(stream: str | None, graph: _OutputStreamGraph, visited: frozenset[str]) -> bool:
+def _stream_reaches_untrusted(stream: str | None, graph: _OutputStreamGraph, visited: frozenset[str]) -> frozenset[str]:
     if not isinstance(stream, str) or not stream:
-        return False
-    producers = graph.producers_by_stream.get(stream)
-    if not producers:
-        return False
-    return any(_producer_reaches_untrusted(producer, graph, visited) for producer in producers)
+        return frozenset()
+    reached: set[str] = set()
+    for producer in graph.producers_by_stream.get(stream) or ():
+        reached |= _producer_reaches_untrusted(producer, graph, visited)
+    return frozenset(reached)
 
 
 def _is_effective_prompt_shield(node: NodeSpec) -> bool:
@@ -382,20 +406,27 @@ def _is_effective_prompt_shield(node: NodeSpec) -> bool:
     return node_has_blocking_control(node, PluginCapability.PROMPT_SHIELD, ControlRole.INPUT)
 
 
-def _producer_reaches_untrusted(producer: NodeSpec, graph: _OutputStreamGraph, visited: frozenset[str]) -> bool:
+def _producer_reaches_untrusted(producer: NodeSpec, graph: _OutputStreamGraph, visited: frozenset[str]) -> frozenset[str]:
     if producer.id in visited:
-        return False
+        return frozenset()
     # Path-LOCAL visited (passed by value), keyed on stable node id: a diamond
     # that reconverges on a shared upstream must not truncate a sibling path.
     visited = visited | {producer.id}
     if _is_effective_prompt_shield(producer):
-        return False
-    if producer.plugin in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
-        return True
+        return frozenset()
+    plugin = producer.plugin
+    if plugin is not None and plugin in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
+        return frozenset({plugin})
     if producer.node_type == "queue":
-        return any(
-            _producer_reaches_untrusted(predecessor, graph, visited) for predecessor in graph.queue_predecessors.get(producer.id, ())
-        )
+        reached: set[str] = set()
+        for predecessor in graph.queue_predecessors.get(producer.id, ()):
+            reached |= _producer_reaches_untrusted(predecessor, graph, visited)
+        return frozenset(reached)
+    if producer.node_type == "row_union":
+        reached = set()
+        for branch in _coalesce_branch_connections(producer.branches):
+            reached |= set(_stream_reaches_untrusted(branch, graph, visited))
+        return frozenset(reached)
     return _stream_reaches_untrusted(producer.input, graph, visited)
 
 
@@ -438,6 +469,9 @@ def _producer_proves_shield(producer: NodeSpec, graph: _OutputStreamGraph, visit
         if not predecessors:
             return False  # queue with no known predecessor → unknown → fail-safe
         return all(_producer_proves_shield(predecessor, graph, visited) for predecessor in predecessors)
+    if producer.node_type == "row_union":
+        branches = _coalesce_branch_connections(producer.branches)
+        return bool(branches) and all(_stream_proves_shield(branch, graph, visited) for branch in branches)
     return _stream_proves_shield(producer.input, graph, visited)
 
 
@@ -1208,7 +1242,34 @@ def pipeline_decision_artifact_hash(
         return _raw_html_cleanup_artifact_hash(node, all_nodes)
     if normalized == WEB_SCRAPE_HTTP_IDENTITY_USER_TERM:
         return _web_scrape_http_identity_artifact_hash(node)
+    if normalized == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM:
+        return _required_control_auto_wired_artifact_hash(node)
     raise ValueError(f"pipeline_decision_artifact_hash: unknown pipeline_decision user_term {user_term!r}")
+
+
+def _required_control_auto_wired_artifact_hash(node: NodeSpec) -> str:
+    """Material-scoped hash for the auto-wired required-control disclosure.
+
+    The review acknowledges that the server spliced this control node onto a
+    specific edge because deployment policy requires the control. The hash
+    binds to exactly that adjudication — the inserted node's identity, its
+    plugin, and the edge it occupies (input and on_success). Re-pointing the
+    node to a different edge or swapping the control implementation drifts the
+    acknowledgement; unrelated option edits (thresholds, schema mode) do not
+    change what was inserted where, so they leave the review intact.
+    """
+
+    if node.plugin is None:
+        raise ValueError("pipeline_decision_artifact_hash: required_control_auto_wired requires a plugin-bearing node")
+    return stable_hash(
+        {
+            "review_kind": "required_control_auto_wired",
+            "node_id": node.id,
+            "plugin": node.plugin,
+            "input": node.input,
+            "on_success": node.on_success,
+        }
+    )
 
 
 def _web_scrape_http_identity_artifact_hash(node: NodeSpec) -> str:
@@ -1298,6 +1359,11 @@ def _prompt_shield_producer_paths(producer: NodeSpec, graph: _OutputStreamGraph,
         if not predecessors:
             return [(head,)]
         return [(head, *sub) for predecessor in predecessors for sub in _prompt_shield_producer_paths(predecessor, graph, visited)]
+    if producer.node_type == "row_union":
+        branches = _coalesce_branch_connections(producer.branches)
+        if not branches:
+            return [(head,)]
+        return [(head, *sub) for branch in branches for sub in _prompt_shield_upstream_paths(branch, graph, visited)]
     return [(head, *sub) for sub in _prompt_shield_upstream_paths(producer.input, graph, visited)]
 
 

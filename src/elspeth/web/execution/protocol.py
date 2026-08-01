@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol
 from uuid import UUID
 
 from elspeth.contracts.freeze import freeze_fields
@@ -14,6 +14,7 @@ from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.coordination.lifecycle import SessionOperationLease
+from elspeth.web.execution.completion_gates import CompletionGateFacts
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.protocol import RunRecord
@@ -79,7 +80,6 @@ class YamlGenerator(Protocol):
     def generate_yaml(self, state: CompositionState) -> str: ...
 
 
-@runtime_checkable
 class ExecutionService(Protocol):
     """Protocol for pipeline execution operations.
 
@@ -115,6 +115,7 @@ class ExecutionService(Protocol):
         session_operation_context: SessionOperationContext,
         user_id: str | None = None,
         session_id: UUID | None = None,
+        completion_gates: CompletionGateFacts | None = None,
     ) -> ValidationResult:
         """Async dry-run validation for an already materialized composition state.
 
@@ -123,6 +124,11 @@ class ExecutionService(Protocol):
         composition version. When provided, ``session_id`` scopes inline blob
         metadata lookups to the same session boundary that execution enforces
         before linking blobs to runs.
+
+        ``completion_gates`` carries persisted composer completion-gate facts
+        parsed off the caller's ``composition_states`` record; the recompute
+        cannot rediscover those turn events, so the implementation merges them
+        into the returned readiness (withholding ``completion_ready`` only).
         """
         ...
 

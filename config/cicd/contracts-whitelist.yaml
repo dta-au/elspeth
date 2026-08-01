@@ -35,6 +35,12 @@ allowed_external_types:
   - "web/deployment_contract:ContractCheck"
   - "web/plugin_policy/models:PluginAvailabilitySnapshot"
   - "core/landscape/database:LandscapeSchemaShape"
+  # Provider-neutral LLM profile runtime dataclass — lives in core because
+  # elspeth.core must never import elspeth.plugins at module scope, while
+  # elspeth.plugins (and eventually the pipeline gateway provider) import it
+  # from core. Web plugin policy is one of several intended consumers, not a
+  # violation of a contracts/-only boundary.
+  - "core/llm_profiles:RuntimeLLMProfile"
 
 # dict[str, Any] patterns that are intentional
 # Format: "file_path:context:param_name"
@@ -160,6 +166,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/azure/content_safety.py:AzureContentSafety.probe_config:return"
   - "src/elspeth/plugins/transforms/azure/document_intelligence.py:AzureDocumentIntelligence.probe_config:return"
   - "src/elspeth/plugins/transforms/azure/prompt_shield.py:AzurePromptShield.probe_config:return"
+  - "src/elspeth/plugins/transforms/aws/textract_document_analysis.py:AWSTextractDocumentAnalysis.probe_config:return"
   - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.probe_config:return"
   - "src/elspeth/plugins/transforms/rag/transform.py:RAGRetrievalTransform.probe_config:return"
 
@@ -194,6 +201,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/blob_fetch.py:BlobFetch.__init__:options"
   - "src/elspeth/plugins/transforms/blob_csv_expand.py:BlobCSVExpand.__init__:options"
   - "src/elspeth/plugins/transforms/azure/document_intelligence.py:AzureDocumentIntelligence.__init__:config"
+  - "src/elspeth/plugins/transforms/aws/textract_document_analysis.py:AWSTextractDocumentAnalysis.__init__:config"
   - "src/elspeth/plugins/sources/json_source.py:JSONSource.__init__:config"
   - "src/elspeth/plugins/sources/csv_source.py:CSVSource.__init__:config"
   - "src/elspeth/plugins/sources/null_source.py:NullSource.__init__:config"
@@ -253,6 +261,10 @@ allowed_dict_patterns:
   - "src/elspeth/core/config.py:_fingerprint_secrets:return"
   - "src/elspeth/core/config.py:_expand_config_templates:raw_config"
   - "src/elspeth/core/config.py:_expand_config_templates:return"
+  # Raw pre-pydantic config dict rewrite for the batch/CLI llm_profiles
+  # catalog lowering pass — same shape as _expand_env_vars/_expand_config_templates above.
+  - "src/elspeth/core/config.py:_lower_llm_profile_nodes:raw_config"
+  - "src/elspeth/core/config.py:_lower_llm_profile_nodes:return"
   - "src/elspeth/core/config.py:_fingerprint_config_for_audit:config_dict"
   - "src/elspeth/core/config.py:_fingerprint_config_for_audit:return"
   # In-place DSN-password sanitiser for audit copy (placement-based, e.g. database sink url).
@@ -376,6 +388,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/llm/provider.py:LLMProvider.execute_query:response_format"
   - "src/elspeth/plugins/transforms/llm/providers/azure.py:AzureLLMProvider.execute_query:response_format"
   - "src/elspeth/plugins/transforms/llm/providers/openrouter.py:OpenRouterLLMProvider.execute_query:response_format"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider.execute_query:response_format"
 
   # LLM tracing — extra_metadata is provider-specific (deployment, model, query keys vary per caller)
   - "src/elspeth/plugins/transforms/llm/langfuse.py:LangfuseTracer.record_success:extra_metadata"
@@ -453,6 +466,14 @@ allowed_dict_patterns:
   # LLMCallResponse are the typed audit contracts around these mappings.
   - "src/elspeth/plugins/transforms/llm/providers/openrouter.py:OpenRouterLLMProvider._build_llm_request_payload:response_format"
   - "src/elspeth/plugins/transforms/llm/providers/openrouter.py:OpenRouterLLMProvider._record_logical_llm_success:raw_response"
+
+  # ELSPETH LLM Gateway provider — same OpenAI-compatible wire shapes as
+  # OpenRouter above (request_body IS the JSON POST body sent verbatim;
+  # raw_response is the gateway's parsed chat-completion JSON kept for audit).
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._post_chat_completion:request_body"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._build_llm_request_payload:response_format"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:GatewayLLMProvider._record_logical_llm_success:raw_response"
+  - "src/elspeth/plugins/transforms/llm/providers/gateway.py:_validate_readyz_adapter_identity:payload"
   - "src/elspeth/plugins/infrastructure/clients/replayer.py:ReplayMissError.__init__:request_data"
   - "src/elspeth/plugins/infrastructure/clients/replayer.py:CallReplayer.replay:request_data"
   - "src/elspeth/plugins/infrastructure/clients/verifier.py:CallVerifier.verify:request_data"
@@ -824,6 +845,11 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._attempt_preflight_repair:llm_messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._maybe_run_early_checkpoint:llm_messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_checkpoint_arguments:return"
+  # R2-F14 (elspeth-5403f346c0): the format-retry helper returns a COPY of that
+  # same checkpoint-argument dict with the verdict-format re-prompt appended to
+  # ``problem_summary``. Identical shape, identical rationale — it cannot be a
+  # TypedDict without ``_build_checkpoint_arguments`` becoming one first.
+  - "src/elspeth/web/composer/service.py:_advisor_arguments_with_format_reprompt:return"
   # Guided chat audit records hash the exact LiteLLM/OpenAI chat-completion
   # message list sent to the provider. The payload shape is the provider API
   # boundary ({role, content, optional tool fields}) and is intentionally open.
@@ -848,6 +874,12 @@ allowed_dict_patterns:
   # Any)``) — the same untyped external-library boundary as the entries above —
   # so it cannot be reduced to a TypedDict without shadowing LiteLLM's own API.
   - "src/elspeth/web/composer/service.py:_apply_openrouter_app_identity:kwargs"
+  # ``_apply_endpoint_kwargs`` (Phase 3 Task 2 endpoint affordance) adds
+  # ``api_base``/``api_key`` to the same open-ended LiteLLM ``acompletion``
+  # kwargs dict as the entry above, for the same reason: it is LiteLLM's
+  # untyped external-library completion surface, not a contract this
+  # codebase owns the shape of.
+  - "src/elspeth/web/composer/service.py:_apply_endpoint_kwargs:kwargs"
   # Blob sync helpers — return dicts for LLM-visible tool response payloads.
   # The list_composer_blobs shape is deliberately metadata-only, enforced by
   # the construction helper; bytes/previews/storage paths stay outside the
@@ -995,6 +1027,10 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/guided/profile.py:WorkflowProfile.from_dict:d"
   - "src/elspeth/web/composer/guided/_discovery.py:_assistant_tool_calls_message:return"
   - "src/elspeth/web/composer/guided/_discovery.py:_execute_discovery_call:return"
+  # Retain-repair thread: OpenAI/LiteLLM wire-shape provider messages
+  # (assistant tool-call turn + role=tool results), same shape family as
+  # _assistant_tool_calls_message above.
+  - "src/elspeth/web/composer/guided/chat_solver.py:_deferred_intent_repair_thread:return (list)"
   - "src/elspeth/web/composer/tools/_dispatch.py:get_discovery_tool_definitions:return (list)"
   - "src/elspeth/web/composer/tools/_dispatch.py:_closed_root_schema:return"
   # Current branch reconciliation: intentional heterogeneous telemetry,
@@ -1007,7 +1043,6 @@ allowed_dict_patterns:
   - "src/elspeth/web/execution/preflight.py:audit_safe_resolved_config:return"
   - "src/elspeth/web/execution/preflight.py:restore_options:component"
   - "src/elspeth/web/execution/service.py:_trained_operator_catalog_and_snapshot:kwargs"
-  - "src/elspeth/web/execution/validation.py:_trained_operator_validation_context:kwargs"
   - "src/elspeth/web/composer/tools/transforms.py:_normalized_splice_node_projection:return"
   - "src/elspeth/web/composer/tools/transforms.py:_execute_splice_transform:args"
   - "src/elspeth/web/composer/tools/transforms.py:_handle_splice_transform:arguments"

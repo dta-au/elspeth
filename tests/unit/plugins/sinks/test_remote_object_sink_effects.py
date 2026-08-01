@@ -7,16 +7,20 @@ import io
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import md5, sha256
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import Any
 
 import pytest
+from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
+from azure.storage.blob import BlobProperties
+from botocore.exceptions import ClientError, ConnectionClosedError
 
 from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     RestrictedSinkEffectContext,
     SinkEffectDescriptorMode,
@@ -30,7 +34,7 @@ from elspeth.contracts.sink_effects import (
 from elspeth.engine._error_hash import compute_error_hash
 from elspeth.engine.orchestrator.preflight import validate_sink_effect_capability
 from elspeth.plugins.sinks import _remote_object_effects as remote_effects
-from elspeth.plugins.sinks.aws_s3_sink import AWSS3Sink
+from elspeth.plugins.sinks.aws_s3_sink import AWSS3Sink, S3ConditionalWriteRejectedError
 from elspeth.plugins.sinks.azure_blob_sink import AzureBlobSink
 from tests.fixtures.base_classes import inject_write_failure
 
@@ -88,18 +92,24 @@ def _prepare(
     )
 
 
-class _S3Missing(Exception):
-    response: ClassVar[dict[str, object]] = {
-        "Error": {"Code": "NoSuchKey"},
-        "ResponseMetadata": {"HTTPStatusCode": 404},
-    }
+def _s3_missing_error() -> ClientError:
+    return ClientError(
+        {
+            "Error": {"Code": "NoSuchKey"},
+            "ResponseMetadata": {"HTTPStatusCode": 404},
+        },
+        "HeadObject",
+    )
 
 
-class _S3PreconditionFailed(Exception):
-    response: ClassVar[dict[str, object]] = {
-        "Error": {"Code": "PreconditionFailed"},
-        "ResponseMetadata": {"HTTPStatusCode": 412},
-    }
+def _s3_precondition_failed_error() -> ClientError:
+    return ClientError(
+        {
+            "Error": {"Code": "PreconditionFailed"},
+            "ResponseMetadata": {"HTTPStatusCode": 412},
+        },
+        "PutObject",
+    )
 
 
 @dataclass
@@ -119,7 +129,7 @@ class _S3Store:
     def head_object(self, **request: object) -> dict[str, object]:
         self.requests.append({"operation": "head", **request})
         if self.value is None:
-            raise _S3Missing()
+            raise _s3_missing_error()
         return {
             "ContentLength": len(self.value.body),
             "ETag": self.value.etag,
@@ -132,9 +142,9 @@ class _S3Store:
         if self.control is not None:
             raise self.control
         if request.get("IfNoneMatch") == "*" and self.value is not None:
-            raise _S3PreconditionFailed()
+            raise _s3_precondition_failed_error()
         if "IfMatch" in request and (self.value is None or request["IfMatch"] != self.value.etag):
-            raise _S3PreconditionFailed()
+            raise _s3_precondition_failed_error()
         body = request["Body"]
         assert isinstance(body, io.BufferedIOBase)
         payload = body.read()
@@ -145,40 +155,38 @@ class _S3Store:
         self.value = _Object(payload, etag, dict(metadata))
         if self.response_loss:
             self.response_loss = False
-            raise ConnectionError("response lost after accepted write")
+            raise ConnectionClosedError(endpoint_url="https://bucket.s3.test")
         return {"ETag": etag}
-
-
-class ResourceNotFoundError(Exception):
-    pass
-
-
-class _AzurePreconditionFailed(Exception):
-    status_code = 412
 
 
 class _AzureBlob:
     def __init__(self, store: _AzureStore) -> None:
         self._store = store
 
-    def get_blob_properties(self) -> SimpleNamespace:
+    def get_blob_properties(self) -> BlobProperties:
         self._store.requests.append({"operation": "properties"})
+        if self._store.control is not None:
+            raise self._store.control
         value = self._store.value
         if value is None:
-            raise ResourceNotFoundError()
-        return SimpleNamespace(
-            size=len(value.body),
-            etag=value.etag,
-            metadata=value.metadata,
-            content_settings=SimpleNamespace(content_md5=md5(value.body, usedforsecurity=False).digest()),
+            raise ResourceNotFoundError("missing")
+        return BlobProperties(
+            **{
+                "Content-Length": len(value.body),
+                "ETag": value.etag,
+                "metadata": value.metadata,
+                "Content-MD5": md5(value.body, usedforsecurity=False).digest(),
+            }
         )
 
     def upload_blob(self, data: object, **request: object) -> dict[str, object]:
         self._store.requests.append({"operation": "upload", **request})
+        if self._store.control is not None:
+            raise self._store.control
         if request.get("if_none_match") == "*" and self._store.value is not None:
-            raise _AzurePreconditionFailed()
+            raise ResourceModifiedError("precondition")
         if "etag" in request and (self._store.value is None or request["etag"] != self._store.value.etag):
-            raise _AzurePreconditionFailed()
+            raise ResourceModifiedError("precondition")
         if isinstance(data, bytes):
             payload = data
         else:
@@ -200,6 +208,7 @@ class _AzureStore:
         self.value: _Object | None = None
         self.requests: list[dict[str, object]] = []
         self.response_loss = False
+        self.control: BaseException | None = None
         self.blob = _AzureBlob(self)
 
     def get_blob_client(self, *_args: object, **_kwargs: object) -> _AzureBlob:
@@ -497,6 +506,81 @@ def test_azure_fresh_process_successor_and_response_loss_reconcile() -> None:
     assert reconciled.descriptor == second_plan.expected_descriptor
 
 
+def test_non_azure_exception_named_resource_not_found_is_not_absence() -> None:
+    pretender_type = type("ResourceNotFoundError", (Exception,), {})
+    pretender = pretender_type("not an Azure SDK error")
+
+    assert AzureBlobSink._is_missing(pretender) is False
+
+
+def test_azure_properties_require_the_declared_sdk_contract() -> None:
+    with pytest.raises(TypeError):
+        AzureBlobSink._observation_from_properties(object())
+
+
+def test_azure_prepare_missing_owned_inspection_evidence_raises() -> None:
+    store = _AzureStore()
+    sink = _azure(store)
+    member = _member(0, {"id": 1})
+    inspection = sink.inspect_effect(
+        SinkEffectInspectionRequest(effect_id="d1" * 32, target="{}", predecessor_descriptor=None),
+        _CTX,
+    )
+    evidence = dict(inspection.evidence)
+    evidence.pop("predecessor_declared")
+    corrupt_inspection = replace(inspection, evidence=evidence)
+
+    with pytest.raises(KeyError, match="predecessor_declared"):
+        sink.prepare_effect(
+            SinkEffectPrepareRequest(
+                effect_id="d1" * 32,
+                effect_input=SinkEffectPipelineMembersInput(members=(member,), target_snapshot_members=(member,)),
+                inspection=corrupt_inspection,
+            ),
+            _CTX,
+        )
+
+
+@pytest.mark.parametrize("control", [GeneratorExit(), AssertionError("our bug"), NotImplementedError("our bug")])
+def test_azure_external_call_programmer_failures_escape(control: BaseException) -> None:
+    store = _AzureStore()
+    sink = _azure(store)
+    store.control = control
+
+    with pytest.raises(type(control)):
+        sink.inspect_effect(
+            SinkEffectInspectionRequest(effect_id="d2" * 32, target="{}", predecessor_descriptor=None),
+            _CTX,
+        )
+
+
+def test_azure_local_stage_open_failure_is_not_an_unknown_remote_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _AzureStore()
+    sink = _azure(store)
+    member = _member(0, {"id": 1})
+    plan = _prepare(sink, effect_id="d3" * 32, current=(member,), target_snapshot=(member,))
+    stage = Path(str(plan.safe_evidence["staging_path"]))
+    original_open = Path.open
+    failure = OSError("local stage race")
+    stage_open_count = 0
+
+    def fail_stage_open(path: Path, *args: object, **kwargs: object) -> Any:
+        nonlocal stage_open_count
+        if path == stage:
+            stage_open_count += 1
+            if stage_open_count == 2:
+                raise failure
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", fail_stage_open)
+    with pytest.raises(OSError) as exc_info:
+        sink.commit_effect(plan, _CTX)
+    assert exc_info.value is failure
+    assert all(request["operation"] != "upload" for request in store.requests)
+
+
 def test_azure_effect_diverts_fixed_schema_extra_and_publishes_good_rows() -> None:
     store = _AzureStore()
     good = _member(0, {"id": 1, "name": "Ada"})
@@ -565,13 +649,81 @@ def test_remote_effect_evidence_rejects_missing_or_invalid_diversion_attribution
 
     evidence = dict(plan.safe_evidence)
     evidence.pop("diversion_attribution")
-    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="diversion attribution"):
+    with pytest.raises(KeyError, match="diversion_attribution"):
         remote_effects.RemoteObjectPlanEvidence.from_mapping(evidence)
 
     evidence = dict(plan.safe_evidence)
     evidence["diversion_attribution"] = ({"ordinal": 0, "reason_hash": "0" * 64, "error_hash": "not-hex"},)
     with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="diversion attribution"):
         remote_effects.RemoteObjectPlanEvidence.from_mapping(evidence)
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    [
+        "accepted_ordinals",
+        "checksum_algorithm",
+        "checksum_b64",
+        "diverted_ordinals",
+        "format_name",
+        "precondition",
+        "predecessor_etag",
+        "provider",
+        "publication_kind",
+        "replace_authority",
+        "schema",
+        "staged_hash",
+        "staged_size",
+        "staging_path",
+        "target",
+    ],
+)
+def test_remote_owned_plan_evidence_requires_every_field(missing_key: str) -> None:
+    store = _S3Store()
+    member = _member(0, {"id": 1})
+    plan = _prepare(_s3(store), effect_id="81" * 32, current=(member,), target_snapshot=(member,))
+    evidence = dict(plan.safe_evidence)
+    evidence.pop(missing_key)
+
+    with pytest.raises(KeyError, match=missing_key):
+        remote_effects.RemoteObjectPlanEvidence.from_mapping(evidence)
+
+
+@pytest.mark.parametrize(
+    "missing_key",
+    [
+        "schema",
+        "effect_id",
+        "provider",
+        "observed_exists",
+        "predecessor_declared",
+        "observed_etag",
+        "target",
+    ],
+)
+def test_remote_owned_inspection_evidence_requires_every_field(missing_key: str) -> None:
+    effect_id = "82" * 32
+    inspection = remote_effects.inspect_remote_object(
+        provider="aws_s3",
+        target="s3://bucket/key",
+        request=SinkEffectInspectionRequest(
+            effect_id=effect_id,
+            target="{}",
+            predecessor_descriptor=None,
+        ),
+        observation=remote_effects.RemoteObjectObservation(
+            exists=False,
+            etag=None,
+            content_hash=None,
+            size_bytes=None,
+        ),
+    )
+    evidence = dict(inspection.evidence)
+    evidence.pop(missing_key)
+    divergent = replace(inspection, evidence=evidence)
+
+    with pytest.raises(KeyError, match=missing_key):
+        remote_effects._inspection_values(divergent, effect_id=effect_id, provider="aws_s3")
 
 
 @pytest.mark.parametrize("factory", [_s3, _azure])
@@ -790,6 +942,547 @@ def test_restage_fails_closed_on_divergent_partition(tmp_path: Any, monkeypatch:
     with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="partition diverges"):
         sink.restage_effect(plan, SinkEffectPipelineMembersInput(members=(oversize,), target_snapshot_members=(oversize,)), _CTX)
     assert not stage.exists()
+
+
+# ---------------------------------------------------------------------------
+# Content-identity idempotence (elspeth-9a78b3a02f): reaffirmed no-op vs.
+# genuine collision, decided at prepare from the full verified-identity set.
+# ---------------------------------------------------------------------------
+
+
+def _raw_prepare(
+    *,
+    effect_id: str,
+    provider: str,
+    body: bytes,
+    checksum_algorithm: str,
+    observation: remote_effects.RemoteObjectObservation,
+    predecessor_descriptor: ArtifactDescriptor | None = None,
+    allow_replace: bool = False,
+) -> Any:
+    inspection = remote_effects.inspect_remote_object(
+        provider=provider,
+        target="s3://bucket/key" if provider == "aws_s3" else "azure://container/blob",
+        request=SinkEffectInspectionRequest(
+            effect_id=effect_id,
+            target="{}",
+            predecessor_descriptor=predecessor_descriptor,
+        ),
+        observation=observation,
+    )
+    return remote_effects.prepare_remote_object(
+        effect_id=effect_id,
+        provider=provider,
+        inspection=inspection,
+        body_chunks=(body,),
+        format_name="json",
+        max_bytes=4096,
+        accepted_ordinals=(0,),
+        diverted_ordinals=(),
+        predecessor_descriptor=predecessor_descriptor,
+        checksum_algorithm=checksum_algorithm,
+        allow_replace=allow_replace,
+    )
+
+
+def _genesis_identity(*, effect_id: str, provider: str, body: bytes, checksum_algorithm: str) -> tuple[str, int, str]:
+    """Prepare against an absent target to learn the exact staged identity."""
+    plan = _raw_prepare(
+        effect_id=effect_id,
+        provider=provider,
+        body=body,
+        checksum_algorithm=checksum_algorithm,
+        observation=remote_effects.RemoteObjectObservation(False, None, None, None),
+    )
+    checksum_b64 = plan.safe_evidence["checksum_b64"]
+    assert isinstance(checksum_b64, str)
+    return plan.payload_hash, len(body), checksum_b64
+
+
+@pytest.mark.parametrize(
+    ("provider", "checksum_algorithm"),
+    [("aws_s3", "sha256"), ("azure_blob", "md5")],
+)
+def test_reaffirmed_noop_recognizes_independently_reprepared_identical_content(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, provider: str, checksum_algorithm: str
+) -> None:
+    """A second, independent effect for identical content must no-op, not collide."""
+    monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
+    body = b'{"id":1}'
+    staged_hash, staged_size, checksum_b64 = _genesis_identity(
+        effect_id="a" * 64, provider=provider, body=body, checksum_algorithm=checksum_algorithm
+    )
+
+    present = remote_effects.RemoteObjectObservation(
+        exists=True,
+        etag='"existing-etag"',
+        content_hash=staged_hash,
+        size_bytes=staged_size,
+        effect_id=None,
+        plan_hash=None,
+        protocol_version="sink-effect-v1",
+        checksum_algorithm=checksum_algorithm,
+        checksum_b64=checksum_b64,
+    )
+    plan = _raw_prepare(
+        effect_id="b" * 64,
+        provider=provider,
+        body=body,
+        checksum_algorithm=checksum_algorithm,
+        observation=present,
+        allow_replace=False,
+    )
+
+    assert plan.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
+    assert plan.safe_evidence["publication_kind"] == "reaffirmed"
+    assert plan.safe_evidence["replace_authority"] == "none"
+    assert plan.safe_evidence["precondition"] == "if_none_match"
+    assert plan.safe_evidence["predecessor_etag"] is None
+    assert plan.expected_descriptor is not None
+    assert plan.expected_descriptor.content_hash == staged_hash
+    assert plan.expected_descriptor.size_bytes == staged_size
+    assert not Path(str(plan.safe_evidence["staging_path"])).exists()
+
+
+def test_reaffirmed_result_survives_owned_stage_cleanup_failure(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
+    body = b'{"id":1}'
+    staged_hash, staged_size, checksum_b64 = _genesis_identity(
+        effect_id="1" * 64,
+        provider="aws_s3",
+        body=body,
+        checksum_algorithm="sha256",
+    )
+    target_stage = remote_effects._stage_path("2" * 64, "aws_s3")
+    original_unlink = Path.unlink
+
+    def fail_target_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == target_stage:
+            raise OSError("owned cleanup failed")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_target_unlink)
+    present = remote_effects.RemoteObjectObservation(
+        exists=True,
+        etag='"existing-etag"',
+        content_hash=staged_hash,
+        size_bytes=staged_size,
+        protocol_version="sink-effect-v1",
+        checksum_algorithm="sha256",
+        checksum_b64=checksum_b64,
+    )
+
+    plan = _raw_prepare(
+        effect_id="2" * 64,
+        provider="aws_s3",
+        body=body,
+        checksum_algorithm="sha256",
+        observation=present,
+    )
+
+    assert plan.safe_evidence["publication_kind"] == "reaffirmed"
+
+
+@pytest.mark.parametrize(
+    "divergence",
+    ["content_hash", "size_bytes", "protocol_version", "checksum_algorithm", "checksum_b64"],
+)
+def test_reaffirm_requires_the_full_verified_identity_set_not_partial_match(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch, divergence: str
+) -> None:
+    """Metadata-only or partial equality must never be credited as identity proof."""
+    monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
+    body = b'{"id":1}'
+    staged_hash, staged_size, checksum_b64 = _genesis_identity(
+        effect_id="c" * 64, provider="aws_s3", body=body, checksum_algorithm="sha256"
+    )
+    fields: dict[str, object] = {
+        "content_hash": staged_hash,
+        "size_bytes": staged_size,
+        "protocol_version": "sink-effect-v1",
+        "checksum_algorithm": "sha256",
+        "checksum_b64": checksum_b64,
+    }
+    if divergence == "content_hash":
+        fields["content_hash"] = "f" * 64
+    elif divergence == "size_bytes":
+        fields["size_bytes"] = staged_size + 1
+    elif divergence == "protocol_version":
+        fields["protocol_version"] = None
+    elif divergence == "checksum_algorithm":
+        fields["checksum_algorithm"] = None
+        fields["checksum_b64"] = None
+    else:
+        fields["checksum_b64"] = base64.b64encode(b"\x00" * 32).decode("ascii")
+    present = remote_effects.RemoteObjectObservation(
+        exists=True,
+        etag='"existing-etag"',
+        content_hash=cast_str_or_none(fields["content_hash"]),
+        size_bytes=cast_int_or_none(fields["size_bytes"]),
+        effect_id=None,
+        plan_hash=None,
+        protocol_version=cast_str_or_none(fields["protocol_version"]),
+        checksum_algorithm=cast_str_or_none(fields["checksum_algorithm"]),
+        checksum_b64=cast_str_or_none(fields["checksum_b64"]),
+    )
+
+    with pytest.raises(remote_effects.RemoteObjectCollisionError):
+        _raw_prepare(
+            effect_id="d" * 64,
+            provider="aws_s3",
+            body=body,
+            checksum_algorithm="sha256",
+            observation=present,
+            allow_replace=False,
+        )
+
+    assert not remote_effects._stage_path("d" * 64, "aws_s3").exists()
+
+
+def test_collision_error_survives_owned_stage_cleanup_failure(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
+    target_stage = remote_effects._stage_path("3" * 64, "aws_s3")
+    original_unlink = Path.unlink
+
+    def fail_target_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == target_stage:
+            raise OSError("owned cleanup failed")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_target_unlink)
+    foreign = remote_effects.RemoteObjectObservation(
+        exists=True,
+        etag='"foreign"',
+        content_hash=None,
+        size_bytes=len(b'{"id":1}'),
+    )
+
+    with pytest.raises(remote_effects.RemoteObjectCollisionError):
+        _raw_prepare(
+            effect_id="3" * 64,
+            provider="aws_s3",
+            body=b'{"id":1}',
+            checksum_algorithm="sha256",
+            observation=foreign,
+        )
+
+
+def cast_str_or_none(value: object) -> str | None:
+    assert value is None or isinstance(value, str)
+    return value
+
+
+def cast_int_or_none(value: object) -> int | None:
+    assert value is None or isinstance(value, int)
+    return value
+
+
+def test_prepare_rejects_foreign_object_without_elspeth_identity_evidence(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pre-existing object with no elspeth metadata is never reaffirmable."""
+    monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
+    body = b'{"id":1}'
+    foreign = remote_effects.RemoteObjectObservation(
+        exists=True,
+        etag='"foreign-etag"',
+        content_hash=None,
+        size_bytes=len(body),
+        effect_id=None,
+        plan_hash=None,
+        protocol_version=None,
+        checksum_algorithm=None,
+        checksum_b64=None,
+    )
+
+    with pytest.raises(remote_effects.RemoteObjectCollisionError):
+        _raw_prepare(
+            effect_id="e" * 64,
+            provider="aws_s3",
+            body=body,
+            checksum_algorithm="sha256",
+            observation=foreign,
+            allow_replace=False,
+        )
+
+
+def test_prepare_replaces_under_overwrite_config_authority_when_content_differs(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """overwrite=True authorizes an unconditional replace; no comparison is required."""
+    monkeypatch.setenv("ELSPETH_EFFECT_SPOOL_DIR", str(tmp_path))
+    body = b'{"id":2}'
+    existing = remote_effects.RemoteObjectObservation(
+        exists=True,
+        etag='"existing-etag"',
+        content_hash="0" * 64,
+        size_bytes=999,
+        effect_id=None,
+        plan_hash=None,
+        protocol_version="sink-effect-v1",
+        checksum_algorithm="sha256",
+        checksum_b64=base64.b64encode(b"\x00" * 32).decode("ascii"),
+    )
+
+    plan = _raw_prepare(
+        effect_id="f" * 64,
+        provider="aws_s3",
+        body=body,
+        checksum_algorithm="sha256",
+        observation=existing,
+        allow_replace=True,
+    )
+
+    assert plan.descriptor_mode is SinkEffectDescriptorMode.PRECOMPUTED
+    assert plan.safe_evidence["publication_kind"] == "conditional_replace"
+    assert plan.safe_evidence["replace_authority"] == "overwrite_config"
+    assert plan.safe_evidence["precondition"] == "if_match"
+    assert plan.safe_evidence["predecessor_etag"] == '"existing-etag"'
+
+
+def test_plan_evidence_round_trips_reaffirmed_replace_authority() -> None:
+    evidence = remote_effects.RemoteObjectPlanEvidence(
+        provider="aws_s3",
+        target="s3://bucket/key",
+        staging_path="/tmp/stage",
+        precondition="if_none_match",
+        predecessor_etag=None,
+        staged_hash="a" * 64,
+        staged_size=3,
+        checksum_algorithm="sha256",
+        checksum_b64=base64.b64encode(b"\x01" * 32).decode("ascii"),
+        format_name="json",
+        accepted_ordinals=(0,),
+        diverted_ordinals=(),
+        diversion_attribution=(),
+        publication_kind="reaffirmed",
+        replace_authority="none",
+    )
+    round_tripped = remote_effects.RemoteObjectPlanEvidence.from_mapping(evidence.as_mapping())
+    assert round_tripped == evidence
+
+
+@pytest.mark.parametrize("bad_authority", ["overwrite", "predecessor", "None"])
+def test_plan_evidence_rejects_replace_authority_outside_closed_vocab(bad_authority: str) -> None:
+    evidence = dict(
+        remote_effects.RemoteObjectPlanEvidence(
+            provider="aws_s3",
+            target="s3://bucket/key",
+            staging_path="/tmp/stage",
+            precondition="if_none_match",
+            predecessor_etag=None,
+            staged_hash="a" * 64,
+            staged_size=3,
+            checksum_algorithm="sha256",
+            checksum_b64=base64.b64encode(b"\x01" * 32).decode("ascii"),
+            format_name="json",
+            accepted_ordinals=(0,),
+            diverted_ordinals=(),
+            diversion_attribution=(),
+            publication_kind="virtual",
+            replace_authority="none",
+        ).as_mapping()
+    )
+    evidence["replace_authority"] = bad_authority
+    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="replace authority is not closed"):
+        remote_effects.RemoteObjectPlanEvidence.from_mapping(evidence)
+
+
+def test_plan_evidence_rejects_conditional_replace_without_authority() -> None:
+    evidence = dict(
+        remote_effects.RemoteObjectPlanEvidence(
+            provider="aws_s3",
+            target="s3://bucket/key",
+            staging_path="/tmp/stage",
+            precondition="if_match",
+            predecessor_etag='"etag"',
+            staged_hash="a" * 64,
+            staged_size=3,
+            checksum_algorithm="sha256",
+            checksum_b64=base64.b64encode(b"\x01" * 32).decode("ascii"),
+            format_name="json",
+            accepted_ordinals=(0,),
+            diverted_ordinals=(),
+            diversion_attribution=(),
+            publication_kind="conditional_replace",
+            replace_authority="overwrite_config",
+        ).as_mapping()
+    )
+    evidence["replace_authority"] = "none"
+    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="conditional_replace requires"):
+        remote_effects.RemoteObjectPlanEvidence.from_mapping(evidence)
+
+
+def test_plan_evidence_rejects_reaffirmed_with_replace_authority_or_if_match() -> None:
+    base_kwargs = {
+        "provider": "aws_s3",
+        "target": "s3://bucket/key",
+        "staging_path": "/tmp/stage",
+        "staged_hash": "a" * 64,
+        "staged_size": 3,
+        "checksum_algorithm": "sha256",
+        "checksum_b64": base64.b64encode(b"\x01" * 32).decode("ascii"),
+        "format_name": "json",
+        "accepted_ordinals": (0,),
+        "diverted_ordinals": (),
+        "diversion_attribution": (),
+        "publication_kind": "reaffirmed",
+    }
+    tampered_authority = dict(
+        remote_effects.RemoteObjectPlanEvidence(
+            precondition="if_none_match",
+            predecessor_etag=None,
+            replace_authority="none",
+            **base_kwargs,  # type: ignore[arg-type]
+        ).as_mapping()
+    )
+    tampered_authority["replace_authority"] = "overwrite_config"
+    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="reaffirmed evidence must carry"):
+        remote_effects.RemoteObjectPlanEvidence.from_mapping(tampered_authority)
+
+    tampered_precondition = dict(
+        remote_effects.RemoteObjectPlanEvidence(
+            precondition="if_match",
+            predecessor_etag='"etag"',
+            replace_authority="predecessor_lineage",
+            **base_kwargs,  # type: ignore[arg-type]
+        ).as_mapping()
+    )
+    tampered_precondition["publication_kind"] = "reaffirmed"
+    tampered_precondition["replace_authority"] = "none"
+    # predecessor_etag stays set (a valid if_match pairing) so only the
+    # reaffirmed-specific precondition check is exercised here.
+    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="reaffirmed evidence must carry"):
+        remote_effects.RemoteObjectPlanEvidence.from_mapping(tampered_precondition)
+
+
+# ---------------------------------------------------------------------------
+# Sink wiring (elspeth-9a78b3a02f): the inspect-time overwrite=False guard is
+# gone; prepare_effect decides reaffirm-vs-collision, and commit_effect
+# re-checks replace authority so a stale/replayed plan cannot clobber an
+# object under a sink now configured overwrite=False.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("factory", [_s3, _azure])
+def test_second_independent_sink_reaffirms_identical_content_without_overwrite(factory: Any) -> None:
+    """The bug fix: overwrite=False must no-op on an idempotent re-drive of
+    identical content instead of hard-rejecting it (elspeth-9a78b3a02f)."""
+    store = _S3Store() if factory is _s3 else _AzureStore()
+    member = _member(0, {"id": 1})
+    first_sink = factory(store, overwrite=False)
+    first_plan = _prepare(first_sink, effect_id="10" * 32, current=(member,), target_snapshot=(member,))
+    first_sink.commit_effect(first_plan, _CTX)
+    requests_before = len(store.requests)
+
+    second_member = _member(0, {"id": 1})
+    second_sink = factory(store, overwrite=False)
+    second_plan = _prepare(second_sink, effect_id="11" * 32, current=(second_member,), target_snapshot=(second_member,))
+
+    assert second_plan.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
+    assert second_plan.safe_evidence["publication_kind"] == "reaffirmed"
+    assert second_plan.safe_evidence["replace_authority"] == "none"
+    assert second_plan.expected_descriptor == first_plan.expected_descriptor
+    write_op = "put" if factory is _s3 else "upload"
+    assert [request for request in store.requests[requests_before:] if request["operation"] == write_op] == []
+
+
+def test_s3_second_independent_sink_rejects_true_collision_without_overwrite() -> None:
+    store = _S3Store()
+    member = _member(0, {"id": 1})
+    first_sink = _s3(store, overwrite=False)
+    first_plan = _prepare(first_sink, effect_id="12" * 32, current=(member,), target_snapshot=(member,))
+    first_sink.commit_effect(first_plan, _CTX)
+
+    different_member = _member(0, {"id": 999})
+    second_sink = _s3(store, overwrite=False)
+    with pytest.raises(S3ConditionalWriteRejectedError):
+        _prepare(second_sink, effect_id="13" * 32, current=(different_member,), target_snapshot=(different_member,))
+    assert store.value is not None
+    assert json.loads(store.value.body) == [{"id": 1}]
+
+
+def test_azure_second_independent_sink_rejects_true_collision_without_overwrite() -> None:
+    store = _AzureStore()
+    member = _member(0, {"id": 1})
+    first_sink = _azure(store, overwrite=False)
+    first_plan = _prepare(first_sink, effect_id="14" * 32, current=(member,), target_snapshot=(member,))
+    first_sink.commit_effect(first_plan, _CTX)
+
+    different_member = _member(0, {"id": 999})
+    second_sink = _azure(store, overwrite=False)
+    with pytest.raises(remote_effects.RemoteObjectCollisionError):
+        _prepare(second_sink, effect_id="15" * 32, current=(different_member,), target_snapshot=(different_member,))
+    assert store.value is not None
+    assert json.loads(store.value.body) == [{"id": 1}]
+
+
+@pytest.mark.parametrize("factory", [_s3, _azure])
+def test_predecessor_lineage_authorizes_replace_even_without_overwrite_config(factory: Any) -> None:
+    """The resume/predecessor lane must keep working under overwrite=False:
+    declared lineage is its own replace authority (elspeth-9a78b3a02f)."""
+    store = _S3Store() if factory is _s3 else _AzureStore()
+    first_member = _member(0, {"id": 1})
+    first_sink = factory(store, overwrite=False)
+    first_plan = _prepare(first_sink, effect_id="16" * 32, current=(first_member,), target_snapshot=(first_member,))
+    first_result = first_sink.commit_effect(first_plan, _CTX)
+
+    second_member = _member(1, {"id": 2}, identity=1)
+    second_current = _member(0, {"id": 2}, identity=1)
+    second_sink = factory(store, overwrite=False)
+    second_plan = _prepare(
+        second_sink,
+        effect_id="17" * 32,
+        current=(second_current,),
+        target_snapshot=(first_member, second_member),
+        predecessor=first_result.descriptor,
+    )
+
+    assert second_plan.safe_evidence["publication_kind"] == "conditional_replace"
+    assert second_plan.safe_evidence["replace_authority"] == "predecessor_lineage"
+    second_sink.commit_effect(second_plan, _CTX)
+    assert store.value is not None
+    assert json.loads(store.value.body) == [{"id": 1}, {"id": 2}]
+
+
+def test_s3_commit_rejects_a_stale_overwrite_config_authority_plan() -> None:
+    """Closing the blind IfMatch hole: a plan sealed under overwrite=True
+    must not replace under a sink now configured overwrite=False, even
+    though the provider conditional alone would accept it (elspeth-9a78b3a02f)."""
+    store = _S3Store()
+    seed_member = _member(0, {"id": "seed"})
+    seed_sink = _s3(store, overwrite=True)
+    seed_plan = _prepare(seed_sink, effect_id="18" * 32, current=(seed_member,), target_snapshot=(seed_member,))
+    seed_sink.commit_effect(seed_plan, _CTX)
+
+    differing_member = _member(0, {"id": "replacement"})
+    permissive_sink = _s3(store, overwrite=True)
+    plan = _prepare(permissive_sink, effect_id="19" * 32, current=(differing_member,), target_snapshot=(differing_member,))
+    assert plan.safe_evidence["replace_authority"] == "overwrite_config"
+    assert plan.safe_evidence["precondition"] == "if_match"
+
+    strict_sink = _s3(store, overwrite=False)
+    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="commit authority"):
+        strict_sink.commit_effect(plan, _CTX)
+    assert store.value is not None
+    assert json.loads(store.value.body) == [{"id": "seed"}]
+
+
+def test_azure_commit_rejects_a_stale_overwrite_config_authority_plan() -> None:
+    """Azure counterpart of the blind IfMatch hole closure (elspeth-9a78b3a02f)."""
+    store = _AzureStore()
+    seed_member = _member(0, {"id": "seed"})
+    seed_sink = _azure(store, overwrite=True)
+    seed_plan = _prepare(seed_sink, effect_id="1a" * 32, current=(seed_member,), target_snapshot=(seed_member,))
+    seed_sink.commit_effect(seed_plan, _CTX)
+
+    differing_member = _member(0, {"id": "replacement"})
+    permissive_sink = _azure(store, overwrite=True)
+    plan = _prepare(permissive_sink, effect_id="1b" * 32, current=(differing_member,), target_snapshot=(differing_member,))
+    assert plan.safe_evidence["replace_authority"] == "overwrite_config"
+    assert plan.safe_evidence["precondition"] == "if_match"
+
+    strict_sink = _azure(store, overwrite=False)
+    with pytest.raises(remote_effects.RemoteObjectPreconditionError, match="commit authority"):
+        strict_sink.commit_effect(plan, _CTX)
+    assert store.value is not None
+    assert json.loads(store.value.body) == [{"id": "seed"}]
 
 
 @pytest.mark.parametrize("factory", [_s3, _azure])

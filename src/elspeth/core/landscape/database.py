@@ -397,6 +397,8 @@ _REQUIRED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("token_work_items", "expand_group_id"),
     ("token_work_items", "coalesce_node_id"),
     ("token_work_items", "coalesce_name"),
+    # Epoch 30: row_union barrier attribution, the sibling of coalesce_name.
+    ("token_work_items", "row_union_name"),
     ("token_work_items", "attempt"),
     ("token_work_items", "lease_owner"),
     ("token_work_items", "lease_expires_at"),
@@ -762,7 +764,7 @@ def _missing_additive_indexes(inspector: Inspector, present_tables: set[str]) ->
         if table_name not in present_tables:
             missing.add(index_name)
             continue
-        found = {str(index["name"]) for index in inspector.get_indexes(table_name) if index.get("name") is not None}
+        found = {str(index["name"]) for index in inspector.get_indexes(table_name) if "name" in index and index["name"] is not None}
         if index_name not in found:
             missing.add(index_name)
     return frozenset(missing)

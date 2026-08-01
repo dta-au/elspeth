@@ -289,13 +289,10 @@ class SinkEffectReservation:
             raise ValueError("sink effect current-state witness changed during reservation")
         member_by_token = {member.token_id: member for member in request.members}
         for row in locked_states:
-            member = member_by_token.get(row.token_id)
-            if (
-                member is None
-                or row.run_id != request.run_id
-                or row.node_id != request.sink_node_id
-                or row.input_hash != member.payload_hash
-            ):
+            if row.token_id not in member_by_token:
+                raise ValueError("sink effect current-state witness is divergent")
+            member = member_by_token[row.token_id]
+            if row.run_id != request.run_id or row.node_id != request.sink_node_id or row.input_hash != member.payload_hash:
                 raise ValueError("sink effect current-state witness is divergent")
         self._after_witness_locks(self._backend_pid(conn), token_ids, state_ids)
 
@@ -617,23 +614,23 @@ class SinkEffectReservation:
     @staticmethod
     def _validate_existing_members(request: SinkEffectReservationRequest, bindings: Mapping[str, Row[Any]]) -> None:
         for member in request.members:
-            row = bindings.get(member.token_id)
-            if row is None:
+            if member.token_id not in bindings:
                 continue
-            expected = {
-                "run_id": request.run_id,
-                "sink_node_id": request.sink_node_id,
-                "role": request.role.value,
-                "input_kind": SinkEffectInputKind.PIPELINE_MEMBERS.value,
-                "token_id": member.token_id,
-                "row_id": member.row_id,
-                "ingest_sequence": member.ingest_sequence,
-                "lineage_json": member.lineage_json,
-                "lineage_hash": member.lineage_hash,
-                "payload_hash": member.payload_hash,
-                "primary_effect_id": member.primary_effect_id,
-            }
-            if any(getattr(row, field_name) != value for field_name, value in expected.items()):
+            row = bindings[member.token_id]
+            membership_fields = (
+                (row.run_id, request.run_id),
+                (row.sink_node_id, request.sink_node_id),
+                (row.role, request.role.value),
+                (row.input_kind, SinkEffectInputKind.PIPELINE_MEMBERS.value),
+                (row.token_id, member.token_id),
+                (row.row_id, member.row_id),
+                (row.ingest_sequence, member.ingest_sequence),
+                (row.lineage_json, member.lineage_json),
+                (row.lineage_hash, member.lineage_hash),
+                (row.payload_hash, member.payload_hash),
+                (row.primary_effect_id, member.primary_effect_id),
+            )
+            if any(observed != expected for observed, expected in membership_fields):
                 raise ValueError(f"sink effect member {member.token_id!r} has divergent immutable membership")
 
     @staticmethod
@@ -729,25 +726,25 @@ class SinkEffectReservation:
         ).fetchone()
         if row is None:
             raise ValueError("sink effect winner disappeared")
-        immutable = {
-            "run_id": request.run_id,
-            "sink_node_id": request.sink_node_id,
-            "role": request.role.value,
-            "protocol_version": SINK_EFFECT_PROTOCOL_VERSION,
-            "input_kind": request.input_kind.value,
-            "required_member_ordinal": values["required_member_ordinal"],
-            "required_snapshot_slot": values["required_snapshot_slot"],
-            "config_hash": request.config_hash,
-            "membership_or_manifest_hash": identity.membership_or_manifest_hash,
-            "group_payload_hash": identity.group_payload_hash,
-            "artifact_id": identity.artifact_id,
-            "artifact_idempotency_key": identity.artifact_idempotency_key,
-            "primary_effect_id": common_primary_effect_id,
-            "stream_id": stream_id,
-            "stream_sequence": stream_sequence,
-            "predecessor_effect_id": predecessor_effect_id,
-        }
-        if any(getattr(row, field_name) != value for field_name, value in immutable.items()):
+        immutable_fields = (
+            (row.run_id, request.run_id),
+            (row.sink_node_id, request.sink_node_id),
+            (row.role, request.role.value),
+            (row.protocol_version, SINK_EFFECT_PROTOCOL_VERSION),
+            (row.input_kind, request.input_kind.value),
+            (row.required_member_ordinal, values["required_member_ordinal"]),
+            (row.required_snapshot_slot, values["required_snapshot_slot"]),
+            (row.config_hash, request.config_hash),
+            (row.membership_or_manifest_hash, identity.membership_or_manifest_hash),
+            (row.group_payload_hash, identity.group_payload_hash),
+            (row.artifact_id, identity.artifact_id),
+            (row.artifact_idempotency_key, identity.artifact_idempotency_key),
+            (row.primary_effect_id, common_primary_effect_id),
+            (row.stream_id, stream_id),
+            (row.stream_sequence, stream_sequence),
+            (row.predecessor_effect_id, predecessor_effect_id),
+        )
+        if any(observed != expected for observed, expected in immutable_fields):
             raise ValueError("sink effect identity winner is divergent")
         if inserted and row.target_json != _EMPTY_TARGET_JSON:
             raise ValueError("new sink effect did not preserve its empty target sentinel")

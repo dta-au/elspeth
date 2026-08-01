@@ -44,6 +44,8 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 
 from elspeth_lints.core.ast_walker import iter_own_scope
+from elspeth_lints.core.boundary_aliases import BoundaryDecoratorKind, resolve_boundary_kind
+from elspeth_lints.core.boundary_aliases import assignment_target_names as assignment_target_names
 
 # Closed set of rule IDs the ``@trust_boundary`` decorator is permitted to
 # silence. Mirrors the runtime decorator's ``BoundaryRule = Literal["R1",
@@ -130,7 +132,7 @@ class DerivedNameState:
                 self.names.discard(name)
 
     def assign_target(self, target: ast.expr, *, is_derived: bool) -> None:
-        self.assign_target_names(_assignment_targets(target), is_derived=is_derived)
+        self.assign_target_names(assignment_target_names(target), is_derived=is_derived)
 
     def assign_targets(self, targets: Iterable[ast.expr], *, is_derived: bool) -> None:
         for target in targets:
@@ -141,49 +143,34 @@ class DerivedNameState:
 
 
 _TRUST_BOUNDARY_NAME = "trust_boundary"
-_TRUST_BOUNDARY_EXPORT = "elspeth.contracts.trust_boundary"
-_TRUST_BOUNDARY_FUNCTION = "elspeth.contracts.trust_boundary.trust_boundary"
-_TRUST_BOUNDARY_QUALIFIED_NAMES: frozenset[str] = frozenset(
-    {
-        _TRUST_BOUNDARY_EXPORT,
-        _TRUST_BOUNDARY_FUNCTION,
-    }
-)
+_OBSERVATION_BOUNDARY_NAME = "observation_boundary"
 
 
-def _dotted_name(expr: ast.expr) -> tuple[str, ...] | None:
-    if isinstance(expr, ast.Name):
-        return (expr.id,)
-    if isinstance(expr, ast.Attribute):
-        base = _dotted_name(expr.value)
-        if base is None:
-            return None
-        return (*base, expr.attr)
-    return None
-
-
-def _matches_elspeth_trust_boundary_import(
+def _resolve_elspeth_boundary_import(
     func: ast.expr,
     import_aliases: Mapping[str, str],
-) -> bool:
-    """Return True when ``func`` resolves to Elspeth's trust-boundary decorator."""
-    parts = _dotted_name(func)
-    if parts is None:
-        return False
+) -> BoundaryDecoratorKind | None:
+    """Resolve ``func`` to one of ELSPETH's two boundary marker forms."""
+    return resolve_boundary_kind(func, import_aliases)
 
-    alias_target = import_aliases.get(parts[0])
-    dotted = ".".join(parts)
-    if alias_target is None:
-        return dotted in _TRUST_BOUNDARY_QUALIFIED_NAMES
-    if dotted in _TRUST_BOUNDARY_QUALIFIED_NAMES and alias_target.startswith("elspeth."):
-        return True
 
-    target_parts = tuple(alias_target.split("."))
-    if parts[: len(target_parts)] == target_parts:
-        resolved = dotted
-    else:
-        resolved = ".".join((*target_parts, *parts[1:]))
-    return resolved in _TRUST_BOUNDARY_QUALIFIED_NAMES
+def _boundary_kind(
+    func: ast.expr,
+    import_aliases: Mapping[str, str] | None,
+) -> BoundaryDecoratorKind | None:
+    if import_aliases is not None:
+        return _resolve_elspeth_boundary_import(func, import_aliases)
+    if isinstance(func, ast.Name):
+        if func.id == _TRUST_BOUNDARY_NAME:
+            return "trust"
+        if func.id == _OBSERVATION_BOUNDARY_NAME:
+            return "observation"
+    if isinstance(func, ast.Attribute):
+        if func.attr == _TRUST_BOUNDARY_NAME:
+            return "trust"
+        if func.attr == _OBSERVATION_BOUNDARY_NAME:
+            return "observation"
+    return None
 
 
 def _is_trust_boundary_decorator(
@@ -206,19 +193,14 @@ def _is_trust_boundary_decorator(
     When ``import_aliases`` is provided by the tier-model visitor, the match is
     import-aware: a local ``foo.trust_boundary`` or ``from foo import
     trust_boundary`` cannot masquerade as Elspeth's decorator and hide R1/R5
-    findings. ``import_aliases=None`` keeps the extraction helper usable in
-    direct metadata unit tests that parse only a function body.
+    findings. ``import_aliases=None`` is an intentionally UNSAFE syntax-only
+    fallback for isolated metadata unit tests that parse only a function body.
+    Production analyzers and gates must use a scoped resolver or pass a proven
+    alias map; the fallback cannot distinguish foreign or unbound names.
     """
     if not isinstance(decorator, ast.Call):
         return None
-    func = decorator.func
-    if import_aliases is not None:
-        return decorator if _matches_elspeth_trust_boundary_import(func, import_aliases) else None
-    if isinstance(func, ast.Name) and func.id == _TRUST_BOUNDARY_NAME:
-        return decorator
-    if isinstance(func, ast.Attribute) and func.attr == _TRUST_BOUNDARY_NAME:
-        return decorator
-    return None
+    return decorator if _boundary_kind(decorator.func, import_aliases) is not None else None
 
 
 def find_trust_boundary_calls(
@@ -232,7 +214,9 @@ def find_trust_boundary_calls(
     stack (above or below other decorators). More than one trust-boundary
     decorator is ambiguous because only one ``source_param`` / ``suppresses``
     tuple can be the audit signal for the function, so callers must reject
-    duplicate matches.
+    duplicate matches. Omitting ``import_aliases`` selects the unsafe
+    syntax-only unit-test fallback described by
+    :func:`_is_trust_boundary_decorator`; production callers must not omit it.
     """
     calls: list[ast.Call] = []
     for decorator in decorator_list:
@@ -323,6 +307,11 @@ def extract_boundary_metadata(
       the runtime decorator's documented signature.
     * ``R_TB_STACKED`` — the function carries multiple ``@trust_boundary``
       decorators, so the analyzer refuses to choose one suppression claim.
+
+    ``import_aliases=None`` is retained only for isolated metadata unit tests;
+    it is not safe for a production scanner because it performs no binding
+    proof. Gate callers must provide scoped aliases or use the shared boundary
+    iterator.
     """
     calls = find_trust_boundary_calls(func_node.decorator_list, import_aliases=import_aliases)
     if not calls:
@@ -341,6 +330,8 @@ def extract_boundary_metadata(
         ]
 
     call = calls[0]
+    kind = _boundary_kind(call.func, import_aliases)
+    assert kind is not None
 
     diagnostics: list[BoundaryFinding] = []
     parsed: dict[str, object] = {}
@@ -387,7 +378,10 @@ def extract_boundary_metadata(
             return None, diagnostics
         parsed[keyword.arg] = value
 
-    unknown_kwargs = sorted(set(parsed) - _ALLOWED_TRUST_BOUNDARY_KWARGS)
+    allowed_kwargs = _ALLOWED_TRUST_BOUNDARY_KWARGS
+    if kind == "observation":
+        allowed_kwargs = allowed_kwargs - {"test_ref", "test_fingerprint", "non_raising"}
+    unknown_kwargs = sorted(set(parsed) - allowed_kwargs)
     if unknown_kwargs:
         diagnostics.append(
             BoundaryFinding(
@@ -444,7 +438,7 @@ def extract_boundary_metadata(
     if invariant_raw is not None and not isinstance(invariant_raw, str):
         shape_errors.append(f"'invariant' must be a string when present, got {type(invariant_raw).__name__}")
 
-    non_raising_raw = parsed.get("non_raising")
+    non_raising_raw = True if kind == "observation" else parsed.get("non_raising")
     if non_raising_raw is not None and not isinstance(non_raising_raw, bool):
         # ``bool`` is a subclass of ``int``; reject ``non_raising=1`` so the
         # honesty-gate claim cannot be smuggled in as a truthy non-bool.
@@ -482,38 +476,6 @@ def extract_boundary_metadata(
         non_raising=bool(non_raising_raw),
     )
     return metadata, diagnostics
-
-
-# =============================================================================
-# Dataflow walk: which names are "derived from source_param"?
-# =============================================================================
-
-
-def _assignment_targets(target: ast.expr) -> list[str]:
-    """Collect bound name(s) from an assignment LHS.
-
-    Handles plain names and tuple/list unpacking, recursively. Subscript and
-    attribute targets do NOT bind a new name in the local scope (they mutate
-    an existing object), so they are intentionally ignored.
-
-    A starred unpacking target (``*rest``) binds ``rest``; we follow the
-    ``ast.Starred.value`` to the inner name.
-    """
-    if isinstance(target, ast.Name):
-        return [target.id]
-    if isinstance(target, (ast.Tuple, ast.List)):
-        names: list[str] = []
-        for elt in target.elts:
-            names.extend(_assignment_targets(elt))
-        return names
-    if isinstance(target, ast.Starred):
-        return _assignment_targets(target.value)
-    return []
-
-
-def assignment_target_names(target: ast.expr) -> tuple[str, ...]:
-    """Return local names bound by an assignment target."""
-    return tuple(_assignment_targets(target))
 
 
 def subject_is_rooted(node: ast.AST, derived_names: frozenset[str]) -> bool:

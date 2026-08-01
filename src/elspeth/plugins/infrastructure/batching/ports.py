@@ -15,14 +15,13 @@ Retry Safety:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from elspeth.contracts import ExceptionResult, TransformResult
     from elspeth.contracts.identity import TokenInfo
 
 
-@runtime_checkable
 class OutputPort(Protocol):
     """Abstract output interface for pipeline stages.
 

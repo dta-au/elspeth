@@ -87,14 +87,10 @@ export const TURN_7_LEARNING_BULLETS = [
   },
   {
     title: "Ask Elspeth.",
-    // Trails into the freeform-for-complex note (operator 2026-07-23),
-    // folded into this existing chat-panel guidance rather than a new item:
-    // both halves are conversational escalations — ask when confused, and
-    // switch modes when the guided wizard isn't enough. "Switch to" is
-    // deliberate (freeform is a distinct mode reached via the mode switch,
-    // not the same surface). Shared verbatim with the skip path.
+    // Guided/freeform parity guidance is folded into this existing chat-panel
+    // item and shared verbatim with the skip path.
     body:
-      "If anything in a pipeline (a plugin name, a transform's effect, a recorded assumption) doesn't make sense, ask in the chat panel. The composer can explain the pipeline it just built, in plain English, against the actual node options. And for particularly complex pipelines you will need to switch to freeform mode and build the pipeline up step by step rather than through the guided wizard.",
+      "If anything in a pipeline (a plugin name, a transform's effect, a recorded assumption) doesn't make sense, ask in the chat panel. The composer can explain the pipeline it just built, in plain English, against the actual node options. Guided and freeform can build the same pipelines: choose guided for structured prompts or freeform for a conversational, step-by-step exchange. That is an interaction preference, not a capability limit.",
   },
   {
     title: "LLMs are confident even when they're wrong.",
@@ -129,6 +125,22 @@ export const TUTORIAL_SHIELD_OVERRIDE_CAVEAT =
   "Running an LLM over fetched content without a shield is always a high-risk " +
   "decision, not a default. Against real or untrusted web content you would " +
   "wire the shield.";
+
+/**
+ * The same teaching moment for a deployment that HAS an authorized prompt
+ * shield. The override caveat above states a fact about the pipeline — "we are
+ * proceeding without a prompt shield" — which became false once the planner
+ * started wiring an available shield rather than recommending it. Stating it
+ * over a shielded pipeline teaches the reader to distrust the interface, so
+ * this deployment gets the true version of the same lesson: the shield is the
+ * rule, and it is here because the content is fetched from outside.
+ */
+export const TUTORIAL_SHIELD_WIRED_NOTE =
+  "Your pipeline runs the fetched page content through a prompt shield before " +
+  "the model sees it. That is the rule, not an optional extra: anything " +
+  "fetched from outside is untrusted, and text on a page can be written to " +
+  "steer a model. This deployment requires the shield, so the composer wired " +
+  "one for you.";
 
 /**
  * Teaching moment (spec §"Teaching moments"): the source's on_validation_failure

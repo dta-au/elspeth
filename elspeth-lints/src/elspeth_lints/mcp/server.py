@@ -35,6 +35,7 @@ from elspeth_lints.core.allowlist import _JUDGE_METADATA_SIGNATURE_ENV_VAR
 
 __all__ = [
     "HmacKeyPresentError",
+    "build_scan_actions",
     "create_server",
     "main",
     "run_server",
@@ -278,21 +279,19 @@ def _finding_canonical_key(finding: Any) -> str:
     return key
 
 
-def _live_findings_for_tree(root: Path, excluded_dirs: tuple[str, ...]) -> list[Any]:
+def _live_findings_for_tree(root: Path) -> list[Any]:
     """Enumerate live tier_model findings across ``root`` via the *shared* helper.
 
     Uses the same ``scan_single_file_findings`` (scan_file + scan_layer_imports_file)
     that ``verify_bundle_against_tree`` calls per action -- so stage_scan and the
-    from-tree verify cannot drift on the scanner set -- and mirrors
-    ``scan_directory``'s file discovery (rglob ``*.py``, excluding vendored dirs).
+    from-tree verify cannot drift on the scanner set -- and delegates file
+    discovery to the exact iterator used by the tier directory scanners.
     """
     from elspeth_lints.core.tier_model_scan import scan_single_file_findings
+    from elspeth_lints.rules.trust_tier.tier_model.rule import iter_scannable_python_files
 
     findings: list[Any] = []
-    for py_file in sorted(root.rglob("*.py")):
-        relative = py_file.relative_to(root)
-        if any(part in excluded_dirs for part in relative.parts):
-            continue
+    for py_file in sorted(iter_scannable_python_files(root)):
         findings.extend(scan_single_file_findings(target_file=py_file, root=root))
     return findings
 
@@ -326,11 +325,11 @@ def _build_scan_actions(ctx: _ServerContext) -> list[Any]:
       ONLY (the filtered scan cannot raise on the mostly-judge-gated corpus;
       ``.new_findings``/``.ambiguous`` on a *filtered* plan are pollution and are
       never read);
-    * ``new_judgment`` -- live findings whose identity-prefix is owned by NO
-      entry in the **full, unfiltered** allowlist (the double-route guard: an
-      fp-shifted judge-gated entry's live finding shares its prefix with the
-      drifted entry, so it routes to ``drift_repair`` alone, never also to a
-      spurious ``new_judgment``).
+    * ``new_judgment`` -- live findings covered by neither a per-file rule nor
+      an identity-prefix in the **full, unfiltered** allowlist (the double-route
+      guard: an fp-shifted judge-gated entry's live finding shares its prefix
+      with the drifted entry, so it routes to ``drift_repair`` alone, never also
+      to a spurious ``new_judgment``).
     """
     from elspeth_lints.core.bundle_verify import _STALE_DELETE_ORPHAN_STATUSES
     from elspeth_lints.core.judge_signature_diagnosis import (
@@ -338,8 +337,12 @@ def _build_scan_actions(ctx: _ServerContext) -> list[Any]:
         diagnose_judge_signatures,
     )
     from elspeth_lints.core.review_bundle import BundleAction
-    from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix, scan_for_rotations
-    from elspeth_lints.rules.trust_tier.tier_model.rule import _ALWAYS_EXCLUDED_DIRS, _load_tier_model_allowlist
+    from elspeth_lints.rules.trust_tier.tier_model.rotate import (
+        _finding_covered_by_per_file_rule,
+        identity_prefix,
+        scan_for_rotations,
+    )
+    from elspeth_lints.rules.trust_tier.tier_model.rule import _load_tier_model_allowlist
 
     actions: list[Any] = []
 
@@ -378,7 +381,9 @@ def _build_scan_actions(ctx: _ServerContext) -> list[Any]:
         except ValueError:
             continue  # a malformed (non-canonical) key cannot own a prefix
     seen_new: set[str] = set()
-    for finding in _live_findings_for_tree(ctx.root, _ALWAYS_EXCLUDED_DIRS):
+    for finding in _live_findings_for_tree(ctx.root):
+        if _finding_covered_by_per_file_rule(finding, allowlist.per_file_rules):
+            continue
         canonical_key = _finding_canonical_key(finding)
         try:
             prefix = identity_prefix(canonical_key)
@@ -391,6 +396,17 @@ def _build_scan_actions(ctx: _ServerContext) -> list[Any]:
 
     actions.sort(key=lambda action: (action.kind, action.key))
     return actions
+
+
+def build_scan_actions(*, root: Path, allowlist_dir: Path) -> tuple[Any, ...]:
+    """Public key-free action inventory shared by staging and corpus review."""
+    _assert_no_hmac_key_in_env()
+    ctx = _ServerContext(
+        root=Path(root),
+        allowlist_dir=Path(allowlist_dir),
+        staged_dir=Path("."),
+    )
+    return tuple(_build_scan_actions(ctx))
 
 
 def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
@@ -406,7 +422,7 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     staged_by_arg = arguments.get("staged_by")
     staged_by = staged_by_arg if isinstance(staged_by_arg, str) and staged_by_arg else "elspeth-judge-agent"
 
-    actions = _build_scan_actions(ctx)
+    actions = build_scan_actions(root=ctx.root, allowlist_dir=ctx.allowlist_dir)
     bundle = ReviewBundle(
         bundle_id=bundle_id,
         schema_version=1,

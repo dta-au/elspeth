@@ -167,6 +167,82 @@ const COMPOSE_TIMEOUT_MESSAGE =
   "ELSPETH took too long to compose a response. Try a smaller request or split it into multiple steps.";
 const COMPOSE_CANCELLED_MESSAGE =
   "Composition stopped. You can revise your request and send it again.";
+// The two turn-budget convergence causes: the model kept calling tools
+// without settling, so the user's lever is a smaller request.
+const CONVERGENCE_BUDGET_MESSAGE =
+  "ELSPETH couldn't complete the composition after multiple attempts. Try breaking your request into smaller steps.";
+
+/**
+ * Copy for a 422 `error_type: "convergence"` failure (R2-F9,
+ * elspeth-114dd261bc).
+ *
+ * A wall-clock timeout is a different event from a turn-budget exhaustion and
+ * needs different copy: nothing was "attempted multiple times" — the clock ran
+ * out — and the route handler has already persisted whatever pipeline the run
+ * had built as a new composition-state version, which the next turn resumes
+ * from. Saying otherwise sends the user off to rebuild work that still exists.
+ *
+ * Three honesty rules encoded here:
+ *  - the elapsed budget is named only when the body reported it
+ *    (`timeout_seconds`), never derived from the client's abort ceiling;
+ *  - the saved-draft sentence appears only when a `partial_state` actually
+ *    rode the response;
+ *  - the backend's own `recovery_text` is appended rather than paraphrased,
+ *    so the chat copy and the /composer-progress snapshot cannot drift.
+ */
+function formatConvergenceError(apiErr: ApiError): string {
+  if (apiErr.reason !== "convergence_wall_clock_timeout") {
+    return CONVERGENCE_BUDGET_MESSAGE;
+  }
+  const seconds = apiErr.timeout_seconds;
+  const elapsed =
+    typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0
+      ? ` (${Math.round(seconds)}s)`
+      : "";
+  const outcome =
+    apiErr.partial_state != null
+      ? "Your partial pipeline was saved — continue from it or retry."
+      : "No pipeline changes had been saved yet — retry, or try a smaller request.";
+  const recovery =
+    typeof apiErr.recovery_text === "string" ? apiErr.recovery_text.trim() : "";
+  const headline = `ELSPETH ran out of time${elapsed}. ${outcome}`;
+  return recovery ? `${headline} ${recovery}` : headline;
+}
+
+/**
+ * Fold a convergence 422's salvaged draft into the store.
+ *
+ * The route handler saved `partial_state` as a NEW composition-state version
+ * (provenance `convergence_persist`) and `get_current_state` returns the
+ * highest version, so the partial IS what the next turn resumes from. Keeping
+ * the pre-request graph on screen contradicts the server and the copy above.
+ *
+ * `recoveryStartedCompositionVersion` moves with it: that baseline exists to
+ * catch a CONCURRENT third-party edit before RecoveryPanel's Apply overwrites
+ * it, and this fold-in is neither concurrent nor third-party — leaving it
+ * behind would make every timeout Apply raise a false alarm.
+ */
+function convergencePartialStatePatch(
+  apiErr: ApiError,
+  selectedNodeId: string | null,
+): {
+  compositionState?: CompositionState;
+  selectedNodeId?: null;
+  recoveryStartedCompositionVersion?: number;
+} {
+  const partial =
+    apiErr.error_type === "convergence" ? apiErr.partial_state : null;
+  if (partial == null) {
+    return {};
+  }
+  const nodeStillExists =
+    !selectedNodeId || partial.nodes.some((node) => node.id === selectedNodeId);
+  return {
+    compositionState: partial,
+    recoveryStartedCompositionVersion: partial.version,
+    ...(nodeStillExists ? {} : { selectedNodeId: null }),
+  };
+}
 const GUIDED_START_CLEARED_MESSAGE =
   "Guided setup stopped or timed out before staging. You can revise your request and send it again.";
 const GUIDED_START_IN_PROGRESS_MESSAGE =
@@ -435,6 +511,24 @@ function formatLlmUnavailableError(apiErr: ApiError): string {
 
 function formatLlmAuthError(apiErr: ApiError): string {
   return `${LLM_AUTH_ERROR_MESSAGE}${formatProviderDiagnostic(apiErr)}`;
+}
+
+/**
+ * F-4b: the fail-closed audit-integrity 500 refuses to REPLY — it does not
+ * mean the message was lost. Every send_message path inserts the user row
+ * before any audit-guard raise site, so "your message was saved" is honest
+ * for this error_type; claiming anything about pipeline state is not.
+ */
+function formatAuditIntegrityError(apiErr: ApiError): string {
+  const reference =
+    apiErr.request_id === undefined
+      ? " If this repeats, contact your administrator."
+      : ` If this repeats, contact your administrator and reference request ID ${apiErr.request_id}.`;
+  return (
+    "ELSPETH stopped before replying because it could not verify this session's audit trail. " +
+    "Your message was saved. Reload the session to see exactly what was stored." +
+    reference
+  );
 }
 
 /**
@@ -1569,7 +1663,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const seen = new Set(s.messages.map((m) => m.id));
         const repaired = s.messages.map((existing) =>
           existing.id === optimisticMessage.id
-            ? { ...existing, local_status: undefined, local_error: undefined }
+            ? {
+                ...existing,
+                local_status: undefined,
+                local_error: undefined,
+                local_failure_code: undefined,
+              }
             : existing,
         );
         const finalMessages = seen.has(message.id)
@@ -1614,8 +1713,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const apiErr = err as ApiError;
         // Error dispatch based on HTTP status + error_type field
         if (apiErr.status === 422 && apiErr.error_type === "convergence") {
-          errorMessage =
-            "ELSPETH couldn't complete the composition after multiple attempts. Try breaking your request into smaller steps.";
+          errorMessage = formatConvergenceError(apiErr);
         } else if (
           apiErr.status === 502 &&
           apiErr.error_type === "llm_unavailable"
@@ -1626,12 +1724,29 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           apiErr.error_type === "llm_auth_error"
         ) {
           errorMessage = formatLlmAuthError(apiErr);
+        } else if (apiErr.error_type === "audit_integrity_error") {
+          errorMessage = formatAuditIntegrityError(apiErr);
         } else {
           errorMessage =
             apiErr.detail ?? "Failed to send message. Please try again.";
         }
       }
       const apiErr = err as ApiError;
+      // F-4b: on an audit-integrity refusal the user row IS committed (the
+      // insert precedes every audit-guard raise site) — marking it failed is
+      // the lie the user acts on (re-sending a duplicate). Clear the pending
+      // bit instead: saved, no reply.
+      const auditIntegrityRefusal =
+        !isComposeAbort(err) && apiErr.error_type === "audit_integrity_error";
+      // S1: thread the closed failure code onto the failed row so retry
+      // affordances can suppress themselves for permanent failures
+      // ("policy_blocked" — see the F13-D guided precedent below: a
+      // deployment policy refused the pipeline; retrying cannot succeed).
+      // Only set when the structured error actually carried one.
+      const localFailureCode =
+        !isComposeAbort(err) && typeof apiErr.failure_code === "string"
+          ? apiErr.failure_code
+          : undefined;
       const recoveryPatch = isComposerRecoveryError(apiErr)
         ? {
             recoveryError: apiErr,
@@ -1641,15 +1756,33 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (get().activeSessionId !== activeSessionId) {
         return;
       }
+      // Applied AFTER recoveryPatch below so a salvaged draft rebaselines the
+      // apply-confirmation gate onto the version the store now shows.
+      const partialStatePatch = isComposeAbort(err)
+        ? {}
+        : convergencePartialStatePatch(apiErr, get().selectedNodeId);
       set((state) => ({
         isComposing: false,
         error: errorMessage,
         messages: state.messages.map((existing) =>
           existing.id === optimisticMessage.id
-            ? { ...existing, local_status: "failed", local_error: errorMessage }
+            ? auditIntegrityRefusal
+              ? {
+                  ...existing,
+                  local_status: undefined,
+                  local_error: undefined,
+                  local_failure_code: undefined,
+                }
+              : {
+                  ...existing,
+                  local_status: "failed",
+                  local_error: errorMessage,
+                  local_failure_code: localFailureCode,
+                }
             : existing,
         ),
         ...recoveryPatch,
+        ...partialStatePatch,
       }));
       if (isComposeAbort(err)) {
         // The turn ran (and was cancelled) server-side; pull its durable
@@ -2026,7 +2159,12 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const seen = new Set(s.messages.map((m) => m.id));
         const repaired = s.messages.map((existing) =>
           existing.id === messageId
-            ? { ...existing, local_status: undefined, local_error: undefined }
+            ? {
+                ...existing,
+                local_status: undefined,
+                local_error: undefined,
+                local_failure_code: undefined,
+              }
             : existing,
         );
         const finalMessages = seen.has(assistantMessage.id)
@@ -2063,10 +2201,17 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             : apiErr.status === 502 && apiErr.error_type === "llm_auth_error"
               ? formatLlmAuthError(apiErr)
               : apiErr.status === 422 && apiErr.error_type === "convergence"
-                ? "ELSPETH couldn't complete the composition after multiple attempts. Try breaking your request into smaller steps."
+                ? formatConvergenceError(apiErr)
                 : apiErr.detail ?? "Failed to send message. Please try again.";
       }
       const apiErr = err as ApiError;
+      // S1: mirror the sendMessage catch handler — a retry that itself fails
+      // with a permanent code ("policy_blocked") must not re-render the
+      // Retry invitation it just disproved.
+      const localFailureCode =
+        !isComposeAbort(err) && typeof apiErr.failure_code === "string"
+          ? apiErr.failure_code
+          : undefined;
       const recoveryPatch = isComposerRecoveryError(apiErr)
         ? {
             recoveryError: apiErr,
@@ -2077,15 +2222,26 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (get().activeSessionId !== activeSessionId) {
         return;
       }
+      // Mirror of the sendMessage catch: the shared 422 handler already
+      // persisted the salvaged draft, so both entry points must show it.
+      const partialStatePatch = isComposeAbort(err)
+        ? {}
+        : convergencePartialStatePatch(apiErr, get().selectedNodeId);
       set((state) => ({
         isComposing: false,
         error: errorMessage,
         messages: state.messages.map((existing) =>
           existing.id === messageId
-            ? { ...existing, local_status: "failed", local_error: errorMessage }
+            ? {
+                ...existing,
+                local_status: "failed",
+                local_error: errorMessage,
+                local_failure_code: localFailureCode,
+              }
             : existing,
         ),
         ...recoveryPatch,
+        ...partialStatePatch,
       }));
       if (isComposeAbort(err)) {
         // The recompose turn ran (and was cancelled) server-side; pull its
@@ -2948,6 +3104,14 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         })
         .filter((line) => line !== "");
       const retainsRetryCustody = isAmbiguousFailure;
+      // F13-D: ``policy_blocked`` is permanent by construction — a deployment
+      // policy refused this pipeline, and its copy directs the user to CHANGE
+      // the highlighted component. Never render a retry invitation for it,
+      // and never lock the propose_pipeline controls behind a non-retryable
+      // error state (that would contradict the copy's own instruction): the
+      // review returns to active so the revise affordances stay live.
+      const policyBlocked =
+        !retainsRetryCustody && apiErr.failure_code === "policy_blocked";
       const proposalErrorReview: GuidedProposalReviewState | null =
         proposalBinding === null
           ? null
@@ -2961,15 +3125,20 @@ export const useSessionStore = create<SessionState>((set, get) => ({
                 retryable: true,
                 retry_action: proposalRetryAction,
               }
-            : {
-                status: "error",
-                ...proposalBinding,
-                message:
-                  apiErr.detail ??
-                  "The proposal response failed. Refresh the session before taking another action.",
-                retryable: false,
-                retry_action: null,
-              };
+            : policyBlocked
+              ? {
+                  status: "active",
+                  ...proposalBinding,
+                }
+              : {
+                  status: "error",
+                  ...proposalBinding,
+                  message:
+                    apiErr.detail ??
+                    "The proposal response failed. Refresh the session before taking another action.",
+                  retryable: false,
+                  retry_action: null,
+                };
       const responseErrorMessage =
         apiErr.detail ?? "Failed to submit guided response. Please try again.";
       releaseSubmitOwnership();

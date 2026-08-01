@@ -273,7 +273,12 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        batch expansion has one durable effect claim per batch; committed
 #        sidecar-journal batches use a transaction-owned outbox bound to their
 #        canonical sidecar destination.
-SQLITE_SCHEMA_EPOCH = 29
+#   30 → row_union barrier durability: token_work_items.row_union_name records
+#        which declared row_union barrier a blocked work item belongs to, so a
+#        recovered scheduler can reconcile fork-branch groups without in-memory
+#        state. This is a pre-1.0 delete-and-recreate boundary; a Landscape
+#        store written at epoch 29 lacks the column and is not migrated.
+SQLITE_SCHEMA_EPOCH = 30
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -653,6 +658,7 @@ token_work_items_table = Table(
     Column("expand_group_id", String(128)),
     Column("coalesce_node_id", String(NODE_ID_COLUMN_LENGTH)),
     Column("coalesce_name", String(128)),
+    Column("row_union_name", String(128)),
     Column("attempt", Integer, nullable=False),
     Column("lease_owner", String(128)),
     Column("lease_expires_at", DateTime(timezone=True)),

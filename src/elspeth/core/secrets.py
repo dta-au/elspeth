@@ -10,7 +10,13 @@ from collections.abc import Collection, Mapping
 from copy import deepcopy
 from typing import Any
 
-from elspeth.contracts.secrets import ResolvedSecret, ScopedWebSecretResolver, SecretRefPlacementViolation, SecretScope, WebSecretResolver
+from elspeth.contracts.secrets import (
+    ResolvedSecret,
+    ScopedSecretResolverContract,
+    SecretRefPlacementViolation,
+    SecretScope,
+    WebSecretResolver,
+)
 
 _EXACT_ENV_VAR_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}")
 
@@ -27,6 +33,7 @@ SECRET_FIELD_NAMES = frozenset(
     {
         "api_key",
         "api-key",
+        "aws_access_key_id",
         "authorization",
         "connection_string",
         "credential",
@@ -116,7 +123,10 @@ def parse_secret_ref_marker(value: Any) -> tuple[str, SecretScope | None] | None
     """Return the typed deferred-secret marker, if *value* is exactly one."""
     if isinstance(value, Mapping) and set(value) in ({"secret_ref"}, {"secret_ref", "secret_scope"}):
         ref = value["secret_ref"]
-        scope = value.get("secret_scope")
+        if "secret_scope" in value:
+            scope = value["secret_scope"]
+        else:
+            scope = None
         if isinstance(ref, str) and (scope is None or scope in ("user", "server", "org")):
             return ref, scope
     return None
@@ -377,6 +387,8 @@ def _resolve_marker(
 ) -> ResolvedSecret | None:
     if scope is None:
         return resolver.resolve(user_id, name)
-    if not isinstance(resolver, ScopedWebSecretResolver):
-        raise TypeError("Scoped secret marker requires a ScopedWebSecretResolver")
+    # ADR-032: nominal admission against the owned ABC, never the
+    # runtime_checkable Protocol (structural — an impostor would pass).
+    if not isinstance(resolver, ScopedSecretResolverContract):
+        raise TypeError("Scoped secret marker requires a resolver inheriting ScopedSecretResolverContract")
     return resolver.resolve_scoped(user_id, name, scope)

@@ -75,6 +75,7 @@ from elspeth.engine.orchestrator.leader_drain import run_end_of_input_barrier_fl
 from elspeth.engine.orchestrator.outcomes import (
     accumulate_row_outcomes,
     handle_coalesce_timeouts,
+    handle_row_union_timeouts,
 )
 from elspeth.engine.orchestrator.run_state import (
     GraphArtifacts,
@@ -234,12 +235,27 @@ def run_resume_processing_loop(
     coalesce_executor = loop_ctx.coalesce_executor
     coalesce_node_map = dict(loop_ctx.coalesce_node_map)
     agg_transform_lookup = dict(loop_ctx.agg_transform_lookup)
+    row_union_executor = processor.row_union_executor
 
     # A buffered-only resume can have zero unprocessed rows but still carry
     # restored aggregation/coalesce state. If shutdown is already requested,
     # honor it before any end-of-source flush work so buffered state is
     # checkpointed again instead of being flushed to sinks.
     interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
+
+    # elspeth-0bffbd1af1: restored pending groups carry backdated arrival
+    # anchors, so a group whose timeout expired during downtime is already
+    # stale HERE — sweep it closed before the scheduler drain or the source
+    # replay can supply its missing branch and release it. Skipped on an
+    # already-requested shutdown so restored barrier state stays pending for
+    # the next checkpoint instead of being failed by the sweep.
+    if not interrupted_by_shutdown and row_union_executor is not None:
+        handle_row_union_timeouts(
+            row_union_executor=row_union_executor,
+            processor=processor,
+            ctx=ctx,
+            counters=counters,
+        )
 
     if not interrupted_by_shutdown and processor.has_scheduled_work():
         recovered_row_ids = frozenset(row.row_id for row in unprocessed_rows)
@@ -371,6 +387,14 @@ def run_resume_processing_loop(
                 ctx=ctx,
                 counters=counters,
                 pending_tokens=pending_tokens,
+            )
+
+        if row_union_executor is not None:
+            handle_row_union_timeouts(
+                row_union_executor=row_union_executor,
+                processor=processor,
+                ctx=ctx,
+                counters=counters,
             )
 
         # ─────────────────────────────────────────────────────────────

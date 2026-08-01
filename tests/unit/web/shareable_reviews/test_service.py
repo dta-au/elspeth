@@ -168,6 +168,7 @@ class _FakeExecutionService:
     # (blobs/<session_id>/) matches /validate and /execute.
     validate_state_session_ids: list[UUID | None] = field(default_factory=list)
     validate_state_operation_contexts: list[SessionOperationContext] = field(default_factory=list)
+    validate_state_completion_gates: list[Any] = field(default_factory=list)
 
     async def validate(self, session_id: UUID, *, user_id: str | None = None) -> ValidationResult:
         self.validate_await_count += 1
@@ -180,10 +181,12 @@ class _FakeExecutionService:
         user_id: str | None = None,
         session_id: UUID | None = None,
         session_operation_context: SessionOperationContext,
+        completion_gates: Any = None,
     ) -> ValidationResult:
         self.validate_state_await_count += 1
         self.validate_state_session_ids.append(session_id)
         self.validate_state_operation_contexts.append(session_operation_context)
+        self.validate_state_completion_gates.append(completion_gates)
         return self.validation
 
 
@@ -482,7 +485,7 @@ async def test_mark_ready_for_review_happy_path(
 
 
 @pytest.mark.asyncio
-async def test_mark_ready_for_review_passes_session_id_to_validation(
+async def test_mark_ready_for_review_passes_validation_authority_and_completion_gates(
     session_engine_with_row,
     payload_store,
     signer,
@@ -490,14 +493,28 @@ async def test_mark_ready_for_review_passes_session_id_to_validation(
     state_record,
     session_operation_context: SessionOperationContext,
 ):
-    """validate_state must receive the owning session id.
+    """validate_state must receive the owning session context and persisted gates.
 
     The sink path allowlist is session-scoped (blobs/<session_id>/, see
     elspeth-bdc17cfdb1): validating with session_id=None fails closed to
     outputs-only and rejects a state whose sink writes to the session's own
     blob subtree — a state /validate and /execute both accept.
     """
+    from elspeth.web.execution.completion_gates import AdvisorSignoffGateFact, CompletionGateFacts
+
     snapshot = _readiness_snapshot(session_record.id)
+    state_record = replace(
+        state_record,
+        composer_meta={
+            "completion_gates": {
+                "advisor_signoff": {
+                    "status": "blocked",
+                    "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                    "for_graph": "0" * 64,
+                }
+            }
+        },
+    )
     service, _, execution_service, readiness_service = _build_service(
         engine=session_engine_with_row,
         payload_store=payload_store,
@@ -512,6 +529,14 @@ async def test_mark_ready_for_review_passes_session_id_to_validation(
     )
     assert execution_service.validate_state_session_ids == [session_record.id]
     assert execution_service.validate_state_operation_contexts == [session_operation_context]
+    assert execution_service.validate_state_completion_gates == [
+        CompletionGateFacts(
+            advisor_signoff=AdvisorSignoffGateFact(
+                detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                for_graph="0" * 64,
+            )
+        )
+    ]
     assert readiness_service.session_operation_contexts == [session_operation_context]
 
 

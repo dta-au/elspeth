@@ -74,6 +74,7 @@ TRANSPORT_CODEX_CLI: str = "codex_cli"
 # resolves by transport when the caller passes no explicit model_id.
 DEFAULT_AGENT_JUDGE_MODEL: str = "claude-opus-4-7"  # confirm the SDK-accepted id post-install (Task 2)
 DEFAULT_CODEX_JUDGE_MODEL: str = "gpt-5.6-sol"
+CODEX_JUDGE_REASONING_EFFORT: str = "high"
 
 # OpenRouter endpoint. The OpenAI SDK is pointed here rather than at
 # OpenAI's own endpoint so model identity (and therefore which family's
@@ -116,9 +117,8 @@ _OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 # Sections 3-8 are excerpted from CLAUDE.md verbatim where the wording is
 # load-bearing for the verdict (e.g. the fabrication-decision test, the
 # Decision Test table). The Three-Tier section (§3) additionally carries
-# the project's origin-vs-courier and "persisted external data re-read is
-# Tier-3" (second-order / stored-input) rules, and the "validation is
-# in-flight, not permanent" boundary. Worked examples and tables that do
+# the project's origin-vs-courier and serialization-preserves-authorship
+# rules. Worked examples and tables that do
 # not apply to allowlist-suppression decisions (deep_freeze patterns, DAG
 # transitions, etc.) are omitted only because they are irrelevant to a
 # suppression verdict — NOT to hit a size target.
@@ -235,7 +235,8 @@ Must be 100% pristine at all times. We wrote it, we own it, we trust it
 completely.
 
 - Bad data in the audit trail = crash immediately.
-- No coercion, no defaults, no silent recovery.
+- Read required values by direct access first.
+- No implicit coercion, no hidden defaults, no silent recovery.
 - Every field must be exactly what we expect — wrong type = crash, NULL
   where unexpected = crash, invalid enum value = crash.
 
@@ -243,6 +244,27 @@ Why: the audit trail is the legal record. Silently coercing bad data is
 evidence tampering. A defensive ``.get()`` on a row read out of the
 audit database is forbidden — if the field is missing, that is a
 catastrophic invariant break and must surface.
+
+If and only if a first-party domain contract explicitly authorizes
+synthesizing or correcting a Tier-1 value, the coercion must remain
+absolutely explicit and visible at the use site in this form:
+
+    value = owned["field"]
+    if value is weird:
+        value = correct_value
+
+The direct access happens first, so a missing required field still
+crashes. ``.get(default)``, truthiness fallback (``value or default``),
+exception fallback, implicit cast/coercion, and helper-hidden
+normalization are forbidden substitutes. A helper that conceals the
+branch makes an auditor unable to see where authored evidence became a
+synthetic value.
+
+Serialization never demotes Tier 1. Our-authored audit records,
+checkpoints, and transaction journals remain Tier 1 after JSON, YAML,
+SQL, ORM, or other serialization/deserialization. Read their required
+fields directly and let corruption raise; the transport format does not
+change authorship.
 
 ### Tier 2: Pipeline Data (Post-Source) — ELEVATED TRUST ("Probably OK")
 
@@ -253,10 +275,10 @@ The defining Tier-2 property is that the *shape* is guaranteed: a dict is
 a dict, an int is an int, because source validation or a typed contract
 established it. You trust the shape but NOT the value — ``divisor == 0``
 is type-valid and still a threat, so wrap operations on values. Because
-the shape is guaranteed, re-checking it with ``isinstance``/``getattr``/
-``.get`` is the forbidden defensive pattern. The contrapositive matters:
-if the shape is NOT contractually guaranteed at this point (see Tier 3),
-the data is not Tier 2, and shape-guarding it is legitimate.
+the shape is guaranteed, re-checking it with ``isinstance`` or ``.get``
+is the forbidden defensive pattern. The contrapositive matters: if the
+shape is NOT contractually guaranteed at this point (see Tier 3), the
+data is not Tier 2, and declared shape discrimination is legitimate.
 
 - Types are trustworthy (source validated and/or coerced them).
 - Values might still cause operation failures (division by zero, invalid
@@ -335,44 +357,21 @@ silent-recovery pattern, and it is forbidden even at a genuine Tier-3
 boundary. Guarding the shape never licenses trusting the *value*
 (division-by-zero and friends remain threats).
 
-### Validation is in-flight, not permanent — persisted external data is re-read as Tier-3
+### Serialization preserves authorship and trust tier
 
-A shape established by validation at write time is NOT guaranteed at a
-later read. Two independent reasons: (1) the persistent store is mutable
-— config DBs and audit rows can be hand-edited, restored from a stale
-backup, or tampered with between write and read; (2) the validating model
-can drift — the Pydantic/schema contract that accepted the value can
-change shape by the next read. So a value re-read from our own DB — even
-hydrated into a typed dataclass such as ``SourceSpec.options`` — is
-shape-UNGUARANTEED at the read site, and guarding/wrapping it there is
-honest, not redundant defensive code.
+Serialization is a courier, not an author. It never turns our statement
+into somebody else's statement, and it never turns somebody else's
+statement into ours. Our-authored audit/checkpoint/journal data remains
+Tier 1 when re-read and must use direct access with crash-on-corruption
+semantics. External-authored configuration or payload content that was
+stored without promotion remains external-origin; a first-party
+dataclass or database row carrying it does not claim authorship of its
+contents.
 
-This is the classic second-order / stored-input boundary. A rationale of
-the form "this config was validated once at the load boundary, so a
-``ValueError`` on re-read is a Tier-1 invariant break" is WRONG: the value
-is external-origin, the store is mutable, and re-reading it is a fresh
-Tier-3 boundary. ACCEPT a guard/wrap on persisted external-origin config
-re-read from our own storage; treat an unguarded re-read that can crash a
-tool or run on malformed stored input as the defect — not the guard.
-
-The deciding factor is chain of custody, not storage, and it explains the
-asymmetry you will see. Think of it as evidence handling: a value is
-trusted while it stays inside our trust domain, but writing it to disk and
-reading it back leaves it unattended with a custodian we don't fully
-control (filesystem, DB engine, serialization layer), so the reader must
-re-check the seal. What a broken seal MEANS differs by whose statement it
-is. A checkpoint WE authored, re-read from the same DB, stays Tier-1: it
-is our own statement under unbroken custody, a broken seal is tampering
-with our evidence, and the response is to crash — the "seal check" there
-is the NATURAL crash of direct access, never an added guard (a `.get()`/
-try-except on a Tier-1 read is the forbidden defensive pattern).
-``source.options`` THEY authored stays Tier-3: it is someone else's
-statement, persistence interrupted custody, a broken seal is a damaged
-delivery, and the response is an explicit boundary guard that quarantines.
-Persistence does not change whose statement a value is. So do NOT
-over-generalise this to "anything read from the DB is Tier-3": our-authored
-audit/checkpoint reads remain Tier-1. The question is always whose
-statement the value represents, not which table it came from.
+Do not classify data from the storage mechanism alone. Trace who authored
+the value and whether a declared boundary contract promoted it. In
+particular, never argue that JSON/SQL/ORM deserialization demotes Tier 1
+or licenses a defensive re-check of our own invariant.
 
 ``raise`` is not synonymous with ``crash``, and deciding the fate is not
 the raising code's job. The code at the point of detection has one
@@ -401,10 +400,10 @@ surrounding structure routes it, not whether it raises.
 - Sink: no coercion, expect types.
 - Our data (Landscape, checkpoints): crash on any anomaly —
   serialization doesn't change trust tier (we authored the *values*).
-- Persisted external-origin config (composer/user/operator-authored,
-  re-read from our DB): still Tier-3 — guarding/wrapping the re-read is
-  honest; "validated once" does not promote it, and living in a typed
-  dataclass (``SourceSpec``) is the container, not the tier.
+- Persisted external-origin config (composer/user/operator-authored)
+  that no declared first-party boundary contract promoted: still Tier-3.
+  Storage and a courier dataclass (``SourceSpec``) do not change
+  authorship; a real promotion contract does.
 
 ----------------------------------------------------------------
 Plugin Ownership: System Code, Not User Code
@@ -438,9 +437,12 @@ response body, a remote API payload — even when our own client made the
 call and returns the wrapper object. The external system controls that
 shape; no ELSPETH contract guarantees it; it is Tier-3 external data per
 the Quick Reference ("Transform on external calls: external response is
-Tier 3"). Shape-guarding or coercing such a value (``getattr``/``.get``/
-``isinstance`` on provider-variable or network-sourced fields) is the
-Tier-3 boundary pattern, NOT a Plugin-Ownership violation. The
+Tier 3"). Shape-guarding or coercing such a value (``.get`` /
+``isinstance`` on provider-variable or network-sourced fields) may be
+the Tier-3 boundary pattern. Sentinel-defaulted ``getattr`` extraction
+is permitted here under the parse-don't-validate rule below (ADR-032);
+what remains banned is duck-typed presence probing used to satisfy an
+ELSPETH-internal contract. The
 discriminator is NOT the courier ("what code returned the object") but
 trust-necessity-and-trustworthiness: does this code need to rely on the
 value's shape, and if so, is that shape actually guaranteed (trustworthy)
@@ -462,12 +464,57 @@ Defensive Programming: Forbidden. Offensive Programming: Encouraged
 
 ### What's Forbidden (Defensive Programming)
 
-Do not use ``.get()``, ``getattr()``, ``isinstance()``, or silent
-exception handling to suppress errors from nonexistent attributes,
-malformed data, or incorrect types. Access typed dataclass fields
-directly (``obj.field``), not defensively (``obj.get("field")``).
-``hasattr()`` is unconditionally banned — it swallows all exceptions
-from ``@property`` getters, not just missing attributes.
+Do not use ``.get()``, ``isinstance()``, or silent exception handling to
+suppress errors from nonexistent fields, malformed data, or incorrect
+types under a fixed contract. Access typed dataclass fields directly
+(``obj.field``), not defensively (``obj.get("field")``).
+
+Attribute presence probing used to satisfy an ELSPETH-INTERNAL contract
+is banned absolutely. Do not use ``getattr``, ``hasattr``,
+``inspect.getattr_static``, forwarding ``__getattr__``,
+property-swallowing exception nets, or any duck-typed presence probe to
+decide that an ELSPETH-owned object satisfies an ELSPETH contract.
+These let an object pretend to satisfy a different contract and can
+swallow arbitrary property failures. At a genuinely unknown-type
+boundary over objects ELSPETH itself constructs, use ``isinstance``
+discrimination against a declared concrete type that ELSPETH defines.
+
+Do NOT use a ``runtime_checkable`` ``Protocol`` for that discrimination
+(ADR-032). A Protocol ``isinstance()`` IS structural typing: it tests
+only that attributes with the right NAMES exist, which is exactly the
+duck typing this rule bans, so an arbitrary impostor declaring those
+names passes it. Since Python 3.12 it also resolves names through
+``inspect.getattr_static``, which bypasses ``__getattr__``, so it
+SILENTLY REJECTS legitimate objects whose fields resolve dynamically
+(``__getattr__`` forwarding; pydantic ``extra='allow'`` values held in
+``__pydantic_extra__``). It is permissive to impostors and strict
+against honest objects, and is never a security control. Consequence
+for tests: ``unittest.mock.Mock`` fails every such check, even with
+``spec=``, so a test passing a Mock exercises the reject branch
+silently and proves nothing about admission.
+
+At an EXTERNAL boundary — a third-party SDK object, an LLM provider
+reply, an HTTP or remote payload — do not authenticate the object's
+type at all. Parse, don't validate: read each needed field ONCE with a
+sentinel-defaulted ``getattr(obj, 'field', _MISSING)``, assert the
+VALUES (non-empty ``str``, parseable JSON, within bounds), construct an
+ELSPETH-owned frozen type from what survived, and propagate only that.
+That extraction is the CORRECT pattern there, not a violation of the
+ban above: the value assertions plus the read-once copy into an owned
+type ARE the boundary. Nominal typing against a vendor class is brittle
+(it breaks across SDK versions and across providers), and structural
+typing is both broken and useless; neither is the control.
+
+``hasattr`` is immune to the ``getattr_static`` hazard specifically —
+it calls the real ``getattr`` and so does see dynamically resolved
+attributes — but it remains banned as a presence probe under an
+internal contract, because it still lets an object pretend to satisfy
+one.
+
+Under a fixed contract, access the declared attribute directly and let
+breakage raise. Do not use ``isinstance`` to revalidate Tier 1 or
+another fixed contract; it is a boundary discriminator, not a general
+defensive recommendation.
 
 Defensive handling IS appropriate at trust boundaries.
 
@@ -571,13 +618,41 @@ decorator, not an allowlist entry. Emit:
 * ``should_use_decorator``: the parameter name (e.g. ``"arguments"``)
   that the agent should pass as the decorator's ``source_param``;
 * ``rationale``: explain that this finding is a structural Tier-3
-  boundary case and the remediation is
-  ``@trust_boundary(tier=3, source=<one-line description of the
-  external source>, source_param=<the parameter name>,
-  suppresses=(<the rule_id>,), invariant=<what the function
-  guarantees on malformed input>, test_ref=<pytest nodeid>,
-  test_fingerprint=<canonical AST fingerprint>)`` on the enclosing
-  function, followed by deletion of any related allowlist entries.
+  boundary case, identify which metadata contract applies and enumerate
+  its required and forbidden fields, and call for deletion of any related
+  allowlist entries. Do not emit decorator code or propose a concrete code
+  fix. The structured nudge identifies the applicable contract; the agent
+  remains responsible for implementation and evidence.
+
+There are exactly two valid decorator metadata contracts:
+
+1. Raising boundary metadata (the function rejects malformed input by raising)
+   requires ``tier=3``, ``source``, ``source_param``, ``suppresses``, an
+   invariant naming the raised exception and malformed-input guarantee,
+   and MUST include both ``test_ref=<pytest nodeid>`` and
+   ``test_fingerprint=<canonical AST fingerprint>``. It MUST omit
+   ``non_raising=True``. The nodeid must resolve to a current behavioral
+   test that exercises the malformed-input rejection, and the fingerprint
+   must bind that current test body. Never invent ``test_ref`` or
+   ``test_fingerprint`` values; enumerate them as required evidence and
+   leave their acquisition to the implementing agent.
+
+2. Non-raising boundary metadata covers genuinely non-raising
+   optional-extraction, advisory, and convert-to-result boundaries. Such
+   a boundary returns a sentinel or result on malformed input and never
+   raises on it. It requires ``tier=3``, ``source``, ``source_param``,
+   ``suppresses``, an invariant naming the sentinel/result behavior, and
+   MUST set ``non_raising=True``. It MUST omit both ``test_ref`` and
+   ``test_fingerprint``. This form is valid only when the companion gate
+   mechanically verifies that malformed-input guards do not raise.
+
+A raising form missing either test field is INVALID. A non-raising form
+carrying either test field is INVALID. ``non_raising=True`` on code whose
+malformed-input path raises is INVALID. Do not emit a decorator
+recommendation with missing or contradictory metadata. If the visible
+code does not establish which contract applies, keep
+``should_use_decorator: null`` and BLOCK pending the missing evidence
+rather than inventing metadata.
 
 If ANY of the three answers is no — the finding is not in a boundary
 function, the rule is not in {R1, R5}, or the subject is not rooted at
@@ -614,8 +689,10 @@ Example A — should suggest the decorator (BLOCKED + should_use_decorator):
   Verdict: ``BLOCKED``. Reason: all three conditions met (function
   takes external ``arguments``; R1 is in the suppressible set; the
   reported subject is rooted at ``arguments``). Emit
-  ``should_use_decorator: "arguments"`` and recommend the decorator
-  in the rationale.
+  ``should_use_decorator: "arguments"``. The rationale identifies the
+  raising metadata contract and enumerates its required and forbidden
+  fields; it does not generate decorator code or guess the behavioral
+  test's nodeid/fingerprint.
 
 Example B — regular ACCEPT inside an already-decorated function:
 
@@ -643,9 +720,9 @@ Example C — regular BLOCK (rationale shallow, no decorator help):
 
   Verdict: ``BLOCKED``. The decorator would not help (no external
   parameter; ``self._cache`` is not Tier-3 data). Emit
-  ``should_use_decorator: null``; the rationale describes a code-fix
-  task (use direct attribute access; let it KeyError if the cache
-  invariant is broken), not a legitimate suppression.
+  ``should_use_decorator: null``; the rationale identifies a
+  fixed-contract defensive-access violation and leaves the concrete
+  remediation to the agent.
 
 ================================================================
 Output schema
@@ -721,11 +798,11 @@ BLOCKED and make that uncertainty visible with lower ``confidence``.
    is the most common misapplication; check the data flow in the
    excerpt, not just the rationale's adjective. The mirror error is just
    as wrong, and licenses the opposite mistake (dropping a needed guard):
-   external-origin data dressed up as Tier-1/Tier-2 because it sits in one
-   of our dataclasses or was re-read from our DB ("validated once"). Trace
-   the value's contents to their origin, not to the object that carries
-   them — persisted composer/user config re-read from our storage is
-   Tier-3 at the read site.
+   external-origin data dressed up as Tier-1/Tier-2 merely because it
+   sits in one of our dataclasses or was stored in our DB. Trace the
+   value's contents to their author and any declared promotion contract,
+   not to the object or storage mechanism that carries them. Never demote
+   our-authored Tier-1 data because it crossed a serialization boundary.
 
 2. Apply the Defensive vs Offensive Decision Test directly to the
    finding. If the answer points to "let it crash" or "fix the root
@@ -2112,7 +2189,7 @@ def _call_codex_cli(
         "-c",
         'web_search="disabled"',
         "-c",
-        'model_reasoning_effort="high"',
+        f'model_reasoning_effort="{CODEX_JUDGE_REASONING_EFFORT}"',
         "-c",
         "features.shell_tool=false",
         "-c",

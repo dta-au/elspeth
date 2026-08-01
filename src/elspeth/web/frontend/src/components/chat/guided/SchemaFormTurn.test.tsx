@@ -301,6 +301,29 @@ describe("SchemaFormTurn", () => {
       expect(container.querySelector(".guided-schema-required-marker")).toBeNull();
     });
 
+    it("renders the knob placeholder on a JSON textarea (F5-5b)", async () => {
+      const user = userEvent.setup();
+      render(
+        <SchemaFormTurn
+          payload={pluginPayload([
+            field({
+              name: "schema",
+              label: "Schema",
+              kind: "json-value",
+              placeholder: '{"mode": "fixed", "fields": ["doc_id: str", "note: str?"]}',
+            }),
+          ])}
+          onSubmit={vi.fn()}
+        />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      expect(screen.getByRole("textbox", { name: "Schema" })).toHaveAttribute(
+        "placeholder",
+        '{"mode": "fixed", "fields": ["doc_id: str", "note: str?"]}',
+      );
+    });
+
     it("flags invalid JSON inline and blocks Continue until it parses", async () => {
       const user = userEvent.setup();
       const onSubmit = vi.fn();
@@ -821,6 +844,135 @@ describe("SchemaFormTurn", () => {
           "2 values need attention: Token, Data key — open Edit to review.",
         ),
       ).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+    });
+  });
+  // ── required_when: conditional requiredness (R2-F2) ────────────────────────
+  //
+  // The knob schema lowered only pydantic field-level requiredness, so the
+  // local file sinks' `collision_policy` (default=None) arrived `required:
+  // false` even though the composer rejects a runnable file sink that omits it
+  // under mode='write'. The form let the user press Continue straight into that
+  // rejection. `required_when` carries the composer's rule to the form.
+  describe("required_when", () => {
+    function collisionPolicyFields(): KnobField[] {
+      return [
+        field({
+          name: "collision_policy",
+          label: "Collision Policy",
+          kind: "enum",
+          enum: ["fail_if_exists", "auto_increment", "append_or_create"],
+          nullable: true,
+          default: null,
+          required_when: { field: "mode", equals: "write" },
+        }),
+        // `mode` is declared AFTER the field that references it — it lives on
+        // the concrete sink subclass while collision_policy lives on
+        // LocalFileSinkConfig. A forward reference must work.
+        field({
+          name: "mode",
+          label: "Mode",
+          kind: "enum",
+          enum: ["write", "append"],
+          default: "write",
+        }),
+      ];
+    }
+
+    it("blocks Continue and names the field when the predicate is met", () => {
+      render(<SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={vi.fn()} />);
+
+      expect(
+        screen.getByText("1 value needs attention: Collision Policy — open Edit to review."),
+      ).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+    });
+
+    it("keeps the blocking field VISIBLE in the summary as 'Not set'", () => {
+      // Naming a field in the banner that the summary elides would send the
+      // user hunting for a row that is not there (elspeth-eba8820005).
+      render(<SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={vi.fn()} />);
+
+      expect(screen.getByText("Collision Policy")).toBeInTheDocument();
+      expect(screen.getByText("Not set")).toBeInTheDocument();
+    });
+
+    it("renders the required marker and aria-required while the predicate is met", async () => {
+      const user = userEvent.setup();
+      const { container } = render(
+        <SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={vi.fn()} />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      expect(screen.getByRole("combobox", { name: /Collision Policy/ })).toHaveAttribute(
+        "aria-required",
+        "true",
+      );
+      // Exactly one marker: `mode` carries a default and stays optional, so the
+      // visible cue must not spread to every field in the form.
+      const markers = container.querySelectorAll(".guided-schema-required-marker");
+      expect(markers).toHaveLength(1);
+      expect(markers[0].closest("label")?.textContent).toContain("Collision Policy");
+      expect(markers[0].closest("label")?.textContent).toContain("(required)");
+    });
+
+    it("drops the required marker and aria-required once the predicate is unmet", async () => {
+      const user = userEvent.setup();
+      const { container } = render(
+        <SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={vi.fn()} />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      await user.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "append");
+
+      expect(screen.getByRole("combobox", { name: "Collision Policy" })).not.toHaveAttribute(
+        "aria-required",
+      );
+      expect(container.querySelectorAll(".guided-schema-required-marker")).toHaveLength(0);
+    });
+
+    it("releases Continue once the conditionally-required value is chosen", async () => {
+      const onSubmit = vi.fn();
+      const user = userEvent.setup();
+      render(<SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={onSubmit} />);
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      await user.selectOptions(screen.getByRole("combobox", { name: /Collision Policy/ }), "auto_increment");
+      await user.click(screen.getByRole("button", { name: "Done editing" }));
+      const continueButton = screen.getByRole("button", { name: "Continue" });
+      expect(continueButton).toBeEnabled();
+      await user.click(continueButton);
+
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          edited_values: expect.objectContaining({
+            options: { collision_policy: "auto_increment", mode: "write" },
+          }),
+        }),
+      );
+    });
+
+    it("stays optional while the predicate is unmet", async () => {
+      const user = userEvent.setup();
+      render(<SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={vi.fn()} />);
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      await user.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "append");
+      await user.click(screen.getByRole("button", { name: "Done editing" }));
+
+      expect(screen.getByRole("button", { name: "Continue" })).toBeEnabled();
+      expect(screen.queryByText(/needs attention/)).not.toBeInTheDocument();
+    });
+
+    it("re-gates Continue when the predicate becomes met again", async () => {
+      const user = userEvent.setup();
+      render(<SchemaFormTurn payload={pluginPayload(collisionPolicyFields())} onSubmit={vi.fn()} />);
+
+      await user.click(screen.getByRole("button", { name: "Edit" }));
+      await user.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "append");
+      await user.selectOptions(screen.getByRole("combobox", { name: "Mode" }), "write");
+      await user.click(screen.getByRole("button", { name: "Done editing" }));
+
       expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
     });
   });

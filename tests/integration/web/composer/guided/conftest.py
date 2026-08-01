@@ -82,12 +82,8 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
     database_url = str(engine.url)
     engines_to_dispose = [engine]
 
-    # Session and blob services
-    session_service = SessionServiceImpl(
-        engine,
-        telemetry=build_sessions_telemetry(),
-        log=structlog.get_logger("test.guided.conftest"),
-    )
+    # Blob service (the profile-aware session service is constructed after
+    # the plugin-policy stack below, mirroring production create_app wiring).
     blob_service = BlobServiceImpl(engine, tmp_path)
 
     # FastAPI app
@@ -102,7 +98,6 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
     app.dependency_overrides[get_current_user] = mock_user
 
     # App state: minimal set required by session router
-    app.state.session_service = session_service
     app.state.session_engine = engine  # for guided step-2.5 recipe application
     app.state.blob_service = blob_service
     app.state.payload_store = FilesystemPayloadStore(tmp_path / "payloads")
@@ -125,6 +120,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
                 "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
             }
         },
+        default_llm_profile="task-role",
     )
 
     class _DeterministicGuidedPlanner:
@@ -296,14 +292,30 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
         def user_generation(self, principal: str, name: str) -> str | None:
             return None
 
-    app.state.plugin_snapshot_factory = lambda user: build_plugin_snapshot(
-        policy=app.state.web_plugin_policy,
+    def _principal_snapshot(user_id: str):
+        return build_plugin_snapshot(
+            policy=app.state.web_plugin_policy,
+            catalog=app.state.catalog_service,
+            profiles=app.state.operator_profile_registry,
+            principal_scope=f"local:{user_id}",
+            secret_inventory=_EmptyInventory(),
+            generation_key=b"guided-integration-policy-key",
+        )
+
+    app.state.plugin_snapshot_factory = lambda user: _principal_snapshot(user.user_id)
+
+    # Session service — profile-aware, mirroring production create_app()
+    # wiring: the guided proposal settlement independently re-derives wire
+    # reviews through the session principal's snapshot.
+    session_service = SessionServiceImpl(
+        engine,
+        telemetry=build_sessions_telemetry(),
+        log=structlog.get_logger("test.guided.conftest"),
+        plugin_snapshot_factory=_principal_snapshot,
+        operator_profile_registry=app.state.operator_profile_registry,
         catalog=app.state.catalog_service,
-        profiles=app.state.operator_profile_registry,
-        principal_scope=f"local:{user.user_id}",
-        secret_inventory=_EmptyInventory(),
-        generation_key=b"guided-integration-policy-key",
     )
+    app.state.session_service = session_service
 
     # Audit recorder for test inspection (Phase 3 Task 3.4 will wire this)
     app.state.composer_recorder = BufferingRecorder()
@@ -339,11 +351,6 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
             return UserIdentity(user_id="alice", username="alice")
 
         restarted_app.dependency_overrides[get_current_user] = restarted_mock_user
-        restarted_app.state.session_service = SessionServiceImpl(
-            restarted_engine,
-            telemetry=build_sessions_telemetry(),
-            log=structlog.get_logger("test.guided.conftest.restarted"),
-        )
         restarted_app.state.session_engine = restarted_engine
         restarted_app.state.blob_service = BlobServiceImpl(restarted_engine, tmp_path)
         restarted_app.state.payload_store = FilesystemPayloadStore(tmp_path / "payloads")
@@ -361,13 +368,25 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
             policy=restarted_app.state.web_plugin_policy,
             settings=restarted_runtime_policy,
         )
-        restarted_app.state.plugin_snapshot_factory = lambda user: build_plugin_snapshot(
-            policy=restarted_app.state.web_plugin_policy,
+
+        def _restarted_principal_snapshot(user_id: str):
+            return build_plugin_snapshot(
+                policy=restarted_app.state.web_plugin_policy,
+                catalog=restarted_app.state.catalog_service,
+                profiles=restarted_app.state.operator_profile_registry,
+                principal_scope=f"local:{user_id}",
+                secret_inventory=_EmptyInventory(),
+                generation_key=b"guided-integration-policy-key",
+            )
+
+        restarted_app.state.plugin_snapshot_factory = lambda user: _restarted_principal_snapshot(user.user_id)
+        restarted_app.state.session_service = SessionServiceImpl(
+            restarted_engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.guided.conftest.restarted"),
+            plugin_snapshot_factory=_restarted_principal_snapshot,
+            operator_profile_registry=restarted_app.state.operator_profile_registry,
             catalog=restarted_app.state.catalog_service,
-            profiles=restarted_app.state.operator_profile_registry,
-            principal_scope=f"local:{user.user_id}",
-            secret_inventory=_EmptyInventory(),
-            generation_key=b"guided-integration-policy-key",
         )
         restarted_app.state.composer_recorder = BufferingRecorder()
         restarted_app.state.composer_progress_registry = ComposerProgressRegistry(

@@ -17,7 +17,7 @@ from typing import Protocol
 
 from elspeth.contracts import TransformProtocol
 from elspeth.contracts.errors import OrchestrationInvariantError
-from elspeth.contracts.types import CoalesceName, NodeID
+from elspeth.contracts.types import CoalesceName, NodeID, RowUnionName
 from elspeth.core.config import GateSettings
 from elspeth.engine.orchestrator.plugin_types import RowPlugin
 
@@ -27,6 +27,9 @@ class DAGTraversalSnapshot(Protocol):
 
     @property
     def coalesce_node_map(self) -> Mapping[CoalesceName, NodeID]: ...
+
+    @property
+    def row_union_node_map(self) -> Mapping[RowUnionName, NodeID]: ...
 
     @property
     def node_to_plugin(self) -> Mapping[NodeID, RowPlugin | GateSettings]: ...
@@ -63,6 +66,7 @@ class DAGNavigator:
         coalesce_on_success_map: Mapping[CoalesceName, str],
         sink_names: frozenset[str],
         branch_first_node: Mapping[str, NodeID] | None = None,
+        row_union_node_ids: Mapping[RowUnionName, NodeID] | None = None,
     ) -> None:
         # Wrap all mappings in MappingProxyType for true immutability
         self._node_to_plugin: Mapping[NodeID, RowPlugin | GateSettings] = MappingProxyType(dict(node_to_plugin))
@@ -76,6 +80,10 @@ class DAGNavigator:
         self._coalesce_on_success_map: Mapping[CoalesceName, str] = MappingProxyType(dict(coalesce_on_success_map))
         self._sink_names = sink_names
         self._branch_first_node: Mapping[str, NodeID] = MappingProxyType(dict(branch_first_node or {}))
+        self._row_union_node_ids: Mapping[RowUnionName, NodeID] = MappingProxyType(dict(row_union_node_ids or {}))
+        self._row_union_name_by_node_id: Mapping[NodeID, RowUnionName] = MappingProxyType(
+            {node_id: name for name, node_id in (row_union_node_ids or {}).items()}
+        )
 
     @classmethod
     def from_traversal_context(
@@ -93,12 +101,15 @@ class DAGNavigator:
         derives coalesce_name_by_node_id automatically.
         """
         coalesce_node_ids = dict(traversal.coalesce_node_map)
+        row_union_node_ids = dict(traversal.row_union_node_map)
         node_to_plugin = dict(traversal.node_to_plugin)
         node_to_next = dict(traversal.node_to_next)
 
-        # Coalesce nodes are structural by definition; the union keeps that
+        # Barrier nodes are structural by definition; the union keeps that
         # invariant even for snapshot implementations that omit them.
-        structural_node_ids = frozenset(traversal.structural_node_ids) | frozenset(coalesce_node_ids.values())
+        structural_node_ids = (
+            frozenset(traversal.structural_node_ids) | frozenset(coalesce_node_ids.values()) | frozenset(row_union_node_ids.values())
+        )
         coalesce_name_by_node_id = {node_id: coalesce_name for coalesce_name, node_id in coalesce_node_ids.items()}
 
         return cls(
@@ -110,6 +121,7 @@ class DAGNavigator:
             coalesce_on_success_map=coalesce_on_success_map or {},
             sink_names=sink_names or frozenset(),
             branch_first_node=dict(traversal.branch_first_node),
+            row_union_node_ids=row_union_node_ids,
         )
 
     def resolve_plugin_for_node(self, node_id: NodeID) -> TransformProtocol | GateSettings | None:
@@ -173,6 +185,16 @@ class DAGNavigator:
                 f"Unknown coalesce name '{coalesce_name}' — "
                 f"not in coalesce_node_ids map. "
                 f"Known coalesce names: {sorted(self._coalesce_node_ids.keys())}"
+            ) from exc
+
+    def resolve_row_union_node(self, row_union_name: RowUnionName) -> NodeID:
+        """Resolve a row_union node id from its configured barrier name."""
+        try:
+            return self._row_union_node_ids[row_union_name]
+        except KeyError as exc:
+            raise OrchestrationInvariantError(
+                f"Unknown row_union name '{row_union_name}' — not in row_union_node_ids map. "
+                f"Known row_union names: {sorted(self._row_union_node_ids.keys())}"
             ) from exc
 
     def resolve_coalesce_name(self, coalesce_node_id: NodeID) -> CoalesceName:

@@ -29,7 +29,7 @@ from elspeth.web.sessions.models import (
     websocket_tickets_table,
 )
 from elspeth.web.sessions.schema import (
-    _EPOCH_37_COORDINATION_TABLES,
+    _EPOCH_42_COORDINATION_TABLES,
     SessionSchemaError,
     _stamp_schema_sentinels,
     _user_tables,
@@ -267,12 +267,12 @@ def test_blob_reservation_rejects_partial_or_invalid_custody(
             conn.execute(insert(blobs_table).values(**values))
 
 
-def test_epoch_37_coordination_tables_and_expiry_indexes_are_exact() -> None:
+def test_current_schema_includes_epoch_42_coordination_tables_and_expiry_indexes() -> None:
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
     inspector = inspect(eng)
 
-    assert SESSION_SCHEMA_EPOCH == 37
+    assert SESSION_SCHEMA_EPOCH == 42
     expected_tables = frozenset(
         {
             "web_instances",
@@ -287,7 +287,7 @@ def test_epoch_37_coordination_tables_and_expiry_indexes_are_exact() -> None:
             "sessions_cleanup_claims",
         }
     )
-    assert expected_tables == _EPOCH_37_COORDINATION_TABLES
+    assert expected_tables == _EPOCH_42_COORDINATION_TABLES
     assert expected_tables <= set(inspector.get_table_names())
     assert not any("deleted" in table and "session" in table for table in inspector.get_table_names())
 
@@ -313,7 +313,7 @@ def test_epoch_37_coordination_tables_and_expiry_indexes_are_exact() -> None:
     assert {"ix_runs_owner_lease_expires_at", "ix_runs_saga_state"} <= run_indexes
 
 
-def test_epoch_37_coordination_check_constraints_are_exact() -> None:
+def test_epoch_42_coordination_check_constraints_are_exact() -> None:
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
     inspector = inspect(eng)
@@ -421,7 +421,7 @@ def test_session_operation_authority_shape_retains_exact_nonnull_fields() -> Non
     assert session_operation_fences_table.primary_key.columns.keys() == ["session_id"]
 
 
-def test_epoch_36_database_is_rejected_by_epoch_37_runtime() -> None:
+def test_epoch_36_database_is_rejected_by_epoch_42_runtime() -> None:
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
     with eng.begin() as conn:
@@ -430,7 +430,7 @@ def test_epoch_36_database_is_rejected_by_epoch_37_runtime() -> None:
 
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH=37.*Delete the session DB file and restart",
+        match=r"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH=42.*Delete the session DB file and restart",
     ):
         initialize_session_schema(eng)
 
@@ -950,9 +950,59 @@ def test_initialize_session_schema_rejects_epoch_35_database() -> None:
     assert probe_current_schema(eng) is False
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH=37.*Delete the session DB file and restart",
+        match=r"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH=42.*Delete the session DB file and restart",
     ):
         initialize_session_schema(eng)
+
+
+def test_epoch_36_database_without_declined_result_contract_fails_at_sentinel(tmp_path) -> None:
+    """The pre-decline epoch-36 CHECKs are rejected as an older schema."""
+    db_path = tmp_path / "epoch-36-without-declined-result.db"
+    engine = create_session_engine(f"sqlite:///{db_path}")
+    initialize_session_schema(engine)
+    with engine.begin() as connection:
+        guided_operations_sql = connection.execute(
+            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
+        ).scalar_one()
+        declined_result_kind = "'composition_state', 'pipeline_proposal', 'session', 'declined'"
+        prior_result_kind = "'composition_state', 'pipeline_proposal', 'session'"
+        declined_result_locator = (
+            "(kind = 'guided_plan' AND result_kind = 'declined' "
+            "AND result_state_id IS NOT NULL AND result_message_id IS NOT NULL "
+            "AND result_session_id IS NULL AND proposal_id IS NULL) OR "
+        )
+        epoch_36_sql = guided_operations_sql.replace(declined_result_kind, prior_result_kind).replace(
+            declined_result_locator,
+            "",
+        )
+        assert epoch_36_sql != guided_operations_sql
+        assert "'declined'" not in epoch_36_sql
+        connection.execute(text("PRAGMA writable_schema = ON"))
+        connection.execute(
+            text("UPDATE sqlite_master SET sql = :sql WHERE type = 'table' AND name = 'guided_operations'"),
+            {"sql": epoch_36_sql},
+        )
+        connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 36 WHERE store_kind = 'session'"))
+        connection.execute(text("PRAGMA user_version = 36"))
+        schema_version = connection.execute(text("PRAGMA schema_version")).scalar_one()
+        connection.execute(text(f"PRAGMA schema_version = {schema_version + 1}"))
+        connection.execute(text("PRAGMA writable_schema = OFF"))
+    engine.dispose()
+
+    stale_engine = create_session_engine(f"sqlite:///{db_path}")
+    with stale_engine.connect() as connection:
+        assert connection.execute(text("PRAGMA user_version")).scalar_one() == 36
+        stored_sql = connection.execute(
+            text("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'guided_operations'")
+        ).scalar_one()
+        assert "'declined'" not in stored_sql
+
+    with pytest.raises(
+        SessionSchemaError,
+        match=r"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH=42.*"
+        r"Delete the session DB file and restart",
+    ):
+        initialize_session_schema(stale_engine)
 
 
 def test_epoch_30_database_without_schema_9_operation_contract_fails_closed_with_recreate_guidance(tmp_path) -> None:
@@ -990,7 +1040,7 @@ def test_epoch_30_database_without_schema_9_operation_contract_fails_closed_with
 
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH=37.*"
+        match=r"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH=42.*"
         r"Delete the session DB file and restart",
     ):
         initialize_session_schema(stale_engine)

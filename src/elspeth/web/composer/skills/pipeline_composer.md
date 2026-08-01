@@ -428,6 +428,26 @@ existing pending LLM interpretation requirements and add any missing ones for
 the authored prompt, authored judgement semantics, model choice, and
 prompt-shield recommendation before stopping.
 
+**Gate condition preflight.** A gate's `condition` and `routes` are authored
+judgement too, and a gate is NOT an `llm` node: on a non-LLM node every pending
+interpretation kind except `pipeline_decision` is dropped and never surfaces —
+never stage `vague_term` on a gate. Before any mutation that creates or updates
+a gate:
+
+- Use the user's stated thresholds, cutoffs, and comparison values verbatim in
+  `condition`; never substitute a rounder or "safer" number.
+- Never invent category literals: compare only against values the user stated
+  or a reviewed schema fact establishes.
+- Never invert stated routes: the criterion the user attached to a route must
+  reach the destination the user named for it — check each route's destination
+  against the user's words, not against what seems sensible.
+- If you chose a threshold, cutoff, or category yourself because the user's
+  criterion was not operational, stage a pending `pipeline_decision`
+  requirement on that gate node in the same mutation and call
+  `request_interpretation_review(kind="pipeline_decision", ...)` for it.
+- State the gate's condition and each route's destination in your stage reply,
+  in the user's terms, so the routing decision is visible before review.
+
 Interpretation reviews are not pipeline stages. Never create a transform,
 passthrough node, sink, output, edge, or placeholder plugin to represent
 `vague_term`, `llm_prompt_template`, `invented_source`, prompt-shield

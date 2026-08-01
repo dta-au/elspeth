@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Final, cast
 
@@ -79,11 +79,14 @@ def _verify_snapshot_graph(
                 emitted = json.loads(frame[:-1])
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains invalid JSON") from exc
-            if type(emitted) is not dict or emitted.get("record_type") == "manifest":
+            if type(emitted) is not dict or ("record_type" in emitted and emitted["record_type"] == "manifest"):
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains an invalid data record")
             if canonical_json(emitted).encode("utf-8") + b"\n" != frame:
                 raise AuditIntegrityError(f"audit-export snapshot chunk {chunk.ordinal} contains non-canonical record bytes")
-            signature = emitted.pop("signature", None)
+            if "signature" in emitted:
+                signature = emitted.pop("signature")
+            else:
+                signature = None
             unsigned_bytes = canonical_json(emitted).encode("utf-8")
             if snapshot.signing_mode is AuditExportSigningMode.UNSIGNED:
                 if signature is not None:
@@ -364,15 +367,55 @@ class VerifiedAuditExportCandidate:
 
 
 def _snapshot_values(snapshot: AuditExportSnapshot) -> dict[str, object]:
-    return {field.name: getattr(snapshot, field.name) for field in fields(AuditExportSnapshot)} | {
+    return {
+        "snapshot_id": snapshot.snapshot_id,
+        "source_run_id": snapshot.source_run_id,
         "source_status": snapshot.source_status.value,
+        "source_completed_at": snapshot.source_completed_at,
+        "exported_at": snapshot.exported_at,
+        "registry_key_hash": snapshot.registry_key_hash,
+        "exporter_version": snapshot.exporter_version,
+        "serialization_version": snapshot.serialization_version,
         "export_format": snapshot.export_format.value,
         "signing_mode": snapshot.signing_mode.value,
+        "signer_key_id": snapshot.signer_key_id,
+        "derivation_version": snapshot.derivation_version,
+        "public_export_config_hash": snapshot.public_export_config_hash,
+        "chunking_algorithm_version": snapshot.chunking_algorithm_version,
+        "per_chunk_record_limit": snapshot.per_chunk_record_limit,
+        "per_chunk_byte_limit": snapshot.per_chunk_byte_limit,
+        "record_count": snapshot.record_count,
+        "total_bytes": snapshot.total_bytes,
+        "chunk_count": snapshot.chunk_count,
+        "terminal_chunk_ordinal": snapshot.terminal_chunk_ordinal,
+        "content_store_id": snapshot.content_store_id,
+        "manifest_hash": snapshot.manifest_hash,
+        "last_chunk_seal_hash": snapshot.last_chunk_seal_hash,
+        "snapshot_hash": snapshot.snapshot_hash,
+        "snapshot_seal_hash": snapshot.snapshot_seal_hash,
+        "signature_hex": snapshot.signature_hex,
+        "record_chain_algorithm": snapshot.record_chain_algorithm,
+        "final_hash": snapshot.final_hash,
+        "signed_manifest_schema": snapshot.signed_manifest_schema,
+        "signed_manifest_hash": snapshot.signed_manifest_hash,
+        "signed_manifest_ref": snapshot.signed_manifest_ref,
+        "signed_manifest_size_bytes": snapshot.signed_manifest_size_bytes,
     }
 
 
 def _chunk_values(chunk: AuditExportSnapshotChunk) -> dict[str, object]:
-    return {field.name: getattr(chunk, field.name) for field in fields(AuditExportSnapshotChunk)}
+    return {
+        "snapshot_id": chunk.snapshot_id,
+        "ordinal": chunk.ordinal,
+        "content_ref": chunk.content_ref,
+        "content_hash": chunk.content_hash,
+        "size_bytes": chunk.size_bytes,
+        "record_count": chunk.record_count,
+        "predecessor_seal_hash": chunk.predecessor_seal_hash,
+        "cumulative_records": chunk.cumulative_records,
+        "cumulative_bytes": chunk.cumulative_bytes,
+        "chunk_seal_hash": chunk.chunk_seal_hash,
+    }
 
 
 def _timestamp(value: datetime) -> str:
@@ -384,18 +427,43 @@ def _timestamp(value: datetime) -> str:
 
 
 def _snapshot_comparison_values(snapshot: AuditExportSnapshot) -> tuple[object, ...]:
-    values: list[object] = []
-    for field in fields(AuditExportSnapshot):
-        # Store provenance belongs to the CAS winner, not to the canonical
-        # byte graph. A rotated writer may derive and store the exact same
-        # graph under a new store ID and must reuse the prior winner.
-        if field.name == "content_store_id":
-            continue
-        value = getattr(snapshot, field.name)
-        if isinstance(value, datetime):
-            value = _timestamp(value)
-        values.append(value)
-    return tuple(values)
+    # Store provenance belongs to the CAS winner, not to the canonical byte
+    # graph. A rotated writer may derive and store the exact same graph under a
+    # new store ID and must reuse the prior winner, so content_store_id is the
+    # one deliberately omitted field.
+    return (
+        snapshot.snapshot_id,
+        snapshot.source_run_id,
+        snapshot.source_status,
+        _timestamp(snapshot.source_completed_at),
+        _timestamp(snapshot.exported_at),
+        snapshot.registry_key_hash,
+        snapshot.exporter_version,
+        snapshot.serialization_version,
+        snapshot.export_format,
+        snapshot.signing_mode,
+        snapshot.signer_key_id,
+        snapshot.derivation_version,
+        snapshot.public_export_config_hash,
+        snapshot.chunking_algorithm_version,
+        snapshot.per_chunk_record_limit,
+        snapshot.per_chunk_byte_limit,
+        snapshot.record_count,
+        snapshot.total_bytes,
+        snapshot.chunk_count,
+        snapshot.terminal_chunk_ordinal,
+        snapshot.manifest_hash,
+        snapshot.last_chunk_seal_hash,
+        snapshot.snapshot_hash,
+        snapshot.snapshot_seal_hash,
+        snapshot.signature_hex,
+        snapshot.record_chain_algorithm,
+        snapshot.final_hash,
+        snapshot.signed_manifest_schema,
+        snapshot.signed_manifest_hash,
+        snapshot.signed_manifest_ref,
+        snapshot.signed_manifest_size_bytes,
+    )
 
 
 class AuditExportSnapshotRepository:

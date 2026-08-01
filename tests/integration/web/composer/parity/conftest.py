@@ -9,7 +9,7 @@ This conftest builds ONE production stack that all parity surfaces share:
   ``app.state.composer_service`` (so both freeform ``compose`` and guided-full's
   ``plan_guided_full_pipeline`` run the real planner against the same web policy),
   with ``_compute_availability`` forced available;
-* a permissive-but-real web plugin policy that admits every plugin the nine
+* a permissive-but-real web plugin policy that admits every plugin the ten
   fixtures use (``csv`` / ``json`` sources+sinks and ``llm`` are already in
   ``REQUIRED_WEB_PLUGIN_IDS``; ``passthrough`` / ``type_coerce`` / ``batch_stats``
   / ``batch_replicate`` are added to the allowlist). The guided conftest
@@ -168,10 +168,10 @@ FIXTURES_DIR = REPO_ROOT / "evals" / "composer-parity" / "fixtures"
 
 
 def load_parity_fixtures() -> list[dict[str, Any]]:
-    """Load the nine canonical class fixtures, sorted by class for stable ids."""
+    """Load the ten canonical class fixtures, sorted by class for stable ids."""
     fixtures = [json.loads(path.read_text(encoding="utf-8")) for path in sorted(FIXTURES_DIR.glob("*.json"))]
-    if len(fixtures) != 9:  # pragma: no cover - corpus contract
-        raise AssertionError(f"expected 9 parity fixtures, found {len(fixtures)}")
+    if len(fixtures) != 10:  # pragma: no cover - corpus contract
+        raise AssertionError(f"expected 10 parity fixtures, found {len(fixtures)}")
     return fixtures
 
 
@@ -343,6 +343,8 @@ _PARITY_ALLOWLIST = (
     "transform:type_coerce",
     "transform:batch_stats",
     "transform:batch_replicate",
+    "transform:value_transform",
+    "transform:batch_experiment_compare",
 )
 
 
@@ -709,6 +711,7 @@ def _build_settings(data_dir: Path) -> WebSettings:
                 "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
             }
         },
+        default_llm_profile="task-role",
     )
 
 

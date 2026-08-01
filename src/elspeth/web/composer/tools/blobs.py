@@ -47,7 +47,7 @@ from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_m
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
-from elspeth.contracts.trust_boundary import trust_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.web.blobs.protocol import AllowedMimeType, BlobIntegrityError, BlobQuotaExceededError
 from elspeth.web.blobs.service import (
     _BlobDeletionCoordinator,
@@ -175,13 +175,12 @@ def _sync_get_blob(engine: Engine, blob_id: str, session_id: str | None = None) 
         return _blob_row_to_tool_dict(row)
 
 
-@trust_boundary(
+@observation_boundary(
     tier=3,
     source="LLM composer tool-call blob_id argument",
     source_param="blob_id",
     suppresses=("R5",),
     invariant="returns a repairable error message for non-string or non-UUID blob_id and None for canonical input; never raises on blob_id",
-    non_raising=True,
 )
 def _blob_id_uuid_validation_error(blob_id: Any) -> str | None:
     """Return a repairable boundary error when ``blob_id`` is not canonical."""

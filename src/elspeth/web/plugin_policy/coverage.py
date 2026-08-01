@@ -13,7 +13,7 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
-from elspeth.web.composer.state import CompositionState, NodeSpec
+from elspeth.web.composer.state import CompositionState, NodeSpec, _coalesce_branch_connections
 
 _NON_PRODUCED_ROUTE_TARGETS = frozenset({"discard", "fork", "stop"})
 
@@ -43,10 +43,39 @@ class OutputStreamGraph:
 
 @dataclass(frozen=True, slots=True)
 class ControlCoverageFinding:
+    """One uncovered required-control site, with enough detail to explain it.
+
+    ``reason`` discriminates the diagnosis only — every variant is the same
+    rejection with the same severity. ``output_error_route_not_post_dominated``
+    is the narrow, fully-diagnosable output case: the node's own ``on_error``
+    edge is the single uncovered stream, so the message can name the one
+    authorable repair instead of a generic "not covered". ``uncovered_stream``
+    is populated only for that case and carries the offending ``on_error``
+    target.
+
+    ``input_fields_unprovable`` is the second fully-diagnosable case: the
+    topology IS correct — a blocking control dominates the node's input — but
+    the node's protected field set could not be proven, so a control scoped to
+    a specific field list cannot be credited (only ``fields: all`` can).
+    Reporting that as ``input_not_dominated`` sent authors to repair a wiring
+    layout that was already right (AWS acceptance run 2, R2-F17).
+    ``protected_fields`` and ``scanned_fields`` carry the two sets the message
+    must name; ``scanned_fields`` is diagnosis-only and is never a credit
+    decision.
+    """
+
     component_id: str
     capability: PluginCapability
     role: ControlRole
-    reason: Literal["input_not_dominated", "output_not_post_dominated"]
+    reason: Literal[
+        "input_not_dominated",
+        "input_fields_unprovable",
+        "output_not_post_dominated",
+        "output_error_route_not_post_dominated",
+    ]
+    uncovered_stream: str | None = None
+    protected_fields: tuple[str, ...] = ()
+    scanned_fields: tuple[str, ...] = ()
 
 
 def build_output_stream_graph(nodes: Sequence[NodeSpec]) -> OutputStreamGraph:
@@ -109,12 +138,23 @@ def node_has_blocking_control(
 
 
 def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> bool:
-    """Return whether a control scans every field whose content it protects."""
-    if not protected_fields:
-        return False
+    """Return whether a control scans every field whose content it protects.
+
+    ``fields: all`` is decided FIRST because it is a superset of every
+    protected set — provable or not — so it covers the empty set too. The
+    empty-set bail-out below is the fail-closed rule for every OTHER scope: an
+    empty protected set is not proof that no field needs protecting (a dynamic
+    ``row[key]`` prompt access and a prompt with no row access at all both
+    extract to the empty set — see ``extract_jinja2_field_usage``), so a
+    control scoped to a specific field list cannot be credited against it.
+    Ordering these the other way round rejected correctly-shielded pipelines
+    outright (AWS acceptance run 2, R2-F17 / elspeth-5c0c09db31).
+    """
     configured = node.options.get("fields")
     if configured == "all":
         return True
+    if not protected_fields:
+        return False
     if isinstance(configured, str):
         scanned_fields = frozenset({configured}) if configured.strip() else frozenset()
     elif isinstance(configured, Sequence) and not isinstance(configured, (str, bytes)):
@@ -236,37 +276,118 @@ def control_coverage_findings(
                 protected_fields=protected_fields,
             )
             if not covered:
+                # Diagnosis is decided HERE, where both field sets are in
+                # hand — never threaded through the recursion, which stays a
+                # pure predicate over coverage. The probe re-asks the SAME
+                # predicate with the field-scope rule switched off, so a
+                # scope-only failure is distinguished from a broken topology
+                # by the credit walk itself rather than by a second, weaker
+                # traversal that could disagree with it.
+                structurally_covered = _stream_proves_input_control(
+                    node.input,
+                    graph,
+                    source_streams=source_streams,
+                    visited=frozenset(),
+                    protected_fields=None,
+                )
+                # Field sets are named only when a control provably dominates:
+                # every control the scan then finds is a real dominator, so the
+                # message cannot point at an irrelevant one.
+                scanned_fields = _upstream_control_scan_scopes(node, graph, capability) if structurally_covered else None
                 findings.append(
                     ControlCoverageFinding(
                         component_id=node.id,
                         capability=capability,
                         role=ControlRole.INPUT,
-                        reason="input_not_dominated",
+                        reason=("input_fields_unprovable" if not protected_fields and structurally_covered else "input_not_dominated"),
+                        protected_fields=tuple(sorted(protected_fields)),
+                        scanned_fields=scanned_fields or (),
                     )
                 )
         else:
             protected_fields = _llm_output_fields(node)
             outputs = _node_output_streams(node)
-            covered = bool(outputs) and all(
-                _stream_proves_output_control(
+            # Same predicate as before, evaluated per stream instead of through
+            # a short-circuiting all(): ``covered`` is still "every authored
+            # output stream is post-dominated by the control". The helpers are
+            # pure, so dropping the short circuit changes cost on the failing
+            # path only — never the verdict.
+            uncovered = tuple(
+                stream
+                for stream in outputs
+                if not _stream_proves_output_control(
                     stream,
                     graph,
                     sink_streams=sink_streams,
                     visited=frozenset({node.id}),
                     protected_fields=protected_fields,
                 )
-                for stream in outputs
             )
-            if not covered:
+            if not outputs or uncovered:
+                # Diagnosis only. The node's own on_error edge is singled out
+                # when it is the SOLE uncovered stream, because that case has
+                # exactly one authorable repair (on_error must name a sink or
+                # 'discard' — engine invariant, core/dag/builder.py:1108 — so
+                # no control can be interposed on an error branch). An
+                # on_error of 'discard' is exempt in
+                # ``_NON_PRODUCED_ROUTE_TARGETS`` and therefore never lands in
+                # ``uncovered``, so a failure elsewhere in the graph keeps the
+                # general reason even when on_error is set.
+                error_route = node.on_error if node.on_error and node.on_error != node.on_success else None
+                names_error_route = error_route is not None and uncovered == (error_route,)
                 findings.append(
                     ControlCoverageFinding(
                         component_id=node.id,
                         capability=capability,
                         role=ControlRole.OUTPUT,
-                        reason="output_not_post_dominated",
+                        reason=("output_error_route_not_post_dominated" if names_error_route else "output_not_post_dominated"),
+                        uncovered_stream=error_route if names_error_route else None,
                     )
                 )
     return tuple(findings)
+
+
+def _upstream_producers(node: NodeSpec, graph: OutputStreamGraph) -> tuple[NodeSpec, ...]:
+    """Return the nodes producing this node's inputs, queue predecessors included."""
+    if node.node_type == "queue":
+        return graph.queue_predecessors.get(node.id, ())
+    return tuple(producer for stream in _node_input_streams(node) for producer in graph.producers_by_stream.get(stream, ()))
+
+
+def _upstream_control_scan_scopes(
+    node: NodeSpec,
+    graph: OutputStreamGraph,
+    capability: PluginCapability,
+) -> tuple[str, ...] | None:
+    """Return the field scopes of the nearest upstream blocking controls.
+
+    DIAGNOSIS ONLY. This never decides coverage — ``_stream_proves_input_control``
+    is the sole credit authority and this walk deliberately ignores the
+    field-scope, mapper-translation and overwrite rules that make coverage
+    sound. It answers exactly one question for the message: is there a blocking
+    control upstream at all, and what does it scan? ``None`` means none was
+    found on any path, which keeps "no control anywhere" reported as a topology
+    failure rather than a field-scope failure.
+    """
+    seen = {node.id}
+    frontier = list(_upstream_producers(node, graph))
+    scopes: set[str] = set()
+    found = False
+    while frontier:
+        producer = frontier.pop()
+        if producer.id in seen:
+            continue
+        seen.add(producer.id)
+        if node_has_blocking_control(producer, capability, ControlRole.INPUT):
+            found = True
+            configured = producer.options.get("fields")
+            if isinstance(configured, str):
+                scopes.add(configured)
+            elif isinstance(configured, Sequence) and not isinstance(configured, (str, bytes)):
+                scopes.update(str(field) for field in configured)
+            continue
+        frontier.extend(_upstream_producers(producer, graph))
+    return tuple(sorted(scopes)) if found else None
 
 
 def _node_output_streams(node: NodeSpec) -> tuple[str, ...]:
@@ -288,10 +409,8 @@ def _node_output_streams(node: NodeSpec) -> tuple[str, ...]:
 def _node_input_streams(node: NodeSpec) -> tuple[str, ...]:
     if node.node_type == "queue":
         return ()
-    if node.node_type == "coalesce":
-        if isinstance(node.branches, Mapping):
-            return tuple(node.branches.values())
-        return node.branches or ()
+    if node.node_type in ("coalesce", "row_union"):
+        return _coalesce_branch_connections(node.branches)
     return (node.input,) if node.input else ()
 
 
@@ -369,14 +488,52 @@ def _translate_protected_fields_through_mapper(
     return frozenset(translated)
 
 
+def _deterministic_written_fields(node: NodeSpec) -> frozenset[str] | None:
+    """Return the top-level row fields a deterministic transform writes.
+
+    ``None`` means the write set is unprovable, so required-control coverage
+    must fail closed on that path: an unproven transform may overwrite a
+    shielded field with unscanned content. ``field_mapper`` is excluded here
+    because ``_translate_protected_fields_through_mapper`` models its writes.
+    """
+    if node.plugin == "passthrough":
+        return frozenset()
+    if node.plugin != "value_transform":
+        return None
+    operations = node.options.get("operations")
+    if not isinstance(operations, Sequence) or isinstance(operations, (str, bytes)):
+        return None
+    targets: set[str] = set()
+    for operation in operations:
+        if not isinstance(operation, Mapping):
+            return None
+        target = operation.get("target")
+        if not isinstance(target, str) or not target.strip():
+            return None
+        targets.add(target)
+    return frozenset(targets)
+
+
 def _stream_proves_input_control(
     stream: str | None,
     graph: OutputStreamGraph,
     *,
     source_streams: frozenset[str],
     visited: frozenset[str],
-    protected_fields: frozenset[str],
+    protected_fields: frozenset[str] | None,
 ) -> bool:
+    """Prove a blocking input control dominates ``stream``.
+
+    ``protected_fields=None`` is the DIAGNOSIS PROBE: it asks the same
+    question with the field-scope rule switched off — "does a blocking control
+    dominate this input at all, whatever it scans?" — using the existing
+    ``node_has_blocking_control`` convention for that sentinel. Every
+    structural refusal (external calls, unprovable write sets, unprovable
+    mapper config, cycles, unknown producers) still applies, so a probe answer
+    of True means the topology really is right and only the control's scope is
+    at fault. The probe is never a credit decision: coverage is decided by the
+    call with the real protected set.
+    """
     if not isinstance(stream, str) or not stream:
         return False
     producers = graph.producers_by_stream.get(stream)
@@ -401,7 +558,7 @@ def _producer_proves_input_control(
     *,
     source_streams: frozenset[str],
     visited: frozenset[str],
-    protected_fields: frozenset[str],
+    protected_fields: frozenset[str] | None,
 ) -> bool:
     if producer.id in visited:
         return False
@@ -425,6 +582,30 @@ def _producer_proves_input_control(
             )
             for predecessor in predecessors
         )
+    if producer.node_type == "row_union":
+        branches = _coalesce_branch_connections(producer.branches)
+        return bool(branches) and all(
+            _stream_proves_input_control(
+                branch,
+                graph,
+                source_streams=source_streams,
+                visited=visited,
+                protected_fields=protected_fields,
+            )
+            for branch in branches
+        )
+    if producer.node_type == "gate" and producer.plugin is None:
+        # Config gates route and fork rows without modifying them (GateExecutor
+        # emits output_hash == input_hash and forks children with the parent's
+        # row data verbatim), so a control dominating the gate's single input
+        # dominates every route and fork branch it emits.
+        return _stream_proves_input_control(
+            producer.input,
+            graph,
+            source_streams=source_streams,
+            visited=visited,
+            protected_fields=protected_fields,
+        )
     if producer.plugin is None:
         return False
     try:
@@ -433,13 +614,26 @@ def _producer_proves_input_control(
         return False
     if plugin_cls.determinism is Determinism.EXTERNAL_CALL:
         return False
+    if producer.plugin != "field_mapper":
+        written_fields = _deterministic_written_fields(producer)
+        if written_fields is None or (protected_fields is not None and written_fields & protected_fields):
+            # A write below the nearest shield replaces scanned content with
+            # unscanned data, so upstream shielding cannot cover it. Unknown
+            # write sets fail closed — including under the diagnosis probe,
+            # which switches off the field-scope rule only.
+            return False
+    # The probe carries no field names, so mapper translation cannot change
+    # its answer — but an unprovable mapper CONFIG is a structural refusal and
+    # must still fail closed, so it is evaluated against the empty set.
     translated_fields = _translate_protected_fields_through_mapper(
         producer,
-        protected_fields,
+        frozenset() if protected_fields is None else protected_fields,
         direction="upstream",
     )
     if translated_fields is None:
         return False
+    if protected_fields is None:
+        translated_fields = None
     return _stream_proves_input_control(
         producer.input,
         graph,

@@ -1,0 +1,57 @@
+terraform {
+  required_version = ">= 1.14, < 2.0"
+
+  backend "s3" {}
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 6.54.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.9.0"
+    }
+    tls = {
+      source  = "hashicorp/tls"
+      version = "~> 4.3.0"
+    }
+  }
+}
+
+provider "aws" {
+  region              = var.aws_region
+  profile             = var.aws_profile
+  allowed_account_ids = [var.aws_account_id]
+
+  default_tags {
+    tags = {
+      ACCEPTANCE_RUN_ID = var.run_id
+      Owner             = var.owner
+      Purpose           = var.purpose
+      RunId             = var.run_id
+      CleanupDeadline   = var.cleanup_deadline
+      Scenario          = var.scenario_id
+      ManagedBy         = "terraform"
+    }
+  }
+}
+
+provider "aws" {
+  alias               = "iam_lifecycle"
+  region              = var.aws_region
+  profile             = var.iam_lifecycle_aws_profile
+  allowed_account_ids = [var.aws_account_id]
+
+  default_tags {
+    tags = {
+      ACCEPTANCE_RUN_ID = var.run_id
+      Owner             = var.owner
+      Purpose           = var.purpose
+      RunId             = var.run_id
+      CleanupDeadline   = var.cleanup_deadline
+      Scenario          = var.scenario_id
+      ManagedBy         = "terraform"
+    }
+  }
+}

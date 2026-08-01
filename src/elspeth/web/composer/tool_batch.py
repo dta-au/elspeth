@@ -163,7 +163,39 @@ _MISSING_TOOL_CALL_FIELD = object()
 
 
 def _admit_tool_batch(tool_calls: Sequence[Any]) -> _AdmittedToolBatch:
-    """Copy and validate provider calls before the first await or side effect."""
+    """Copy and validate provider calls before the first await or side effect.
+
+    Field presence is probed with ``getattr(..., _MISSING_TOOL_CALL_FIELD)``
+    and NEVER with a ``runtime_checkable`` ``Protocol`` ``isinstance()``
+    check. Since Python 3.12 a runtime-checkable Protocol's
+    ``__instancecheck__`` resolves members through
+    ``inspect.getattr_static``, which deliberately bypasses ``__getattr__``.
+    Real provider tool calls do not survive that: LiteLLM's
+    ``litellm.types.utils.ChatCompletionMessageToolCall`` declares NO
+    pydantic model fields at all — ``id``/``type``/``function`` live in
+    ``__pydantic_extra__`` and resolve only through ``BaseModel.__getattr__``
+    — so a Protocol ``isinstance()`` rejects every genuine tool call from
+    every provider (elspeth-9ea866438b). Do not "harden" this back into a
+    Protocol check.
+
+    The Tier-3 posture is unchanged and lives entirely in the value
+    assertions below plus the read-once copy into the frozen
+    ``_AdmittedToolCall``/``_AdmittedToolFunction``: a missing field, a
+    non-``str`` field, a blank/oversized/duplicate ID are each still a hard
+    ``AuditIntegrityError``, and every field is read exactly once and
+    snapshotted, so nothing downstream can be re-resolved to a different
+    value. What is deliberately NOT asserted is the *mechanism* by which a
+    provider object resolves those fields — that is unobservable at this
+    boundary once the values are snapshotted, and demanding static
+    resolution is precisely what broke against reality.
+
+    ``getattr`` absorbs only ``AttributeError``. A provider object whose
+    ``__getattr__`` raises something else propagates that exception rather
+    than converting it to ``AuditIntegrityError``; that matches the
+    behaviour this guard had before the Protocol experiment, and widening
+    to ``except Exception`` would turn this into the permissive duck-type
+    the boundary exists to prevent.
+    """
     admitted_calls: list[_AdmittedToolCall] = []
     call_ids: set[str] = set()
     for tool_call in tool_calls:
@@ -865,7 +897,7 @@ async def run_tool_batch(
                         composer_model_version=safe_response_model(response) or ctx.service._model,
                         composer_provider=ctx.service._availability.provider or "unknown",
                         composer_skill_hash=ctx.service._composer_skill_hash,
-                        tool_arguments_hash=audit.arguments_hash,
+                        tool_arguments_hash=audit.binding_arguments_hash,
                     )
                     candidate = await run_sync_in_worker(
                         build_set_pipeline_candidate,
@@ -907,7 +939,7 @@ async def run_tool_batch(
                         )
                         safe_candidate_context = replace(
                             candidate_context,
-                            tool_arguments_hash=audit.arguments_hash,
+                            tool_arguments_hash=audit.binding_arguments_hash,
                         )
                         custody_outcome = await _try_finalize_proposal_custody(
                             custody,
@@ -1018,7 +1050,7 @@ async def run_tool_batch(
                     composer_model_version=safe_response_model(response) or ctx.service._model,
                     composer_provider=ctx.service._availability.provider or "unknown",
                     composer_skill_hash=ctx.service._composer_skill_hash,
-                    tool_arguments_hash=audit.arguments_hash,
+                    tool_arguments_hash=audit.binding_arguments_hash,
                     session_operation_context=ctx.session_operation_context,
                 )
                 proposals_this_turn += 1
@@ -1561,7 +1593,7 @@ async def run_tool_batch(
             _composer_model_version: str = safe_response_model(response) or ctx.service._model,
             _composer_provider: str = ctx.service._availability.provider or "unknown",
             _composer_skill_hash: str = ctx.service._composer_skill_hash,
-            _tool_arguments_hash: str = audit.arguments_hash,
+            _tool_arguments_hash: str = audit.binding_arguments_hash,
             _prevalidated_unapplied_result: ToolResult | None = prevalidated_unapplied_result,
             _preproposal_exception: BaseException | None = preproposal_exception,
         ) -> Any:

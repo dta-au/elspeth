@@ -29,6 +29,7 @@ from uuid import UUID
 
 import pytest
 import structlog
+from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import func, select
 
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
@@ -63,6 +64,14 @@ _COMPLETE_MULTI_CLAUSE_REQUESTS = (
     pytest.param(
         "Build a pipeline that reads customers.csv and writes results.jsonl.",
         id="ordinary-source-and-sink-clauses",
+    ),
+    pytest.param(
+        "Build a pipeline that reads customers.csv and splits rows by country. Do not do that with a generic transform.",
+        id="scoped-anaphoric-constraint",
+    ),
+    pytest.param(
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Do not add a generic transform.",
+        id="scoped-negative-action-constraint",
     ),
     *(
         pytest.param(json.loads(path.read_text(encoding="utf-8"))["intent"], id=f"parity-{path.stem}")
@@ -124,10 +133,15 @@ def _timeout_completion() -> Any:
 
 
 def _provider_error_completion() -> Any:
-    """An opaque provider crash — trips the PROVIDER_ERROR code."""
+    """A declared LiteLLM provider failure — trips the PROVIDER_ERROR code."""
 
     async def completion(**_kwargs: Any) -> _Response:
-        raise RuntimeError(f"provider unavailable {_PROVIDER_LEAK_SENTINEL}")
+        raise LiteLLMAPIError(
+            status_code=503,
+            message=f"provider unavailable {_PROVIDER_LEAK_SENTINEL}",
+            llm_provider="test-provider",
+            model="test/planner",
+        )
 
     return completion
 
@@ -359,6 +373,17 @@ def _registered_recipe_request(*, envelope_insertion: str) -> str:
         "Build the pipeline. I changed my mind.",
         "Build the pipeline. On second thought, leave it.",
         "Build the pipeline. Actually, skip it.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Please do not do that.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Please don\u2019t do that.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Please do not proceed.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. I do not want that.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Stop.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Cancel it.",
+        "Read the CSV documentation and explain how transforms work.",
+        "Read customers.csv and explain how transforms work.",
+        "Read customers.csv and explain the password policy.",
+        "Read customers.csv and explain: write is a pipeline operation.",
+        "Read customers.csv and summarize the data, then write a summary in this chat.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. It should not be built.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. I do not want you to build it.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. Cancel the request.",
@@ -368,6 +393,11 @@ def _registered_recipe_request(*, envelope_insertion: str) -> str:
         "Build a pipeline that reads customers.csv and writes results.jsonl. I no longer want it.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. This is only an example, not a request.",
         "Build a pipeline that reads customers.csv and writes results.jsonl. Instead, explain what it would do.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Do not make any changes.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Don't change anything.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Do not process that request.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Do not save anything.",
+        "Build a pipeline that reads customers.csv and writes results.jsonl. Do not update it.",
         "Avoid then build the pipeline.",
         "Refrain, then build the pipeline.",
         "Document then build the pipeline.",
@@ -447,7 +477,9 @@ def test_complete_multi_clause_request_enters_empty_pipeline_planner(
         # attempt lands as durable audit evidence alongside the terminal one.
         (_malformed_completion, 502, "invalid_provider_response", "MALFORMED_RESPONSE", _PROSE_NUDGE_BUDGET + 1),
         (_timeout_completion, 504, "provider_timeout", "TIMEOUT", 1),
-        (_provider_error_completion, 503, "provider_unavailable", "PROVIDER_ERROR", 1),
+        # LiteLLM API errors are the declared retryable provider failure, so
+        # every configured physical attempt must be present in the audit.
+        (_provider_error_completion, 503, "provider_unavailable", "PROVIDER_ERROR", 3),
     ],
     ids=["malformed", "timeout", "provider_error"],
 )
@@ -553,21 +585,111 @@ _ALL_PLANNER_CODES = (
 )
 
 
+# The detail-code shapes a rejection can carry. ``policy_blocked`` is keyed on
+# THIS axis, not on the planner code, so parity must be checked over the full
+# cross product rather than over codes alone.
+_DETAIL_CODE_CASES: tuple[tuple[str, ...], ...] = (
+    # Non-rejection failure (timeout, provider error): no codes at all.
+    (),
+    # Ordinary wiring rejection — must NOT read as a policy refusal.
+    ("interpretation_review_contract_unsatisfied",),
+    ("plugin_options_invalid", "schema_contract_violation"),
+    # Categorical deployment-policy refusals, from each of the two producing
+    # seams (the authoritative source gate and the plugin snapshot).
+    ("aws_s3_source_not_allowed",),
+    ("plugin_not_allowed_on_web",),
+    # A policy refusal alongside ordinary wiring noise: the policy code wins,
+    # because no repair to the wiring can clear it.
+    ("plugin_options_invalid", "aws_s3_source_not_allowed"),
+)
+
+
 @pytest.mark.parametrize("code", _ALL_PLANNER_CODES)
-def test_freeform_planner_failure_code_matches_guided(code: str) -> None:
+@pytest.mark.parametrize("detail_codes", _DETAIL_CODE_CASES)
+def test_freeform_planner_failure_code_matches_guided(code: str, detail_codes: tuple[str, ...]) -> None:
     """The freeform surface must classify every planner code exactly as guided.
 
     Task 0 gates Task 3's cross-surface disposition parity; a divergence here
     (e.g. one surface returning invalid_provider_response/502 where the other
     returns operation_failed/500 for the same code) is precisely the bug Task 0
-    exists to prevent.
+    exists to prevent. Parametrized over detail codes as well since
+    ``policy_blocked`` is decided on that axis.
     """
     from elspeth.web.composer.pipeline_planner import PipelinePlannerError
     from elspeth.web.sessions.routes._helpers import _freeform_planner_failure_code
     from elspeth.web.sessions.routes.composer.guided_plan import _guided_full_failure_code
 
-    exc = PipelinePlannerError("planner failure", code=code)
+    exc = PipelinePlannerError("planner failure", code=code, detail_codes=detail_codes)
     assert _freeform_planner_failure_code(exc) == _guided_full_failure_code(exc)
+
+
+@pytest.mark.parametrize("code", _ALL_PLANNER_CODES)
+@pytest.mark.parametrize("detail_codes", _DETAIL_CODE_CASES)
+def test_policy_detail_codes_decide_policy_blocked_on_both_surfaces(code: str, detail_codes: tuple[str, ...]) -> None:
+    """A categorical policy refusal is permanent under EVERY planner code.
+
+    The observed failure surfaced as ``VALIDATION_FAILED`` (the server-derived
+    pass-through gate), but the same refusal reaches ``REPAIR_EXHAUSTED`` when the
+    model burns its repair budget re-authoring the prohibited component — so the
+    classification cannot be keyed on the planner code. Conversely an ordinary
+    wiring rejection must NOT be promoted to a policy refusal.
+    """
+    from elspeth.web.composer.pipeline_planner import PipelinePlannerError
+    from elspeth.web.sessions.routes._helpers import PLANNER_POLICY_DETAIL_CODES, _freeform_planner_failure_code
+    from elspeth.web.sessions.routes.composer.guided_plan import _guided_full_failure_code
+
+    exc = PipelinePlannerError("planner failure", code=code, detail_codes=detail_codes)
+    expected_policy = any(detail in PLANNER_POLICY_DETAIL_CODES for detail in detail_codes)
+
+    assert (_guided_full_failure_code(exc) == "policy_blocked") is expected_policy
+    assert (_freeform_planner_failure_code(exc) == "policy_blocked") is expected_policy
+
+
+def test_every_reachable_failure_code_has_an_http_envelope_on_both_surfaces() -> None:
+    """Both mappers feed a bare dict index — an unmapped code is a raw 500.
+
+    ``_handle_planner_failure`` does ``_FREEFORM_PLANNER_FAILURE_HTTP[failure_code]``
+    and ``raise_guided_operation_failure`` refuses an unknown code with an
+    ``AuditIntegrityError``. Widening either mapper without widening its table
+    reintroduces exactly the uncoded crash this taxonomy removes, so the tables
+    are checked against everything the mappers can actually return.
+    """
+    from elspeth.web.composer.pipeline_planner import PipelinePlannerError
+    from elspeth.web.sessions.routes._helpers import _FREEFORM_PLANNER_FAILURE_HTTP, _freeform_planner_failure_code
+    from elspeth.web.sessions.routes.composer.guided_plan import _guided_full_failure_code
+    from elspeth.web.sessions.routes.guided_operations import _SAFE_FAILURES
+
+    reachable: set[str] = set()
+    for code in _ALL_PLANNER_CODES:
+        for detail_codes in _DETAIL_CODE_CASES:
+            exc = PipelinePlannerError("planner failure", code=code, detail_codes=detail_codes)
+            reachable.add(_freeform_planner_failure_code(exc))
+            reachable.add(_guided_full_failure_code(exc))
+
+    assert "policy_blocked" in reachable
+    assert reachable <= set(_FREEFORM_PLANNER_FAILURE_HTTP)
+    assert reachable <= set(_SAFE_FAILURES)
+    # Shared codes must also agree on the HTTP status, or the same failure reads
+    # as a different class depending on which surface authored the pipeline.
+    for failure_code in reachable:
+        assert _FREEFORM_PLANNER_FAILURE_HTTP[failure_code][0] == _SAFE_FAILURES[failure_code][0], failure_code
+
+
+def test_freeform_policy_blocked_copy_blames_neither_provider_nor_operation_id() -> None:
+    """The freeform copy is policy-aware too, not a provider-fault retread."""
+    from elspeth.web.sessions.routes._helpers import _FREEFORM_PLANNER_FAILURE_HTTP
+
+    status, copy = _FREEFORM_PLANNER_FAILURE_HTTP["policy_blocked"]
+    lowered = copy.lower()
+
+    assert status == 422
+    assert "provider" not in lowered
+    assert "operation id" not in lowered
+    assert "composer model" not in lowered
+    assert "deployment policy" in lowered
+    # Freeform chat has no component highlight — only the guided review UI
+    # pins the blocked component — so this copy must not say "highlighted".
+    assert "highlighted" not in lowered
 
 
 _DECLINE_TEXT = "I must decline: this request needs a streaming-join capability no available plugin provides."

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 from pathlib import Path
 
 import pytest
@@ -190,3 +191,19 @@ def test_local_requirement_check_is_lazy_and_offline(monkeypatch: pytest.MonkeyP
     assert result.available is True
     assert "boto3" in imported
     assert "botocore" in imported
+
+
+def test_local_requirement_check_uses_declared_package_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    versions = {"boto3": "1.43.46", "botocore": "1.43.46"}
+    monkeypatch.setattr(importlib.metadata, "version", versions.__getitem__)
+
+    assert guardrail_profiles.check_bedrock_local_requirements().available is True
+
+
+def test_local_requirement_check_rejects_missing_package_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing(_distribution_name: str) -> str:
+        raise importlib.metadata.PackageNotFoundError
+
+    monkeypatch.setattr(importlib.metadata, "version", missing)
+
+    assert guardrail_profiles.check_bedrock_local_requirements().available is False

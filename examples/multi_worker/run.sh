@@ -18,7 +18,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 source "$PROJECT_ROOT/examples/chaosllm_env.sh"
 
-CHAOS_CONFIG="examples/multi_worker/chaos_config.yaml"
+CHAOS_CONFIG="${ELSPETH_MULTI_WORKER_CHAOS_CONFIG:-examples/multi_worker/chaos_config.yaml}"
 PIPELINE_CONFIG="examples/multi_worker/settings.yaml"
 DB="examples/multi_worker/runs/audit.db"
 CHAOS_PORT=8199
@@ -26,6 +26,11 @@ CHAOS_PID=""
 LEADER_PID=""
 FOLLOWER_PIDS=()
 WORKERS="${WORKERS:-1}"
+
+if [[ ! "$WORKERS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: WORKERS must be a positive integer." >&2
+    exit 2
+fi
 
 cleanup() {
     # Kill any still-running followers and the leader, then the ChaosLLM server.
@@ -55,18 +60,22 @@ echo "=== multi_worker (elspeth join) — leader + $WORKERS follower(s) ==="
 echo ""
 
 # --- Start ChaosLLM (errorworks bug: must use --workers 1) ---
+if { true >"/dev/tcp/127.0.0.1/$CHAOS_PORT"; } 2>/dev/null; then
+    echo "ERROR: port $CHAOS_PORT is already in use; refusing to attach to an unowned service." >&2
+    exit 1
+fi
 echo "Starting ChaosLLM server on port $CHAOS_PORT..."
 .venv/bin/chaosllm serve --config "$CHAOS_CONFIG" --port "$CHAOS_PORT" --workers 1 &
 CHAOS_PID=$!
 echo "Waiting for ChaosLLM to be ready..."
 for i in $(seq 1 30); do
+    if ! kill -0 "$CHAOS_PID" 2>/dev/null; then echo "ERROR: ChaosLLM failed to start."; exit 1; fi
     if curl -sf "http://127.0.0.1:$CHAOS_PORT/health" > /dev/null 2>&1; then
         echo "ChaosLLM is ready."; echo ""; break
     fi
-    if ! kill -0 "$CHAOS_PID" 2>/dev/null; then echo "ERROR: ChaosLLM failed to start."; exit 1; fi
     sleep 0.5
 done
-if ! curl -sf "http://127.0.0.1:$CHAOS_PORT/health" > /dev/null 2>&1; then
+if ! kill -0 "$CHAOS_PID" 2>/dev/null || ! curl -sf "http://127.0.0.1:$CHAOS_PORT/health" > /dev/null 2>&1; then
     echo "ERROR: ChaosLLM not responding after 15 seconds."; exit 1
 fi
 
@@ -168,7 +177,7 @@ SQL
 WORKER_COUNT="$(sqlite3 "file:${DB}?mode=ro" \
   "PRAGMA query_only=ON; SELECT COUNT(*) FROM (SELECT from_lease_owner FROM scheduler_events WHERE run_id='$RUN_ID' AND event_type IN ('mark_pending_sink','mark_failed') AND from_lease_owner IS NOT NULL GROUP BY from_lease_owner HAVING COUNT(*) >= 1);" 2>/dev/null || echo 0)"
 TOTAL_ROWS="$(sqlite3 "file:${DB}?mode=ro" \
-  "PRAGMA query_only=ON; SELECT COUNT(*) FROM token_work_items WHERE run_id='$RUN_ID' AND status IN ('terminal','failed');" 2>/dev/null || echo 0)"
+  "PRAGMA query_only=ON; SELECT COUNT(*) FROM token_outcomes WHERE run_id='$RUN_ID' AND completed=1 AND outcome IN ('success','failure');" 2>/dev/null || echo 0)"
 
 echo ""
 # PASS requires BOTH signals: the attribution assertion (>=2 workers each

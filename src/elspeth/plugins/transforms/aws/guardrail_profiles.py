@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
 import re
 from dataclasses import dataclass
 from typing import Literal
@@ -74,13 +75,16 @@ class BedrockLocalRequirementResult:
 def check_bedrock_local_requirements() -> BedrockLocalRequirementResult:
     """Check optional SDK availability/version without making a network call."""
     try:
-        boto3 = importlib.import_module("boto3")
-        botocore = importlib.import_module("botocore")
-    except ImportError:
+        importlib.import_module("boto3")
+        importlib.import_module("botocore")
+        versions = (
+            importlib.metadata.version("boto3"),
+            importlib.metadata.version("botocore"),
+        )
+    except (ImportError, importlib.metadata.PackageNotFoundError):
         return BedrockLocalRequirementResult(available=False)
 
-    for module in (boto3, botocore):
-        version = getattr(module, "__version__", "")
+    for version in versions:
         try:
             major, minor, *_rest = (int(part) for part in version.split("."))
         except (TypeError, ValueError):

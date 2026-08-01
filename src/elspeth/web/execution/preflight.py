@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,7 +32,7 @@ from elspeth.web.paths import (
     resolve_data_path,
     resolve_sink_data_path,
 )
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginKind
 
 RUNTIME_CHECK_PLUGIN_INSTANTIATION = execution_schemas.RUNTIME_CHECK_PLUGIN_INSTANTIATION
 RUNTIME_CHECK_GRAPH_STRUCTURE = execution_schemas.RUNTIME_CHECK_GRAPH_STRUCTURE
@@ -294,31 +294,77 @@ def _profiled_plugin_ids(plugin_snapshot: PluginAvailabilitySnapshot) -> frozens
     return frozenset(plugin_id for plugin_id, _aliases in plugin_snapshot.usable_profile_aliases)
 
 
-def _authored_sources(config: Mapping[str, Any]) -> Mapping[str, Any]:
-    sources = config.get("sources")
-    if isinstance(sources, Mapping):
-        return sources
-    source = config.get("source")
-    if isinstance(source, Mapping):
-        return {"source": source}
-    return {}
+def _required_component_mapping(
+    config: Mapping[str, Any],
+    key: str,
+    *,
+    owner: str,
+) -> dict[str, dict[str, Any]]:
+    raw = config[key]
+    if type(raw) is not dict:
+        raise TypeError(f"{owner} '{key}' must be a dict, got {type(raw).__name__}")
+    components = cast(dict[str, Any], raw)
+    for component_name, component in components.items():
+        if type(component) is not dict:
+            raise TypeError(f"{owner} '{key}' component '{component_name}' must be a dict, got {type(component).__name__}")
+    return cast(dict[str, dict[str, Any]], components)
 
 
-def _authored_named_components(config: Mapping[str, Any], key: str) -> dict[str, Mapping[str, Any]]:
-    raw = config.get(key)
-    if not isinstance(raw, (list, tuple)):
-        return {}
-    return {
-        str(component["name"]): component for component in raw if isinstance(component, Mapping) and isinstance(component.get("name"), str)
-    }
+def _required_component_list(
+    config: Mapping[str, Any],
+    key: str,
+    *,
+    owner: str,
+) -> list[MutableMapping[str, Any]]:
+    raw = config[key]
+    if type(raw) is not list:
+        raise TypeError(f"{owner} '{key}' must be a list, got {type(raw).__name__}")
+    components = raw
+    for index, component in enumerate(components):
+        if type(component) is not dict:
+            raise TypeError(f"{owner} '{key}' component at index {index} must be a dict, got {type(component).__name__}")
+    return cast(list[MutableMapping[str, Any]], components)
 
 
-def _authored_options(component: object) -> dict[str, Any] | None:
-    if not isinstance(component, Mapping):
-        return None
-    options = component.get("options")
-    if not isinstance(options, Mapping):
-        return None
+def _authored_sources(config: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    if "sources" in config:
+        return _required_component_mapping(config, "sources", owner="Audit-safe authored settings")
+    if "source" in config:
+        source = config["source"]
+        if type(source) is not dict:
+            raise TypeError(f"Audit-safe authored settings 'source' must be a dict, got {type(source).__name__}")
+        return {"source": cast(dict[str, Any], source)}
+    raise KeyError("Audit-safe authored settings require 'sources' or historical 'source'")
+
+
+def _authored_named_components(config: Mapping[str, Any], key: str) -> dict[str, dict[str, Any]]:
+    if key in config:
+        raw = config[key]
+    else:
+        raw = None
+    if raw is None:
+        raw = []
+    if type(raw) is not list:
+        raise TypeError(f"Audit-safe authored settings '{key}' must be a list, got {type(raw).__name__}")
+    components = raw
+    by_name: dict[str, dict[str, Any]] = {}
+    for index, component in enumerate(components):
+        if type(component) is not dict:
+            raise TypeError(
+                f"Audit-safe authored settings '{key}' component at index {index} must be a dict, got {type(component).__name__}"
+            )
+        component_config = cast(dict[str, Any], component)
+        name = component_config["name"]
+        if type(name) is not str:
+            raise TypeError(f"Audit-safe authored settings '{key}' component at index {index} has non-string name {type(name).__name__}")
+        by_name[name] = component_config
+    return by_name
+
+
+def _authored_options(component: Mapping[str, Any]) -> dict[str, Any]:
+    options = component["options"]
+    if type(options) is not dict:
+        raise TypeError(f"Audit-safe authored plugin options must be a dict, got {type(options).__name__}")
     return cast(dict[str, Any], deep_thaw(options))
 
 
@@ -338,36 +384,45 @@ def _audit_safe_plugin_configs(
     authored_sources = _authored_sources(audit_safe_settings)
     authored_transforms = _authored_named_components(audit_safe_settings, "transforms")
     authored_aggregations = _authored_named_components(audit_safe_settings, "aggregations")
-    authored_sinks = audit_safe_settings.get("sinks")
-    sink_map = authored_sinks if isinstance(authored_sinks, Mapping) else {}
+    authored_sinks = _required_component_mapping(
+        audit_safe_settings,
+        "sinks",
+        owner="Audit-safe authored settings",
+    )
     restored: list[tuple[Any, Any]] = []
 
-    def substitute(plugin: Any, component: object, plugin_id: PluginId) -> None:
+    def substitute(
+        plugin: Any,
+        authored_components: Mapping[str, Mapping[str, Any]],
+        component_name: str,
+        plugin_id: PluginId,
+    ) -> None:
         if plugin_id not in profiled:
             return
+        component = authored_components[component_name]
         options = _authored_options(component)
-        if options is None:
-            raise RuntimeError("Audit-safe authored settings are missing profiled plugin options.")
         restored.append((plugin, plugin.config))
         plugin.config = options
 
     try:
         for source_name, source in bundle.sources.items():
-            substitute(source, authored_sources.get(source_name), PluginId("source", source.name))
+            substitute(source, authored_sources, source_name, PluginId("source", source.name))
         for wired in bundle.transforms:
             substitute(
                 wired.plugin,
-                authored_transforms.get(wired.settings.name),
+                authored_transforms,
+                wired.settings.name,
                 PluginId("transform", wired.settings.plugin),
             )
         for aggregation_name, (plugin, aggregation_settings) in bundle.aggregations.items():
             substitute(
                 plugin,
-                authored_aggregations.get(aggregation_name),
+                authored_aggregations,
+                aggregation_name,
                 PluginId("transform", aggregation_settings.plugin),
             )
         for sink_name, sink in bundle.sinks.items():
-            substitute(sink, sink_map.get(sink_name), PluginId("sink", sink.name))
+            substitute(sink, authored_sinks, sink_name, PluginId("sink", sink.name))
         yield
     finally:
         for plugin, executable_config in restored:
@@ -389,38 +444,46 @@ def audit_safe_resolved_config(
     authored_sources = _authored_sources(audit_safe_settings)
     authored_transforms = _authored_named_components(audit_safe_settings, "transforms")
     authored_aggregations = _authored_named_components(audit_safe_settings, "aggregations")
-    authored_sinks = audit_safe_settings.get("sinks")
-    sink_map = authored_sinks if isinstance(authored_sinks, Mapping) else {}
+    authored_sinks = _required_component_mapping(
+        audit_safe_settings,
+        "sinks",
+        owner="Audit-safe authored settings",
+    )
 
-    def restore_options(component: dict[str, Any], authored: object, kind: str) -> None:
-        plugin_name = component.get("plugin")
-        if not isinstance(plugin_name, str) or PluginId(cast(Any, kind), plugin_name) not in profiled:
+    def restore_options(
+        component: dict[str, Any],
+        authored_components: Mapping[str, Mapping[str, Any]],
+        component_name: str,
+        kind: PluginKind,
+    ) -> None:
+        plugin_name = component["plugin"]
+        if PluginId(kind, plugin_name) not in profiled:
             return
-        options = _authored_options(authored)
-        if options is None:
-            raise RuntimeError("Audit-safe authored settings are missing profiled plugin options.")
-        component["options"] = options
+        authored = authored_components[component_name]
+        component["options"] = _authored_options(authored)
 
-    resolved_sources = resolved.get("sources")
-    if isinstance(resolved_sources, dict):
-        for source_name, component in resolved_sources.items():
-            if isinstance(component, dict):
-                restore_options(component, authored_sources.get(source_name), "source")
-    resolved_transforms = resolved.get("transforms")
-    if isinstance(resolved_transforms, list):
-        for component in resolved_transforms:
-            if isinstance(component, dict):
-                restore_options(component, authored_transforms.get(str(component.get("name"))), "transform")
-    resolved_aggregations = resolved.get("aggregations")
-    if isinstance(resolved_aggregations, list):
-        for component in resolved_aggregations:
-            if isinstance(component, dict):
-                restore_options(component, authored_aggregations.get(str(component.get("name"))), "transform")
-    resolved_sinks = resolved.get("sinks")
-    if isinstance(resolved_sinks, dict):
-        for sink_name, component in resolved_sinks.items():
-            if isinstance(component, dict):
-                restore_options(component, sink_map.get(sink_name), "sink")
+    resolved_sources = _required_component_mapping(resolved, "sources", owner="Resolved audit config")
+    for source_name, source_component in resolved_sources.items():
+        restore_options(source_component, authored_sources, source_name, "source")
+    resolved_transforms = _required_component_list(resolved, "transforms", owner="Resolved audit config")
+    for transform_component in resolved_transforms:
+        restore_options(
+            cast(dict[str, Any], transform_component),
+            authored_transforms,
+            transform_component["name"],
+            "transform",
+        )
+    resolved_aggregations = _required_component_list(resolved, "aggregations", owner="Resolved audit config")
+    for aggregation_component in resolved_aggregations:
+        restore_options(
+            cast(dict[str, Any], aggregation_component),
+            authored_aggregations,
+            aggregation_component["name"],
+            "transform",
+        )
+    resolved_sinks = _required_component_mapping(resolved, "sinks", owner="Resolved audit config")
+    for sink_name, sink_component in resolved_sinks.items():
+        restore_options(sink_component, authored_sinks, sink_name, "sink")
     return resolved
 
 
@@ -437,6 +500,7 @@ def build_runtime_graph(settings: ElspethSettings, bundle: PluginBundle) -> Exec
         gates=list(settings.gates),
         coalesce_settings=(list(settings.coalesce) if settings.coalesce else None),
         queues=settings.queues,
+        row_union_settings=(list(settings.row_unions) if settings.row_unions else None),
     )
 
 

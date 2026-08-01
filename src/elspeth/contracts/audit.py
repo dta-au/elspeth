@@ -643,25 +643,25 @@ class SinkEffect:
     finalized_at: datetime | None
 
     def __post_init__(self) -> None:
-        for field_name in (
-            "effect_id",
-            "config_hash",
-            "membership_or_manifest_hash",
-            "group_payload_hash",
-            "artifact_id",
+        for field_name, required_hash_value in (
+            ("effect_id", self.effect_id),
+            ("config_hash", self.config_hash),
+            ("membership_or_manifest_hash", self.membership_or_manifest_hash),
+            ("group_payload_hash", self.group_payload_hash),
+            ("artifact_id", self.artifact_id),
         ):
-            _validate_hash(getattr(self, field_name), field_name)
-        for field_name in (
-            "plan_hash",
-            "expected_descriptor_hash",
-            "precondition_hash",
-            "reconcile_evidence_hash",
-            "result_descriptor_hash",
-            "primary_effect_id",
-            "stream_id",
-            "predecessor_effect_id",
+            _validate_hash(required_hash_value, field_name)
+        for field_name, optional_hash_value in (
+            ("plan_hash", self.plan_hash),
+            ("expected_descriptor_hash", self.expected_descriptor_hash),
+            ("precondition_hash", self.precondition_hash),
+            ("reconcile_evidence_hash", self.reconcile_evidence_hash),
+            ("result_descriptor_hash", self.result_descriptor_hash),
+            ("primary_effect_id", self.primary_effect_id),
+            ("stream_id", self.stream_id),
+            ("predecessor_effect_id", self.predecessor_effect_id),
         ):
-            _validate_hash(getattr(self, field_name), field_name, optional=True)
+            _validate_hash(optional_hash_value, field_name, optional=True)
         _validate_nonempty_string(self.protocol_version, "protocol_version")
         _validate_nonempty_string(self.artifact_idempotency_key, "artifact_idempotency_key")
         _validate_nonempty_string(self.target_json, "target_json")
@@ -798,10 +798,19 @@ class SinkEffectMemberRecord:
         require_int(self.ordinal, "ordinal", min_value=0)
         require_int(self.ingest_sequence, "ingest_sequence", min_value=0)
         _validate_nonempty_string(self.lineage_json, "lineage_json")
-        for field_name in ("lineage_hash", "payload_hash"):
-            _validate_hash(getattr(self, field_name), field_name)
-        for field_name in ("primary_effect_id", "reason_hash", "member_effect_id", "descriptor_hash", "evidence_hash"):
-            _validate_hash(getattr(self, field_name), field_name, optional=True)
+        for field_name, required_hash_value in (
+            ("lineage_hash", self.lineage_hash),
+            ("payload_hash", self.payload_hash),
+        ):
+            _validate_hash(required_hash_value, field_name)
+        for field_name, optional_hash_value in (
+            ("primary_effect_id", self.primary_effect_id),
+            ("reason_hash", self.reason_hash),
+            ("member_effect_id", self.member_effect_id),
+            ("descriptor_hash", self.descriptor_hash),
+            ("evidence_hash", self.evidence_hash),
+        ):
+            _validate_hash(optional_hash_value, field_name, optional=True)
         if (self.role is SinkEffectRole.PRIMARY) != (self.primary_effect_id is None):
             raise ValueError("sink effect member primary linkage must match its role")
         if self.prepared_disposition not in (None, "accepted", "diverted"):
@@ -891,38 +900,38 @@ class AuditExportSnapshot:
             raise ValueError("audit export snapshot requires an immutable export-terminal run")
         _validate_enum(self.export_format, AuditExportFormat, "export_format")
         _validate_enum(self.signing_mode, AuditExportSigningMode, "signing_mode")
-        for field_name in (
-            "snapshot_id",
-            "registry_key_hash",
-            "public_export_config_hash",
-            "manifest_hash",
-            "last_chunk_seal_hash",
-            "snapshot_hash",
-            "snapshot_seal_hash",
-            "final_hash",
-            "signed_manifest_hash",
+        for field_name, hash_value in (
+            ("snapshot_id", self.snapshot_id),
+            ("registry_key_hash", self.registry_key_hash),
+            ("public_export_config_hash", self.public_export_config_hash),
+            ("manifest_hash", self.manifest_hash),
+            ("last_chunk_seal_hash", self.last_chunk_seal_hash),
+            ("snapshot_hash", self.snapshot_hash),
+            ("snapshot_seal_hash", self.snapshot_seal_hash),
+            ("final_hash", self.final_hash),
+            ("signed_manifest_hash", self.signed_manifest_hash),
         ):
-            _validate_hash(getattr(self, field_name), field_name)
+            _validate_hash(hash_value, field_name)
         _validate_hash(self.signature_hex, "signature_hex", optional=True)
-        for field_name in (
-            "exporter_version",
-            "serialization_version",
-            "signer_key_id",
-            "derivation_version",
-            "chunking_algorithm_version",
-            "content_store_id",
-            "record_chain_algorithm",
+        for field_name, string_value in (
+            ("exporter_version", self.exporter_version),
+            ("serialization_version", self.serialization_version),
+            ("signer_key_id", self.signer_key_id),
+            ("derivation_version", self.derivation_version),
+            ("chunking_algorithm_version", self.chunking_algorithm_version),
+            ("content_store_id", self.content_store_id),
+            ("record_chain_algorithm", self.record_chain_algorithm),
         ):
-            _validate_nonempty_string(getattr(self, field_name), field_name)
-        for field_name in (
-            "per_chunk_record_limit",
-            "per_chunk_byte_limit",
-            "record_count",
-            "total_bytes",
-            "chunk_count",
-            "signed_manifest_size_bytes",
+            _validate_nonempty_string(string_value, field_name)
+        for field_name, integer_value in (
+            ("per_chunk_record_limit", self.per_chunk_record_limit),
+            ("per_chunk_byte_limit", self.per_chunk_byte_limit),
+            ("record_count", self.record_count),
+            ("total_bytes", self.total_bytes),
+            ("chunk_count", self.chunk_count),
+            ("signed_manifest_size_bytes", self.signed_manifest_size_bytes),
         ):
-            require_int(getattr(self, field_name), field_name, min_value=1)
+            require_int(integer_value, field_name, min_value=1)
         require_int(self.terminal_chunk_ordinal, "terminal_chunk_ordinal", min_value=0)
         if self.terminal_chunk_ordinal != self.chunk_count - 1:
             raise ValueError("terminal_chunk_ordinal must equal chunk_count - 1")
@@ -1045,8 +1054,10 @@ class Artifact:
             "inherited": False,
             "virtual": False,
         }
-        expected = evidence_performed.get(self.publication_evidence_kind)
-        if expected is None or self.publication_performed is not expected:
+        if self.publication_evidence_kind not in evidence_performed:
+            raise ValueError("effect artifact publication evidence is invalid or contradicts publication_performed")
+        expected = evidence_performed[self.publication_evidence_kind]
+        if self.publication_performed is not expected:
             raise ValueError("effect artifact publication evidence is invalid or contradicts publication_performed")
 
     @property

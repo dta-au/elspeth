@@ -57,30 +57,26 @@ def _control_manifest_bind_retained_evidence_locked(
         manifest=manifest,
     )
     if require_complete:
-        scenarios = receipt["scenarios"]
-        assert isinstance(scenarios, dict)
+        scenarios = cast(dict[str, object], receipt["scenarios"])
         if any(
             not cast(dict[str, object], scenarios[scenario_id])["cloudwatch_retained_metrics"]
             or not cast(dict[str, object], scenarios[scenario_id])["xray_retained_trace_ids"]
             for scenario_id in ("A", "B")
         ):
             raise AcceptanceCheckError("retained_evidence_incomplete")
-    evidence = manifest["evidence"]
-    assert isinstance(evidence, dict)
+    evidence = cast(dict[str, object], manifest["evidence"])
     if evidence["retained_evidence_path"] is not None:
         if evidence["retained_evidence_path"] == protected_path and evidence["retained_evidence_sha256"] == receipt_sha256:
             return manifest
         previous = _load_retained_evidence(manifest)
         if _control_timestamp(cast(str, receipt["captured_at"])) < _control_timestamp(cast(str, previous["captured_at"])):
             raise AcceptanceCheckError("retained_evidence_conflict")
-        previous_scenarios = previous["scenarios"]
-        next_scenarios = receipt["scenarios"]
-        assert isinstance(previous_scenarios, dict) and isinstance(next_scenarios, dict)
+        previous_scenarios = cast(dict[str, object], previous["scenarios"])
+        next_scenarios = cast(dict[str, object], receipt["scenarios"])
         grew = False
         for scenario_id in ("A", "B"):
-            previous_scenario = previous_scenarios[scenario_id]
-            next_scenario = next_scenarios[scenario_id]
-            assert isinstance(previous_scenario, dict) and isinstance(next_scenario, dict)
+            previous_scenario = cast(dict[str, object], previous_scenarios[scenario_id])
+            next_scenario = cast(dict[str, object], next_scenarios[scenario_id])
             previous_metrics = {
                 json.dumps(item, sort_keys=True, separators=(",", ":"))
                 for item in cast(list[dict[str, object]], previous_scenario["cloudwatch_retained_metrics"])
@@ -144,18 +140,16 @@ def control_manifest_checkpoint_operator_evidence(
         _read_protected_document(Path(_control_path(exec_receipt_path)), check="operator_exec_receipt_file")
     )
     scenario_id = exec_receipt["scenario_id"]
-    details = exec_receipt["details"]
+    details = cast(dict[str, object], exec_receipt["details"])
     if (
         exec_receipt["check"] != "verify-operator-telemetry"
         or exec_receipt["candidate_sha"] != manifest["candidate_sha"]
         or scenario_id not in {"A", "B"}
-        or not isinstance(details, dict)
         or details["phase"] != "positive"
     ):
         raise AcceptanceCheckError("retained_evidence_binding")
-    metric_query = details["retained_metric_query"]
-    trace_id = details["retained_trace_id"]
-    assert isinstance(metric_query, dict) and isinstance(trace_id, str)
+    metric_query = cast(dict[str, object], details["retained_metric_query"])
+    trace_id = cast(str, details["retained_trace_id"])
     protected_checkpoint = Path(_control_path(checkpoint_path))
     current = now()
 
@@ -164,18 +158,14 @@ def control_manifest_checkpoint_operator_evidence(
             _read_protected_document(protected_checkpoint, check="retained_evidence_file"),
             manifest=manifest,
         )
-        existing_scenarios = existing["scenarios"]
-        assert isinstance(existing_scenarios, dict)
-        existing_scenario = existing_scenarios[scenario_id]
-        assert isinstance(existing_scenario, dict)
-        if (
-            metric_query not in existing_scenario["cloudwatch_retained_metrics"]
-            or trace_id not in existing_scenario["xray_retained_trace_ids"]
-        ):
+        existing_scenarios = cast(dict[str, object], existing["scenarios"])
+        existing_scenario = cast(dict[str, object], existing_scenarios[scenario_id])
+        existing_metrics = cast(list[dict[str, object]], existing_scenario["cloudwatch_retained_metrics"])
+        existing_traces = cast(list[str], existing_scenario["xray_retained_trace_ids"])
+        if metric_query not in existing_metrics or trace_id not in existing_traces:
             raise AcceptanceCheckError("retained_evidence_conflict")
     else:
-        evidence = manifest["evidence"]
-        assert isinstance(evidence, dict)
+        evidence = cast(dict[str, object], manifest["evidence"])
         if evidence["retained_evidence_path"] is None:
             scenarios: dict[str, object] = {
                 scenario: {
@@ -189,8 +179,7 @@ def control_manifest_checkpoint_operator_evidence(
         else:
             previous = _load_retained_evidence(manifest)
             scenarios = json.loads(json.dumps(previous["scenarios"]))
-        scenario = scenarios[scenario_id]
-        assert isinstance(scenario, dict)
+        scenario = cast(dict[str, object], scenarios[scenario_id])
         metrics = cast(list[dict[str, object]], scenario["cloudwatch_retained_metrics"])
         traces = cast(list[str], scenario["xray_retained_trace_ids"])
         if metric_query in metrics or trace_id in traces:
@@ -262,12 +251,10 @@ def control_manifest_init(
         expected_phase="preapply",
     )
     _validate_scenario_inventory_isolation(scenario_a_document, scenario_b_document)
-    scenario_a_values = scenario_a_document["values"]
-    scenario_b_values = scenario_b_document["values"]
-    assert isinstance(scenario_a_values, dict) and isinstance(scenario_b_values, dict)
-    scenario_a_binding_path = scenario_a_values["SCENARIO_TF_BINDING_FILE"]
-    scenario_b_binding_path = scenario_b_values["SCENARIO_TF_BINDING_FILE"]
-    assert isinstance(scenario_a_binding_path, str) and isinstance(scenario_b_binding_path, str)
+    scenario_a_values = cast(dict[str, object], scenario_a_document["values"])
+    scenario_b_values = cast(dict[str, object], scenario_b_document["values"])
+    scenario_a_binding_path = cast(str, scenario_a_values["SCENARIO_TF_BINDING_FILE"])
+    scenario_b_binding_path = cast(str, scenario_b_values["SCENARIO_TF_BINDING_FILE"])
     _, scenario_a_state_identity = _validate_tf_binding_receipt(
         Path(scenario_a_binding_path),
         scenario_id="A",
@@ -381,11 +368,9 @@ def control_manifest_bind_scenario(
         raise AcceptanceCheckError("scenario_inventory_binding")
     manifest = _read_control_manifest(path)
     _require_mutable_control_manifest(manifest)
-    scenarios = manifest["scenarios"]
-    aws = manifest["aws"]
-    assert isinstance(scenarios, dict) and isinstance(aws, dict)
-    scenario = scenarios[scenario_id]
-    assert isinstance(scenario, dict)
+    scenarios = cast(dict[str, object], manifest["scenarios"])
+    aws = cast(dict[str, object], manifest["aws"])
+    scenario = cast(dict[str, object], scenarios[scenario_id])
     resolved_path = _control_path(inventory_path)
     inventory = _validate_scenario_inventory(
         _read_protected_document(Path(resolved_path), check="scenario_inventory_file"),
@@ -413,12 +398,10 @@ def control_manifest_bind_scenario(
     ):
         raise AcceptanceCheckError("scenario_inventory_unresolved")
     preapply = _load_preapply_scenario_inventory(manifest, scenario_id)
-    preapply_values = preapply["values"]
-    preapply_orphan = preapply["orphan_sweep"]
-    values = inventory["values"]
-    orphan = inventory["orphan_sweep"]
-    assert isinstance(values, dict) and isinstance(orphan, dict)
-    assert isinstance(preapply_values, dict) and isinstance(preapply_orphan, dict)
+    preapply_values = cast(dict[str, object], preapply["values"])
+    preapply_orphan = cast(dict[str, object], preapply["orphan_sweep"])
+    values = cast(dict[str, object], inventory["values"])
+    orphan = cast(dict[str, object], inventory["orphan_sweep"])
     if any(values[field] != preapply_values[field] for field in _SCENARIO_VALUE_FIELDS - _RESOLVED_SCENARIO_FIELDS):
         raise AcceptanceCheckError("scenario_inventory_conflict")
     if any(orphan[field] != preapply_orphan[field] for field in _ORPHAN_INVENTORY_FIELDS - _PROVIDER_GENERATED_ORPHAN_FIELDS):
@@ -436,8 +419,6 @@ def control_manifest_bind_scenario(
     if state_identity != scenario["tf_state_identity_sha256"]:
         raise AcceptanceCheckError("tf_binding_binding")
     other_id = "B" if scenario_id == "A" else "A"
-    other_scenario = scenarios[other_id]
-    assert isinstance(other_scenario, dict)
     other_inventory = _load_bound_scenario_inventory(manifest, other_id)
     _validate_scenario_inventory_isolation(
         inventory if scenario_id == "A" else other_inventory, other_inventory if scenario_id == "A" else inventory

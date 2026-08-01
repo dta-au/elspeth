@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 import sys
@@ -176,9 +177,7 @@ def _bedrock_receipt_projection(
         "response_usage.cost": "provider_reported",
         "_hidden_params.response_cost": "litellm_calculated",
     }
-    cost_source = cost_sources.get(record.provider_cost_source)
-    if cost_source is None:
-        raise AcceptanceCheckError("bedrock_metadata")
+    cost_source = cost_sources[record.provider_cost_source]
     return {
         "returned_model_sha256": _sha256(record.model_returned.encode("utf-8")),
         "provider_request_id_sha256": _sha256(record.provider_request_id.encode("utf-8")),
@@ -247,15 +246,87 @@ def _build_operator_profile_registry(settings: Any) -> OperatorProfileRegistry:
     return OperatorProfileRegistry(policy=policy, settings=runtime)
 
 
+_GUARDRAIL_GATE_ENV = "ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS"
+
+_MAX_GUARDRAIL_CONFIG_ENV_BYTES = 64 * 1024
+
+
+def _guardrail_config_defaults(env: Mapping[str, str], plugin_id: str) -> tuple[str | None, str | None]:
+    """Derive (alias, version) defaults from the rendered guardrail policy env.
+
+    The deployment already renders ``ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES``
+    (plugin -> approved alias) and ``ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES``
+    (approved bindings including ``guardrail_version``) into the task
+    definition, so the live check can default the PROFILE_ALIAS and
+    EXPECTED_VERSION inputs from them.  The safe/blocked probe texts stay
+    operator-supplied: the check needs a human-chosen attack string.
+    Unparseable or non-matching config yields no default and the input is
+    reported missing.
+    """
+
+    raw_defaults = env.get("ELSPETH_WEB__BEDROCK_GUARDRAIL_DEFAULT_PROFILES")
+    raw_profiles = env.get("ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES")
+    if (
+        type(raw_defaults) is not str
+        or type(raw_profiles) is not str
+        or len(raw_defaults) > _MAX_GUARDRAIL_CONFIG_ENV_BYTES
+        or len(raw_profiles) > _MAX_GUARDRAIL_CONFIG_ENV_BYTES
+    ):
+        return None, None
+    try:
+        defaults = json.loads(raw_defaults)
+        profiles = json.loads(raw_profiles)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, None
+    if not isinstance(defaults, dict) or not isinstance(profiles, list):
+        return None, None
+    alias = defaults.get(plugin_id)
+    if type(alias) is not str or not alias:
+        return None, None
+    versions = [
+        profile.get("guardrail_version")
+        for profile in profiles
+        if isinstance(profile, dict) and profile.get("plugin") == plugin_id and profile.get("alias") == alias
+    ]
+    if len(versions) != 1 or type(versions[0]) is not str:
+        return alias, None
+    return alias, versions[0]
+
+
 def _guardrail_live_inputs(env: Mapping[str, str]) -> tuple[tuple[str, str, str, str, str], ...]:
-    if env.get("ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS") != "1":
+    gate = env.get(_GUARDRAIL_GATE_ENV)
+    if gate is None:
+        raise AcceptanceCheckError("guardrails_live_inputs_missing", missing=(_GUARDRAIL_GATE_ENV,))
+    if gate != "1":
         raise AcceptanceCheckError("guardrails_gate")
-    values: list[tuple[str, str, str, str, str]] = []
+    missing: list[str] = []
+    resolved: list[tuple[str, str | None, str | None, str | None, str | None]] = []
     for plugin_id, alias_name, safe_name, blocked_name, version_name in _GUARDRAIL_INPUTS:
+        default_alias, default_version = _guardrail_config_defaults(env, plugin_id)
         alias = env.get(alias_name)
+        if alias is None:
+            alias = default_alias
+        version = env.get(version_name)
+        if version is None and env.get(alias_name) in {None, default_alias}:
+            # The rendered-config version default only binds to the
+            # rendered-config alias; an operator-supplied divergent alias
+            # must supply its own expected version.
+            version = default_version
         safe_text = env.get(safe_name)
         blocked_text = env.get(blocked_name)
-        version = env.get(version_name)
+        if alias is None:
+            missing.append(alias_name)
+        if version is None:
+            missing.append(version_name)
+        if safe_text is None:
+            missing.append(safe_name)
+        if blocked_text is None:
+            missing.append(blocked_name)
+        resolved.append((plugin_id, alias, safe_text, blocked_text, version))
+    if missing:
+        raise AcceptanceCheckError("guardrails_live_inputs_missing", missing=tuple(missing))
+    values: list[tuple[str, str, str, str, str]] = []
+    for plugin_id, alias, safe_text, blocked_text, version in resolved:
         if (
             type(alias) is not str
             or not alias
@@ -333,11 +404,14 @@ def build_plugin_policy_acceptance(
             secret_inventory=_AcceptanceSecretInventory(),
             generation_key=secret_key.encode("utf-8"),
         )
+        tutorial_state_profile = runtime.default_llm_profile
+        if tutorial_state_profile is None:
+            tutorial_state_profile = ""
         readiness = build_plugin_policy_readiness(
             policy=policy,
             snapshot=snapshot,
-            tutorial_profile=runtime.tutorial_llm_profile,
-            tutorial_state=_canonical_tutorial_policy_state(profile_alias=runtime.tutorial_llm_profile or ""),
+            tutorial_profile=runtime.default_llm_profile,
+            tutorial_state=_canonical_tutorial_policy_state(profile_alias=tutorial_state_profile),
             profile_registry=profiles,
             catalog=catalog,
         )
@@ -347,32 +421,61 @@ def build_plugin_policy_acceptance(
     selected = dict(snapshot.selected)
     aliases = dict(snapshot.selected_profile_aliases)
     modes = dict(snapshot.control_modes)
-    tutorial_alias = runtime.tutorial_llm_profile
+    tutorial_alias = runtime.default_llm_profile
     llm_profiles = dict(runtime.llm_profiles)
-    tutorial_profile = llm_profiles.get(tutorial_alias) if tutorial_alias is not None else None
+    tutorial_profile = None
+    if tutorial_alias is not None:
+        tutorial_profile = llm_profiles[tutorial_alias]
     readiness_rows = {row.id: row for row in readiness.rows}
-    profile_row = readiness_rows.get("tutorial_profile")
-    coverage_row = readiness_rows.get("tutorial_required_control_coverage")
+    profile_row = readiness_rows["tutorial_profile"]
+    coverage_row = readiness_rows["tutorial_required_control_coverage"]
+    tutorial_profile_region: object = None
+    if tutorial_profile is not None:
+        tutorial_profile_options = dict(tutorial_profile.provider_options)
+        if "region_name" in tutorial_profile_options:
+            tutorial_profile_region = tutorial_profile_options["region_name"]
+    selected_llm = None
+    if PluginCapability.LLM in selected:
+        selected_llm = selected[PluginCapability.LLM]
+    selected_prompt_shield = None
+    if PluginCapability.PROMPT_SHIELD in selected:
+        selected_prompt_shield = selected[PluginCapability.PROMPT_SHIELD]
+    selected_content_safety = None
+    if PluginCapability.CONTENT_SAFETY in selected:
+        selected_content_safety = selected[PluginCapability.CONTENT_SAFETY]
+    prompt_shield_mode = None
+    if PluginCapability.PROMPT_SHIELD in modes:
+        prompt_shield_mode = modes[PluginCapability.PROMPT_SHIELD]
+    content_safety_mode = None
+    if PluginCapability.CONTENT_SAFETY in modes:
+        content_safety_mode = modes[PluginCapability.CONTENT_SAFETY]
+    llm_alias = None
+    if llm_id in aliases:
+        llm_alias = aliases[llm_id]
+    prompt_shield_alias = None
+    if prompt_id in aliases:
+        prompt_shield_alias = aliases[prompt_id]
+    content_safety_alias = None
+    if content_id in aliases:
+        content_safety_alias = aliases[content_id]
     if (
         tutorial_alias is None
         or tutorial_profile is None
         or tutorial_profile.provider != "bedrock"
         or tutorial_profile.model != live_model
-        or dict(tutorial_profile.provider_options).get("region_name") != live_region
+        or tutorial_profile_region != live_region
         or readiness.tutorial_ready is not False
-        or profile_row is None
         or profile_row.status == "error"
-        or coverage_row is None
         or coverage_row.status != "error"
         or not {llm_id, prompt_id, content_id} <= snapshot.available
-        or selected.get(PluginCapability.LLM) != llm_id
-        or selected.get(PluginCapability.PROMPT_SHIELD) != prompt_id
-        or selected.get(PluginCapability.CONTENT_SAFETY) != content_id
-        or modes.get(PluginCapability.PROMPT_SHIELD) is not ControlMode.REQUIRED
-        or modes.get(PluginCapability.CONTENT_SAFETY) is not ControlMode.REQUIRED
-        or aliases.get(llm_id) != tutorial_alias
-        or aliases.get(prompt_id) != expected_aliases["aws_bedrock_prompt_shield"]
-        or aliases.get(content_id) != expected_aliases["aws_bedrock_content_safety"]
+        or selected_llm != llm_id
+        or selected_prompt_shield != prompt_id
+        or selected_content_safety != content_id
+        or prompt_shield_mode is not ControlMode.REQUIRED
+        or content_safety_mode is not ControlMode.REQUIRED
+        or llm_alias != tutorial_alias
+        or prompt_shield_alias != expected_aliases["aws_bedrock_prompt_shield"]
+        or content_safety_alias != expected_aliases["aws_bedrock_content_safety"]
     ):
         raise AcceptanceCheckError("plugin_policy_selection")
 
@@ -424,6 +527,8 @@ def verify_bedrock_guardrails(
     try:
         settings = settings_loader()
         registry = registry_factory(settings)
+    except AcceptanceCheckError:
+        raise
     except Exception:
         raise AcceptanceCheckError("guardrails_settings") from None
     checked_at = _utc_timestamp(now())
@@ -502,6 +607,11 @@ def run_bedrock_guardrails_live(
         settings = settings_loader()
         policy_evidence, policy_receipt = policy_acceptance_factory(settings, env)
         manager = telemetry_manager_factory(settings)
+    except AcceptanceCheckError:
+        # A named check failure (for example ``guardrails_live_inputs_missing``
+        # or ``guardrails_gate``) must surface as itself, never be
+        # re-labelled as a settings failure (F13).
+        raise
     except Exception:
         raise AcceptanceCheckError("guardrails_settings") from None
 

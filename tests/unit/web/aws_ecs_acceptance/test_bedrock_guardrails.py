@@ -244,7 +244,7 @@ def _guardrail_env(**updates: str) -> dict[str, str]:
             },
             separators=(",", ":"),
         ),
-        "ELSPETH_WEB__TUTORIAL_LLM_PROFILE": "tutorial",
+        "ELSPETH_WEB__DEFAULT_LLM_PROFILE": "tutorial",
         "ELSPETH_WEB__BEDROCK_GUARDRAIL_PROFILES": json.dumps(
             [
                 {
@@ -429,6 +429,138 @@ def test_verify_bedrock_guardrails_fails_closed_on_invalid_gate_or_fixture_input
         )
 
 
+def test_verify_bedrock_guardrails_names_missing_live_inputs_exactly() -> None:
+    env = _guardrail_env()
+    del env["ELSPETH_LIVE_BEDROCK_PROMPT_SAFE_TEXT"]
+    del env["ELSPETH_LIVE_BEDROCK_CONTENT_BLOCKED_TEXT"]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="guardrails_live_inputs_missing") as raised:
+        acceptance.verify_bedrock_guardrails(
+            env,
+            settings_loader=pytest.fail,
+            registry_factory=pytest.fail,
+            execution=object(),
+        )
+
+    assert raised.value.missing == (
+        "ELSPETH_LIVE_BEDROCK_PROMPT_SAFE_TEXT",
+        "ELSPETH_LIVE_BEDROCK_CONTENT_BLOCKED_TEXT",
+    )
+
+
+def test_verify_bedrock_guardrails_reports_absent_gate_env_as_missing_input() -> None:
+    env = _guardrail_env()
+    del env["ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS"]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="guardrails_live_inputs_missing") as raised:
+        acceptance.verify_bedrock_guardrails(
+            env,
+            settings_loader=pytest.fail,
+            registry_factory=pytest.fail,
+            execution=object(),
+        )
+
+    assert raised.value.missing == ("ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS",)
+
+
+def test_verify_bedrock_guardrails_defaults_alias_and_version_from_rendered_policy_env() -> None:
+    env = _guardrail_env()
+    for name in (
+        "ELSPETH_LIVE_BEDROCK_PROMPT_PROFILE_ALIAS",
+        "ELSPETH_LIVE_BEDROCK_PROMPT_EXPECTED_VERSION",
+        "ELSPETH_LIVE_BEDROCK_CONTENT_PROFILE_ALIAS",
+        "ELSPETH_LIVE_BEDROCK_CONTENT_EXPECTED_VERSION",
+    ):
+        del env[name]
+    profiles = {
+        "transform:aws_bedrock_prompt_shield": SimpleNamespace(
+            alias="prompt-approved", plugin="aws_bedrock_prompt_shield", guardrail_version="7"
+        ),
+        "transform:aws_bedrock_content_safety": SimpleNamespace(
+            alias="content-approved", plugin="aws_bedrock_content_safety", guardrail_version="11"
+        ),
+    }
+    resolved: list[tuple[str, str]] = []
+
+    class Registry:
+        def approved_bedrock_guardrail_profile(self, plugin_id: object, *, alias: str) -> object:
+            resolved.append((str(plugin_id), alias))
+            return profiles[str(plugin_id)]
+
+    def checker(**kwargs: object) -> object:
+        profile = kwargs["profile"]
+        return SimpleNamespace(
+            plugin_id=profile.plugin,  # type: ignore[attr-defined]
+            profile_alias=profile.alias,  # type: ignore[attr-defined]
+            safe_case_passed=True,
+            attack_case_blocked=True,
+            request_ids_present=True,
+        )
+
+    receipt = acceptance.verify_bedrock_guardrails(
+        env,
+        settings_loader=lambda: object(),
+        registry_factory=lambda _settings: Registry(),
+        execution=object(),
+        checker=checker,
+        now=lambda: datetime(2026, 7, 30, 1, 2, 3, tzinfo=UTC),
+    )
+
+    assert resolved == [
+        ("transform:aws_bedrock_prompt_shield", "prompt-approved"),
+        ("transform:aws_bedrock_content_safety", "content-approved"),
+    ]
+    controls = receipt["controls"]
+    assert [control["guardrail_version"] for control in controls] == ["7", "11"]  # type: ignore[index]
+
+
+def test_verify_bedrock_guardrails_never_defaults_version_for_divergent_operator_alias() -> None:
+    env = _guardrail_env(ELSPETH_LIVE_BEDROCK_PROMPT_PROFILE_ALIAS="operator-divergent-alias")
+    del env["ELSPETH_LIVE_BEDROCK_PROMPT_EXPECTED_VERSION"]
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="guardrails_live_inputs_missing") as raised:
+        acceptance.verify_bedrock_guardrails(
+            env,
+            settings_loader=pytest.fail,
+            registry_factory=pytest.fail,
+            execution=object(),
+        )
+
+    assert raised.value.missing == ("ELSPETH_LIVE_BEDROCK_PROMPT_EXPECTED_VERSION",)
+
+
+def test_verify_bedrock_guardrails_keeps_settings_code_for_genuine_settings_failures() -> None:
+    def settings_loader() -> object:
+        raise RuntimeError("raw settings failure sentinel")
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="guardrails_settings") as raised:
+        acceptance.verify_bedrock_guardrails(
+            _guardrail_env(),
+            settings_loader=settings_loader,
+            registry_factory=pytest.fail,
+            execution=object(),
+        )
+    assert "raw settings failure sentinel" not in str(raised.value)
+
+
+def test_guardrail_live_owner_surfaces_named_check_failures_instead_of_settings_code() -> None:
+    def policy_factory(_settings: object, _env: object) -> object:
+        raise acceptance.AcceptanceCheckError(
+            "guardrails_live_inputs_missing",
+            missing=("ELSPETH_LIVE_BEDROCK_PROMPT_SAFE_TEXT",),
+        )
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="guardrails_live_inputs_missing") as raised:
+        acceptance.run_bedrock_guardrails_live(
+            _guardrail_env(),
+            settings_loader=lambda: object(),
+            policy_acceptance_factory=policy_factory,  # type: ignore[arg-type]
+            telemetry_manager_factory=lambda _settings: pytest.fail("telemetry manager must not be built"),
+        )
+
+    assert raised.value.missing == ("ELSPETH_LIVE_BEDROCK_PROMPT_SAFE_TEXT",)
+
+
 def test_verify_bedrock_guardrails_rejects_aws_overrides_before_settings_load() -> None:
     raw = "raw-credential-endpoint-role-arn-sentinel"
     with pytest.raises(acceptance.AcceptanceCheckError, match="guardrails_aws_override") as raised:
@@ -480,7 +612,10 @@ def test_verify_bedrock_guardrails_rejects_version_drift_and_redacts_checker_fai
     assert "raw provider" not in str(raised.value)
 
 
-def test_plugin_policy_acceptance_binds_effective_bedrock_policy_tutorial_and_safe_aliases(tmp_path: Path) -> None:
+def test_plugin_policy_acceptance_binds_effective_bedrock_policy_tutorial_and_safe_aliases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from elspeth.web.config import WebSettings
 
     settings = WebSettings(
@@ -507,7 +642,7 @@ def test_plugin_policy_acceptance_binds_effective_bedrock_policy_tutorial_and_sa
                 "region_name": "ap-southeast-2",
             }
         },
-        tutorial_llm_profile="tutorial",
+        default_llm_profile="tutorial",
         bedrock_guardrail_profiles=[
             {
                 "alias": "prompt-approved",
@@ -558,6 +693,14 @@ def test_plugin_policy_acceptance_binds_effective_bedrock_policy_tutorial_and_sa
     drifted["ELSPETH_WEB__PLUGIN_ALLOWLIST"] = "[]"
     with pytest.raises(acceptance.AcceptanceCheckError, match="plugin_policy_settings"):
         acceptance.build_plugin_policy_acceptance(settings, drifted)
+
+    monkeypatch.setattr(
+        bedrock,
+        "build_plugin_policy_readiness",
+        lambda **_kwargs: SimpleNamespace(rows=(), tutorial_ready=False),
+    )
+    with pytest.raises(KeyError, match="tutorial_profile"):
+        acceptance.build_plugin_policy_acceptance(settings, env)
 
 
 def test_guardrail_live_owner_persists_four_calls_before_forwarding_telemetry_and_closes_resources(tmp_path: Path) -> None:

@@ -462,6 +462,9 @@ class TestConvertEmptySession:
         assert events[0]["exc_class"] == "AuditIntegrityError"
         assert events[0]["site"] == "post_guided_convert"
         assert events[0]["frames"]
+        # R2-F16b: the correlation field is always emitted (None here — this
+        # app carries no RequestIdMiddleware).
+        assert "request_id" in events[0]
         assert "diagnostic retained for audit" not in repr(events[0])
 
     def test_expected_head_conflict_is_terminal_409_and_exactly_replayed(self, composer_test_client: TestClient) -> None:

@@ -12,6 +12,7 @@ from unittest.mock import create_autospec, patch
 import pytest
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter as SDKOTLPSpanExporter
 from opentelemetry.sdk.trace.export import SpanExportResult
+from structlog.testing import capture_logs
 
 from elspeth.contracts.call_data import RawCallPayload
 from elspeth.contracts.config.defaults import INTERNAL_DEFAULTS
@@ -239,6 +240,41 @@ class TestHandleEventBasic:
             _wait_for_processing(manager)
             assert len(e1.events) == 1
             assert len(e2.events) == 1
+        finally:
+            manager.close()
+
+    def test_observer_failure_does_not_skip_later_observers_or_exporters(self) -> None:
+        config = MockTelemetryConfig()
+        exporter = TelemetryTestExporter()
+        event = _lifecycle_event()
+        observed: list[tuple[str, object]] = []
+
+        def failing_observer(received: object) -> None:
+            observed.append(("failing", received))
+            raise RuntimeError("SENSITIVE_OBSERVER_FAILURE")
+
+        def later_observer(received: object) -> None:
+            observed.append(("later", received))
+
+        manager = TelemetryManager(
+            config,
+            exporters=[exporter],
+            event_observers=[failing_observer, later_observer],
+        )
+        try:
+            with capture_logs() as logs:
+                manager.handle_event(event)
+                _wait_for_processing(manager)
+
+            assert observed == [("failing", event), ("later", event)]
+            assert exporter.events == [event]
+            [failure_log] = [entry for entry in logs if entry["event"] == "Telemetry event observer failed"]
+            assert failure_log["observer_type"] == "function"
+            assert failure_log["event_type"] == "RunStarted"
+            assert failure_log["error_type"] == "RuntimeError"
+            assert failure_log["log_level"] == "error"
+            assert "SENSITIVE_OBSERVER_FAILURE" not in repr(logs)
+            assert event.run_id not in repr(logs)
         finally:
             manager.close()
 

@@ -20,7 +20,6 @@ Contract:
 from __future__ import annotations
 
 import csv
-import hashlib
 import hmac
 import io
 import re
@@ -147,39 +146,83 @@ async def inspect_selected_ready_session_blob(
     selected_blob_id: UUID | None,
     session_operation_context: SessionOperationContext,
 ) -> SourceInspectionFacts | None:
-    """Inspect one explicit or unambiguous ready blob owned by a session."""
+    """Inspect one explicit or unambiguous ready blob owned by a session.
 
-    records = await blob_service.list_blobs(session_id, limit=None)
-    ready_records = tuple(record for record in records if record.status == "ready")
-    resolved_blob_id = resolve_source_inspection_blob_id(
-        selected_blob_id=selected_blob_id,
-        ready_blob_ids=tuple(record.id for record in ready_records),
-    )
-    if resolved_blob_id is None:
-        return None
-    record = next(record for record in ready_records if record.id == resolved_blob_id)
+    An explicit ``selected_blob_id`` resolves with a direct, session-qualified
+    ``get_blob`` lookup rather than listing every blob in the session and
+    filtering in Python — a session can accumulate an unbounded number of
+    blobs, and every guided selection previously paid the cost of
+    materializing all of them just to find the one the caller named.
+
+    The no-selection legacy path (exactly one ready blob resolves
+    unambiguously) still needs the full listing, and deliberately keeps
+    ``limit=None``: ready-status filtering happens in Python after the
+    fetch, so passing a numeric page limit here could return a page of
+    non-ready blobs and miss the one ready blob further down — silently
+    turning an unambiguous inspection into a false ``None``.
+    """
+    if selected_blob_id is not None and type(selected_blob_id) is not UUID:
+        raise TypeError("selected_blob_id must be UUID or None")
+
+    if selected_blob_id is not None:
+        try:
+            record = await blob_service.get_blob(
+                selected_blob_id,
+                session_operation_context=session_operation_context,
+            )
+        except BlobNotFoundError as exc:
+            raise ValueError("selected source blob is not ready in this session") from exc
+        if record.session_id != session_id or record.status != "ready":
+            raise ValueError("selected source blob is not ready in this session")
+    else:
+        records = await blob_service.list_blobs(session_id, limit=None)
+        ready_records = tuple(r for r in records if r.status == "ready")
+        resolved_blob_id = resolve_source_inspection_blob_id(
+            selected_blob_id=None,
+            ready_blob_ids=tuple(r.id for r in ready_records),
+        )
+        if resolved_blob_id is None:
+            return None
+        record = next(r for r in ready_records if r.id == resolved_blob_id)
+
     try:
-        content = await blob_service.read_blob_content(
-            resolved_blob_id,
+        prefix, verified_hash, total_size = await blob_service.read_blob_content_prefix_verified(
+            record.id,
+            prefix_bytes=_MAX_BYTES,
             session_operation_context=session_operation_context,
         )
     except (BlobNotFoundError, BlobStateError) as exc:
         raise SourceInspectionBlobLifecycleError from exc
     if record.content_hash is None:
         raise AuditIntegrityError("ready source-inspection blob has no content hash")
-    actual_hash = hashlib.sha256(content).hexdigest()
-    if not hmac.compare_digest(actual_hash, record.content_hash):
+    # Not redundant with the store's own internal verification, even though
+    # every compliant implementation already verifies bytes against its own
+    # freshly-read row before returning them: `record` here is a separately
+    # obtained snapshot (from `get_blob`/`list_blobs`, taken before this
+    # read), so this independently certifies that *this* module's own audit
+    # claim — the `content_hash_prefix` stamped into redacted_identity below
+    # — matches the bytes actually inspected, rather than relaying an
+    # unverified claim about a `BlobServiceProtocol` implementation's
+    # internals. `read_blob_content_prefix_verified` streams the blob in
+    # bounded chunks and verifies one full-content sha256 incrementally —
+    # `verified_hash` below is that single digest, checked against
+    # `record.content_hash`. Exactly one hash pass over the bytes, with
+    # memory bounded to chunk size + the inspection prefix regardless of
+    # blob size — a prefix/bounded read alone could never serve this check,
+    # since a partial digest can never validate a full-content hash.
+    if not hmac.compare_digest(verified_hash, record.content_hash):
         raise BlobIntegrityError(
             str(record.id),
             expected=record.content_hash,
-            actual=actual_hash,
+            actual=verified_hash,
         )
     return inspect_blob_content(
-        content=content,
+        content=prefix,
         filename=record.filename,
         mime_type=record.mime_type,
         blob_id=record.id,
         content_hash=record.content_hash,
+        total_size_bytes=total_size,
     )
 
 

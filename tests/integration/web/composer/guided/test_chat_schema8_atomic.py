@@ -6,6 +6,7 @@ import ast
 import asyncio
 import inspect
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,10 +23,11 @@ from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, Compose
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.guided.chat_solver import Step1SourceChatResolution
+from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SinkResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession
-from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.sessions._guided_step_chat import (
     GuidedStepChatOnlyResult,
     Step1SourcePluginReselectedResult,
@@ -43,6 +45,7 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import GuidedChatRequest
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep as _Step2Journey
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -115,6 +118,25 @@ def _chat_operation_count(client: TestClient, session_id: str) -> int:
                 )
             ).scalar_one()
         )
+
+
+@contextmanager
+def _compose_operation_context(client: TestClient, session_id: str) -> Iterator[SessionOperationContext]:
+    service = client.app.state.session_service
+    context = asyncio.run(
+        service._run_sync(
+            lambda: service.session_operation_authority.acquire(
+                session_id=UUID(session_id),
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            )
+        )
+    )
+    try:
+        yield context
+    finally:
+        asyncio.run(service._run_sync(service.session_operation_authority.release, context))
 
 
 def test_step_2_singular_sink_resolution_maps_to_the_live_transition() -> None:
@@ -190,6 +212,7 @@ async def _resolved_source_provider(**_kwargs: object) -> GuidedChatProviderOutc
             error_class=None,
         ),
         resolution=resolution,
+        deferred_action=None,
     )
 
 
@@ -562,6 +585,204 @@ def test_schema_form_uploaded_source_type_mismatch_is_acknowledged_without_provi
     assert replay.status_code == 200, replay.json()
     assert replay.json() == body
     assert _chat_operation_count(composer_test_client, session_id) == 1
+
+
+def test_matching_uploaded_source_missing_required_failure_policy_raises(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    with _compose_operation_context(composer_test_client, session_id) as session_operation_context:
+        uploaded = asyncio.run(
+            composer_test_client.app.state.blob_service.create_blob(
+                UUID(session_id),
+                "orders.csv",
+                b"order_id,total\n1,10\n",
+                "text/csv",
+                created_by="user",
+                session_operation_context=session_operation_context,
+            )
+        )
+
+        def missing_policy_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
+            assert inspection_facts is not None
+            return {
+                "path": f"blob:{uploaded.id}",
+                "schema": {"mode": "observed"},
+            }
+
+        monkeypatch.setattr(guided_route, "build_step_1_source_prefill", missing_policy_prefill)
+
+        with pytest.raises(InvariantError, match="source prefill is missing required on_validation_failure"):
+            asyncio.run(
+                guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
+                    message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
+                    plugin_hint="csv",
+                    blob_service=composer_test_client.app.state.blob_service,
+                    session_id=UUID(session_id),
+                    session_operation_context=session_operation_context,
+                )
+            )
+
+
+def test_matching_uploaded_source_missing_required_path_raises(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    with _compose_operation_context(composer_test_client, session_id) as session_operation_context:
+        asyncio.run(
+            composer_test_client.app.state.blob_service.create_blob(
+                UUID(session_id),
+                "orders.csv",
+                b"order_id,total\n1,10\n",
+                "text/csv",
+                created_by="user",
+                session_operation_context=session_operation_context,
+            )
+        )
+
+        def missing_path_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
+            assert inspection_facts is not None
+            return {
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            }
+
+        monkeypatch.setattr(guided_route, "build_step_1_source_prefill", missing_path_prefill)
+
+        with pytest.raises(InvariantError, match="matching source prefill is missing required path"):
+            asyncio.run(
+                guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
+                    message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
+                    plugin_hint="csv",
+                    blob_service=composer_test_client.app.state.blob_service,
+                    session_id=UUID(session_id),
+                    session_operation_context=session_operation_context,
+                )
+            )
+
+
+@pytest.mark.parametrize("malformed_policy", [None, 0, ""])
+def test_matching_uploaded_source_malformed_failure_policy_raises(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    malformed_policy: object,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    with _compose_operation_context(composer_test_client, session_id) as session_operation_context:
+        uploaded = asyncio.run(
+            composer_test_client.app.state.blob_service.create_blob(
+                UUID(session_id),
+                "orders.csv",
+                b"order_id,total\n1,10\n",
+                "text/csv",
+                created_by="user",
+                session_operation_context=session_operation_context,
+            )
+        )
+
+        def malformed_policy_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
+            assert inspection_facts is not None
+            return {
+                "path": f"blob:{uploaded.id}",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": malformed_policy,
+            }
+
+        monkeypatch.setattr(guided_route, "build_step_1_source_prefill", malformed_policy_prefill)
+
+        with pytest.raises(InvariantError, match="source prefill on_validation_failure must be a non-empty exact str"):
+            asyncio.run(
+                guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
+                    message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
+                    plugin_hint="csv",
+                    blob_service=composer_test_client.app.state.blob_service,
+                    session_id=UUID(session_id),
+                    session_operation_context=session_operation_context,
+                )
+            )
+
+
+@pytest.mark.parametrize(
+    ("prefill", "expected_field"),
+    [
+        (
+            {
+                "path": None,
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            },
+            "path",
+        ),
+        (
+            {
+                "path": 0,
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            },
+            "path",
+        ),
+        (
+            {
+                "path": "",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            },
+            "path",
+        ),
+        (
+            {
+                "path": "blob:authoritative",
+                "on_validation_failure": "discard",
+            },
+            "schema",
+        ),
+        (
+            {
+                "path": "blob:authoritative",
+                "schema": None,
+                "on_validation_failure": "discard",
+            },
+            "schema",
+        ),
+    ],
+)
+def test_matching_uploaded_source_malformed_prefill_contract_raises(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    prefill: dict[str, object],
+    expected_field: str,
+) -> None:
+    session_id = _create_session(composer_test_client)
+    with _compose_operation_context(composer_test_client, session_id) as session_operation_context:
+        asyncio.run(
+            composer_test_client.app.state.blob_service.create_blob(
+                UUID(session_id),
+                "orders.csv",
+                b"order_id,total\n1,10\n",
+                "text/csv",
+                created_by="user",
+                session_operation_context=session_operation_context,
+            )
+        )
+
+        def malformed_prefill(_plugin: str, *, inspection_facts: object | None = None) -> dict[str, object]:
+            assert inspection_facts is not None
+            return dict(prefill)
+
+        monkeypatch.setattr(guided_route, "build_step_1_source_prefill", malformed_prefill)
+
+        with pytest.raises(InvariantError, match=expected_field):
+            asyncio.run(
+                guided_route._source_from_latest_uploaded_blob_for_step_1_chat(
+                    message='I\'ve uploaded "orders.csv"; please use it as the pipeline input.',
+                    plugin_hint="csv",
+                    blob_service=composer_test_client.app.state.blob_service,
+                    session_id=UUID(session_id),
+                    session_operation_context=session_operation_context,
+                )
+            )
 
 
 def test_schema_form_source_plugin_reselection_rebuilds_form_and_preserves_ready_upload(
@@ -1073,6 +1294,7 @@ async def _resolved_sink_provider(**_kwargs: object) -> GuidedChatProviderOutcom
             error_class=None,
         ),
         sink=sink,
+        deferred_action=None,
     )
 
 
@@ -1146,6 +1368,66 @@ def test_sink_resolution_prefills_schema_form_from_chat_options(
     assert sink_prefilled["on_write_failure"] == "discard"
 
 
+def test_invalid_sink_prefill_never_reaches_operator_logs(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    session_id = _create_session(composer_test_client)
+    sink_state = _Step2Journey()._drive_to_step_2_single_select(composer_test_client, session_id)
+    sink_turn = sink_state["next_turn"]
+    canary = "raw-model-config-canary-7f3a9d"
+
+    async def invalid_sink_provider(**_kwargs: object) -> GuidedChatProviderOutcome:
+        sink = SinkResolved(
+            outputs=(
+                SinkOutputResolved(
+                    name="result",
+                    plugin="json",
+                    options={
+                        "path": "out.json",
+                        "schema": {"mode": "observed"},
+                        canary: "untrusted",
+                    },
+                    required_fields=(),
+                    schema_mode="observed",
+                    on_write_failure="discard",
+                ),
+            )
+        )
+        return Step2SinkResolvedResult(
+            chat=StepChatResult(
+                assistant_message="I set up the JSON sink.",
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=1,
+                error_class=None,
+            ),
+            sink=sink,
+            deferred_action=None,
+        )
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", invalid_sink_provider, raising=False)
+    with capture_logs() as logs:
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/chat",
+            json=_chat_body(sink_turn, message="Save the results."),
+        )
+
+    assert response.status_code == 200, response.json()
+    rejection = next(entry for entry in logs if entry["event"] == "guided.step_2_sink_prefill_config_rejected")
+    assert rejection["rejection_code"] == "invalid_sink_configuration"
+    assert rejection["exc_class"] == "PluginConfigError"
+    assert "plugin" not in rejection
+    assert "error_detail" not in rejection
+    assert canary not in repr(logs)
+    # inv-f1 D4 / incidental 2: the rejected prefill was deliberately NOT
+    # applied — the wire reason must say so, not blame provider availability.
+    body = response.json()
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+
+
 def test_inline_source_defers_to_existing_ready_uploaded_blob(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -1190,6 +1472,7 @@ def test_inline_source_unencodable_content_settles_as_advisory_without_blob(
                 error_class=None,
             ),
             resolution=resolution,
+            deferred_action=None,
         )
 
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", surrogate_provider, raising=False)

@@ -208,8 +208,28 @@ class LineExplode(BaseTransform):
     name = "line_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:440df1626495b2c9"
+    source_file_hash: str | None = "sha256:d40053696353f520"
     config_model = LineExplodeConfig
+    usage_when_to_use: str = (
+        "Use to split one newline-framed text field into rows while preserving the rest of the input "
+        "row and, when requested, recording each emitted line's index."
+    )
+    usage_when_not_to_use: str = (
+        "Not for reading lines from a file or parsing CSV records: use the text source for a file, "
+        "or blob_csv_expand for CSV content already stored as a payload blob."
+    )
+    example_use: str = """transform:
+  plugin: line_explode
+  options:
+    source_field: content
+    output_field: line
+    include_index: true
+    index_field: line_index
+    max_lines: 1000
+    schema:
+      mode: observed
+"""
+    capability_tags: tuple[str, ...] = ("text", "lines", "fan-out", "deaggregation")
     creates_tokens = True
 
     @classmethod

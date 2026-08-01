@@ -45,6 +45,7 @@ CAPABILITY_CORE_NODE_GUIDANCE: Final[Mapping[str, str]] = MappingProxyType(
         "coalesce": "[capability-node:coalesce]",
         "gate": "[capability-node:gate]",
         "queue": "[capability-node:queue]",
+        "row_union": "[capability-node:row_union]",
         "transform": "[capability-node:transform]",
     }
 )
@@ -84,13 +85,13 @@ def documented_capability_fields(text: str) -> Mapping[str, frozenset[str]]:
 
 
 def _schema_mapping(value: object, *, path: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
+    if type(value) is not dict:
         raise AuditIntegrityError(f"canonical capability schema node {path} must be an object")
     return cast(Mapping[str, Any], value)
 
 
 def _property_names(schema: Mapping[str, Any], *, path: str) -> frozenset[str]:
-    properties = _schema_mapping(schema.get("properties"), path=f"{path}.properties")
+    properties = _schema_mapping(schema["properties"], path=f"{path}.properties")
     if any(type(name) is not str for name in properties):
         raise AuditIntegrityError(f"canonical capability schema property names at {path} must be exact strings")
     return frozenset(properties)
@@ -99,21 +100,21 @@ def _property_names(schema: Mapping[str, Any], *, path: str) -> frozenset[str]:
 def canonical_capability_fields(schema: Mapping[str, Any]) -> Mapping[str, frozenset[str]]:
     """Extract every authoring-structural field from the terminal schema."""
     root = _schema_mapping(schema, path="$pipeline")
-    properties = _schema_mapping(root.get("properties"), path="$pipeline.properties")
-    source = _schema_mapping(properties.get("source"), path="$pipeline.properties.source")
-    sources = _schema_mapping(properties.get("sources"), path="$pipeline.properties.sources")
-    named_source = _schema_mapping(sources.get("additionalProperties"), path="$pipeline.properties.sources.*")
-    nodes = _schema_mapping(properties.get("nodes"), path="$pipeline.properties.nodes")
-    node = _schema_mapping(nodes.get("items"), path="$pipeline.properties.nodes.items")
-    node_properties = _schema_mapping(node.get("properties"), path="$pipeline.properties.nodes.items.properties")
-    trigger = _schema_mapping(node_properties.get("trigger"), path="$pipeline.properties.nodes.items.properties.trigger")
-    edges = _schema_mapping(properties.get("edges"), path="$pipeline.properties.edges")
-    edge = _schema_mapping(edges.get("items"), path="$pipeline.properties.edges.items")
-    outputs = _schema_mapping(properties.get("outputs"), path="$pipeline.properties.outputs")
-    output = _schema_mapping(outputs.get("items"), path="$pipeline.properties.outputs.items")
-    metadata = _schema_mapping(properties.get("metadata"), path="$pipeline.properties.metadata")
-    source_properties = _schema_mapping(source.get("properties"), path="$pipeline.properties.source.properties")
-    inline_blob = _schema_mapping(source_properties.get("inline_blob"), path="$pipeline.properties.source.properties.inline_blob")
+    properties = _schema_mapping(root["properties"], path="$pipeline.properties")
+    source = _schema_mapping(properties["source"], path="$pipeline.properties.source")
+    sources = _schema_mapping(properties["sources"], path="$pipeline.properties.sources")
+    named_source = _schema_mapping(sources["additionalProperties"], path="$pipeline.properties.sources.*")
+    nodes = _schema_mapping(properties["nodes"], path="$pipeline.properties.nodes")
+    node = _schema_mapping(nodes["items"], path="$pipeline.properties.nodes.items")
+    node_properties = _schema_mapping(node["properties"], path="$pipeline.properties.nodes.items.properties")
+    trigger = _schema_mapping(node_properties["trigger"], path="$pipeline.properties.nodes.items.properties.trigger")
+    edges = _schema_mapping(properties["edges"], path="$pipeline.properties.edges")
+    edge = _schema_mapping(edges["items"], path="$pipeline.properties.edges.items")
+    outputs = _schema_mapping(properties["outputs"], path="$pipeline.properties.outputs")
+    output = _schema_mapping(outputs["items"], path="$pipeline.properties.outputs.items")
+    metadata = _schema_mapping(properties["metadata"], path="$pipeline.properties.metadata")
+    source_properties = _schema_mapping(source["properties"], path="$pipeline.properties.source.properties")
+    inline_blob = _schema_mapping(source_properties["inline_blob"], path="$pipeline.properties.source.properties.inline_blob")
     extracted = {
         "pipeline": frozenset(properties),
         "source": _property_names(source, path="$pipeline.source"),
@@ -170,13 +171,12 @@ class PlannerCapabilityManifest:
             raise ValueError("profile must be 'ordinary' or 'tutorial'")
         if type(self.planner_implementation_id) is not str or not self.planner_implementation_id:
             raise ValueError("planner_implementation_id must be a non-empty exact string")
-        for name in (
-            "capability_core_hash",
-            "canonical_schema_hash",
-            "effective_tool_hash",
-            "rendered_prompt_hash",
+        for name, value in (
+            ("capability_core_hash", self.capability_core_hash),
+            ("canonical_schema_hash", self.canonical_schema_hash),
+            ("effective_tool_hash", self.effective_tool_hash),
+            ("rendered_prompt_hash", self.rendered_prompt_hash),
         ):
-            value = getattr(self, name)
             if type(value) is not str or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
                 raise ValueError(f"{name} must be a lowercase SHA-256 digest")
 
@@ -209,7 +209,7 @@ def build_planner_capability_manifest(
     canonical_json(messages)
     canonical_json(tools)
     core = load_pipeline_capability_core()
-    system_contents = [message.get("content") for message in messages if message.get("role") == "system"]
+    system_contents = [message["content"] for message in messages if message["role"] == "system"]
     if not system_contents or type(system_contents[0]) is not str or not system_contents[0].startswith(core):
         raise AuditIntegrityError("planner capability core is missing from the first system message")
     if any(type(content) is not str for content in system_contents):
@@ -226,10 +226,10 @@ def build_planner_capability_manifest(
     )
     if tool_names != expected_names:
         raise AuditIntegrityError("planner advertised tool identities or order drifted")
-    terminal = _schema_mapping(tools[-1].get("function"), path="$tools[-1].function")
-    parameters = _schema_mapping(terminal.get("parameters"), path="$tools[-1].function.parameters")
-    properties = _schema_mapping(parameters.get("properties"), path="$tools[-1].function.parameters.properties")
-    advertised_schema = _schema_mapping(properties.get("pipeline"), path="$tools[-1].function.parameters.properties.pipeline")
+    terminal = _schema_mapping(tools[-1]["function"], path="$tools[-1].function")
+    parameters = _schema_mapping(terminal["parameters"], path="$tools[-1].function.parameters")
+    properties = _schema_mapping(parameters["properties"], path="$tools[-1].function.parameters.properties")
+    advertised_schema = _schema_mapping(properties["pipeline"], path="$tools[-1].function.parameters.properties.pipeline")
     if stable_hash(advertised_schema) != stable_hash(canonical_schema):
         raise AuditIntegrityError("planner terminal does not advertise the canonical pipeline schema")
     validate_capability_field_contract(canonical_schema, core)

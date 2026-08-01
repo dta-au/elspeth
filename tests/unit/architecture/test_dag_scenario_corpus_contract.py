@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import subprocess
 import sys
@@ -62,6 +63,7 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     ScenarioManifest,
     ScenarioRunEvidence,
     ScenarioSpec,
+    SemanticRunExpectation,
     SinkBoundaryEffectProjection,
     SinkBoundaryRecoveryEvidence,
     SinkBoundaryWorkProjection,
@@ -236,17 +238,17 @@ EXPECTED_STATUS_MATRIX = {
         "unknown",
     ),
     "row-union-interleave": (
-        "fail",
-        "fail",
-        "fail",
-        "fail",
-        "not_applicable",
-        "not_applicable",
-        "not_applicable",
-        "fail",
-        "fail",
-        "not_applicable",
-        "not_applicable",
+        "pass",
+        "pass",
+        "pass",
+        "pass",
+        "partial",
+        "unknown",
+        "unknown",
+        "pass",
+        "pass",
+        "partial",
+        "unknown",
     ),
     "retry-quarantine-discard-routed-errors": (
         "pass",
@@ -301,6 +303,28 @@ EXPECTED_STATUS_MATRIX = {
         "unknown",
     ),
 }
+
+
+def test_corpus_harness_threads_and_projects_row_union_barriers() -> None:
+    build_source = inspect.getsource(corpus_harness.build_scenario)
+    projection_source = inspect.getsource(corpus_harness._stable_projection)
+
+    assert "row_union_settings=" in build_source
+    assert 'startswith(("coalesce:", "row_union:"))' in projection_source
+
+
+def test_row_union_two_variant_ab_semantic_case_is_registered() -> None:
+    manifest = load_manifest()
+    scenario = next(scenario for scenario in manifest.scenarios if scenario.id == "row-union-interleave")
+
+    assert tuple(case.id for case in scenario.cases) == ("two-variant-ab",)
+    case = scenario.cases[0]
+    assert case.workflow == "run"
+    assert case.fixture == "row-union-interleave/two-variant-ab.yaml"
+    assert case.input_fixtures == {"primary": "row-union-interleave/input.csv"}
+    assert case.output_artifacts["output"].filename == "output.jsonl"
+    assert isinstance(case.expected, SemanticRunExpectation)
+
 
 EXPECTED_ASSESSMENT_LOCATORS = {
     "core-builder-schema-plural-sources": (
@@ -397,6 +421,13 @@ EXPECTED_ASSESSMENT_LOCATORS = {
     "b3-stateful-runtime-exact-contracts": (
         "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b3_stateful_runtime_cases_pin_exact_contracts",
     ),
+    "row-union-two-variant-ab-production-contract": (
+        "tests/integration/core/dag/test_dag_scenario_production_path.py"
+        "::test_row_union_two_variant_ab_preserves_complete_declared_groups_and_statistics",
+    ),
+    "composer-row-union-authoring-parity": (
+        "tests/integration/web/composer/parity/test_fixture_matrix.py::test_surface_derives_isomorphic_committed_graph",
+    ),
 }
 
 EXPECTED_ASSESSMENT_EVIDENCE = tuple(
@@ -407,8 +438,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
     for evidence_group, locators in EXPECTED_ASSESSMENT_LOCATORS.items()
     for index, locator in enumerate(locators, start=1)
 )
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "2eabea4332cae4a30411a35f710c9288cc67bfbe782ae4b247a4315c64695346"
-EXPECTED_CASE_REGISTRY_SHA256 = "068a3a9c88322d4ba66729095f705a1502f6a7d009c157930c9107c3b1a59aca"
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb84c65a0b5100f4354830f9"
+EXPECTED_CASE_REGISTRY_SHA256 = "528f614bf5a22a706313d4f2ac77c56148ebb0404f622ccb2ad8e4c1bbcfd5e4"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",
@@ -479,6 +510,7 @@ EXPECTED_CASE_FIXTURE_SHA256 = {
     "aggregation-immutable-batch:resume-after-eof-flush-fault": "c72db99d6e9394db19beaa46770fbdd67ef86ae5b0364bf83094b01bd33945d8",
     "row-expansion-parent-child-recovery:json-explode-parent-child": "bf40f9a9fd913518566c36bd27a0530d6edaed40dde67b69642eabacc48716ed",
     "row-expansion-parent-child-recovery:resume-after-child-enqueue": "ebd85363be5af5e19acaa2af087ef5dddc10693fe7ac0674ff960d2d4f94a8e6",
+    "row-union-interleave:two-variant-ab": "8561ba5d8eca7a3003075d15b78fa5e8088f585fb43d8ffb47f8b4e402e7cef5",
     "retry-quarantine-discard-routed-errors:retry-then-success": "add6f84b856bf06915c6275a005bfb4aef5ad50068f7c93038b6b7d99970ab90",
     "retry-quarantine-discard-routed-errors:source-quarantine-routed": "286d04abef045d70a846b65bfc348792ff6242aff237451f30050565d8e5e639",
     "retry-quarantine-discard-routed-errors:transform-discard": "fb4d0c91d4612e6dcb0d9903f097db8b3e50310386811ddaee15d1749de23948",
@@ -600,6 +632,11 @@ EXPECTED_HARNESS_EVIDENCE = (
         "harness-row-expansion-parent-child-recovery-resume-after-child-enqueue",
         "row-expansion-parent-child-recovery:resume-after-child-enqueue",
         ("config", "build", "runtime", "audit", "recovery"),
+    ),
+    (
+        "harness-row-union-interleave-two-variant-ab",
+        "row-union-interleave:two-variant-ab",
+        ("config", "build", "runtime"),
     ),
     *(
         (
@@ -2180,6 +2217,33 @@ def test_b3_stable_projection_rejects_batch_and_expansion_cross_reference_drift(
         corpus_schema.StableRunProjection.model_validate(values)
 
 
+def test_stable_projection_rejects_completed_batch_without_real_terminal_outcome() -> None:
+    values = _exact_runtime_projection_values()
+    values["terminal_dispositions"] = (
+        {
+            "key": "primary:0#0",
+            "token_key": "primary:0#0",
+            "outcome": "transient",
+            "path": "batch_consumed",
+            "sink_name": None,
+        },
+    )
+    values["batches"] = (
+        {
+            "key": "aggregation:eof_sum@stable|0",
+            "aggregation_node_key": "aggregation:eof_sum@stable",
+            "attempt": 0,
+            "status": "completed",
+            "trigger_type": "end_of_source",
+            "trigger_reason": "source_exhausted",
+            "members": ({"ordinal": 0, "token_key": "primary:0#0"},),
+        },
+    )
+
+    with pytest.raises(ValidationError, match="non-empty projection must contain a terminal success or failure outcome"):
+        corpus_schema.StableRunProjection.model_validate(values)
+
+
 def test_b3_scheduler_event_ordering_accepts_one_exact_reentered_status_chain() -> None:
     events: list[dict[str, Any]] = [
         {"event_type": "mark_pending_sink_terminal", "from_status": "leased", "to_status": "terminal"},
@@ -2526,7 +2590,8 @@ def test_composed_coalesce_semantic_ledger_is_structured_and_identity_is_regress
     semantic_cases = tuple(
         (scenario, case)
         for scenario, case in iter_harness_cases(manifest)
-        if isinstance(case.expected, corpus_schema.SemanticRunExpectation)
+        if scenario.id in {"fork-coalesce-policies", "parallel-coalesces", "sequential-nested-fork-coalesce"}
+        and isinstance(case.expected, corpus_schema.SemanticRunExpectation)
     )
 
     assert len(semantic_cases) == 20
@@ -4830,6 +4895,7 @@ def test_manifest_has_exact_inventory_status_matrix_and_registered_cases() -> No
         ("aggregation-immutable-batch", "eof-immutable-membership"),
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
         ("row-expansion-parent-child-recovery", "json-explode-parent-child"),
+        ("row-union-interleave", "two-variant-ab"),
         ("retry-quarantine-discard-routed-errors", "retry-then-success"),
         ("retry-quarantine-discard-routed-errors", "source-quarantine-routed"),
         ("retry-quarantine-discard-routed-errors", "transform-discard"),
@@ -4850,11 +4916,11 @@ def test_manifest_pins_every_exact_current_assessment_evidence_record() -> None:
     )
     assert assessment_evidence == EXPECTED_ASSESSMENT_EVIDENCE
     assert harness_evidence == EXPECTED_HARNESS_EVIDENCE
-    assert len(manifest.evidence) == 107
-    assert len(assessment_evidence) == 61
-    assert len(harness_evidence) == 46
-    assert len({reference.id for reference in manifest.evidence}) == 107
-    assert len({reference.locator for reference in manifest.evidence}) == 107
+    assert len(manifest.evidence) == 110
+    assert len(assessment_evidence) == 63
+    assert len(harness_evidence) == 47
+    assert len({reference.id for reference in manifest.evidence}) == 110
+    assert len({reference.locator for reference in manifest.evidence}) == 110
     normalized_registry = json.dumps(
         [reference.model_dump(mode="json") for reference in manifest.evidence],
         sort_keys=True,
@@ -4887,6 +4953,7 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
         ("aggregation-immutable-batch", "eof-immutable-membership"),
         ("row-expansion-parent-child-recovery", "resume-after-child-enqueue"),
         ("row-expansion-parent-child-recovery", "json-explode-parent-child"),
+        ("row-union-interleave", "two-variant-ab"),
         ("retry-quarantine-discard-routed-errors", "retry-then-success"),
         ("retry-quarantine-discard-routed-errors", "source-quarantine-routed"),
         ("retry-quarantine-discard-routed-errors", "transform-discard"),
@@ -4992,6 +5059,11 @@ def test_registered_cases_and_harness_references_have_exact_atomic_parity() -> N
             ("row-expansion-parent-child-recovery", "audit"),
         ),
         "harness-row-expansion-parent-child-recovery-resume-after-child-enqueue": (("row-expansion-parent-child-recovery", "recovery"),),
+        "harness-row-union-interleave-two-variant-ab": (
+            ("row-union-interleave", "config"),
+            ("row-union-interleave", "build"),
+            ("row-union-interleave", "runtime"),
+        ),
         **{
             f"harness-retry-quarantine-discard-routed-errors-{case_id}": (
                 ("retry-quarantine-discard-routed-errors", "runtime"),
@@ -5289,6 +5361,7 @@ def test_registered_fixture_bytes_and_production_config_loading_are_exact(tmp_pa
         ("fork-multiple-terminals-partial-failure", "reopen-after-partial-terminal"),
         *(("fork-coalesce-policies", case_id) for case_id in B2_COALESCE_REGISTERED_CASE_IDS),
         ("sequential-nested-fork-coalesce", "reopen-terminal-publication"),
+        ("row-union-interleave", "two-variant-ab"),
         ("checkpoint-deterministic-resume", "reopen-resume"),
     ],
 )
@@ -5313,6 +5386,7 @@ def test_registered_fixtures_cross_the_real_production_build_boundary(
         aggregations=bundle.aggregations,
         gates=list(settings.gates),
         coalesce_settings=list(settings.coalesce) if settings.coalesce else None,
+        row_union_settings=list(settings.row_unions) if settings.row_unions else None,
         queues=settings.queues,
     )
     graph.validate()
@@ -5358,7 +5432,6 @@ def test_manifest_pytest_evidence_batch_collects_without_running_suites() -> Non
 def test_manifest_gap_ownership_and_not_applicable_reasons_follow_the_approved_rules() -> None:
     manifest = load_manifest()
     expected_not_applicable_reasons = {
-        "row-union-interleave": "Row union has no supported construct, so post-build audit, recovery, and concurrency do not apply after configuration, build, contract, and runtime already fail.",
         "checkpoint-deterministic-resume": "Checkpoint/resume is a runtime lifecycle, not an authored topology.",
         "multi-worker-lease-reclaim-late-completion": "Worker multiplicity is deployment/runtime configuration, not DAG authoring.",
     }

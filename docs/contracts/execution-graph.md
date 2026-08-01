@@ -379,6 +379,16 @@ class GraphValidationWarning:
     node_ids: tuple[str, ...]  # Affected nodes (transform, gate, coalesce)
 ```
 
+### DIVERT + Row Union Interaction Warnings
+
+The same build pass calls `warn_divert_row_union_interactions()` for the sibling correlated barrier: if a transform in a branch chain feeding a `row_union` has `on_error` routing (a DIVERT edge), a diverted row never arrives at the barrier.
+
+`row_union` is `require_all` by definition and never releases a partial group, so the blast radius is wider than the coalesce case it mirrors. Losing one branch does not merge a thinner row — it fails the **whole correlated group** closed, discarding the rows the sibling branches produced successfully, and the audit trail records a group failure rather than the branch outputs lost with it.
+
+These produce `GraphValidationWarning` objects (non-fatal) with code `DIVERT_ROW_UNION_GROUP_LOSS`, using the same shape shown above; `node_ids` carries the row_union node followed by the diverting transforms. The warnings are logged via structlog. Only `MOVE` incoming edges are inspected — identity branches (a `COPY` straight from the fork gate to the barrier) have no transforms of their own, so nothing in-branch can divert.
+
+Both barrier kinds contribute to a single `set_validation_warnings()` call, which **assigns** rather than appends.
+
 ### Schema Modes
 
 ```python

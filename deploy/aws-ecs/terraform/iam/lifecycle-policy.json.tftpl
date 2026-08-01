@@ -1,0 +1,98 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadIamLifecycleState",
+      "Effect": "Allow",
+      "Action": [
+        "iam:Get*",
+        "iam:List*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "CreateRunBoundary",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreatePolicy",
+        "iam:TagPolicy"
+      ],
+      "Resource": "${iam_permissions_boundary_arn}",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/ACCEPTANCE_RUN_ID": "${run_id}"
+        }
+      }
+    },
+    {
+      "Sid": "ManageRunBoundary",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicy",
+        "iam:DeletePolicyVersion",
+        "iam:SetDefaultPolicyVersion",
+        "iam:TagPolicy",
+        "iam:UntagPolicy"
+      ],
+      "Resource": "${iam_permissions_boundary_arn}"
+    },
+    {
+      "Sid": "CreateRunRolesWithNarrowBoundary",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:TagRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/ACCEPTANCE_RUN_ID": "${run_id}",
+          "iam:PermissionsBoundary": "${iam_permissions_boundary_arn}"
+        }
+      }
+    },
+    {
+      "Sid": "DeleteRunRoleLifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "iam:DeleteRole",
+        "iam:DeleteRolePermissionsBoundary",
+        "iam:TagRole",
+        "iam:UntagRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/a-*-execution-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-task-role",
+        "arn:aws:iam::${aws_account_id}:role/elspeth/${run_id}/b-*-execution-role"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}"
+        }
+      }
+    },
+    {
+      "Sid": "DenyRolePermissionMutationOrActivation",
+      "Effect": "Deny",
+      "Action": [
+        "ecs:RunTask",
+        "iam:AttachRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PassRole",
+        "iam:PutRolePolicy",
+        "iam:PutRolePermissionsBoundary",
+        "iam:UpdateAssumeRolePolicy",
+        "sts:AssumeRole"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

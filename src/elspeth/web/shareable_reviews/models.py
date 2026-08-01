@@ -117,13 +117,13 @@ class NodeSpecResponse(_StrictResponse):
     """Strict wire mirror of ``NodeSpec`` (web/composer/state.py).
 
     Optional fields (condition, routes, fork_to, branches, policy, merge,
-    trigger, output_mode, expected_output_count) default to None to match
+    trigger, output_mode, expected_output_count, timeout_seconds) default to None to match
     ``CompositionState.to_dict()`` which omits these keys when the
     underlying dataclass field is None.
     """
 
     id: str
-    node_type: Literal["transform", "gate", "aggregation", "coalesce", "queue"]
+    node_type: Literal["transform", "gate", "aggregation", "coalesce", "queue", "row_union"]
     plugin: str | None
     input: str
     on_success: str | None
@@ -140,6 +140,7 @@ class NodeSpecResponse(_StrictResponse):
     trigger: CompositionObject | None = None
     output_mode: str | None = None
     expected_output_count: int | None = None
+    timeout_seconds: float | None = None
 
 
 class EdgeSpecResponse(_StrictResponse):

@@ -46,6 +46,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tools._common import (
     _DATA_ERROR_KEY,
+    _PLUGIN_UNAVAILABLE_EXPLANATIONS,
     ToolContext,
     ToolResult,
     _discovery_result,
@@ -69,6 +70,8 @@ from elspeth.web.interpretation_state import (
     RAW_HTML_CLEANUP_REVIEW_DRAFT,
     RAW_HTML_CLEANUP_USER_TERM,
 )
+from elspeth.web.plugin_policy.models import PluginUnavailableReason
+from elspeth.web.provider_config_policy import AWS_S3_SOURCE_POLICY_ERROR
 
 _AUTHORING_VALIDATION_COUNTER = metrics.get_meter("elspeth.web.composer.tools").create_counter(
     "composer.authoring_validation.total",
@@ -298,6 +301,47 @@ _GET_EXPRESSION_GRAMMAR_DECLARATION = ToolDeclaration(
 )
 
 
+# One suggested fix per plugin-unavailability reason. Every
+# ``PluginUnavailableReason`` value is emitted as a tool ``error_code``
+# (``_plugin_policy_failure`` -> ``_failure_result(..., error_code=reason.value)``),
+# so the planner's redacted repair feedback can carry any of them — yet the whole
+# family resolved to NOTHING through ``explain_validation_code`` until now: the
+# model saw a bare token like ``credential_unavailable`` and had no way to learn
+# whether to pick a different plugin, wait for an operator, or stop trying. This
+# dict is TOTAL over the enum (a new reason KeyErrors here at import time rather
+# than silently degrading to an unexplained code), and the *explanation* half is
+# reused verbatim from ``_PLUGIN_UNAVAILABLE_EXPLANATIONS`` so the copy the model
+# reads cannot drift from the copy the tool failure already carries.
+_PLUGIN_UNAVAILABLE_FIXES: Final[dict[PluginUnavailableReason, str]] = {
+    PluginUnavailableReason.NOT_AUTHORIZED: (
+        "Pick a plugin from the live catalogue (list_sources / list_sinks / list_transforms return only usable ones) — "
+        "re-emitting the same plugin cannot enable it. If the user needs this one specifically, say plainly that an "
+        "operator must turn it on in this deployment's plugin policy."
+    ),
+    PluginUnavailableReason.NOT_INSTALLED: (
+        "Pick an installed plugin from list_sources / list_sinks / list_transforms; check the name for a typo first. "
+        "No change to the options can conjure a plugin this deployment does not have."
+    ),
+    PluginUnavailableReason.LOCAL_REQUIREMENT_MISSING: (
+        "Pick a different plugin from the live catalogue, or tell the user an operator must install the missing "
+        "requirement in this deployment — the pipeline itself cannot supply it."
+    ),
+    PluginUnavailableReason.CREDENTIAL_MISSING: (
+        "Pick a plugin whose credential this deployment already holds, or tell the user an operator must configure "
+        "this plugin's credential. Never invent a literal credential value or a secret_ref name to work around it."
+    ),
+    PluginUnavailableReason.PROFILE_UNAVAILABLE: (
+        "Pick a plugin the live catalogue offers, or tell the user an operator must configure an operator profile "
+        "for this one before it can be used."
+    ),
+    PluginUnavailableReason.WEB_SURFACE_PROHIBITED: (
+        "Use an operator-controlled connector, allowlisted ingestion job, or batch/CLI runtime instead. This refusal is "
+        "categorical: no option change, no credential, and no operator setting can make this plugin usable here, so do "
+        "not re-emit it."
+    ),
+}
+
+
 _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     (
         r"No source configured",
@@ -348,6 +392,112 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         r"Coalesce '(.+)' is missing required field '(.+)'",
         "A coalesce node is missing a required field (branches or policy).",
         "Update the coalesce node with upsert_node, providing the missing field.",
+    ),
+    (
+        r"row_union_config_invalid",
+        "A row_union contains plugin, options, routing, aggregation, or coalesce-only configuration that the structural barrier forbids.",
+        "Keep only id, node_type='row_union', input, branches, on_success, and an optional finite positive timeout_seconds.",
+    ),
+    (
+        r"row_union_name_invalid",
+        "The row_union name does not satisfy the runtime identifier contract.",
+        "Choose a name of 1-38 characters that starts with a letter and contains only letters, digits, underscores, "
+        "and hyphens; do not use a reserved label or a name beginning with '__'.",
+    ),
+    (
+        r"row_union_branches_invalid",
+        "A row_union needs at least two declared fork branches.",
+        "Provide an ordered branches mapping with at least two unique branch names and input connections.",
+    ),
+    (
+        r"row_union_branch_invalid",
+        "A row_union branch name or connection is empty, duplicated, or otherwise invalid.",
+        "Give every branch a non-empty unique alias and a non-empty unique incoming connection.",
+    ),
+    (
+        r"row_union_input_mismatch",
+        "The row_union adapter input does not equal the first declared branch connection.",
+        "Set input to the first value in the ordered branches mapping.",
+    ),
+    (
+        r"row_union_on_success_invalid",
+        "A row_union must publish released rows through a non-empty on_success connection.",
+        "Set on_success to a downstream processing connection.",
+    ),
+    (
+        r"row_union_timeout_invalid",
+        "The row_union timeout is not a finite positive number.",
+        "Omit timeout_seconds or set it to a finite number greater than zero.",
+    ),
+    (
+        r"row_union_branch_alias_unreachable",
+        "A row_union branch alias does not match a fork branch declared upstream.",
+        "Use the upstream gate's fork_to branch names as the row_union branches keys.",
+    ),
+    (
+        r"row_union_branch_unreachable",
+        "A row_union branch connection is not produced by the corresponding fork branch.",
+        "Wire each branch transform's on_success to the matching row_union branches value.",
+    ),
+    (
+        r"row_union_branch_origin_invalid",
+        "The row_union branch aliases come from more than one gate, so the reconverged rows have no single correlation origin.",
+        "Pick every branches key from one gate's fork_to, or add a separate row_union for each fork.",
+    ),
+    (
+        r"row_union_branch_not_downstream",
+        "A row_union branch alias maps to a connection that is not downstream of that alias's own fork edge.",
+        "Wire each branches[alias] value through processing that starts at the matching gate fork branch.",
+    ),
+    (
+        r"row_union_branch_aggregation_invalid",
+        "A transform-mode aggregation inside a fork branch loses the per-row identity required to satisfy the row_union group.",
+        "Set that aggregation's output_mode to passthrough so each row keeps its identity, or move the aggregation "
+        "upstream of the fork that feeds the row_union.",
+    ),
+    (
+        r"row_union_nested_fork_invalid",
+        "A nested fork inside a row_union branch replaces the enclosing branch identity, so the require-all group cannot complete.",
+        "Move the nested fork before the fork that feeds the row_union, or terminate the nested branch at a sink.",
+    ),
+    (
+        r"row_union_downstream_group_invalid",
+        "A row_union release reaches a downstream early-trigger aggregation or correlated barrier that can split, "
+        "drop, or duplicate members of the indivisible N-to-N group.",
+        "For an aggregation, omit trigger or use trigger: {} so only end_of_source flushes, or move it upstream of "
+        "the fork. For a downstream coalesce or row_union, move that barrier upstream of the fork or terminate the "
+        "released group at a sink.",
+    ),
+    (
+        r"row_union_schema_incompatible",
+        "The row_union branch declarations cannot safely feed one long-format output stream. Fixed schemas must have "
+        "the same complete declared shape; flexible schemas may add branch-only fields but shared fields cannot "
+        "declare conflicting types.",
+        "Use the row_union_schema facts: align the complete declared field sets and types for fixed branches; for "
+        "flexible branches, change only the listed conflicting shared fields to compatible types. Keep disjoint "
+        "flexible-only fields; they do not need to be deleted.",
+    ),
+    (
+        r"fork_branch_multiple_barriers",
+        "One fork branch is declared by two barriers (coalesce and/or row_union). A fork branch delivers its arrival to "
+        "exactly one barrier, so the engine rejects the second claim at graph build time.",
+        "Keep the branch on a single barrier: delete it from the other barrier's branches, or give each barrier its own "
+        "fork branch name in the gate's fork_to and wire that branch to it.",
+    ),
+    (
+        r"gate_duplicate_fork_branch",
+        "A gate declares the same fork branch name more than once, so the declared branch set is ambiguous.",
+        "Remove duplicate entries from the gate's fork_to list while preserving the intended unique branch order.",
+    ),
+    (
+        r"row_union_on_success_must_be_connection",
+        "A row_union release target names a sink, but the barrier may only release into downstream processing.",
+        "Set row_union.on_success to a connection consumed by a downstream node, then route that node to the sink.",
+    ),
+    (
+        r"row_union_on_success_dangling",
+        "No downstream node consumes the row_union release connection.",
+        "Add a downstream processing node whose input equals row_union.on_success.",
     ),
     (
         r"aggregation_missing_plugin|Aggregation '(.+)' is missing required field 'plugin'",
@@ -470,13 +620,19 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     # the only signal it carries, so each must be explainable here.
     (
         r"unknown[ _]node_type",
-        "The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, transform. There is no 'fork' node_type.",
-        "Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node — node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input, and branches rejoin at a COALESCE node (branches + policy + merge). A node after the coalesce consumes it by setting input='<coalesce id>' — the coalesce's own on_success may only name a sink.",
+        "The node_type is not one of the composer's node kinds: aggregation, coalesce, gate, queue, row_union, transform. There is no 'fork' node_type.",
+        "Keep your current pipeline shape and change ONLY the invalid node: forking is expressed with a GATE node — "
+        "node_type='gate', condition='True', routes={'true': 'fork', 'false': 'fork'}, "
+        "fork_to=['branch_a', 'branch_b']; each branch node reads one branch name as its input. "
+        "Use COALESCE (branches + policy + merge) for N-to-one field merging: a downstream node consumes the coalesce id. "
+        "Use row_union for require_all N-to-N reconvergence that releases every original branch row: branches maps fork aliases "
+        "to arriving connections, input repeats the first branch value, and on_success names downstream processing.",
     ),
     (
         r"coalesce_on_success_must_be_sink|coalesce_on_success_unknown_sink|Coalesce on_success must point to a sink|Coalesce '(.+)' on_success references unknown sink",
-        "A coalesce node's on_success may only name an existing sink; merged rows otherwise flow to whichever node reads the coalesce id as its input.",
-        "Either set the coalesce on_success to a sink name from outputs[], or leave on_success null and give the downstream node input='<coalesce node id>'.",
+        "A coalesce node's on_success may only name an existing sink; merged rows otherwise flow to whichever node reads the coalesce id as its input. "
+        "For coalesce_on_success_unknown_sink the rejection's 'connectivity' facts, when present, carry the offending value ('dangling_on_success') and the candidate's sink names ('declared_sinks').",
+        "Either set the coalesce on_success to a sink name from outputs[] (the connectivity facts' declared_sinks) exactly, or leave on_success null and give the downstream node input='<coalesce node id>'.",
     ),
     (
         r"coalesce_missing_policy|Coalesce '(.+)' is missing required field 'policy'",
@@ -536,18 +692,24 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
     ),
     (
         r"plugin_options_invalid",
-        "One or more of the component's options failed its plugin schema (missing required option, wrong shape, flexible schema without fields, or — for llm — a missing/invalid operator profile alias).",
-        "Call get_plugin_schema(<plugin_type>, <plugin_name>) for the exact option shapes and allowed values (the llm transform's 'profile' enum lists the operator-approved aliases), fix only the offending options, and re-emit. For schema options: use {mode: observed} to infer types, or provide explicit fields with mode fixed/flexible.",
+        "One of the component's options failed its plugin schema. This code alone does not identify WHICH option: the rejection's 'detail' field carries the validator's own message naming the exact option and requirement — read it before hypothesising a cause.",
+        "Apply exactly what 'detail' names (it usually includes a ready repair, e.g. a patch_node_options call). Only if detail is absent: call get_plugin_schema(<plugin_type>, <plugin_name>) for the exact option shapes and allowed values, fix only the offending options, and re-emit. Common traps, all equally likely: an llm node must declare options.required_input_fields matching its prompt_template's row.* references (or [] to opt out); schema options use {mode: observed} to infer types or explicit fields with mode fixed/flexible; the llm 'profile' must be one of the enum aliases from get_plugin_schema.",
     ),
     (
         r"transform_on_success_dangling|aggregation_on_success_dangling|source_on_success_dangling|is neither a sink nor a known connection",
-        "An on_success destination must be an existing sink name or a connection another node reads as its input.",
-        "Point on_success at one of outputs[].sink_name exactly, or at the connection name a downstream node declares as its input. Call get_pipeline_state to list the current sink names and node input connections, then re-emit with a matching destination.",
+        "An on_success destination must be an existing sink name or a connection another node reads as its input. "
+        "The rejection's 'connectivity' facts, when present, name the exact mismatch in YOUR rejected candidate: "
+        "'dangling_on_success' is the value that matched nothing; 'declared_sinks' and 'consumable_connections' are the only valid destinations.",
+        "Re-emit with on_success set to one of the connectivity facts' declared_sinks or consumable_connections, copied exactly — "
+        "for a straight source-to-sink pipeline the source's on_success must equal the outputs[].sink_name byte-for-byte. "
+        "Change nothing else. Only without connectivity facts: call get_pipeline_state to list the CURRENT saved state's sink names "
+        "and node input connections (note it shows the saved state, not a rejected candidate).",
     ),
     (
         r"transform_on_error_unknown_sink|references unknown sink",
-        "An on_error destination may only be 'discard' or an existing sink name.",
-        "Set on_error='discard', or point it at one of outputs[].sink_name exactly.",
+        "An on_error destination may only be 'discard' or an existing sink name. The rejection's 'connectivity' facts, when present, "
+        "carry the offending value as 'dangling_on_error' and the candidate's sink names as 'declared_sinks'.",
+        "Set on_error='discard', or point it at one of the connectivity facts' declared_sinks (outputs[].sink_name) exactly.",
     ),
     (
         r"gate_route_labels_mismatch|route labels don't match",
@@ -555,8 +717,33 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         'Use routes={"true": <destination>, "false": <destination>}. For a pure fan-out gate: condition=\'True\', routes={"true": "fork", "false": "fork"}, fork_to=[<branch connections>]. Only string-returning conditions may use custom route labels.',
     ),
     (
+        r"gate_condition_ignores_stated_threshold",
+        "The instruction states a comparison (a threshold on a field), but every gate in the candidate has a constant "
+        "condition. A constant condition makes no per-row decision, so the stated rule is expressed nowhere in the "
+        "pipeline and every row takes the same path — with a fan-out gate that means every row is written to every "
+        "destination. The rejection's 'detail' quotes the comparison from the instruction verbatim.",
+        "Author the comparison as the gate's condition — e.g. condition=\"row['amount'] > 500\" — and point "
+        'routes={"true": <one destination>, "false": <the other destination>} at the two DIFFERENT destinations '
+        "(drop fork_to; a fork delivers to every branch). "
+        "If the constant fan-out was genuinely intended — every row to every destination — re-emit the same pipeline "
+        "unchanged and it will be accepted.",
+    ),
+    (
+        r"passthrough_cannot_produce_declared_fields",
+        "The candidate has no transform or aggregation nodes, so every row it writes is exactly the row the source "
+        "read — but the reviewed outputs declare fields that no reviewed source declares or observes. Nothing in this "
+        "pipeline can put those fields on a row. The rejection's 'detail' names them; they are also visible as "
+        "outputs[].required_fields in the reviewed planner context, minus every source's observed_columns and "
+        "declared_fields.",
+        "Add the transform node(s) that produce the named fields — for a straight rename or copy from an existing "
+        "column a field_mapper with the appropriate mapping is enough; for derived or generated values use the "
+        "transform that computes them — and wire the source through them to the sink. Re-emitting the same "
+        "zero-transform pipeline will be rejected again with this same code.",
+    ),
+    (
         r"proposal_missing_requested_transforms",
-        "The revision candidate contains no transform or aggregation nodes, but the operator's revision instruction asked for processing — a bare source-to-sink pass-through would ship a pipeline that silently performs none of the requested work behind a confident name.",
+        "The revision candidate contains no transform or aggregation nodes, but the operator's revision instruction asked for processing — a bare source-to-sink pass-through would ship a pipeline that silently performs none of the requested work behind a confident name. "
+        "This code only fires when a pass-through COULD satisfy the reviewed output fields; when it could not, the satisfiability rejection 'passthrough_cannot_produce_declared_fields' fires instead and re-emitting unchanged is NOT accepted there.",
         "Re-emit with the transform nodes the revision instruction requests, as a minimal delta: keep the reviewed source and sink wiring unchanged and add only the processing nodes. "
         "If a pass-through with no transforms is genuinely what the instruction calls for, re-emit the same pipeline unchanged to confirm the deliberate no-transform intent — the confirmation will be accepted.",
     ),
@@ -698,6 +885,46 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Ask the operator for the deployment's abuse contact email and scraping reason, or leave the http block for the operator "
         "to fill — never invent an email or domain.",
     ),
+    (
+        r"prompt_template_unbound_variables|prompt render context does not define",
+        "A prompt_template interpolates bare variable names the render context does not define — templates see row data only "
+        "as 'row.<field>' and lookup data as 'lookup.<key>', so rendering raises 'Undefined variable' at runtime and none of "
+        "the row's data reaches the model.",
+        "Rewrite each bare name as '{{ row.<field> }}' using a field the upstream schema provides (e.g. '{{ text }}' becomes "
+        "'{{ row.text }}'), or '{{ lookup.<key> }}' for lookup data, or remove the reference.",
+    ),
+    (
+        r"query_template_unbound_row_fields|input_fields binds only",
+        "A multi-query LLM template references 'row.<variable>' names the query never binds — each query renders with 'row' "
+        "holding exactly its input_fields variables plus 'source_row', so an unbound reference raises 'Undefined variable' "
+        "at runtime and that query fails for every row.",
+        "Bind each missing name in that query's input_fields (template variable → row column), rename the reference to a "
+        "variable the query already binds, or use '{{ row.source_row.<column> }}' for direct access to the source row.",
+    ),
+    # Deployment security policy, not a wiring mistake: no repair to the
+    # candidate can make an aws_s3 SOURCE acceptable on the web surface, so the
+    # explanation must say so outright or the planner burns its whole repair
+    # budget re-authoring the same rejected source. Explanation and fix are the
+    # SAME pair the authoritative gate emits (``AWS_S3_SOURCE_POLICY_ERROR`` and
+    # the suggestion in ``web.execution.validation``); the constant is imported
+    # rather than restated so the copy cannot drift from the policy it explains.
+    (
+        r"aws_s3_source_not_allowed|Web-authored aws_s3 sources are disabled",
+        AWS_S3_SOURCE_POLICY_ERROR,
+        "Use an operator-controlled connector, allowlisted ingestion job, or batch/CLI runtime for S3 reads.",
+    ),
+    # Plugin-unavailability family. Exact-code patterns only (``re.escape``, no
+    # alternation): these codes are short and generic, and a loose pattern here
+    # would shadow an unrelated entry above. They sit LAST so every message-shaped
+    # pattern above still wins on a full validation message.
+    *(
+        (
+            re.escape(reason.value),
+            f"The pipeline names a plugin that cannot be used in this deployment: {_PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]}.",
+            _PLUGIN_UNAVAILABLE_FIXES[reason],
+        )
+        for reason in PluginUnavailableReason
+    ),
 )
 
 
@@ -714,6 +941,28 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "coalesce_missing_branches",
     "coalesce_policy_invalid",
     "coalesce_merge_invalid",
+    "row_union_config_invalid",
+    "row_union_name_invalid",
+    "row_union_branches_invalid",
+    "row_union_branch_invalid",
+    "row_union_input_mismatch",
+    "row_union_on_success_invalid",
+    "row_union_timeout_invalid",
+    "row_union_branch_alias_unreachable",
+    "row_union_branch_unreachable",
+    "row_union_branch_origin_invalid",
+    "row_union_branch_not_downstream",
+    "row_union_branch_aggregation_invalid",
+    "row_union_nested_fork_invalid",
+    "row_union_downstream_group_invalid",
+    "row_union_schema_incompatible",
+    "row_union_on_success_must_be_connection",
+    "row_union_on_success_dangling",
+    # Cross-node barrier topology: mirrors the engine's "each fork branch can
+    # only join at one barrier" rule for coalesce/coalesce, coalesce/row_union
+    # and row_union/row_union claims.
+    "fork_branch_multiple_barriers",
+    "gate_duplicate_fork_branch",
     "transform_missing_on_success",
     "transform_missing_on_error",
     "transform_on_success_dangling",
@@ -765,6 +1014,14 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "coalesce_on_success_unknown_sink",
     "aggregation_trigger_invalid",
     "web_scrape_http_identity_invalid",
+    # ── Prompt-context binding guard (R2-F17 compounding; elspeth-bea314a89b) ─
+    # A prompt_template interpolating names outside {row, lookup} crashes at
+    # render under StrictUndefined and sends no row data to the model.
+    "prompt_template_unbound_variables",
+    # ── Multi-query row-binding guard (elspeth-bea314a89b follow-up) ───────
+    # A multi-query template referencing row.<name> outside that query's
+    # input_fields + {source_row} fails that query at render for every row.
+    "query_template_unbound_row_fields",
     # ── Pre-application semantic rejections (tutorial op 1152d7e3 closure) ──
     # Previously codeless _failure_result sites: the planner saw only the
     # 'validation_error' placeholder while the actionable message was redacted.
@@ -775,6 +1032,27 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # A revision candidate netting zero transform nodes drew one coded nudge
     # instead of silently shipping a passthrough with aspirational metadata.
     "proposal_missing_requested_transforms",
+    # ── Unproducible declared output fields (R2-F4, 2026-08-01) ────────────
+    # Planner-loop only: pairs the reviewed guided facts (what the sources
+    # carry vs what the outputs declare) with the candidate's node count.
+    # No structural validator sees both.
+    "passthrough_cannot_produce_declared_fields",
+    # ── Stated-threshold fidelity guard (R2-F17, 2026-08-01) ───────────────
+    # Planner-loop only: the instruction is the evidence, so no structural
+    # validator can raise this. The shape it rejects is legal everywhere else.
+    "gate_condition_ignores_stated_threshold",
+    # ── Deployment policy refusal (F14b, 2026-07-31) ───────────────────────
+    # Reaches planner feedback from the authoritative source gate; the planner
+    # must learn the refusal is categorical rather than repair around it.
+    "aws_s3_source_not_allowed",
+    # ── Plugin-unavailability family (same sweep) ──────────────────────────
+    # Every ``PluginUnavailableReason`` value is a live tool ``error_code``
+    # (``_plugin_policy_failure``), so each can reach planner feedback. Derived
+    # from the enum rather than transcribed: a new reason joins the catalogue
+    # and the explain patterns together, or the explain-pattern generator's
+    # ``_PLUGIN_UNAVAILABLE_FIXES[reason]`` lookup raises KeyError at import
+    # time — totality is enforced by that lookup, not by an assert.
+    *(reason.value for reason in PluginUnavailableReason),
 )
 
 

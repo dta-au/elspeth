@@ -16,11 +16,14 @@ from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     RestrictedSinkEffectContext,
     SinkEffectCommitResult,
+    SinkEffectDescriptorMode,
     SinkEffectInspectionRequest,
     SinkEffectMember,
     SinkEffectPipelineMembersInput,
+    SinkEffectPlan,
     SinkEffectPrepareRequest,
 )
+from elspeth.plugins.sinks._remote_object_effects import RemoteObjectCollisionError
 from elspeth.plugins.sinks.azure_blob_sink import AzureBlobSink
 from tests.fixtures.base_classes import inject_write_failure
 
@@ -67,14 +70,14 @@ def _effect_member(operation_id: str, ordinal: int, row: dict[str, Any]) -> Sink
     )
 
 
-def _publish_effect(
+def _prepare_effect(
     sink: AzureBlobSink,
     rows: list[dict[str, Any]],
     *,
     operation_id: str,
     predecessor: ArtifactDescriptor | None = None,
-) -> SinkEffectCommitResult:
-    """Exercise the public recoverable-effect protocol against real Azurite."""
+) -> SinkEffectPlan:
+    """Drive inspect+prepare only, against real Azurite, without committing."""
     members = tuple(_effect_member(operation_id, ordinal, row) for ordinal, row in enumerate(rows))
     effect_id = sha256(canonical_json({"operation_id": operation_id, "rows": rows}).encode()).hexdigest()
     ctx = RestrictedSinkEffectContext(
@@ -87,7 +90,7 @@ def _publish_effect(
         SinkEffectInspectionRequest(effect_id=effect_id, target="{}", predecessor_descriptor=predecessor),
         ctx,
     )
-    plan = sink.prepare_effect(
+    return sink.prepare_effect(
         SinkEffectPrepareRequest(
             effect_id=effect_id,
             effect_input=SinkEffectPipelineMembersInput(members=members, target_snapshot_members=members),
@@ -95,6 +98,23 @@ def _publish_effect(
         ),
         ctx,
     )
+
+
+def _publish_effect(
+    sink: AzureBlobSink,
+    rows: list[dict[str, Any]],
+    *,
+    operation_id: str,
+    predecessor: ArtifactDescriptor | None = None,
+) -> SinkEffectCommitResult:
+    """Exercise the public recoverable-effect protocol against real Azurite."""
+    ctx = RestrictedSinkEffectContext(
+        run_id="azure-e2e-run",
+        run_started_at=datetime(2026, 7, 17, tzinfo=UTC),
+        operation_id=operation_id,
+        sink_node_id="azure-sink",
+    )
+    plan = _prepare_effect(sink, rows, operation_id=operation_id, predecessor=predecessor)
     return sink.commit_effect(plan, ctx)
 
 
@@ -155,4 +175,36 @@ class TestBlobSink:
         result = _publish_effect(sink, [{"id": 1, "name": "Ada"}], operation_id="jsonl-write")
 
         assert result.descriptor.path_or_uri == f"azure://{azurite_blob_container['container']}/{blob_path}"
+        assert _read_blob(azurite_blob_container, blob_path).decode("utf-8") == '{"id": 1, "name": "Ada"}'
+
+    def test_blob_sink_reaffirms_identical_content_and_rejects_true_collision_without_overwrite(
+        self, azurite_blob_container: dict[str, str]
+    ) -> None:
+        """elspeth-9a78b3a02f against real Azurite: overwrite=False must
+        no-op on an idempotent re-drive of identical content (never issuing
+        a second upload_blob), and still reject a genuine collision."""
+        blob_path = "outputs/idempotent.jsonl"
+        rows = [{"id": 1, "name": "Ada"}]
+
+        primary = inject_write_failure(
+            AzureBlobSink(_sink_config(azurite_blob_container, blob_path=blob_path, format_="jsonl", overwrite=False))
+        )
+        primary_result = _publish_effect(primary, rows, operation_id="idempotent-primary")
+
+        reaffirming = inject_write_failure(
+            AzureBlobSink(_sink_config(azurite_blob_container, blob_path=blob_path, format_="jsonl", overwrite=False))
+        )
+        reaffirmed_plan = _prepare_effect(reaffirming, rows, operation_id="idempotent-reaffirm")
+
+        assert reaffirmed_plan.descriptor_mode is SinkEffectDescriptorMode.NO_PUBLICATION
+        assert reaffirmed_plan.safe_evidence["publication_kind"] == "reaffirmed"
+        assert reaffirmed_plan.expected_descriptor == primary_result.descriptor
+        # Content on the blob is unchanged — no second upload was ever issued.
+        assert _read_blob(azurite_blob_container, blob_path).decode("utf-8") == '{"id": 1, "name": "Ada"}'
+
+        colliding = inject_write_failure(
+            AzureBlobSink(_sink_config(azurite_blob_container, blob_path=blob_path, format_="jsonl", overwrite=False))
+        )
+        with pytest.raises(RemoteObjectCollisionError):
+            _prepare_effect(colliding, [{"id": 2, "name": "Grace"}], operation_id="idempotent-collision")
         assert _read_blob(azurite_blob_container, blob_path).decode("utf-8") == '{"id": 1, "name": "Ada"}'

@@ -25,40 +25,37 @@ Procedurally generated CSV with the following fields:
 ## Pipeline Flow
 
 ```
-CSV Source (50k rows)
+CSV Source (committed 10k-row fixture)
     ↓
 Value Threshold Gate
-    ├─→ value >= 5000 → high_value.csv (~10k rows)
-    └─→ value < 5000  → normal.csv (~40k rows)
+    ├─→ value >= 5000 → high_value.csv (~half the rows)
+    └─→ value < 5000  → normal.csv (~half the rows)
 ```
 
 ## Usage
 
-### 1. Generate Test Data
+### 1. Run the Shipped Fixture
 
-Generate 50,000 rows (default):
+The repository includes a deterministic 10,000-row `input.csv` fixture:
 
 ```bash
-python examples/large_scale_test/generate_data.py
+elspeth run --settings examples/large_scale_test/settings.yaml --execute
 ```
 
-Generate custom row count:
+### 2. Optionally Regenerate the Fixture
+
+`generate_data.py` overwrites the committed `input.csv`. Use it only when you
+intend to benchmark a different row count:
 
 ```bash
 # 1,000 rows (quick local check)
 python examples/large_scale_test/generate_data.py 1000
 
-# 10,000 rows
-python examples/large_scale_test/generate_data.py 10000
+# 50,000 rows (generator default)
+python examples/large_scale_test/generate_data.py
 
 # 100,000 rows (stress test)
 python examples/large_scale_test/generate_data.py 100000
-```
-
-### 2. Run Pipeline
-
-```bash
-elspeth run --settings examples/large_scale_test/settings.yaml --execute
 ```
 
 ### 3. Explore Results
@@ -76,8 +73,10 @@ head examples/large_scale_test/output/high_value.csv
 Explore lineage for any row:
 
 ```bash
-# Pick any row ID from the dataset
-elspeth explain --run latest --row 1234 --database examples/large_scale_test/runs/audit.db
+# Landscape row IDs are UUIDs, not the CSV's integer `id` values.
+DB=examples/large_scale_test/runs/audit.db
+ROW_ID="$(sqlite3 "$DB" 'SELECT row_id FROM rows ORDER BY source_row_index LIMIT 1')"
+elspeth explain --run latest --row "$ROW_ID" --no-tui --database "$DB"
 ```
 
 Query the audit database directly:
@@ -85,8 +84,11 @@ Query the audit database directly:
 ```bash
 sqlite3 examples/large_scale_test/runs/audit.db
 
-# Check row counts
-SELECT state, COUNT(*) FROM tokens GROUP BY state;
+# Check completed terminal outcomes
+SELECT outcome, COUNT(*)
+FROM token_outcomes
+WHERE completed = 1
+GROUP BY outcome;
 
 # View gate routing decisions
 SELECT * FROM routing_events LIMIT 10;
@@ -114,17 +116,9 @@ The current durable scheduler mode records recoverable scheduler state and
 per-transition scheduler events for every row. That makes this example much
 heavier than the older pre-durable-scheduler benchmark numbers.
 
-Measured local SQLite evidence from the multi-source-token-scheduler worktree:
-5,000 generated rows completed in about 50 seconds with all rows successful and
-matching scheduler event counts.
-
-Use these as order-of-magnitude expectations on a local SQLite database:
-
-| Row Count | Processing Time | Throughput |
-|-----------|----------------|------------|
-| 1,000 | ~10 seconds | ~100 rows/sec |
-| 5,000 | ~50 seconds | ~100 rows/sec |
-| 50,000 | ~7-9 minutes | ~100 rows/sec |
+One uncontended local SQLite run of the committed 10,000-row fixture completed
+in about 237 seconds (~42 rows/sec), with all rows successful and 40,000
+scheduler events. Treat this as observed evidence, not a portable benchmark.
 
 Actual performance depends on hardware, disk I/O, the declared checkpoint
 policy, payload storage, and database backend. PostgreSQL or a future
@@ -142,7 +136,8 @@ For each row, ELSPETH records:
 - Sink node state and output artifact hash
 
 The durable scheduler path writes more than five rows of audit data per input
-row. A 50k-row run should be treated as a long-running local benchmark.
+row. The shipped 10k-row run takes several minutes on a typical development
+machine; larger generated runs are long-running local benchmarks.
 
 ## Use Cases
 
@@ -194,10 +189,10 @@ See the `batch_aggregation` example for batch processing at scale.
 
 ## Cleanup
 
-Remove generated data and outputs:
+Remove generated outputs and audit databases while preserving the committed
+10,000-row input fixture:
 
 ```bash
-rm examples/large_scale_test/input.csv
 rm -rf examples/large_scale_test/output/*.csv
 rm -rf examples/large_scale_test/runs/*.db
 ```
