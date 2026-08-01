@@ -1009,14 +1009,15 @@ def _validate_pipeline_impl(
     # They consume a snapshot, so authored phases never share mutable check state.
     checks = list(ledger.checks)
     errors = []
-    state = interpretation_validated.materialized_state
     authored = interpretation_validated.authored
+    policy_state = authored.policy.state
+    materialized_state = interpretation_validated.materialized_state
     all_refs = list(authored.all_secret_refs)
     env_ref_names = set(authored.env_ref_names)
     semantic_contracts = authored.semantic_contracts
 
     # Step 2: Generate YAML
-    pipeline_yaml = yaml_generator.generate_yaml(state)
+    pipeline_yaml = yaml_generator.generate_yaml(materialized_state)
     pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(settings.data_dir), session_id=session_id)
 
     if blob_get_metadata is not None and "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml:
@@ -1091,7 +1092,7 @@ def _validate_pipeline_impl(
     # earlier left their pass records in ``checks`` before an earlier-declared
     # gate could fail, which suppressed the canonical skipped-after-failure record
     # and made the trail report a later gate passing under an earlier failure.
-    for node in state.nodes:
+    for node in policy_state.nodes:
         if node.node_type != "transform":
             continue
         provider_policy_error = web_rag_provider_config_policy_error(node.options)
@@ -1136,7 +1137,7 @@ def _validate_pipeline_impl(
         )
     )
 
-    for node in state.nodes:
+    for node in policy_state.nodes:
         if node.node_type != "transform":
             continue
         llm_retry_policy_error = web_llm_retry_budget_policy_error(node.plugin, node.options)
@@ -1191,7 +1192,7 @@ def _validate_pipeline_impl(
     # CLI dev examples; this web-execution gate is the boundary that makes the
     # single-machine threat model not leak into the hosted path. Mirrors the
     # managed_identity / web_scrape network policies.
-    for node in state.nodes:
+    for node in policy_state.nodes:
         if node.node_type != "transform":
             continue
         llm_base_url_policy_error = web_llm_base_url_policy_error(node.plugin, node.options)
@@ -1236,7 +1237,7 @@ def _validate_pipeline_impl(
         )
     )
 
-    for node in state.nodes:
+    for node in policy_state.nodes:
         if node.node_type != "transform":
             continue
         llm_tracing_policy_error = web_llm_tracing_policy_error(node.plugin, node.options)
@@ -1281,7 +1282,7 @@ def _validate_pipeline_impl(
         )
     )
 
-    for source_name, source in state.sources.items():
+    for source_name, source in policy_state.sources.items():
         endpoint_policy_error = (
             None if plugin_snapshot.is_trained_operator else web_aws_s3_endpoint_url_policy_error(source.plugin, source.options)
         )
@@ -1319,7 +1320,7 @@ def _validate_pipeline_impl(
             semantic_contracts=list(semantic_contracts),
         )
 
-    for output in state.outputs:
+    for output in policy_state.outputs:
         endpoint_policy_error = (
             None if plugin_snapshot.is_trained_operator else web_aws_s3_endpoint_url_policy_error(output.plugin, output.options)
         )
@@ -1371,7 +1372,7 @@ def _validate_pipeline_impl(
     )
 
     if not plugin_snapshot.is_trained_operator:
-        for source_name, source in state.sources.items():
+        for source_name, source in policy_state.sources.items():
             source_policy_error = web_aws_s3_source_policy_error(source.plugin)
             if source_policy_error is None:
                 continue
@@ -1857,11 +1858,11 @@ def _validate_pipeline_impl(
         if isinstance(exc, EdgeContractError):
             consumer_target = _edge_patch_target_for_node_id(
                 exc.to_node_id,
-                state=state,
+                state=policy_state,
                 graph=graph,
                 component_type=exc.component_type,
             )
-            edge_message, edge_suggestion = _format_edge_contract_failure(exc, state=state, graph=graph)
+            edge_message, edge_suggestion = _format_edge_contract_failure(exc, state=policy_state, graph=graph)
             errors.append(
                 ValidationError(
                     component_id=consumer_target.component_id,
@@ -1902,7 +1903,7 @@ def _validate_pipeline_impl(
     # downstream sink, plus the repair action so the composer LLM can self-correct
     # on the next turn.  See dispatch-prompt-floofy-noodle.md plan + skill lines
     # 758-768 (Concept-5 exemption) and 1517-1518 (fork-branch exemption).
-    for identity_finding in _find_identity_node_advisories(state):
+    for identity_finding in _find_identity_node_advisories(policy_state):
         sink_mode_text = (
             f", which uses schema.mode: {identity_finding.sink_schema_mode}" if identity_finding.sink_schema_mode is not None else ""
         )

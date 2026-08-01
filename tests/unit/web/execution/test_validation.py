@@ -1977,6 +1977,44 @@ class TestValidatePipelineBatchTransformOptions:
 class TestValidatePipelinePendingInterpretationPlaceholders:
     """Runtime preflight must distinguish composer authoring from execution."""
 
+    def test_materialized_yaml_and_authored_advisory_use_distinct_states(self) -> None:
+        state = _make_state(
+            nodes=(
+                _make_node(
+                    plugin="llm",
+                    options={"prompt_template": "Rate how {{ interpretation: cool }} this row is."},
+                ),
+            )
+        )
+        yaml_generator = _FakeYamlGenerator()
+        graph = _runtime_graph_mock()
+
+        with (
+            patch("elspeth.web.execution.validation.load_settings_from_yaml_string", return_value=_fake_settings()),
+            patch("elspeth.web.execution.validation.instantiate_runtime_plugins", return_value=_FakeRuntimeBundle()),
+            patch("elspeth.web.execution.validation.build_runtime_graph", return_value=graph),
+            patch(
+                "elspeth.web.execution.validation.assemble_and_validate_pipeline_config",
+                return_value=_fake_pipeline_config(),
+            ),
+            patch("elspeth.web.execution.validation._find_identity_node_advisories", return_value=[]) as identity_advisories,
+        ):
+            result = validate_pipeline_for_trained_operator(
+                state,
+                _make_settings(),
+                yaml_generator,
+                allow_pending_interpretation_placeholders=True,
+            )
+
+        assert result.is_valid is True
+        materialized_state = yaml_generator.rendered_states[0]
+        assert materialized_state.nodes[0].options["prompt_template"] == "Rate how pending interpretation this row is."
+        assert materialized_state != state
+
+        diagnostic_state = identity_advisories.call_args.args[0]
+        assert diagnostic_state == state
+        assert diagnostic_state.nodes[0].options["prompt_template"] == "Rate how {{ interpretation: cool }} this row is."
+
     def test_pending_structured_interpretation_returns_typed_readiness(self) -> None:
         state = _make_state(
             nodes=(
