@@ -103,6 +103,7 @@ sources:
       temperature: 0.2
       max_tokens: 300
       response_field: research_question
+      on_validation_failure: discard
       schema:
         mode: observed
 ```
@@ -133,6 +134,7 @@ omitting the configured field.
 | `temperature` | bounded float | Same bounds and default as the corresponding transform provider config. |
 | `max_tokens` | positive integer | Same bounds and default as the corresponding transform provider config. |
 | `response_field` | non-empty field name; default `llm_response` | Base name for the response and the two operational fields. |
+| `on_validation_failure` | required route or `discard` | Existing source-boundary policy for a completed row that contradicts its declared schema. |
 | `schema` | `SchemaConfig` | Existing source schema contract, augmented by the three guaranteed LLM output fields. |
 
 Each provider variant also exposes the same model, endpoint, authentication,
@@ -170,7 +172,7 @@ request bounds.
 3. render the prompt and make one provider request during `load()`;
 4. validate the provider result and populate the three output fields;
 5. validate the completed mapping against the source output schema;
-6. yield `SourceRow(index=0, data=...)`; and
+6. yield `SourceRow.valid(..., contract=contract, source_row_index=0)`; and
 7. close provider resources during `close()`.
 
 The plugin declares non-deterministic execution and the same relevant audit
