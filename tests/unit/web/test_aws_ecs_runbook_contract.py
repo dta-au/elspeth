@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -33,6 +34,79 @@ def _bedrock_text() -> str:
 
 def _fences(language: str) -> list[str]:
     return re.findall(rf"```{language}\n(.*?)```", _text(), flags=re.DOTALL)
+
+
+def _container_insights_cleanup_function() -> str:
+    text = _text()
+    start = text.index("cleanup_container_insights_log_group() {")
+    end = text.index('\nif ! cleanup_container_insights_log_group "$SCENARIO_A_INVENTORY"', start)
+    return text[start:end]
+
+
+def _run_container_insights_cleanup(
+    tmp_path: Path,
+    *,
+    present_at: int,
+    fail_describe_at: int = 0,
+    max_wait_seconds: int = 50,
+    quiet_seconds: int = 20,
+) -> subprocess.CompletedProcess[str]:
+    inventory = tmp_path / "inventory.json"
+    inventory.write_text('{"values":{"ECS_CLUSTER":"acceptance-test-cluster"}}', encoding="utf-8")
+    describe_count = tmp_path / "describe-count"
+    describe_count.write_text("0", encoding="utf-8")
+    delete_count = tmp_path / "delete-count"
+    delete_count.write_text("0", encoding="utf-8")
+
+    script = f"""
+set -Eeuo pipefail
+SECONDS=0
+sleep() {{ SECONDS=$((SECONDS + $1)); }}
+aws_capture() {{
+  case "$*" in
+    *"logs describe-log-groups"*)
+      count=$(<"$DESCRIBE_COUNT_FILE")
+      count=$((count + 1))
+      printf '%s' "$count" >"$DESCRIBE_COUNT_FILE"
+      if test "$MOCK_FAIL_DESCRIBE_AT" -gt 0 && test "$count" -eq "$MOCK_FAIL_DESCRIBE_AT"; then
+        printf '%s\n' 'aws_command_failed' >&2
+        return 254
+      fi
+      if test "$count" -eq "$MOCK_PRESENT_AT"; then
+        printf '{{"logGroups":[{{"logGroupName":"%s"}}]}}\n' "$log_group"
+      else
+        printf '%s\n' '{{"logGroups":[]}}'
+      fi
+      ;;
+    *"logs delete-log-group"*)
+      count=$(<"$DELETE_COUNT_FILE")
+      printf '%s' "$((count + 1))" >"$DELETE_COUNT_FILE"
+      ;;
+    *) return 64 ;;
+  esac
+}}
+{_container_insights_cleanup_function()}
+set +e
+cleanup_container_insights_log_group "$INVENTORY_PATH"
+status=$?
+set -e
+printf 'status=%s describe_calls=%s delete_calls=%s\n' \
+  "$status" "$(<"$DESCRIBE_COUNT_FILE")" "$(<"$DELETE_COUNT_FILE")"
+exit "$status"
+"""
+    env = {
+        **os.environ,
+        "AWS_REGION": "ap-southeast-1",
+        "DESCRIBE_COUNT_FILE": str(describe_count),
+        "DELETE_COUNT_FILE": str(delete_count),
+        "INVENTORY_PATH": str(inventory),
+        "MOCK_PRESENT_AT": str(present_at),
+        "MOCK_FAIL_DESCRIBE_AT": str(fail_describe_at),
+        "ELSPETH_CONTAINER_INSIGHTS_MAX_WAIT_SECONDS": str(max_wait_seconds),
+        "ELSPETH_CONTAINER_INSIGHTS_POLL_INTERVAL_SECONDS": "10",
+        "ELSPETH_CONTAINER_INSIGHTS_QUIET_SECONDS": str(quiet_seconds),
+    }
+    return subprocess.run(["bash"], input=script, capture_output=True, text=True, check=False, env=env)
 
 
 def _json_documents() -> list[object]:
@@ -674,6 +748,38 @@ def test_fresh_account_bootstrap_is_manifest_armed_backends_initialized_and_dest
     assert shared_destroy.index('terraform_capture -chdir="$BOOTSTRAP_TF_DIR" plan -destroy') < shared_destroy.index(
         "checkpoint_cleanup shared_resource_cleanup confirmed"
     )
+
+
+def test_container_insights_cleanup_converges_after_full_already_absent_quiet_window(tmp_path: Path) -> None:
+    result = _run_container_insights_cleanup(tmp_path, present_at=99)
+
+    assert result.returncode == 0, result.stderr
+    assert "container_insights_log_group_stable elapsed_seconds=20 quiet_seconds=20 samples=3 deletions=0" in result.stdout
+    assert "status=0 describe_calls=3 delete_calls=0" in result.stdout
+
+
+def test_container_insights_cleanup_restarts_full_quiet_window_after_delayed_recreation(tmp_path: Path) -> None:
+    result = _run_container_insights_cleanup(tmp_path, present_at=3)
+
+    assert result.returncode == 0, result.stderr
+    assert "container_insights_log_group_stable elapsed_seconds=40 quiet_seconds=20 samples=5 deletions=1" in result.stdout
+    assert "status=0 describe_calls=5 delete_calls=1" in result.stdout
+
+
+def test_container_insights_cleanup_fails_when_recreation_leaves_no_full_quiet_window(tmp_path: Path) -> None:
+    result = _run_container_insights_cleanup(tmp_path, present_at=3, max_wait_seconds=30)
+
+    assert result.returncode != 0
+    assert "status=1 describe_calls=4 delete_calls=1" in result.stdout
+    assert "container_insights_log_group_not_stabilized" in result.stderr
+
+
+def test_container_insights_cleanup_propagates_aws_errors_after_recreation(tmp_path: Path) -> None:
+    result = _run_container_insights_cleanup(tmp_path, present_at=1, fail_describe_at=2)
+
+    assert result.returncode != 0
+    assert "status=1 describe_calls=2 delete_calls=1" in result.stdout
+    assert "aws_command_failed" in result.stderr
 
 
 def test_rollback_image_packages_baseline_source_with_candidate_docker_contract() -> None:

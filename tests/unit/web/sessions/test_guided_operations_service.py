@@ -270,6 +270,7 @@ def test_operation_decoders_reject_kind_locator_drift_and_status_residue() -> No
         "proposal_id": None,
         "response_hash": "a" * 64,
         "failure_code": None,
+        "unproducible_output_fields": None,
         "lease_token": None,
         "lease_expires_at": None,
         "settled_at": datetime.now(UTC),
@@ -303,9 +304,35 @@ def test_operation_decoders_reject_kind_locator_drift_and_status_residue() -> No
                     "proposal_id": None,
                     "response_hash": None,
                     "failure_code": None,
+                    "unproducible_output_fields": None,
                 },
             )
         )
+
+
+@pytest.mark.parametrize(
+    "raw_fields",
+    [[], {}, "client", ["client", 7]],
+)
+def test_failed_operation_decoder_rejects_malformed_output_field_enrichment(raw_fields: object) -> None:
+    row = {
+        "status": "failed",
+        "kind": "guided_respond",
+        "result_kind": None,
+        "result_state_id": None,
+        "result_message_id": None,
+        "result_session_id": None,
+        "proposal_id": None,
+        "response_hash": None,
+        "failure_code": "invalid_provider_response",
+        "unproducible_output_fields": raw_fields,
+        "lease_token": None,
+        "lease_expires_at": None,
+        "settled_at": datetime.now(UTC),
+    }
+
+    with pytest.raises(AuditIntegrityError, match="malformed unproducible output fields"):
+        SessionServiceImpl._guided_terminal_outcome(cast("Any", row))
 
 
 @pytest.mark.asyncio
@@ -1826,3 +1853,48 @@ async def test_failed_operation_replays_only_closed_safe_failure(file_engine) ->
     assert row.proposal_id is None
     assert row.result_state_id is None
     assert row.result_session_id is None
+
+
+@pytest.mark.asyncio
+async def test_failed_operation_replays_typed_unproducible_output_fields(file_engine) -> None:
+    service = _service(file_engine)
+    session_id = await _create_session(service)
+    claimed = await service.reserve_guided_operation(
+        session_id=session_id,
+        operation_id="operation-failed-with-output-gap",
+        kind="guided_respond",
+        request_hash="3" * 64,
+        actor="worker-a",
+        lease_seconds=30,
+    )
+    assert isinstance(claimed, GuidedOperationClaimed)
+
+    failed = await service.fail_guided_operation_with_audit(
+        GuidedOperationFailureCommand(
+            fence=claimed.fence,
+            failure_code="invalid_provider_response",
+            actor="worker-a",
+            audit_evidence=GuidedAuditEvidence(),
+            unproducible_output_fields=("amount_aud", "client"),
+        )
+    )
+    assert failed == GuidedOperationFailed(
+        failure_code="invalid_provider_response",
+        unproducible_output_fields=("amount_aud", "client"),
+    )
+
+    replay = await service.get_guided_operation(
+        session_id=session_id,
+        operation_id="operation-failed-with-output-gap",
+        kind="guided_respond",
+        request_hash="3" * 64,
+    )
+    assert replay == failed
+
+    with file_engine.connect() as conn:
+        stored = conn.execute(
+            select(guided_operations_table.c.unproducible_output_fields).where(
+                guided_operations_table.c.operation_id == "operation-failed-with-output-gap"
+            )
+        ).scalar_one()
+    assert stored == ["amount_aud", "client"]

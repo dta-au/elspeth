@@ -313,11 +313,9 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
     * ``rotation`` -- remove findings already assigned to judge-gated diagnosis,
       then plan the residual pre-judge population; residual ambiguity fails
       staging because no deterministic action can represent it safely;
-    * ``new_judgment`` -- live findings covered by neither a per-file rule nor
-      an identity-prefix in the **full, unfiltered** allowlist (the double-route
-      guard: an fp-shifted judge-gated entry's live finding shares its prefix
-      with the drifted entry, so it routes to ``drift_repair`` alone, never also
-      to a spurious ``new_judgment``).
+    * ``new_judgment`` -- live findings covered by neither an exact canonical
+      key nor a per-file rule in the full allowlist, excluding identity groups
+      already reserved for a diagnosis action in this bundle.
     """
     from elspeth_lints.core.bundle_verify import _STALE_DELETE_ORPHAN_STATUSES
     from elspeth_lints.core.judge_signature_diagnosis import (
@@ -325,8 +323,11 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
         diagnose_judge_signatures,
     )
     from elspeth_lints.core.review_bundle import BundleAction
-    from elspeth_lints.core.tier_model_scan import census_tree_targets, plan_non_judge_rotations
-    from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
+    from elspeth_lints.core.tier_model_scan import (
+        census_tree_targets,
+        plan_non_judge_rotations,
+        routable_new_judgment_findings,
+    )
     from elspeth_lints.rules.trust_tier.tier_model.rule import _load_tier_model_allowlist
 
     actions: list[Any] = []
@@ -350,15 +351,10 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
     # Scan once, classify full coverage, then remove findings already assigned
     # to judge-gated diagnosis before planning the residual pre-judge lane.
     allowlist = _load_tier_model_allowlist(ctx.allowlist_dir)
-    covered_prefixes: set[str] = set()
-    for entry in allowlist.entries:
-        try:
-            covered_prefixes.add(identity_prefix(entry.key))
-        except ValueError:
-            continue  # a malformed (non-canonical) key cannot own a prefix
+    covered_keys = {entry.key for entry in allowlist.entries}
     target_scan = census_tree_targets(
         root=ctx.root,
-        covered_prefixes=covered_prefixes,
+        covered_keys=covered_keys,
         per_file_rules=allowlist.per_file_rules,
     )
     rotation_plan = plan_non_judge_rotations(
@@ -374,8 +370,13 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
     for rotation in rotation_plan.rotations:
         actions.append(BundleAction(lane="resign", kind="rotation", key=rotation.old_key, source_file=rotation.entry_source_file))
 
-    # new_judgment lane: coverage check against the FULL, unfiltered allowlist.
-    for finding in target_scan.uncovered_findings:
+    # New-judgment coverage is exact. Identity-prefix grouping is used only to
+    # keep outstanding diagnosis work in a separate authority lane.
+    for finding in routable_new_judgment_findings(
+        uncovered_findings=target_scan.uncovered_findings,
+        diagnosis_items=diagnosis.items,
+        rotation_plan=rotation_plan,
+    ):
         actions.append(_new_judgment_action_from_finding(finding))
 
     actions.sort(key=lambda action: (action.kind, action.key))

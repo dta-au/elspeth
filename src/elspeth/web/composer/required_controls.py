@@ -56,6 +56,7 @@ from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, P
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
+    ServerStagedRequiredControlUserTerm,
 )
 
 # Coverage's private per-stream predicates are imported deliberately: they are
@@ -262,7 +263,7 @@ def _control_options(
     options[INTERPRETATION_REQUIREMENTS_KEY] = [
         {
             "kind": "pipeline_decision",
-            "user_term": REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
+            "user_term": ServerStagedRequiredControlUserTerm(REQUIRED_CONTROL_AUTO_WIRED_USER_TERM),
             "draft": disclosure_draft,
         }
     ]

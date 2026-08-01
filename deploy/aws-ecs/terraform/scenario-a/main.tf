@@ -62,10 +62,11 @@ module "scenario" {
 # orphan carrying the exact name this module wants to create. The next apply
 # on the same namespace then fails CreateLogGroup with
 # ResourceAlreadyExistsException. A depends_on ordering fix cannot help — the
-# collision happens after destroy completes, not during create. Set
-# -var=adopt_container_insights_log_group=true on the documented
-# redeploy-retry path to formally import that orphan back into state instead
-# of trying to create it; the default (false) is a no-op so fresh accounts,
+# collision happens after destroy completes, not during create. Generate a
+# replacement plan with -var=adopt_container_insights_log_group=true on the
+# documented redeploy-retry path to formally import that orphan back into
+# state instead of trying to create it. Never add the variable while applying
+# an existing saved plan; the default (false) is a no-op so fresh accounts,
 # where no orphan exists, are unaffected.
 import {
   for_each = var.adopt_container_insights_log_group ? [1] : []

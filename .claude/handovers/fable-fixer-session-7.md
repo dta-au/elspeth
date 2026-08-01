@@ -24,12 +24,10 @@ CLOSED**. No half-done work is left in the tree.
   `514bd319e..afb6a4fd9` (session 6: `d01e425bd`, `56ac2ab51`, `afb6a4fd9`).
 
 ## OPERATOR DIRECTIVES (2026-07-04, effective — carry these)
-- **Commit `--no-verify` by DEFAULT**, every commit. Pre-commit hooks do NOT run per
-  commit; the batched reconciliation moves to session end (mandatory — see checklist).
-  `--no-verify` skips LOCAL hooks only: it does NOT authorize signing, blessing
-  trust-tier/baseline HMAC state, or touching `ELSPETH_JUDGE_METADATA_HMAC_KEY`. One
-  line in the session report that the batched reconciliation ran + its result is enough
-  (no per-commit `--no-verify` note needed).
+- **Commit normally with repository hooks enabled.** Keep the batched session-end
+  reconciliation mandatory, but treat any per-commit hook failure as evidence to
+  investigate. Signing, blessing trust-tier/baseline HMAC state, and access to
+  `ELSPETH_JUDGE_METADATA_HMAC_KEY` remain operator-only.
 - **Efficiency**: NO mid-session full-suite or broad-directory pytest runs — the full
   unscoped `pytest tests/` happens EXACTLY ONCE at session end. Per ticket run only the
   scoped file / `-k` selection you need, once, at ticket close; ruff+mypy scoped to
@@ -59,7 +57,7 @@ CLOSED**. No half-done work is left in the tree.
    behaviour-preserving refactors, build an extensional parity net (proven green against
    PRE-refactor code) before restructuring — but only where the risk warrants it.
 4. Scoped tests + `.venv/bin/ruff check` + `.venv/bin/mypy` on touched files.
-5. One commit per ticket: `fix|refactor(engine): <behavior> (<ticket-id>)`, `--no-verify`.
+5. One normal, hook-verified commit per ticket: `fix|refactor(engine): <behavior> (<ticket-id>)`.
 6. Close gate: `issue_update` to `verifying` with `-f root_cause=… -f fix_verification=…`,
    then `issue_close --reason … --commit "release/0.7.0@<sha>"`.
 

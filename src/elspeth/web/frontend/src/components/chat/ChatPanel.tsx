@@ -2646,13 +2646,16 @@ export function ChatPanel({
           // once isComposing goes false nothing more is coming, so an
           // incomplete turn is one that ENDED without a reply (convergence /
           // timeout — the backend persists partial state and the tool audit,
-          // then raises 422, and never writes a reply row). Those turns must
-          // still render so their tool calls stay visible; they simply carry
-          // no prose, because the only text on them is the model's internal
-          // narration and presenting that as an answer is the bug this
-          // fixes. Without the escape they would be hidden forever.
+          // then raises 422, and never writes a reply row). A later turn also
+          // proves an incomplete agent turn is historical, even while a new
+          // composition is running. Those historical turns must still render
+          // so their tool calls stay visible; only the current tail turn stays
+          // behind the atomic-reveal gate.
           chatTurns
-            .filter((turn: ChatTurn) => turn.isComplete || !isComposing)
+            .filter(
+              (turn: ChatTurn, index: number) =>
+                turn.isComplete || !isComposing || index < chatTurns.length - 1,
+            )
             .map((turn: ChatTurn) => {
               const repr = turnRepresentativeMessage(turn);
               // Attach the inline-source summary to the most recent complete

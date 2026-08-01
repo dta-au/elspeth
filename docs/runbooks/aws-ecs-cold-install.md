@@ -753,23 +753,102 @@ ECS's service-linked role re-creates
 the cluster goes INACTIVE — a final Container Insights metrics flush. That
 recreated log group is untagged and lives outside every Terraform state, so
 the tag query below cannot see it, and a same-namespace redeploy retry can
-hit `ResourceAlreadyExistsException` on `CreateLogGroup`. Give the flush a
-few minutes, then delete it; the command is idempotent and safe to re-run:
+hit `ResourceAlreadyExistsException` on `CreateLogGroup`.
+
+Point-in-time absence is not terminal: the final flush may not have landed.
+Poll for the delayed recreation, delete every exact-name appearance, and
+require one full quiet window whether the group was already absent or was
+deleted here. Every deletion restarts the quiet window. The separate maximum
+bounds the procedure; if a late recreation leaves too little time to prove a
+full quiet window, cleanup fails closed and stays open for the named owner.
+Any AWS API error also fails under the strict shell instead of being
+suppressed as if it were `ResourceNotFoundException`:
 
 ```bash
-aws logs delete-log-group \
-  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
-  --log-group-name "/aws/ecs/containerinsights/${ECS_CLUSTER}/performance" \
-  || true
+ELSPETH_CONTAINER_INSIGHTS_MAX_WAIT_SECONDS=1200
+ELSPETH_CONTAINER_INSIGHTS_POLL_INTERVAL_SECONDS=10
+ELSPETH_CONTAINER_INSIGHTS_QUIET_SECONDS=600
+
+cleanup_container_insights_log_group() (
+  set -Eeuo pipefail
+  local log_group listing count started_at quiet_started_at samples=0 deletions=0
+  local elapsed quiet_elapsed remaining sleep_seconds
+  log_group="/aws/ecs/containerinsights/${ECS_CLUSTER}/performance"
+  test "$ELSPETH_CONTAINER_INSIGHTS_MAX_WAIT_SECONDS" -gt 0
+  test "$ELSPETH_CONTAINER_INSIGHTS_POLL_INTERVAL_SECONDS" -gt 0
+  test "$ELSPETH_CONTAINER_INSIGHTS_QUIET_SECONDS" -gt 0
+  test "$ELSPETH_CONTAINER_INSIGHTS_QUIET_SECONDS" -le "$ELSPETH_CONTAINER_INSIGHTS_MAX_WAIT_SECONDS"
+
+  started_at=$SECONDS
+  quiet_started_at=-1
+  while true; do
+    listing="$(aws logs describe-log-groups \
+      --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+      --log-group-name-prefix "$log_group" --output json)"
+    count="$(jq --arg name "$log_group" \
+      '[.logGroups[]? | select(.logGroupName == $name)] | length' \
+      <<<"$listing")"
+    test "$count" = 0 || test "$count" = 1
+    samples=$((samples + 1))
+    if test "$count" = 1; then
+      aws logs delete-log-group \
+        --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+        --log-group-name "$log_group"
+      deletions=$((deletions + 1))
+      quiet_started_at=$SECONDS
+    else
+      if test "$quiet_started_at" -lt 0; then
+        quiet_started_at=$SECONDS
+      fi
+      elapsed=$((SECONDS - started_at))
+      quiet_elapsed=$((SECONDS - quiet_started_at))
+      if test "$quiet_elapsed" -ge "$ELSPETH_CONTAINER_INSIGHTS_QUIET_SECONDS"; then
+        printf 'container_insights_log_group_stable elapsed_seconds=%s quiet_seconds=%s samples=%s deletions=%s\n' \
+          "$elapsed" "$quiet_elapsed" "$samples" "$deletions"
+        return 0
+      fi
+    fi
+
+    elapsed=$((SECONDS - started_at))
+    if test "$elapsed" -ge "$ELSPETH_CONTAINER_INSIGHTS_MAX_WAIT_SECONDS"; then
+      printf 'container_insights_log_group_not_stabilized elapsed_seconds=%s samples=%s deletions=%s\n' \
+        "$elapsed" "$samples" "$deletions" >&2
+      return 1
+    fi
+    remaining=$((ELSPETH_CONTAINER_INSIGHTS_MAX_WAIT_SECONDS - elapsed))
+    sleep_seconds=$ELSPETH_CONTAINER_INSIGHTS_POLL_INTERVAL_SECONDS
+    if test "$sleep_seconds" -gt "$remaining"; then
+      sleep_seconds=$remaining
+    fi
+    sleep "$sleep_seconds"
+  done
+)
+
+cleanup_container_insights_log_group
 ```
 
-`aws logs delete-log-group` fails with `ResourceNotFoundException` when the
-group has not been re-created yet, or was already deleted — expected outcomes
-this teardown tolerates with `|| true`. If a later same-namespace redeploy
-still hits `ResourceAlreadyExistsException` despite this step (the flush can
-lag), re-run the command above, or set
-`-var=adopt_container_insights_log_group=true` on that apply to import the
-orphan back into Terraform state instead of deleting it.
+If a later same-namespace redeploy still hits
+`ResourceAlreadyExistsException`, first confirm the exact orphan exists. Do
+not reuse the failed saved plan: an apply may already have changed remote
+objects and a saved plan has sealed its variable values. Generate and inspect
+a replacement plan with adoption enabled, then apply only that plan file; do
+not add `-var` to the saved-plan apply:
+
+```bash
+ORPHAN_LOG_GROUP="/aws/ecs/containerinsights/${ECS_CLUSTER}/performance"
+test "$(aws logs describe-log-groups \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --log-group-name-prefix "$ORPHAN_LOG_GROUP" \
+  --query "length(logGroups[?logGroupName=='$ORPHAN_LOG_GROUP'])" \
+  --output text)" = 1
+
+terraform -chdir=scenario-a plan \
+  -var-file=../examples/scenario-a.tfvars \
+  -var='adopt_container_insights_log_group=true' \
+  -out=.terraform/scenario-a-adopt.tfplan
+terraform -chdir=scenario-a show -no-color .terraform/scenario-a-adopt.tfplan
+terraform -chdir=scenario-a apply .terraform/scenario-a-adopt.tfplan
+```
 
 Finally, query the run tag:
 

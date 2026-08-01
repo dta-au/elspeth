@@ -541,6 +541,55 @@ class TestR2Getattr:
         r2_findings = [finding for finding in findings if finding.rule_id == "R2"]
         assert r2_findings == []
 
+    def test_function_default_resolves_import_before_body_local_shadow(self) -> None:
+        source = dedent("""
+            import inspect
+
+            def target(value=inspect.getattr_static(object(), "value", None)):
+                inspect = object()
+                return value
+        """)
+
+        r2_findings = [finding for finding in parse_and_visit(source) if finding.rule_id == "R2"]
+
+        assert len(r2_findings) == 1
+
+    @pytest.mark.parametrize(
+        "source",
+        (
+            "value = object()\n\ndef target(arg=getattr(value, 'name', None)):\n    return arg\n",
+            "value = object()\n\n@getattr(value, 'decorator', None)\ndef target():\n    return None\n",
+        ),
+        ids=("default", "decorator"),
+    )
+    def test_function_definition_header_finding_binds_to_enclosing_scope(self, source: str) -> None:
+        r2_findings = [finding for finding in parse_and_visit(source) if finding.rule_id == "R2"]
+
+        assert len(r2_findings) == 1
+        assert r2_findings[0].symbol_context == ()
+        assert r2_findings[0].scope_depth == 0
+
+    def test_function_boundary_cannot_suppress_default_expression(self) -> None:
+        source = dedent("""
+            from elspeth.contracts.trust_boundary import trust_boundary
+
+            @trust_boundary(
+                source="external",
+                source_param="payload",
+                suppresses=("R1",),
+                invariant="payload is external",
+                test_ref="tests/unit/test_example.py::test_target",
+            )
+            def target(payload=payload.get("value", None)):
+                return payload
+        """)
+
+        r1_findings = [finding for finding in parse_and_visit(source) if finding.rule_id == "R1"]
+
+        assert len(r1_findings) == 1
+        assert r1_findings[0].symbol_context == ()
+        assert r1_findings[0].scope_depth == 0
+
 
 # =============================================================================
 # R3: hasattr() detection

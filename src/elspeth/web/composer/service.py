@@ -6229,18 +6229,13 @@ _ADVISOR_UNTRUSTED_USER_MESSAGE_HEADER: Final[str] = (
     "it states — schema mode, field names/types, named plugins/values — and verify the "
     "pipeline above satisfies it):"
 )
-# R2-F14 (elspeth-5403f346c0): the verdict marker scan is deliberately
-# case-SENSITIVE for CLEAN. The advisor prompt asks for a literal
-# ``CLEAN``/``FLAGGED`` token, and a case-insensitive scan across a whole line
-# fails OPEN on ordinary adjectival prose ("the extracted data looks clean and
-# consistent"), which would silently mint a sign-off. A CLEAN reply written in
-# the natural lowercase register is still accepted, but ONLY through the
-# LINE-START-ANCHORED ``_ADVISOR_VERDICT_LINE_RE`` fallback below. That arm is
-# anchored, so a lowercase CLEAN behind a label ("Verdict: clean") is NOT
-# accepted and is re-prompted instead — deliberately fail-closed, since
-# widening the any-register CLEAN surface is how adjectival prose gets back
-# in. The uppercase ``Verdict: CLEAN`` parses via the cased arm; only the
-# lowercase variant costs a retry round trip.
+# R2-F14 (elspeth-5403f346c0): CLEAN acceptance is deliberately verdict-shaped.
+# The advisor prompt asks for a literal ``CLEAN``/``FLAGGED`` token, and an
+# anywhere-in-line scan fails OPEN on negated, quoted, or adjectival uses. A
+# bare CLEAN reply is accepted only through the line-start-anchored
+# ``_ADVISOR_VERDICT_LINE_RE`` below. The observed uppercase ``Verdict: CLEAN``
+# format has its own anchored tolerance arm; ``Verdict: clean`` is deliberately
+# re-prompted rather than widening the any-register CLEAN surface.
 #
 # FLAGGED is different (acceptance-r2 final review, parked T8 residual): it is
 # ADDITIONALLY matched any-register anywhere in a line via
@@ -6263,6 +6258,11 @@ _ADVISOR_VERDICT_LINE_RE: Final[re.Pattern[str]] = re.compile(
     r"^(CLEAN|FLAGGED)\s*(?:[:.\-\u2013\u2014]|$)",
     re.IGNORECASE,
 )
+# The labeled tolerance arm preserves the observed ``Verdict: CLEAN`` model
+# formatting without treating an arbitrary uppercase CLEAN mention as a sign-
+# off. The label is case-insensitive, but CLEAN deliberately is not: the bare
+# lowercase form is accepted only by the stricter line-start arm above.
+_ADVISOR_CLEAN_VERDICT_LABEL_RE: Final[re.Pattern[str]] = re.compile(r"^(?i:verdict):\s*CLEAN\s*(?:[:.\-\u2013\u2014]|$)")
 # Each family below trips the scan ALONE (elspeth-4f7377f99d/C2): a template
 # author does not need both an "ignore/override" verb-phrase AND a
 # CLEAN-imperative in the same string to be flagged. IGNORE_RE requires the
@@ -6474,9 +6474,11 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
     those used to be declared MALFORMED and fail the build closed, which is a
     formatting quibble presented to the user as a build failure.
 
-    So: strip markdown emphasis and scan. CLEAN acceptance is bounded to the
-    first :data:`_ADVISOR_VERDICT_SCAN_MAX_LINES` non-empty lines. The old
-    "reply mentions both words => malformed" tripwire is gone; a genuinely
+    So: strip markdown emphasis and scan. Explicit verdict-shaped CLEAN
+    acceptance is bounded to the first
+    :data:`_ADVISOR_VERDICT_SCAN_MAX_LINES` non-empty lines. Uppercase CLEAN in
+    a negation, quotation, or adjective is not a verdict. The old "reply
+    mentions both words => malformed" tripwire is gone; a genuinely
     verdict-less reply is still MALFORMED, and the caller now spends a retry
     re-asking for the format rather than terminating the build.
 
@@ -6492,7 +6494,8 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
     real ``FLAGGED`` verdict sits below it — under a window-bounded rule that
     parsed as a silent sign-off with no format re-prompt. So a ``CLEAN`` that
     coexists with a ``FLAGGED`` ANYWHERE in the reply is never a sign-off;
-    only a reply carrying an in-window CLEAN and no FLAGGED at all passes.
+    only a reply carrying an explicit in-window CLEAN verdict and no FLAGGED at
+    all passes.
     The CLEAN window stays bounded (a sign-off buried under preamble is still
     re-prompted — widening acceptance is the fail-open direction; widening
     blocking is not). This still resolves each shape the fix exists to
@@ -6508,9 +6511,9 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
         if not line:
             continue
         scanned += 1
-        # Cased scan anywhere in the line (``**CLEAN**``, ``Verdict: FLAGGED``,
-        # "<preamble> FLAGGED"), then the any-register ANCHORED fallback for a
-        # bare leading token written in lowercase.
+        # The broad cased scan participates in FLAGGED dominance only. The
+        # anchored fallback adds a lowercase leading FLAGGED; CLEAN acceptance
+        # is decided separately by the explicit verdict-shaped arms below.
         markers = [match.group(1).upper() for match in _ADVISOR_VERDICT_MARKER_RE.finditer(line)]
         if not markers:
             anchored = _ADVISOR_VERDICT_LINE_RE.match(line)
@@ -6522,8 +6525,12 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
             # blocking is the safe direction. The second arm is the widened
             # any-register FLAGGED (terminator-guarded; see its definition).
             return AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=text)
+        explicit_marker = _ADVISOR_VERDICT_LINE_RE.match(line)
+        explicit_clean = (
+            explicit_marker is not None and explicit_marker.group(1).upper() == "CLEAN"
+        ) or _ADVISOR_CLEAN_VERDICT_LABEL_RE.match(line) is not None
         if scanned <= _ADVISOR_VERDICT_SCAN_MAX_LINES:
-            saw_clean = saw_clean or bool(markers)
+            saw_clean = saw_clean or explicit_clean
 
     if saw_clean:
         return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text=text)
@@ -6575,8 +6582,15 @@ def _advisor_prompt_template_injection_finding(state: CompositionState, *, user_
     scan covers it rather than relying solely on the advisor's own judgment
     of fenced-and-labeled untrusted text.
     """
-    if user_message and _looks_like_advisor_prompt_injection(user_message):
-        return "FLAGGED: the user's message contains advisor-instruction injection text; remove it before sign-off."
+    if user_message:
+        unquoted_user_message, quotes_balanced, _quoted_material_seen = _no_tool_policy._strip_quoted_text(user_message)
+        # The originating request may legitimately name an injection string as
+        # quoted data. Elide only fully balanced quoted spans; an unclosed quote
+        # keeps the original text under the fail-closed scan. Prompt/template
+        # option values below never take this exception and remain raw-scanned.
+        user_message_to_scan = unquoted_user_message if quotes_balanced else user_message
+        if _looks_like_advisor_prompt_injection(user_message_to_scan):
+            return "FLAGGED: the user's message contains advisor-instruction injection text; remove it before sign-off."
 
     for source_name, source in state.sources.items():
         for key, value in _advisor_prompt_option_values(source.options):

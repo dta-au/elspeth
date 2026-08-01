@@ -153,11 +153,10 @@ _CONTROL_COVERAGE_SUGGESTIONS: dict[str, str] = {
         "the control mode to 'recommend' — it is not an authoring change."
     ),
     "input_fields_unprovable": (
-        "The wiring is already right — do not move the control. Set the control's "
-        "'fields' to 'all' so it scans every string field, or rewrite the node's "
-        "prompt template so every row access is static ('{{ row.field }}', never "
-        "'{{ row[key] }}') and list those exact fields in the control's 'fields'. "
-        "Then validate again."
+        "Do not auto-wire a field-scoped control from the known field subset. Place a "
+        "blocking control after any downstream rewrites and set fields: 'all', or rewrite "
+        "the node's prompt template so every row access is static ('{{ row.field }}', "
+        "never '{{ row[key] }}') and then protect those exact fields. Validate again."
     ),
     "output_not_post_dominated": (
         "Wire the required control transform so it sits on every path that carries the "
@@ -221,16 +220,24 @@ def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyF
             "run under the CLI/batch runtime where web plugin policy does not apply."
         )
     elif coverage.reason == "input_fields_unprovable":
-        message = (
-            f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
-            f"{coverage.role.value} control upstream, but its own protected field set could not "
-            "be proven from its prompt template, so a control scoped to specific fields cannot be "
-            f"credited: protected fields {_field_set(coverage.protected_fields)}, control scans "
-            f"{_field_set(coverage.scanned_fields)}. An empty protected set is not proof that no "
-            "field needs protecting — a dynamic access such as row[key] extracts nothing either — "
-            "so only a control with fields: 'all' covers it. The wiring itself is correct; this is "
-            "a control-scope repair, not a layout repair."
-        )
+        if coverage.scanned_fields:
+            message = (
+                f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
+                f"{coverage.role.value} control upstream, but its own protected field set could not "
+                "be proven from its prompt template, so a control scoped to specific fields cannot be "
+                f"credited: protected fields {_field_set(coverage.protected_fields)}, control scans "
+                f"{_field_set(coverage.scanned_fields)}. A dynamic access such as row[key] can read "
+                "outside the statically known set, so only fields: 'all' covers it."
+            )
+        else:
+            message = (
+                f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
+                f"{coverage.role.value} control, but its complete protected field set could not be "
+                f"proven from its prompt template (known fields: {_field_set(coverage.protected_fields)}). "
+                "A dynamic access such as row[key] can read outside that set, so Composer cannot safely "
+                "auto-wire a field-scoped control. Place a blocking control after any downstream rewrites "
+                "with fields: 'all', or rewrite the prompt to use only static row fields."
+            )
     else:
         message = (
             f"Node '{coverage.component_id}' is not covered by the required '{coverage.capability.value}' {coverage.role.value} control."

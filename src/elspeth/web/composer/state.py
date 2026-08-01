@@ -17,7 +17,6 @@ from pathlib import PurePosixPath
 from typing import Any, Literal, NotRequired, Self, TypedDict
 
 from jinja2 import TemplateSyntaxError
-from jinja2.meta import find_undeclared_variables
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -52,7 +51,7 @@ from elspeth.core.config import (
 )
 from elspeth.core.dag.coalesce_merge import merge_guaranteed_fields
 from elspeth.core.templates import extract_jinja2_field_usage
-from elspeth.plugins.infrastructure.templates import create_sandboxed_environment
+from elspeth.plugins.infrastructure.templates import create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
@@ -1683,12 +1682,13 @@ _PROMPT_TEMPLATE_GLOBAL_NAMES: frozenset[str] = frozenset(create_sandboxed_envir
     suppresses=("R1", "R5"),
     invariant=(
         "returns a high-severity ValidationEntry only when a string prompt_template parses "
-        "and declares top-level names outside the render context; absent, mistyped, or "
-        "unparseable templates yield None (sibling rules report those) and never raise"
+        "and may load top-level names neither supplied by the render context nor definitely "
+        "assigned locally; absent, mistyped, or unparseable templates yield None (sibling "
+        "rules report those) and never raise"
     ),
 )
 def _validate_prompt_template_variable_bindings(node: NodeSpec) -> ValidationEntry | None:
-    """Reject prompt templates whose interpolations can never bind at render.
+    """Reject prompt templates whose names may be unbound on a render path.
 
     ``PromptTemplate.render`` supplies exactly ``row`` and ``lookup`` under
     ``StrictUndefined``, so a bare ``{{ text }}`` raises ``TemplateError:
@@ -1715,7 +1715,7 @@ def _validate_prompt_template_variable_bindings(node: NodeSpec) -> ValidationEnt
         ast = create_sandboxed_environment().parse(masked)
     except TemplateSyntaxError:
         return None
-    unbound = sorted(find_undeclared_variables(ast) - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
+    unbound = sorted(find_runtime_unbound_variables(ast) - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
     if not unbound:
         return None
     names = ", ".join(f"'{name}'" for name in unbound)
@@ -1740,7 +1740,7 @@ _MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({"source_row"})
 
 
 def _parse_template_names(template: str) -> tuple[frozenset[str], frozenset[str]] | None:
-    """Parse a prompt template into (top-level names, first-level row fields).
+    """Parse a prompt into (possible context names, first-level row fields).
 
     ``{{interpretation:...}}`` placeholders are masked first — they resolve to
     operator-accepted text upstream of rendering and are not Jinja2 names.
@@ -1755,7 +1755,7 @@ def _parse_template_names(template: str) -> tuple[frozenset[str], frozenset[str]
         usage = extract_jinja2_field_usage(masked)
     except TemplateSyntaxError:
         return None
-    return frozenset(find_undeclared_variables(ast)), usage.fields
+    return find_runtime_unbound_variables(ast), usage.fields
 
 
 def _well_formed_query_entries(queries: Any) -> tuple[tuple[str, Mapping[str, Any]], ...]:

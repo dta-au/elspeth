@@ -90,6 +90,28 @@ def test_input_role_coverage_keeps_the_general_message() -> None:
     assert "on_error" not in message
 
 
+def test_unprovable_input_without_dominating_control_does_not_claim_wiring_is_correct() -> None:
+    from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
+    from elspeth.web.plugin_policy.coverage import ControlCoverageFinding
+    from elspeth.web.plugin_policy.validation import _control_coverage_finding
+
+    finding = _control_coverage_finding(
+        ControlCoverageFinding(
+            component_id="judge",
+            capability=PluginCapability.PROMPT_SHIELD,
+            role=ControlRole.INPUT,
+            reason="input_fields_unprovable",
+        )
+    )
+
+    assert "control upstream" not in finding.message
+    assert "wiring itself is correct" not in finding.message
+    assert "fields: 'all'" in finding.message
+    assert finding.suggestion is not None
+    assert "wiring is already right" not in finding.suggestion
+    assert "fields: 'all'" in finding.suggestion
+
+
 def test_error_route_coverage_message_routes_retention_to_the_operator() -> None:
     """Retaining failed rows is real, but it is not an authoring change.
 

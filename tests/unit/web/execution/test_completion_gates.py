@@ -259,8 +259,10 @@ class TestParse:
     @pytest.mark.parametrize(
         "raw",
         [
+            None,
             "not-a-mapping",
             {"unknown_gate": {}},
+            {"advisor_signoff": None},
             {"advisor_signoff": "not-a-mapping"},
             {"advisor_signoff": {"status": "cleared", "detail": "d", "for_graph": "f"}},
             {"advisor_signoff": {"status": "blocked", "detail": "", "for_graph": "f"}},

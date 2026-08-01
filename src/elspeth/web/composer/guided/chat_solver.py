@@ -1910,7 +1910,7 @@ async def maybe_resolve_step_1_source_chat(
                     )
                 try:
                     result = _parse_step_1_source_tool_arguments(arguments, plugin_hint=plugin_hint)
-                except GuidedToolArgumentShapeError:
+                except (GuidedToolArgumentShapeError, AssistantScaffoldLeakError):
                     if is_retained_pair and deferred is not None:
                         # Same retention rule for a shape-invalid source half.
                         status = ComposerLLMCallStatus.SUCCESS
@@ -2510,7 +2510,7 @@ async def maybe_resolve_step_2_sink_chat(
                     )
                 try:
                     sink, assistant = _parse_step_2_sink_tool_arguments(arguments)
-                except GuidedToolArgumentShapeError:
+                except (GuidedToolArgumentShapeError, AssistantScaffoldLeakError):
                     if pending_deferred is not None:
                         # Same retention rule for a shape-invalid sink half.
                         status = ComposerLLMCallStatus.SUCCESS

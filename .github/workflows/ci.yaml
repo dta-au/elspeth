@@ -58,6 +58,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
+          # Branch-creation pushes have no event.before. Full history is needed
+          # to resolve their complete delta from the default-branch merge base.
+          fetch-depth: 0
 
       - name: Check GitHub workflows (actionlint)
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
@@ -108,12 +111,13 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         env:
           BASELINE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           if [[ "$BASELINE_REF" == "0000000000000000000000000000000000000000" ]]; then
             # A protected release branch's creation push has no event.before.
-            # Compare its first delivered commit with that commit's first parent.
-            git fetch --no-tags --depth=2 origin "$GITHUB_SHA"
-            BASELINE_REF="$(git rev-parse "$GITHUB_SHA^")"
+            # Compare every commit delivered on the new branch with its trusted
+            # common ancestor on the repository's default branch.
+            BASELINE_REF="$(git merge-base "$GITHUB_SHA" "origin/$DEFAULT_BRANCH")"
           else
             git fetch --no-tags --depth=1 origin "$BASELINE_REF"
           fi

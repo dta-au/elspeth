@@ -23,7 +23,7 @@ recovery after committed blob deletion. The notes below intentionally cover
 only major changes and critical correctness or security fixes.
 
 **Breaking pre-1.0 schema cutover:** `SESSION_SCHEMA_EPOCH` advances from 35
-to 41. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
+to 42. Epoch 36 adds retryable blob-deletion cleanup, epoch 37 adds the
 completed guided-plan decline contract, epoch 38 adds the decline result
 message locator that pins the exact assistant message a decline replays, and
 epoch 39 adds the `policy_blocked` guided-operation failure code so a
@@ -33,7 +33,9 @@ misattributed to the model provider. Epoch 40 makes the explicit coalesce
 `null`, so epoch-39 sessions fail at startup instead of during guided replay.
 Epoch 41 does the same for the `node_options_summary` key the proposal and
 wiring review cards render, so an epoch-40 session cannot reach a stored
-payload whose projection no longer verifies.
+payload whose projection no longer verifies. Epoch 42 retains the reviewed
+unproducible-output field gap on failed guided operations so retries replay the
+original closed HTTP failure envelope exactly.
 Guided checkpoints remain at schema 10 and Landscape
 `SQLITE_SCHEMA_EPOCH` advances from 29 to 30, which adds the durable row_union
 barrier attribution column to scheduler work items. ELSPETH does not migrate

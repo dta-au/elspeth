@@ -6050,8 +6050,8 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
         notes = getattr(exc_info.value, "__notes__", ())
         assert any("Temporary blob cleanup failed" in note and cleanup_message in note for note in notes), notes
 
-    def test_tempfile_cleanup_failure_preserves_quota_rejection(self) -> None:
-        """Cleanup must not replace a mapped quota-failure ToolResult."""
+    def test_tempfile_cleanup_failure_surfaces_after_quota_rejection(self) -> None:
+        """A mapped quota rejection must not hide leaked uncommitted bytes."""
         from elspeth.web.composer.tools import _execute_update_blob
 
         quota_message = "quota-primary-rejection"
@@ -6065,8 +6065,9 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
         with (
             patch("elspeth.web.composer.tools.blobs._check_blob_quota", return_value=quota_message),
             patch.object(Path, "unlink", _fail_tempfile_unlink),
+            pytest.raises(OSError, match="temp-unlink-fault"),
         ):
-            result = _execute_update_blob(
+            _execute_update_blob(
                 {"blob_id": self.blob_id, "content": "x" * 100},
                 _empty_state(),
                 _trained_tool_context(
@@ -6077,8 +6078,35 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
                 ),
             )
 
-        assert result.success is False
-        assert result.data["error"] == quota_message
+    def test_tempfile_cleanup_failure_surfaces_after_retention_rejection(self) -> None:
+        """A mapped retention rejection must not hide leaked uncommitted bytes."""
+        from elspeth.web.composer.tools import _execute_update_blob
+
+        real_unlink = Path.unlink
+
+        def _fail_tempfile_unlink(path_self: Path, *, missing_ok: bool = False) -> None:
+            if path_self.suffix == ".tmp":
+                raise OSError("temp-unlink-fault")
+            real_unlink(path_self, missing_ok=missing_ok)
+
+        with (
+            patch(
+                "elspeth.web.composer.tools.blobs._in_progress_session_fork_operation_id",
+                return_value="fork-operation",
+            ),
+            patch.object(Path, "unlink", _fail_tempfile_unlink),
+            pytest.raises(OSError, match="temp-unlink-fault"),
+        ):
+            _execute_update_blob(
+                {"blob_id": self.blob_id, "content": "x" * 100},
+                _empty_state(),
+                _trained_tool_context(
+                    _mock_catalog(),
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
+                ),
+            )
 
     def test_tempfile_cleanup_failure_preserves_successful_update(self) -> None:
         """Cleanup must not replace a committed file-and-DB update."""

@@ -1567,7 +1567,7 @@ def _execute_update_blob(
                         f"Temporary blob cleanup failed for {tmp_path} "
                         f"({type(cleanup_exc).__name__}: {cleanup_exc}). Manual cleanup required."
                     )
-                elif cleanup_primary_result is None and not replaced:
+                elif not replaced:
                     raise
 
         return _discovery_result(

@@ -37,7 +37,10 @@ Choose one mode before doing anything:
 
 Do not merge branches merely to build or deploy. Build from the worktree and
 commit the user selected. AWS CLI login lives under `~/.aws`, so it is shared
-across worktrees; project virtual environments and `.env` files are not.
+across worktrees. ELSPETH worktrees symlink `.venv` to the main checkout, so
+never install or sync dependencies from a worktree. Bind Python imports to the
+selected worktree with an explicit `PYTHONPATH` and execute the existing
+`.venv/bin/*` tools directly.
 
 ## Rules that prevent the expensive mistakes
 
@@ -106,8 +109,11 @@ container lane is:
 - AWS live tests only when their real integration changed or the user asks for
   live acceptance.
 
-Sync the worktree environment before testcontainers. A root-worktree
-`VIRTUAL_ENV` pointing at another worktree is not the environment to repair.
+Do not sync or install into the worktree's symlinked `.venv`. Unset an inherited
+`VIRTUAL_ENV`, bind `PYTHONPATH` to this checkout's `src` and
+`elspeth-lints/src`, and execute `.venv/bin/pytest` directly. If a required
+dependency is absent, stop and have the shared environment repaired from its
+owning main checkout or use a genuinely separate environment.
 
 ### 3. Build and smoke the exact image
 

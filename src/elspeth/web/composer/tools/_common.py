@@ -74,8 +74,10 @@ from elspeth.web.composer.state import (
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
+    REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
     SOURCE_AUTHORING_KEY,
     InterpretationRequirement,
+    ServerStagedRequiredControlUserTerm,
     parse_interpretation_requirements,
     serialize_authoring_review_options,
     strip_authoring_options,
@@ -1906,15 +1908,22 @@ def _resolver_owned_interpretation_requirement_error(
         kind = requirement["kind"]
         user_term = requirement["user_term"]
         draft = requirement["draft"]
+        server_staged_auto_wire = type(user_term) is ServerStagedRequiredControlUserTerm
         if (
             type(kind) is not str
             or not kind.strip()
-            or type(user_term) is not str
+            or (type(user_term) is not str and not server_staged_auto_wire)
             or not user_term.strip()
             or type(draft) is not str
             or not draft.strip()
         ):
             return malformed_error
+        if user_term == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM and not server_staged_auto_wire:
+            return (
+                f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}] uses "
+                f"server-owned user_term '{REQUIRED_CONTROL_AUTO_WIRED_USER_TERM}'. "
+                "Only the required-control finalizer may stage this disclosure."
+            )
         try:
             InterpretationKind(kind)
         except ValueError:
@@ -2159,13 +2168,14 @@ def _canonicalize_authored_interpretation_requirements(
             raise AssertionError("interpretation requirement entries must be admitted before canonicalization")
         kind = requirement["kind"]
         user_term = requirement["user_term"]
-        if type(kind) is not str or type(user_term) is not str:
+        if type(kind) is not str or (type(user_term) is not str and type(user_term) is not ServerStagedRequiredControlUserTerm):
             raise AssertionError("interpretation requirement kind/user_term must be admitted before canonicalization")
+        persisted_user_term = str(user_term)
         requirement_id = existing_ids.get(
-            (kind, user_term.strip()),
+            (kind, persisted_user_term.strip()),
             _authored_interpretation_requirement_id(
                 component_id=component_id,
-                user_term=user_term,
+                user_term=persisted_user_term,
                 source=source,
             ),
         )
@@ -2176,7 +2186,7 @@ def _canonicalize_authored_interpretation_requirements(
             _pending_interpretation_requirement(
                 requirement_id=requirement_id,
                 kind=InterpretationKind(kind),
-                user_term=user_term,
+                user_term=persisted_user_term,
                 draft=draft,
             )
         )

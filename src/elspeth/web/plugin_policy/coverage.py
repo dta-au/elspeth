@@ -42,6 +42,14 @@ class OutputStreamGraph:
 
 
 @dataclass(frozen=True, slots=True)
+class _ProtectedFields:
+    """Known prompt fields plus whether that set is statically complete."""
+
+    fields: frozenset[str]
+    provable: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ControlCoverageFinding:
     """One uncovered required-control site, with enough detail to explain it.
 
@@ -54,14 +62,14 @@ class ControlCoverageFinding:
     target.
 
     ``input_fields_unprovable`` is the second fully-diagnosable case: the
-    topology IS correct — a blocking control dominates the node's input — but
-    the node's protected field set could not be proven, so a control scoped to
-    a specific field list cannot be credited (only ``fields: all`` can).
-    Reporting that as ``input_not_dominated`` sent authors to repair a wiring
-    layout that was already right (AWS acceptance run 2, R2-F17).
+    node's protected field set is not statically complete, so a control scoped
+    to a specific field list cannot be credited (only ``fields: all`` can).
+    This reason remains authoritative even when the topology is also broken:
+    ``input_not_dominated`` is auto-wirable, and auto-wiring from a known
+    subset would install a control that still cannot cover a dynamic access.
     ``protected_fields`` and ``scanned_fields`` carry the two sets the message
-    must name; ``scanned_fields`` is diagnosis-only and is never a credit
-    decision.
+    can name; ``scanned_fields`` is populated only when a control structurally
+    dominates, is diagnosis-only, and is never a credit decision.
     """
 
     component_id: str
@@ -166,53 +174,49 @@ def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> 
     return protected_fields.issubset(scanned_fields)
 
 
-def _llm_input_fields(node: NodeSpec) -> frozenset[str]:
-    """Return row fields interpolated into LLM prompts, or empty when unprovable."""
+def _llm_input_fields(node: NodeSpec) -> _ProtectedFields:
+    """Return known prompt fields without erasing whether the set is complete."""
     prompt_fields = _template_input_fields(node.options.get("prompt_template"))
-    if prompt_fields is None:
-        return frozenset()
-    fields = set(prompt_fields)
+    fields = set(prompt_fields.fields)
+    provable = prompt_fields.provable
 
     queries = node.options.get("queries")
     if queries is None:
-        return frozenset(fields)
+        return _ProtectedFields(frozenset(fields), provable)
     if isinstance(queries, Mapping):
         definitions = tuple(queries.values())
     elif isinstance(queries, Sequence) and not isinstance(queries, (str, bytes)):
         definitions = tuple(queries)
     else:
-        return frozenset()
+        return _ProtectedFields(frozenset(fields), False)
 
     for definition in definitions:
         if not isinstance(definition, Mapping):
-            return frozenset()
+            return _ProtectedFields(frozenset(fields), False)
         input_fields = definition.get("input_fields")
         if not isinstance(input_fields, Mapping):
-            return frozenset()
+            return _ProtectedFields(frozenset(fields), False)
         row_fields = tuple(input_fields.values())
         if any(not isinstance(field, str) or not field.strip() for field in row_fields):
-            return frozenset()
+            return _ProtectedFields(frozenset(fields), False)
         fields.update(cast("tuple[str, ...]", row_fields))
         template = definition.get("template")
         if template is not None:
             query_template_fields = _template_input_fields(template)
-            if query_template_fields is None:
-                return frozenset()
-            fields.update(query_template_fields)
-    return frozenset(fields)
+            fields.update(query_template_fields.fields)
+            provable = provable and query_template_fields.provable
+    return _ProtectedFields(frozenset(fields), provable)
 
 
-def _template_input_fields(template: object) -> frozenset[str] | None:
+def _template_input_fields(template: object) -> _ProtectedFields:
     """Extract static row-field accesses; dynamic or malformed templates are unprovable."""
     if not isinstance(template, str):
-        return None
+        return _ProtectedFields(frozenset(), False)
     try:
         usage = extract_jinja2_field_usage(template)
     except TemplateSyntaxError:
-        return None
-    if usage.dynamic_accesses:
-        return None
-    return usage.fields
+        return _ProtectedFields(frozenset(), False)
+    return _ProtectedFields(usage.fields, not usage.dynamic_accesses)
 
 
 def _llm_output_fields(node: NodeSpec) -> frozenset[str]:
@@ -267,13 +271,14 @@ def control_coverage_findings(
         if not node_has_capability(node, PluginCapability.LLM):
             continue
         if capability is PluginCapability.PROMPT_SHIELD:
-            protected_fields = _llm_input_fields(node)
+            input_fields = _llm_input_fields(node)
             covered = _stream_proves_input_control(
                 node.input,
                 graph,
                 source_streams=source_streams,
                 visited=frozenset(),
-                protected_fields=protected_fields,
+                protected_fields=input_fields,
+                enforce_field_scope=True,
             )
             if not covered:
                 # Diagnosis is decided HERE, where both field sets are in
@@ -288,7 +293,8 @@ def control_coverage_findings(
                     graph,
                     source_streams=source_streams,
                     visited=frozenset(),
-                    protected_fields=None,
+                    protected_fields=input_fields,
+                    enforce_field_scope=False,
                 )
                 # Field sets are named only when a control provably dominates:
                 # every control the scan then finds is a real dominator, so the
@@ -299,8 +305,12 @@ def control_coverage_findings(
                         component_id=node.id,
                         capability=capability,
                         role=ControlRole.INPUT,
-                        reason=("input_fields_unprovable" if not protected_fields and structurally_covered else "input_not_dominated"),
-                        protected_fields=tuple(sorted(protected_fields)),
+                        reason=(
+                            "input_fields_unprovable"
+                            if not input_fields.provable or (not input_fields.fields and structurally_covered)
+                            else "input_not_dominated"
+                        ),
+                        protected_fields=tuple(sorted(input_fields.fields)),
                         scanned_fields=scanned_fields or (),
                     )
                 )
@@ -520,14 +530,14 @@ def _stream_proves_input_control(
     *,
     source_streams: frozenset[str],
     visited: frozenset[str],
-    protected_fields: frozenset[str] | None,
+    protected_fields: _ProtectedFields,
+    enforce_field_scope: bool,
 ) -> bool:
     """Prove a blocking input control dominates ``stream``.
 
-    ``protected_fields=None`` is the DIAGNOSIS PROBE: it asks the same
+    ``enforce_field_scope=False`` is the DIAGNOSIS PROBE: it asks the same
     question with the field-scope rule switched off — "does a blocking control
-    dominate this input at all, whatever it scans?" — using the existing
-    ``node_has_blocking_control`` convention for that sentinel. Every
+    dominate this input at all, whatever it scans?" Every
     structural refusal (external calls, unprovable write sets, unprovable
     mapper config, cycles, unknown producers) still applies, so a probe answer
     of True means the topology really is right and only the control's scope is
@@ -545,6 +555,7 @@ def _stream_proves_input_control(
                 source_streams=source_streams,
                 visited=visited,
                 protected_fields=protected_fields,
+                enforce_field_scope=enforce_field_scope,
             )
             for producer in producers
         )
@@ -558,7 +569,8 @@ def _producer_proves_input_control(
     *,
     source_streams: frozenset[str],
     visited: frozenset[str],
-    protected_fields: frozenset[str] | None,
+    protected_fields: _ProtectedFields,
+    enforce_field_scope: bool,
 ) -> bool:
     if producer.id in visited:
         return False
@@ -567,7 +579,7 @@ def _producer_proves_input_control(
         producer,
         PluginCapability.PROMPT_SHIELD,
         ControlRole.INPUT,
-        protected_fields=protected_fields,
+        protected_fields=(protected_fields.fields if protected_fields.provable else frozenset()) if enforce_field_scope else None,
     ):
         return True
     if producer.node_type == "queue":
@@ -579,6 +591,7 @@ def _producer_proves_input_control(
                 source_streams=source_streams,
                 visited=visited,
                 protected_fields=protected_fields,
+                enforce_field_scope=enforce_field_scope,
             )
             for predecessor in predecessors
         )
@@ -591,6 +604,7 @@ def _producer_proves_input_control(
                 source_streams=source_streams,
                 visited=visited,
                 protected_fields=protected_fields,
+                enforce_field_scope=enforce_field_scope,
             )
             for branch in branches
         )
@@ -605,6 +619,7 @@ def _producer_proves_input_control(
             source_streams=source_streams,
             visited=visited,
             protected_fields=protected_fields,
+            enforce_field_scope=enforce_field_scope,
         )
     if producer.plugin is None:
         return False
@@ -616,30 +631,30 @@ def _producer_proves_input_control(
         return False
     if producer.plugin != "field_mapper":
         written_fields = _deterministic_written_fields(producer)
-        if written_fields is None or (protected_fields is not None and written_fields & protected_fields):
+        if (
+            written_fields is None
+            or (not protected_fields.provable and bool(written_fields))
+            or bool(written_fields & protected_fields.fields)
+        ):
             # A write below the nearest shield replaces scanned content with
             # unscanned data, so upstream shielding cannot cover it. Unknown
             # write sets fail closed — including under the diagnosis probe,
             # which switches off the field-scope rule only.
             return False
-    # The probe carries no field names, so mapper translation cannot change
-    # its answer — but an unprovable mapper CONFIG is a structural refusal and
-    # must still fail closed, so it is evaluated against the empty set.
     translated_fields = _translate_protected_fields_through_mapper(
         producer,
-        frozenset() if protected_fields is None else protected_fields,
+        protected_fields.fields,
         direction="upstream",
     )
     if translated_fields is None:
         return False
-    if protected_fields is None:
-        translated_fields = None
     return _stream_proves_input_control(
         producer.input,
         graph,
         source_streams=source_streams,
         visited=visited,
-        protected_fields=translated_fields,
+        protected_fields=_ProtectedFields(translated_fields, protected_fields.provable),
+        enforce_field_scope=enforce_field_scope,
     )
 
 

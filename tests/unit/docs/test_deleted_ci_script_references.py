@@ -22,7 +22,12 @@ SOURCE_PREFIXES_OUT_OF_SCOPE = ("src/elspeth/web/",)
 
 
 def _active_markdown_paths() -> list[Path]:
-    paths = [*REPO_ROOT.glob("*.md"), *REPO_ROOT.glob("docs/**/*.md")]
+    paths = [
+        *REPO_ROOT.glob("*.md"),
+        *REPO_ROOT.glob("docs/**/*.md"),
+        *REPO_ROOT.glob(".agents/skills/**/*.md"),
+        *REPO_ROOT.glob(".claude/skills/**/*.md"),
+    ]
     return [
         path
         for path in sorted(paths)
@@ -44,6 +49,8 @@ def _active_reference_paths() -> list[Path]:
     paths = [
         *REPO_ROOT.glob("*.md"),
         *REPO_ROOT.glob("docs/**/*.md"),
+        *REPO_ROOT.glob(".agents/skills/**/*.md"),
+        *REPO_ROOT.glob(".claude/skills/**/*.md"),
         *REPO_ROOT.glob("src/elspeth/**/*.py"),
     ]
     return [

@@ -889,10 +889,12 @@ class TestStep2IntraStep:
 
         from structlog.testing import capture_logs
 
+        operation_id = str(uuid4())
         with capture_logs() as planner_logs:
             settled = _post_current_response(
                 composer_test_client,
                 session_id,
+                operation_id=operation_id,
                 component_action={"action": "finish", "component_kind": "output"},
             )
 
@@ -910,6 +912,14 @@ class TestStep2IntraStep:
             assert failure_detail["failure_code"] == "invalid_provider_response"
             assert failure_detail["unproducible_output_fields"] == ["amount_aud", "client"]
             assert "amount_aud" in failure_detail["detail"] and "client" in failure_detail["detail"]
+            replayed = _post_current_response(
+                composer_test_client,
+                session_id,
+                operation_id=operation_id,
+                component_action={"action": "finish", "component_kind": "output"},
+            )
+            assert replayed.status_code == 502, replayed.json()
+            assert replayed.json() == settled.json()
             # The guided surface records its planner disposition as a
             # structured log rather than a durable audit row
             # (``_log_guided_planner_failure``), so that is where the closed

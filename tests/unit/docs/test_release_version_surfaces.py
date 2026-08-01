@@ -95,4 +95,7 @@ def test_current_operator_runbooks_use_072_candidate_and_071_baseline() -> None:
     assert "elspeth:ecs-0.7.2-closeout" in aws
     assert '"candidate_package_version": "0.7.2"' in aws
     assert '"previous_package_version": "0.7.1"' in aws
+    assert f'"candidate": {{"session_epoch": {SESSION_SCHEMA_EPOCH}, "landscape_epoch": 30' in aws
     assert '"previous": {"session_epoch": 35, "landscape_epoch": 29' in aws
+    assert f'"structural_changes": "session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_30' in aws
+    assert f"repair forward with epoch-{SESSION_SCHEMA_EPOCH} session/epoch-30 Landscape code" in aws

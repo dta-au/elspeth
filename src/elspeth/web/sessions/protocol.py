@@ -321,9 +321,16 @@ class GuidedOperationCompleted:
 @final
 @dataclass(frozen=True, slots=True)
 class GuidedOperationFailed:
-    """Immutable terminal failure containing only the closed safe code."""
+    """Immutable terminal failure containing only closed, replay-safe facts."""
 
     failure_code: GuidedOperationFailureCode
+    unproducible_output_fields: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.failure_code not in GUIDED_OPERATION_FAILURE_CODE_VALUES:
+            raise AuditIntegrityError("guided operation failure code is outside the closed vocabulary")
+        if type(self.unproducible_output_fields) is not tuple or any(type(field) is not str for field in self.unproducible_output_fields):
+            raise AuditIntegrityError("guided operation failure output fields must be an exact string tuple")
 
 
 type GuidedOperationOutcome = (
@@ -1222,6 +1229,7 @@ class GuidedOperationFailureCommand:
     failure_code: GuidedOperationFailureCode
     actor: str
     audit_evidence: GuidedAuditEvidence
+    unproducible_output_fields: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.fence) is not GuidedOperationFence:
@@ -1232,6 +1240,8 @@ class GuidedOperationFailureCommand:
             raise AuditIntegrityError("guided operation failure actor must be non-empty")
         if type(self.audit_evidence) is not GuidedAuditEvidence:
             raise AuditIntegrityError("guided operation failure audit evidence must be exact")
+        if type(self.unproducible_output_fields) is not tuple or any(type(field) is not str for field in self.unproducible_output_fields):
+            raise AuditIntegrityError("guided operation failure output fields must be an exact string tuple")
 
 
 @final

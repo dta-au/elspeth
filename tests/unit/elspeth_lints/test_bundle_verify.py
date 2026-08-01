@@ -291,6 +291,55 @@ def test_verify_accepts_mixed_signed_and_prejudge_exact_same_prefix_group(tmp_pa
     assert report.mismatches == ()
 
 
+def test_verify_signed_exact_entry_does_not_cover_second_same_prefix_finding(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    target = root / "plugins" / "gadget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'anonymous')\n"
+        "        return payload.get('second', first)\n",
+        encoding="utf-8",
+    )
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(findings) == 2
+    _write_signed_v2_entry(allowlist_dir, "signed.yaml", finding=findings[0])
+
+    report = verify_bundle_against_tree(_bundle(root, allowlist_dir, ()), root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert report.target_census.exact_covered_count == 1
+    assert report.target_census.uncovered_count == 1
+    assert any(_canonical_key(findings[1]) in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_accepts_judgment_for_second_same_prefix_finding(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    target = root / "plugins" / "gadget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'anonymous')\n"
+        "        return payload.get('second', first)\n",
+        encoding="utf-8",
+    )
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(findings) == 2
+    _write_signed_v2_entry(allowlist_dir, "signed.yaml", finding=findings[0])
+    bundle = _bundle(root, allowlist_dir, (_new_judgment_action(findings[1], "plugins/gadget.py"),))
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is True
+    assert report.mismatches == ()
+
+
 def test_verify_rejects_relative_paths_recorded_in_bundle(tmp_path: Path) -> None:
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
@@ -342,6 +391,32 @@ def test_verify_rejects_bundle_omitting_stale_delete(tmp_path: Path) -> None:
     assert any(
         "target census" in mismatch and "missing stale_delete action" in mismatch and key in mismatch for mismatch in report.mismatches
     )
+
+
+def test_verify_fails_closed_when_source_tree_contains_syntax_error(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    (root / "plugins" / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=r"tier-model scan failed.*plugins/broken\.py.*syntax"):
+        verify_bundle_against_tree(_bundle(root, allowlist_dir, ()), root=root, allowlist_dir=allowlist_dir)
+
+
+def test_verify_rejects_stale_delete_when_bound_source_is_unscannable(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    target = _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    target.write_text("def broken(:\n", encoding="utf-8")
+    bundle = _bundle(
+        root,
+        allowlist_dir,
+        (BundleAction(lane="resign", kind="stale_delete", key=key, source_file="widget.yaml"),),
+    )
+
+    with pytest.raises(ValueError, match=r"tier-model scan failed.*plugins/widget\.py.*syntax"):
+        verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
 
 
 def test_verify_rejects_substituted_scan_scope_before_signing(tmp_path: Path) -> None:

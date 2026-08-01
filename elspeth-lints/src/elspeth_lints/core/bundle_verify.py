@@ -48,7 +48,9 @@ from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle
 from elspeth_lints.core.tier_model_scan import (
     TargetCensus,
     census_tree_targets,
+    diagnosis_deferred_prefixes,
     plan_non_judge_rotations,
+    routable_new_judgment_findings,
     scan_single_file_findings,
 )
 from elspeth_lints.rules.trust_tier.tier_model.rotate import (
@@ -119,12 +121,13 @@ def verify_bundle_against_tree(
     diagnosis = diagnose_judge_signatures(root=root, allowlist_dir=allowlist_dir)
     index: dict[str, Any] = {item.key: item for item in diagnosis.items}
     allowlist = _load_tier_model_allowlist(allowlist_dir)
-    covered_prefixes = frozenset(identity_prefix(entry.key) for entry in allowlist.entries)
+    covered_keys = frozenset(entry.key for entry in allowlist.entries)
     target_scan = census_tree_targets(
         root=root,
-        covered_prefixes=covered_prefixes,
+        covered_keys=covered_keys,
         per_file_rules=allowlist.per_file_rules,
     )
+    deferred_prefixes = diagnosis_deferred_prefixes(diagnosis.items)
 
     # Survey every non-judge-gated rotation even when the staged bundle omits
     # the lane. Remove findings already assigned to judge-gated diagnosis so a
@@ -156,7 +159,12 @@ def verify_bundle_against_tree(
         file_findings = new_judgment_findings_by_file.setdefault(finding.file_path, {})
         assert file_findings is not None
         file_findings[canonical_key] = finding
-    for finding in target_scan.uncovered_findings:
+    expected_new_judgments = routable_new_judgment_findings(
+        uncovered_findings=target_scan.uncovered_findings,
+        diagnosis_items=diagnosis.items,
+        rotation_plan=full_rotation_plan,
+    )
+    for finding in expected_new_judgments:
         canonical_key = _finding_canonical_key(finding)
         if canonical_key not in justify_keys:
             mismatches.append(f"target census missing justify action for uncovered finding {canonical_key!r}")
@@ -179,7 +187,8 @@ def verify_bundle_against_tree(
                     action,
                     root=root,
                     live_findings_by_file=new_judgment_findings_by_file,
-                    covered_prefixes=covered_prefixes,
+                    covered_keys=covered_keys,
+                    deferred_prefixes=deferred_prefixes,
                     per_file_rules=allowlist.per_file_rules,
                 )
             )
@@ -214,7 +223,8 @@ def _verify_new_judgment(
     *,
     root: Path,
     live_findings_by_file: dict[str, dict[str, Any] | None],
-    covered_prefixes: frozenset[str],
+    covered_keys: frozenset[str],
+    deferred_prefixes: frozenset[str],
     per_file_rules: list[PerFileRule],
 ) -> list[str]:
     if not action.file_path:  # pragma: no cover - enforced by BundleAction.__post_init__
@@ -236,8 +246,10 @@ def _verify_new_judgment(
             f"new_judgment {action.key!r}: no live finding at the staged fingerprint in "
             f"{action.file_path} (vanished or fingerprint-shifted)"
         ]
-    if identity_prefix(action.key) in covered_prefixes or _finding_covered_by_per_file_rule(finding, per_file_rules):
+    if action.key in covered_keys or _finding_covered_by_per_file_rule(finding, per_file_rules):
         return [f"new_judgment {action.key!r}: finding is already covered by the current allowlist; re-run stage_scan"]
+    if identity_prefix(action.key) in deferred_prefixes:
+        return [f"new_judgment {action.key!r}: identity is reserved for an outstanding diagnosis action; re-run stage_scan"]
     return []
 
 

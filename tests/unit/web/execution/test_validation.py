@@ -5405,7 +5405,7 @@ class TestPluginPolicySuggestions:
             binding_generation_fingerprint="required-control-generation",
         )
         state = _make_state(
-            nodes=(_make_node(plugin="llm"),),
+            nodes=(_make_node(plugin="llm", options={"prompt_template": "Assess {{ row.ticket_id }}"}),),
             outputs=(_make_output(),),
         )
 

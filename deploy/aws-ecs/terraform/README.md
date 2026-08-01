@@ -963,11 +963,13 @@ after a destroy can then hit `ResourceAlreadyExistsException` on
 `CreateLogGroup`. A `depends_on` ordering fix cannot help; the collision
 happens after destroy completes, not during create.
 
-Delete the orphan once the flush has had time to land
-(`aws logs delete-log-group --log-group-name
-/aws/ecs/containerinsights/<cluster-name>/performance`, tolerant of
-`ResourceNotFoundException`) — see the cold-install runbook's Teardown
-section. If a retry still collides, set `-var=adopt_container_insights_log_group=true`
-on that apply instead: both roots declare the variable (default `false`) and
-gate an `import` block on it that formally adopts the orphan into state
-rather than deleting it.
+Follow the cold-install runbook's bounded Teardown poll. It requires one full
+quiet window for an already-absent group and restarts that window after deleting
+each exact-name appearance, while a separate maximum keeps cleanup bounded and
+fail-closed. If a retry still collides, generate and inspect a replacement
+plan with `-var=adopt_container_insights_log_group=true`, then apply only that
+new saved plan without adding `-var` to `terraform apply`. Both roots declare
+the variable (default `false`) and gate an `import` block on it that formally
+adopts the orphan into state rather than deleting it. Never reuse the failed
+saved plan: it sealed the old variable values and its failed apply may already
+have changed state or remote objects.

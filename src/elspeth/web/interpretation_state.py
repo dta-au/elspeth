@@ -60,6 +60,18 @@ PROMPT_SHIELD_USER_TERM: Final[str] = "prompt_injection_shield_recommendation"
 # elspeth-f99655f540). The row rides on the INSERTED node, staged pending by
 # ``web.composer.required_controls.wire_required_controls``.
 REQUIRED_CONTROL_AUTO_WIRED_USER_TERM: Final[str] = "required_control_auto_wired"
+
+
+class ServerStagedRequiredControlUserTerm(str):
+    """Nominal in-process authority for a server-staged auto-wire disclosure.
+
+    Public composer payloads can carry only the ordinary string value. The
+    required-control finalizer uses this owned subtype while the candidate is
+    admitted; persisted canonical rows intentionally return to plain JSON
+    strings and use the existing internal-revalidation path thereafter.
+    """
+
+
 PROMPT_SHIELD_WARNING_DRAFT: Final[str] = (
     "Recommend inserting azure_prompt_shield (or the deployment equivalent prompt-injection shield) "
     "between the external-content fetch step and this LLM. The current draft routes "

@@ -4819,27 +4819,3 @@ per_file_rules:
     section in the Phase 8 plan.
   expires: null
   max_hits: 10
-- pattern: web/interpretation_state.py
-  rules:
-  - R1
-  - R5
-  reason: 'Composer interpretation-review state reads operator/LLM-authored option
-    dicts (Tier-3 authoring metadata: interpretation_requirements, prompt_template_parts,
-    source_authoring, web_scrape field config). isinstance()/dict.get() are the documented
-    lenient Tier-3 staging idiom for these externally-shaped dicts (see module docstring).
-    Collapsed from per-fingerprint entries to one bounded per-file rule because the
-    file''s high edit cadence rotated AST fingerprints on every change; max_hits caps
-    the exemption so a NEW R1/R5 still trips CI review. R6/R7 are not exempted here.'
-  expires: null
-  max_hits: 70
-- pattern: web/sessions/service.py
-  rules:
-  - R1
-  - R5
-  reason: Session service reads composer-authored option dicts and Pydantic/SQLAlchemy
-    boundary results (Tier-3). R1/R5 collapsed to one bounded per-file rule for the
-    same AST-fingerprint-churn reason as interpretation_state.py; max_hits caps the
-    exemption so a NEW R1/R5 still trips review. R6 (silent-except) and R7 (contextlib.suppress)
-    remain individually fingerprinted for per-site scrutiny.
-  expires: null
-  max_hits: 35

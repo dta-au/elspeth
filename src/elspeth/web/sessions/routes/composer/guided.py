@@ -4882,6 +4882,7 @@ async def post_guided_respond(
                                 llm_calls=planner_recorder.llm_calls,
                                 chat_turns=planner_recorder.chat_turns,
                             ),
+                            unproducible_output_fields=(exc.unproducible_output_fields if isinstance(exc, PipelinePlannerError) else ()),
                         )
                     )
                 except GuidedOperationFenceLostError:
@@ -4904,10 +4905,7 @@ async def post_guided_respond(
                     # Read off the escaping planner error rather than
                     # recomputed from the guided session, which may not be
                     # bound yet at this generic handler.
-                    raise_guided_operation_failure(
-                        failed,
-                        unproducible_output_fields=(exc.unproducible_output_fields if isinstance(exc, PipelinePlannerError) else ()),
-                    )
+                    raise_guided_operation_failure(failed)
 
         if rejoin_after_lock:
             joined = await reserve_or_replay_guided_operation(

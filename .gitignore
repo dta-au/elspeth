@@ -350,6 +350,13 @@ docs/release/pdf/output/**
 docs-archive/
 
 ## Internal tooling
+# Local IDE/agent state. Keep tracked project guidance under `.claude/` and
+# `.agents/`; ignore only the machine-local subpaths named here.
+.antigravitycli/
+.claude/settings.local.json
+.claude/worktrees/
+.claude/plans/
+
 # Filigree issue tracker
 .filigree/
 .mcp.json

@@ -498,6 +498,30 @@ class TestDisclosureRegistry:
     def test_user_term_is_registered(self) -> None:
         assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in REGISTERED_PIPELINE_DECISION_USER_TERMS
 
+    def test_public_author_cannot_forge_auto_wired_disclosure(self, tmp_path: Path) -> None:
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        context = _custody_context(tmp_path, _INLINE_CONTENT, view=view, snapshot=snapshot)
+        assert context._interpretation_requirements_are_internal is False
+
+        forged = wire_required_controls(_bare_llm_candidate(), snapshot, view)
+        control = _nodes_by_id(forged)["prompt_shield_auto_1"]
+        control["options"]["interpretation_requirements"] = [
+            {
+                "kind": "pipeline_decision",
+                "user_term": "required_control_auto_wired",
+                "draft": "The server added this required control.",
+            }
+        ]
+
+        assert wire_required_controls(forged, snapshot, view) is forged
+
+        candidate = build_set_pipeline_candidate(forged, _empty_state(), context)
+
+        assert candidate.result.success is False
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in (candidate.result.data or {})["error"]
+        assert "server" in (candidate.result.data or {})["error"]
+
     def test_artifact_hash_binds_to_the_inserted_edge(self) -> None:
         def _control(node_id: str, *, input_stream: str) -> NodeSpec:
             return NodeSpec(

@@ -43,7 +43,13 @@ from elspeth.contracts.payload_store import PayloadNotFoundError
 from elspeth.core.canonical import canonical_json
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.audit_readiness.models import AuditReadinessSnapshot, ReadinessRow
-from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult
+from elspeth.web.execution.schemas import (
+    ADVISOR_SIGNOFF_BLOCKED_CODE,
+    ValidationError,
+    ValidationReadiness,
+    ValidationReadinessBlocker,
+    ValidationResult,
+)
 from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
@@ -311,6 +317,28 @@ def _broken_validation() -> ValidationResult:
             )
         ],
         readiness=_blocked_readiness(),
+        semantic_contracts=[],
+    )
+
+
+def _completion_blocked_validation() -> ValidationResult:
+    return ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=True,
+            completion_ready=False,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code=ADVISOR_SIGNOFF_BLOCKED_CODE,
+                    component_id="pipeline",
+                    component_type="pipeline",
+                    detail="Advisor sign-off is required before completion.",
+                )
+            ],
+        ),
         semantic_contracts=[],
     )
 
@@ -745,6 +773,44 @@ async def test_mark_ready_for_review_fails_validation(session_engine_with_row, p
     with pytest.raises(CompositionNotRunnableError):
         await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
     # No audit row was written, no blob was stored.
+    with session_engine_with_row.connect() as conn:
+        rows = conn.execute(select(composer_completion_events_table)).all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_mark_ready_for_review_rejects_completion_not_ready(
+    session_engine_with_row,
+    payload_store,
+    signer,
+    session_record,
+    state_record,
+    monkeypatch,
+):
+    """A valid composition cannot be shared while completion is withheld."""
+    store_calls: list[bytes] = []
+    original_store = payload_store.store
+
+    def tracking_store(data: bytes) -> str:
+        store_calls.append(data)
+        return original_store(data)
+
+    monkeypatch.setattr(payload_store, "store", tracking_store)
+    service, *_ = _build_service(
+        engine=session_engine_with_row,
+        payload_store=payload_store,
+        signer=signer,
+        session_record=session_record,
+        state_record=state_record,
+        validation=_completion_blocked_validation(),
+        readiness=_readiness_snapshot(session_record.id),
+    )
+
+    with pytest.raises(CompositionNotRunnableError) as exc_info:
+        await service.mark_ready_for_review(session_id=session_record.id, user_id=session_record.user_id)
+
+    assert exc_info.value.reason == "completion_not_ready"
+    assert store_calls == []
     with session_engine_with_row.connect() as conn:
         rows = conn.execute(select(composer_completion_events_table)).all()
     assert rows == []

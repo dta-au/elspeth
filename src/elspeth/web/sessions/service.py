@@ -3775,7 +3775,17 @@ class SessionServiceImpl:
         lease_expires_at = row["lease_expires_at"]
         if not isinstance(lease_token, str) or not 1 <= len(lease_token) <= 256 or not isinstance(lease_expires_at, datetime):
             raise AuditIntegrityError("Tier 1: in-progress guided operation has an invalid lease bundle")
-        if any(row[field] is not None for field in ("settled_at", "result_kind", "result_message_id", "response_hash", "failure_code")):
+        if any(
+            row[field] is not None
+            for field in (
+                "settled_at",
+                "result_kind",
+                "result_message_id",
+                "response_hash",
+                "failure_code",
+                "unproducible_output_fields",
+            )
+        ):
             raise AuditIntegrityError("Tier 1: in-progress guided operation retained terminal residue")
         kind = row["kind"]
         if row["result_session_id"] is not None and kind != "session_fork":
@@ -3785,6 +3795,15 @@ class SessionServiceImpl:
         if row["proposal_id"] is not None and kind not in {"guided_respond", "guided_chat"}:
             raise AuditIntegrityError("Tier 1: in-progress guided operation has a mismatched proposal locator")
         return SessionServiceImpl._ensure_utc(lease_expires_at)
+
+    @staticmethod
+    def _guided_failure_unproducible_output_fields(row: RowMapping) -> tuple[str, ...]:
+        raw_fields = row["unproducible_output_fields"]
+        if raw_fields is None:
+            return ()
+        if type(raw_fields) is not list or not raw_fields or any(type(field) is not str for field in raw_fields):
+            raise AuditIntegrityError("Tier 1: guided operation has malformed unproducible output fields")
+        return tuple(raw_fields)
 
     @staticmethod
     def _validate_guided_terminal_bundle(row: RowMapping) -> None:
@@ -3809,10 +3828,16 @@ class SessionServiceImpl:
                 raise AuditIntegrityError("Tier 1: failed guided operation retained terminal failure residue")
             if not isinstance(row["settled_at"], datetime):
                 raise AuditIntegrityError("Tier 1: failed guided operation is missing settled_at")
+            SessionServiceImpl._guided_failure_unproducible_output_fields(row)
             return
         if status != "completed":
             raise AuditIntegrityError("Tier 1: guided operation terminal decoder received a non-terminal row")
-        if row["lease_token"] is not None or row["lease_expires_at"] is not None or row["failure_code"] is not None:
+        if (
+            row["lease_token"] is not None
+            or row["lease_expires_at"] is not None
+            or row["failure_code"] is not None
+            or row["unproducible_output_fields"] is not None
+        ):
             raise AuditIntegrityError("Tier 1: completed guided operation retained terminal residue")
         if not isinstance(row["settled_at"], datetime):
             raise AuditIntegrityError("Tier 1: completed guided operation is missing settled_at")
@@ -3872,7 +3897,10 @@ class SessionServiceImpl:
     def _guided_terminal_outcome(row: RowMapping) -> GuidedOperationCompleted | GuidedOperationFailed:
         SessionServiceImpl._validate_guided_terminal_bundle(row)
         if row["status"] == "failed":
-            return GuidedOperationFailed(failure_code=cast("GuidedOperationFailureCode", row["failure_code"]))
+            return GuidedOperationFailed(
+                failure_code=cast("GuidedOperationFailureCode", row["failure_code"]),
+                unproducible_output_fields=SessionServiceImpl._guided_failure_unproducible_output_fields(row),
+            )
         response_hash = cast("str", row["response_hash"])
         result_kind = row["result_kind"]
         if result_kind == "composition_state":
@@ -4177,6 +4205,7 @@ class SessionServiceImpl:
                         result_session_id=None,
                         response_hash=None,
                         failure_code="request_cancelled",
+                        unproducible_output_fields=None,
                         settled_at=now,
                         updated_at=now,
                     )
@@ -4522,6 +4551,7 @@ class SessionServiceImpl:
                 lease_expires_at=None,
                 response_hash=response_hash,
                 failure_code=None,
+                unproducible_output_fields=None,
                 settled_at=now,
                 updated_at=now,
                 **locator_values,
@@ -4574,11 +4604,14 @@ class SessionServiceImpl:
         failure_code: GuidedOperationFailureCode,
         actor: str,
         failure_audit_cohort: GuidedFailureAuditCohort,
+        unproducible_output_fields: tuple[str, ...],
     ) -> GuidedOperationFailed:
         """Clear partial locators and settle one closed safe failure atomically."""
         self._validate_guided_actor(actor)
         if failure_code not in GUIDED_OPERATION_FAILURE_CODE_VALUES:
             raise ValueError("unsupported guided operation failure code")
+        if type(unproducible_output_fields) is not tuple or any(type(field) is not str for field in unproducible_output_fields):
+            raise ValueError("unproducible_output_fields must be an exact string tuple")
         row, now = self.require_guided_operation_fence_on_connection(conn, fence)
         changed = conn.execute(
             update(guided_operations_table)
@@ -4601,6 +4634,7 @@ class SessionServiceImpl:
                 result_session_id=None,
                 response_hash=None,
                 failure_code=failure_code,
+                unproducible_output_fields=(list(unproducible_output_fields) if unproducible_output_fields else None),
                 settled_at=now,
                 updated_at=now,
             )
@@ -4620,7 +4654,10 @@ class SessionServiceImpl:
             failure_audit_cohort=failure_audit_cohort,
             occurred_at=now,
         )
-        return GuidedOperationFailed(failure_code=failure_code)
+        return GuidedOperationFailed(
+            failure_code=failure_code,
+            unproducible_output_fields=unproducible_output_fields,
+        )
 
     async def fail_guided_operation(
         self,
@@ -4639,6 +4676,7 @@ class SessionServiceImpl:
                     failure_code=failure_code,
                     actor=actor,
                     failure_audit_cohort=GuidedFailureAuditCohort.empty(),
+                    unproducible_output_fields=(),
                 )
 
         return cast("GuidedOperationFailed", await self._run_sync(_sync))
@@ -4693,6 +4731,7 @@ class SessionServiceImpl:
                     failure_code=command.failure_code,
                     actor=command.actor,
                     failure_audit_cohort=GuidedFailureAuditCohort.from_records(audit_records),
+                    unproducible_output_fields=command.unproducible_output_fields,
                 )
 
         return cast("GuidedOperationFailed", await self._run_sync(_sync))
@@ -12659,6 +12698,7 @@ class SessionServiceImpl:
                             result_session_id=None,
                             response_hash=child_response_hash,
                             failure_code=None,
+                            unproducible_output_fields=None,
                             created_at=now,
                             updated_at=now,
                             settled_at=now,

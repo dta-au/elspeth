@@ -1085,6 +1085,45 @@ def test_all_fields_shield_is_credited_when_prompt_fields_are_unprovable() -> No
     assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
 
 
+def test_all_fields_shield_does_not_cover_dynamic_prompt_after_downstream_rewrite() -> None:
+    state = _state(
+        _all_fields_shield("shield", "raw", "rewrite_in"),
+        _value_transform(
+            "rewrite",
+            "rewrite_in",
+            "llm_in",
+            [{"target": "prompt", "expression": "row['untrusted']"}],
+        ),
+        _llm_with_template("Classify: {{ row[lookup.field_name] }}"),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_fields_unprovable"),
+    ]
+    assert findings[0].scanned_fields == ()
+
+
+def test_all_fields_shield_covers_dynamic_prompt_after_downstream_field_mapping() -> None:
+    """A mapper only relocates values already scanned by an all-field shield."""
+    state = _state(
+        _all_fields_shield("shield", "raw", "mapping_in"),
+        _node(
+            "rename",
+            "field_mapper",
+            "mapping_in",
+            "llm_in",
+            options={"mapping": {"untrusted": "prompt"}, "select_only": False},
+        ),
+        _llm_with_template("Classify: {{ row[lookup.field_name] }}"),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
 def test_unprovable_prompt_fields_are_a_distinct_diagnosis_naming_both_field_sets() -> None:
     """A field-scoped shield still fails closed — but says why, not "not covered".
 
@@ -1114,14 +1153,14 @@ def test_unprovable_prompt_fields_are_a_distinct_diagnosis_naming_both_field_set
     assert findings[0].scanned_fields == ("prompt",)
 
 
-def test_missing_shield_keeps_the_domination_diagnosis_when_prompt_fields_are_unprovable() -> None:
-    """No upstream control at all is a topology failure, not a scope failure."""
+def test_missing_shield_preserves_the_unprovable_prompt_field_diagnosis() -> None:
+    """Unprovable scope must block unsafe field-scoped auto-wiring."""
     state = _state(_llm_with_template("Classify: {{ row[lookup.field_name] }}"))
 
     findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
 
     assert [(finding.component_id, finding.reason) for finding in findings] == [
-        ("judge", "input_not_dominated"),
+        ("judge", "input_fields_unprovable"),
     ]
 
 
@@ -1152,14 +1191,13 @@ def test_all_fields_control_is_credited_for_output_coverage_too() -> None:
     assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
 
 
-def test_external_call_below_the_shield_is_not_reported_as_a_scope_failure() -> None:
-    """The scope diagnosis must not claim a broken topology is already right.
+def test_external_call_below_the_shield_preserves_unprovable_field_diagnosis() -> None:
+    """Unprovable scope remains authoritative over the topology diagnosis.
 
     A ``web_scrape`` between the shield and the LLM reintroduces unscanned
-    content, so no shield scope — not even ``all`` — can cover this node. The
-    diagnosis must stay ``input_not_dominated``: telling the author "the wiring
-    is already right, widen the control's fields" would send them round a
-    repair that cannot land.
+    content, so no upstream shield scope can cover this node. The diagnostic
+    renderer uses the empty scanned-field set to avoid claiming the wiring is
+    correct, while the unprovable reason prevents unsafe partial auto-wiring.
     """
     state = _state(
         _shield("shield", "raw", "fetch_in"),
@@ -1171,7 +1209,7 @@ def test_external_call_below_the_shield_is_not_reported_as_a_scope_failure() -> 
     findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
 
     assert [(finding.component_id, finding.reason) for finding in findings] == [
-        ("judge", "input_not_dominated"),
+        ("judge", "input_fields_unprovable"),
     ]
     # No field sets are asserted for a topology failure — naming a control
     # that does not dominate would be a second false statement.

@@ -450,11 +450,15 @@ def test_static_analysis_ratchets_permanent_multi_rule_blankets_repo_wide_on_prs
     assert env.get("BASELINE_REF") == (
         "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}"
     )
+    assert env.get("DEFAULT_BRANCH") == "${{ github.event.repository.default_branch }}"
+
+    checkout = _step(static_analysis, "Checkout code")
+    assert checkout["with"]["fetch-depth"] == 0
 
     run = _step_run(static_analysis, step_name)
     assert 'if [[ "$BASELINE_REF" == "0000000000000000000000000000000000000000" ]]' in run
-    assert 'git fetch --no-tags --depth=2 origin "$GITHUB_SHA"' in run
-    assert 'BASELINE_REF="$(git rev-parse "$GITHUB_SHA^")"' in run
+    assert 'BASELINE_REF="$(git merge-base "$GITHUB_SHA" "origin/$DEFAULT_BRANCH")"' in run
+    assert 'git rev-parse "$GITHUB_SHA^"' not in run
     assert 'git fetch --no-tags --depth=1 origin "$BASELINE_REF"' in run
     assert "check-per-file-blanket-ratchet" in run
     assert '--baseline-ref "$BASELINE_REF"' in run

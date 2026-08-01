@@ -101,11 +101,14 @@ config/cicd/enforce_tier_model/
 +-- tui.yaml         # tui/* entries
 ```
 
-**Adding a new allowlist entry:** Determine the top-level module from the finding's file path (e.g., `core/canonical.py` -> `core.yaml`) and add the entry to that module's YAML file under `allow_hits:`.
-New signed entries and signed-entry repairs go through the cicd-judge workflow;
-do not hand-write judge metadata. For stale signature repair, `NO_MATCHING_FINDING`,
-`SCOPE_BINDING_DRIFT`, `AST_PATH_BINDING_DRIFT`, and operator-only signing steps,
-load `cicd-allowlist-audit`.
+**Adding a new allowlist entry:** Do not add a row to `allow_hits` manually.
+Leave the live finding uncovered, call `mcp__elspeth-judge__stage_scan`, and
+confirm it appears in the `new_judgment` lane with
+`mcp__elspeth-judge__stage_status`. The operator then fires the staged bundle;
+the signing workflow creates the accepted row transactionally. For
+`NO_MATCHING_FINDING`, `SCOPE_BINDING_DRIFT`, `AST_PATH_BINDING_DRIFT`, or any
+operator-only step, load `judge-signature-workflow` and
+`cicd-allowlist-audit`. Never hand-write judge metadata or signatures.
 
 Run the rule with:
 

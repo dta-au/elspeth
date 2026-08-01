@@ -23,8 +23,8 @@ not remain folded into the historical 0.7.1 notes.
   epoch-36 blob-deletion cleanup, the epoch-37 guided-plan decline contract,
   the epoch-38 decline replay message locator, the epoch-39 policy refusal
   code, and the epoch-40 coalesce timeout and epoch-41 node option summary payload
-  cutovers to 0.7.2.
-- `SESSION_SCHEMA_EPOCH` is 41, guided checkpoint schema is 10, and
+  cutovers, plus epoch-42 failed guided-operation replay enrichment, to 0.7.2.
+- `SESSION_SCHEMA_EPOCH` is 42, guided checkpoint schema is 10, and
   `SQLITE_SCHEMA_EPOCH` is 30. An upgrade from 0.7.1 recreates both a stale
   session store and a Landscape store left at epoch 29.
 - Web Composer freeform and guided authoring, Composer tools, YAML
