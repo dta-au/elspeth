@@ -64,8 +64,30 @@ The following known obligations are excluded from the corrected-residue total:
   stale-delete obligations. No allowlist or signature was changed by this
   cleanup.
 
+## Entry 2: Coalesce property reachable-state generator
+
+- Date: 2026-08-01
+- Tracker: `elspeth-b81363eef7`
+- Discovered by: CI-equivalent full-suite verification
+- Corrected commit: `affa74935`
+- Integration commit: `6ed97d5af`
+- Result: 1 corrected site in 1 new recurring pattern class
+
+| Pattern | Sites | Exact surface | Plausible detector |
+|---|---:|---|---|
+| Filter-heavy property generator | 1 | `test_maybe_coalesce_matches_legacy_step_semantics_for_reachable_states` drew three ordered step values independently, then discarded unreachable combinations with two `assume()` calls | AST rule for `@given` parameters compared to one another in `assume()`; require a dependent strategy when the constraint defines the intended input domain |
+
+The reproducing seed generated only 9 valid inputs while discarding 50. The
+replacement strategy directly generates
+`1 <= current_step <= coalesce_step <= step_count <= 10`, preserving all
+property assertions and the 250-example budget. Full-file review found no
+additional stale residue or trust-tier obligation.
+
+Unresolved stale residue for this entry: **0 sites**.
+
 ## Running totals
 
 | Features reviewed | Corrected sites | Pattern classes recorded | Unresolved residue |
 |---:|---:|---:|---:|
 | 1 | 100 | 9 | 0 |
+| 1 | 101 | 10 | 0 |
