@@ -967,16 +967,18 @@ class TestR5IsinstanceClassification:
         assert self._r5_findings(source, filename="web/composer/llm_response_parsing.py") == []
 
     @pytest.mark.parametrize(
-        "helper_name",
+        ("helper_name", "filename"),
         (
-            "_collect_secret_refs",
-            "_find_identity_node_advisories",
-            "_infer_component_type_from_plugin_error",
-            "_mask_pending_interpretation_placeholders_for_authoring_preflight",
-            "validate_pipeline",
+            ("_collect_secret_refs", "web/execution/_validation_authoring.py"),
+            ("_secret_ref_exists", "web/execution/_validation_authoring.py"),
+            ("review_interpretations", "web/execution/_validation_authoring.py"),
+            ("_find_identity_node_advisories", "web/execution/_validation_diagnostics.py"),
+            ("_find_gate_fan_out_advisories", "web/execution/_validation_diagnostics.py"),
+            ("_infer_component_type_from_plugin_error", "web/execution/_validation_diagnostics.py"),
+            ("validate_pipeline", "web/execution/validation.py"),
         ),
     )
-    def test_execution_validation_helper_names_receive_no_closed_exemption(self, helper_name: str) -> None:
+    def test_execution_validation_helper_names_receive_no_closed_exemption(self, helper_name: str, filename: str) -> None:
         source = dedent(f"""
             def {helper_name}(value):
                 if isinstance(value, dict):
@@ -984,8 +986,7 @@ class TestR5IsinstanceClassification:
                 return None
         """)
 
-        assert len(self._r5_findings(source, filename="web/execution/validation.py")) == 1
-        assert len(self._r5_findings(source, filename="web/execution/_validation_diagnostics.py")) == 1
+        assert len(self._r5_findings(source, filename=filename)) == 1
 
     @pytest.mark.parametrize(
         ("source", "filename"),

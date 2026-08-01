@@ -18,6 +18,7 @@ from elspeth.web.composer.state import (
     PipelineMetadata,
     SourceSpec,
 )
+from elspeth.web.execution._validation_ledger import CORE_VALIDATION_CHECK_NAMES, ValidationLedger
 from elspeth.web.execution.completion_gates import (
     ADVISOR_SIGNOFF_PENDING_DETAIL,
     COMPLETION_GATES_META_KEY,
@@ -31,6 +32,15 @@ from elspeth.web.execution.completion_gates import (
 from elspeth.web.execution.schemas import (
     ADVISOR_SIGNOFF_BLOCKED_CODE,
     CHECK_ADVISOR_SIGNOFF,
+    CHECK_GATE_FAN_OUT_ADVISORY,
+    CHECK_IDENTITY_NODE_ADVISORY,
+    CHECK_OUTCOME_SECRET_REFS_NO_REFS,
+    CHECK_PLUGIN_ENABLEMENT,
+    CHECK_SECRET_REFS,
+    VALIDATION_CHECK_NAMES,
+    ValidationCheck,
+    ValidationCheckName,
+    ValidationError,
     ValidationReadiness,
     ValidationReadinessBlocker,
     ValidationResult,
@@ -88,7 +98,11 @@ def _make_state(
 def _green_result() -> ValidationResult:
     return ValidationResult(
         is_valid=True,
-        checks=[],
+        checks=[
+            *(_passed_check(name) for name in CORE_VALIDATION_CHECK_NAMES),
+            _passed_check(CHECK_IDENTITY_NODE_ADVISORY),
+            _passed_check(CHECK_GATE_FAN_OUT_ADVISORY),
+        ],
         errors=[],
         readiness=ValidationReadiness(
             authoring_valid=True,
@@ -97,6 +111,60 @@ def _green_result() -> ValidationResult:
             blockers=[],
         ),
     )
+
+
+def _passed_check(name: ValidationCheckName) -> ValidationCheck:
+    return ValidationCheck(
+        name=name,
+        passed=True,
+        detail=f"{name} passed",
+        affected_nodes=(),
+        outcome_code=CHECK_OUTCOME_SECRET_REFS_NO_REFS if name == CHECK_SECRET_REFS else None,
+    )
+
+
+def _failed_ledger_result() -> ValidationResult:
+    ledger = ValidationLedger()
+    return ledger.finish_failure(
+        ValidationCheck(
+            name=CHECK_PLUGIN_ENABLEMENT,
+            passed=False,
+            detail="Plugin enablement failed",
+            affected_nodes=("source",),
+            outcome_code=None,
+        ),
+        errors=(
+            ValidationError(
+                component_id="source",
+                component_type="source",
+                message="Plugin is unavailable",
+                suggestion="Enable the plugin.",
+                error_code="plugin_unavailable",
+            ),
+        ),
+        readiness=ValidationReadiness(
+            authoring_valid=False,
+            execution_ready=False,
+            completion_ready=False,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code=CHECK_PLUGIN_ENABLEMENT,
+                    component_id="source",
+                    component_type="source",
+                    detail="Plugin enablement failed.",
+                )
+            ],
+        ),
+    )
+
+
+def _advisor_checks(result: ValidationResult) -> list[ValidationCheck]:
+    return [check for check in result.checks if check.name == CHECK_ADVISOR_SIGNOFF]
+
+
+def _assert_canonical_check_order(result: ValidationResult) -> None:
+    ranks = [VALIDATION_CHECK_NAMES.index(check.name) for check in result.checks]
+    assert ranks == sorted(ranks)
 
 
 _BLOCKED_DETAIL = "The advisor sign-off could not be obtained; the pipeline cannot complete."
@@ -234,10 +302,11 @@ class TestMerge:
         (blocker,) = merged.readiness.blockers
         assert blocker.code == ADVISOR_SIGNOFF_BLOCKED_CODE
         assert blocker.detail == _BLOCKED_DETAIL
-        (check,) = merged.checks
+        (check,) = _advisor_checks(merged)
         assert check.name == CHECK_ADVISOR_SIGNOFF
         assert check.passed is False
         assert check.detail == _BLOCKED_DETAIL
+        _assert_canonical_check_order(merged)
 
     def test_stale_fingerprint_uses_pending_wording(self) -> None:
         blocked_for = _make_state()
@@ -253,8 +322,9 @@ class TestMerge:
         (blocker,) = merged.readiness.blockers
         assert blocker.code == ADVISOR_SIGNOFF_BLOCKED_CODE
         assert blocker.detail == ADVISOR_SIGNOFF_PENDING_DETAIL
-        (check,) = merged.checks
+        (check,) = _advisor_checks(merged)
         assert check.detail == ADVISOR_SIGNOFF_PENDING_DETAIL
+        _assert_canonical_check_order(merged)
 
     def test_merge_preserves_recomputed_defects(self) -> None:
         """A stale gate on a now-broken graph must not mask the real defects."""
@@ -288,3 +358,48 @@ class TestMerge:
         assert merged.readiness.authoring_valid is False
         codes = [blocker.code for blocker in merged.readiness.blockers]
         assert codes == ["state_exists", ADVISOR_SIGNOFF_BLOCKED_CODE]
+
+    def test_failed_ledger_reconciles_skipped_advisor_slot(self) -> None:
+        state = _make_state()
+        base = _failed_ledger_result()
+        facts = CompletionGateFacts(
+            advisor_signoff=AdvisorSignoffGateFact(
+                detail=_BLOCKED_DETAIL,
+                for_graph=completion_gate_fingerprint(state),
+            )
+        )
+
+        merged = merge_completion_gates(base, facts, state)
+
+        assert merged.is_valid is base.is_valid
+        assert merged.readiness.authoring_valid is base.readiness.authoring_valid
+        assert merged.readiness.execution_ready is base.readiness.execution_ready
+        assert merged.readiness.completion_ready is False
+        assert merged.errors == base.errors
+        assert merged.readiness.blockers[0] == base.readiness.blockers[0]
+        assert [blocker.code for blocker in merged.readiness.blockers] == [
+            CHECK_PLUGIN_ENABLEMENT,
+            ADVISOR_SIGNOFF_BLOCKED_CODE,
+        ]
+        (advisor_check,) = _advisor_checks(merged)
+        assert advisor_check.passed is False
+        assert advisor_check.detail == _BLOCKED_DETAIL
+        assert advisor_check.outcome_code is None
+        _assert_canonical_check_order(merged)
+
+    def test_merge_is_idempotent_for_already_merged_result(self) -> None:
+        state = _make_state()
+        facts = CompletionGateFacts(
+            advisor_signoff=AdvisorSignoffGateFact(
+                detail=_BLOCKED_DETAIL,
+                for_graph=completion_gate_fingerprint(state),
+            )
+        )
+
+        once = merge_completion_gates(_green_result(), facts, state)
+        twice = merge_completion_gates(once, facts, state)
+
+        assert twice == once
+        assert len(_advisor_checks(twice)) == 1
+        assert sum(blocker.code == ADVISOR_SIGNOFF_BLOCKED_CODE for blocker in twice.readiness.blockers) == 1
+        _assert_canonical_check_order(twice)
