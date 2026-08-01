@@ -2547,6 +2547,7 @@ def validate_pipeline(
                     error_code=None,
                 )
             )
+        _append_skipped_checks(checks, _CHECK_SCHEMA)
         return ValidationResult(
             is_valid=False,
             checks=checks,
