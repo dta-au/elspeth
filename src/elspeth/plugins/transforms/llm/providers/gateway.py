@@ -40,7 +40,6 @@ import math
 import time
 from threading import Lock
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
-from urllib.parse import urlsplit
 
 import httpx
 from pydantic import Field, field_validator
@@ -59,7 +58,19 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+from elspeth.plugins.llm.config_validation import (
+    GATEWAY_MAX_TOKENS_LIMIT,
+    GATEWAY_MAX_TOKENS_MIN_EXCLUSIVE,
+    GATEWAY_MODEL_MAX_LENGTH,
+    GATEWAY_MODEL_MIN_LENGTH,
+    GATEWAY_TIMEOUT_MAX_SECONDS,
+    GATEWAY_TIMEOUT_MIN_EXCLUSIVE,
+    GATEWAY_VALUE_SOURCES,
+    GATEWAY_VERSIONED_BASE,
+    validate_gateway_capabilities,
+    validate_gateway_contract_major,
+    validate_gateway_endpoint,
+)
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResult, ParsedFinishReason, parse_finish_reason
 from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant
@@ -82,58 +93,6 @@ _GATEWAY_CONTRACT_HEADER = "X-ELSPETH-LLM-Gateway-Contract"
 #: response body remains available only through the audited HTTP payload.
 _STATIC_GATEWAY_ERROR = "Gateway LLM request failed"
 
-_GATEWAY_VERSIONED_BASE = "/v1"
-_GATEWAY_LOOPBACK_HOST = "127.0.0.1"
-
-# Closed capability vocabulary the Phase 1 gateway contract can report/require.
-_SUPPORTED_GATEWAY_CAPABILITIES = frozenset({"text", "tools", "json_object", "json_schema", "seed", "usage"})
-
-# The only gateway contract major ELSPETH currently speaks.
-_SUPPORTED_GATEWAY_CONTRACT_MAJORS = frozenset({1})
-
-
-def _validate_gateway_endpoint(value: str) -> str:
-    """Apply the credential-safe HTTPS rule plus the gateway's stricter shape.
-
-    ``validate_credential_safe_https_url`` treats any loopback spelling
-    (``localhost``, ``127.0.0.1``, ``::1``) as an acceptable HTTP loopback
-    host. The gateway design only accepts the literal ``127.0.0.1`` form, so
-    that broader allowance is narrowed here.
-
-    Two additional checks close review gaps from Task 2:
-
-    - the path shape check rejects empty (doubled-slash), ``.``, and ``..``
-      segments *before* the ``endswith`` check, so ``https://host//v1`` and
-      ``https://host/v1/../v1`` cannot spell their way past a suffix-only
-      comparison. A legitimate reverse-proxy sub-path mount such as
-      ``https://host/gateway/v1`` is unaffected — it has no such segments.
-    - ``urlsplit`` parses ``.port`` lazily; a malformed port
-      (out-of-range, non-numeric) raises ``ValueError`` only when the
-      attribute is actually read. Reading it here turns that into a clean,
-      immediate config-validation error instead of a deferred connect-time
-      failure.
-    """
-    validated = validate_credential_safe_https_url(value, field_name="endpoint", allow_http_loopback=True)
-    parsed = urlsplit(validated)
-    try:
-        _ = parsed.port
-    except ValueError as exc:
-        raise ValueError(f"endpoint must have a valid port: {exc}") from exc
-    if parsed.scheme == "http" and parsed.hostname != _GATEWAY_LOOPBACK_HOST:
-        raise ValueError(f"endpoint must use HTTPS unless targeting the literal {_GATEWAY_LOOPBACK_HOST} loopback host")
-    if parsed.query:
-        raise ValueError("endpoint must not contain a query string")
-    if parsed.fragment:
-        raise ValueError("endpoint must not contain a fragment")
-    path_segments = parsed.path.split("/")
-    # path_segments[0] is always "" for an absolute path (leading '/'); only
-    # interior/trailing segments are checked for doubled slashes and dot segments.
-    if any(segment in ("", ".", "..") for segment in path_segments[1:]):
-        raise ValueError("endpoint path must not contain empty, '.', or '..' segments")
-    if not parsed.path.endswith(_GATEWAY_VERSIONED_BASE):
-        raise ValueError(f"endpoint must end with the versioned base path {_GATEWAY_VERSIONED_BASE!r}")
-    return validated
-
 
 class GatewayConfig(LLMConfig):
     """Configuration for the ELSPETH LLM Gateway provider.
@@ -147,13 +106,13 @@ class GatewayConfig(LLMConfig):
     every provider variant must still declare its participation contract.
     """
 
-    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = ()
+    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = GATEWAY_VALUE_SOURCES
 
     provider: Literal["gateway"] = Field(default="gateway", description="LLM provider")
     model: str = Field(
         ...,
-        min_length=1,
-        max_length=512,
+        min_length=GATEWAY_MODEL_MIN_LENGTH,
+        max_length=GATEWAY_MODEL_MAX_LENGTH,
         description="Logical model alias resolved server-side by the gateway",
     )
     endpoint: str = Field(..., description="Gateway base URL; must end with the versioned base path '/v1'")
@@ -166,33 +125,34 @@ class GatewayConfig(LLMConfig):
         default=(),
         description="Gateway capabilities this configuration requires; closed set",
     )
-    timeout_seconds: float = Field(default=60.0, gt=0, le=300, description="Request timeout")
-    max_tokens: int | None = Field(default=None, gt=0, le=131072, description="Maximum tokens in response")
+    timeout_seconds: float = Field(
+        default=60.0,
+        gt=GATEWAY_TIMEOUT_MIN_EXCLUSIVE,
+        le=GATEWAY_TIMEOUT_MAX_SECONDS,
+        description="Request timeout",
+    )
+    max_tokens: int | None = Field(
+        default=None,
+        gt=GATEWAY_MAX_TOKENS_MIN_EXCLUSIVE,
+        le=GATEWAY_MAX_TOKENS_LIMIT,
+        description="Maximum tokens in response",
+    )
     tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing configuration")
 
     @field_validator("endpoint")
     @classmethod
     def _validate_endpoint(cls, value: str) -> str:
-        return _validate_gateway_endpoint(value)
+        return validate_gateway_endpoint(value)
 
     @field_validator("contract_major")
     @classmethod
     def _validate_contract_major(cls, value: int) -> int:
-        if value not in _SUPPORTED_GATEWAY_CONTRACT_MAJORS:
-            raise ValueError(f"contract_major {value} is not supported; supported majors: {sorted(_SUPPORTED_GATEWAY_CONTRACT_MAJORS)}")
-        return value
+        return validate_gateway_contract_major(value)
 
     @field_validator("required_capabilities")
     @classmethod
     def _validate_required_capabilities(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        seen: set[str] = set()
-        for capability in value:
-            if capability not in _SUPPORTED_GATEWAY_CAPABILITIES:
-                raise ValueError(f"unknown gateway capability {capability!r}; supported: {sorted(_SUPPORTED_GATEWAY_CAPABILITIES)}")
-            if capability in seen:
-                raise ValueError(f"duplicate gateway capability {capability!r}")
-            seen.add(capability)
-        return value
+        return validate_gateway_capabilities(value)
 
 
 # ---------------------------------------------------------------------------
@@ -438,12 +398,8 @@ class GatewayLLMProvider:
         # Re-validate defensively (mirrors OpenRouterLLMProvider): GatewayConfig
         # already enforces this shape at config-construction time, but this
         # provider can also be constructed directly (tests, future callers).
-        self._base_url = _validate_gateway_endpoint(endpoint)
-        if contract_major not in _SUPPORTED_GATEWAY_CONTRACT_MAJORS:
-            raise ValueError(
-                f"contract_major {contract_major} is not supported; supported majors: {sorted(_SUPPORTED_GATEWAY_CONTRACT_MAJORS)}"
-            )
-        self._contract_major = contract_major
+        self._base_url = validate_gateway_endpoint(endpoint)
+        self._contract_major = validate_gateway_contract_major(contract_major)
         self._required_capabilities = required_capabilities
         self._usage_required = "usage" in required_capabilities
         # Populated by _check_readyz — forensic-only until a GatewayConfig
@@ -664,7 +620,7 @@ class GatewayLLMProvider:
 
     def _readyz_base_url(self) -> str:
         """The gateway root (``/readyz`` lives one level above ``/v1``)."""
-        return self._base_url.removesuffix(_GATEWAY_VERSIONED_BASE)
+        return self._base_url.removesuffix(GATEWAY_VERSIONED_BASE)
 
     def _check_readyz(self, *, operation_id: str, model: str) -> None:
         http_client = AuditedHTTPClient(

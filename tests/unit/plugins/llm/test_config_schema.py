@@ -20,11 +20,33 @@ from typing import Annotated
 import jsonschema
 from pydantic import Field, TypeAdapter
 
+from elspeth.contracts.schema import SchemaConfig
+from elspeth.plugins.transforms.llm import get_llm_guaranteed_fields
 from elspeth.plugins.transforms.llm.providers.azure import AzureOpenAIConfig
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig
 from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterConfig
 from elspeth.plugins.transforms.llm.transform import _PROVIDERS, LLMTransform
+
+
+def test_transform_keyword_response_field_compatibility_is_preserved() -> None:
+    """Source-only keyword rejection must not tighten the existing transform API."""
+    cfg = OpenRouterConfig(
+        provider="openrouter",
+        model="openai/gpt-4o-mini",
+        api_key="test-api-key",
+        prompt_template="Summarise {{ row.text }}",
+        required_input_fields=["text"],
+        response_field="class",
+        schema_config=SchemaConfig(mode="observed"),
+    )
+
+    assert cfg.response_field == "class"
+    assert get_llm_guaranteed_fields(cfg.response_field) == (
+        "class",
+        "class_usage",
+        "class_model",
+    )
 
 
 class TestLLMConfigSchema:

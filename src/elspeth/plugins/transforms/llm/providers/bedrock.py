@@ -19,6 +19,15 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
+from elspeth.plugins.llm.config_validation import (
+    BEDROCK_MODEL_MAX_LENGTH,
+    BEDROCK_MODEL_MIN_LENGTH,
+    BEDROCK_REGION_MAX_LENGTH,
+    BEDROCK_REGION_MIN_LENGTH,
+    BEDROCK_REGION_PATTERN,
+    BEDROCK_VALUE_SOURCES,
+    validate_bedrock_model,
+)
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.provider import (
     FinishReason,
@@ -43,20 +52,20 @@ class BedrockConfig(LLMConfig):
     # unlike OpenRouter there is no authoritative local catalog to validate.
     # The LLM plugin is explicitly registered with the value-source walker, so
     # every provider variant must still declare its participation contract.
-    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = ()
+    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = BEDROCK_VALUE_SOURCES
 
     provider: Literal["bedrock"] = Field(default="bedrock", description="LLM provider")
     model: str = Field(
         ...,
-        min_length=9,
-        max_length=512,
+        min_length=BEDROCK_MODEL_MIN_LENGTH,
+        max_length=BEDROCK_MODEL_MAX_LENGTH,
         description="LiteLLM Bedrock model id in bedrock/<id> form",
     )
     region_name: str | None = Field(
         default=None,
-        min_length=1,
-        max_length=64,
-        pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
+        min_length=BEDROCK_REGION_MIN_LENGTH,
+        max_length=BEDROCK_REGION_MAX_LENGTH,
+        pattern=BEDROCK_REGION_PATTERN,
         description="AWS region override; default AWS region resolution otherwise",
     )
     tracing: dict[str, Any] | None = Field(default=None, description="Tier 2 tracing (langfuse only)")
@@ -64,11 +73,7 @@ class BedrockConfig(LLMConfig):
     @field_validator("model")
     @classmethod
     def _require_bedrock_prefix(cls, value: str) -> str:
-        if value != value.strip() or not value.startswith("bedrock/") or not value.removeprefix("bedrock/"):
-            raise ValueError("Bedrock model must be a non-empty LiteLLM 'bedrock/<model-id>' value without surrounding whitespace")
-        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
-            raise ValueError("Bedrock model must not contain control characters")
-        return value
+        return validate_bedrock_model(value)
 
 
 class _LiteLLMSDKAdapter:

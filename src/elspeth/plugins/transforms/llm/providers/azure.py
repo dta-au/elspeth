@@ -20,9 +20,9 @@ import structlog
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts.audit_protocols import PluginAuditWriter
-from elspeth.contracts.value_source import DerivedFromSiblingValueSource, ValueSource
+from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient, ContentPolicyError, LLMClientError
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+from elspeth.plugins.llm.config_validation import AZURE_MODEL_VALUE_SOURCES, derive_azure_model, validate_azure_endpoint
 from elspeth.plugins.transforms.llm.base import LLMConfig
 from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMQueryResult, parse_finish_reason
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, TracingConfig
@@ -72,30 +72,20 @@ class AzureOpenAIConfig(LLMConfig):
     @field_validator("endpoint")
     @classmethod
     def _validate_endpoint_url(cls, value: str) -> str:
-        return validate_credential_safe_https_url(value, field_name="endpoint", allow_http_loopback=True)
+        return validate_azure_endpoint(value)
 
     @model_validator(mode="before")
     @classmethod
     def _set_model_from_deployment(cls, data: Any) -> Any:
         """Set model to deployment_name if not explicitly provided."""
-        if isinstance(data, dict) and not data.get("model"):
-            deployment = data.get("deployment_name")
-            if deployment:
-                data["model"] = deployment
-        return data
+        return derive_azure_model(data)
 
     # Value-source declaration: ``model`` is derived from ``deployment_name``.
     # The ``_set_model_from_deployment`` validator above fills the field when
     # empty; the value-source compliance walker confirms post-validation that
     # ``model == deployment_name`` (or that ``model`` was empty in the original
     # config — accepted because the validator substitutes the sibling).
-    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = (
-        DerivedFromSiblingValueSource(
-            field_name="model",
-            sibling_field="deployment_name",
-            allow_empty_default=True,
-        ),
-    )
+    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = AZURE_MODEL_VALUE_SOURCES
 
 
 class AzureLLMProvider:

@@ -19,7 +19,6 @@ import math
 import time
 from threading import Lock
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
-from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from pydantic import Field, field_validator
@@ -28,7 +27,7 @@ from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.call_data import LLMCallError, LLMCallRequest, LLMCallResponse
 from elspeth.contracts.token_usage import TokenUsage
-from elspeth.contracts.value_source import CatalogValueSource, ValueSource
+from elspeth.contracts.value_source import ValueSource
 from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
     CONTEXT_LENGTH_PATTERNS,
@@ -39,9 +38,14 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
-from elspeth.plugins.infrastructure.url_validation import validate_credential_safe_https_url
+from elspeth.plugins.llm.config_validation import (
+    OPENROUTER_BASE_URL,
+    OPENROUTER_BASE_URL_APPLIES_WHEN,
+    OPENROUTER_MODEL_VALUE_SOURCES,
+    normalize_openrouter_base_url,
+    validate_openrouter_base_url,
+)
 from elspeth.plugins.transforms.llm.base import LLMConfig
-from elspeth.plugins.transforms.llm.model_catalog import MODEL_CATALOG_OPENROUTER
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResult, ParsedFinishReason, parse_finish_reason
 from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant
 
@@ -58,12 +62,6 @@ __all__ = [
     "normalize_openrouter_base_url",
 ]
 
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-"""Canonical OpenRouter HTTP API base URL used by direct OpenRouter providers."""
-
-OPENROUTER_BASE_URL_APPLIES_WHEN = (("base_url", OPENROUTER_BASE_URL),)
-"""Value-source predicate for configs targeting the canonical OpenRouter API."""
 
 OPENROUTER_APP_REFERER = "https://github.com/johnm-dta/elspeth"
 """Canonical public project URL used for OpenRouter app attribution."""
@@ -92,13 +90,6 @@ def _summarize_http_error_body(error: httpx.HTTPStatusError) -> str:
     if not body:
         return ""
     return f" | provider error body redacted (body_present=true; chars={len(body)})"
-
-
-def normalize_openrouter_base_url(value: str) -> str:
-    """Normalize base URL spellings that runtime HTTP joining treats as identical."""
-    parsed = urlsplit(value)
-    path = parsed.path.rstrip("/")
-    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
 
 
 def _validate_chat_completion_response(response: httpx.Response) -> tuple[dict[str, Any], str, TokenUsage, ParsedFinishReason, str]:
@@ -214,7 +205,7 @@ class OpenRouterConfig(LLMConfig):
         # (http://127.0.0.1:8199/v1, used by the shipped examples) validate and
         # run. The bearer token never leaves the local machine, so this does not
         # weaken the "no bearer over plaintext to a remote host" guarantee.
-        return normalize_openrouter_base_url(validate_credential_safe_https_url(value, field_name="base_url", allow_http_loopback=True))
+        return validate_openrouter_base_url(value)
 
     # Catalog membership for ``model`` is enforced as a value-source concern,
     # NOT in config construction: the ``CatalogValueSource`` declaration below
@@ -245,13 +236,7 @@ class OpenRouterConfig(LLMConfig):
     # slug list. The ``applies_when`` predicate keeps the catalog check
     # in lock-step with the actual HTTP boundary the runtime targets.
     # ClassVar so Pydantic v2 ignores it.
-    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = (
-        CatalogValueSource(
-            field_name="model",
-            catalog_id=MODEL_CATALOG_OPENROUTER,
-            applies_when=OPENROUTER_BASE_URL_APPLIES_WHEN,
-        ),
-    )
+    VALUE_SOURCES: ClassVar[tuple[ValueSource, ...]] = OPENROUTER_MODEL_VALUE_SOURCES
 
 
 class OpenRouterLLMProvider:
@@ -294,9 +279,7 @@ class OpenRouterLLMProvider:
         # loopback dev servers (ChaosLLM at http://127.0.0.1:8199/v1) are
         # permitted; the bearer token stays on the local machine. Remote hosts
         # still require HTTPS.
-        self._base_url = normalize_openrouter_base_url(
-            validate_credential_safe_https_url(base_url, field_name="base_url", allow_http_loopback=True)
-        )
+        self._base_url = validate_openrouter_base_url(base_url)
         self._timeout = timeout_seconds
         self._recorder = recorder
         self._run_id = run_id
