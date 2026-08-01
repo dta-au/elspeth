@@ -8,11 +8,11 @@
 
 **Tech Stack:** Python 3.13, dataclasses, pydantic response models, pytest, Ruff/mypy through repository gates, Loomweave, Filigree, Wardline.
 
-**Status (2026-08-01):** Tasks 1–8 are implemented locally through integration
-commit `6c4d843c7` on `codex/execution-validation-pipeline`; trust and house-style
-closeout continues from `1a2fda249` on
-`codex/execution-validation-trust-cleanup`. Task 9 remains open for final
-integration testing and tracker closeout.
+**Status (2026-08-01):** Tasks 1–9 are implemented and verified locally through
+evidence commit `279835d94` on `codex/execution-validation-pipeline`.
+`elspeth-39d6d479c0` and the integration-discovered property-test bug
+`elspeth-b81363eef7` are closed with that commit anchor. No branch was pushed,
+deployed, or signed.
 
 **Delivered deviations:** The implementation did not add the proposed
 `ValidationRequest` carrier; public arguments remain explicit and only injected
@@ -510,7 +510,7 @@ git commit -m "refactor(web): isolate validation diagnostics"
 
 **Branch:** `codex/execution-validation-pipeline`
 
-- [ ] **Step 1: Re-audit the merged diff**
+- [x] **Step 1: Re-audit the merged diff**
 
 ```bash
 git diff release/0.7.2...HEAD --check
@@ -520,13 +520,13 @@ git diff --stat release/0.7.2...HEAD
 Confirm no Composer state implementation, signed allowlist, generated artifact,
 or unrelated acceptance file changed.
 
-- [ ] **Step 2: Run focused web validation tests**
+- [x] **Step 2: Run focused web validation tests**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution tests/integration/web/test_plugin_policy_end_to_end.py tests/integration/pipeline/test_composer_runtime_agreement.py -q
 ```
 
-- [ ] **Step 3: Run repository gates**
+- [x] **Step 3: Run repository gates**
 
 ```bash
 .venv/bin/pytest tests/
@@ -537,8 +537,23 @@ or unrelated acceptance file changed.
 The known operator-signature trust-tier state may remain fail-closed as
 documented by the repository; no agent signs or rekeys it.
 
-- [ ] **Step 4: Update Filigree and summarize**
+Final evidence on `279835d94`:
+
+- `pytest tests/`: 35,390 passed, 66 skipped, 1 expected xfail, 0 failures;
+- `elspeth-lints check`: exit 0;
+- Wardline: 709 files, 6,369 findings evaluated, 0 active errors, 63
+  recognized boundaries;
+- Ruff: 22 changed Python files clean and formatted;
+- strict mypy: 9 source files clean;
+- contracts and range-diff gates: clean.
+
+- [x] **Step 4: Update Filigree and summarize**
 
 Attach the final integration commit to `elspeth-39d6d479c0`, describe the two
 repaired defects, list every merged branch/commit, record exact gate outcomes,
 and close only if the entire planned scope is complete.
+
+Closed `elspeth-39d6d479c0` and `elspeth-b81363eef7` with the verified evidence
+commit. The release-end trust handoff remains deliberately separate: three
+explicit nominal R5 adjudications and three stale signed reframer rows require
+operator action after package churn settles.

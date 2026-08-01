@@ -1,11 +1,10 @@
 # Execution Validation Pipeline Refactor Design
 
-**Status:** Implemented locally on 2026-08-01; final integration gates pending
+**Status:** Implemented and verified locally on 2026-08-01
 **Tracking:** `elspeth-39d6d479c0`
 **Integration branch:** `codex/execution-validation-pipeline`
-**Implementation context:** integrated through `6c4d843c7`; trust and
-house-style closeout continues from `1a2fda249` on
-`codex/execution-validation-trust-cleanup`
+**Implementation context:** verified through evidence commit `279835d94` on
+`codex/execution-validation-pipeline`
 
 ## Purpose
 
