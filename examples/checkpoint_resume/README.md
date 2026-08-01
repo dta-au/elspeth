@@ -42,10 +42,15 @@ elspeth run --settings examples/checkpoint_resume/settings.yaml --execute
 
 ```bash
 # Dry-run first — see what would happen
-elspeth resume <run_id> --database examples/checkpoint_resume/runs/audit.db
+elspeth resume <run_id> \
+  --settings examples/checkpoint_resume/settings.yaml \
+  --database examples/checkpoint_resume/runs/audit.db
 
 # Execute the resume — processes only unfinished rows
-elspeth resume <run_id> --database examples/checkpoint_resume/runs/audit.db --execute
+elspeth resume <run_id> \
+  --settings examples/checkpoint_resume/settings.yaml \
+  --database examples/checkpoint_resume/runs/audit.db \
+  --execute
 ```
 
 The resume skips rows that were already persisted and appends new results to the output files.

@@ -1,0 +1,31 @@
+<!-- @dsCard group="Colors" viewport="700x170" name="Semantic & accent" subtitle="Success · error · warning · info, plus accent and link" -->
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<link rel="stylesheet" href="../styles.css" />
+<style>
+  body { margin: 0; padding: 16px; background: var(--color-bg); font-family: var(--font-sans); }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .cell { border-radius: var(--radius-lg); padding: 10px 12px; border: 1px solid; }
+  .dot { width: 14px; height: 14px; border-radius: 50%; margin-bottom: 8px; }
+  .nm { font-size: 12px; font-weight: 600; }
+  .vl { font-family: var(--font-mono); font-size: 10px; opacity: .8; margin-top: 2px; }
+  .acc { display:flex; gap:10px; margin-top:12px; }
+  .accbox { flex:1; border-radius:var(--radius-md); padding:10px 12px; font-size:12px; font-weight:600; }
+</style>
+</head>
+<body>
+  <div class="grid">
+    <div class="cell" style="background:var(--color-success-bg);border-color:var(--color-success-border);color:var(--color-success)"><div class="dot" style="background:#14b0ae"></div><div class="nm">success</div><div class="vl">#14b0ae</div></div>
+    <div class="cell" style="background:var(--color-error-bg);border-color:var(--color-error-border);color:var(--color-error)"><div class="dot" style="background:#e85653"></div><div class="nm">error</div><div class="vl">#e85653</div></div>
+    <div class="cell" style="background:var(--color-warning-bg);border-color:var(--color-warning-border);color:var(--color-warning)"><div class="dot" style="background:#e38444"></div><div class="nm">warning</div><div class="vl">#e38444</div></div>
+    <div class="cell" style="background:var(--color-info-bg);border-color:var(--color-info-border);color:var(--color-info)"><div class="dot" style="background:#61daff"></div><div class="nm">info</div><div class="vl">#61daff</div></div>
+  </div>
+  <div class="acc">
+    <div class="accbox" style="background:#1a7a52;color:#fff">accent · #1a7a52</div>
+    <div class="accbox" style="background:#16664a;color:#fff">btn-primary · #16664a</div>
+    <div class="accbox" style="background:var(--color-surface);color:#61daff;border:1px solid var(--color-border)">link · #61daff</div>
+  </div>
+</body>
+</html>

@@ -1070,10 +1070,12 @@ def explain(
     # Keep the fallback for older callers that may still return config=None.
     from elspeth.cli_helpers import resolve_audit_passphrase
 
+    explain_settings = config
     landscape_settings = config.landscape if config else None
     if landscape_settings is None and settings_path is not None and settings_path.exists():
         try:
             settings_for_passphrase, _ = _load_settings_with_secrets(Path(settings_path).expanduser())
+            explain_settings = settings_for_passphrase
             landscape_settings = settings_for_passphrase.landscape
         except (FileNotFoundError, yaml.YAMLError, YamlParserError, YamlScannerError) as e:
             # User explicitly provided --settings (guarded by settings_path is not None
@@ -1115,7 +1117,15 @@ def explain(
         raise typer.Exit(1) from None
 
     try:
-        factory = RecorderFactory(db)
+        payload_store = None
+        if explain_settings is not None:
+            from elspeth.core.payload_store import FilesystemPayloadStore
+
+            payload_path = explain_settings.payload_store.base_path
+            if payload_path.exists():
+                payload_store = FilesystemPayloadStore(payload_path)
+
+        factory = RecorderFactory(db) if payload_store is None else RecorderFactory(db, payload_store=payload_store)
 
         # Resolve 'latest' run_id
         resolved_run_id = resolve_run_id(run_id, factory)

@@ -139,7 +139,7 @@ Some examples deliberately exercise failure accounting:
 |--------------------|-----------------|
 | `deep_routing`, `error_routing` | `PARTIAL`, exit 1; packaged blocked-content rows reach quarantine |
 | `fork_coalesce/settings_union_fail.yaml` | `FAILED`, non-zero exit; the first field collision aborts the run |
-| `row_union_ab_experiment/settings_screened.yaml` | `PARTIAL`, exit 0; screened pairs fail closed and remain audited |
+| `row_union_ab_experiment/settings_screened.yaml` | `PARTIAL`, exit 1; screened pairs fail closed and remain audited |
 | ChaosLLM / ChaosWeb realistic fault profiles | Stochastic `COMPLETED`, `PARTIAL`, or preflight failure depending on injected faults; verify every ingested row reached a result or error sink |
 
 ## Resetting examples

@@ -107,6 +107,45 @@ class TestCLIIntegration:
         assert len(data) == 3
         assert data[0]["name"] == "alice"
 
+    def test_explain_uses_configured_payload_store(self, pipeline_config: Path, tmp_path: Path) -> None:
+        """explain --settings resolves source payloads from the configured store."""
+        from elspeth.cli import app
+        from elspeth.core.landscape import LandscapeDB
+        from elspeth.core.landscape.factory import RecorderFactory
+
+        run_result = runner.invoke(app, ["run", "-s", str(pipeline_config), "--execute"])
+        assert run_result.exit_code == 0, run_result.output
+
+        db_path = tmp_path / "landscape.db"
+        db = LandscapeDB.from_url(f"sqlite:///{db_path}", create_tables=False)
+        try:
+            repositories = RecorderFactory.read_only(db)
+            run_id = repositories.run_lifecycle.list_runs()[0].run_id
+            rows = repositories.query.get_rows(run_id)
+        finally:
+            db.close()
+        assert rows
+
+        explain_result = runner.invoke(
+            app,
+            [
+                "explain",
+                "--run",
+                "latest",
+                "--row",
+                rows[0].row_id,
+                "--no-tui",
+                "--database",
+                str(db_path),
+                "--settings",
+                str(pipeline_config),
+            ],
+        )
+
+        assert explain_result.exit_code == 0, explain_result.output
+        assert "Payload Available: True" in explain_result.output
+        assert "alice" in explain_result.output
+
     def test_plugins_list_shows_all_types(self) -> None:
         """plugins list shows sources and sinks."""
         from elspeth.cli import app

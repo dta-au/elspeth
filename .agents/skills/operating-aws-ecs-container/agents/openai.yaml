@@ -1,0 +1,6 @@
+interface:
+  display_name: "Operate AWS ECS Container"
+  short_description: "Build, deploy, and validate ELSPETH on ECS"
+  default_prompt: "Use $operating-aws-ecs-container to build, deploy, validate, or diagnose the ELSPETH AWS ECS container."
+policy:
+  allow_implicit_invocation: true

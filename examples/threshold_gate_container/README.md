@@ -8,12 +8,21 @@ The same pipeline as `threshold_gate` but with container-appropriate paths (`/ap
 
 ## Running
 
+The image defaults to UID/GID `1654`. For this local bind-mount exercise, run
+the container as your host UID/GID so the deliberately private (`0600`) audit,
+payload, and CSV artifacts remain readable by the host user. The example stores
+payloads under `runs/payloads`, so they survive the container alongside the
+Landscape database.
+
 ```bash
 # Build the ELSPETH image
 docker build -t elspeth .
 
+PIPELINE_DIR="$(pwd)/examples/threshold_gate_container"
+
 # Run the containerised pipeline
-docker run -v $(pwd)/examples/threshold_gate_container:/app/pipeline elspeth \
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v "$PIPELINE_DIR:/app/pipeline" elspeth \
   run --settings /app/pipeline/settings.yaml --execute
 ```
 
