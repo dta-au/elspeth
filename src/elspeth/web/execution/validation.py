@@ -70,6 +70,7 @@ from elspeth.web.execution._semantic_helpers import (
     assistance_suggestion_for,
     serialize_semantic_contracts,
 )
+from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
 from elspeth.web.execution.preflight import (
     RUNTIME_CHECK_GRAPH_STRUCTURE,
     RUNTIME_CHECK_PLUGIN_INSTANTIATION,
@@ -869,6 +870,45 @@ def validate_pipeline(
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
     allow_pending_interpretation_placeholders: bool = False,
     session_id: str | None = None,
+) -> ValidationResult:
+    """Compatibility facade that captures patchable runtime dependencies per call."""
+    dependencies = ValidationDependencies(
+        load_yaml=load_bounded_pipeline_yaml,
+        load_settings_yaml=load_settings_from_yaml_string,
+        load_settings_dict=load_settings_from_config_dict,
+        instantiate_plugins=instantiate_runtime_plugins,
+        build_graph=build_runtime_graph,
+        validate_routes=assemble_and_validate_pipeline_config,
+    )
+    return ValidationPipeline(dependencies).run(
+        state,
+        settings,
+        yaml_generator,
+        plugin_snapshot=plugin_snapshot,
+        profile_registry=profile_registry,
+        catalog=catalog,
+        secret_service=secret_service,
+        user_id=user_id,
+        blob_get_metadata=blob_get_metadata,
+        allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
+        session_id=session_id,
+    )
+
+
+def _validate_pipeline_impl(
+    state: CompositionState,
+    settings: ValidationSettings,
+    yaml_generator: YamlGenerator,
+    *,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    profile_registry: OperatorProfileRegistry | None,
+    catalog: CatalogService,
+    secret_service: WebSecretResolver | None = None,
+    user_id: str | None = None,
+    blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
+    allow_pending_interpretation_placeholders: bool = False,
+    session_id: str | None = None,
+    dependencies: ValidationDependencies,
 ) -> ValidationResult:
     """Dry-run validation through the real engine code path.
 
@@ -1686,7 +1726,7 @@ def validate_pipeline(
     pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(settings.data_dir), session_id=session_id)
 
     if blob_get_metadata is not None and "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml:
-        config_dict = load_bounded_pipeline_yaml(pipeline_yaml)
+        config_dict = dependencies.load_yaml(pipeline_yaml)
         if type(config_dict) is not dict:
             raise TypeError(
                 f"generate_yaml() produced non-dict YAML (got {type(config_dict).__name__}) — this is a bug in the YAML generator"
@@ -2103,7 +2143,7 @@ def validate_pipeline(
     try:
         settings_config: dict[str, Any] | None = None
         if secret_service is not None and user_id is not None and all_refs:
-            config_dict = load_bounded_pipeline_yaml(pipeline_yaml)
+            config_dict = dependencies.load_yaml(pipeline_yaml)
             if not isinstance(config_dict, dict):
                 raise TypeError(
                     f"generate_yaml() produced non-dict YAML (got {type(config_dict).__name__}) — this is a bug in the YAML generator"
@@ -2126,7 +2166,7 @@ def validate_pipeline(
             # The export YAML is generated separately from the original state
             # (generate_public_yaml), so the real marker is preserved on the wire
             # — the placeholder lives only in this loader-local copy.
-            config_dict = load_bounded_pipeline_yaml(pipeline_yaml)
+            config_dict = dependencies.load_yaml(pipeline_yaml)
             if isinstance(config_dict, dict):
                 settings_config = redact_secret_refs_for_validation(config_dict)
 
@@ -2135,9 +2175,9 @@ def validate_pipeline(
         # resolved above via resolve_secret_refs; any remaining ${VAR} is
         # user-authored data, not a host-environment lookup.
         if settings_config is None:
-            elspeth_settings = load_settings_from_yaml_string(pipeline_yaml, expand_env_vars=False)
+            elspeth_settings = dependencies.load_settings_yaml(pipeline_yaml, expand_env_vars=False)
         else:
-            elspeth_settings = load_settings_from_config_dict(settings_config, expand_env_vars=False)
+            elspeth_settings = dependencies.load_settings_dict(settings_config, expand_env_vars=False)
         checks.append(
             ValidationCheck(
                 name=_CHECK_SETTINGS,
@@ -2215,7 +2255,7 @@ def validate_pipeline(
     #   but rejected by the walker; PLUGINS check passed, VALUE_SOURCE
     #   compliance check failed, downstream checks skipped via cascade.
     try:
-        bundle = instantiate_runtime_plugins(elspeth_settings, plugin_snapshot=plugin_snapshot)
+        bundle = dependencies.instantiate_plugins(elspeth_settings, plugin_snapshot=plugin_snapshot)
         checks.append(
             ValidationCheck(
                 name=_CHECK_PLUGINS,
@@ -2381,7 +2421,7 @@ def validate_pipeline(
 
     # Step 5: Graph construction + structural validation
     try:
-        graph = build_runtime_graph(elspeth_settings, bundle)
+        graph = dependencies.build_graph(elspeth_settings, bundle)
         graph.validate()
         graph_warnings = [_graph_warning_to_validation_warning(warning) for warning in graph.validation_warnings]
         checks.append(
@@ -2445,7 +2485,7 @@ def validate_pipeline(
     # TransformSettings requires it) and must surface as a 500, not as a
     # per-pipeline validation failure.
     try:
-        assemble_and_validate_pipeline_config(
+        dependencies.validate_routes(
             sources=bundle.sources,
             transforms=bundle.transforms,
             sinks=bundle.sinks,

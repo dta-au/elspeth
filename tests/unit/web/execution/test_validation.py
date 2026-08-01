@@ -9,6 +9,7 @@ W18 fix: Only typed exceptions are caught — no bare except Exception.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +38,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.execution import validation as validation_module
 from elspeth.web.execution.protocol import YamlGenerator
 from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE, ValidationCheck
 from elspeth.web.execution.validation import (
@@ -523,6 +525,166 @@ def _runtime_graph_mock(
     graph.get_coalesce_id_map.return_value = {}
     graph.get_row_union_id_map.return_value = {}
     return cast(MagicMock, graph)
+
+
+def test_validate_pipeline_public_signature_is_stable_through_boundary_decorator() -> None:
+    expected = (
+        "(state: 'CompositionState', settings: 'ValidationSettings', yaml_generator: 'YamlGenerator', *, "
+        "plugin_snapshot: 'PluginAvailabilitySnapshot', profile_registry: 'OperatorProfileRegistry | None', "
+        "catalog: 'CatalogService', secret_service: 'WebSecretResolver | None' = None, user_id: 'str | None' = None, "
+        "blob_get_metadata: 'Callable[[UUID], BlobRecord | None] | None' = None, "
+        "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None) -> 'ValidationResult'"
+    )
+
+    assert str(inspect.signature(validation_module.validate_pipeline)) == expected
+    assert inspect.signature(validation_module.validate_pipeline) == inspect.signature(validation_module.validate_pipeline.__wrapped__)
+
+
+def test_trained_operator_wrapper_forwards_through_public_facade(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _make_state()
+    settings = _make_settings()
+    yaml_generator = _FakeYamlGenerator()
+    catalog = create_catalog_service()
+    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    profile_registry = MagicMock(spec=OperatorProfileRegistry)
+    secret_service = MagicMock()
+    blob_get_metadata = MagicMock()
+    expected_result = MagicMock()
+    facade = MagicMock(return_value=expected_result)
+    monkeypatch.setattr(validation_module, "validate_pipeline", facade)
+
+    result = validation_module.validate_pipeline_for_trained_operator(
+        state,
+        settings,
+        yaml_generator,
+        plugin_snapshot=plugin_snapshot,
+        profile_registry=profile_registry,
+        catalog=catalog,
+        secret_service=secret_service,
+        user_id="operator-1",
+        blob_get_metadata=blob_get_metadata,
+        allow_pending_interpretation_placeholders=True,
+        session_id="session-1",
+    )
+
+    assert result is expected_result
+    facade.assert_called_once_with(
+        state,
+        settings,
+        yaml_generator,
+        plugin_snapshot=plugin_snapshot,
+        profile_registry=profile_registry,
+        catalog=catalog,
+        secret_service=secret_service,
+        user_id="operator-1",
+        blob_get_metadata=blob_get_metadata,
+        allow_pending_interpretation_placeholders=True,
+        session_id="session-1",
+    )
+
+
+def test_public_facade_resolves_runtime_dependencies_at_call_time() -> None:
+    state = _make_state(outputs=(_make_output(),))
+    settings = _make_settings()
+    yaml_generator = _FakeYamlGenerator("sources: {}\nsinks: {}\n")
+    catalog = create_catalog_service()
+    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    graph = _runtime_graph_mock()
+
+    with (
+        patch("elspeth.web.execution.validation.load_settings_from_yaml_string", return_value=_fake_settings()) as load_settings,
+        patch(
+            "elspeth.web.execution.validation.instantiate_runtime_plugins",
+            return_value=_FakeRuntimeBundle(),
+        ) as instantiate_plugins,
+        patch("elspeth.web.execution.validation.build_runtime_graph", return_value=graph) as build_graph,
+        patch(
+            "elspeth.web.execution.validation.assemble_and_validate_pipeline_config",
+            return_value=_fake_pipeline_config(),
+        ) as validate_routes,
+    ):
+        result = validation_module.validate_pipeline(
+            state,
+            settings,
+            yaml_generator,
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=None,
+            catalog=catalog,
+            session_id="test-session",
+        )
+
+    assert result.is_valid is True
+    load_settings.assert_called_once()
+    instantiate_plugins.assert_called_once()
+    build_graph.assert_called_once()
+    validate_routes.assert_called_once()
+
+
+def test_public_facade_resolves_bounded_and_dict_loaders_at_call_time() -> None:
+    state = _make_state(outputs=(_make_output(),))
+    settings = _make_settings()
+    yaml_generator = _FakeYamlGenerator(
+        """sources:
+  primary:
+    plugin: csv
+    on_success: primary
+    options:
+      api_key:
+        secret_ref: MY_KEY
+sinks:
+  primary:
+    plugin: csv
+    options: {}
+"""
+    )
+    catalog = create_catalog_service()
+    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    parsed_config = {
+        "sources": {
+            "primary": {
+                "plugin": "csv",
+                "on_success": "primary",
+                "options": {"api_key": {"secret_ref": "MY_KEY"}},
+            }
+        },
+        "sinks": {"primary": {"plugin": "csv", "options": {}}},
+    }
+
+    with (
+        patch("elspeth.web.execution.validation.load_bounded_pipeline_yaml", return_value=parsed_config) as load_yaml,
+        patch(
+            "elspeth.web.execution.validation.load_settings_from_config_dict",
+            side_effect=ValueError("stop after facade dependency capture"),
+        ) as load_settings,
+    ):
+        result = validation_module.validate_pipeline(
+            state,
+            settings,
+            yaml_generator,
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=None,
+            catalog=catalog,
+            session_id="test-session",
+        )
+
+    assert result.is_valid is False
+    load_yaml.assert_called_once()
+    load_settings.assert_called_once()
+
+
+def test_validation_pipeline_constructs_from_explicit_dependencies() -> None:
+    from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
+
+    dependencies = ValidationDependencies(
+        load_yaml=validation_module.load_bounded_pipeline_yaml,
+        load_settings_yaml=validation_module.load_settings_from_yaml_string,
+        load_settings_dict=validation_module.load_settings_from_config_dict,
+        instantiate_plugins=validation_module.instantiate_runtime_plugins,
+        build_graph=validation_module.build_runtime_graph,
+        validate_routes=validation_module.assemble_and_validate_pipeline_config,
+    )
+
+    assert ValidationPipeline(dependencies).dependencies is dependencies
 
 
 @dataclass(frozen=True)
