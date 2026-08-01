@@ -45,6 +45,7 @@ from elspeth.web.composer.tools._common import (
     _plugin_policy_failure,
     _post_mutation_invariant_error,
     _prevalidate_transform_for_context,
+    _prohibited_section,
     _reserved_connection_names,
     _row_union_node_contract_error,
     _runtime_owned_llm_option_error,
@@ -123,14 +124,25 @@ def _handle_list_transforms(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
-    return _discovery_result(state, context.catalog.list_transforms())
+    return _discovery_result(
+        state,
+        {
+            "available": context.catalog.list_transforms(),
+            "prohibited": _prohibited_section(context.catalog.list_prohibited_transforms()),
+        },
+    )
 
 
 _LIST_TRANSFORMS_DECLARATION = ToolDeclaration(
     name="list_transforms",
     handler=_handle_list_transforms,
     kind=ToolKind.DISCOVERY,
-    description="List available transform plugins with name and summary.",
+    description=(
+        "List available transform plugins with name and summary. The result's "
+        "`prohibited` array names any transform categorically banned from the web "
+        "authoring surface by security policy, with its closed reason and "
+        "explanation — cite it when a user asks why a specific plugin is unavailable."
+    ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
 )
@@ -141,14 +153,25 @@ def _handle_list_sinks(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
-    return _discovery_result(state, context.catalog.list_sinks())
+    return _discovery_result(
+        state,
+        {
+            "available": context.catalog.list_sinks(),
+            "prohibited": _prohibited_section(context.catalog.list_prohibited_sinks()),
+        },
+    )
 
 
 _LIST_SINKS_DECLARATION = ToolDeclaration(
     name="list_sinks",
     handler=_handle_list_sinks,
     kind=ToolKind.DISCOVERY,
-    description="List available sink plugins with name and summary.",
+    description=(
+        "List available sink plugins with name and summary. The result's "
+        "`prohibited` array names any sink categorically banned from the web "
+        "authoring surface by security policy, with its closed reason and "
+        "explanation — cite it when a user asks why a specific plugin is unavailable."
+    ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
 )

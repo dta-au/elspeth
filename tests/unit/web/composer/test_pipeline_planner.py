@@ -1847,7 +1847,9 @@ async def test_list_sources_disclosure_closes_authoritative_validation_envelope(
         assert payload["data"]["success"] is False
         assert payload["data"]["validation"]["errors"][0]["error_code"] == "SCHEMA_VALIDATION"
     else:
-        assert isinstance(payload["data"], list)
+        assert isinstance(payload["data"], dict)
+        assert isinstance(payload["data"]["available"], list)
+        assert isinstance(payload["data"]["prohibited"], list)
     if restricted:
         assert all(canary not in tool_message["content"] for canary in _ALL_PROVIDER_DISCLOSURE_CANARIES)
         for entries in (

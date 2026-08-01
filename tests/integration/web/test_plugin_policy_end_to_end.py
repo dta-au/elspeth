@@ -418,7 +418,9 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
         _handle_list_transforms({}, empty_state, context),
         _handle_list_sinks({}, empty_state, context),
     )
-    guided_discovery = frozenset(str(PluginId(item.plugin_type, item.name)) for result in guided_results for item in result.data)
+    guided_discovery = frozenset(
+        str(PluginId(item.plugin_type, item.name)) for result in guided_results for item in result.data["available"]
+    )
     prompt = build_context_string(empty_state, view, plugin_snapshot=snapshot, schemas_loaded=frozenset())
     freeform_policy = json.loads(prompt.partition("\n")[2])["plugin_policy"]
     freeform_prompt = frozenset(freeform_policy["available_ids"])
@@ -454,7 +456,7 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
     guided_capabilities: dict[str, set[str]] = {}
     for result in guided_results:
         assert result.success is True
-        for item in result.data:
+        for item in result.data["available"]:
             plugin_id = str(PluginId(item.plugin_type, item.name))
             for declaration in item.policy_capabilities:
                 guided_capabilities.setdefault(declaration.capability.value, set()).add(plugin_id)

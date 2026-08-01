@@ -26,6 +26,7 @@ class PolicyCatalogView:
         self._full = full
         self.snapshot = snapshot
         self._profiles: OperatorProfileRegistry | None = profiles
+        self._full_items_cache: dict[PluginKind, list[PluginSummary]] = {}
 
     @classmethod
     def for_trained_operator(
@@ -40,19 +41,73 @@ class PolicyCatalogView:
         view._full = full
         view.snapshot = snapshot
         view._profiles = None
+        view._full_items_cache = {}
         return view
+
+    def _full_items(self, kind: PluginKind) -> list[PluginSummary]:
+        """Return this kind's unrestricted catalog listing, fetched at most once per view.
+
+        ``list_*`` and ``list_prohibited_*`` both need the same unrestricted
+        listing (one to keep only ``snapshot.available``, the other to keep
+        only the ``WEB_SURFACE_PROHIBITED`` entries) — a discovery tool
+        dispatch calls both back-to-back, so caching here is what keeps a
+        single ``list_sources`` call from re-deriving every ``PluginSummary``
+        twice. Pinned by ``test_cacheable_tool_returns_cached_result`` /
+        ``test_cache_hit_rebuilds_result_envelope_from_current_state``
+        (exact ``catalog.list_sources.call_count``) in test_service.py.
+        """
+        if kind not in self._full_items_cache:
+            if kind == "source":
+                self._full_items_cache[kind] = self._full.list_sources()
+            elif kind == "transform":
+                self._full_items_cache[kind] = self._full.list_transforms()
+            else:
+                self._full_items_cache[kind] = self._full.list_sinks()
+        return self._full_items_cache[kind]
 
     def _visible(self, kind: PluginKind, items: list[PluginSummary]) -> list[PluginSummary]:
         return [item for item in items if PluginId(kind, item.name) in self.snapshot.available]
 
     def list_sources(self) -> list[PluginSummary]:
-        return self._visible("source", self._full.list_sources())
+        return self._visible("source", self._full_items("source"))
 
     def list_transforms(self) -> list[PluginSummary]:
-        return self._visible("transform", self._full.list_transforms())
+        return self._visible("transform", self._full_items("transform"))
 
     def list_sinks(self) -> list[PluginSummary]:
-        return self._visible("sink", self._full.list_sinks())
+        return self._visible("sink", self._full_items("sink"))
+
+    def _prohibited(self, kind: PluginKind, items: list[PluginSummary]) -> list[PluginSummary]:
+        """Return items closed by the categorical ``WEB_SURFACE_PROHIBITED`` ban.
+
+        The ONLY unavailable reason this surfaces. Every other reason (not
+        installed, not authorized, missing credential, no operator profile)
+        stays silent here — those describe ordinary "not selectable *yet*"
+        gaps an operator can close, so they belong to the attempt-failure
+        path (``set_source`` etc.), not a standing discovery listing. This
+        reason is different in kind: nothing an operator does in this
+        deployment can clear it, so a user asking "why can't I use X"
+        deserves the answer without first attempting and failing. See
+        R2-F18 / elspeth-28a695d7f4.
+        """
+        banned = {
+            availability.plugin_id
+            for availability in self.snapshot.unavailable
+            if availability.reason is PluginUnavailableReason.WEB_SURFACE_PROHIBITED
+        }
+        return [item for item in items if PluginId(kind, item.name) in banned]
+
+    def list_prohibited_sources(self) -> list[PluginSummary]:
+        """Return source plugins categorically banned from the web surface."""
+        return self._prohibited("source", self._full_items("source"))
+
+    def list_prohibited_transforms(self) -> list[PluginSummary]:
+        """Return transform plugins categorically banned from the web surface."""
+        return self._prohibited("transform", self._full_items("transform"))
+
+    def list_prohibited_sinks(self) -> list[PluginSummary]:
+        """Return sink plugins categorically banned from the web surface."""
+        return self._prohibited("sink", self._full_items("sink"))
 
     def capability_groups(self) -> dict[PluginCapability, tuple[PluginId, ...]]:
         """Return safe visible plugin IDs grouped by declared capability."""

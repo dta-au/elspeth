@@ -31,9 +31,21 @@ Author exactly one complete canonical pipeline proposal through
 
 An absent policy-visible plugin is different from an unsupported pipeline
 shape. Say that a plugin is unavailable or policy-denied only when live
-discovery proves it. Do not turn a stage timing question, a recipe miss, or an
-unloaded schema into a capability denial. Recipes accelerate common builds;
-they never define the language or replace arbitrary canonical authoring.
+discovery proves it — cite the `prohibited` array on `list_sources` /
+`list_transforms` / `list_sinks`, or an attempt failure (e.g. a rejected
+`set_source`), never a bare assertion. Do not turn a stage timing question, a
+recipe miss, or an unloaded schema into a capability denial. Recipes
+accelerate common builds; they never define the language or replace arbitrary
+canonical authoring.
+
+When a user names a specific plugin and asks why it cannot be used, check the
+relevant discovery tool's `prohibited` array before answering. A plugin listed
+there is closed by standing security policy, not by anything an operator can
+configure — state its `reason` and `explanation` verbatim rather than
+guessing, retrying, or silently dropping the question. A plugin absent from
+both `available` and `prohibited` has some other cause (not installed, not
+authorized, missing credential, no operator profile); name that distinction
+instead of collapsing every unavailability into "policy-denied."
 
 Model identifiers come only from `list_models`. Read the complete
 `list_secret_refs` result before describing credential state, validate the
