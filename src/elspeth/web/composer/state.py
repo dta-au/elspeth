@@ -16,6 +16,8 @@ from math import isfinite
 from pathlib import PurePosixPath
 from typing import Any, Literal, NotRequired, Self, TypedDict
 
+from jinja2 import TemplateSyntaxError
+from jinja2.meta import find_undeclared_variables
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
@@ -49,8 +51,10 @@ from elspeth.core.config import (
     _validate_node_name_chars,
 )
 from elspeth.core.dag.coalesce_merge import merge_guaranteed_fields
+from elspeth.plugins.infrastructure.templates import create_sandboxed_environment
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.validation import INTERPRETATION_PLACEHOLDER_RE
 
 NodeType = Literal["transform", "gate", "aggregation", "coalesce", "row_union", "queue"]
 EdgeType = Literal["on_success", "on_error", "route_true", "route_false", "fork"]
@@ -1625,6 +1629,71 @@ def _validate_aggregation_trigger(node_id: str, trigger: Mapping[str, Any]) -> V
             error_code="aggregation_trigger_invalid",
         )
     return None
+
+
+# The names PromptTemplate.render actually supplies (templates.py builds the
+# context as exactly {"row": ..., "lookup": ...}) plus the Jinja2 environment
+# globals (range, namespace, ...) that resolve at render time. Any other
+# top-level template name hits StrictUndefined and raises TemplateError live.
+_PROMPT_TEMPLATE_CONTEXT_NAMES: frozenset[str] = frozenset({"row", "lookup"})
+_PROMPT_TEMPLATE_GLOBAL_NAMES: frozenset[str] = frozenset(create_sandboxed_environment().globals)
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying a web-authored prompt_template (untrusted Jinja2 text)",
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "returns a high-severity ValidationEntry only when a string prompt_template parses "
+        "and declares top-level names outside the render context; absent, mistyped, or "
+        "unparseable templates yield None (sibling rules report those) and never raise"
+    ),
+)
+def _validate_prompt_template_variable_bindings(node: NodeSpec) -> ValidationEntry | None:
+    """Reject prompt templates whose interpolations can never bind at render.
+
+    ``PromptTemplate.render`` supplies exactly ``row`` and ``lookup`` under
+    ``StrictUndefined``, so a bare ``{{ text }}`` raises ``TemplateError:
+    Undefined variable`` at runtime — the model receives none of the row's
+    data, and prompt-shield field-scope reasoning sees an empty protected set
+    (R2-F17 compounding finding). ``{{interpretation:<term>}}`` placeholders
+    are masked before parsing: they are resolved to operator-accepted text
+    upstream of rendering and are not Jinja2 variables.
+
+    Returns None when prompt_template is absent, not a string, or fails to
+    parse (other layers own those shapes), and for multi-query nodes: with
+    ``queries`` present, each query's ``input_fields`` maps template variables
+    to row columns directly (``build_template_context`` in multi_query.py), so
+    bare names are the documented idiom there — the same ``queries is None``
+    scoping as ``LLMConfig._validate_required_input_fields_appear_in_template``.
+    """
+    if node.options.get("queries") is not None:
+        return None
+    template = node.options.get("prompt_template")
+    if not isinstance(template, str):
+        return None
+    masked = INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)
+    try:
+        ast = create_sandboxed_environment().parse(masked)
+    except TemplateSyntaxError:
+        return None
+    unbound = sorted(find_undeclared_variables(ast) - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
+    if not unbound:
+        return None
+    names = ", ".join(f"'{name}'" for name in unbound)
+    return ValidationEntry(
+        component=f"node:{node.id}",
+        message=(
+            f"prompt_template references {names}, which the prompt render context does not define — "
+            "row data is only available as 'row.<field>' and lookup data as 'lookup.<key>', so "
+            "rendering fails with 'Undefined variable' at runtime and none of the row's data "
+            "reaches the model. Rewrite each name as '{{ row.<field> }}' (matching an upstream "
+            "schema field) or '{{ lookup.<key> }}', or remove the reference."
+        ),
+        severity="high",
+        error_code="prompt_template_unbound_variables",
+    )
 
 
 def _locked_input_field_set(options: Mapping[str, Any], owner: str) -> frozenset[str] | None:
@@ -3391,6 +3460,10 @@ class CompositionState:
             if abuse_contact_error is not None:
                 errors.append(abuse_contact_error)
             errors.extend(_validate_web_scrape_http_identity_not_placeholder(node))
+
+            prompt_binding_error = _validate_prompt_template_variable_bindings(node)
+            if prompt_binding_error is not None:
+                errors.append(prompt_binding_error)
 
             # ``timeout_seconds`` is a top-level structural-barrier field.
             # Queue rejects it through queue_node_contract_error below so every

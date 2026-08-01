@@ -870,7 +870,7 @@ def test_guided_tutorial_shape_short_form_review_builds_a_valid_candidate(tmp_pa
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
-                    "prompt_template": "Summarise {{ page_content }}",
+                    "prompt_template": "Summarise {{ row.page_content }}",
                     "interpretation_requirements": [_short_form_shield_review()],
                 },
             },
@@ -1046,7 +1046,7 @@ def test_guided_shape_malformed_review_row_is_repairable_not_a_keyerror(tmp_path
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
-                    "prompt_template": "Summarise {{ url }}",
+                    "prompt_template": "Summarise {{ row.url }}",
                     # The live crash shape: no user_term, nothing to synthesize
                     # an id from.
                     "interpretation_requirements": [{"kind": "pipeline_decision", "draft": "Recommend a prompt-injection shield."}],
