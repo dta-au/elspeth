@@ -208,9 +208,19 @@ class AssistantScaffoldLeakError(ValueError):
 
 
 def _require_prose_assistant_message(value: object, *, tool: str) -> str:
-    """Validate an LLM-supplied assistant_message is user-facing prose."""
+    """Validate an LLM-supplied assistant_message is user-facing prose.
+
+    Raises :class:`GuidedToolArgumentShapeError` (a ``ValueError`` subclass,
+    resolved at call time — the class is defined later in this module) for a
+    non-string/empty value: this guard runs inside the step-1/step-2 tool
+    parsers, whose retain-alone pair salvage catches exactly that type. A
+    bare ``ValueError`` here escaped the salvage, silently discarding a
+    parsed-valid ``retain_deferred_intent`` and mislabeling the turn
+    SYNTHETIC_UNAVAILABLE (R2-F15 residual, acceptance-r2 final review).
+    :class:`AssistantScaffoldLeakError` stays distinct — the advisory wrapper
+    branches on it specifically."""
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{tool} assistant_message must be a non-empty string")
+        raise GuidedToolArgumentShapeError(f"{tool} assistant_message must be a non-empty string")
     lowered = value.lower()
     for marker in _TOOL_SCAFFOLD_MARKERS:
         if marker in lowered:
@@ -1577,7 +1587,11 @@ def _parse_step_1_source_tool_arguments(arguments: str, *, plugin_hint: str | No
     if on_validation_failure_raw is None or (isinstance(on_validation_failure_raw, str) and not on_validation_failure_raw):
         on_validation_failure = "discard"
     elif not isinstance(on_validation_failure_raw, str):
-        raise ValueError(
+        # The shape-error type (not a bare ValueError) is load-bearing: the
+        # step-1 retain-alone pair salvage catches exactly this class, and a
+        # bare ValueError discarded a parsed-valid retained intent with the
+        # defective source half (R2-F15 residual, acceptance-r2 final review).
+        raise GuidedToolArgumentShapeError(
             f"resolve_source on_validation_failure must be a string when provided; got {type(on_validation_failure_raw).__name__}"
         )
     else:
