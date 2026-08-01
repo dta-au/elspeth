@@ -21,6 +21,7 @@ from threading import Lock
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import httpx
+import structlog
 from pydantic import Field, field_validator
 
 from elspeth.contracts import CallStatus, CallType
@@ -38,6 +39,7 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
+from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed
 from elspeth.plugins.llm.config_validation import (
     OPENROUTER_BASE_URL,
     OPENROUTER_BASE_URL_APPLIES_WHEN,
@@ -50,6 +52,8 @@ from elspeth.plugins.transforms.llm.provider import LLMAuditParent, LLMQueryResu
 from elspeth.plugins.transforms.llm.validation import reject_nonfinite_constant
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 
 __all__ = [
@@ -68,6 +72,8 @@ OPENROUTER_APP_REFERER = "https://github.com/johnm-dta/elspeth"
 
 OPENROUTER_APP_TITLE = "Elspeth"
 """Canonical OpenRouter app display title."""
+
+logger = structlog.get_logger(__name__)
 
 
 def _http_error_body_text(error: httpx.HTTPStatusError) -> str:
@@ -339,6 +345,7 @@ class OpenRouterLLMProvider:
         logical_start = time.perf_counter()
 
         http_client = self._get_http_client(audit_parent)
+        primary_error: BaseException | None = None
         try:
             # Build request body
             request_body: dict[str, Any] = {
@@ -402,6 +409,7 @@ class OpenRouterLLMProvider:
             )
             return result
         except LLMClientError as exc:
+            primary_error = exc
             self._record_logical_llm_error(
                 audit_parent=audit_parent,
                 started_at=logical_start,
@@ -409,8 +417,26 @@ class OpenRouterLLMProvider:
                 exc=exc,
             )
             raise
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            self._release_http_client(cache_key)
+            cleanup_failures: list[BaseException] = []
+            self._release_http_client(cache_key, on_close_error=cleanup_failures.append)
+            if cleanup_failures:
+                cleanup_error = cleanup_failures[0]
+                emit_resource_cleanup_failed(
+                    self._telemetry_emit,
+                    run_id=self._run_id,
+                    component="openrouter_provider",
+                    resource="audited_http_client",
+                    error=cleanup_error,
+                    suppressed=primary_error is not None,
+                    logger=logger,
+                    **audit_parent.client_kwargs(),
+                )
+                if primary_error is None:
+                    raise cleanup_error
 
     def _build_llm_request_payload(
         self,
@@ -554,7 +580,12 @@ class OpenRouterLLMProvider:
             self._http_client_refs[cache_key] += 1
             return self._http_clients[cache_key]
 
-    def _release_http_client(self, cache_key: str) -> None:
+    def _release_http_client(
+        self,
+        cache_key: str,
+        *,
+        on_close_error: Callable[[BaseException], None] | None = None,
+    ) -> None:
         """Decrement reference count and close client when last user releases it."""
         client_to_close: AuditedHTTPClient | None = None
         with self._http_clients_lock:
@@ -570,7 +601,12 @@ class OpenRouterLLMProvider:
                 client_to_close = self._http_clients.pop(cache_key, None)
                 self._http_client_refs.pop(cache_key, None)
         if client_to_close is not None:
-            client_to_close.close()
+            try:
+                client_to_close.close()
+            except BaseException as exc:
+                if on_close_error is None:
+                    raise
+                on_close_error(exc)
 
     def close(self) -> None:
         """Release all cached clients."""

@@ -15,6 +15,7 @@ from elspeth.contracts.events import (
     FieldResolutionApplied,
     GateEvaluated,
     PhaseChanged,
+    ResourceCleanupFailed,
     RowCreated,
     RunFinished,
     RunStarted,
@@ -56,7 +57,7 @@ def should_emit(event: TelemetryEvent, granularity: TelemetryGranularity) -> boo
     """
     match event:
         # Lifecycle events: always emit at any granularity
-        case RunStarted() | RunFinished() | PhaseChanged():
+        case RunStarted() | RunFinished() | PhaseChanged() | ResourceCleanupFailed():
             return True
 
         # Row-level events: emit at ROWS or FULL

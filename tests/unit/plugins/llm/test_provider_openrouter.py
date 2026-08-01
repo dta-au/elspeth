@@ -9,13 +9,13 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 import httpx
 import pytest
 
-from elspeth.contracts import CallType
+from elspeth.contracts import CallStatus, CallType
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
@@ -87,6 +87,8 @@ class FakeHTTPClient:
     error: BaseException | None = None
     post_calls: list[HTTPPostCall] = field(default_factory=list)
     closed: bool = False
+    close_error: BaseException | None = None
+    close_calls: int = 0
 
     def post(self, url: str, **kwargs: Any) -> httpx.Response:
         self.post_calls.append(HTTPPostCall(url=url, kwargs=dict(kwargs)))
@@ -97,7 +99,10 @@ class FakeHTTPClient:
         return self.response
 
     def close(self) -> None:
+        self.close_calls += 1
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
     @property
     def last_post(self) -> HTTPPostCall:
@@ -114,8 +119,12 @@ def _provider_http_client(provider: OpenRouterLLMProvider, http_client: FakeHTTP
         _ = audit_parent
         return http_client
 
-    def release_http_client(cache_key: str) -> None:
-        _ = cache_key
+    def release_http_client(
+        cache_key: str,
+        *,
+        on_close_error: Any = None,
+    ) -> None:
+        _ = cache_key, on_close_error
 
     provider._get_http_client = get_http_client  # type: ignore[method-assign]
     provider._release_http_client = release_http_client  # type: ignore[method-assign]
@@ -124,6 +133,15 @@ def _provider_http_client(provider: OpenRouterLLMProvider, http_client: FakeHTTP
     finally:
         provider._get_http_client = original_get  # type: ignore[method-assign]
         provider._release_http_client = original_release  # type: ignore[method-assign]
+
+
+def _install_cached_http_client(
+    provider: OpenRouterLLMProvider,
+    audit_parent: LLMAuditParent,
+    http_client: FakeHTTPClient,
+) -> None:
+    provider._http_clients[audit_parent.cache_key] = cast("AuditedHTTPClient", http_client)
+    provider._http_client_refs[audit_parent.cache_key] = 0
 
 
 @pytest.fixture()
@@ -259,6 +277,62 @@ class TestExecuteQuery:
         assert result.usage.prompt_tokens == 10
         assert result.usage.completion_tokens == 5
 
+    def test_success_cleanup_failure_surfaces_and_emits_system_health(
+        self,
+        provider: OpenRouterLLMProvider,
+        audit_recorder: FakeAuditRecorder,
+        telemetry_emit: FakeTelemetryEmit,
+    ) -> None:
+        parent = LLMAuditParent.for_row(state_id="state-1", token_id="token-1")
+        client = FakeHTTPClient(
+            response=_make_http_response(),
+            close_error=RuntimeError("close failed"),
+        )
+        _install_cached_http_client(provider, parent, client)
+
+        with pytest.raises(RuntimeError, match="close failed"):
+            provider.execute_query(
+                messages=[{"role": "user", "content": "hi"}],
+                model="gpt-4o",
+                temperature=0.0,
+                max_tokens=100,
+                audit_parent=parent,
+            )
+
+        assert any(call["status"] is CallStatus.SUCCESS for call in audit_recorder.calls)
+        assert [type(event).__name__ for event in telemetry_emit.events] == ["ResourceCleanupFailed"]
+        assert provider._http_clients == {}
+        assert provider._http_client_refs == {}
+        assert client.close_calls == 1
+
+    def test_mapped_provider_error_remains_primary_when_cleanup_fails(
+        self,
+        provider: OpenRouterLLMProvider,
+        telemetry_emit: FakeTelemetryEmit,
+    ) -> None:
+        parent = LLMAuditParent.for_operation(operation_id="operation-1")
+        client = FakeHTTPClient(
+            response=_make_error_response(503, body='{"error": "SENTINEL-provider-body"}'),
+            close_error=RuntimeError("close failed"),
+        )
+        _install_cached_http_client(provider, parent, client)
+
+        with pytest.raises(ServerError) as exc_info:
+            provider.execute_query(
+                messages=[{"role": "user", "content": "hi"}],
+                model="gpt-4o",
+                temperature=0.0,
+                max_tokens=100,
+                audit_parent=parent,
+            )
+
+        assert "Server error (HTTP 503)" in str(exc_info.value)
+        assert "SENTINEL-provider-body" not in str(exc_info.value)
+        assert [type(event).__name__ for event in telemetry_emit.events] == ["ResourceCleanupFailed"]
+        assert provider._http_clients == {}
+        assert provider._http_client_refs == {}
+        assert client.close_calls == 1
+
     def test_operation_parent_keeps_transport_and_logical_calls_together(
         self,
         provider: OpenRouterLLMProvider,
@@ -280,6 +354,35 @@ class TestExecuteQuery:
         assert len(audit_recorder.operation_calls) == 2
         assert {call["call_type"] for call in audit_recorder.operation_calls} == {CallType.HTTP, CallType.LLM}
         assert all(call["operation_id"] == "operation-1" for call in audit_recorder.operation_calls)
+
+    def test_operation_parent_failure_records_only_operation_errors_and_releases_client(
+        self,
+        provider: OpenRouterLLMProvider,
+        audit_recorder: FakeAuditRecorder,
+    ) -> None:
+        http_client = FakeHTTPClient(response=_make_error_response(500))
+        with patch("elspeth.plugins.infrastructure.clients.http.httpx.Client", autospec=True) as client_class:
+            client_class.return_value = http_client
+
+            with pytest.raises(ServerError):
+                provider.execute_query(
+                    messages=[{"role": "user", "content": "hi"}],
+                    model="gpt-4o",
+                    temperature=0.0,
+                    max_tokens=100,
+                    audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+                )
+
+        assert audit_recorder.calls == []
+        assert audit_recorder.allocated_state_ids == []
+        assert audit_recorder.allocated_operation_ids == ["operation-1", "operation-1"]
+        assert len(audit_recorder.operation_calls) == 2
+        assert {call["call_type"] for call in audit_recorder.operation_calls} == {CallType.HTTP, CallType.LLM}
+        assert all(call["operation_id"] == "operation-1" for call in audit_recorder.operation_calls)
+        assert all(call["status"] == CallStatus.ERROR for call in audit_recorder.operation_calls)
+        assert provider._http_clients == {}
+        assert provider._http_client_refs == {}
+        assert http_client.closed
 
     def test_max_tokens_none_omitted_from_request_body(self, provider: OpenRouterLLMProvider) -> None:
         """When max_tokens=None, it should NOT appear in the request body."""

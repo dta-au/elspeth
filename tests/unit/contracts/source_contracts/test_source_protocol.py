@@ -34,7 +34,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -42,8 +42,12 @@ from elspeth.contracts import Determinism, PluginSchema, SchemaContract, SourceR
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.base import BaseSource
-from tests.fixtures.factories import make_context
+from elspeth.plugins.sources.llm import LLMSource
+from elspeth.plugins.transforms.llm.provider import FinishReason, LLMQueryResult
+from tests.fixtures.factories import make_context, make_operation_context
+from tests.unit.plugins.sources.llm.conftest import FakeProvider
 
 if TYPE_CHECKING:
     from elspeth.contracts import SourceProtocol
@@ -307,3 +311,42 @@ class TestSourceProtocolContractBase(SourceContractPropertyTestBase):
     @pytest.fixture
     def source(self) -> SourceProtocol:
         return _SourceContractExemplarSource({})
+
+
+class TestLLMSourceProtocolContract(SourceContractPropertyTestBase):
+    """Apply the shared source protocol to the non-deterministic one-shot source."""
+
+    @pytest.fixture
+    def ctx(self) -> PluginContext:
+        return make_operation_context(plugin_name="llm")
+
+    @pytest.fixture
+    def source(self, ctx: PluginContext) -> Iterator[SourceProtocol]:
+        source = LLMSource(
+            {
+                "provider": "openrouter",
+                "model": "openai/gpt-4o-mini",
+                "api_key": "test-api-key",
+                "prompt_template": "Return one bounded answer.",
+                "response_field": "answer",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            }
+        )
+        source.on_success = "output"
+        source.on_start(ctx)
+        real_provider = source._provider
+        assert real_provider is not None
+        real_provider.close()
+        source._provider = FakeProvider(
+            LLMQueryResult(
+                content="bounded answer",
+                usage=TokenUsage.known(prompt_tokens=2, completion_tokens=2),
+                model="served-model",
+                finish_reason=FinishReason.STOP,
+            )
+        )
+        try:
+            yield cast("SourceProtocol", source)
+        finally:
+            source.close()

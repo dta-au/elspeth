@@ -8,12 +8,14 @@ from elspeth.plugins.sources.llm.config import (
     LLMSourceConfig,
     OpenRouterLLMSourceConfig,
 )
+from elspeth.plugins.sources.llm.source import LLMSource
 
 __all__ = [
     "SOURCE_PROVIDER_CONFIGS",
     "AzureOpenAILLMSourceConfig",
     "BedrockLLMSourceConfig",
     "GatewayLLMSourceConfig",
+    "LLMSource",
     "LLMSourceConfig",
     "OpenRouterLLMSourceConfig",
 ]

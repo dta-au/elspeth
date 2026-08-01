@@ -133,6 +133,7 @@ allowed_dict_patterns:
   # detaching authoring state and replacing deferred secret references.
   - "src/elspeth/web/composer/_validation_probe.py:prepare_validation_probe_options:return"
   - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.get_config_model:config"
+  - "src/elspeth/plugins/sources/llm/source.py:LLMSource.get_config_model:config"
 
   # probe_config classmethod (ADR-009 §Clause 4) — returns the exact shape
   # the constructor accepts (dict[str, Any]). A TypedDict would require
@@ -168,6 +169,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/transforms/azure/prompt_shield.py:AzurePromptShield.probe_config:return"
   - "src/elspeth/plugins/transforms/aws/textract_document_analysis.py:AWSTextractDocumentAnalysis.probe_config:return"
   - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.probe_config:return"
+  - "src/elspeth/plugins/sources/llm/source.py:LLMSource.probe_config:return"
   - "src/elspeth/plugins/transforms/rag/transform.py:RAGRetrievalTransform.probe_config:return"
 
   # Plugin implementations - config input
@@ -206,6 +208,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/sources/csv_source.py:CSVSource.__init__:config"
   - "src/elspeth/plugins/sources/null_source.py:NullSource.__init__:config"
   - "src/elspeth/plugins/sources/text_source.py:TextSource.__init__:config"
+  - "src/elspeth/plugins/sources/llm/source.py:LLMSource.__init__:config"
 
   # Plugin manager - factory methods for creating plugins from config
   - "src/elspeth/plugins/infrastructure/manager.py:PluginManager.create_source:config"
@@ -296,6 +299,7 @@ allowed_dict_patterns:
   - "src/elspeth/plugins/infrastructure/base.py:BaseSink.get_config_schema:return"
   - "src/elspeth/plugins/infrastructure/base.py:BaseSource.get_config_schema:return"
   - "src/elspeth/plugins/transforms/llm/transform.py:LLMTransform.get_config_schema:return"
+  - "src/elspeth/plugins/sources/llm/source.py:LLMSource.get_config_schema:return"
   # MCP tool registration mutates and freezes JSON Schema property dicts before
   # exposing them through mcp.types.Tool.inputSchema.
   - "src/elspeth/mcp/server.py:_schema_properties_with_int_bounds:return"

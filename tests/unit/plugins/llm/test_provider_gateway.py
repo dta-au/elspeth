@@ -15,12 +15,14 @@ import json
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 import httpx
 import pytest
 import respx
 
 from elspeth.contracts import CallStatus, CallType
+from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
@@ -198,6 +200,59 @@ class TestExecuteQueryHappyPath:
         assert result.finish_reason is FinishReason.STOP
         assert result.usage.prompt_tokens == 10
         assert result.usage.completion_tokens == 5
+
+    @respx.mock
+    def test_success_cleanup_failure_surfaces_and_emits_system_health(
+        self,
+        provider: GatewayLLMProvider,
+        audit_recorder: FakeAuditRecorder,
+        telemetry_emit: FakeTelemetryEmit,
+    ) -> None:
+        respx.post(f"{_ENDPOINT}/chat/completions").mock(return_value=_gateway_response(_completion_body()))
+
+        with (
+            patch.object(AuditedHTTPClient, "close", autospec=True, side_effect=RuntimeError("close failed")),
+            pytest.raises(RuntimeError, match="close failed"),
+        ):
+            provider.execute_query(
+                messages=[{"role": "user", "content": "hi"}],
+                model="standard",
+                temperature=0.0,
+                max_tokens=100,
+                audit_parent=LLMAuditParent.for_row(state_id="state-1", token_id="token-1"),
+            )
+
+        assert any(call["status"] is CallStatus.SUCCESS for call in audit_recorder.calls)
+        assert type(telemetry_emit.events[-1]).__name__ == "ResourceCleanupFailed"
+        assert provider._http_clients == {}
+        assert provider._http_client_refs == {}
+
+    @respx.mock
+    def test_mapped_provider_error_remains_primary_when_cleanup_fails(
+        self,
+        provider: GatewayLLMProvider,
+        telemetry_emit: FakeTelemetryEmit,
+    ) -> None:
+        respx.post(f"{_ENDPOINT}/chat/completions").mock(
+            return_value=_gateway_response(_error_body("upstream_unavailable", sentinel=True), status_code=503)
+        )
+
+        with (
+            patch.object(AuditedHTTPClient, "close", autospec=True, side_effect=RuntimeError("close failed")),
+            pytest.raises(ServerError) as exc_info,
+        ):
+            provider.execute_query(
+                messages=[{"role": "user", "content": "hi"}],
+                model="standard",
+                temperature=0.0,
+                max_tokens=100,
+                audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+            )
+
+        assert _BODY_SENTINEL not in str(exc_info.value)
+        assert type(telemetry_emit.events[-1]).__name__ == "ResourceCleanupFailed"
+        assert provider._http_clients == {}
+        assert provider._http_client_refs == {}
 
     @respx.mock
     def test_sends_contract_header_and_bearer(self, provider: GatewayLLMProvider) -> None:
@@ -771,6 +826,35 @@ class TestAuditRows:
         assert len(audit_recorder.operation_calls) == 2
         assert {call["call_type"] for call in audit_recorder.operation_calls} == {CallType.HTTP, CallType.LLM}
         assert all(call["operation_id"] == "operation-1" for call in audit_recorder.operation_calls)
+
+    @respx.mock
+    def test_operation_parent_failure_records_only_operation_errors_and_releases_client(
+        self,
+        provider: GatewayLLMProvider,
+        audit_recorder: FakeAuditRecorder,
+    ) -> None:
+        respx.post(f"{_ENDPOINT}/chat/completions").mock(
+            return_value=_gateway_response(_error_body("upstream_unavailable"), status_code=503)
+        )
+
+        with pytest.raises(ServerError):
+            provider.execute_query(
+                messages=[{"role": "user", "content": "hi"}],
+                model="standard",
+                temperature=0.0,
+                max_tokens=100,
+                audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+            )
+
+        assert audit_recorder.calls == []
+        assert audit_recorder.allocated_state_ids == []
+        assert audit_recorder.allocated_operation_ids == ["operation-1", "operation-1"]
+        assert len(audit_recorder.operation_calls) == 2
+        assert {call["call_type"] for call in audit_recorder.operation_calls} == {CallType.HTTP, CallType.LLM}
+        assert all(call["operation_id"] == "operation-1" for call in audit_recorder.operation_calls)
+        assert all(call["status"] == CallStatus.ERROR for call in audit_recorder.operation_calls)
+        assert provider._http_clients == {}
+        assert provider._http_client_refs == {}
 
     def test_semantic_row_carries_resolved_prompt_template_hash(
         self, audit_recorder: FakeAuditRecorder, telemetry_emit: FakeTelemetryEmit

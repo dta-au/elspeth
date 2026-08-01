@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from enum import StrEnum
 
 import pytest
 
@@ -18,6 +19,15 @@ from elspeth.plugins.transforms.llm.provider import (
     classify_finish_reason_failure,
     parse_finish_reason,
 )
+
+
+class _IdentifierEnum(StrEnum):
+    VALUE = "identifier-value"
+
+
+class _FormattingString(str):
+    def __str__(self) -> str:
+        return "formatted-differently"
 
 
 def test_llm_audit_parent_accepts_row_and_operation_forms() -> None:
@@ -48,6 +58,41 @@ def test_llm_audit_parent_accepts_row_and_operation_forms() -> None:
 )
 def test_llm_audit_parent_rejects_invalid_parentage(kwargs: dict[str, str]) -> None:
     with pytest.raises((TypeError, ValueError)):
+        LLMAuditParent(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "field_name"),
+    [
+        ({"state_id": 1, "token_id": "token-1"}, "state_id"),
+        ({"state_id": "state-1", "token_id": 1}, "token_id"),
+        ({"operation_id": 1}, "operation_id"),
+    ],
+)
+def test_llm_audit_parent_rejects_non_string_ids_with_type_error(
+    kwargs: dict[str, object],
+    field_name: str,
+) -> None:
+    with pytest.raises(TypeError, match=rf"{field_name} must be a string"):
+        LLMAuditParent(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [_IdentifierEnum.VALUE, _FormattingString("identifier-value")])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"state_id": "state-1", "token_id": "token-1"},
+        {"operation_id": "operation-1"},
+    ],
+)
+def test_llm_audit_parent_rejects_string_subclasses_before_identity_use(
+    value: str,
+    kwargs: dict[str, str],
+) -> None:
+    field_name = "operation_id" if "operation_id" in kwargs else "state_id"
+    kwargs[field_name] = value
+
+    with pytest.raises(TypeError, match=rf"{field_name} must be a string"):
         LLMAuditParent(**kwargs)
 
 

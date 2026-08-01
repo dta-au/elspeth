@@ -43,6 +43,14 @@ class LLMAuditParent:
     operation_id: str | None = None
 
     def __post_init__(self) -> None:
+        for field_name, value in (
+            ("state_id", self.state_id),
+            ("token_id", self.token_id),
+            ("operation_id", self.operation_id),
+        ):
+            if value is not None and type(value) is not str:
+                raise TypeError(f"{field_name} must be a string, got {type(value).__name__}")
+
         row_parent = self.state_id is not None or self.token_id is not None
         operation_parent = self.operation_id is not None
         if row_parent == operation_parent:
@@ -74,6 +82,14 @@ class LLMAuditParent:
             "token_id": self.token_id,
             "operation_id": self.operation_id,
         }
+
+    def tracing_metadata(self) -> dict[str, str]:
+        """Return the validated tracing identity without fabricating token ids."""
+        if self.operation_id is not None:
+            return {"operation_id": self.operation_id}
+        if self.state_id is None or self.token_id is None:
+            raise RuntimeError("validated row parent lost tracing identity")
+        return {"state_id": self.state_id, "token_id": self.token_id}
 
     def allocate_call_index(self, recorder: CallRecorder) -> int:
         """Allocate the next semantic-call index under this parent."""

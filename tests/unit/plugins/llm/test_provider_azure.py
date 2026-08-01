@@ -470,6 +470,34 @@ class TestExecuteQuery:
                 ),
             )
 
+    def test_operation_parent_constructs_audited_client_and_records_operation_call(
+        self,
+        provider: AzureLLMProvider,
+        audit_recorder: FakeAuditRecorder,
+    ) -> None:
+        def fail_create(**kwargs: Any) -> None:
+            del kwargs
+            raise RuntimeError("provider failure")
+
+        provider._underlying_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=fail_create)),
+        )
+
+        with pytest.raises(LLMClientError):
+            provider.execute_query(
+                messages=[{"role": "user", "content": "hi"}],
+                model="gpt-4o",
+                temperature=0.0,
+                max_tokens=100,
+                audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+            )
+
+        assert audit_recorder.calls == []
+        assert audit_recorder.allocated_state_ids == []
+        assert audit_recorder.allocated_operation_ids == ["operation-1"]
+        assert [call["operation_id"] for call in audit_recorder.operation_calls] == ["operation-1"]
+        assert provider._llm_clients == {}
+
 
 class TestClientCaching:
     """Tests for client creation and caching."""

@@ -45,10 +45,33 @@ class _TransformContextDouble:
 
 
 class _TracerDouble:
-    def record_success(self, **_kwargs: Any) -> None:
+    def record_success(
+        self,
+        *,
+        parent: LLMAuditParent,
+        query_name: str,
+        prompt: str,
+        response_content: str,
+        model: str | None,
+        usage: TokenUsage | None,
+        latency_ms: float | None,
+        extra_metadata: dict[str, Any] | None,
+        system_prompt: str | None,
+    ) -> None:
         return None
 
-    def record_error(self, **_kwargs: Any) -> None:
+    def record_error(
+        self,
+        *,
+        parent: LLMAuditParent,
+        query_name: str,
+        prompt: str,
+        error_message: str,
+        model: str,
+        latency_ms: float | None,
+        extra_metadata: dict[str, Any] | None,
+        system_prompt: str | None,
+    ) -> None:
         return None
 
 

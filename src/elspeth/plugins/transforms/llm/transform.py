@@ -291,6 +291,7 @@ class SingleQueryStrategy:
             return _shutdown_requested_result()
 
         # 3. Call provider (EXTERNAL — errors classified by provider)
+        trace_parent = LLMAuditParent.for_row(state_id=state_id, token_id=token_id)
         start_time = time.monotonic()
         try:
             result = provider.execute_query(
@@ -298,20 +299,19 @@ class SingleQueryStrategy:
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
-                audit_parent=LLMAuditParent.for_row(
-                    state_id=state_id,
-                    token_id=token_id,
-                ),
+                audit_parent=trace_parent,
             )
         except ContextLengthError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name="single",
                 prompt=rendered.prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=None,
+                system_prompt=self.system_prompt,
             )
             return TransformResult.error(
                 {"reason": "context_length_exceeded", "error": str(e)},
@@ -320,12 +320,14 @@ class SingleQueryStrategy:
         except LLMClientError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name="single",
                 prompt=rendered.prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=None,
+                system_prompt=self.system_prompt,
             )
             if e.retryable:
                 raise
@@ -343,12 +345,14 @@ class SingleQueryStrategy:
         )
         if finish_reason_error is not None:
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name="single",
                 prompt=rendered.prompt,
                 error_message=finish_reason_error.error_message,
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=None,
+                system_prompt=self.system_prompt,
             )
             return finish_reason_error.result
 
@@ -357,13 +361,15 @@ class SingleQueryStrategy:
 
         # Record success in tracer
         tracer.record_success(
-            token_id=token_id,
+            parent=trace_parent,
             query_name="single",
             prompt=rendered.prompt,
             response_content=content,
-            model=self.model,
+            model=result.model,
             usage=result.usage,
             latency_ms=latency_ms,
+            extra_metadata=None,
+            system_prompt=self.system_prompt,
         )
 
         # 6. Build output row — operational fields only
@@ -592,6 +598,7 @@ class MultiQueryStrategy:
             else:
                 response_format = {"type": "json_object"}
 
+        trace_parent = LLMAuditParent.for_row(state_id=state_id, token_id=token_id)
         start_time = time.monotonic()
         try:
             result = provider.execute_query(
@@ -599,21 +606,20 @@ class MultiQueryStrategy:
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=query_max_tokens,
-                audit_parent=LLMAuditParent.for_row(
-                    state_id=state_id,
-                    token_id=token_id,
-                ),
+                audit_parent=trace_parent,
                 response_format=response_format,
             )
         except ContextLengthError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name=spec.name,
                 prompt=rendered.prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=None,
+                system_prompt=self.system_prompt,
             )
             return TransformResult.error(
                 {
@@ -627,12 +633,14 @@ class MultiQueryStrategy:
         except LLMClientError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name=spec.name,
                 prompt=rendered.prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=None,
+                system_prompt=self.system_prompt,
             )
             if e.retryable:
                 raise  # Pool catches with AIMD; sequential catches and returns error
@@ -656,12 +664,14 @@ class MultiQueryStrategy:
         )
         if finish_reason_error is not None:
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name=spec.name,
                 prompt=rendered.prompt,
                 error_message=finish_reason_error.error_message,
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=None,
+                system_prompt=self.system_prompt,
             )
             return finish_reason_error.result
 
@@ -669,13 +679,15 @@ class MultiQueryStrategy:
         content = strip_markdown_fences(result.content)
 
         tracer.record_success(
-            token_id=token_id,
+            parent=trace_parent,
             query_name=spec.name,
             prompt=rendered.prompt,
             response_content=content,
-            model=self.model,
+            model=result.model,
             usage=result.usage,
             latency_ms=latency_ms,
+            extra_metadata=None,
+            system_prompt=self.system_prompt,
         )
 
         # Build partial output for this query
@@ -1589,11 +1601,6 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         # Must happen after provider creation — the OpenAI SDK must be available.
         if isinstance(self._tracing_config, AzureAITracingConfig):
             _configure_azure_monitor(self._tracing_config)
-            logger.info(
-                "Azure AI tracing initialized",
-                provider="azure_ai",
-                content_recording=self._tracing_config.enable_content_recording,
-            )
 
     def runtime_preflight(self, ctx: LifecycleContext) -> None:
         """Fail fast if the configured LLM provider/model cannot be reached."""

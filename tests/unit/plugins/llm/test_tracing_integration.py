@@ -186,7 +186,7 @@ class TestLangfuseIntegration:
 
         # Record a trace via tracer
         transform._tracer.record_success(
-            token_id="token-123",
+            parent=LLMAuditParent.for_row(state_id="state-123", token_id="token-123"),
             query_name=transform.name,
             prompt="Hello world",
             response_content="Hi there!",
@@ -194,6 +194,7 @@ class TestLangfuseIntegration:
             usage=TokenUsage.known(10, 5),
             latency_ms=150.0,
             extra_metadata={"deployment": "gpt-4"},
+            system_prompt=None,
         )
 
         # Verify observations were created (span + generation)
@@ -204,6 +205,7 @@ class TestLangfuseIntegration:
         assert span_kwargs["as_type"] == "span"
         assert span_kwargs["name"] == "elspeth.llm"
         assert span_kwargs["metadata"]["token_id"] == "token-123"
+        assert span_kwargs["metadata"]["state_id"] == "state-123"
         assert span_kwargs["metadata"]["plugin"] == "llm"
         assert span_kwargs["metadata"]["deployment"] == "gpt-4"
 
@@ -355,13 +357,15 @@ class TestTracingDisabled:
 
         # This should not raise any errors (no-op tracer)
         transform._tracer.record_success(
-            token_id="test-token",
+            parent=LLMAuditParent.for_row(state_id="test-state", token_id="test-token"),
             query_name=transform.name,
             prompt="test",
             response_content="response",
             model="gpt-4",
             usage=None,
             latency_ms=None,
+            extra_metadata=None,
+            system_prompt=None,
         )
         # If we get here without error, test passes
 
@@ -571,13 +575,15 @@ class TestMultiQueryLangfuseTracingViaStrategy:
         # Simulate what MultiQueryStrategy.execute() does for each query:
         # it calls tracer.record_success after each successful LLM call
         transform._tracer.record_success(
-            token_id="test-token",
+            parent=LLMAuditParent.for_row(state_id="test-state", token_id="test-token"),
             query_name="cs1_crit1",
             prompt="Case: data Criterion: criterion_name",
             response_content='{"score": 5}',
             model=_OPENROUTER_MODEL,
             usage=TokenUsage.known(100, 50),
             latency_ms=500.0,
+            extra_metadata=None,
+            system_prompt=None,
         )
 
         # Verify observations were created (span + generation)
@@ -602,12 +608,14 @@ class TestMultiQueryLangfuseTracingViaStrategy:
 
         # Simulate what MultiQueryStrategy.execute() does on query failure
         transform._tracer.record_error(
-            token_id="test-token",
+            parent=LLMAuditParent.for_row(state_id="test-state", token_id="test-token"),
             query_name="cs1_crit1",
             prompt="Case: data Criterion: criterion_name",
             error_message="Rate limit exceeded",
             model=_OPENROUTER_MODEL,
             latency_ms=50.0,
+            extra_metadata=None,
+            system_prompt=None,
         )
 
         # Verify error observations were created (span + generation)

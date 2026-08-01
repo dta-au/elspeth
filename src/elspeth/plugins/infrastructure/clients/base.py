@@ -12,12 +12,12 @@ if TYPE_CHECKING:
     from elspeth.contracts.audit_protocols import CallRecorder
     from elspeth.contracts.call_data import CallPayload
     from elspeth.contracts.contexts import LimiterProtocol
-    from elspeth.contracts.events import ExternalCallCompleted
+    from elspeth.contracts.events import TelemetryEvent
 
 # Type alias for telemetry emit callback.
 # When telemetry is disabled, orchestrator provides a no-op function.
 # Clients always call this - never check for None.
-TelemetryEmitCallback = Callable[["ExternalCallCompleted"], None]
+TelemetryEmitCallback = Callable[["TelemetryEvent"], None]
 
 
 class AuditedClientBase:

@@ -2615,11 +2615,7 @@ class TestAzureAITracingOnStart:
     """Tests for _configure_azure_monitor() wiring in on_start()."""
 
     def test_on_start_calls_configure_azure_monitor(self) -> None:
-        """on_start() calls _configure_azure_monitor for AzureAITracingConfig.
-
-        Also verifies success-path logging: logger.info is called with
-        "Azure AI tracing initialized" and the content_recording value.
-        """
+        """on_start configures Azure tracing without duplicate lifecycle logging."""
         from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig
         from elspeth.plugins.transforms.llm.transform import LLMTransform
 
@@ -2648,12 +2644,7 @@ class TestAzureAITracingOnStart:
             assert isinstance(call_arg, AzureAITracingConfig)
             assert call_arg.connection_string == "InstrumentationKey=test"
 
-            # Verify success-path logging includes content_recording value
-            mock_logger.info.assert_any_call(
-                "Azure AI tracing initialized",
-                provider="azure_ai",
-                content_recording=True,
-            )
+            mock_logger.info.assert_not_called()
 
     def test_on_start_propagates_import_error_from_configure(self) -> None:
         """on_start() lets ImportError propagate when _configure_azure_monitor fails."""

@@ -125,6 +125,16 @@ def _execute(provider: BedrockLLMProvider) -> Any:
     )
 
 
+def _execute_for_operation(provider: BedrockLLMProvider) -> Any:
+    return provider.execute_query(
+        messages=[{"role": "user", "content": "hi"}],
+        model=MODEL,
+        temperature=0.25,
+        max_tokens=64,
+        audit_parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+    )
+
+
 class TestBedrockConfig:
     def test_valid_config_uses_default_credential_chain(self) -> None:
         config = BedrockConfig.from_dict(_config())
@@ -219,6 +229,20 @@ class TestBedrockAdapter:
         ):
             assert forbidden not in kwargs
         assert result.content == "Hello"
+
+    def test_operation_parent_constructs_audited_client_and_records_operation_call(self) -> None:
+        recorder = FakeAuditRecorder()
+        provider = _provider(recorder=recorder)
+
+        with patch("litellm.completion", return_value=_response()):
+            result = _execute_for_operation(provider)
+
+        assert result.content == "Hello"
+        assert recorder.calls == []
+        assert recorder.allocated_state_ids == []
+        assert recorder.allocated_operation_ids == ["operation-1"]
+        assert [call["operation_id"] for call in recorder.operation_calls] == ["operation-1"]
+        assert provider._llm_clients == {}
 
     def test_region_does_not_override_an_explicit_call_kwarg(self) -> None:
         from elspeth.plugins.transforms.llm.providers.bedrock import _LiteLLMSDKAdapter
