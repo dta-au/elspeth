@@ -721,6 +721,29 @@ async def test_end_gate_flagged_with_budget_repairs(make_service, clean_runnable
 
 
 @pytest.mark.asyncio
+async def test_end_gate_repair_message_carries_user_facing_output_contract(make_service, clean_runnable_state):
+    """R2-F12 (elspeth-bff8fe6864): the injected advisor repair message must
+    tell the model the end user never saw the advisor's findings and that
+    its final reply — the one the user WILL see — must state only the
+    outcome, never reference/quote/rebut the advisor. Without this contract
+    the model's next no-tool reply (persisted as the genuine answer row)
+    can read as a rebuttal of an exchange the real user never witnessed."""
+    service = make_service()
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: sink omits rating")
+    )
+    llm_messages: list[dict[str, object]] = []
+    outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0, llm_messages=llm_messages)
+    assert outcome.action == "continue"
+    content = next(m["content"] for m in llm_messages if m["role"] == "user")
+    assert (
+        "Fix the findings via tool calls. The end user has NOT seen these findings; "
+        "your final reply is shown to them and must state only the outcome — "
+        "never reference, quote, or rebut the advisor."
+    ) in content
+
+
+@pytest.mark.asyncio
 async def test_end_gate_repair_continue_fences_findings_before_reinjection(make_service, clean_runnable_state):
     """C2: the same fence/cap discipline applies to the END gate's repair-
     continue re-injection (distinct code path from the early checkpoint)."""
