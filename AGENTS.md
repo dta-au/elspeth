@@ -32,6 +32,10 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 - Worktrees live under `.claude/worktrees/<name>` and symlink `.venv` to the
   main checkout: a bare `uv pip install` inside a worktree clobbers the main
   venv.
+- Do not silently switch the shared checkout onto a task branch. If work is
+  intended to happen on a branch without creating a separate worktree, surface
+  that choice to the user before switching; prefer a dedicated worktree for
+  branch-scoped work so the active checkout remains on its current branch.
 - The pre-commit secret scanner rescans every line of a touched file, so old
   lines can fire on unrelated edits. Append `# secret-scan: allow-this-line`
   to a false positive; do not bypass the hook with `--no-verify`.
