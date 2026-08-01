@@ -36,6 +36,8 @@ from elspeth.web.execution._validation_model import (
     PhaseFailure,
     PhaseReport,
     PolicyLoweredState,
+    SecretValidatedState,
+    _blocked_readiness,
 )
 from elspeth.web.execution.schemas import (
     CHECK_BATCH_TRANSFORM_OPTIONS,
@@ -56,8 +58,6 @@ from elspeth.web.execution.schemas import (
     ValidationCheck,
     ValidationCheckName,
     ValidationError,
-    ValidationReadiness,
-    ValidationReadinessBlocker,
 )
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REVIEW_PENDING_CODE,
@@ -84,15 +84,6 @@ _WEB_FETCH_TRANSFORMS = frozenset({"blob_fetch", "web_scrape"})
 _WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS = 30
 _WEB_BLOB_FETCH_MAX_BODY_BYTES = 10 * 1024 * 1024
 _WEB_BLOB_FETCH_INT_ADAPTER: TypeAdapter[int] = TypeAdapter(int)
-
-
-@dataclass(frozen=True, slots=True)
-class SecretValidatedState:
-    """Policy-lowered state plus secret evidence collected at its boundary."""
-
-    policy: PolicyLoweredState
-    all_secret_refs: tuple[tuple[str, SecretScope | None], ...]
-    env_ref_names: frozenset[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,30 +118,6 @@ def _parse_resource_limit(
             ),
         )
     return _ParsedResourceLimit(value=value, error=None)
-
-
-def _blocked_readiness(
-    *,
-    code: str,
-    detail: str,
-    component_id: str | None = None,
-    component_type: str | None = None,
-    authoring_valid: bool = False,
-    completion_ready: bool = False,
-) -> ValidationReadiness:
-    return ValidationReadiness(
-        authoring_valid=authoring_valid,
-        execution_ready=False,
-        completion_ready=completion_ready,
-        blockers=[
-            ValidationReadinessBlocker(
-                code=code,
-                component_id=component_id,
-                component_type=component_type,
-                detail=detail,
-            )
-        ],
-    )
 
 
 def _path_value_failure(
@@ -267,7 +234,17 @@ def validate_path_policy(
     data_dir: Path,
     session_id: str | None,
 ) -> PhaseReport[PolicyLoweredState] | PhaseFailure:
-    """Validate authored source, sink, and nested provider paths."""
+    """Validate authored source, sink, and nested provider paths.
+
+    Deliberately stricter than its pre-split origin in two ways, both
+    fail-closed: a non-string path option value is a structured
+    ``path_allowlist`` rejection (the origin passed it into
+    ``resolve_data_path`` and surfaced an uncaught exception as a 500), and
+    ``OSError``/``TypeError``/``ValueError`` from path resolution likewise
+    become structured rejections. All three authored path key sets are
+    single-string-valued, so for composer-authored (JSON-derived) state this
+    only converts crashes into diagnoses — it admits nothing new.
+    """
     from elspeth.web.paths import (
         NESTED_LOCAL_PATH_OPTION_KEYS,
         SINK_LOCAL_PATH_OPTION_KEYS,
@@ -834,12 +811,7 @@ def validate_semantic_evidence(
         )
     detail = f"All {len(semantic_contracts)} semantic contract(s) satisfied" if semantic_contracts else "No semantic contracts to check"
     return PhaseReport(
-        artifact=AuthoredValidatedState(
-            policy=secret.policy,
-            all_secret_refs=secret.all_secret_refs,
-            env_ref_names=secret.env_ref_names,
-            semantic_contracts=responses,
-        ),
+        artifact=AuthoredValidatedState.from_secret_evidence(secret, semantic_contracts=responses),
         checks=(ValidationCheck(name=CHECK_SEMANTIC_CONTRACTS, passed=True, detail=detail, affected_nodes=(), outcome_code=None),),
     )
 

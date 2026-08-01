@@ -27,6 +27,7 @@ from elspeth.web.execution._validation_model import (
     MaterializedYaml,
     PhaseFailure,
     PhaseReport,
+    _blocked_readiness,
 )
 from elspeth.web.execution.schemas import (
     CHECK_GATE_FAN_OUT_ADVISORY,
@@ -42,15 +43,13 @@ from elspeth.web.execution.schemas import (
     ValidationCheck,
     ValidationCheckName,
     ValidationError,
-    ValidationReadiness,
-    ValidationReadinessBlocker,
     ValidationWarning,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 if TYPE_CHECKING:
     from elspeth.web.execution._validation_diagnostics import (
-        _EdgePatchTarget,
+        _EdgePatchTargetResolver,
         _GateFanOutFinding,
         _IdentityFinding,
         _StaticLLMPromptFinding,
@@ -90,17 +89,6 @@ class _RouteValidator(Protocol):
     ) -> PipelineConfig: ...
 
 
-class _EdgePatchTargetResolver(Protocol):
-    def __call__(
-        self,
-        dag_node_id: str,
-        *,
-        state: CompositionState,
-        graph: ExecutionGraph,
-        component_type: str | None,
-    ) -> _EdgePatchTarget: ...
-
-
 class _EdgeFormatter(Protocol):
     def __call__(
         self,
@@ -121,28 +109,6 @@ class _GateFanOutFinder(Protocol):
 
 class _StaticLLMPromptFinder(Protocol):
     def __call__(self, state: CompositionState) -> Sequence[_StaticLLMPromptFinding]: ...
-
-
-def _blocked_readiness(
-    *,
-    code: str,
-    detail: str,
-    component_id: str | None = None,
-    component_type: str | None = None,
-) -> ValidationReadiness:
-    return ValidationReadiness(
-        authoring_valid=False,
-        execution_ready=False,
-        completion_ready=False,
-        blockers=[
-            ValidationReadinessBlocker(
-                code=code,
-                component_id=component_id,
-                component_type=component_type,
-                detail=detail,
-            )
-        ],
-    )
 
 
 def _check(name: ValidationCheckName, *, passed: bool, detail: str, affected_nodes: tuple[str, ...] = ()) -> ValidationCheck:

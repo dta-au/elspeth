@@ -30,11 +30,11 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.schemas import (
+    CHECK_GATE_FAN_OUT_ADVISORY,
     VALIDATION_BLOCKING_CHECK_NAMES,
     VALIDATION_CHECK_NAMES,
 )
 from elspeth.web.execution.validation import (
-    _CHECK_GATE_FAN_OUT_ADVISORY,
     _find_gate_fan_out_advisories,
     validate_pipeline_for_trained_operator,
 )
@@ -139,9 +139,9 @@ def _state(
 
 def test_check_name_is_registered_and_non_blocking() -> None:
     """The name is the public contract; blocking membership is the whole point."""
-    assert _CHECK_GATE_FAN_OUT_ADVISORY == "gate_fan_out_advisory"
-    assert _CHECK_GATE_FAN_OUT_ADVISORY in VALIDATION_CHECK_NAMES
-    assert _CHECK_GATE_FAN_OUT_ADVISORY not in VALIDATION_BLOCKING_CHECK_NAMES
+    assert CHECK_GATE_FAN_OUT_ADVISORY == "gate_fan_out_advisory"
+    assert CHECK_GATE_FAN_OUT_ADVISORY in VALIDATION_CHECK_NAMES
+    assert CHECK_GATE_FAN_OUT_ADVISORY not in VALIDATION_BLOCKING_CHECK_NAMES
 
 
 # ── Detection ───────────────────────────────────────────────────────────
@@ -282,7 +282,7 @@ def test_advisory_is_emitted_without_blocking_the_run(
     result = validate_pipeline_for_trained_operator(state, _make_settings(), _YamlGeneratorDouble(), session_id="test-session")
 
     assert result.is_valid is True, "The advisory must never block a legal fan-out"
-    advisories = [check for check in result.checks if check.name == _CHECK_GATE_FAN_OUT_ADVISORY]
+    advisories = [check for check in result.checks if check.name == CHECK_GATE_FAN_OUT_ADVISORY]
     assert len(advisories) == 1
     assert advisories[0].passed is True
     assert tuple(advisories[0].affected_nodes) == ("split",)

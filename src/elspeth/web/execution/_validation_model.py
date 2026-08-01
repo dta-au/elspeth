@@ -12,6 +12,7 @@ from elspeth.web.execution.schemas import (
     ValidationCheck,
     ValidationError,
     ValidationReadiness,
+    ValidationReadinessBlocker,
     ValidationWarning,
 )
 
@@ -29,6 +30,37 @@ class PhaseTermination(Exception):
     def __init__(self, result: ValidationResult) -> None:
         super().__init__("execution validation terminated")
         self.result = result
+
+
+def _blocked_readiness(
+    *,
+    code: str,
+    detail: str,
+    component_id: str | None = None,
+    component_type: str | None = None,
+    authoring_valid: bool = False,
+    completion_ready: bool = False,
+) -> ValidationReadiness:
+    """Single-source blocked-readiness constructor for every validation phase.
+
+    Previously copied into four modules, two of which had silently dropped the
+    ``authoring_valid`` / ``completion_ready`` axes — a fork that could not
+    express the interpretation-review-pending shape. One definition, full
+    signature, defaults preserving the reduced copies' behavior.
+    """
+    return ValidationReadiness(
+        authoring_valid=authoring_valid,
+        execution_ready=False,
+        completion_ready=completion_ready,
+        blockers=[
+            ValidationReadinessBlocker(
+                code=code,
+                component_id=component_id,
+                component_type=component_type,
+                detail=detail,
+            )
+        ],
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +124,15 @@ class PolicyLoweredState:
 
 
 @dataclass(frozen=True, slots=True)
+class SecretValidatedState:
+    """Policy-lowered state plus secret evidence collected at its boundary."""
+
+    policy: PolicyLoweredState
+    all_secret_refs: tuple[tuple[str, SecretScope | None], ...]
+    env_ref_names: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
 class AuthoredValidatedState:
     """Policy-lowered state plus evidence collected by authored checks."""
 
@@ -99,6 +140,27 @@ class AuthoredValidatedState:
     all_secret_refs: tuple[tuple[str, SecretScope | None], ...]
     env_ref_names: frozenset[str]
     semantic_contracts: tuple[SemanticEdgeContractResponse, ...]
+
+    @classmethod
+    def from_secret_evidence(
+        cls,
+        secret: SecretValidatedState,
+        *,
+        semantic_contracts: tuple[SemanticEdgeContractResponse, ...],
+    ) -> AuthoredValidatedState:
+        """Consume the secret carrier wholesale at the semantic handoff.
+
+        The ONLY forwarding site, co-located with both carriers: a field
+        added to ``SecretValidatedState`` is dropped here or nowhere — in
+        this module, next to the definitions — instead of silently at a
+        distant phase seam.
+        """
+        return cls(
+            policy=secret.policy,
+            all_secret_refs=secret.all_secret_refs,
+            env_ref_names=secret.env_ref_names,
+            semantic_contracts=semantic_contracts,
+        )
 
     def __post_init__(self) -> None:
         object.__setattr__(

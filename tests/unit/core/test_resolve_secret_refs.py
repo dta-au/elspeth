@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem
+from elspeth.contracts.secrets import ResolvedSecret, ScopedSecretResolverContract, SecretInventoryItem, SecretScope
 from elspeth.core.secrets import (
     SECRET_REF_VALIDATION_PLACEHOLDER,
     SecretResolutionError,
@@ -46,6 +46,38 @@ class FakeResolver:
         if name not in self._secrets:
             return None
         return ResolvedSecret(name=name, value=self._secrets[name], scope="user", fingerprint=_VALID_FINGERPRINT)
+
+
+class _StructuralScopedImpostor(FakeResolver):
+    """Duck-typed lookalike: has resolve_scoped but does NOT inherit the contract."""
+
+    def resolve_scoped(self, user_id: str, name: str, scope: SecretScope) -> ResolvedSecret | None:
+        del scope
+        return self.resolve(user_id, name)
+
+
+class _NominalScopedResolver(FakeResolver, ScopedSecretResolverContract):
+    def resolve_scoped(self, user_id: str, name: str, scope: SecretScope) -> ResolvedSecret | None:
+        del scope
+        return self.resolve(user_id, name)
+
+
+def test_scoped_marker_rejects_structural_impostor() -> None:
+    """ADR-032: scoped-marker admission is nominal (the owned ABC), never the
+    runtime_checkable Protocol — a duck-typed lookalike must not be handed a
+    scope-pinned credential resolution."""
+    resolver = _StructuralScopedImpostor({"PINNED": "sk-1"})
+    config = {"api_key": {"secret_ref": "PINNED", "secret_scope": "server"}}
+    with pytest.raises(TypeError, match="ScopedSecretResolverContract"):
+        resolve_secret_refs(config, resolver, "user1")
+
+
+def test_scoped_marker_admits_nominal_inheritor() -> None:
+    resolver = _NominalScopedResolver({"PINNED": "sk-1"})
+    config = {"api_key": {"secret_ref": "PINNED", "secret_scope": "server"}}
+    result, resolutions = resolve_secret_refs(config, resolver, "user1")
+    assert result == {"api_key": "sk-1"}
+    assert len(resolutions) == 1
 
 
 def test_replaces_secret_ref_in_flat_dict() -> None:

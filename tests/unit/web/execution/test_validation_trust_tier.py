@@ -7,16 +7,18 @@ from pathlib import Path
 
 from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file_with_observations
 
-_PRODUCTION_FILES = (
-    "_validation_authoring.py",
-    "_validation_diagnostics.py",
-    "_validation_ledger.py",
-    "_validation_materialization.py",
-    "_validation_model.py",
-    "_validation_pipeline.py",
-    "_validation_runtime.py",
-    "validation.py",
-)
+# Discovered from the package directory rather than hand-listed so a future
+# `_validation_*.py` sibling cannot be extracted with zero trust-tier pin
+# coverage and no test failure. The count floor guards the glob itself.
+_KNOWN_PRODUCTION_FILE_COUNT = 8
+
+
+def _production_files(execution_root: Path) -> list[str]:
+    discovered = sorted(path.name for path in execution_root.glob("_validation_*.py"))
+    discovered.append("validation.py")
+    assert len(discovered) >= _KNOWN_PRODUCTION_FILE_COUNT, "validation package glob found fewer modules than the split created"
+    return discovered
+
 
 # These R5s are policy-wrong, adjudication-ready nominal checks over owned
 # concrete classes: one admits the real scoped-resolver implementation instead
@@ -86,7 +88,7 @@ def test_touched_validation_files_have_only_explicit_adjudication_candidates() -
 
     findings_by_file: dict[str, list[str]] = {}
     suppressions_by_file: dict[str, Counter[str]] = {}
-    for filename in _PRODUCTION_FILES:
+    for filename in _production_files(execution_root):
         findings, suppressed = scan_file_with_observations(execution_root / filename, source_root)
         if findings:
             findings_by_file[filename] = [f"{finding.rule_id}:{':'.join(finding.symbol_context)}" for finding in findings]

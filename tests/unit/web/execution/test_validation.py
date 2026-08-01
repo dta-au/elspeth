@@ -39,11 +39,10 @@ from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution import validation as validation_module
 from elspeth.web.execution.protocol import YamlGenerator
-from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE, ValidationCheck, ValidationResult
+from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE, ValidationResult
 from elspeth.web.execution.validation import (
     _ALL_CHECKS,
     _CHECK_SETTINGS,
-    _append_skipped_checks,
     _build_edge_contract_suggestion,
     _collect_secret_refs,
     _format_edge_contract_failure,
@@ -534,8 +533,14 @@ def test_validate_pipeline_public_signature_is_stable_through_boundary_decorator
         "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None) -> 'ValidationResult'"
     )
 
+    # The single literal comparison IS the whole guarantee: inspect.signature
+    # follows __wrapped__, so if the boundary decorator ever broke
+    # introspection (lost __wrapped__, interposed an unannotated shim) this
+    # resolves to (*args, **kwargs) and fails. A second
+    # signature(f) == signature(f.__wrapped__) comparison was removed as a
+    # tautology — signature() already resolves through __wrapped__ on both
+    # sides, so it could never fail for any functools.wraps decorator.
     assert str(inspect.signature(validation_module.validate_pipeline)) == expected
-    assert inspect.signature(validation_module.validate_pipeline) == inspect.signature(validation_module.validate_pipeline.__wrapped__)
 
 
 def test_trained_operator_wrapper_forwards_through_public_facade(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -806,6 +811,28 @@ class TestValidatePipelineEmptyComposition:
         assert "Field required" not in err.message
         assert err.suggestion is not None
 
+    def test_empty_pipeline_is_the_only_partial_ledger_shape(self) -> None:
+        """The empty-composition result is deliberately EXEMPT from the
+        complete-failure-ledger invariant: the 18 checks canonically before
+        settings_load never ran, and recording them as passed would
+        fabricate evidence. This pin makes the exemption explicit so the
+        shape is never mistaken for a ValidationLedger bug — and so a
+        future route through the ledger is a conscious contract change."""
+        from elspeth.web.execution.schemas import VALIDATION_BLOCKING_CHECK_NAMES
+
+        state = _make_state(source_options=None)
+
+        result = validate_pipeline_for_trained_operator(state, _make_settings(), _FakeYamlGenerator())
+
+        names = [check.name for check in result.checks]
+        settings_rank = VALIDATION_BLOCKING_CHECK_NAMES.index("settings_load")
+        # Starts AT settings_load — the unrun canonical prefix is absent.
+        assert names == list(VALIDATION_BLOCKING_CHECK_NAMES[settings_rank:])
+        assert result.checks[0].passed is False
+        for skipped in result.checks[1:]:
+            assert skipped.passed is False
+            assert skipped.outcome_code == CHECK_OUTCOME_SKIPPED_AFTER_FAILURE
+
     def test_empty_pipeline_skips_pydantic_invocation(self) -> None:
         """The short-circuit returns before any of the engine code paths
         the mocks would intercept — confirms we are NOT relying on
@@ -1067,57 +1094,6 @@ class TestValidatePipelinePathAllowlist:
         path_check = next(c for c in result.checks if c.name == "path_allowlist")
         assert path_check.passed is True
         assert "skipped" in path_check.detail.lower()
-
-
-class TestSkippedCheckDeduplication:
-    """``_append_skipped_checks`` must not emit a second, contradictory
-    "skipped" record for a check that was already recorded earlier in the
-    same ``validate_pipeline_for_trained_operator`` pass.
-
-    Because checks are *emitted* during ``validate_pipeline_for_trained_operator`` in a different
-    order than the canonical ``_ALL_CHECKS`` ordering, a check that already has
-    a record can fall inside the "skip everything after me" range of a later
-    gate failure.  Without the ``already_emitted`` guard it would then gain a
-    second, contradictory ``passed=False`` skipped record; the guard exists to
-    prevent exactly that.
-    """
-
-    def test_does_not_duplicate_an_already_emitted_check(self) -> None:
-        from_check = _ALL_CHECKS[0]
-        already_emitted_name = _ALL_CHECKS[-1]  # positioned strictly after from_check
-        assert already_emitted_name != from_check
-
-        original = ValidationCheck(
-            name=already_emitted_name,
-            passed=True,
-            detail="recorded before the skip-after sweep",
-            affected_nodes=(),
-            outcome_code=None,
-        )
-        checks = [original]
-
-        _append_skipped_checks(checks, from_check)
-
-        names = [c.name for c in checks]
-        # The already-emitted record survives exactly once — not shadowed by a
-        # contradictory "skipped" entry for the same check name.
-        assert names.count(already_emitted_name) == 1
-        survivor = next(c for c in checks if c.name == already_emitted_name)
-        assert survivor is original
-        assert survivor.passed is True
-
-    def test_still_records_skips_for_not_yet_emitted_checks(self) -> None:
-        """The dedup guard must not suppress genuine skips for checks that
-        were not already emitted — otherwise the audit trail loses coverage."""
-        from_check = _ALL_CHECKS[0]
-        not_emitted = _ALL_CHECKS[1]  # after from_check, never pre-seeded
-
-        checks: list[ValidationCheck] = []
-        _append_skipped_checks(checks, from_check)
-
-        skipped = next(c for c in checks if c.name == not_emitted)
-        assert skipped.passed is False
-        assert "skipped" in skipped.detail.lower()
 
 
 class TestValidatePipelineWebFetchNetworkPolicy:

@@ -174,6 +174,30 @@ def completion_gates_meta_value(
     }
 
 
+def completion_gates_meta_from_facts(facts: CompletionGateFacts | None) -> CompletionGatesDict:
+    """Re-serialize parsed gate facts into the persistence envelope.
+
+    Used by save paths that carry NO advisor adjudication of their own
+    (recovery persists after a failed compose turn) to carry a durable
+    advisor fact forward verbatim instead of erasing it. The fact is parsed
+    off the prior row first (``parse_completion_gates`` raises on
+    corruption), then re-emitted unchanged; the embedded ``for_graph``
+    fingerprint keeps the read side honest — ``merge_completion_gates``
+    downgrades a carried fact to the pending wording the moment the graph
+    no longer matches, so the verdict is never re-attributed to content the
+    advisor did not see.
+    """
+    if facts is None or facts.advisor_signoff is None:
+        return {}
+    return {
+        "advisor_signoff": AdvisorSignoffGateDict(
+            status=_GATE_STATUS_BLOCKED,
+            detail=facts.advisor_signoff.detail,
+            for_graph=facts.advisor_signoff.for_graph,
+        )
+    }
+
+
 def parse_completion_gates(
     composer_meta: Mapping[str, Any] | None,
 ) -> CompletionGateFacts | None:

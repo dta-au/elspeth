@@ -11,12 +11,14 @@ from elspeth.web.execution._validation_model import (
     AuthoredValidatedState,
     GraphedRuntime,
     InstantiatedRuntime,
+    InterpretationValidatedState,
     LoadedRuntime,
     MaterializedYaml,
     PhaseFailure,
     PhaseReport,
     PhaseTermination,
     PolicyLoweredState,
+    SecretValidatedState,
 )
 from elspeth.web.execution.schemas import (
     CHECK_GATE_FAN_OUT_ADVISORY,
@@ -132,7 +134,9 @@ def _record_all_core_passes(ledger: ValidationLedger) -> None:
     ("carrier_type", "field_names"),
     [
         (PolicyLoweredState, ("state", "operator_resolved_model_node_ids")),
+        (SecretValidatedState, ("policy", "all_secret_refs", "env_ref_names")),
         (AuthoredValidatedState, ("policy", "all_secret_refs", "env_ref_names", "semantic_contracts")),
+        (InterpretationValidatedState, ("authored", "materialized_state")),
         (MaterializedYaml, ("authored", "materialized_state", "pipeline_yaml")),
         (LoadedRuntime, ("materialized", "settings")),
         (InstantiatedRuntime, ("loaded", "bundle")),
@@ -149,9 +153,37 @@ def test_validation_carriers_are_frozen_slotted_dataclasses(
 
 
 def test_core_names_are_the_24_name_canonical_prefix() -> None:
-    assert len(CORE_VALIDATION_CHECK_NAMES) == 24
-    assert VALIDATION_BLOCKING_CHECK_NAMES[:24] == CORE_VALIDATION_CHECK_NAMES
-    assert CORE_VALIDATION_CHECK_NAMES[-1] == "schema_compatibility"
+    """Pin the literal canonical sequence, not properties derivable from the
+    definition (the previous length/prefix assertions restated the module's
+    own import-time guard). Emission rank is load-bearing — completion-gate
+    reconciliation inserts by VALIDATION_CHECK_NAMES.index — so any insertion,
+    removal, or reorder must be a conscious edit here too."""
+    assert CORE_VALIDATION_CHECK_NAMES == (
+        "plugin_enablement",
+        "operator_profile_options",
+        "required_control_availability",
+        "required_control_coverage",
+        "path_allowlist",
+        "web_scrape_network_policy",
+        "web_fetch_resource_policy",
+        "secret_refs",
+        "semantic_contracts",
+        "batch_transform_options",
+        "interpretation_review",
+        "blob_inline_refs",
+        "managed_identity_policy",
+        "llm_retry_budget_policy",
+        "llm_base_url_policy",
+        "llm_tracing_policy",
+        "aws_s3_endpoint_url_policy",
+        "aws_s3_source_policy",
+        "settings_load",
+        "plugin_instantiation",
+        "value_source_compliance",
+        "graph_structure",
+        "route_target_resolution",
+        "schema_compatibility",
+    )
 
 
 def test_phase_report_snapshots_caller_owned_checks_on_construction() -> None:

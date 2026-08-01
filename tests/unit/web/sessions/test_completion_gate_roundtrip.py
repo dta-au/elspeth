@@ -176,3 +176,27 @@ async def test_carried_forward_gate_reports_pending_on_changed_graph(service) ->
     (blocker,) = merged.readiness.blockers
     assert blocker.code == ADVISOR_SIGNOFF_BLOCKED_CODE
     assert blocker.detail == ADVISOR_SIGNOFF_PENDING_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_durable_completion_gates_returns_prior_envelope_verbatim(service) -> None:
+    """The recovery-save carry-forward helper reads the latest persisted row
+    and re-serializes its gate fact byte-identically; a session with no
+    persisted state yields the explicit empty envelope."""
+    from elspeth.web.sessions.routes._helpers import _durable_completion_gates
+
+    state = _make_state()
+    fingerprint = completion_gate_fingerprint(state)
+    record = await _save_with_gate(service, state, fingerprint)
+
+    carried = await _durable_completion_gates(service, record.session_id)
+    assert carried == {
+        "advisor_signoff": {
+            "status": "blocked",
+            "detail": _BLOCKED_DETAIL,
+            "for_graph": fingerprint,
+        }
+    }
+
+    fresh = await service.create_session("alice", "No gate yet", "local")
+    assert await _durable_completion_gates(service, fresh.id) == {}

@@ -86,7 +86,16 @@ class ValidationPipeline:
         allow_pending_interpretation_placeholders: bool = False,
         session_id: str | None = None,
     ) -> ValidationResult:
-        """Delegate to the injected implementation, converting terminations."""
+        """Delegate to the injected implementation, converting terminations.
+
+        Only :class:`PhaseTermination` is converted. ``ValidationLedger``'s
+        invariant guards raise bare ``RuntimeError`` (out-of-order core
+        check, non-passed pass record, unregistered advisory, reuse after
+        finish); those deliberately propagate — a ledger-ordering bug is a
+        Tier-1 invariant break that must surface as a 500 through the
+        composer failure path (W18 posture), never be converted into a
+        ValidationResult.
+        """
         try:
             return self.run_impl(
                 state,

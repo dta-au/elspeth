@@ -55,6 +55,24 @@ def test_facade_diagnostic_exports_are_the_direct_implementations() -> None:
             ),
             "source",
         ),
+        (
+            PluginConfigError(
+                "Invalid JSON sink config",
+                cause="bad path",
+                plugin_class="JsonSinkConfig",
+                component_type="sink",
+            ),
+            "sink",
+        ),
+        (
+            PluginConfigError(
+                "Invalid LLM config",
+                cause="bad model",
+                plugin_class="LLMTransformConfig",
+                component_type="transform",
+            ),
+            "transform",
+        ),
         (PluginConfigError("Generic config error"), None),
         (PluginNotFoundError("No plugin named 'missing'"), None),
     ],
