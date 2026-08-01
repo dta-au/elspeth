@@ -41,6 +41,7 @@ from elspeth.web.sessions._guided_step_chat import (
     GuidedStepChatOnlyResult,
     GuidedStepDeferredClarificationResult,
     GuidedStepDeferredIntentResult,
+    GuidedStepDeferredIntentWithheldResolutionResult,
     GuidedStepDeferredManagementResult,
     Step1SourcePluginReselectedResult,
     Step1SourceResolvedResult,
@@ -128,6 +129,7 @@ from .guided_chat_intent_management import (
 type GuidedChatProviderOutcome = (
     GuidedStepChatOnlyResult
     | GuidedStepDeferredIntentResult
+    | GuidedStepDeferredIntentWithheldResolutionResult
     | GuidedStepDeferredClarificationResult
     | GuidedStepDeferredManagementResult
     | Step1SourcePluginReselectedResult
@@ -1046,6 +1048,12 @@ async def post_guided_chat_schema8(
                         sink_resolution = provider_outcome.sink if type(provider_outcome) is Step2SinkResolvedResult else None
                         if type(provider_outcome) is GuidedStepDeferredIntentResult:
                             deferred_action = provider_outcome.action
+                        elif type(provider_outcome) is GuidedStepDeferredIntentWithheldResolutionResult:
+                            # Retain-alone: the pair's resolution half was
+                            # withheld; its chat carries the scoped not-applied
+                            # failure and composes with the disposition below,
+                            # exactly like the F1 contract.
+                            deferred_action = provider_outcome.action
                         elif type(provider_outcome) is Step1SourceResolvedResult:
                             # A resolve+retain PAIR: the resolution applies at
                             # this stage AND the future-stage instruction is
@@ -1056,7 +1064,9 @@ async def post_guided_chat_schema8(
                         else:
                             deferred_action = None
                         deferred_paired_resolution = deferred_action is not None and (
-                            type(provider_outcome) is Step1SourceResolvedResult or type(provider_outcome) is Step2SinkResolvedResult
+                            type(provider_outcome) is Step1SourceResolvedResult
+                            or type(provider_outcome) is Step2SinkResolvedResult
+                            or type(provider_outcome) is GuidedStepDeferredIntentWithheldResolutionResult
                         )
                         deferred_management_action = (
                             provider_outcome.action if type(provider_outcome) is GuidedStepDeferredManagementResult else None
@@ -1406,6 +1416,13 @@ async def post_guided_chat_schema8(
                                 # a rejected application, not provider weather
                                 # (inv-f1 incidental 2).
                                 "SinkPrefillConfigRejected",
+                                # Retain-alone: the pair's resolution half was
+                                # withheld while the retain applied — the
+                                # not-applied signal is scoped to that half
+                                # (round-2 review finding).
+                                "PairedResolutionShapeRejected",
+                                "PairedResolutionConfigRejected",
+                                "PairedResolutionNotResent",
                             }
                             else "quality_guard"
                             if chat_result.error_class == "AssistantScaffoldLeakError"

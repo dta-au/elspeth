@@ -338,6 +338,44 @@ class GuidedChatDeferredIntentOutcome:
             raise TypeError("GuidedChatDeferredIntentOutcome.action must be exact")
 
 
+# Closed, value-free classifications of WHY a pair's resolution half did not
+# apply when its valid retain half applies alone. The caller renders and
+# audits the not-applied signal from these — never from model text.
+_PAIRED_RESOLUTION_ERROR_CLASSES: Final[frozenset[str]] = frozenset(
+    {
+        "PairedResolutionShapeRejected",
+        "PairedResolutionConfigRejected",
+        "PairedResolutionNotResent",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GuidedChatDeferredIntentWithheldResolutionOutcome:
+    """A pair's valid retain applies alone; its resolution half was withheld.
+
+    Returned instead of :class:`GuidedChatDeferredIntentOutcome` whenever the
+    reply PAIRED a resolution with the retain but the resolution half never
+    became acceptable (shape-invalid arguments, config-invalid at the
+    iteration cap, or the model declining to resend the pair). Carrying the
+    closed classification keeps the F1 honesty contract on the retain-alone
+    exits: the turn must surface and audit that the resolution was NOT
+    applied while the instruction was saved (round-2 review finding).
+    """
+
+    action: DeferredIntentAction
+    resolution_error_class: str
+
+    def __post_init__(self) -> None:
+        if type(self.action) is not DeferredIntentAction:
+            raise TypeError("GuidedChatDeferredIntentWithheldResolutionOutcome.action must be exact")
+        if self.resolution_error_class not in _PAIRED_RESOLUTION_ERROR_CLASSES:
+            raise TypeError(
+                "GuidedChatDeferredIntentWithheldResolutionOutcome.resolution_error_class must be one of "
+                f"{sorted(_PAIRED_RESOLUTION_ERROR_CLASSES)}"
+            )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class GuidedChatDeferredManagementOutcome:
     action: DeferredIntentManagementAction
@@ -378,6 +416,7 @@ type Step1SourceChatOutcome = (
     GuidedChatEmptyOutcome
     | GuidedChatProseOutcome
     | GuidedChatDeferredIntentOutcome
+    | GuidedChatDeferredIntentWithheldResolutionOutcome
     | GuidedChatDeferredManagementOutcome
     | Step1SourcePluginReselectedOutcome
     | Step1SourceResolvedOutcome
@@ -1771,9 +1810,14 @@ async def maybe_resolve_step_1_source_chat(
                     if is_retained_pair and deferred is not None:
                         # The pair's retain half is valid; keep it rather than
                         # discarding the instruction with the defective source
-                        # (R2-F15: never silently dropped).
+                        # (R2-F15: never silently dropped). The withheld
+                        # resolution stays classified so the caller renders and
+                        # audits the not-applied signal.
                         status = ComposerLLMCallStatus.SUCCESS
-                        return GuidedChatDeferredIntentOutcome(action=deferred)
+                        return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                            action=deferred,
+                            resolution_error_class="PairedResolutionShapeRejected",
+                        )
                     raise GuidedSolverResponseShapeError(
                         f"{function.name} function.arguments must be a JSON string; got {type(arguments).__name__}"
                     )
@@ -1783,7 +1827,10 @@ async def maybe_resolve_step_1_source_chat(
                     if is_retained_pair and deferred is not None:
                         # Same retention rule for a shape-invalid source half.
                         status = ComposerLLMCallStatus.SUCCESS
-                        return GuidedChatDeferredIntentOutcome(action=deferred)
+                        return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                            action=deferred,
+                            resolution_error_class="PairedResolutionShapeRejected",
+                        )
                     raise
                 status = ComposerLLMCallStatus.SUCCESS
                 return Step1SourceResolvedOutcome(resolution=result, deferred_action=deferred)
@@ -2151,6 +2198,7 @@ type Step2SinkChatOutcome = (
     GuidedChatEmptyOutcome
     | GuidedChatProseOutcome
     | GuidedChatDeferredIntentOutcome
+    | GuidedChatDeferredIntentWithheldResolutionOutcome
     | GuidedChatDeferredManagementOutcome
     | Step2SinkResolvedOutcome
 )
@@ -2360,8 +2408,13 @@ async def maybe_resolve_step_2_sink_chat(
                     if pending_deferred is not None:
                         # The pair's retain half is valid; keep it rather than
                         # discarding the instruction with the defective sink.
+                        # The withheld resolution stays classified so the
+                        # caller renders and audits the not-applied signal.
                         status = ComposerLLMCallStatus.SUCCESS
-                        return GuidedChatDeferredIntentOutcome(action=pending_deferred)
+                        return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                            action=pending_deferred,
+                            resolution_error_class="PairedResolutionShapeRejected",
+                        )
                     raise GuidedSolverResponseShapeError(
                         f"{function.name} function.arguments must be a JSON string; got {type(arguments).__name__}"
                     )
@@ -2371,7 +2424,10 @@ async def maybe_resolve_step_2_sink_chat(
                     if pending_deferred is not None:
                         # Same retention rule for a shape-invalid sink half.
                         status = ComposerLLMCallStatus.SUCCESS
-                        return GuidedChatDeferredIntentOutcome(action=pending_deferred)
+                        return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                            action=pending_deferred,
+                            resolution_error_class="PairedResolutionShapeRejected",
+                        )
                     raise
                 config_rejection = resolved_sink_config_error(sink)
                 if config_rejection is None:
@@ -2423,7 +2479,10 @@ async def maybe_resolve_step_2_sink_chat(
                     # was rejected; the valid retain still applies rather than
                     # being silently discarded with the reply.
                     status = ComposerLLMCallStatus.SUCCESS
-                    return GuidedChatDeferredIntentOutcome(action=pending_deferred)
+                    return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                        action=pending_deferred,
+                        resolution_error_class="PairedResolutionNotResent",
+                    )
                 content = message.content
                 if content is None or not str(content).strip():
                     status = ComposerLLMCallStatus.SUCCESS
@@ -2440,7 +2499,10 @@ async def maybe_resolve_step_2_sink_chat(
             if not discovery_calls or len(discovery_calls) != len(tool_calls):
                 if pending_deferred is not None:
                     status = ComposerLLMCallStatus.SUCCESS
-                    return GuidedChatDeferredIntentOutcome(action=pending_deferred)
+                    return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                        action=pending_deferred,
+                        resolution_error_class="PairedResolutionNotResent",
+                    )
                 status = ComposerLLMCallStatus.SUCCESS
                 return GuidedChatEmptyOutcome()
             if len(discovery_calls) > tool_call_cap:
@@ -2530,7 +2592,10 @@ async def maybe_resolve_step_2_sink_chat(
     # retain half still applies alone (R2-F15: the instruction is never
     # silently discarded); otherwise degrade to the advisory fallback.
     if pending_deferred is not None:
-        return GuidedChatDeferredIntentOutcome(action=pending_deferred)
+        return GuidedChatDeferredIntentWithheldResolutionOutcome(
+            action=pending_deferred,
+            resolution_error_class="PairedResolutionConfigRejected",
+        )
     return GuidedChatEmptyOutcome()
 
 

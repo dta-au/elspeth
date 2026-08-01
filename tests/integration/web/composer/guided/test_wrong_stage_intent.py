@@ -1267,6 +1267,152 @@ def test_pair_of_sink_resolution_and_future_intent_applies_both_atomically(
     assert all(private_message not in repr(message.tool_calls) for message in messages if message.role != "user")
 
 
+def _last_chat_turn_audit(client: TestClient, session_id: str) -> dict:
+    """Return the newest chat_turn_audit envelope's recorded turn."""
+    messages = asyncio.run(client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+    envelopes = [
+        envelope
+        for message in messages
+        if message.role == "audit"
+        for envelope in (message.tool_calls or ())
+        if envelope.get("_kind") == "chat_turn_audit"
+    ]
+    assert envelopes, "no chat_turn_audit envelope recorded"
+    return dict(envelopes[-1]["turn"])
+
+
+_PAIR_RETAIN_ARGUMENTS: dict[str, object] = {
+    "target_stage": "topology",
+    "catalog_kind": "transform",
+    "catalog_name": "passthrough",
+    "redacted_summary": "Include the named transform during topology authoring.",
+    "constraints": [
+        {
+            "kind": "component_count",
+            "component_kind": "node",
+            "plugin_kind": "transform",
+            "plugin_name": "passthrough",
+            "operator": "at_least",
+            "count": 1,
+        }
+    ],
+}
+
+_PAIR_CONFIG_INVALID_SINK_ARGUMENTS: dict[str, object] = {
+    "resolution": "sink",
+    "output": {
+        "name": "results",
+        "plugin": "json",
+        # flexible-without-fields fails the json sink's config model.
+        "options": {"path": "out.jsonl", "schema": {"mode": "flexible"}},
+        "required_fields": [],
+        "schema_mode": "observed",
+        "on_write_failure": "discard",
+    },
+    "assistant_message": "Saved the results as a JSON Lines file.",
+}
+
+
+def _pair_round(sink_arguments: object, round_index: int) -> SimpleNamespace:
+    tool_calls = [
+        SimpleNamespace(id=f"c_sink_{round_index}", function=SimpleNamespace(name="resolve_sink", arguments=sink_arguments)),
+        SimpleNamespace(
+            id=f"c_retain_{round_index}",
+            function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_PAIR_RETAIN_ARGUMENTS)),
+        ),
+    ]
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=tool_calls))])
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_error_class"),
+    [
+        ("cap_exhaustion", "PairedResolutionConfigRejected"),
+        ("shape_invalid_sink", "PairedResolutionShapeRejected"),
+        ("prose_decline", "PairedResolutionNotResent"),
+        ("hallucinated_tool", "PairedResolutionNotResent"),
+    ],
+)
+def test_retain_alone_exits_keep_the_not_applied_signal(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    expected_error_class: str,
+) -> None:
+    """Every retain-alone exit must keep the F1 honesty contract, mirrored.
+
+    Round-2 review finding: when a pair's sink half never becomes acceptable
+    (cap exhaustion, shape-invalid sink, prose decline, or the hallucinated-
+    tool gate after a rejected pair round), the retain applies alone — but the
+    turn previously rendered ONLY the bare disposition with kind=assistant and
+    audit SUCCESS, hiding that the requested output was never configured.
+    """
+    client = composer_test_client
+    session_id = _create_session(client)
+    TestStepChatCrossStep._seed_csv_blob(client, session_id)
+    TestStepChatCrossStep._configure_csv_source(client, session_id)
+    before = client.get(f"/api/sessions/{session_id}/guided").json()
+    assert before["guided_session"]["step"] == "step_2_sink"
+    private_message = "Save results as jsonl with the private retain-alone-needle, and later add passthrough."
+    rounds = 0
+
+    async def responder(**_kwargs: object) -> SimpleNamespace:
+        nonlocal rounds
+        rounds += 1
+        if scenario == "cap_exhaustion":
+            return _pair_round(json.dumps(_PAIR_CONFIG_INVALID_SINK_ARGUMENTS), rounds)
+        if scenario == "shape_invalid_sink":
+            return _pair_round("{}", rounds)
+        if rounds == 1:
+            return _pair_round(json.dumps(_PAIR_CONFIG_INVALID_SINK_ARGUMENTS), rounds)
+        if scenario == "prose_decline":
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="The path must live under outputs.", tool_calls=None))]
+            )
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=None,
+                        tool_calls=[SimpleNamespace(id="c_hx", function=SimpleNamespace(name="set_pipeline", arguments="{}"))],
+                    )
+                )
+            ]
+        )
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", responder)
+    response = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=before["next_turn"]["turn_token"],
+        message=private_message,
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["assistant_message"] == (
+        "I couldn't apply the output configuration from that message, so your "
+        "pipeline output is unchanged. Describe the output again and I'll rebuild it. "
+        "I saved that instruction for the topology stage."
+    )
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    guided = _guided(client, session_id)
+    (intent,) = guided.deferred_intents
+    assert intent.target_stage == "topology"
+    assert intent.catalog_name == "passthrough"
+    assert intent.message_content_hash == stable_hash(private_message)
+    # The output stage really is untouched.
+    assert guided.reviewed_outputs == {}
+    assert body["composition_state"]["outputs"] == []
+    # The recorded chat-turn audit carries the scoped failure, not SUCCESS.
+    audit_turn = _last_chat_turn_audit(client, session_id)
+    assert audit_turn["status"] == ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE.value
+    assert audit_turn["error_class"] == expected_error_class
+    assert private_message not in _text_outside_chat_history(body)
+
+
 def _inline_source_resolution() -> Step1SourceChatResolution:
     return Step1SourceChatResolution(
         assistant_message="Created the JSON rows as the source.",

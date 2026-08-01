@@ -213,11 +213,11 @@ def test_form_authored_source_seeds_observed_columns_from_its_declared_schema() 
 
 
 def test_solver_wrapper_and_atomic_provider_channels_are_closed_discriminated_unions() -> None:
-    assert len(get_args(chat_solver.Step1SourceChatOutcome.__value__)) == 6
-    assert len(get_args(chat_solver.Step2SinkChatOutcome.__value__)) == 5
-    assert len(get_args(guided_step_chat_module.Step1SourceChatResult.__value__)) == 7
-    assert len(get_args(guided_step_chat_module.Step2SinkChatResult.__value__)) == 6
-    assert len(get_args(guided_chat_atomic_module.GuidedChatProviderOutcome.__value__)) == 7
+    assert len(get_args(chat_solver.Step1SourceChatOutcome.__value__)) == 7
+    assert len(get_args(chat_solver.Step2SinkChatOutcome.__value__)) == 6
+    assert len(get_args(guided_step_chat_module.Step1SourceChatResult.__value__)) == 8
+    assert len(get_args(guided_step_chat_module.Step2SinkChatResult.__value__)) == 7
+    assert len(get_args(guided_chat_atomic_module.GuidedChatProviderOutcome.__value__)) == 8
 
 
 @pytest.mark.parametrize(
@@ -225,6 +225,7 @@ def test_solver_wrapper_and_atomic_provider_channels_are_closed_discriminated_un
     [
         (chat_solver, "GuidedChatProseOutcome", {"assistant_message"}),
         (chat_solver, "GuidedChatDeferredIntentOutcome", {"action"}),
+        (chat_solver, "GuidedChatDeferredIntentWithheldResolutionOutcome", {"action", "resolution_error_class"}),
         (chat_solver, "GuidedChatDeferredManagementOutcome", {"action"}),
         (chat_solver, "Step1SourcePluginReselectedOutcome", {"plugin", "assistant_message"}),
         (chat_solver, "Step1SourceResolvedOutcome", {"resolution", "deferred_action"}),
@@ -232,6 +233,7 @@ def test_solver_wrapper_and_atomic_provider_channels_are_closed_discriminated_un
         (guided_step_chat_module, "GuidedStepChatOnlyResult", {"chat"}),
         (guided_step_chat_module, "GuidedStepDeferredClarificationResult", {"chat"}),
         (guided_step_chat_module, "GuidedStepDeferredIntentResult", {"chat", "action"}),
+        (guided_step_chat_module, "GuidedStepDeferredIntentWithheldResolutionResult", {"chat", "action"}),
         (guided_step_chat_module, "GuidedStepDeferredManagementResult", {"chat", "action"}),
         (guided_step_chat_module, "Step1SourcePluginReselectedResult", {"chat", "plugin"}),
         (guided_step_chat_module, "Step1SourceResolvedResult", {"chat", "resolution", "deferred_action"}),
@@ -1135,8 +1137,9 @@ async def test_step_2_pair_with_config_invalid_sink_at_cap_returns_retain_alone(
         max_discovery_iters=2,
     )
 
-    assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
     assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.resolution_error_class == "PairedResolutionConfigRejected"
     assert len(calls) == 2
 
 
@@ -1164,8 +1167,9 @@ async def test_step_2_pair_with_shape_invalid_sink_returns_retain_alone(monkeypa
         timeout_seconds=30.0,
     )
 
-    assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
     assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
 
 
 @pytest.mark.asyncio
@@ -1194,8 +1198,9 @@ async def test_step_1_pair_with_shape_invalid_source_returns_retain_alone(monkey
         timeout_seconds=30.0,
     )
 
-    assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
     assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
 
 
 @pytest.mark.asyncio

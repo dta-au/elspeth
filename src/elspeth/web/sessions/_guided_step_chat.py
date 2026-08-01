@@ -24,6 +24,7 @@ from elspeth.web.composer.guided.chat_solver import (
     AssistantScaffoldLeakError,
     DeferredIntentManagementChatRequest,
     GuidedChatDeferredIntentOutcome,
+    GuidedChatDeferredIntentWithheldResolutionOutcome,
     GuidedChatDeferredManagementOutcome,
     GuidedChatEmptyOutcome,
     GuidedChatProseOutcome,
@@ -153,6 +154,28 @@ class GuidedStepDeferredIntentResult:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class GuidedStepDeferredIntentWithheldResolutionResult:
+    """A pair's retain applies alone; its resolution half was withheld.
+
+    ``chat`` carries the scoped not-applied failure (SYNTHETIC_UNAVAILABLE +
+    the resolution half's closed error_class); the route composes it with the
+    retain disposition exactly like the F1 contract, so the turn never claims
+    a clean success while the requested resolution was not configured.
+    """
+
+    chat: StepChatResult
+    action: DeferredIntentAction
+
+    def __post_init__(self) -> None:
+        if type(self.chat) is not StepChatResult:
+            raise TypeError("GuidedStepDeferredIntentWithheldResolutionResult.chat must be exact")
+        if self.chat.status is not ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE or self.chat.error_class is None:
+            raise TypeError("GuidedStepDeferredIntentWithheldResolutionResult.chat must carry the scoped not-applied failure")
+        if type(self.action) is not DeferredIntentAction:
+            raise TypeError("GuidedStepDeferredIntentWithheldResolutionResult.action must be exact")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class GuidedStepDeferredManagementResult:
     chat: StepChatResult
     action: DeferredIntentManagementAction
@@ -214,6 +237,7 @@ type Step1SourceChatResult = (
     GuidedStepChatEmptyResult
     | GuidedStepChatOnlyResult
     | GuidedStepDeferredIntentResult
+    | GuidedStepDeferredIntentWithheldResolutionResult
     | GuidedStepDeferredClarificationResult
     | GuidedStepDeferredManagementResult
     | Step1SourcePluginReselectedResult
@@ -224,6 +248,7 @@ type Step2SinkChatResult = (
     GuidedStepChatEmptyResult
     | GuidedStepChatOnlyResult
     | GuidedStepDeferredIntentResult
+    | GuidedStepDeferredIntentWithheldResolutionResult
     | GuidedStepDeferredClarificationResult
     | GuidedStepDeferredManagementResult
     | Step2SinkResolvedResult
@@ -264,6 +289,19 @@ _SCAFFOLD_LEAK_MESSAGE = (
     "That reply didn't pass a quality check, so it wasn't shown — nothing is "
     "wrong with the service. Try sending your message again, or keep going "
     "with the wizard controls."
+)
+
+# Not-applied copy for a pair whose RESOLUTION half was withheld while its
+# retain half applies alone. The route appends the retain disposition, so the
+# copy covers only the resolution half's fate.
+_PAIRED_SOURCE_NOT_APPLIED_MESSAGE = (
+    "I couldn't apply the source content from that message, so your "
+    "pipeline source is unchanged. Describe the source again and I'll rebuild it."
+)
+
+_PAIRED_SINK_NOT_APPLIED_MESSAGE = (
+    "I couldn't apply the output configuration from that message, so your "
+    "pipeline output is unchanged. Describe the output again and I'll rebuild it."
 )
 
 # Reply for the clarification-retention fallback: the instruction WAS kept
@@ -487,6 +525,16 @@ async def resolve_step_1_source_chat_with_auto_drop(
                     status=ComposerChatTurnStatus.SUCCESS,
                     latency_ms=latency_ms,
                     error_class=None,
+                ),
+                action=outcome.action,
+            )
+        if type(outcome) is GuidedChatDeferredIntentWithheldResolutionOutcome:
+            return GuidedStepDeferredIntentWithheldResolutionResult(
+                chat=StepChatResult(
+                    assistant_message=_PAIRED_SOURCE_NOT_APPLIED_MESSAGE,
+                    status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                    latency_ms=latency_ms,
+                    error_class=outcome.resolution_error_class,
                 ),
                 action=outcome.action,
             )
@@ -717,6 +765,16 @@ async def resolve_step_2_sink_chat_with_auto_drop(
                     status=ComposerChatTurnStatus.SUCCESS,
                     latency_ms=latency_ms,
                     error_class=None,
+                ),
+                action=outcome.action,
+            )
+        if type(outcome) is GuidedChatDeferredIntentWithheldResolutionOutcome:
+            return GuidedStepDeferredIntentWithheldResolutionResult(
+                chat=StepChatResult(
+                    assistant_message=_PAIRED_SINK_NOT_APPLIED_MESSAGE,
+                    status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                    latency_ms=latency_ms,
+                    error_class=outcome.resolution_error_class,
                 ),
                 action=outcome.action,
             )
