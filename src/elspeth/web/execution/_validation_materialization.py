@@ -115,6 +115,15 @@ def _blob_inline_validation_error(violation: BlobInlineValidationViolation) -> V
     )
 
 
+def _snapshot_materialized_evidence(materialized: MaterializedYaml) -> MaterializedYaml:
+    """Detach mutable evidence while preserving admitted state identity and YAML value."""
+    return MaterializedYaml(
+        authored=materialized.authored,
+        materialized_state=materialized.materialized_state,
+        pipeline_yaml=materialized.pipeline_yaml,
+    )
+
+
 def materialize_validation_yaml(
     interpretation: InterpretationValidatedState,
     *,
@@ -214,7 +223,7 @@ def validate_managed_identity_policy(materialized: MaterializedYaml) -> PhaseRep
             semantic_contracts=materialized.authored.semantic_contracts,
         )
     return PhaseReport(
-        artifact=materialized,
+        artifact=_snapshot_materialized_evidence(materialized),
         checks=(
             ValidationCheck(
                 name=CHECK_MANAGED_IDENTITY_POLICY,
@@ -262,7 +271,7 @@ def validate_llm_retry_budget_policy(materialized: MaterializedYaml) -> PhaseRep
             semantic_contracts=materialized.authored.semantic_contracts,
         )
     return PhaseReport(
-        artifact=materialized,
+        artifact=_snapshot_materialized_evidence(materialized),
         checks=(
             ValidationCheck(
                 name=CHECK_LLM_RETRY_BUDGET_POLICY,
@@ -310,7 +319,7 @@ def validate_llm_base_url_policy(materialized: MaterializedYaml) -> PhaseReport[
             semantic_contracts=materialized.authored.semantic_contracts,
         )
     return PhaseReport(
-        artifact=materialized,
+        artifact=_snapshot_materialized_evidence(materialized),
         checks=(
             ValidationCheck(
                 name=CHECK_LLM_BASE_URL_POLICY,
@@ -358,7 +367,7 @@ def validate_llm_tracing_policy(materialized: MaterializedYaml) -> PhaseReport[M
             semantic_contracts=materialized.authored.semantic_contracts,
         )
     return PhaseReport(
-        artifact=materialized,
+        artifact=_snapshot_materialized_evidence(materialized),
         checks=(
             ValidationCheck(
                 name=CHECK_LLM_TRACING_POLICY,
@@ -448,7 +457,7 @@ def validate_aws_s3_endpoint_url_policy(
         else "Local trained-operator validation is exempt from the web aws_s3 endpoint_url policy"
     )
     return PhaseReport(
-        artifact=materialized,
+        artifact=_snapshot_materialized_evidence(materialized),
         checks=(
             ValidationCheck(
                 name=CHECK_AWS_S3_ENDPOINT_URL_POLICY,
@@ -506,7 +515,7 @@ def validate_aws_s3_source_policy(
         else "Local trained-operator validation is exempt from the web aws_s3 source policy"
     )
     return PhaseReport(
-        artifact=materialized,
+        artifact=_snapshot_materialized_evidence(materialized),
         checks=(
             ValidationCheck(
                 name=CHECK_AWS_S3_SOURCE_POLICY,

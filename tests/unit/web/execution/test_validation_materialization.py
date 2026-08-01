@@ -401,6 +401,7 @@ def test_provider_policy_phases_read_authored_policy_and_preserve_failure_eviden
     assert result.failed_check.name == check_name
     assert result.errors[0].error_code == error_code
     assert result.readiness.blockers[0].code == check_name
+    artifact.authored.semantic_contracts[0].outcome = "conflict"
     assert result.semantic_contracts == (_contract(),)
 
 
@@ -415,7 +416,7 @@ def test_provider_policy_phases_read_authored_policy_and_preserve_failure_eviden
         ("aws_source", "aws_s3_source_policy"),
     ],
 )
-def test_provider_policy_phases_pass_through_materialized_artifact(phase_name: str, check_name: str) -> None:
+def test_provider_policy_successes_detach_materialized_semantic_evidence(phase_name: str, check_name: str) -> None:
     artifact = _materialized(_state())
     snapshot = _web_snapshot()
     if phase_name == "managed":
@@ -432,5 +433,11 @@ def test_provider_policy_phases_pass_through_materialized_artifact(phase_name: s
         result = validate_aws_s3_source_policy(artifact, plugin_snapshot=snapshot)
 
     assert isinstance(result, PhaseReport)
-    assert result.artifact is artifact
+    artifact.authored.semantic_contracts[0].outcome = "conflict"
+
+    assert result.artifact is not artifact
+    assert result.artifact.authored.policy is artifact.authored.policy
+    assert result.artifact.materialized_state is artifact.materialized_state
+    assert result.artifact.pipeline_yaml == artifact.pipeline_yaml
+    assert result.artifact.authored.semantic_contracts[0].outcome == "satisfied"
     assert [(check.name, check.passed) for check in result.checks] == [(check_name, True)]
