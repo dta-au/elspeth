@@ -1252,6 +1252,32 @@ class TestRequiredModeAutoWireAids:
         assert "'discard'" in rendered
         assert "operator decision" in rendered
 
+    def test_placeholder_dependent_direct_required_posture_keeps_the_manual_wiring_mandate(self, tmp_path: Path) -> None:
+        """Review finding 1 counterpart: an alias-less selection whose required
+        bindings only exist as placeholder exemplars is NOT auto-wired, so the
+        aids must keep the manual WIRE mandate and never claim the guarantee."""
+        view, _snapshot = _direct_control_view(tmp_path)
+
+        aids = build_planner_authoring_aids(view)
+        shield_rules = "\n".join(aids["prompt_shield"]["rules"])
+        safety_rules = "\n".join(aids["content_safety"]["rules"])
+        for rendered in (shield_rules, safety_rules):
+            assert "automatically splices" not in rendered
+            assert "WIRE a" in rendered
+            assert "required, not advisory" in rendered
+
+    def test_review_registry_forbids_hand_authoring_the_auto_wire_disclosure(self) -> None:
+        """Minor 2: the disclosure row is server-staged only — a planner-authored
+        row would forge a policy_required audit entry."""
+        from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+
+        view, _snapshot = _trained_view()
+
+        rules = "\n".join(build_planner_authoring_aids(view)["review_registry"]["rules"])
+        assert "NEVER author a pipeline_decision row" in rules
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in rules
+        assert "forges" in rules
+
     def test_required_but_unselected_shield_keeps_the_warning_advisory(self, tmp_path: Path) -> None:
         """REQUIRED with no selected implementation is the operator-problem
         posture: nothing can be auto-wired, so the aids must not claim it."""

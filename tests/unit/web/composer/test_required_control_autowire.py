@@ -166,6 +166,37 @@ class TestAutoWireSplicing:
         # inserted node, and the row rides on it.
         assert _disclosure_rows(nodes["assess_ticket"]) == []
 
+    def test_double_shield_disclosure_names_the_scope_mismatch(self, tmp_path: Path) -> None:
+        """When an under-scoped shield already dominates the edge (coverage
+        populates scanned_fields), the second shield's disclosure must name the
+        scanned-vs-protected mismatch so a two-shield graph is explicable."""
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_candidate()
+        candidate["nodes"].insert(
+            0,
+            {
+                "id": "narrow_shield",
+                "node_type": "transform",
+                "plugin": "aws_bedrock_prompt_shield",
+                "input": "rows",
+                "on_success": "narrow_shielded",
+                "on_error": "discard",
+                "options": {
+                    "profile": "prompt-approved",
+                    "fields": ["ticket_id"],
+                    "schema": {"mode": "observed"},
+                },
+            },
+        )
+        candidate["nodes"][1]["input"] = "narrow_shielded"
+
+        wired = wire_required_controls(candidate, snapshot, view)
+
+        nodes = _nodes_by_id(wired)
+        draft = _disclosure_rows(nodes["prompt_shield_auto_1"])[0]["draft"]
+        assert "scans only [ticket_id]" in draft
+        assert "reads [body, ticket_id]" in draft
+
     def test_wired_candidate_builds_and_passes_required_control_coverage(self, tmp_path: Path) -> None:
         (tmp_path / "outputs").mkdir(exist_ok=True)
         view, snapshot = _guardrail_profile_view(tmp_path)
@@ -181,23 +212,71 @@ class TestAutoWireSplicing:
         coverage = [finding for finding in result.findings if finding.stage == "required_control_coverage"]
         assert coverage == [], [finding.message for finding in coverage]
 
-    def test_direct_config_controls_author_the_exemplar_direct_options(self, tmp_path: Path) -> None:
-        """Alias-less (Azure) controls get secret_ref + placeholder service bindings."""
-        view, snapshot = _direct_control_view(tmp_path)
+    def test_alias_backed_selection_still_wires(self, tmp_path: Path) -> None:
+        """A REAL selection — operator profile alias — is auto-wired. (The full
+        splice-shape assertions live in the first test of this class; this one
+        exists as the explicit positive counterpart to the placeholder refusal.)"""
+        view, snapshot = _guardrail_profile_view(tmp_path)
 
         wired = wire_required_controls(_bare_llm_candidate(), snapshot, view)
 
         nodes = _nodes_by_id(wired)
-        shield = nodes["prompt_shield_auto_1"]
-        safety = nodes["content_safety_auto_1"]
-        assert shield["plugin"] == "azure_prompt_shield"
-        assert safety["plugin"] == "azure_content_safety"
-        for control in (shield, safety):
-            assert "profile" not in control["options"]
-            assert control["options"]["api_key"] == {"secret_ref": "AZURE_CONTENT_SAFETY_KEY"}
-            assert control["options"]["endpoint"]
-        # Effective blocking posture — all-6 thresholds are a coverage no-op.
-        assert any(value < 6 for value in safety["options"]["thresholds"].values())
+        assert nodes["prompt_shield_auto_1"]["options"]["profile"] == "prompt-approved"
+        assert nodes["content_safety_auto_1"]["options"]["profile"] == "content-approved"
+
+    def test_placeholder_dependent_direct_selection_inserts_nothing(self, tmp_path: Path) -> None:
+        """SECURITY (review finding 1): an alias-less selection whose required
+        service bindings only exist as placeholder exemplars must NOT be wired —
+        a placeholder Azure endpoint (suffix-only validated, third-party
+        registrable) baked into real node config would clear the coverage gate
+        while pointing a live secret_ref at an unowned resource. The pass
+        treats the selection as REQUIRED-but-unselected: no insertion, coverage
+        finding preserved."""
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _direct_control_view(tmp_path)
+        candidate = _bare_llm_candidate()
+
+        assert wire_required_controls(candidate, snapshot, view) == candidate
+
+        # The finding stays for the author/operator — never a done-looking
+        # disclosure over placeholder config.
+        context = _custody_context(tmp_path, _INLINE_CONTENT, view=view, snapshot=snapshot)
+        built = build_set_pipeline_candidate(candidate, _empty_state(), context)
+        assert built.acceptable is True, (built.result.data or {}).get("error")
+        result = view.validate_authored_state(built.result.updated_state)
+        coverage = [finding for finding in result.findings if finding.stage == "required_control_coverage"]
+        assert coverage, "the required-control coverage finding must be preserved"
+
+    def test_direct_options_deployability_predicate(self, tmp_path: Path) -> None:
+        """Placeholder-dependent plugins are refused; secret-only direct
+        bindings (real deployment values by construction) are deployable."""
+        from types import SimpleNamespace
+
+        from elspeth.web.composer.planner_authoring_aids import (
+            _direct_control_options_are_deployable,
+            _plugin_summaries,
+        )
+
+        view, _snapshot = _direct_control_view(tmp_path)
+        summaries = _plugin_summaries(view)
+        assert _direct_control_options_are_deployable(summaries, "azure_prompt_shield") is False
+        assert _direct_control_options_are_deployable(summaries, "azure_content_safety") is False
+
+        secret_only = {
+            "transform": [
+                SimpleNamespace(
+                    name="secret_only_control",
+                    config_fields=[
+                        SimpleNamespace(name="api_key", required=True),
+                        SimpleNamespace(name="fields", required=True),
+                        SimpleNamespace(name="schema", required=True),
+                        SimpleNamespace(name="verbose", required=False),
+                    ],
+                    secret_requirements=[SimpleNamespace(field="api_key", candidates=("CONTROL_KEY",))],
+                )
+            ]
+        }
+        assert _direct_control_options_are_deployable(secret_only, "secret_only_control") is True
 
 
 class TestAutoWireIdempotence:

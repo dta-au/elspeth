@@ -270,6 +270,7 @@ def _prompt_shield_rules(
     *,
     shield_plugin: str | None,
     shield_required: bool = False,
+    shield_auto_wired: bool = False,
     untrusted_producers: tuple[str, ...],
 ) -> list[str]:
     """Shield-staging rules quoting the registered review constants verbatim.
@@ -294,7 +295,7 @@ def _prompt_shield_rules(
     keyed by snapshot hash.
     """
     producers = " or ".join(sorted(untrusted_producers))
-    if shield_plugin is not None and shield_required:
+    if shield_plugin is not None and shield_required and shield_auto_wired:
         return [
             f"This deployment REQUIRES a prompt-injection shield and has selected {shield_plugin}. "
             "You do not need to wire it yourself: when a proposal's llm input is not already "
@@ -309,6 +310,23 @@ def _prompt_shield_rules(
             f"Do NOT stage the {PROMPT_SHIELD_USER_TERM} review row on those llm nodes — with the "
             "shield wired (by you or by the auto-wire pass) the exposure it warns about no longer "
             "exists.",
+        ]
+    if shield_plugin is not None and shield_required:
+        # REQUIRED and selected, but not auto-wirable: the selection is
+        # alias-less and its required service bindings only exist as
+        # placeholder exemplars, which must never become real node config. The
+        # manual-wiring mandate stays the teaching for this posture.
+        return [
+            f"An authorized prompt-injection shield is available in this deployment: {shield_plugin}. "
+            f"When an llm transform consumes externally-controlled content (any path from a {producers} "
+            f"output reaches its input), WIRE a {shield_plugin} transform between that producer node and "
+            "the llm node — its input is the producer node's on_success connection, and its on_success "
+            "is the llm node's input. This is required, not advisory: untrusted text must not "
+            "reach the model unshielded.",
+            "Load the shield's schema and assistance through the capability catalog before authoring "
+            "it, and configure it from that schema alone.",
+            f"With the shield wired, do NOT also stage the {PROMPT_SHIELD_USER_TERM} review row — the "
+            "exposure it warns about no longer exists.",
         ]
     draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_plugin is not None else PROMPT_SHIELD_WARNING_DRAFT
     availability = (
@@ -330,7 +348,7 @@ def _prompt_shield_rules(
     ]
 
 
-def _content_safety_rules(*, safety_plugin: str) -> list[str]:
+def _content_safety_rules(*, safety_plugin: str, auto_wired: bool = True) -> list[str]:
     """Wiring rules for the content-safety control this deployment selected.
 
     Same regime as the shield's available branch, on the other side of the
@@ -347,26 +365,42 @@ def _content_safety_rules(*, safety_plugin: str) -> list[str]:
     an edge these rules never mentioned.
 
     Like the shield's required branch, the on_success edge is auto-wired
-    server-side (R2-F10): the aids teach the guarantee and keep only the
+    server-side (R2-F10) when the selection is actually deployable (an
+    operator profile alias, or direct options fully bound to real
+    deployment values): the aids then teach the guarantee and keep only the
     on_error discipline, which the auto-wire pass cannot repair — no control
     can sit on an error branch, so a quarantine sink stays an operator
-    decision.
+    decision. A selection whose required bindings only exist as placeholder
+    exemplars cannot be auto-wired, so that posture keeps the manual-wiring
+    mandate.
     """
+    on_error_rule = (
+        f"Screening is checked on EVERY output edge of the llm node, not just on_success. An "
+        f"on_error edge names a SINK (or 'discard') and nothing else, so it cannot pass through "
+        f"{safety_plugin} — set the llm node's on_error to 'discard', and likewise for any "
+        f"transform between the llm node and {safety_plugin}. Only downstream OF the "
+        f"{safety_plugin} transform may on_error name a quarantine sink. Keeping failed llm rows "
+        "in a quarantine sink is an operator decision (relax the control mode, or run under the "
+        "CLI/batch runtime), never something to author around.",
+    )
+    if auto_wired:
+        return [
+            f"This deployment REQUIRES the {safety_plugin} content-safety control on every path "
+            "carrying llm output. You do not need to wire it yourself: when a proposal's llm "
+            f"on_success path is not already covered, ELSPETH automatically splices a {safety_plugin} "
+            "transform onto that edge and stages a required_control_auto_wired disclosure card for "
+            f"the operator to acknowledge. You MAY wire a {safety_plugin} transform explicitly when "
+            "you want to control its placement; the auto-wire pass leaves a covered graph untouched.",
+            *on_error_rule,
+        ]
     return [
-        f"This deployment REQUIRES the {safety_plugin} content-safety control on every path "
-        "carrying llm output. You do not need to wire it yourself: when a proposal's llm "
-        f"on_success path is not already covered, ELSPETH automatically splices a {safety_plugin} "
-        "transform onto that edge and stages a required_control_auto_wired disclosure card for "
-        f"the operator to acknowledge. You MAY wire a {safety_plugin} transform explicitly when "
-        "you want to control its placement; the auto-wire pass leaves a covered graph untouched.",
-        f"Screening is checked on EVERY output edge of the llm node, not just on_success — and "
-        f"auto-wiring covers ONLY the on_success edge. An on_error edge names a SINK (or "
-        f"'discard') and nothing else, so it cannot pass through {safety_plugin} — set the llm "
-        f"node's on_error to 'discard', and likewise for any transform between the llm node and "
-        f"{safety_plugin}. Only downstream OF the {safety_plugin} transform may on_error name a "
-        "quarantine sink. Keeping failed llm rows in a quarantine sink is an operator decision "
-        "(relax the control mode, or run under the CLI/batch runtime), never something to author "
-        "around.",
+        f"An authorized content-safety control is available in this deployment: {safety_plugin}. "
+        f"WIRE a {safety_plugin} transform on the llm node's on_success output — its input is the "
+        "llm node's on_success connection, and its on_success carries the screened rows onward. "
+        "This is required, not advisory: model-generated content must be screened before it is "
+        "written out.",
+        *on_error_rule,
+        "Load its schema and assistance through the capability catalog before authoring it, and configure it from that schema alone.",
     ]
 
 
@@ -598,6 +632,10 @@ _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
     "required LLM reviews auto-stage on every llm node. The planner-owned "
     "kinds are vague_term (wired via prompt_template_parts), registered "
     "pipeline_decision, and invented_source.",
+    "NEVER author a pipeline_decision row with user_term "
+    "required_control_auto_wired — that disclosure is staged exclusively by "
+    "the server's required-control auto-wire pass, and a hand-authored row "
+    "forges a policy_required entry in the audit disclosure.",
 )
 
 
@@ -681,6 +719,35 @@ def _direct_control_options(summaries: Mapping[str, list[PluginSummary]], plugin
         elif field.name in placeholders:
             options[field.name] = placeholders[field.name]
     return options
+
+
+def _direct_control_options_are_deployable(summaries: Mapping[str, list[PluginSummary]], plugin_name: str) -> bool:
+    """Whether an alias-less control's required options are REAL deployment bindings.
+
+    ``_direct_control_options`` fills required fields from two sources: the
+    plugin's canonical secret-ref inventory (real deployment bindings — the
+    ref must exist for the plugin to be available) and the
+    ``_DIRECT_CONTROL_OPTION_EXEMPLARS`` placeholder table, which exists ONLY
+    so worked exemplars prevalidate — the planner is expected to substitute
+    the deployment's real value. A placeholder must never become persisted
+    node config: Azure endpoint validation is suffix-only, so a wired
+    ``https://your-resource...`` endpoint clears every gate while pointing a
+    live secret_ref at a third-party-registrable resource. Returns False when
+    any required field (beyond the ones the caller authors itself: fields /
+    schema / source) would come from the placeholder table or be left
+    unfilled — the auto-wire pass then treats the selection as
+    REQUIRED-but-unselected and the aids keep teaching manual wiring.
+    """
+    plugin = next(entry for entry in summaries["transform"] if entry.name == plugin_name)
+    candidates_by_field = {requirement.field: requirement.candidates for requirement in plugin.secret_requirements}
+    caller_authored = {"fields", "schema", "source"}
+    for field in plugin.config_fields:
+        if not field.required or field.name in caller_authored:
+            continue
+        if candidates_by_field.get(field.name):
+            continue
+        return False
+    return True
 
 
 def _plugin_declares_field(summaries: Mapping[str, list[PluginSummary]], plugin_name: str, field_name: str) -> bool:
@@ -1340,6 +1407,17 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
     # be served to another.
     required_safety = _selected_control_profile(catalog, PluginCapability.CONTENT_SAFETY)
     required_output_control = required_safety[0] if required_safety is not None else None
+    # Auto-wirability mirrors required_controls.wire_required_controls exactly:
+    # an alias-backed selection, or a direct-config selection whose required
+    # bindings are all real (never placeholder exemplars), is auto-wired; the
+    # aids must not claim the guarantee for any other posture.
+    required_shield = _selected_control_profile(catalog, PluginCapability.PROMPT_SHIELD)
+    shield_auto_wired = required_shield is not None and (
+        required_shield[1] is not None or _direct_control_options_are_deployable(summaries, required_shield[0])
+    )
+    safety_auto_wired = required_safety is not None and (
+        required_safety[1] is not None or _direct_control_options_are_deployable(summaries, required_safety[0])
+    )
     if "llm" in visible["transform"]:
         aids["model_custody"] = {
             "rules": _model_custody_rules(_usable_llm_profile_alias(catalog)),
@@ -1364,11 +1442,12 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
                     else None
                 ),
                 shield_required=control_modes.get(PluginCapability.PROMPT_SHIELD, ControlMode.RECOMMEND) is ControlMode.REQUIRED,
+                shield_auto_wired=shield_auto_wired,
                 untrusted_producers=visible_untrusted_producers,
             ),
         }
     if "llm" in visible["transform"] and required_output_control is not None:
-        aids["content_safety"] = {"rules": _content_safety_rules(safety_plugin=required_output_control)}
+        aids["content_safety"] = {"rules": _content_safety_rules(safety_plugin=required_output_control, auto_wired=safety_auto_wired)}
     if visible_untrusted_producers and "field_mapper" in visible["transform"]:
         aids["raw_html_cleanup"] = {"rules": _raw_html_cleanup_rules(untrusted_producers=visible_untrusted_producers)}
     if "web_scrape" in visible["transform"]:

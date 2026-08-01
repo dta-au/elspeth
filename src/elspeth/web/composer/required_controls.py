@@ -47,6 +47,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 # interpretation_state — is deliberate, so the two surfaces can never drift.
 from elspeth.web.composer.planner_authoring_aids import (
     _direct_control_options,
+    _direct_control_options_are_deployable,
     _plugin_declares_field,
     _plugin_summaries,
     _selected_control_profile,
@@ -80,16 +81,35 @@ _REQUIRED_CONTROL_CAPABILITIES: Final[tuple[PluginCapability, ...]] = (
 _AUTO_WIRE_ACTIONABLE_REASONS: Final[frozenset[str]] = frozenset({"input_not_dominated", "output_not_post_dominated"})
 
 
-def _disclosure_draft(*, capability: PluginCapability, control_plugin: str, llm_node_id: str, role: ControlRole) -> str:
+def _disclosure_draft(
+    *,
+    capability: PluginCapability,
+    control_plugin: str,
+    llm_node_id: str,
+    role: ControlRole,
+    protected_fields: tuple[str, ...] = (),
+    scanned_fields: tuple[str, ...] = (),
+) -> str:
     """Operator-facing draft for the auto-wired disclosure review card."""
     edge = "input" if role is ControlRole.INPUT else "output"
-    return (
+    draft = (
         f"ELSPETH automatically inserted the deployment-required {capability.value} control "
         f"'{control_plugin}' on the {edge} path of llm node '{llm_node_id}'. Deployment policy "
         "makes this control mandatory on every such path; acknowledging records that you "
         "reviewed the inserted node. Removing it will block the pipeline at the required-control "
         f"gate unless an operator relaxes the {capability.value} control mode."
     )
+    if scanned_fields and protected_fields:
+        # Coverage populates scanned_fields only when a control already
+        # provably dominates this edge with the WRONG field scope. The graph
+        # then carries two controls, which is only explicable if the card
+        # names the mismatch that made the second one necessary.
+        draft += (
+            f" An existing upstream control scans only [{', '.join(scanned_fields)}] while this "
+            f"node reads [{', '.join(protected_fields)}], so a control scoped to the full "
+            "protected set was inserted rather than modifying the existing control."
+        )
+    return draft
 
 
 def _parse_node(raw: Mapping[str, Any]) -> NodeSpec:
@@ -183,7 +203,7 @@ def _parse_source(block: Mapping[str, Any]) -> SourceSpec:
     )
 
 
-def _reserved_names(candidate: Mapping[str, Any], state: CompositionState) -> set[str]:
+def _reserved_names(state: CompositionState) -> set[str]:
     """Every identifier a new node id or stream name must not collide with."""
     names: set[str] = set()
     for node in state.nodes:
@@ -277,6 +297,7 @@ def _splice_input_control(
     *,
     target_id: str,
     protected_fields: tuple[str, ...],
+    scanned_fields: tuple[str, ...],
     capability: PluginCapability,
     plugin_name: str,
     alias: str | None,
@@ -317,6 +338,8 @@ def _splice_input_control(
                 control_plugin=plugin_name,
                 llm_node_id=target_id,
                 role=ControlRole.INPUT,
+                protected_fields=protected_fields,
+                scanned_fields=scanned_fields,
             ),
         ),
     }
@@ -439,6 +462,19 @@ def wire_required_controls(
         return result
 
     summaries = _plugin_summaries(catalog)
+    # SECURITY: an alias-less selection whose required options would come from
+    # the aids' placeholder exemplar table is NOT deployable — a placeholder
+    # endpoint (third-party registrable, suffix-only validated) must never be
+    # baked into real node config carrying a live secret_ref. Treat it as
+    # REQUIRED-but-unselected: insert nothing, leave the finding, and the aids
+    # keep teaching manual wiring for that posture.
+    selections = {
+        capability: (plugin_name, alias)
+        for capability, (plugin_name, alias) in selections.items()
+        if alias is not None or _direct_control_options_are_deployable(summaries, plugin_name)
+    }
+    if not selections:
+        return result
     working_nodes = [dict(node) for node in candidate["nodes"]]
     changed = False
     # Each successful splice permanently covers at least one finding, so the
@@ -451,7 +487,7 @@ def wire_required_controls(
             # A splice produced an unparseable candidate — impossible by
             # construction, but fail safe: keep what was authored so far.
             break
-        reserved = _reserved_names(working_candidate, state)
+        reserved = _reserved_names(state)
         nodes_by_id = {node.id: node for node in state.nodes}
         progressed = False
         for capability, (plugin_name, alias) in selections.items():
@@ -466,6 +502,7 @@ def wire_required_controls(
                         working_nodes,
                         target_id=finding.component_id,
                         protected_fields=finding.protected_fields,
+                        scanned_fields=finding.scanned_fields,
                         capability=capability,
                         plugin_name=plugin_name,
                         alias=alias,
