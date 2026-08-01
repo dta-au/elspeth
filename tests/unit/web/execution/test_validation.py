@@ -40,7 +40,7 @@ from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution import validation as validation_module
 from elspeth.web.execution.protocol import YamlGenerator
-from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE, ValidationCheck
+from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE, ValidationCheck, ValidationResult
 from elspeth.web.execution.validation import (
     _ALL_CHECKS,
     _CHECK_SETTINGS,
@@ -547,10 +547,13 @@ def test_trained_operator_wrapper_forwards_through_public_facade(monkeypatch: py
     catalog = create_catalog_service()
     plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     profile_registry = MagicMock(spec=OperatorProfileRegistry)
-    secret_service = MagicMock()
-    blob_get_metadata = MagicMock()
-    expected_result = MagicMock()
-    facade = MagicMock(return_value=expected_result)
+    secret_service = FakeSecretService(available_refs=set())
+
+    def blob_get_metadata(_blob_id: object) -> None:
+        return None
+
+    expected_result = create_autospec(ValidationResult, instance=True)
+    facade = create_autospec(validation_module.validate_pipeline, return_value=expected_result)
     monkeypatch.setattr(validation_module, "validate_pipeline", facade)
 
     result = validation_module.validate_pipeline_for_trained_operator(

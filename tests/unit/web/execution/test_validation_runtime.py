@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import ANY, MagicMock
+from unittest.mock import ANY, MagicMock, create_autospec
 
 import pytest
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
+from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError, GraphValidationError, GraphValidationWarning
+from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
 from elspeth.engine.orchestrator.types import RouteValidationError
 from elspeth.engine.orchestrator.value_source_validation import ValueSourceFinding, ValueSourceValidationError
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
@@ -35,6 +38,7 @@ from elspeth.web.execution._validation_runtime import (
     validate_schema_compatibility,
     validate_value_source_compliance,
 )
+from elspeth.web.execution.preflight import build_runtime_graph, instantiate_runtime_plugins
 from elspeth.web.execution.schemas import (
     SemanticEdgeContractResponse,
     ValidationError,
@@ -98,10 +102,35 @@ def _instantiated(loaded: LoadedRuntime | None = None) -> InstantiatedRuntime:
     return InstantiatedRuntime(loaded=loaded or _loaded(), bundle=cast(Any, _bundle()))
 
 
+def _autospec_callable(target: Any, **configuration: Any) -> MagicMock:
+    return cast(MagicMock, create_autospec(target, **configuration))
+
+
 def _graph(*, warnings: tuple[GraphValidationWarning, ...] = ()) -> MagicMock:
-    graph = MagicMock()
+    graph = cast(MagicMock, create_autospec(ExecutionGraph, instance=True))
     graph.validation_warnings = warnings
     return graph
+
+
+def _unexpected_edge_target(
+    dag_node_id: str,
+    *,
+    state: CompositionState,
+    graph: ExecutionGraph,
+    component_type: str | None,
+) -> Any:
+    del dag_node_id, state, graph, component_type
+    raise AssertionError("edge target resolver must not be called")
+
+
+def _unexpected_edge_formatter(
+    exc: EdgeContractError,
+    *,
+    state: CompositionState,
+    graph: ExecutionGraph,
+) -> tuple[str, str]:
+    del exc, state, graph
+    raise AssertionError("edge formatter must not be called")
 
 
 def _graphed(graph: Any | None = None) -> GraphedRuntime:
@@ -147,9 +176,9 @@ def _reframe_missing(exc: PydanticValidationError) -> list[ValidationError]:
 def test_settings_phase_loads_exact_yaml_without_host_expansion_and_detaches_evidence() -> None:
     materialized = _materialized(pipeline_yaml="sources: {}\nsinks: {}\n")
     parsed_settings = object()
-    load_yaml = MagicMock()
-    load_settings_yaml = MagicMock(return_value=parsed_settings)
-    load_settings_dict = MagicMock()
+    load_yaml = _autospec_callable(load_bounded_pipeline_yaml)
+    load_settings_yaml = _autospec_callable(load_settings_from_yaml_string, return_value=parsed_settings)
+    load_settings_dict = _autospec_callable(load_settings_from_config_dict)
 
     result = load_runtime_settings(
         materialized,
@@ -186,9 +215,9 @@ def test_settings_phase_reframes_missing_parts_but_retains_raw_check_detail() ->
         _materialized(),
         secret_service=None,
         user_id=None,
-        load_yaml=MagicMock(),
-        load_settings_yaml=MagicMock(side_effect=exc_info.value),
-        load_settings_dict=MagicMock(),
+        load_yaml=_autospec_callable(load_bounded_pipeline_yaml),
+        load_settings_yaml=_autospec_callable(load_settings_from_yaml_string, side_effect=exc_info.value),
+        load_settings_dict=_autospec_callable(load_settings_from_config_dict),
         reframe_missing_parts=_reframe_missing,
     )
 
@@ -206,9 +235,9 @@ def test_settings_phase_converts_only_expected_non_pydantic_errors(error: Except
         _materialized(),
         secret_service=None,
         user_id=None,
-        load_yaml=MagicMock(),
-        load_settings_yaml=MagicMock(side_effect=error),
-        load_settings_dict=MagicMock(),
+        load_yaml=_autospec_callable(load_bounded_pipeline_yaml),
+        load_settings_yaml=_autospec_callable(load_settings_from_yaml_string, side_effect=error),
+        load_settings_dict=_autospec_callable(load_settings_from_config_dict),
         reframe_missing_parts=_reframe_missing,
     )
 
@@ -224,9 +253,9 @@ def test_settings_phase_propagates_unexpected_exceptions() -> None:
             _materialized(),
             secret_service=None,
             user_id=None,
-            load_yaml=MagicMock(),
-            load_settings_yaml=MagicMock(side_effect=RuntimeError("loader invariant")),
-            load_settings_dict=MagicMock(),
+            load_yaml=_autospec_callable(load_bounded_pipeline_yaml),
+            load_settings_yaml=_autospec_callable(load_settings_from_yaml_string, side_effect=RuntimeError("loader invariant")),
+            load_settings_dict=_autospec_callable(load_settings_from_config_dict),
             reframe_missing_parts=_reframe_missing,
         )
 
@@ -234,7 +263,7 @@ def test_settings_phase_propagates_unexpected_exceptions() -> None:
 def test_plugin_and_value_source_successes_are_separate_ordered_phases() -> None:
     loaded = _loaded()
     bundle = _bundle()
-    instantiate = MagicMock(return_value=bundle)
+    instantiate = _autospec_callable(instantiate_runtime_plugins, return_value=bundle)
 
     plugins = validate_runtime_plugins(
         loaded,
@@ -261,7 +290,7 @@ def test_value_source_failure_records_plugin_pass_and_attributed_errors() -> Non
     result = validate_runtime_plugins(
         _loaded(),
         plugin_snapshot=_snapshot(),
-        instantiate_plugins=MagicMock(side_effect=error),
+        instantiate_plugins=_autospec_callable(instantiate_runtime_plugins, side_effect=error),
         infer_component_type=lambda exc: "transform",
     )
 
@@ -294,7 +323,7 @@ def test_plugin_phase_discriminates_expected_construction_failures(error: Except
     result = validate_runtime_plugins(
         _loaded(),
         plugin_snapshot=_snapshot(),
-        instantiate_plugins=MagicMock(side_effect=error),
+        instantiate_plugins=_autospec_callable(instantiate_runtime_plugins, side_effect=error),
         infer_component_type=lambda exc: component_type,
     )
 
@@ -315,7 +344,10 @@ def test_plugin_phase_propagates_unexpected_exceptions() -> None:
         validate_runtime_plugins(
             _loaded(),
             plugin_snapshot=_snapshot(),
-            instantiate_plugins=MagicMock(side_effect=RuntimeError("plugin invariant")),
+            instantiate_plugins=_autospec_callable(
+                instantiate_runtime_plugins,
+                side_effect=RuntimeError("plugin invariant"),
+            ),
             infer_component_type=lambda exc: None,
         )
 
@@ -324,7 +356,7 @@ def test_graph_phase_preserves_warning_order_and_first_node_attribution() -> Non
     warning_a = GraphValidationWarning(code="A", message="first", node_ids=("node_a", "node_b"))
     warning_b = GraphValidationWarning(code="B", message="second", node_ids=())
     graph = _graph(warnings=(warning_a, warning_b))
-    build_graph = MagicMock(return_value=graph)
+    build_graph = _autospec_callable(build_runtime_graph, return_value=graph)
     instantiated = _instantiated()
 
     result = validate_graph_structure(instantiated, build_graph=build_graph, warning_to_validation_warning=_warning)
@@ -344,7 +376,7 @@ def test_graph_phase_converts_graph_errors_and_propagates_unexpected_errors() ->
     graph_error = GraphValidationError("bad graph", component_id="gate_1", component_type="gate")
     failure = validate_graph_structure(
         _instantiated(),
-        build_graph=MagicMock(side_effect=graph_error),
+        build_graph=_autospec_callable(build_runtime_graph, side_effect=graph_error),
         warning_to_validation_warning=_warning,
     )
     assert isinstance(failure, PhaseFailure)
@@ -355,14 +387,14 @@ def test_graph_phase_converts_graph_errors_and_propagates_unexpected_errors() ->
     with pytest.raises(RuntimeError, match="graph invariant"):
         validate_graph_structure(
             _instantiated(),
-            build_graph=MagicMock(side_effect=RuntimeError("graph invariant")),
+            build_graph=_autospec_callable(build_runtime_graph, side_effect=RuntimeError("graph invariant")),
             warning_to_validation_warning=_warning,
         )
 
 
 def test_route_phase_calls_runtime_validator_with_exact_admitted_artifacts() -> None:
     graphed = _graphed()
-    validate_routes = MagicMock(return_value=object())
+    validate_routes = _autospec_callable(assemble_and_validate_pipeline_config, return_value=object())
 
     result = validate_route_targets(graphed, validate_routes=validate_routes)
     assert isinstance(result, PhaseReport)
@@ -383,14 +415,23 @@ def test_route_phase_calls_runtime_validator_with_exact_admitted_artifacts() -> 
 def test_route_phase_catches_only_route_validation_error() -> None:
     failure = validate_route_targets(
         _graphed(),
-        validate_routes=MagicMock(side_effect=RouteValidationError("missing sink")),
+        validate_routes=_autospec_callable(
+            assemble_and_validate_pipeline_config,
+            side_effect=RouteValidationError("missing sink"),
+        ),
     )
     assert isinstance(failure, PhaseFailure)
     assert failure.failed_check.name == "route_target_resolution"
     assert failure.readiness.blockers[0].code == "route_target_resolution"
 
     with pytest.raises(RuntimeError, match="route invariant"):
-        validate_route_targets(_graphed(), validate_routes=MagicMock(side_effect=RuntimeError("route invariant")))
+        validate_route_targets(
+            _graphed(),
+            validate_routes=_autospec_callable(
+                assemble_and_validate_pipeline_config,
+                side_effect=RuntimeError("route invariant"),
+            ),
+        )
 
 
 def test_schema_phase_uses_authored_policy_state_for_rich_edge_diagnostics() -> None:
@@ -447,8 +488,8 @@ def test_schema_phase_plain_error_and_success_preserve_exact_graph() -> None:
     )
     failure = validate_schema_compatibility(
         _graphed(failing_graph),
-        edge_patch_target_for_node_id=MagicMock(),
-        format_edge_contract_failure=MagicMock(),
+        edge_patch_target_for_node_id=_unexpected_edge_target,
+        format_edge_contract_failure=_unexpected_edge_formatter,
     )
     assert isinstance(failure, PhaseFailure)
     assert failure.errors[0].message == "schema mismatch"
@@ -458,8 +499,8 @@ def test_schema_phase_plain_error_and_success_preserve_exact_graph() -> None:
     graphed = _graphed(graph)
     success = validate_schema_compatibility(
         graphed,
-        edge_patch_target_for_node_id=MagicMock(),
-        format_edge_contract_failure=MagicMock(),
+        edge_patch_target_for_node_id=_unexpected_edge_target,
+        format_edge_contract_failure=_unexpected_edge_formatter,
     )
     assert isinstance(success, PhaseReport)
     assert success.artifact is not graphed
@@ -480,11 +521,15 @@ def test_identity_advisory_checks_use_policy_state_and_preserve_exact_prose() ->
         sink_name="primary",
         sink_schema_mode="observed",
     )
-    finder = MagicMock(return_value=[finding])
+    seen: list[CompositionState] = []
+
+    def finder(state: CompositionState) -> list[Any]:
+        seen.append(state)
+        return [finding]
 
     checks = build_identity_advisory_checks(graphed, find_identity_node_advisories=finder)
 
-    finder.assert_called_once_with(policy_state)
+    assert seen == [policy_state]
     assert len(checks) == 1
     assert checks[0].name == "identity_node_advisory"
     assert checks[0].affected_nodes == ("passthrough",)
