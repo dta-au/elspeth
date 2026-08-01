@@ -14,15 +14,15 @@ implemented by a fresh subagent and reviewed (spec + quality) before the next.
 | T1 planner source-omission repairable | R2-F16 | P1 | ✅ complete (bf94d3a12) |
 | T2 threshold-fidelity guard + coverage credit (amended) | R2-F17 | P1 | ✅ complete (0a210fef6) |
 | T3 unsatisfiable 0-transform sketch | R2-F4 | P3 | ✅ complete (593439324) |
-| T4 retain-and-defer wrong-stage intents | R2-F15 | P1 | 🔵 implementing |
-| T5 transcript custody for stage prose | R2-F6 | P2 | ⬜ |
-| T6 advisor rebuttal output contract | R2-F12 | P2 | ⬜ |
-| T7 fence sentinels (leak + escape) | R2-F13 | P2 | ⬜ |
-| T8 advisor parsing/retry/surfacing | R2-F14 | P2 | ⬜ |
-| T9 END advisor sees user constraints | R2-F8a | P3 | ⬜ |
-| T10 timeout salvaged-draft surfacing | R2-F9 | P2 | ⬜ |
-| T11 auto-wire required guardrails | R2-F10 | P2 | ⬜ |
-| T12 prohibited plugins discoverable | R2-F18 | P2 | ⬜ |
+| T4 retain-and-defer wrong-stage intents | R2-F15 | P1 | ✅ complete (14f925ec0) |
+| T5 transcript custody for stage prose | R2-F6 | P2 | ✅ complete (6d995b60c) |
+| T6 advisor rebuttal output contract | R2-F12 | P2 | ✅ complete (a411d29ca) |
+| T7 fence sentinels (leak + escape) | R2-F13 | P2 | ✅ complete (9b734e27e) |
+| T8 advisor parsing/retry/surfacing | R2-F14 | P2 | ✅ complete (4c2bac7a7) |
+| T9 END advisor sees user constraints | R2-F8a | P3 | ✅ complete (6f54ec794) |
+| T10 timeout salvaged-draft surfacing | R2-F9 | P2 | ✅ complete (468c2fde8) |
+| T11 auto-wire required guardrails | R2-F10 | P2 | ✅ complete (e5032bb79) |
+| T12 prohibited plugins discoverable | R2-F18 | P2 | 🔵 implementing |
 
 ## Disclosure stream — worktree `r2-disclosure`
 
@@ -53,15 +53,20 @@ implemented by a fresh subagent and reviewed (spec + quality) before the next.
 | Gate | Status |
 |---|---|
 | Merge order: composer → disclosure → forms → terraform (`--no-ff`) | ⬜ |
+| Reconcile with 2 external chips — MERGED into composer branch (602243b8d); T2 coverage semantics verified reachable; local-only multi-query chip pushed to origin | ✅ |
+| Chip 3 in flight: persist composer readiness (from T8's discovery) — reconcile at merge; EPOCH HAZARD: may bump 40→41 colliding with T18's bump — resolve to coherent sequence | 🔵 running |
 | Single SESSION_SCHEMA_EPOCH bump 40→41 — CLAIMED by T18 (e64f3d463); T4 reuses it | 🟡 owned |
 | Full `pytest tests/ -n 12` (~10 min) + `elspeth-lints check` on merged release/0.7.2 | ⬜ |
 | Final whole-branch review (most capable model) | ⬜ |
+| ⏸️ **OPERATOR PAUSE POINT — stop here and hand back** (2026-08-01 directive) | ⬜ |
 | Local staging e2e smoke (elspeth.foundryside.dev): rebuild, wipe DB, Playwright-verify composer fixes | ⬜ |
 | Rebuild images, redeploy stack (wipes sessions.db) | ⬜ |
 | Full 10-exercise live re-run incl. ex 6/7/9/10 | ⬜ |
+| Trust-tier signing ceremony (agent stages key-free bundle; operator fires) | ⬜ |
 
 ## Notes / decisions
 
+- 2026-08-01: operator: trust-tier CI exempt for the sprint (signature drift expected from code churn); ALL other CI gates remain in force; full signing ceremony at sprint end.
 - 2026-08-01: operator authorized local staging use (rebuild, DB discard, sudoers restart, Playwright) at my discretion — inserted as a pre-AWS smoke gate.
 - 2026-08-01: operator: full suite ≈1 h serial / ≈10 min with 12 workers — scoped tests per task, ONE `-n 12` full run at reconciliation.
 - 2026-08-01: T2 ADJUDICATED mid-flight: blocking degenerate-gate codes would have rejected ELSPETH's own documented fan-out idiom (implementer escalated with receipts). Replaced with a planner-side threshold-fidelity guard + non-blocking fan-out advisory; plan amended and pushed. Intent (no silent double-writes) preserved.
