@@ -393,6 +393,26 @@ class TestClosedCodeCatalogueInvariants:
         assert multiple_barriers not in (intrinsic, origin, downstream)
         assert "barrier" in multiple_barriers[0]
 
+    def test_query_template_unbound_row_fields_resolves_to_multi_query_guidance(self) -> None:
+        """The multi-query row-binding code must not fall through to the
+        single-prompt unbound-variables entry: the repair is different (bind
+        the variable in that query's input_fields, or use row.source_row),
+        and the single-prompt advice ("rewrite as row.<field>") would send
+        the planner in a circle — the reference already IS row.<field>."""
+        assert "query_template_unbound_row_fields" in _CLOSED_VALIDATION_ERROR_CODES
+
+        guidance = explain_validation_code("query_template_unbound_row_fields")
+        assert guidance is not None, "query_template_unbound_row_fields does not resolve to catalogue guidance"
+        explanation, fix = guidance
+        assert explanation and fix
+        assert "input_fields" in explanation
+        assert "input_fields" in fix
+        assert "source_row" in fix
+
+        single_prompt = explain_validation_code("prompt_template_unbound_variables")
+        assert single_prompt is not None
+        assert guidance != single_prompt
+
     def test_codes_are_containment_free(self) -> None:
         """No closed code may be a substring of another.
 
