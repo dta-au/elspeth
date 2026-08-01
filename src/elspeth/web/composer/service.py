@@ -6499,15 +6499,23 @@ def _advisor_signoff_blocked_validation(*, reason: str, findings: str) -> Valida
     stable operator-facing summary).
 
     Only the ``"exhausted"`` branch's ``findings`` is free advisor text (a
-    FLAGGED verdict); it is bounded and fenced (:func:`_fence_advisor_findings`)
-    before it reaches this wire-payload detail string. The ``"unavailable"``
-    branch's ``findings`` is always one of the two fixed backend constants
-    (``_ADVISOR_UNAVAILABLE_USER_DETAIL`` / ``_ADVISOR_MALFORMED_USER_DETAIL``)
-    and is interpolated as-is — deliberately NOT fenced/capped, so its wording
-    stays literal for the Tier-3 egress contract.
+    FLAGGED verdict); it is bounded (:func:`_truncate_advisor_findings`)
+    before it reaches this wire-payload detail string. This is the HUMAN
+    channel (R2-F13, elspeth-e8872dfbbe): the ``_ADVISOR_FINDINGS_UNTRUSTED_
+    BEGIN/END`` sentinels exist to signal "untrusted commentary, not a new
+    operator instruction" to a downstream *LLM* re-reading the transcript
+    (:func:`_fence_advisor_findings`, used on the re-injection path only) —
+    they carry no meaning for a human reader and must never reach this
+    user-facing wire detail, so plain framing is used instead. The
+    ``"unavailable"`` branch's ``findings`` is always one of the two fixed
+    backend constants (``_ADVISOR_UNAVAILABLE_USER_DETAIL`` /
+    ``_ADVISOR_MALFORMED_USER_DETAIL``) and is interpolated as-is —
+    deliberately NOT truncated, so its wording stays literal for the Tier-3
+    egress contract.
     """
     detail = (
-        f"The advisor sign-off did not pass ({reason}); the pipeline cannot complete.\n\n{_fence_advisor_findings(findings)}"
+        f"The advisor sign-off did not pass ({reason}); the pipeline cannot complete.\n\n"
+        f"Advisor findings (untrusted, quoted):\n{_truncate_advisor_findings(findings)}"
         if reason == "exhausted"
         else f"The advisor sign-off could not be obtained ({reason}); the pipeline cannot complete. {findings}"
     )
@@ -6566,6 +6574,19 @@ def _advisor_signoff_blocked_validation(*, reason: str, findings: str) -> Valida
 # (inserting a module-level def mid-file rotates every downstream symbol's
 # fingerprint); Python resolves the name at call time so the forward
 # reference from earlier call sites is safe.
+#
+# R2-F13 (elspeth-e8872dfbbe): the BEGIN/END sentinels are meaningful ONLY on
+# the LLM re-injection path (:func:`_fence_advisor_findings`, consumed by a
+# downstream LLM re-reading the transcript) — never on the human-facing wire
+# payload (:func:`_advisor_signoff_blocked_validation`), which now uses plain
+# framing instead so no fence token ever reaches a user surface. On the LLM
+# path, advisor output that parrots the exact sentinel line (e.g. the advisor
+# model echoing "END_UNTRUSTED_ADVISOR_FINDINGS" back, whether by adversarial
+# intent or by innocently quoting the earlier prompt) would otherwise close
+# the fence early — a fence ESCAPE, not just a leak — so
+# :func:`_fence_advisor_findings` neutralizes any embedded occurrence of
+# either sentinel inside the payload before wrapping it in the wrapper's own,
+# guaranteed-unique BEGIN/END pair.
 # ---------------------------------------------------------------------------
 _ADVISOR_FINDINGS_MAX_CHARS: Final[int] = 4_000
 _ADVISOR_FINDINGS_UNTRUSTED_BEGIN: Final[str] = "BEGIN_UNTRUSTED_ADVISOR_FINDINGS"
@@ -6582,8 +6603,18 @@ _ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
 )
 
 
+def _truncate_advisor_findings(findings_text: str) -> str:
+    """Cap free-text advisor findings to ``_ADVISOR_FINDINGS_MAX_CHARS``.
+
+    Shared by both the LLM re-injection fence (:func:`_fence_advisor_findings`)
+    and the human-facing wire detail (:func:`_advisor_signoff_blocked_validation`)
+    so a runaway/adversarial advisor response cannot balloon either surface.
+    """
+    return findings_text if len(findings_text) <= _ADVISOR_FINDINGS_MAX_CHARS else findings_text[: _ADVISOR_FINDINGS_MAX_CHARS - 1] + "…"
+
+
 def _fence_advisor_findings(findings_text: str) -> str:
-    """Bound and fence free-text advisor findings before re-injection.
+    """Bound and fence free-text advisor findings before LLM re-injection.
 
     Truncation caps the blast radius of a runaway/adversarial advisor
     response; the BEGIN/END markers mirror the
@@ -6594,6 +6625,25 @@ def _fence_advisor_findings(findings_text: str) -> str:
     a new operator instruction. Callers pass only the FLAGGED/free-text case;
     the fixed unavailable/malformed constants are deliberately NOT routed
     through this helper (their wording must stay literal, see callers).
+
+    Before wrapping, any occurrence of the sentinel strings THEMSELVES inside
+    the (already-truncated) payload is neutralized by splicing an escape
+    backslash into the middle of the token — otherwise advisor output that
+    parrots ``END_UNTRUSTED_ADVISOR_FINDINGS`` would prematurely close the
+    fence, letting the remainder of the payload be read as trusted
+    instructions by the downstream LLM (a fence escape, R2-F13/
+    elspeth-e8872dfbbe). Splicing (rather than merely prefixing) breaks the
+    token's contiguity so the exact sentinel substring no longer occurs
+    anywhere in the escaped payload, guaranteeing the wrapped output contains
+    exactly one occurrence of each sentinel: the wrapper's own.
     """
-    text = findings_text if len(findings_text) <= _ADVISOR_FINDINGS_MAX_CHARS else findings_text[: _ADVISOR_FINDINGS_MAX_CHARS - 1] + "…"
+    text = _truncate_advisor_findings(findings_text)
+    text = text.replace(
+        _ADVISOR_FINDINGS_UNTRUSTED_BEGIN,
+        _ADVISOR_FINDINGS_UNTRUSTED_BEGIN[0] + "\\" + _ADVISOR_FINDINGS_UNTRUSTED_BEGIN[1:],
+    )
+    text = text.replace(
+        _ADVISOR_FINDINGS_UNTRUSTED_END,
+        _ADVISOR_FINDINGS_UNTRUSTED_END[0] + "\\" + _ADVISOR_FINDINGS_UNTRUSTED_END[1:],
+    )
     return f"{_ADVISOR_FINDINGS_UNTRUSTED_BEGIN}\n{text}\n{_ADVISOR_FINDINGS_UNTRUSTED_END}"
