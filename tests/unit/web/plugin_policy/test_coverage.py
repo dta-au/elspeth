@@ -7,7 +7,14 @@ from dataclasses import replace
 import pytest
 
 from elspeth.contracts.plugin_capabilities import PluginCapability
-from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import (
+    CompositionState,
+    NodeSpec,
+    OutputSpec,
+    PipelineMetadata,
+    SourceSpec,
+    _validate_prompt_template_variable_bindings,
+)
 from elspeth.web.plugin_policy.coverage import (
     _translate_protected_fields_through_mapper,
     build_output_stream_graph,
@@ -1015,7 +1022,23 @@ def _llm_with_template(template: str, *, input_stream: str = "llm_in", on_succes
 
     ``_llm`` synthesises ``{{ row.<field> }}`` accesses; these cases turn on
     templates that carry NO provable ``row.*`` access at all.
+
+    The template must be one a real candidate could still carry, so the
+    upstream binding guard is asserted here rather than in each case:
+    ``_validate_prompt_template_variable_bindings`` (elspeth-bea314a89b) now
+    rejects bare-variable templates like ``{{ text }}`` at
+    ``CompositionState.validate`` — earlier in the funnel than coverage — so
+    that shape can no longer reach a coverage decision at all. Dynamic
+    ``row[<expr>]`` access is the surviving route to an empty provable field
+    set. Without this assertion a later tightening of the binding guard would
+    leave the provability cases silently vacuous: they call
+    ``control_coverage_findings`` directly and would keep passing on a shape
+    production forbids.
     """
+    assert (
+        _validate_prompt_template_variable_bindings(_node("probe", "llm", input_stream, on_success, options={"prompt_template": template}))
+        is None
+    ), f"fixture template is rejected before coverage runs: {template!r}"
     return _node(
         "judge",
         "llm",
@@ -1039,15 +1062,23 @@ def _all_fields_shield(node_id: str, input_stream: str, on_success: str) -> Node
 def test_all_fields_shield_is_credited_when_prompt_fields_are_unprovable() -> None:
     """AWS acceptance run 2 (R2-F17): a correctly placed shield was rejected.
 
-    ``Classify: {{ text }}`` has no ``row.*`` access, so the provable prompt
-    field set is empty — and the empty-set bail-out ran BEFORE the
-    ``fields: all`` shortcut, so a control that scans every field was never
-    credited and ``input_not_dominated`` fired on a conforming pipeline.
-    ``all`` is a superset of every protected set, provable or not.
+    The incident's own template was ``Classify: {{ text }}``, which has no
+    ``row.*`` access, so the provable prompt field set is empty — and the
+    empty-set bail-out ran BEFORE the ``fields: all`` shortcut, so a control
+    that scans every field was never credited and ``input_not_dominated``
+    fired on a conforming pipeline. ``all`` is a superset of every protected
+    set, provable or not.
+
+    The fixture uses dynamic ``row[<expr>]`` access rather than the incident's
+    literal template because ``{{ text }}`` is now rejected upstream at
+    ``CompositionState.validate`` (elspeth-bea314a89b) and can no longer reach
+    coverage. The regression this pins is the ordering of the ``fields: all``
+    shortcut against the empty-set bail-out, which is unchanged by how the
+    protected set came to be empty.
     """
     state = _state(
         _all_fields_shield("shield", "raw", "llm_in"),
-        _llm_with_template("Classify: {{ text }}"),
+        _llm_with_template("Classify: {{ row[lookup.field_name] }}"),
         source_target="raw",
     )
 
@@ -1057,15 +1088,20 @@ def test_all_fields_shield_is_credited_when_prompt_fields_are_unprovable() -> No
 def test_unprovable_prompt_fields_are_a_distinct_diagnosis_naming_both_field_sets() -> None:
     """A field-scoped shield still fails closed — but says why, not "not covered".
 
-    An empty extraction is not proof that no row field reaches the prompt (a
-    dynamic ``row[key]`` access extracts nothing either), so a control scanning
-    a specific list cannot be credited. The author needs the distinct
-    diagnosis, not the generic domination message which points at a topology
-    that is in fact correct.
+    An empty extraction is not proof that no row field reaches the prompt, so
+    a control scanning a specific list cannot be credited. The author needs
+    the distinct diagnosis, not the generic domination message which points at
+    a topology that is in fact correct.
+
+    The fixture is the dynamic ``row[<expr>]`` access this rationale names:
+    every row field it reads is chosen at render time, so the prompt provably
+    DOES consume row data while the statically provable set stays empty — the
+    fail-closed case in its purest form, and the shape that survives the
+    upstream bare-variable guard (elspeth-bea314a89b).
     """
     state = _state(
         _shield("shield", "raw", "llm_in", fields=("prompt",)),
-        _llm_with_template("Classify: {{ text }}"),
+        _llm_with_template("Classify: {{ row[lookup.field_name] }}"),
         source_target="raw",
     )
 
@@ -1080,7 +1116,7 @@ def test_unprovable_prompt_fields_are_a_distinct_diagnosis_naming_both_field_set
 
 def test_missing_shield_keeps_the_domination_diagnosis_when_prompt_fields_are_unprovable() -> None:
     """No upstream control at all is a topology failure, not a scope failure."""
-    state = _state(_llm_with_template("Classify: {{ text }}"))
+    state = _state(_llm_with_template("Classify: {{ row[lookup.field_name] }}"))
 
     findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
 
@@ -1128,7 +1164,7 @@ def test_external_call_below_the_shield_is_not_reported_as_a_scope_failure() -> 
     state = _state(
         _shield("shield", "raw", "fetch_in"),
         _node("fetch", "web_scrape", "fetch_in", "llm_in"),
-        _llm_with_template("Classify: {{ text }}"),
+        _llm_with_template("Classify: {{ row[lookup.field_name] }}"),
         source_target="raw",
     )
 
