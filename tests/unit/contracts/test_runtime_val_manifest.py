@@ -5,9 +5,10 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Iterator
-from typing import ClassVar, TypedDict
+from typing import Annotated, ClassVar, Literal, Optional, TypedDict, Union
 
 import pytest
+import typing_extensions
 
 import elspeth.contracts.schema_contract as schema_contract_module
 import elspeth.contracts.secret_scrub as secret_scrub_module
@@ -43,6 +44,14 @@ class _RuntimeValManifestIndirectPayload(TypedDict):
 class _RuntimeValManifestOrderedPayload(TypedDict):
     alpha: str
     bravo: int
+
+
+class _RuntimeValManifestTypingSpecialFormsPayload(TypedDict):
+    literal: Literal["accepted", "rejected"]
+    optional: Optional[str]  # noqa: UP045 - regression covers typing.Optional.
+    union: Union[str, int]  # noqa: UP007 - regression covers typing.Union.
+    annotated: Annotated[str, "audit-tag"]
+    readonly: typing_extensions.ReadOnly[str]
 
 
 class _RuntimeValManifestIndirectViolation(DeclarationContractViolation):
@@ -528,6 +537,45 @@ def test_manifest_records_delegated_declaration_helper_implementation_hash(
     assert baseline_entry["implementation_hash"] != mutated_entry["implementation_hash"]
 
 
+def test_manifest_records_exact_package_root_helper_implementation_hash(
+    _isolate_runtime_val_registries: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.contracts.declaration_contracts as dc
+    import elspeth.contracts.tier_registry as tr
+
+    dc._FROZEN = False
+    tr._FROZEN = False
+    prepare_for_run()
+
+    helper = declared_output_fields_module.verify_declared_output_fields
+    monkeypatch.setattr(helper, "__module__", "elspeth")
+    baseline = build_runtime_val_manifest()
+    baseline_entry = next(entry for entry in baseline["declaration_contracts"] if entry["name"] == "declared_output_fields")
+
+    def replacement(
+        *,
+        declared_output_fields: frozenset[str],
+        emitted_rows: object,
+        plugin_name: str,
+        node_id: str,
+        run_id: str,
+        row_id: str,
+        token_id: str,
+    ) -> None:
+        del declared_output_fields, emitted_rows, plugin_name, node_id, run_id, row_id, token_id
+
+    monkeypatch.setattr(helper, "__code__", replacement.__code__)
+    mutated = build_runtime_val_manifest()
+    mutated_entry = next(entry for entry in mutated["declaration_contracts"] if entry["name"] == "declared_output_fields")
+
+    assert baseline_entry["name"] == mutated_entry["name"]
+    assert baseline_entry["class_name"] == mutated_entry["class_name"]
+    assert baseline_entry["class_module"] == mutated_entry["class_module"]
+    assert baseline_entry["dispatch_sites"] == mutated_entry["dispatch_sites"]
+    assert baseline_entry["implementation_hash"] != mutated_entry["implementation_hash"]
+
+
 def test_manifest_records_declaration_helper_global_constant_drift(
     _isolate_runtime_val_registries: None,
 ) -> None:
@@ -915,6 +963,52 @@ def test_callable_implementation_hash_records_default_owned_constructor() -> Non
         mutated = _callable_implementation_hash(_runtime_val_manifest_default_constructor_root)
     finally:
         _RuntimeValManifestOpaqueDependency.__init__.__code__ = original_code
+
+    assert baseline != mutated
+
+
+def test_callable_implementation_hash_respects_nested_default_shadowing() -> None:
+    def dependency_root(value: int = 1) -> Callable[[object], object]:
+        return lambda value: value.missing  # type: ignore[attr-defined]
+
+    baseline = _callable_implementation_hash(dependency_root)
+
+    assert _callable_implementation_hash(dependency_root) == baseline
+
+
+def test_callable_implementation_hash_respects_nested_closure_shadowing() -> None:
+    captured = 1
+
+    def dependency_root() -> tuple[int, Callable[[object], Callable[[], object]]]:
+        outer_value = captured
+
+        def nested(captured: object) -> Callable[[], object]:
+            return lambda: captured.missing  # type: ignore[attr-defined]
+
+        return outer_value, nested
+
+    baseline = _callable_implementation_hash(dependency_root)
+
+    assert _callable_implementation_hash(dependency_root) == baseline
+
+
+def test_callable_implementation_hash_records_unshadowed_nested_default_capture() -> None:
+    def dependency_root(
+        cls: type[_RuntimeValManifestHelperClass] = _RuntimeValManifestHelperClass,
+    ) -> Callable[[], str]:
+        return lambda: cls.value()
+
+    baseline = _callable_implementation_hash(dependency_root)
+    original_code = _RuntimeValManifestHelperClass.value.__code__
+
+    def replacement() -> str:
+        return "after"
+
+    _RuntimeValManifestHelperClass.value.__code__ = replacement.__code__
+    try:
+        mutated = _callable_implementation_hash(dependency_root)
+    finally:
+        _RuntimeValManifestHelperClass.value.__code__ = original_code
 
     assert baseline != mutated
 
@@ -1541,6 +1635,70 @@ def test_payload_schema_hash_canonicalizes_annotation_order() -> None:
         assert _payload_schema_hash(_RuntimeValManifestOrderedPayload) == baseline
     finally:
         _RuntimeValManifestOrderedPayload.__annotations__ = original_annotations
+
+
+@pytest.mark.parametrize(
+    ("annotation", "expected"),
+    [
+        (
+            Literal["accepted", "rejected"],
+            {
+                "annotation": {
+                    "origin": {"typing_special_form": "Literal"},
+                    "args": ["accepted", "rejected"],
+                }
+            },
+        ),
+        (
+            Optional[str],  # noqa: UP045 - regression covers typing.Optional.
+            {
+                "annotation": {
+                    "origin": {"typing_special_form": "Union"},
+                    "args": [{"type": "builtins:str"}, {"type": "builtins:NoneType"}],
+                }
+            },
+        ),
+        (
+            Union[str, int],  # noqa: UP007 - regression covers typing.Union.
+            {
+                "annotation": {
+                    "origin": {"typing_special_form": "Union"},
+                    "args": [{"type": "builtins:str"}, {"type": "builtins:int"}],
+                }
+            },
+        ),
+        (
+            Annotated[str, "audit-tag"],
+            {
+                "annotation": {
+                    "origin": {"typing_special_form": "Annotated"},
+                    "args": [{"type": "builtins:str"}, "audit-tag"],
+                }
+            },
+        ),
+        (
+            typing_extensions.ReadOnly[str],
+            {
+                "annotation": {
+                    "origin": {"typing_special_form": "ReadOnly"},
+                    "args": [{"type": "builtins:str"}],
+                }
+            },
+        ),
+    ],
+)
+def test_normalize_code_constant_preserves_typing_special_form_identity_and_arguments(
+    annotation: object,
+    expected: object,
+) -> None:
+    assert _normalize_code_constant(annotation) == expected
+
+
+def test_payload_schema_hash_accepts_typing_special_form_annotations() -> None:
+    baseline = _payload_schema_hash(_RuntimeValManifestTypingSpecialFormsPayload)
+
+    assert baseline.startswith("sha256:")
+    assert _payload_schema_hash(_RuntimeValManifestTypingSpecialFormsPayload) == baseline
 
 
 def test_payload_schema_hash_rejects_opaque_annotations() -> None:

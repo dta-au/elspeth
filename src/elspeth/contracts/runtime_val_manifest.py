@@ -47,6 +47,7 @@ import hashlib
 import inspect
 import json
 import re
+import sys
 import textwrap
 from types import (
     BuiltinFunctionType,
@@ -86,6 +87,8 @@ class _UnsupportedManifestValue:
 
 _UNSUPPORTED_MANIFEST_VALUE = _UnsupportedManifestValue()
 _MISSING_CLASS_ATTRIBUTE = object()
+_TYPING_SPECIAL_FORM_MODULES = ("typing", "typing_extensions")
+_TYPING_SPECIAL_FORM_NAMES = ("Annotated", "Literal", "NotRequired", "ReadOnly", "Required", "Union")
 
 
 def _type_identity(cls: type[object]) -> str:
@@ -111,13 +114,28 @@ def _callable_dependency_key(func: FunctionType) -> str:
 
 
 def _module_is_owned(module_name: str, *, owner_module: str) -> bool:
-    if module_name.startswith("elspeth."):
+    if module_name == "elspeth" or module_name.startswith("elspeth."):
         return True
     return module_name == owner_module and (owner_module.startswith("tests.") or owner_module == "__main__")
 
 
 def _normalized_sort_key(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _typing_special_form_name(value: object) -> str | None:
+    for module_name in _TYPING_SPECIAL_FORM_MODULES:
+        module = sys.modules.get(module_name)
+        if not isinstance(module, ModuleType):
+            continue
+        for special_form_name in _TYPING_SPECIAL_FORM_NAMES:
+            try:
+                canonical = inspect.getattr_static(module, special_form_name)
+            except AttributeError:
+                continue
+            if canonical is value:
+                return special_form_name
+    return None
 
 
 def _try_normalize_code_constant(value: object) -> object:
@@ -174,6 +192,9 @@ def _try_normalize_code_constant(value: object) -> object:
         if normalized_origin is _UNSUPPORTED_MANIFEST_VALUE or any(arg is _UNSUPPORTED_MANIFEST_VALUE for arg in normalized_args):
             return _UNSUPPORTED_MANIFEST_VALUE
         return {"annotation": {"origin": normalized_origin, "args": normalized_args}}
+    typing_special_form_name = _typing_special_form_name(value)
+    if typing_special_form_name is not None:
+        return {"typing_special_form": typing_special_form_name}
     if isinstance(value, type):
         return {"type": _type_identity(value)}
     if isinstance(value, BuiltinFunctionType):
@@ -221,6 +242,27 @@ def _iter_code_objects(code: CodeType, *, path: str = "<root>") -> list[tuple[st
             continue
         child_path = f"{path}/{constant.co_name}[{index}]"
         code_objects.extend(_iter_code_objects(constant, path=child_path))
+    return code_objects
+
+
+def _iter_code_objects_for_binding(
+    code: CodeType,
+    *,
+    binding_name: str,
+    path: str = "<root>",
+) -> list[tuple[str, CodeType]]:
+    code_objects = [(path, code)]
+    for index, constant in enumerate(code.co_consts):
+        if type(constant) is not CodeType or binding_name not in constant.co_freevars:
+            continue
+        child_path = f"{path}/{constant.co_name}[{index}]"
+        code_objects.extend(
+            _iter_code_objects_for_binding(
+                constant,
+                binding_name=binding_name,
+                path=child_path,
+            )
+        )
     return code_objects
 
 
@@ -512,7 +554,7 @@ def _loaded_binding_attribute_names(
     binding_name: str,
 ) -> list[str]:
     names: set[str] = set()
-    for _, nested_code in _iter_code_objects(code):
+    for _, nested_code in _iter_code_objects_for_binding(code, binding_name=binding_name):
         instructions = list(dis.get_instructions(nested_code))
         for index, instruction in enumerate(instructions[:-1]):
             if instruction.opname not in load_opnames or instruction.argval != binding_name:
@@ -531,7 +573,7 @@ def _binding_is_directly_called(
     load_opnames: frozenset[str],
     binding_name: str,
 ) -> bool:
-    for _, nested_code in _iter_code_objects(code):
+    for _, nested_code in _iter_code_objects_for_binding(code, binding_name=binding_name):
         instructions = list(dis.get_instructions(nested_code))
         for index, instruction in enumerate(instructions):
             if instruction.opname not in load_opnames or instruction.argval != binding_name:
@@ -772,7 +814,7 @@ def _qualified_bound_values(
     load_opnames: frozenset[str],
 ) -> list[tuple[str, object, object | None, bool]]:
     qualified_values: list[tuple[str, object, object | None, bool]] = []
-    for _, nested_code in _iter_code_objects(code):
+    for _, nested_code in _iter_code_objects_for_binding(code, binding_name=binding_name):
         instructions = list(dis.get_instructions(nested_code))
         for index, instruction in enumerate(instructions[:-1]):
             if instruction.opname not in load_opnames or instruction.argval != binding_name:
