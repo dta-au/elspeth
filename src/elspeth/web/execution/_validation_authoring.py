@@ -36,6 +36,7 @@ from elspeth.web.execution._validation_model import (
     PhaseFailure,
     PhaseReport,
     PolicyLoweredState,
+    _blocked_readiness,
 )
 from elspeth.web.execution.schemas import (
     CHECK_BATCH_TRANSFORM_OPTIONS,
@@ -56,8 +57,6 @@ from elspeth.web.execution.schemas import (
     ValidationCheck,
     ValidationCheckName,
     ValidationError,
-    ValidationReadiness,
-    ValidationReadinessBlocker,
 )
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REVIEW_PENDING_CODE,
@@ -127,30 +126,6 @@ def _parse_resource_limit(
             ),
         )
     return _ParsedResourceLimit(value=value, error=None)
-
-
-def _blocked_readiness(
-    *,
-    code: str,
-    detail: str,
-    component_id: str | None = None,
-    component_type: str | None = None,
-    authoring_valid: bool = False,
-    completion_ready: bool = False,
-) -> ValidationReadiness:
-    return ValidationReadiness(
-        authoring_valid=authoring_valid,
-        execution_ready=False,
-        completion_ready=completion_ready,
-        blockers=[
-            ValidationReadinessBlocker(
-                code=code,
-                component_id=component_id,
-                component_type=component_type,
-                detail=detail,
-            )
-        ],
-    )
 
 
 def _path_value_failure(

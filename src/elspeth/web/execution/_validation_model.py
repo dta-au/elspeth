@@ -12,6 +12,7 @@ from elspeth.web.execution.schemas import (
     ValidationCheck,
     ValidationError,
     ValidationReadiness,
+    ValidationReadinessBlocker,
     ValidationWarning,
 )
 
@@ -29,6 +30,37 @@ class PhaseTermination(Exception):
     def __init__(self, result: ValidationResult) -> None:
         super().__init__("execution validation terminated")
         self.result = result
+
+
+def _blocked_readiness(
+    *,
+    code: str,
+    detail: str,
+    component_id: str | None = None,
+    component_type: str | None = None,
+    authoring_valid: bool = False,
+    completion_ready: bool = False,
+) -> ValidationReadiness:
+    """Single-source blocked-readiness constructor for every validation phase.
+
+    Previously copied into four modules, two of which had silently dropped the
+    ``authoring_valid`` / ``completion_ready`` axes — a fork that could not
+    express the interpretation-review-pending shape. One definition, full
+    signature, defaults preserving the reduced copies' behavior.
+    """
+    return ValidationReadiness(
+        authoring_valid=authoring_valid,
+        execution_ready=False,
+        completion_ready=completion_ready,
+        blockers=[
+            ValidationReadinessBlocker(
+                code=code,
+                component_id=component_id,
+                component_type=component_type,
+                detail=detail,
+            )
+        ],
+    )
 
 
 @dataclass(frozen=True, slots=True)

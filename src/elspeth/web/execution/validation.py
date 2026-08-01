@@ -76,7 +76,7 @@ from elspeth.web.execution._validation_materialization import (
     validate_llm_tracing_policy,
     validate_managed_identity_policy,
 )
-from elspeth.web.execution._validation_model import PhaseFailure, PhaseReport
+from elspeth.web.execution._validation_model import PhaseFailure, PhaseReport, _blocked_readiness
 from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
 from elspeth.web.execution._validation_runtime import (
     build_gate_fan_out_advisory_checks,
@@ -99,7 +99,6 @@ from elspeth.web.execution.preflight import (
 )
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import (
-    CHECK_GATE_FAN_OUT_ADVISORY,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
     CHECK_SETTINGS,
     CHECK_VALUE_SOURCE_COMPLIANCE,
@@ -107,7 +106,6 @@ from elspeth.web.execution.schemas import (
     ValidationCheck,
     ValidationError,
     ValidationReadiness,
-    ValidationReadinessBlocker,
     ValidationResult,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
@@ -120,10 +118,6 @@ _CHECK_GRAPH = RUNTIME_CHECK_GRAPH_STRUCTURE
 _CHECK_SCHEMA = RUNTIME_CHECK_SCHEMA_COMPATIBILITY
 assert RUNTIME_GRAPH_VALIDATION_CHECKS == (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_SCHEMA)
 
-# Non-blocking, happy-path-only advisory. It deliberately stays outside the
-# canonical blocking list and is retained here as a compatibility import seam.
-_CHECK_GATE_FAN_OUT_ADVISORY = CHECK_GATE_FAN_OUT_ADVISORY
-
 
 def _execution_ready() -> ValidationReadiness:
     return ValidationReadiness(
@@ -131,30 +125,6 @@ def _execution_ready() -> ValidationReadiness:
         execution_ready=True,
         completion_ready=True,
         blockers=[],
-    )
-
-
-def _blocked_readiness(
-    *,
-    code: str,
-    detail: str,
-    component_id: str | None = None,
-    component_type: str | None = None,
-    authoring_valid: bool = False,
-    completion_ready: bool = False,
-) -> ValidationReadiness:
-    return ValidationReadiness(
-        authoring_valid=authoring_valid,
-        execution_ready=False,
-        completion_ready=completion_ready,
-        blockers=[
-            ValidationReadinessBlocker(
-                code=code,
-                component_id=component_id,
-                component_type=component_type,
-                detail=detail,
-            )
-        ],
     )
 
 
@@ -220,10 +190,6 @@ def _skipped_checks(from_check: str, *, already_emitted: frozenset[str] = frozen
                 )
             )
     return result
-
-
-def _append_skipped_checks(checks: list[ValidationCheck], from_check: str) -> None:
-    checks.extend(_skipped_checks(from_check, already_emitted=frozenset(check.name for check in checks)))
 
 
 @observation_boundary(

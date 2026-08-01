@@ -152,6 +152,35 @@ into this port.
 
 Unresolved stale residue for this entry: **0 sites**.
 
+## Entry 6: Correction to Entry 3 + post-merge dedup sweep
+
+- Date: 2026-08-02
+- Discovered by: adversarial verification pass of the merge review (its own
+  named detectors, run against Entry 3's reviewed file)
+- Result: 6 corrected sites across 2 existing pattern classes
+
+Entry 3 declared zero unresolved residue while its reviewed file still
+imported the zero-production-reference facade alias
+`_CHECK_GATE_FAN_OUT_ADVISORY` — both of the ledger's own named detectors
+("Dead facade aliases", "Stale coupling to private aliases") cover it. Per
+the counting rules the published entry stays as written; this correction
+records the miss.
+
+| Pattern | Sites | Exact surface | Plausible detector |
+|---|---:|---|---|
+| Dead facade aliases | 1 | `_CHECK_GATE_FAN_OUT_ADVISORY` in `validation.py` — the 14th and last alias, surviving only for its test import | Existing zero-reference rule |
+| Stale coupling to private aliases | 5 | 1 import + 4 usages in `test_gate_fan_out_advisory.py`; migrated to `schemas.CHECK_GATE_FAN_OUT_ADVISORY` exactly as the identity and static-prompt tests were | Existing AST ban candidate |
+
+The same sweep single-sourced the forked helpers the merge review catalogued
+(`_blocked_readiness` ×4 → `_validation_model`, `_snapshot_materialized_evidence`
+×2 → `_validation_model`, `_EdgePatchTargetResolver` ×2 → `_validation_diagnostics`),
+deleted the dead-but-tested `_append_skipped_checks` seam, made the trust-tier
+pin's production-file scope glob-derived, and removed the tautological second
+assertion from the signature-stability test — intentional consolidation, not
+counted as residue sites.
+
+Unresolved stale residue for this entry: **0 sites**.
+
 ## Running totals
 
 | Features reviewed | Corrected sites | Pattern classes recorded | Unresolved residue |
@@ -161,3 +190,4 @@ Unresolved stale residue for this entry: **0 sites**.
 | 2 | 103 | 10 | 0 |
 | 2 | 105 | 12 | 0 |
 | 2 | 116 | 13 | 0 |
+| 2 | 122 | 13 | 0 |

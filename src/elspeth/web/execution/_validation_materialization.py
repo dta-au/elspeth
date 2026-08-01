@@ -26,6 +26,8 @@ from elspeth.web.execution._validation_model import (
     MaterializedYaml,
     PhaseFailure,
     PhaseReport,
+    _blocked_readiness,
+    _snapshot_materialized_evidence,
 )
 from elspeth.web.execution.preflight import resolve_runtime_yaml_paths
 from elspeth.web.execution.protocol import YamlGenerator
@@ -39,8 +41,6 @@ from elspeth.web.execution.schemas import (
     CHECK_MANAGED_IDENTITY_POLICY,
     ValidationCheck,
     ValidationError,
-    ValidationReadiness,
-    ValidationReadinessBlocker,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.provider_config_policy import (
@@ -51,28 +51,6 @@ from elspeth.web.provider_config_policy import (
     web_llm_tracing_policy_error,
     web_rag_provider_config_policy_error,
 )
-
-
-def _blocked_readiness(
-    *,
-    code: str,
-    detail: str,
-    component_id: str | None = None,
-    component_type: str | None = None,
-) -> ValidationReadiness:
-    return ValidationReadiness(
-        authoring_valid=False,
-        execution_ready=False,
-        completion_ready=False,
-        blockers=[
-            ValidationReadinessBlocker(
-                code=code,
-                component_id=component_id,
-                component_type=component_type,
-                detail=detail,
-            )
-        ],
-    )
 
 
 def _blob_inline_component_id(field_path: str) -> str | None:
@@ -112,15 +90,6 @@ def _blob_inline_validation_error(violation: BlobInlineValidationViolation) -> V
         message=f"Inline content blob reference at {violation.field_path} is {violation.category}: {violation.detail}",
         suggestion="Verify the blob exists, is ready, is under the configured size caps, and matches the pinned sha256.",
         error_code=f"{violation.category}_inline_blob_content",
-    )
-
-
-def _snapshot_materialized_evidence(materialized: MaterializedYaml) -> MaterializedYaml:
-    """Detach mutable evidence while preserving admitted state identity and YAML value."""
-    return MaterializedYaml(
-        authored=materialized.authored,
-        materialized_state=materialized.materialized_state,
-        pipeline_yaml=materialized.pipeline_yaml,
     )
 
 
