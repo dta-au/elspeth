@@ -4673,6 +4673,12 @@ sinks:
         assert _check(result, "graph_structure").passed is True
         assert _check(result, "route_target_resolution").passed is True
         assert _check(result, "schema_compatibility").passed is False
+        _assert_complete_failure_ledger(result, "schema_compatibility")
+        assert [check.name for check in result.checks[-3:]] == [
+            "state_exists",
+            "advisor_signoff",
+            "proof_diagnostics",
+        ]
 
 
 class TestEdgeContractFailureFormatting:
