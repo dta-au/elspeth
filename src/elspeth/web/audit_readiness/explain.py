@@ -59,6 +59,12 @@ def build_narrative(
 
 def _describe_source(plugin: str, *, source_name: str) -> str:
     prefix = "- Source data" if source_name == "source" else f"- Source data ({source_name})"
+    if plugin == "llm":
+        return (
+            f"{prefix} — one generated row from one authored prompt at a non-deterministic external LLM boundary. "
+            "The audit trail records the source_load operation and its prompt and response evidence, including the served "
+            "model, provider-reported usage, timestamp, and row lineage under the payload retention policy."
+        )
     if plugin == "csv":
         return f"{prefix} — each row from the CSV input. SHA-256 hash recorded for the source file and for each row."
     if plugin == "json":

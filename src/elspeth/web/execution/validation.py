@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 from uuid import UUID
 
 import yaml
@@ -135,6 +135,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginS
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
 from elspeth.web.provider_config_policy import (
+    LLM_BASE_URL_POLICY_ERROR,
     web_aws_s3_endpoint_url_policy_error,
     web_aws_s3_source_policy_error,
     web_llm_base_url_policy_error,
@@ -175,6 +176,62 @@ _WEB_FETCH_TRANSFORMS = frozenset({"blob_fetch", "web_scrape"})
 _WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS = 30
 _WEB_BLOB_FETCH_MAX_BODY_BYTES = 10 * 1024 * 1024
 _WEB_BLOB_FETCH_INT_ADAPTER: TypeAdapter[int] = TypeAdapter(int)
+
+
+@dataclass(frozen=True, slots=True)
+class _LLMPolicyComponent:
+    """One source or transform subject to component-neutral LLM policy."""
+
+    component_id: str
+    component_type: Literal["source", "transform"]
+    label: str
+    plugin: object
+    options: object
+
+
+def _source_policy_component_id(source_name: object) -> str:
+    """Return a stable, value-safe id for one possibly malformed source key."""
+
+    if type(source_name) is not str:
+        return "source:<invalid>"
+    return "source" if source_name == "source" else f"source:{source_name}"
+
+
+def _llm_policy_components(state: CompositionState) -> tuple[_LLMPolicyComponent, ...]:
+    """Return source-first, stable components for shared LLM egress gates.
+
+    Source names are persisted Tier-3 state. Exact strings sort lexically;
+    malformed keys sort last and receive one value-safe stable identifier.
+    Transform ordering remains the authored node order used before source
+    parity was added.
+    """
+
+    source_items = sorted(
+        cast("Mapping[object, Any]", state.sources).items(),
+        key=lambda item: (0, item[0]) if type(item[0]) is str else (1, ""),
+    )
+    components = [
+        _LLMPolicyComponent(
+            component_id=_source_policy_component_id(source_name),
+            component_type="source",
+            label="Source",
+            plugin=source.plugin,
+            options=source.options,
+        )
+        for source_name, source in source_items
+    ]
+    components.extend(
+        _LLMPolicyComponent(
+            component_id=node.id,
+            component_type="transform",
+            label="Transform",
+            plugin=node.plugin,
+            options=node.options,
+        )
+        for node in state.nodes
+        if node.node_type == "transform"
+    )
+    return tuple(components)
 
 
 def _execution_ready() -> ValidationReadiness:
@@ -1079,6 +1136,9 @@ def validate_pipeline(
     # before policy lowering replaces those aliases with private provider/model
     # options.  A concrete model selected by the operator is not a model choice
     # authored by the composer and therefore has no user review card to resolve.
+    # Deliberately transform-only: source profile attribution remains source-
+    # typed in generic policy findings, but a rowless LLM source does not mint
+    # row prompt/model-choice interpretation reviews or enter this exemption.
     operator_resolved_model_node_ids = frozenset(
         node.id for node in state.nodes if node.plugin == "llm" and isinstance(node.options.get("profile"), str)
     )
@@ -2013,17 +2073,30 @@ def validate_pipeline(
     # CLI dev examples; this web-execution gate is the boundary that makes the
     # single-machine threat model not leak into the hosted path. Mirrors the
     # managed_identity / web_scrape network policies.
-    for node in state.nodes:
-        if node.node_type != "transform":
-            continue
-        llm_base_url_policy_error = web_llm_base_url_policy_error(node.plugin, node.options)
+    for component in _llm_policy_components(state):
+        options = component.options if isinstance(component.options, Mapping) else {}
+        try:
+            llm_base_url_policy_error = web_llm_base_url_policy_error(
+                component.plugin if type(component.plugin) is str else None,
+                options,
+            )
+        except (TypeError, ValueError):
+            # The URL normalizer is a Tier-3 parser and may reject malformed
+            # bracket/port syntax. Fail closed with the static policy message;
+            # never reflect the author-supplied endpoint in diagnostics.
+            llm_base_url_policy_error = LLM_BASE_URL_POLICY_ERROR
         if llm_base_url_policy_error is not None:
+            policy_message = (
+                llm_base_url_policy_error
+                if component.component_type == "transform"
+                else llm_base_url_policy_error.replace("LLM nodes", "LLM sources")
+            )
             checks.append(
                 ValidationCheck(
                     name=_CHECK_LLM_BASE_URL_POLICY,
                     passed=False,
-                    detail=f"Transform '{node.id}' overrides OpenRouter base_url in a web-authored pipeline",
-                    affected_nodes=(node.id,),
+                    detail=f"{component.label} '{component.component_id}' overrides OpenRouter base_url in a web-authored pipeline",
+                    affected_nodes=(component.component_id,),
                     outcome_code=None,
                 )
             )
@@ -2033,18 +2106,18 @@ def validate_pipeline(
                 checks=checks,
                 errors=[
                     ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=llm_base_url_policy_error,
+                        component_id=component.component_id,
+                        component_type=component.component_type,
+                        message=policy_message,
                         suggestion="Remove the base_url option to use the canonical OpenRouter endpoint.",
                         error_code="llm_base_url_not_allowed",
                     ),
                 ],
                 readiness=_blocked_readiness(
                     code=_CHECK_LLM_BASE_URL_POLICY,
-                    detail=f"transform {node.id} overrides OpenRouter base_url in a web-authored pipeline",
-                    component_id=node.id,
-                    component_type="transform",
+                    detail=f"{component.component_type} {component.component_id} overrides OpenRouter base_url in a web-authored pipeline",
+                    component_id=component.component_id,
+                    component_type=component.component_type,
                 ),
                 semantic_contracts=serialize_semantic_contracts(semantic_contracts),
             )
@@ -2058,17 +2131,24 @@ def validate_pipeline(
         )
     )
 
-    for node in state.nodes:
-        if node.node_type != "transform":
-            continue
-        llm_tracing_policy_error = web_llm_tracing_policy_error(node.plugin, node.options)
+    for component in _llm_policy_components(state):
+        options = component.options if isinstance(component.options, Mapping) else {}
+        llm_tracing_policy_error = web_llm_tracing_policy_error(
+            component.plugin if type(component.plugin) is str else None,
+            options,
+        )
         if llm_tracing_policy_error is not None:
+            policy_message = (
+                llm_tracing_policy_error
+                if component.component_type == "transform"
+                else llm_tracing_policy_error.replace("LLM nodes", "LLM sources")
+            )
             checks.append(
                 ValidationCheck(
                     name=_CHECK_LLM_TRACING_POLICY,
                     passed=False,
-                    detail=f"Transform '{node.id}' configures tracing in a web-authored pipeline",
-                    affected_nodes=(node.id,),
+                    detail=f"{component.label} '{component.component_id}' configures tracing in a web-authored pipeline",
+                    affected_nodes=(component.component_id,),
                     outcome_code=None,
                 )
             )
@@ -2078,18 +2158,18 @@ def validate_pipeline(
                 checks=checks,
                 errors=[
                     ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=llm_tracing_policy_error,
+                        component_id=component.component_id,
+                        component_type=component.component_type,
+                        message=policy_message,
                         suggestion="Remove tracing; tracing destinations and credentials are operator-controlled.",
                         error_code="llm_tracing_not_allowed",
                     ),
                 ],
                 readiness=_blocked_readiness(
                     code=_CHECK_LLM_TRACING_POLICY,
-                    detail=f"transform {node.id} configures tracing in a web-authored pipeline",
-                    component_id=node.id,
-                    component_type="transform",
+                    detail=f"{component.component_type} {component.component_id} configures tracing in a web-authored pipeline",
+                    component_id=component.component_id,
+                    component_type=component.component_type,
                 ),
                 semantic_contracts=serialize_semantic_contracts(semantic_contracts),
             )

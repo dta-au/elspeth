@@ -561,10 +561,11 @@ class ReadinessService:
         # Both reads are skipped when the composition has no LLM
         # transforms — the row short-circuits to not_applicable and
         # nothing further is queried.
-        has_llm = _composition_has_llm_transform(state)
+        has_llm_transform = _composition_has_llm_transform(state)
+        has_llm_source = _composition_has_llm_source(state)
         interpretation_events: tuple[InterpretationEventRecord, ...] = ()
         opted_out = False
-        if has_llm:
+        if has_llm_transform:
             opt_out_rows = await self._session_service.list_interpretation_events(
                 session_id,
                 status="all",
@@ -586,7 +587,8 @@ class ReadinessService:
             _build_provenance_row(validation),
             _build_retention_row(self._settings.payload_store_retention_days),
             _build_llm_interpretations_row(
-                has_llm=has_llm,
+                has_llm_transform=has_llm_transform,
+                has_llm_source=has_llm_source,
                 opted_out=opted_out,
                 events=interpretation_events,
             ),
@@ -906,9 +908,16 @@ def _composition_has_llm_transform(state: CompositionState) -> bool:
     return any(n.node_type == "transform" and n.plugin == "llm" for n in state.nodes)
 
 
+def _composition_has_llm_source(state: CompositionState) -> bool:
+    """Return whether a source-native LLM is present, without reading options."""
+
+    return any(source.plugin == "llm" for source in state.sources.values())
+
+
 def _build_llm_interpretations_row(
     *,
-    has_llm: bool,
+    has_llm_transform: bool,
+    has_llm_source: bool,
     opted_out: bool,
     events: Sequence[InterpretationEventRecord],
 ) -> ReadinessRow:
@@ -916,7 +925,9 @@ def _build_llm_interpretations_row(
 
     Phase 5b Task 10 (18a-phase-5b-backend.md §Task 10). Status mapping:
 
-      - No LLM transforms in composition → not_applicable
+      - LLM source only → not_applicable with source-specific authored-prompt
+        narrative; no interpretation events are queried
+      - No LLM transforms or sources in composition → not_applicable
       - LLM transforms present, session opted out → not_applicable
         (with an opt-out note in the summary)
       - LLM transforms present, no interpretation events for the
@@ -937,7 +948,18 @@ def _build_llm_interpretations_row(
     sorted; opt-out rows have ``affected_node_id=None`` and contribute
     nothing.
     """
-    if not has_llm:
+    if not has_llm_transform and has_llm_source:
+        return ReadinessRow(
+            id="llm_interpretations",
+            label="LLM interpretations",
+            status="not_applicable",
+            summary="LLM source prompts do not use interpretation review",
+            detail=(
+                "The rowless LLM source issues one authored prompt without incoming row data, so it creates no row interpretation events."
+            ),
+            component_ids=(),
+        )
+    if not has_llm_transform:
         return ReadinessRow(
             id="llm_interpretations",
             label="LLM interpretations",

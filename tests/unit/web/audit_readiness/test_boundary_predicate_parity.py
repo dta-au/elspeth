@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from elspeth.contracts.enums import Determinism
 from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.web.audit_readiness.boundary_expectations import (
     EXPECTED_BOUNDARY_SINKS,
     EXPECTED_BOUNDARY_SOURCES,
@@ -94,6 +95,19 @@ def test_every_source_classifies_as_boundary() -> None:
         assert _predicate_says_boundary("source", cls), (
             f"Source {cls.name!r} did not classify as boundary under the (kind, determinism) predicate. Determinism: {cls.determinism!r}"
         )
+
+
+def test_llm_source_boundary_expectation_is_deferred_until_public_discovery() -> None:
+    """Pin Task 7/10 atomicity without weakening exact live-catalog parity."""
+    manager = _make_manager()
+
+    assert "llm" not in {cls.name for cls in manager.get_sources()}, (
+        "LLM source discovery is now live; atomically add its NON_DETERMINISTIC "
+        "entry to EXPECTED_SOURCE_DETERMINISMS and replace this deferral test"
+    )
+    assert "llm" not in EXPECTED_SOURCE_DETERMINISMS
+    assert LLMSource.determinism is Determinism.NON_DETERMINISTIC
+    assert _predicate_says_boundary("source", LLMSource) is True
 
 
 def test_every_sink_classifies_as_boundary() -> None:

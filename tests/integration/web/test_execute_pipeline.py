@@ -562,6 +562,74 @@ async def test_execute_fails_closed_for_uncovered_llm_source(
             headers=auth_headers,
         )
 
+        # Exercise the next execution-policy gate with required-control modes
+        # disabled so content-safety coverage cannot mask the base-URL verdict.
+        snapshot = PluginAvailabilitySnapshot.create(
+            policy_hash=unrestricted.policy_hash,
+            principal_scope=unrestricted.principal_scope,
+            available=unrestricted.available,
+            unavailable=unrestricted.unavailable,
+            selected=unrestricted.selected,
+            usable_profile_aliases=unrestricted.usable_profile_aliases,
+            selected_profile_aliases=unrestricted.selected_profile_aliases,
+            control_modes=(),
+            binding_generation_fingerprint=unrestricted.binding_generation_fingerprint,
+            authority=unrestricted.authority,
+        )
+        base_url_created = await client.post(
+            "/api/sessions",
+            headers=auth_headers,
+            json={"title": "LLM source base URL policy"},
+        )
+        assert base_url_created.status_code == 201
+        base_url_session_id = base_url_created.json()["id"]
+        base_url_state = CompositionState(
+            sources={
+                "briefing": SourceSpec(
+                    plugin="llm",
+                    on_success="primary",
+                    options={
+                        "base_url": "https://credential-canary.attacker.invalid/v1",
+                        "prompt_template": "PROMPT_CANARY_DO_NOT_RENDER",
+                    },
+                    on_validation_failure="discard",
+                )
+            },
+            nodes=(),
+            edges=(),
+            outputs=(
+                OutputSpec(
+                    name="primary",
+                    plugin="json",
+                    options={
+                        "path": str(work_dir / "outputs" / base_url_session_id / "result.jsonl"),
+                        "schema": {"mode": "observed"},
+                    },
+                    on_write_failure="discard",
+                ),
+            ),
+            metadata=PipelineMetadata(name="Unsafe LLM source base URL"),
+            version=1,
+        )
+        base_url_state_data = base_url_state.to_dict()
+        await app.state.session_service.save_composition_state(
+            UUID(base_url_session_id),
+            CompositionStateData(
+                sources=base_url_state_data["sources"],
+                nodes=base_url_state_data["nodes"],
+                edges=base_url_state_data["edges"],
+                outputs=base_url_state_data["outputs"],
+                metadata_=base_url_state_data["metadata"],
+                is_valid=True,
+                validation_errors=None,
+            ),
+            provenance="session_seed",
+        )
+        base_url_response = await client.post(
+            f"/api/sessions/{base_url_session_id}/execute",
+            headers=auth_headers,
+        )
+
         malformed_created = await client.post(
             "/api/sessions",
             headers=auth_headers,
@@ -611,6 +679,15 @@ async def test_execute_fails_closed_for_uncovered_llm_source(
     assert detail["errors"][0]["component_id"] == "source"
     assert detail["errors"][0]["component_type"] == "source"
     assert "run_id" not in response.json()
+    assert base_url_response.status_code == 422
+    base_url_detail = base_url_response.json()["detail"]
+    assert base_url_detail["kind"] == "pipeline_validation_failure"
+    assert base_url_detail["errors"][0]["error_code"] == "llm_base_url_not_allowed"
+    assert base_url_detail["errors"][0]["component_id"] == "source:briefing"
+    assert base_url_detail["errors"][0]["component_type"] == "source"
+    assert "credential-canary" not in str(base_url_detail)
+    assert "PROMPT_CANARY" not in str(base_url_detail)
+    assert "run_id" not in base_url_response.json()
     assert malformed_response.status_code == 422
     malformed_detail = malformed_response.json()["detail"]
     assert malformed_detail["errors"][0]["error_code"] == "plugin_unavailable"
