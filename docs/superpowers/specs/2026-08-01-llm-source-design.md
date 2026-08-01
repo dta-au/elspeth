@@ -1,7 +1,7 @@
 # Source-Native Single-Prompt LLM Plugin
 
 **Date:** 2026-08-01
-**Status:** User-approved architecture; document review pending
+**Status:** Approved design
 **Target:** ELSPETH `release/0.7.2`
 **Branch:** `codex/llm-source`
 **Base commit:** `63d713dc4bdca3d07f32352eb9464ad9dce1e96c`
