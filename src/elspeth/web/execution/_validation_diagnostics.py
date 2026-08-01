@@ -16,6 +16,8 @@ from pydantic import ValidationError as PydanticValidationError
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError, GraphValidationWarning
+from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import ValidationError, ValidationWarning
 
@@ -221,41 +223,13 @@ def _edge_patch_target_for_node_id(
     return _unmapped_schema_patch_target(dag_node_id, component_type)
 
 
-def _format_edge_contract_failure(
-    exc: EdgeContractError,
-    *,
-    state: CompositionState | None = None,
-    graph: ExecutionGraph | None = None,
-) -> tuple[str, str]:
-    """Build LLM-actionable (message, suggestion) pair from a structured edge-contract error.
-
-    The composer surfaces both fields verbatim into the assistant's reply when
-    runtime preflight rejects a completion claim. Empirically (cohort
-    diagnosis 2026-05-07), models converge on retry only when the message
-    names the producer/consumer node IDs and per-field issues, AND the
-    suggestion lists concrete tool-call shapes for the fix. Prose like
-    "Type mismatches: f (expected X, got Y)" by itself routinely caused the
-    model to surrender mid-loop because there was no obvious next move.
-
-    Format choices:
-      - Producer/consumer are introduced by NODE ID first (the model uses
-        these as ``node_id=`` arguments), then by SCHEMA NAME (informational
-        — schema classes are baked-in plugin contracts, the model can't
-        target them directly).
-      - Each ``CompatibilityResult`` issue category gets its own bullet
-        block. We keep the original "expected ... got ..." nomenclature
-        from ``CompatibilityResult.error_message`` for continuity, but
-        switch to "consumer requires ... producer emits ..." prose because
-        empirically the composer LLM mis-grounds "expected/got" against
-        the validator's perspective rather than the data-flow direction.
-      - The suggestion leads with option (a) (patch consumer) because the
-        dominant captured failure mode is consumer over-declaration. The
-        producer-side option is listed second with the caveat that plugin
-        output schemas are baked-in.
-    """
-    message = _format_edge_contract_message(exc)
-    suggestion = _build_edge_contract_suggestion(exc, state=state, graph=graph)
-    return message, suggestion
+def _infer_component_type_from_plugin_error(
+    exc: PluginNotFoundError | PluginConfigError,
+) -> str | None:
+    """Return owned config-error attribution through the legacy import seam."""
+    if isinstance(exc, PluginConfigError):
+        return exc.component_type
+    return None
 
 
 def _format_edge_contract_message(exc: EdgeContractError) -> str:
@@ -291,21 +265,6 @@ def _format_edge_contract_message(exc: EdgeContractError) -> str:
     return message
 
 
-def _build_edge_contract_suggestion(
-    exc: EdgeContractError,
-    *,
-    state: CompositionState | None = None,
-    graph: ExecutionGraph | None = None,
-) -> str:
-    """Compose the action-oriented suggestion text for an edge-contract failure."""
-    return _build_edge_contract_suggestion_with_resolver(
-        exc,
-        state=state,
-        graph=graph,
-        resolve_target=_edge_patch_target_for_node_id,
-    )
-
-
 def _build_edge_contract_suggestion_with_resolver(
     exc: EdgeContractError,
     *,
@@ -313,7 +272,13 @@ def _build_edge_contract_suggestion_with_resolver(
     graph: ExecutionGraph | None,
     resolve_target: _EdgePatchTargetResolver,
 ) -> str:
-    """Build patch advice through an explicitly supplied component resolver."""
+    """Build concrete consumer-first patch advice through the supplied resolver.
+
+    Composer models converge more reliably when diagnostics name producer and
+    consumer node IDs and give exact patch-tool shapes. Consumer relaxation is
+    option (a); producer repair remains option (b) because plugin output
+    contracts are normally fixed.
+    """
     result = exc.compatibility_result
     has_type_mismatch = bool(result.type_mismatches)
     has_missing = bool(result.missing_fields)

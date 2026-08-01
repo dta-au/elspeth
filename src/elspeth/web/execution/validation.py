@@ -61,6 +61,9 @@ from elspeth.web.execution._validation_diagnostics import (
     _graph_warning_to_validation_warning,
     _reframe_settings_missing_parts,
 )
+from elspeth.web.execution._validation_diagnostics import (
+    _infer_component_type_from_plugin_error as _infer_component_type_from_plugin_error,
+)
 from elspeth.web.execution._validation_ledger import ValidationLedger
 from elspeth.web.execution._validation_materialization import (
     materialize_validation_yaml,
@@ -92,22 +95,9 @@ from elspeth.web.execution.preflight import (
 )
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import (
-    CHECK_BATCH_TRANSFORM_OPTIONS,
-    CHECK_IDENTITY_NODE_ADVISORY,
-    CHECK_INTERPRETATION_REVIEW,
-    CHECK_OPERATOR_PROFILE_OPTIONS,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
-    CHECK_PATH_ALLOWLIST,
-    CHECK_PLUGIN_ENABLEMENT,
-    CHECK_REQUIRED_CONTROL_AVAILABILITY,
-    CHECK_REQUIRED_CONTROL_COVERAGE,
-    CHECK_ROUTE_TARGETS,
-    CHECK_SECRET_REFS,
-    CHECK_SEMANTIC_CONTRACTS,
     CHECK_SETTINGS,
     CHECK_VALUE_SOURCE_COMPLIANCE,
-    CHECK_WEB_FETCH_RESOURCE_POLICY,
-    CHECK_WEB_SCRAPE_NETWORK_POLICY,
     VALIDATION_BLOCKING_CHECK_NAMES,
     ValidationCheck,
     ValidationError,
@@ -118,23 +108,10 @@ from elspeth.web.execution.schemas import (
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 
-# ── Check names (ordered) ─────────────────────────────────────────────
-_CHECK_PLUGIN_ENABLEMENT = CHECK_PLUGIN_ENABLEMENT
-_CHECK_OPERATOR_PROFILE_OPTIONS = CHECK_OPERATOR_PROFILE_OPTIONS
-_CHECK_REQUIRED_CONTROL_AVAILABILITY = CHECK_REQUIRED_CONTROL_AVAILABILITY
-_CHECK_REQUIRED_CONTROL_COVERAGE = CHECK_REQUIRED_CONTROL_COVERAGE
-_CHECK_PATH_ALLOWLIST = CHECK_PATH_ALLOWLIST
-_CHECK_WEB_SCRAPE_NETWORK_POLICY = CHECK_WEB_SCRAPE_NETWORK_POLICY
-_CHECK_WEB_FETCH_RESOURCE_POLICY = CHECK_WEB_FETCH_RESOURCE_POLICY
-_CHECK_SECRET_REFS = CHECK_SECRET_REFS
-_CHECK_SEMANTIC_CONTRACTS = CHECK_SEMANTIC_CONTRACTS
-_CHECK_BATCH_TRANSFORM_OPTIONS = CHECK_BATCH_TRANSFORM_OPTIONS
-_CHECK_INTERPRETATION_REVIEW = CHECK_INTERPRETATION_REVIEW
 _CHECK_SETTINGS = CHECK_SETTINGS
 _CHECK_PLUGINS = RUNTIME_CHECK_PLUGIN_INSTANTIATION
 _CHECK_VALUE_SOURCE_COMPLIANCE = CHECK_VALUE_SOURCE_COMPLIANCE
 _CHECK_GRAPH = RUNTIME_CHECK_GRAPH_STRUCTURE
-_CHECK_ROUTE_TARGETS = CHECK_ROUTE_TARGETS
 _CHECK_SCHEMA = RUNTIME_CHECK_SCHEMA_COMPATIBILITY
 assert RUNTIME_GRAPH_VALIDATION_CHECKS == (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_SCHEMA)
 
@@ -172,18 +149,9 @@ def _blocked_readiness(
     )
 
 
-# Advisory check — non-blocking, multi-entry (one ValidationCheck per
-# detected node, all sharing this name).  Deliberately NOT included in
-# _ALL_CHECKS: that list governs the "skipped check" propagation when an
-# earlier pass/fail check fails.  This advisory uses ``passed=True`` for
-# every entry and is emitted only on the happy-path return, so structural
-# errors are never drowned in cosmetic noise.
-_CHECK_IDENTITY_NODE_ADVISORY = CHECK_IDENTITY_NODE_ADVISORY
-
 # _CHECK_VALUE_SOURCE_COMPLIANCE slots between _CHECK_PLUGINS (typed configs
 # now exist) and _CHECK_GRAPH (so a hallucinated model fails before any DAG
-# work). The position is asserted by tests/unit/web/execution/test_validation.py
-# to prevent silent reordering.
+# work). A focused regression pins this canonical position.
 _ALL_CHECKS = list(VALIDATION_BLOCKING_CHECK_NAMES)
 
 _DEFAULT_PLUGIN_POLICY_SUGGESTION = _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION
@@ -215,7 +183,12 @@ def _format_edge_contract_failure(
     state: CompositionState | None = None,
     graph: ExecutionGraph | None = None,
 ) -> tuple[str, str]:
-    """Compatibility wrapper preserving the facade's live suggestion patch."""
+    """Preserve the live patch seam and the LLM-actionable diagnostic contract.
+
+    Messages ground both ends by node ID. Suggestions expose concrete patch
+    tool calls and lead with the consumer-side repair before the narrower
+    producer-side alternative.
+    """
     return _format_edge_contract_message(exc), _build_edge_contract_suggestion(exc, state=state, graph=graph)
 
 

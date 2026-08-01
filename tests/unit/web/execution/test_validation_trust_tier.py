@@ -17,12 +17,13 @@ _PRODUCTION_FILES = (
     "validation.py",
 )
 
-# Both R5s are policy-wrong, adjudication-ready nominal checks over owned
+# These R5s are policy-wrong, adjudication-ready nominal checks over owned
 # concrete classes: one admits the real scoped-resolver implementation instead
-# of a runtime Protocol impostor; the other discriminates an owned closed result
-# union. No filename/name exemption may hide either check.
+# of a runtime Protocol impostor; the other two discriminate owned closed
+# result/exception unions. No filename/name exemption may hide any check.
 _ADJUDICATION_CANDIDATES = {
     "_validation_authoring.py": ["R5:_secret_ref_exists", "R5:review_interpretations"],
+    "_validation_diagnostics.py": ["R5:_infer_component_type_from_plugin_error"],
 }
 
 

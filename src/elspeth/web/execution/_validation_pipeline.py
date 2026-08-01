@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Protocol
 from uuid import UUID
 
 from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
@@ -25,7 +25,7 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 
 
 class _YamlLoader(Protocol):
-    def __call__(self, yaml_content: str) -> Any: ...
+    def __call__(self, yaml_content: str) -> object: ...
 
 
 class _YamlSettingsLoader(Protocol):
