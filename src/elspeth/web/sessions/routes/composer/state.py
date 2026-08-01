@@ -5,6 +5,7 @@ from typing import TypedDict
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
@@ -942,9 +943,7 @@ async def _verified_yaml_export_blob_ids(
 
     if not parsed_blob_ids:
         return source_blob_ids
-    blob_service: BlobServiceProtocol | None = getattr(request.app.state, "blob_service", None)
-    if blob_service is None:
-        raise AuditIntegrityError("YAML export blob custody verification is unavailable")
+    blob_service: BlobServiceProtocol = request.app.state.blob_service
     for source, blob_id in parsed_blob_ids:
         try:
             blob = await blob_service.get_blob(
@@ -953,12 +952,14 @@ async def _verified_yaml_export_blob_ids(
             )
         except BlobNotFoundError:
             raise AuditIntegrityError("YAML export blob custody verification failed") from None
+        if not isinstance(blob, BlobRecord):
+            raise TypeError("BlobServiceProtocol.get_blob() must return BlobRecord")
         source_paths = {value for key in SOURCE_LOCAL_PATH_OPTION_KEYS if type(value := source.options.get(key)) is str}
         if (
-            getattr(blob, "id", None) != blob_id
-            or getattr(blob, "session_id", None) != session_id
-            or getattr(blob, "status", None) != "ready"
-            or type(storage_path := getattr(blob, "storage_path", None)) is not str
+            blob.id != blob_id
+            or blob.session_id != session_id
+            or blob.status != "ready"
+            or type(storage_path := blob.storage_path) is not str
             or storage_path not in source_paths
         ):
             raise AuditIntegrityError("YAML export blob custody verification failed")

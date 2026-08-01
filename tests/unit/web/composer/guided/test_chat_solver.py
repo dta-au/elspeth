@@ -13,6 +13,7 @@ from __future__ import annotations
 import inspect
 import json
 from dataclasses import dataclass, fields, replace
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, get_args
 from uuid import UUID, uuid4
@@ -879,6 +880,63 @@ _EXPECTED_DEFERRED_ACTION = DeferredIntentAction(
         ),
     ),
 )
+
+
+def test_repair_thread_admission_parses_real_litellm_dynamic_tool_call() -> None:
+    """Repair replay uses the real provider object's dynamic extra fields."""
+    from litellm.types.utils import ChatCompletionMessageToolCall, Function, Message
+
+    function = Function(name="retain_deferred_intent", arguments=json.dumps({"target_stage": "topology"}))
+    tool_call = ChatCompletionMessageToolCall(id="call_retain", type="function", function=function)
+    message = Message(role="assistant", content=None, tool_calls=[tool_call])
+
+    assert {"id", "function"} <= set(tool_call.__pydantic_extra__ or {})
+    admitted = chat_solver._admit_deferred_intent_repair_thread(
+        message,
+        (tool_call,),
+        retain_call=tool_call,
+    )
+
+    assert admitted is not None
+    assert admitted.assistant_content is None
+    assert admitted.calls[0].id == "call_retain"
+    assert admitted.calls[0].function.name == "retain_deferred_intent"
+    assert admitted.calls[0].function.arguments == json.dumps({"target_stage": "topology"})
+    assert admitted.calls[0].is_retain is True
+
+
+def test_record_llm_call_preserves_active_primary_when_secondary_audit_build_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A secondary sidecar failure must not replace the provider failure."""
+
+    def fail_audit_build(**_kwargs: object) -> object:
+        raise RuntimeError("secondary audit build failure")
+
+    monkeypatch.setattr(chat_solver, "build_llm_call_record", fail_audit_build)
+    primary = ValueError("primary provider failure")
+
+    with pytest.raises(ValueError, match="primary provider failure") as exc_info:
+        try:
+            raise primary
+        finally:
+            chat_solver._record_llm_call(
+                recorder=BufferingRecorder(),
+                model="test/model",
+                messages=[],
+                tools=None,
+                status=ComposerLLMCallStatus.API_ERROR,
+                started_at=datetime.now(UTC),
+                started_ns=0,
+                temperature=None,
+                seed=None,
+                response=None,
+                error_class="ValueError",
+                error_message="ValueError",
+            )
+
+    assert exc_info.value is primary
+    assert any("secondary Composer LLM audit recording failed: RuntimeError" in note for note in primary.__notes__)
 
 
 async def _run_stage_solver(stage: str) -> object:

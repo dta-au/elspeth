@@ -1404,6 +1404,49 @@ async def test_fork_of_fork_preserves_historical_plan_but_selects_current_bindin
 
 
 @pytest.mark.asyncio
+async def test_fork_of_fork_rejects_malformed_retained_historical_plan(service) -> None:
+    parent, fork_message = await _parent_with_fork_message(service)
+    first_fence = await _claim_fork(service, parent.id)
+    first = await service.fork_session(
+        first_fence,
+        fork_message_id=fork_message.id,
+        new_message_content="first edit",
+    )
+    await service.settle_guided_fork_operation(
+        GuidedForkSettlementCommand(
+            authority=first.authority,
+            expected_current_state_id=None,
+            edited_message_id=first.messages[-1].id,
+            rewritten_state_id=None,
+            rewritten_state=None,
+            response_hash="b" * 64,
+            actor="composer_route",
+        )
+    )
+    _release_fork_authority(service, first.authority)
+    await service.add_message(
+        first.session.id,
+        "audit",
+        "{",
+        writer_principal="session_fork",
+    )
+    second_fork_message = await service.add_message(
+        first.session.id,
+        "user",
+        "fork child",
+        writer_principal="route_user_message",
+    )
+    second_fence = await _claim_fork(service, first.session.id)
+
+    with pytest.raises(AuditIntegrityError, match="not valid JSON"):
+        await service.fork_session(
+            second_fence,
+            fork_message_id=second_fork_message.id,
+            new_message_content="second edit",
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("winner", ("archive", "stage"))
 async def test_parent_archive_and_fork_staging_serialize_under_lock_contention(
     durable_engine,

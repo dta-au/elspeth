@@ -9,7 +9,6 @@ Layer: L3 (application).
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from collections.abc import Mapping
@@ -29,14 +28,12 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 if TYPE_CHECKING:
     from elspeth.web.composer.guided.state_machine import TerminalState
 
-# Load both static prompt sources and their individual hashes atomically. The
-# compatibility export ``PIPELINE_COMPOSER_SKILL_HASH`` below covers the exact
-# no-deployment rendering. Stateful services derive their instance hash after
-# adding the deployment overlay. These source hashes let service startup detect
-# on-disk drift in either static file.
+# Load both static prompt sources and their individual hashes atomically.
+# Stateful services derive their instance hash after adding the deployment
+# overlay. These source hashes let service startup detect on-disk drift in
+# either static file.
 _PIPELINE_SKILL, PIPELINE_COMPOSER_INTERACTION_SKILL_HASH = load_skill_with_hash("pipeline_composer")
 PIPELINE_COMPOSER_SKILL_NAME: str = "pipeline_composer"
-PIPELINE_COMPOSER_SKILL_FILENAME: str = f"{PIPELINE_COMPOSER_SKILL_NAME}.md"
 PIPELINE_CAPABILITIES_SKILL_NAME: str = "pipeline_capabilities"
 _PIPELINE_CAPABILITIES_SKILL, PIPELINE_CAPABILITIES_SKILL_HASH = load_skill_with_hash(PIPELINE_CAPABILITIES_SKILL_NAME)
 
@@ -58,7 +55,6 @@ def _strip_advisor_disabled_fallback(text: str) -> str:
 
 
 SYSTEM_PROMPT = render_with_pipeline_capabilities(_strip_advisor_disabled_fallback(_PIPELINE_SKILL))
-PIPELINE_COMPOSER_SKILL_HASH = hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
 
 
 def render_system_prompt(data_dir: str | None = None) -> str:

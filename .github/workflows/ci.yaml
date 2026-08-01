@@ -104,6 +104,25 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: uv sync --frozen --all-extras
 
+      - name: Reject touched or broadened permanent multi-rule per-file blankets
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        env:
+          BASELINE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [[ "$BASELINE_REF" == "0000000000000000000000000000000000000000" ]]; then
+            # A protected release branch's creation push has no event.before.
+            # Compare its first delivered commit with that commit's first parent.
+            git fetch --no-tags --depth=2 origin "$GITHUB_SHA"
+            BASELINE_REF="$(git rev-parse "$GITHUB_SHA^")"
+          else
+            git fetch --no-tags --depth=1 origin "$BASELINE_REF"
+          fi
+          PYTHONPATH=elspeth-lints/src uv run python -m elspeth_lints.core.cli \
+            check-per-file-blanket-ratchet \
+            --baseline-ref "$BASELINE_REF" \
+            --allowlist-root config/cicd \
+            --repo-root .
+
       - name: Reject unverified PR signed allowlist edits
         if: ${{ github.event_name == 'pull_request' }}
         working-directory: ${{ env.CI_CHECKOUT_PATH }}

@@ -128,21 +128,16 @@ def _create_session_tables(bind: Engine | Connection, *, checkfirst: bool = True
     schema.
     """
     with _SESSION_METADATA_CREATE_LOCK:
-        missing = object()
         create_rules: list[tuple[Any, object]] = []
         for table in metadata.tables.values():
             for constraint in table.constraints:
-                create_rules.append((constraint, getattr(constraint, "_create_rule", missing)))
+                create_rules.append((constraint, constraint._create_rule))
 
         try:
             metadata.create_all(bind=bind, checkfirst=checkfirst)
         finally:
             for constraint, create_rule in create_rules:
-                if create_rule is missing:
-                    if hasattr(constraint, "_create_rule"):
-                        del constraint._create_rule
-                else:
-                    constraint._create_rule = create_rule
+                constraint._create_rule = create_rule
 
 
 def initialize_session_schema(engine: Engine) -> None:

@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from elspeth.web.composer.guided.protocol import TurnType, WireStageData, validate_payload
+from elspeth.web.composer.state import NodeSpec
 
 
 def _wire_payload() -> WireStageData:
@@ -190,3 +191,49 @@ def test_node_cardinality_shuts_down_concrete_llm_probe_pool(monkeypatch: pytest
     transform = tracking.instances[0]._delegate
     assert transform._query_executor is not None
     assert transform._query_executor._shutdown_event.is_set()
+
+
+def test_node_cardinality_preserves_inspection_failure_when_close_also_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cleanup failure is secondary to the cardinality inspection failure."""
+    from elspeth.web.composer.guided.emitters import _node_cardinality
+
+    class FailingTransform:
+        @property
+        def creates_tokens(self) -> bool:
+            raise ValueError("primary cardinality inspection failure")
+
+        @property
+        def can_drop_rows(self) -> bool:
+            return False
+
+        def close(self) -> None:
+            raise RuntimeError("secondary transform close failure")
+
+    class FailingManager:
+        def create_transform(self, _plugin: str, _options: object) -> FailingTransform:
+            return FailingTransform()
+
+    monkeypatch.setattr(
+        "elspeth.plugins.infrastructure.manager.get_shared_plugin_manager",
+        lambda: FailingManager(),
+    )
+    node = NodeSpec(
+        id="probe",
+        node_type="transform",
+        plugin="probe",
+        input="input",
+        on_success="output",
+        on_error="discard",
+        options={},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+    with pytest.raises(ValueError, match="primary cardinality inspection failure") as exc_info:
+        _node_cardinality(node, node)
+
+    assert any("transform.close failed during cardinality inspection: RuntimeError" in note for note in exc_info.value.__notes__)

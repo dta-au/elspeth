@@ -20,6 +20,7 @@ noise; production deployments should add a per-user-per-day cap.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from uuid import UUID
 
@@ -49,6 +50,18 @@ _SURROUNDING_TITLE_QUOTES = (
     chr(0x2018),
     chr(0x2019),
 )
+_MISSING_PROVIDER_FIELD = object()
+
+
+class _MalformedAutoTitleResponseError(Exception):
+    """Owned classification for an unusable external completion shape."""
+
+
+@dataclass(frozen=True, slots=True)
+class _AdmittedAutoTitleCompletion:
+    """Owned values admitted from one external LiteLLM response."""
+
+    content: str | None
 
 
 def _auto_title_exception_class(exc: BaseException) -> str:
@@ -58,6 +71,8 @@ def _auto_title_exception_class(exc: BaseException) -> str:
         return "CancelledError"
     if isinstance(exc, LiteLLMAPIError):
         return "LiteLLMAPIError"
+    if isinstance(exc, _MalformedAutoTitleResponseError):
+        return "MalformedResponseError"
     return "other"
 
 
@@ -84,6 +99,20 @@ def _sanitize_title(raw: str) -> str:
             cleaned = cleaned[:-1]
     cleaned = " ".join(cleaned.split())
     return cleaned[:_AUTO_TITLE_MAX_LEN]
+
+
+def _admit_auto_title_completion(response: object) -> _AdmittedAutoTitleCompletion:
+    """Parse the needed LiteLLM values into an owned completion carrier."""
+    choices = getattr(response, "choices", _MISSING_PROVIDER_FIELD)
+    if type(choices) is not list or not choices:
+        raise _MalformedAutoTitleResponseError from None
+    message = getattr(choices[0], "message", _MISSING_PROVIDER_FIELD)
+    if message is _MISSING_PROVIDER_FIELD:
+        raise _MalformedAutoTitleResponseError from None
+    content = getattr(message, "content", _MISSING_PROVIDER_FIELD)
+    if content is _MISSING_PROVIDER_FIELD or (content is not None and type(content) is not str):
+        raise _MalformedAutoTitleResponseError from None
+    return _AdmittedAutoTitleCompletion(content=content)
 
 
 async def maybe_auto_title_session(
@@ -127,14 +156,14 @@ async def maybe_auto_title_session(
     _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
     try:
         response = await _litellm_acompletion(**kwargs)
-        content = response.choices[0].message.content
-        if not isinstance(content, str):
+        admitted = _admit_auto_title_completion(response)
+        if admitted.content is None:
             return
-        title = _sanitize_title(content)
+        title = _sanitize_title(admitted.content)
         if not title:
             return
         await service.update_session_title(session_id, title)
-    except (LiteLLMAPIError, TimeoutError, asyncio.CancelledError) as exc:
+    except (LiteLLMAPIError, TimeoutError, asyncio.CancelledError, _MalformedAutoTitleResponseError) as exc:
         # Auto-titling is best-effort UI metadata for expected provider/
         # scheduling failures, but those failures still need an operational
         # signal so "provider declined" does not look identical to "feature

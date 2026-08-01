@@ -1,9 +1,7 @@
 """HTTP lifecycle adapter for retry-safe composer mutations.
 
-This module deliberately sits outside ``composer/guided.py``.  Several legacy
-guided handlers carry governance fingerprints whose AST locations are stable;
-centralising the retry protocol here avoids inserting module-level definitions
-above those handlers while the pre-release cutover replaces them.
+This module centralises the retry protocol shared by guided mutation routes:
+lease admission, replay, takeover, settlement, and stable HTTP failure mapping.
 """
 
 from __future__ import annotations

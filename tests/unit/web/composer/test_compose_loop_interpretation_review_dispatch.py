@@ -51,11 +51,13 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationKind,
     InterpretationSource,
 )
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.prompts import render_system_prompt
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.service import (
     AdvisorCheckpointVerdict,
+    ComposeLoopTestResult,
     ComposerAvailability,
     ComposerServiceImpl,
     _pending_interpretation_review_repair_message,
@@ -81,6 +83,7 @@ from elspeth.web.interpretation_state import (
 )
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
+    session_operation_fences_table,
     sessions_table,
     skill_markdown_history_table,
 )
@@ -595,6 +598,51 @@ def _build_composer(
     )
 
 
+async def _run_one_turn_with_compose_authority(
+    composer: ComposerServiceImpl,
+    sessions_service: SessionServiceImpl,
+    session_id: UUID,
+    **kwargs: Any,
+) -> ComposeLoopTestResult:
+    """Drive the test seam under the same exact COMPOSE lease as the live route."""
+    # These legacy tests seed ``sessions`` directly. Production session creation
+    # also leaves a released CREATE fence that later operations advance; mirror
+    # that retained authority row before acquiring the COMPOSE lease.
+    created_at = datetime.now(UTC)
+    with sessions_service._engine.begin() as conn:
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=str(session_id),
+                operation_id=f"create-{session_id}",
+                lease_token=f"create-token-{session_id}",
+                operation_kind=SessionOperationKind.CREATE.value,
+                owner_instance_id="test-owner",
+                operation_epoch=1,
+                lease_expires_at=created_at,
+                released_at=created_at,
+            )
+        )
+    context = await sessions_service._run_sync(
+        lambda: sessions_service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await composer._run_one_turn_for_test(
+            session_id=str(session_id),
+            session_operation_context=context,
+            **kwargs,
+        )
+    finally:
+        await sessions_service._run_sync(
+            sessions_service.session_operation_authority.release,
+            context,
+        )
+
+
 def _set_pipeline_clean_llm_node_args() -> dict[str, Any]:
     """A ``set_pipeline`` whose LLM node has a CLEAN prompt_template (no bare
     ``{{interpretation:...}}`` token). The node still auto-stages an
@@ -753,10 +801,9 @@ async def test_compose_loop_dispatches_request_interpretation_review(
     # ``model_version`` was sourced from ``response.model``; with the
     # fixed fake response model this is a deterministic string.
     assert event.model_version == "anthropic/claude-opus-4-7-20260101"
-    # The skill hash matches the in-memory cached value from prompts.py.
-    from elspeth.web.composer.prompts import PIPELINE_COMPOSER_SKILL_HASH
-
-    assert event.composer_skill_hash == PIPELINE_COMPOSER_SKILL_HASH
+    # The event carries the exact prompt bytes used by this no-overlay service.
+    expected_hash = hashlib.sha256(render_system_prompt(None).encode("utf-8")).hexdigest()
+    assert event.composer_skill_hash == expected_hash
 
 
 @pytest.mark.asyncio
@@ -852,9 +899,11 @@ async def test_fresh_session_set_pipeline_then_request_interpretation_review_per
         ]
     )
 
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=None,
     )
 
@@ -944,9 +993,11 @@ async def test_successful_interpretation_review_returns_user_handoff_without_ext
         ]
     )
 
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=None,
         message="create a workflow that rates how cool pages are",
     )
@@ -1065,9 +1116,11 @@ async def test_pending_interpretation_placeholder_without_event_forces_review_to
         ]
     )
 
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=None,
         message="create a workflow that rates how cool pages are",
     )
@@ -1149,9 +1202,11 @@ async def test_orphaned_interpretation_placeholder_fails_turn_closed_after_repai
         ]
     )
 
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=None,
         message="create a workflow that rates how cool pages are",
     )
@@ -1424,9 +1479,11 @@ async def test_budget_exhaustion_finalize_auto_surfaces_prompt_template(
         ]
     )
 
-    await composer._run_one_turn_for_test(
+    await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=None,
         message="summarise each row",
     )
@@ -1475,9 +1532,11 @@ async def test_budget_exhaustion_finalize_fails_closed_on_bare_token_orphan(
         ]
     )
 
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=None,
         message="create a workflow that rates how cool pages are",
     )
@@ -1950,9 +2009,11 @@ async def test_pending_interpretation_event_with_duplicate_placeholder_forces_pr
         ]
     )
 
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_state=state,
         message="create a workflow that rates how cool pages are",
@@ -2030,9 +2091,11 @@ async def test_missing_state_interpretation_review_arg_error_forces_staging_retr
         ]
     )
 
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=None,
         message="create a workflow that rates how cool pages are",
     )
@@ -2280,9 +2343,7 @@ async def test_f5c_skill_markdown_history_upsert_idempotent(
         rows = conn.execute(select(skill_markdown_history_table)).fetchall()
     assert len(rows) == 1
     row = rows[0]
-    from elspeth.web.composer.prompts import PIPELINE_COMPOSER_SKILL_HASH
-
-    assert row.hash == PIPELINE_COMPOSER_SKILL_HASH
+    assert row.hash == hashlib.sha256(row.content.encode("utf-8")).hexdigest()
     assert row.filename == "pipeline_composer.md"
     assert row.content.startswith("#") or row.content  # non-empty markdown
     assert len(row.content) > 100  # the real skill is ~24KB

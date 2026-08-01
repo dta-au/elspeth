@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
@@ -44,6 +44,7 @@ from elspeth.web.sessions.schemas import (
     InterpretationResolveRequest,
     InterpretationResolveResponse,
     ListInterpretationEventsResponse,
+    OptOutSummaryResponse,
 )
 
 
@@ -61,14 +62,14 @@ def _valid_event_kwargs() -> dict[str, object]:
         "affected_node_id": "transform_rate_coolness",
         "tool_call_id": "call_abc123",
         "user_term": "cool",
-        "kind": "vague_term",
+        "kind": InterpretationKind.VAGUE_TERM,
         "llm_draft": "visually appealing and well-organised",
         "accepted_value": "visually appealing and well-organised",
-        "choice": "accepted_as_drafted",
+        "choice": InterpretationChoice.ACCEPTED_AS_DRAFTED,
         "created_at": datetime(2026, 5, 18, 12, 0, 0, tzinfo=UTC),
         "resolved_at": datetime(2026, 5, 18, 12, 0, 5, tzinfo=UTC),
         "actor": "user:abc",
-        "interpretation_source": "user_approved",
+        "interpretation_source": InterpretationSource.USER_APPROVED,
         "model_identifier": "anthropic/claude-opus-4-7",
         "model_version": "claude-opus-4-7-20260101",
         "provider": "anthropic",
@@ -79,6 +80,21 @@ def _valid_event_kwargs() -> dict[str, object]:
         "runtime_model_version_at_resolve": "claude-opus-4-7-20260101",
         "resolved_prompt_template_hash": "c" * 64,
     }
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    (
+        InterpretationEventResponse,
+        InterpretationResolveResponse,
+        InterpretationOptOutResponse,
+        ListInterpretationEventsResponse,
+        OptOutSummaryResponse,
+    ),
+)
+def test_interpretation_response_models_are_strict_and_extra_forbid(model_type: type[BaseModel]) -> None:
+    assert model_type.model_config.get("strict") is True
+    assert model_type.model_config.get("extra") == "forbid"
 
 
 class TestInterpretationEventResponse:
@@ -116,8 +132,8 @@ class TestInterpretationEventResponse:
             runtime_model_identifier_at_resolve=None,
             runtime_model_version_at_resolve=None,
             resolved_prompt_template_hash=None,
-            choice="opted_out",
-            interpretation_source="auto_interpreted_opt_out",
+            choice=InterpretationChoice.OPTED_OUT,
+            interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT,
         )
         event = InterpretationEventResponse(**kwargs)  # type: ignore[arg-type]
         assert event.choice == "opted_out"

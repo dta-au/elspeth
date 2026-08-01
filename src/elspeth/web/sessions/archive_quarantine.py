@@ -47,6 +47,14 @@ class ArchiveQuarantineCollisionError(ArchiveQuarantineIntegrityError):
     """A filesystem object collided with a required quarantine path."""
 
 
+try:
+    _FILE_READ_FLAGS: Final = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    _FILE_CREATE_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    _DIRECTORY_READ_FLAGS: Final = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+except AttributeError as exc:
+    raise ArchiveQuarantineIntegrityError("archive quarantine requires O_DIRECTORY and O_NOFOLLOW support for symlink-safe access") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class ArchiveQuarantineIdentity:
     """Stable identity for one fenced archive operation."""
@@ -613,11 +621,8 @@ def _path_lstat(path: Path) -> os.stat_result | None:
 
 
 def _load_manifest_file(path: Path) -> ArchiveQuarantineManifest:
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(path, _FILE_READ_FLAGS)
     except OSError as exc:
         raise ArchiveQuarantineIntegrityError("unable to open archive quarantine manifest") from exc
     try:
@@ -652,11 +657,8 @@ def _require_manifest_identity(
 
 
 def _write_manifest_temp(path: Path, encoded: bytes) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags, 0o600)
+        descriptor = os.open(path, _FILE_CREATE_FLAGS, 0o600)
     except FileExistsError as exc:
         raise ArchiveQuarantineCollisionError("manifest temp appeared before exclusive creation") from exc
     except OSError as exc:
@@ -856,19 +858,14 @@ def _open_directory_beneath(base: Path, target: Path) -> int:
         relative = target_absolute.relative_to(base_absolute)
     except ValueError as exc:
         raise ArchiveQuarantineIntegrityError("rename directory escaped its common filesystem root") from exc
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(base_absolute, flags)
+        descriptor = os.open(base_absolute, _DIRECTORY_READ_FLAGS)
     except OSError as exc:
         raise ArchiveQuarantineCollisionError("rename root is not a stable real directory") from exc
     try:
         for segment in relative.parts:
             try:
-                child_descriptor = os.open(segment, flags, dir_fd=descriptor)
+                child_descriptor = os.open(segment, _DIRECTORY_READ_FLAGS, dir_fd=descriptor)
             except OSError as exc:
                 if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
                     raise ArchiveQuarantineCollisionError("rename path contains a substituted non-directory component") from exc
@@ -978,15 +975,10 @@ def _ensure_directory_entry(
     if stat.S_ISLNK(entry_stat.st_mode) or not stat.S_ISDIR(entry_stat.st_mode):
         raise ArchiveQuarantineCollisionError(f"{role} is not a real directory")
 
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
         descriptor = os.open(
             name,
-            flags,
+            _DIRECTORY_READ_FLAGS,
             dir_fd=parent_descriptor,
         )
     except OSError as exc:
@@ -1086,15 +1078,10 @@ def _retire_empty_session_directory_locked(
     if stat.S_ISLNK(session_stat.st_mode) or not stat.S_ISDIR(session_stat.st_mode):
         raise ArchiveQuarantineCollisionError("archive quarantine session entry is not a real directory")
 
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
         session_descriptor = os.open(
             paths.session_dir.name,
-            flags,
+            _DIRECTORY_READ_FLAGS,
             dir_fd=version_descriptor,
         )
     except FileNotFoundError:
@@ -1159,12 +1146,7 @@ def _fsync_directory_descriptor(descriptor: int) -> None:
 
 def _fsync_directory(path: Path) -> None:
     _require_existing_directory(path, role="fsync directory")
-    flags = os.O_RDONLY | os.O_CLOEXEC
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags)
+    descriptor = os.open(path, _DIRECTORY_READ_FLAGS)
     try:
         os.fsync(descriptor)
     finally:

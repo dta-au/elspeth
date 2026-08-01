@@ -7,8 +7,9 @@ import hashlib
 import importlib.util
 import os
 import stat
+import sys
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Literal
@@ -39,6 +40,17 @@ class _SQLiteFlockLeaseState(threading.local):
 
 
 _SQLITE_FLOCK_LEASE_STATE = _SQLiteFlockLeaseState()
+
+
+def _run_lock_cleanup(action: Callable[[], None], *, label: str) -> None:
+    """Run one lock cleanup without replacing an active primary failure."""
+    primary_exc = sys.exception()
+    try:
+        action()
+    except BaseException as cleanup_exc:
+        if primary_exc is None:
+            raise
+        primary_exc.add_note(f"{label} also failed ({type(cleanup_exc).__name__})")
 
 
 class _FilesystemFlockLeaseState(threading.local):
@@ -99,9 +111,15 @@ def filesystem_session_lock(root: Path, session_id: str) -> Iterator[None]:
                 yield
             finally:
                 del leases[lease_key]
-                _fcntl.flock(descriptor, _fcntl.LOCK_UN)
+                _run_lock_cleanup(
+                    lambda: _fcntl.flock(descriptor, _fcntl.LOCK_UN),
+                    label="Filesystem session lock release",
+                )
         finally:
-            os.close(descriptor)
+            _run_lock_cleanup(
+                lambda: os.close(descriptor),
+                label="Filesystem session lock descriptor close",
+            )
 
 
 def database_lock_identity(engine: Engine) -> tuple[str, ...]:
@@ -185,9 +203,15 @@ def sqlite_process_session_lock(engine: Engine, session_id: str) -> Iterator[Non
                 yield
             finally:
                 del leases[lease_key]
-                _fcntl.flock(descriptor, _fcntl.LOCK_UN)
+                _run_lock_cleanup(
+                    lambda: _fcntl.flock(descriptor, _fcntl.LOCK_UN),
+                    label="SQLite session lock release",
+                )
         finally:
-            os.close(descriptor)
+            _run_lock_cleanup(
+                lambda: os.close(descriptor),
+                label="SQLite session lock descriptor close",
+            )
 
 
 @contextlib.contextmanager
@@ -247,11 +271,14 @@ def sqlite_transaction_session_lock(conn: Connection, engine: Engine, session_id
         if release_state["released"]:
             return
         release_state["released"] = True
-        lock_stack.close()
+        _run_lock_cleanup(lock_stack.close, label="SQLite transaction session lock release")
 
     def _remove_listener(identifier: Literal["commit", "rollback"], fn: Any) -> None:
-        if event.contains(conn, identifier, fn):
-            event.remove(conn, identifier, fn)
+        def _discard_listener() -> None:
+            if event.contains(conn, identifier, fn):
+                event.remove(conn, identifier, fn)
+
+        _run_lock_cleanup(_discard_listener, label=f"SQLite transaction {identifier} listener cleanup")
 
     def _release_on_commit(_conn: Connection) -> None:
         _release(_conn)
@@ -279,9 +306,8 @@ def postgres_session_advisory_lock(conn: Connection, session_id: str) -> Iterato
         (ELSPETH_SESSIONS_LOCK_CLASSID, session_id),
     )
     conn.commit()
-    try:
-        yield
-    finally:
+
+    def _release() -> None:
         if conn.in_transaction():
             conn.rollback()
         unlocked = conn.exec_driver_sql(
@@ -291,3 +317,8 @@ def postgres_session_advisory_lock(conn: Connection, session_id: str) -> Iterato
         conn.commit()
         if unlocked is not True:
             raise AuditIntegrityError("PostgreSQL session advisory lock was not held during release")
+
+    try:
+        yield
+    finally:
+        _run_lock_cleanup(_release, label="PostgreSQL session advisory lock release")

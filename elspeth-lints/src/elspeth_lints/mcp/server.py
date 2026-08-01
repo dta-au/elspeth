@@ -74,6 +74,12 @@ class _ServerContext:
     allowlist_dir: Path
     staged_dir: Path
 
+    def __post_init__(self) -> None:
+        """Freeze staging scope in absolute coordinates at server creation."""
+        object.__setattr__(self, "root", Path(self.root).resolve())
+        object.__setattr__(self, "allowlist_dir", Path(self.allowlist_dir).resolve())
+        object.__setattr__(self, "staged_dir", Path(self.staged_dir).resolve())
+
 
 @dataclass(frozen=True, slots=True)
 class _ToolOutcome:
@@ -279,23 +285,6 @@ def _finding_canonical_key(finding: Any) -> str:
     return key
 
 
-def _live_findings_for_tree(root: Path) -> list[Any]:
-    """Enumerate live tier_model findings across ``root`` via the *shared* helper.
-
-    Uses the same ``scan_single_file_findings`` (scan_file + scan_layer_imports_file)
-    that ``verify_bundle_against_tree`` calls per action -- so stage_scan and the
-    from-tree verify cannot drift on the scanner set -- and delegates file
-    discovery to the exact iterator used by the tier directory scanners.
-    """
-    from elspeth_lints.core.tier_model_scan import scan_single_file_findings
-    from elspeth_lints.rules.trust_tier.tier_model.rule import iter_scannable_python_files
-
-    findings: list[Any] = []
-    for py_file in sorted(iter_scannable_python_files(root)):
-        findings.extend(scan_single_file_findings(target_file=py_file, root=root))
-    return findings
-
-
 def _new_judgment_action_from_finding(finding: Any) -> Any:
     from elspeth_lints.core.review_bundle import BundleAction
 
@@ -314,17 +303,16 @@ def _new_judgment_action_from_finding(finding: Any) -> Any:
     )
 
 
-def _build_scan_actions(ctx: _ServerContext) -> list[Any]:
+def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
     """Survey the tree+allowlist into non-overlapping bundle actions (key-free, no LLM).
 
     Routing is explicit and non-overlapping:
 
     * ``drift_repair`` / ``stale_delete`` -- from ``diagnose_judge_signatures``
       (signable drift vs non-signable orphan statuses on judge-gated entries);
-    * ``rotation`` -- ``scan_for_rotations(exclude_judge_gated=True).rotations``
-      ONLY (the filtered scan cannot raise on the mostly-judge-gated corpus;
-      ``.new_findings``/``.ambiguous`` on a *filtered* plan are pollution and are
-      never read);
+    * ``rotation`` -- remove findings already assigned to judge-gated diagnosis,
+      then plan the residual pre-judge population; residual ambiguity fails
+      staging because no deterministic action can represent it safely;
     * ``new_judgment`` -- live findings covered by neither a per-file rule nor
       an identity-prefix in the **full, unfiltered** allowlist (the double-route
       guard: an fp-shifted judge-gated entry's live finding shares its prefix
@@ -337,11 +325,8 @@ def _build_scan_actions(ctx: _ServerContext) -> list[Any]:
         diagnose_judge_signatures,
     )
     from elspeth_lints.core.review_bundle import BundleAction
-    from elspeth_lints.rules.trust_tier.tier_model.rotate import (
-        _finding_covered_by_per_file_rule,
-        identity_prefix,
-        scan_for_rotations,
-    )
+    from elspeth_lints.core.tier_model_scan import census_tree_targets, plan_non_judge_rotations
+    from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
     from elspeth_lints.rules.trust_tier.tier_model.rule import _load_tier_model_allowlist
 
     actions: list[Any] = []
@@ -362,17 +347,8 @@ def _build_scan_actions(ctx: _ServerContext) -> list[Any]:
         elif item.status in _STALE_DELETE_ORPHAN_STATUSES:
             actions.append(BundleAction(lane="resign", kind="stale_delete", key=item.key, source_file=item.source_file))
 
-    # rotation lane: non-judge-gated re-binds only. Only ``.rotations`` is
-    # authoritative on a filtered scan.
-    rotation_plan = scan_for_rotations(
-        source_root=ctx.root,
-        allowlist_path=ctx.allowlist_dir,
-        exclude_judge_gated=True,
-    )
-    for rotation in rotation_plan.rotations:
-        actions.append(BundleAction(lane="resign", kind="rotation", key=rotation.old_key, source_file=rotation.entry_source_file))
-
-    # new_judgment lane: coverage check against the FULL, unfiltered allowlist.
+    # Scan once, classify full coverage, then remove findings already assigned
+    # to judge-gated diagnosis before planning the residual pre-judge lane.
     allowlist = _load_tier_model_allowlist(ctx.allowlist_dir)
     covered_prefixes: set[str] = set()
     for entry in allowlist.entries:
@@ -380,21 +356,35 @@ def _build_scan_actions(ctx: _ServerContext) -> list[Any]:
             covered_prefixes.add(identity_prefix(entry.key))
         except ValueError:
             continue  # a malformed (non-canonical) key cannot own a prefix
-    seen_new: set[str] = set()
-    for finding in _live_findings_for_tree(ctx.root):
-        if _finding_covered_by_per_file_rule(finding, allowlist.per_file_rules):
-            continue
-        canonical_key = _finding_canonical_key(finding)
-        try:
-            prefix = identity_prefix(canonical_key)
-        except ValueError:
-            continue
-        if prefix in covered_prefixes or canonical_key in seen_new:
-            continue
-        seen_new.add(canonical_key)
+    target_scan = census_tree_targets(
+        root=ctx.root,
+        covered_prefixes=covered_prefixes,
+        per_file_rules=allowlist.per_file_rules,
+    )
+    rotation_plan = plan_non_judge_rotations(
+        findings=target_scan.findings,
+        allowlist=allowlist,
+        diagnosis_items=diagnosis.items,
+    )
+    if rotation_plan.ambiguous:
+        groups = ", ".join(
+            f"{group.prefix} ({group.finding_count} finding(s), {group.entry_count} entry/entries)" for group in rotation_plan.ambiguous
+        )
+        raise ValueError(f"stage_scan found ambiguous non-judge target group(s): {groups}")
+    for rotation in rotation_plan.rotations:
+        actions.append(BundleAction(lane="resign", kind="rotation", key=rotation.old_key, source_file=rotation.entry_source_file))
+
+    # new_judgment lane: coverage check against the FULL, unfiltered allowlist.
+    for finding in target_scan.uncovered_findings:
         actions.append(_new_judgment_action_from_finding(finding))
 
     actions.sort(key=lambda action: (action.kind, action.key))
+    return actions, target_scan.census
+
+
+def _build_scan_actions(ctx: _ServerContext) -> list[Any]:
+    """Compatibility wrapper returning only the deterministic action inventory."""
+    actions, _census = _build_scan_plan(ctx)
     return actions
 
 
@@ -422,7 +412,7 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     staged_by_arg = arguments.get("staged_by")
     staged_by = staged_by_arg if isinstance(staged_by_arg, str) and staged_by_arg else "elspeth-judge-agent"
 
-    actions = build_scan_actions(root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    actions, target_census = _build_scan_plan(ctx)
     bundle = ReviewBundle(
         bundle_id=bundle_id,
         schema_version=1,
@@ -448,6 +438,12 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         "actions_total": len(bundle.actions),
         "lane_counts": lane_counts,
         "kind_counts": kind_counts,
+        "target_census": {
+            "raw_target_count": target_census.raw_target_count,
+            "exact_covered_count": target_census.exact_covered_count,
+            "per_file_covered_count": target_census.per_file_covered_count,
+            "uncovered_count": target_census.uncovered_count,
+        },
         "sign_bundle_command": _sign_bundle_command(ctx, path),
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"

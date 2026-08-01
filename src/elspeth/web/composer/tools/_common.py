@@ -2676,16 +2676,14 @@ class _SetPipelineNodePayload(TypedDict):
 def _serialize_authoring_options(options: Mapping[str, Any]) -> dict[str, JsonValue]:
     """Strip all resolver-owned review fields from public authoring shells."""
     serialized = cast(dict[str, JsonValue], deep_thaw(serialize_authoring_review_options(options)))
-    requirements = serialized.get(INTERPRETATION_REQUIREMENTS_KEY)
-    if isinstance(requirements, list):
+    if INTERPRETATION_REQUIREMENTS_KEY in serialized:
+        requirements = cast(list[dict[str, JsonValue]], serialized[INTERPRETATION_REQUIREMENTS_KEY])
         serialized[INTERPRETATION_REQUIREMENTS_KEY] = [
             {
                 "kind": requirement["kind"],
                 "user_term": requirement["user_term"],
                 "draft": requirement["draft"],
             }
-            if isinstance(requirement, Mapping)
-            else requirement
             for requirement in requirements
         ]
     return serialized

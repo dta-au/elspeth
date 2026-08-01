@@ -94,6 +94,7 @@ from .._helpers import (
     UserIdentity,
     _cancel_on_client_disconnect,
     _composer_progress_sink,
+    _failure_log_request_id,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
     _inspect_latest_ready_session_blob,
@@ -1712,7 +1713,7 @@ async def post_guided_chat_schema8(
                         # correlates this log line to the response's
                         # X-Request-ID; lenient read so a missing middleware
                         # cannot break the error path.
-                        request_id=getattr(request.state, "request_id", None),
+                        request_id=_failure_log_request_id(request),
                     )
                 try:
                     failed = await service.fail_guided_operation_with_audit(

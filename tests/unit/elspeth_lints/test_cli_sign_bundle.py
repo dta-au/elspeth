@@ -481,6 +481,26 @@ def test_sign_bundle_aborts_on_tree_drift_mismatch(tmp_path: Path, capsys: pytes
     assert yaml_path.read_text(encoding="utf-8") == before  # no write
 
 
+def test_sign_bundle_aborts_before_transaction_when_target_census_is_incomplete(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, ()))
+    before = _tree_bytes(allowlist_dir)
+
+    with _patch_judge(_accept_all) as judge_calls:
+        exit_code = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert exit_code == 2
+    assert judge_calls == []
+    assert _tree_bytes(allowlist_dir) == before
+    assert not (allowlist_dir.parent / ".sign-bundle-transactions").exists()
+    assert "target census missing justify action" in capsys.readouterr().err
+
+
 # =========================================================================== #
 # Task 2.3 -- resign lane (drift_repair re-judges; rotation/stale_delete no judge)
 # =========================================================================== #
@@ -1115,12 +1135,18 @@ def test_sign_bundle_rejects_bundle_replaced_after_confirmation(
     approved = _bundle(
         root,
         allowlist_dir,
-        (BundleAction(lane="resign", kind="rotation", key=gadget_stale, source_file="gadget.yaml"),),
+        (
+            BundleAction(lane="resign", kind="rotation", key=gadget_stale, source_file="gadget.yaml"),
+            BundleAction(lane="resign", kind="rotation", key=sprocket_stale, source_file="sprocket.yaml"),
+        ),
     )
     replacement = _bundle(
         root,
         allowlist_dir,
-        (BundleAction(lane="resign", kind="rotation", key=sprocket_stale, source_file="sprocket.yaml"),),
+        (
+            BundleAction(lane="resign", kind="rotation", key=sprocket_stale, source_file="sprocket.yaml"),
+            BundleAction(lane="resign", kind="rotation", key=gadget_stale, source_file="gadget.yaml"),
+        ),
     )
     bundle_path = _write_bundle_file(tmp_path, approved)
     approved_bytes = bundle_path.read_bytes()
@@ -1204,18 +1230,8 @@ def test_manifest_rejects_authenticated_non_integer_directory_identity(
         sign_bundle_transaction.load_manifest(tx_path)
 
 
-def test_sign_bundle_rotation_execute_minimal_plan_no_unfiltered_rescan(tmp_path: Path) -> None:
-    """Third-consumer regression: no unfiltered re-scan at execute + no over-application.
-
-    Populations: (1) a judge-gated, fp-SHIFTED NON-action entry in the scanned
-    dir (would crash an unfiltered whole-dir scan at ``plan_rotations``);
-    (2) ONE non-judge-gated rotation that IS the staged action; (3) a SECOND,
-    surveyed-but-UNSTAGED non-judge-gated rotation. Against the pre-fix lane that
-    copies ``_run_rotate``'s default unfiltered ``scan_for_rotations`` this would
-    ``RuntimeError`` at execute (population 1) and/or over-apply population (3);
-    the fixed lane reuses the carried filtered plan and applies a one-``Rotation``
-    minimal plan, so it neither raises nor touches population (3).
-    """
+def test_sign_bundle_rejects_incomplete_rotation_inventory_before_execute(tmp_path: Path) -> None:
+    """The complete census rejects omitted drift and rotation work before writes."""
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
 
@@ -1228,9 +1244,9 @@ def test_sign_bundle_rotation_execute_minimal_plan_no_unfiltered_rescan(tmp_path
     # (2) staged non-judge-gated rotation.
     _write_source(root, "plugins/gadget.py", "gadget")
     gadget_finding = _live_finding(root, "plugins/gadget.py")
-    gadget_live = _canonical_key(gadget_finding)
     gadget_stale = _stale_rotation_key(gadget_finding, fp="deadbeefdeadbeef")
     _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=gadget_stale)
+    gadget_before = (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
 
     # (3) surveyed-but-unstaged non-judge-gated rotation.
     _write_source(root, "plugins/sprocket.py", "sprocket")
@@ -1244,11 +1260,8 @@ def test_sign_bundle_rotation_execute_minimal_plan_no_unfiltered_rescan(tmp_path
 
     rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--rotation-log", str(tmp_path / "rotations.log"))))
 
-    assert rc == 0  # (a) did NOT raise on the judge-gated fp-shifted non-action
-    gadget_text = (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8")
-    assert f"- key: {gadget_live}" in gadget_text  # staged key rotated
-    assert gadget_stale not in gadget_text
-    # (b) the unstaged surveyed rotation is byte-untouched -> a minimal one-Rotation plan was built.
+    assert rc == 2
+    assert (allowlist_dir / "gadget.yaml").read_text(encoding="utf-8") == gadget_before
     assert (allowlist_dir / "sprocket.yaml").read_text(encoding="utf-8") == sprocket_before
 
 
@@ -2441,13 +2454,12 @@ def _dup_key_signed_block(key: str) -> list[str]:
 
 
 def test_sign_bundle_dup_key_bundle_aborts(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    """Dup-key dataloss trap: apply_plan refuses span!=1 -> caught -> return 2, both copies intact.
+    """A duplicate-key bundle fails closed before either action can mutate it.
 
     The same key K appears twice -- once judge-gated (filtered out of the
-    non-judge-gated rotation survey, so verify still sees ONE clean rotation) and
-    once non-judge-gated (the staged rotation). At write time ``apply_plan`` finds
-    K twice in the text and raises 'occurs 2x'; the narrow catch converts it to a
-    clean return 2 rather than deleting both copies.
+    non-judge-gated rotation survey) and once non-judge-gated (the staged
+    rotation). The full worklist also sees the signed copy as an orphan, so a
+    rotation-only bundle is rejected before transaction creation.
     """
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
@@ -2465,7 +2477,7 @@ def test_sign_bundle_dup_key_bundle_aborts(tmp_path: Path, capsys: pytest.Captur
 
     assert rc == 2
     assert yaml_path.read_text(encoding="utf-8").count(f"- key: {stale_key}") == 2  # both copies preserved
-    assert "occurs" in capsys.readouterr().err.lower()
+    assert "missing stale_delete action" in capsys.readouterr().err
 
 
 def test_sign_bundle_noncanonical_allowlist_skips_baseline_regen(

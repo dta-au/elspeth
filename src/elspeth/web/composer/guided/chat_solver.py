@@ -725,11 +725,78 @@ def _parse_deferred_intent_management_tool_arguments(arguments: object) -> Defer
     return deferred_intent_management_action_from_dict(value)
 
 
-def _deferred_intent_repair_thread(
+@dataclass(frozen=True, slots=True)
+class _RepairThreadToolFunction:
+    """Owned copy of the provider fields needed to replay one tool call."""
+
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RepairThreadToolCall:
+    """Owned provider-call projection used only for deferred repair replay."""
+
+    id: str
+    function: _RepairThreadToolFunction
+    is_retain: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _DeferredIntentRepairThread:
+    """Validated, provider-independent assistant turn for one repair replay."""
+
+    assistant_content: str | None
+    calls: tuple[_RepairThreadToolCall, ...]
+
+
+_MISSING_REPAIR_THREAD_FIELD: Final[object] = object()
+
+
+def _admit_deferred_intent_repair_thread(
     message: Any,
     tool_calls: Any,
     *,
     retain_call: Any,
+) -> _DeferredIntentRepairThread | None:
+    """Parse raw provider objects into the exact fields needed for replay.
+
+    LiteLLM tool-call fields live in pydantic ``extra="allow"`` storage and
+    resolve dynamically. ADR-032 therefore requires sentinel ``getattr`` at
+    this external boundary, validation of every extracted value, then an owned
+    carrier; downstream replay never touches the provider objects again.
+    """
+    assistant_content = getattr(message, "content", _MISSING_REPAIR_THREAD_FIELD)
+    if assistant_content is _MISSING_REPAIR_THREAD_FIELD or (assistant_content is not None and type(assistant_content) is not str):
+        return None
+    admitted_calls: list[_RepairThreadToolCall] = []
+    for tool_call in tool_calls:
+        call_id = getattr(tool_call, "id", _MISSING_REPAIR_THREAD_FIELD)
+        function = getattr(tool_call, "function", _MISSING_REPAIR_THREAD_FIELD)
+        if type(call_id) is not str or not call_id or function is _MISSING_REPAIR_THREAD_FIELD or function is None:
+            return None
+        name = getattr(function, "name", _MISSING_REPAIR_THREAD_FIELD)
+        arguments = getattr(function, "arguments", _MISSING_REPAIR_THREAD_FIELD)
+        if type(name) is not str or not name or type(arguments) is not str:
+            return None
+        admitted_calls.append(
+            _RepairThreadToolCall(
+                id=call_id,
+                function=_RepairThreadToolFunction(name=name, arguments=arguments),
+                is_retain=tool_call is retain_call,
+            )
+        )
+    if sum(call.is_retain for call in admitted_calls) != 1:
+        return None
+    return _DeferredIntentRepairThread(
+        assistant_content=assistant_content,
+        calls=tuple(admitted_calls),
+    )
+
+
+def _deferred_intent_repair_thread(
+    admitted: _DeferredIntentRepairThread,
+    *,
     error: DeferredIntentActionShapeError,
 ) -> list[dict[str, Any]]:
     """Thread a retain shape rejection back as tool results for self-repair.
@@ -741,9 +808,25 @@ def _deferred_intent_repair_thread(
     so the model resends the complete reply. Shape-error text is value-free
     by construction (key names, types, vocabulary — never user prose).
     """
-    thread: list[dict[str, Any]] = [_assistant_tool_calls_message(message, tool_calls)]
-    for tool_call in tool_calls:
-        if tool_call is retain_call:
+    thread: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": admitted.assistant_content,
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    },
+                }
+                for call in admitted.calls
+            ],
+        }
+    ]
+    for tool_call in admitted.calls:
+        if tool_call.is_retain:
             content = (
                 f"retain_deferred_intent rejected: {error} "
                 "Correct the arguments and call retain_deferred_intent again with the "
@@ -756,24 +839,6 @@ def _deferred_intent_repair_thread(
             )
         thread.append({"role": "tool", "tool_call_id": tool_call.id, "content": content})
     return thread
-
-
-def _tool_calls_are_repair_threadable(tool_calls: Any) -> bool:
-    """Whether every provider tool call can be re-materialised for a repair turn.
-
-    The repair thread must answer every ``tool_call_id``; a provider reply
-    whose calls carry no usable string id (or non-string arguments) cannot be
-    faithfully re-threaded, so its shape failure stays terminal instead of
-    crashing the repair path on the defective reply.
-    """
-    for tool_call in tool_calls:
-        call_id = getattr(tool_call, "id", None)
-        if type(call_id) is not str or not call_id:
-            return False
-        function = getattr(tool_call, "function", None)
-        if function is not None and type(getattr(function, "arguments", None)) is not str:
-            return False
-    return True
 
 
 def _terminal_shape_error_type(terminal_calls: Any) -> type[GuidedSolverResponseShapeError]:
@@ -809,24 +874,29 @@ def _record_llm_call(
 ) -> None:
     if recorder is None or status is None:
         return
-    recorder.record_llm_call(
-        build_llm_call_record(
-            model_requested=model,
-            messages=messages,
-            tools=tools,
-            status=status,
-            started_at=started_at,
-            started_ns=started_ns,
-            temperature=temperature,
-            seed=seed,
-            response=response,
-            error_class=error_class,
-            error_message=error_message,
+    primary_exc = sys.exc_info()[1]
+    try:
+        recorder.record_llm_call(
+            build_llm_call_record(
+                model_requested=model,
+                messages=messages,
+                tools=tools,
+                status=status,
+                started_at=started_at,
+                started_ns=started_ns,
+                temperature=temperature,
+                seed=seed,
+                response=response,
+                error_class=error_class,
+                error_message=error_message,
+            )
         )
-    )
-    current_exc = sys.exc_info()[1]
-    if current_exc is not None:
-        attach_llm_calls(current_exc, recorder)
+        if primary_exc is not None:
+            attach_llm_calls(primary_exc, recorder)
+    except BaseException as audit_exc:
+        if primary_exc is None:
+            raise
+        primary_exc.add_note(f"secondary Composer LLM audit recording failed: {type(audit_exc).__name__}")
 
 
 def _build_step_1_source_dynamic_block(
@@ -1786,13 +1856,16 @@ async def maybe_resolve_step_1_source_chat(
                         # within the same Send. Exhaustion (or an argument shape
                         # we cannot faithfully re-materialise) re-raises so the
                         # caller's retention fallback applies.
-                        if deferred_repair_used or attempt_index + 1 >= max_attempts or not _tool_calls_are_repair_threadable(tool_calls):
-                            raise
-                        deferred_repair_used = True
-                        deferred_repair_thread = _deferred_intent_repair_thread(
+                        admitted_repair = _admit_deferred_intent_repair_thread(
                             message,
                             tool_calls,
                             retain_call=retain_calls[0],
+                        )
+                        if deferred_repair_used or attempt_index + 1 >= max_attempts or admitted_repair is None:
+                            raise
+                        deferred_repair_used = True
+                        deferred_repair_thread = _deferred_intent_repair_thread(
+                            admitted_repair,
                             error=exc,
                         )
                         status = ComposerLLMCallStatus.MALFORMED_RESPONSE
@@ -2390,14 +2463,17 @@ async def maybe_resolve_step_2_sink_chat(
                         # once within the same Send. Exhaustion (or an argument
                         # shape we cannot faithfully re-materialise) re-raises
                         # so the caller's retention fallback applies.
-                        if deferred_repair_used or _iteration + 1 >= iterations or not _tool_calls_are_repair_threadable(tool_calls):
+                        admitted_repair = _admit_deferred_intent_repair_thread(
+                            message,
+                            tool_calls,
+                            retain_call=retain_calls[0],
+                        )
+                        if deferred_repair_used or _iteration + 1 >= iterations or admitted_repair is None:
                             raise
                         deferred_repair_used = True
                         messages.extend(
                             _deferred_intent_repair_thread(
-                                message,
-                                tool_calls,
-                                retain_call=retain_calls[0],
+                                admitted_repair,
                                 error=exc,
                             )
                         )

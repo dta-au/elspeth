@@ -18,18 +18,18 @@ entries:
   allow-hit prefixes and production ``per_file_rules``;
 * ``stale_delete`` -- confirm the tree still reports the key as a non-signable
   orphan; a reappeared live finding is a mismatch (never delete a live entry);
-* ``rotation`` -- re-derive via ``scan_for_rotations(exclude_judge_gated=True)``
-  (the same filtered source ``stage_scan`` uses) and confirm the key is still a
+* ``rotation`` -- remove findings already assigned to judge-gated diagnosis,
+  re-plan the residual pre-judge population, and confirm the key is still a
   rotation ``old_key``.
 
 The report carries the computed ``diagnosis`` (reused by the ``sign-bundle``
-execute phase's drift_repair lane -- one diagnose call per run) and the filtered
-``rotation_plan`` (the *single* whole-dir ``exclude_judge_gated=True`` scan,
-computed once iff the bundle has >=1 rotation action, reused by the execute
-rotation lane so it never re-scans at write time). ``rotation_plan`` is ``None``
-exactly when the bundle has no rotation action. On a filtered plan only
-``.rotations`` is authoritative -- the filtered-out judge-gated findings land in
-``.new_findings``/``.ambiguous`` as pollution; no consumer may read those.
+execute phase's drift_repair lane -- one diagnose call per run) and the residual
+``rotation_plan`` (built from the same raw census after judge assignments are
+removed, then reused by the execute rotation lane so it never re-scans).
+The rotation survey always runs so omitted rotations fail the same complete
+worklist check as omitted judgments, drift repairs, and stale deletes; the plan
+is exposed on the report only when the bundle contains a rotation action.
+Ambiguity in the residual population is genuine and fails verification.
 """
 
 from __future__ import annotations
@@ -45,12 +45,16 @@ from elspeth_lints.core.judge_signature_diagnosis import (
     diagnose_judge_signatures,
 )
 from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle
-from elspeth_lints.core.tier_model_scan import scan_single_file_findings
+from elspeth_lints.core.tier_model_scan import (
+    TargetCensus,
+    census_tree_targets,
+    plan_non_judge_rotations,
+    scan_single_file_findings,
+)
 from elspeth_lints.rules.trust_tier.tier_model.rotate import (
     RotationPlan,
     _finding_covered_by_per_file_rule,
     identity_prefix,
-    scan_for_rotations,
 )
 from elspeth_lints.rules.trust_tier.tier_model.rule import _load_tier_model_allowlist
 
@@ -67,6 +71,7 @@ class BundleVerificationReport:
     mismatches: tuple[str, ...]
     diagnosis: JudgeSignatureDiagnosisReport
     rotation_plan: RotationPlan | None
+    target_census: TargetCensus
 
     @property
     def ok(self) -> bool:
@@ -79,8 +84,15 @@ def verify_bundle_against_tree(
     *,
     root: Path,
     allowlist_dir: Path,
+    bundle_allowlist_dir: Path | None = None,
 ) -> BundleVerificationReport:
-    """Re-derive every bundle action's binding from the tree (pure read)."""
+    """Re-derive every bundle action's binding from the tree (pure read).
+
+    ``allowlist_dir`` is the tree to inspect. During coherent publication the
+    authenticated pre-action allowlist has moved to the transaction's
+    candidate path, while the bundle remains bound to the public allowlist
+    path. ``bundle_allowlist_dir`` keeps those two identities explicit.
+    """
     # CLI callers use repository-relative defaults (``src/elspeth`` and
     # ``config/cicd/enforce_tier_model``).  The scanners resolve each target
     # file before comparing it with ``root``; keep both sides in the same
@@ -88,29 +100,76 @@ def verify_bundle_against_tree(
     # reported as unscannable.
     root = Path(root).resolve()
     allowlist_dir = Path(allowlist_dir).resolve()
+    expected_bundle_allowlist_dir = Path(bundle_allowlist_dir or allowlist_dir).resolve()
+
+    mismatches: list[str] = []
+    recorded_root_path = Path(bundle.root)
+    if not recorded_root_path.is_absolute():
+        mismatches.append(f"bundle root must be absolute; staged value was {bundle.root!r}")
+    elif recorded_root_path.resolve() != root:
+        mismatches.append(f"bundle root {recorded_root_path.resolve()} does not match signing root {root}")
+    recorded_allowlist_path = Path(bundle.allowlist_dir)
+    if not recorded_allowlist_path.is_absolute():
+        mismatches.append(f"bundle allowlist_dir must be absolute; staged value was {bundle.allowlist_dir!r}")
+    elif recorded_allowlist_path.resolve() != expected_bundle_allowlist_dir:
+        mismatches.append(
+            f"bundle allowlist_dir {recorded_allowlist_path.resolve()} does not match signing allowlist_dir {expected_bundle_allowlist_dir}"
+        )
 
     diagnosis = diagnose_judge_signatures(root=root, allowlist_dir=allowlist_dir)
     index: dict[str, Any] = {item.key: item for item in diagnosis.items}
     allowlist = _load_tier_model_allowlist(allowlist_dir)
     covered_prefixes = frozenset(identity_prefix(entry.key) for entry in allowlist.entries)
+    target_scan = census_tree_targets(
+        root=root,
+        covered_prefixes=covered_prefixes,
+        per_file_rules=allowlist.per_file_rules,
+    )
 
-    # Compute the filtered rotation plan exactly once, iff there is a rotation
-    # action. Pass the directory as ``allowlist_path`` (load_allowlist accepts a
-    # dir); ``exclude_judge_gated=True`` keeps the scan from raising on the
-    # canonical mostly-judge-gated corpus.
-    rotation_plan: RotationPlan | None = None
-    if any(action.kind == "rotation" for action in bundle.actions):
-        rotation_plan = scan_for_rotations(
-            source_root=root,
-            allowlist_path=allowlist_dir,
-            exclude_judge_gated=True,
+    # Survey every non-judge-gated rotation even when the staged bundle omits
+    # the lane. Remove findings already assigned to judge-gated diagnosis so a
+    # mixed signed/pre-judge identity group is classified on its true residual
+    # population rather than producing filtered-plan pollution.
+    full_rotation_plan = plan_non_judge_rotations(
+        findings=target_scan.findings,
+        allowlist=allowlist,
+        diagnosis_items=diagnosis.items,
+    )
+    for group in full_rotation_plan.ambiguous:
+        mismatches.append(
+            "target census found ambiguous non-judge target group "
+            f"{group.prefix!r} ({group.finding_count} finding(s), {group.entry_count} entry/entries)"
         )
+    rotation_keys = {action.key for action in bundle.actions if action.kind == "rotation"}
+    for rotation in full_rotation_plan.rotations:
+        if rotation.old_key not in rotation_keys:
+            mismatches.append(f"target census missing rotation action for {rotation.old_key!r}")
+    rotation_plan: RotationPlan | None = full_rotation_plan if rotation_keys else None
 
-    mismatches: list[str] = []
     # One source file can account for hundreds of new judgments.  Re-scan it
     # once and share the key-to-finding map across those actions; otherwise
     # verification cost grows with findings-per-file rather than files.
     new_judgment_findings_by_file: dict[str, dict[str, Any] | None] = {}
+    justify_keys = {action.key for action in bundle.actions if action.kind == "justify"}
+    for finding in target_scan.findings:
+        canonical_key = _finding_canonical_key(finding)
+        file_findings = new_judgment_findings_by_file.setdefault(finding.file_path, {})
+        assert file_findings is not None
+        file_findings[canonical_key] = finding
+    for finding in target_scan.uncovered_findings:
+        canonical_key = _finding_canonical_key(finding)
+        if canonical_key not in justify_keys:
+            mismatches.append(f"target census missing justify action for uncovered finding {canonical_key!r}")
+
+    action_keys_by_kind = {
+        kind: {action.key for action in bundle.actions if action.kind == kind} for kind in ("drift_repair", "stale_delete")
+    }
+    for item in diagnosis.items:
+        if item.status in _SIGNABLE_DIAGNOSIS_STATUSES and item.key not in action_keys_by_kind["drift_repair"]:
+            mismatches.append(f"target census missing drift_repair action for {item.key!r} ({item.status})")
+        elif item.status in _STALE_DELETE_ORPHAN_STATUSES and item.key not in action_keys_by_kind["stale_delete"]:
+            mismatches.append(f"target census missing stale_delete action for orphan {item.key!r} ({item.status})")
+
     for action in bundle.actions:
         if action.kind == "drift_repair":
             mismatches.extend(_verify_drift_repair(action, index))
@@ -135,6 +194,7 @@ def verify_bundle_against_tree(
         mismatches=tuple(mismatches),
         diagnosis=diagnosis,
         rotation_plan=rotation_plan,
+        target_census=target_scan.census,
     )
 
 

@@ -19,8 +19,8 @@ from elspeth.web.composer.guided_blob_refs import GUIDED_REVIEWED_BLOB_PATH_KEYS
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec
 from elspeth.web.interpretation_state import (
-    INTERPRETATION_REQUIREMENTS_KEY,
     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
+    parse_interpretation_requirements,
 )
 
 DecisionCategory = Literal[
@@ -178,12 +178,8 @@ def _node_entries(node: NodeSpec) -> list[ImplicitDecisionEntry]:
 
 def _is_auto_wired_control(node: NodeSpec) -> bool:
     """Detect a server-inserted required control by its staged disclosure row."""
-    requirements = node.options.get(INTERPRETATION_REQUIREMENTS_KEY)
-    if not isinstance(requirements, Sequence) or isinstance(requirements, (str, bytes)):
-        return False
-    return any(
-        isinstance(row, Mapping) and str(row.get("user_term", "")).strip() == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM for row in requirements
-    )
+    requirements = parse_interpretation_requirements(node.options)
+    return requirements is not None and any(row["user_term"] == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM for row in requirements)
 
 
 def _output_entries(output: OutputSpec) -> list[ImplicitDecisionEntry]:

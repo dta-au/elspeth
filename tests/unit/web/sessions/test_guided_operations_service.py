@@ -74,6 +74,28 @@ def test_guided_composite_authority_has_only_narrow_domain_mutations() -> None:
     assert {"reject_pending_proposal"} <= set(dir(sessions_service_module._GuidedComposerMutations))
 
 
+def test_guided_database_clock_maps_malformed_sqlite_text_to_audit_integrity_error() -> None:
+    class _Dialect:
+        name = "sqlite"
+
+    class _Result:
+        @staticmethod
+        def scalar_one() -> str:
+            return "not-a-database-timestamp"
+
+    class _Connection:
+        dialect = _Dialect()
+
+        @staticmethod
+        def exec_driver_sql(_statement: str) -> _Result:
+            return _Result()
+
+    with pytest.raises(AuditIntegrityError, match="database clock returned malformed datetime text") as exc_info:
+        SessionServiceImpl._guided_database_now(cast(Any, _Connection()))
+
+    assert isinstance(exc_info.value.__cause__, ValueError)
+
+
 def _service(engine) -> SessionServiceImpl:
     return DualFencedSessionServiceHarness(
         engine,

@@ -16,6 +16,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast, final
 from uuid import UUID
 
@@ -76,6 +77,7 @@ from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import (
     PostgresSessionOperationRepository,
     SessionDerivedCustodyError,
+    _ForkCreationTransaction,
 )
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.interpretation_state import (
@@ -639,14 +641,19 @@ def _pipeline_dispatch_recovery_from_envelope(
     """Restore one successful same-call dispatch; ignore unrelated and failed attempts."""
     if type(envelope) is not dict:
         return None
-    invocation = envelope.get("invocation")
-    if type(invocation) is not dict or invocation.get("tool_call_id") != expected_tool_call_id:
+    invocation = envelope["invocation"] if "invocation" in envelope else None
+    if type(invocation) is not dict:
         return None
-    if envelope.get("_kind") != "audit":
+    tool_call_id = invocation["tool_call_id"] if "tool_call_id" in invocation else None
+    if tool_call_id != expected_tool_call_id:
+        return None
+    envelope_kind = envelope["_kind"] if "_kind" in envelope else None
+    if envelope_kind != "audit":
         raise AuditIntegrityError("pipeline dispatch envelope kind is malformed")
-    if invocation.get("tool_name") != "set_pipeline":
+    tool_name = invocation["tool_name"] if "tool_name" in invocation else None
+    if tool_name != "set_pipeline":
         raise AuditIntegrityError("pipeline dispatch call id is bound to a different tool")
-    raw_status = invocation.get("status")
+    raw_status = invocation["status"] if "status" in invocation else None
     if type(raw_status) is not str:
         raise AuditIntegrityError("pipeline dispatch status is malformed")
     try:
@@ -656,17 +663,19 @@ def _pipeline_dispatch_recovery_from_envelope(
     if status is not ComposerToolStatus.SUCCESS:
         return None
     binding = PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
-    result_canonical = invocation.get("result_canonical")
-    assert type(result_canonical) is str
+    result_canonical = invocation["result_canonical"] if "result_canonical" in invocation else None
+    if type(result_canonical) is not str:
+        raise AuditIntegrityError("pipeline dispatch result canonical is malformed")
     try:
         result_payload = json.loads(result_canonical)
     except json.JSONDecodeError as exc:
         raise AuditIntegrityError("pipeline dispatch result canonical is malformed") from exc
     if type(result_payload) is not dict:
         raise AuditIntegrityError("pipeline dispatch result payload is malformed")
-    if result_payload.get("pipeline_content_hash_schema") != "composer.pipeline-dispatch-result.v1":
+    content_hash_schema = result_payload["pipeline_content_hash_schema"] if "pipeline_content_hash_schema" in result_payload else None
+    if content_hash_schema != "composer.pipeline-dispatch-result.v1":
         raise AuditIntegrityError("pipeline dispatch result content schema is malformed")
-    content_hash = result_payload.get("pipeline_content_hash")
+    content_hash = result_payload["pipeline_content_hash"] if "pipeline_content_hash" in result_payload else None
     if not is_lower_sha256_hex(content_hash):
         raise AuditIntegrityError("pipeline dispatch result content hash is malformed")
     return PipelineDispatchRecovery(binding=binding, executor_content_hash=content_hash)
@@ -801,30 +810,35 @@ def _verify_pipeline_lifecycle_authority(
     authority: AuthoritativePipelineProposal,
 ) -> None:
     """Verify the complete canonical lifecycle before exposing or mutating it."""
+    is_fork_transaction = type(conn) is _ForkCreationTransaction
     if authority.row.status == "committed":
-        if isinstance(conn, SessionForkCreationTransaction):
+        if is_fork_transaction:
             raise AuditIntegrityError("fork source proposal must remain pending")
-        _verify_committed_pipeline_authority(conn, service=service, authority=authority)
+        _verify_committed_pipeline_authority(cast(Connection, conn), service=service, authority=authority)
         return
     if authority.row.status == "rejected":
-        if isinstance(conn, SessionForkCreationTransaction):
+        if is_fork_transaction:
             raise AuditIntegrityError("fork source proposal must remain pending")
-        _verify_rejected_pipeline_authority(conn, authority=authority)
+        _verify_rejected_pipeline_authority(cast(Connection, conn), authority=authority)
         return
     if authority.row.status != "pending":
         raise AuditIntegrityError("pipeline proposal lifecycle status is malformed")
     sid = str(authority.row.session_id)
     pid = str(authority.row.id)
-    if isinstance(conn, SessionForkCreationTransaction):
-        terminal_count = conn.count_parent_proposal_terminal_events(authority.row.id)
+    if is_fork_transaction:
+        terminal_count = cast(SessionForkCreationTransaction, conn).count_parent_proposal_terminal_events(authority.row.id)
     else:
-        terminal_count = conn.execute(
-            select(func.count(proposal_events_table.c.id))
-            .select_from(proposal_events_table)
-            .where(proposal_events_table.c.session_id == sid)
-            .where(proposal_events_table.c.proposal_id == pid)
-            .where(proposal_events_table.c.event_type.in_(("proposal.accepted", "proposal.rejected")))
-        ).scalar_one()
+        terminal_count = (
+            cast(Connection, conn)
+            .execute(
+                select(func.count(proposal_events_table.c.id))
+                .select_from(proposal_events_table)
+                .where(proposal_events_table.c.session_id == sid)
+                .where(proposal_events_table.c.proposal_id == pid)
+                .where(proposal_events_table.c.event_type.in_(("proposal.accepted", "proposal.rejected")))
+            )
+            .scalar_one()
+        )
     if terminal_count != 0:
         raise AuditIntegrityError("pending pipeline proposal must not have a terminal event")
     if authority.row.audit_event_id != authority.creation_event_id or authority.row.committed_state_id is not None:
@@ -900,14 +914,15 @@ def _verify_guided_root_message_authority(
     from elspeth.web.sessions.schemas import StartGuidedRequest
 
     message_id = guided.root_intent_message_id
-    if isinstance(conn, SessionForkCreationTransaction):
+    if type(conn) is _ForkCreationTransaction:
         try:
             root_message_id = UUID(message_id)
         except ValueError as exc:
             raise AuditIntegrityError("guided root intent message id is malformed") from exc
-        message_row, operations, state_row = conn.read_parent_guided_root_authority(root_message_id)
+        message_row, operations, state_row = cast(SessionForkCreationTransaction, conn).read_parent_guided_root_authority(root_message_id)
     else:
-        message_row = conn.execute(
+        connection = cast(Connection, conn)
+        message_row = connection.execute(
             select(
                 chat_messages_table.c.role,
                 chat_messages_table.c.content,
@@ -917,7 +932,7 @@ def _verify_guided_root_message_authority(
             .where(chat_messages_table.c.id == message_id)
         ).one_or_none()
         operations = tuple(
-            conn.execute(
+            connection.execute(
                 select(guided_operations_table)
                 .where(guided_operations_table.c.session_id == session_id)
                 .where(guided_operations_table.c.kind == "guided_start")
@@ -927,7 +942,7 @@ def _verify_guided_root_message_authority(
             ).fetchall()
         )
         state_row = (
-            conn.execute(
+            connection.execute(
                 select(composition_states_table)
                 .where(composition_states_table.c.session_id == session_id)
                 .where(composition_states_table.c.id == operations[0].result_state_id)
@@ -1312,7 +1327,7 @@ def _strip_guided_profile_in_meta(
     if composer_meta is None:
         return None
     thawed: dict[str, Any] = dict(deep_thaw(composer_meta))
-    guided_raw = thawed.get("guided_session")
+    guided_raw = thawed["guided_session"] if "guided_session" in thawed else None
     if guided_raw is None:
         return thawed
     if type(guided_raw) is not dict:
@@ -1352,10 +1367,10 @@ def _strip_guided_profile_in_meta(
         raise AuditIntegrityError("fork guided message maps have different source keysets")
 
     def _child_user_message(source_message_id: str, field_name: str) -> tuple[str, ChatMessageRecord]:
-        child_message_id = source_to_child_message_id.get(source_message_id)
-        source_message = source_messages_by_id.get(source_message_id)
-        if child_message_id is None or source_message is None:
+        if source_message_id not in source_to_child_message_id or source_message_id not in source_messages_by_id:
             raise AuditIntegrityError(f"fork guided {field_name} references a message outside copied slice")
+        child_message_id = source_to_child_message_id[source_message_id]
+        source_message = source_messages_by_id[source_message_id]
         if source_message.role != "user":
             raise AuditIntegrityError("fork guided planner lineage must identify user messages")
         return child_message_id, source_message
@@ -1523,6 +1538,40 @@ def _fork_blob_plan_from_content(
     return result
 
 
+def _fork_blob_plan_identity_from_content(content: str) -> tuple[UUID, UUID, str]:
+    """Validate and return the custody identity of one retained fork-plan row."""
+    try:
+        raw = json.loads(content)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise AuditIntegrityError("staged fork blob plan is not valid JSON") from exc
+    if type(raw) is not dict or set(raw) != {
+        "schema",
+        "source_session_id",
+        "child_session_id",
+        "operation_id",
+        "source_blobs",
+    }:
+        raise AuditIntegrityError("staged fork blob plan has malformed keys")
+    raw_source_session_id = raw["source_session_id"]
+    raw_child_session_id = raw["child_session_id"]
+    operation_id = raw["operation_id"]
+    if (
+        raw["schema"] != _FORK_BLOB_PLAN_SCHEMA
+        or type(raw_source_session_id) is not str
+        or type(raw_child_session_id) is not str
+        or type(operation_id) is not str
+    ):
+        raise AuditIntegrityError("staged fork blob plan has malformed custody binding")
+    try:
+        source_session_id = UUID(raw_source_session_id)
+        child_session_id = UUID(raw_child_session_id)
+    except ValueError as exc:
+        raise AuditIntegrityError("staged fork blob plan has malformed custody binding") from exc
+    if str(source_session_id) != raw_source_session_id or str(child_session_id) != raw_child_session_id:
+        raise AuditIntegrityError("staged fork blob plan has non-canonical custody binding")
+    return source_session_id, child_session_id, operation_id
+
+
 def _settlement_fork_blob_plan(
     conn: Connection,
     *,
@@ -1538,24 +1587,17 @@ def _settlement_fork_blob_plan(
             chat_messages_table.c.writer_principal == "session_fork",
         )
     ).all():
-        try:
-            decoded = json.loads(row.content)
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if (
-            type(decoded) is dict
-            and decoded.get("schema") == _FORK_BLOB_PLAN_SCHEMA
-            and decoded.get("child_session_id") == str(child_session_id)
-            and decoded.get("operation_id") == operation_id
-        ):
-            candidates.append(
-                _fork_blob_plan_from_content(
-                    row.content,
-                    expected_source_session_id=parent_session_id,
-                    expected_child_session_id=child_session_id,
-                    expected_operation_id=operation_id,
-                )
-            )
+        row_source_session_id, row_child_session_id, row_operation_id = _fork_blob_plan_identity_from_content(row.content)
+        retained_plan = _fork_blob_plan_from_content(
+            row.content,
+            expected_source_session_id=row_source_session_id,
+            expected_child_session_id=row_child_session_id,
+            expected_operation_id=row_operation_id,
+        )
+        if row_child_session_id == child_session_id and row_operation_id == operation_id:
+            if row_source_session_id != parent_session_id:
+                raise AuditIntegrityError("staged fork blob plan has malformed custody binding")
+            candidates.append(retained_plan)
     if len(candidates) != 1:
         raise AuditIntegrityError("Guided fork settlement requires exactly one retained frozen blob plan")
     return candidates[0]
@@ -1564,9 +1606,9 @@ def _settlement_fork_blob_plan(
 def _value_references_parent_blob(value: Any, forbidden: frozenset[str]) -> bool:
     if type(value) is str:
         return value in forbidden or (value.startswith("blob:") and value.removeprefix("blob:") in forbidden)
-    if isinstance(value, Mapping):
+    if type(value) is dict:
         return any(_value_references_parent_blob(item, forbidden) for item in value.values())
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+    if type(value) in (list, tuple):
         return any(_value_references_parent_blob(item, forbidden) for item in value)
     return False
 
@@ -1801,9 +1843,10 @@ def _restore_authoritative_pipeline_proposal(
     raw_base = payload["base"]
     if type(raw_base) is not dict:
         raise AuditIntegrityError("pipeline proposal base metadata is malformed")
-    if raw_base.get("kind") == "absent" and set(raw_base) == {"kind"}:
+    raw_base_kind = raw_base["kind"] if "kind" in raw_base else None
+    if raw_base_kind == "absent" and set(raw_base) == {"kind"}:
         base: AbsentBase | PresentBase = AbsentBase()
-    elif raw_base.get("kind") == "present" and set(raw_base) == {"kind", "state_id", "composition_content_hash"}:
+    elif raw_base_kind == "present" and set(raw_base) == {"kind", "state_id", "composition_content_hash"}:
         raw_state_id = raw_base["state_id"]
         if type(raw_state_id) is not str:
             raise AuditIntegrityError("pipeline proposal base state id is malformed")
@@ -1857,17 +1900,19 @@ def _restore_authoritative_pipeline_proposal(
     if (supersedes_proposal_id is None) != (proposal.supersedes_draft_hash is None):
         raise AuditIntegrityError("pipeline proposal supersedes id/draft binding is incomplete")
     if supersedes_proposal_id is not None:
-        if isinstance(conn, SessionForkCreationTransaction):
-            referenced_row = conn.read_parent_proposal(supersedes_proposal_id)
-            referenced_events = conn.read_parent_proposal_creation_events(supersedes_proposal_id)
+        if type(conn) is _ForkCreationTransaction:
+            transaction = cast(SessionForkCreationTransaction, conn)
+            referenced_row = transaction.read_parent_proposal(supersedes_proposal_id)
+            referenced_events = transaction.read_parent_proposal_creation_events(supersedes_proposal_id)
         else:
-            referenced_row = conn.execute(
+            connection = cast(Connection, conn)
+            referenced_row = connection.execute(
                 select(composition_proposals_table)
                 .where(composition_proposals_table.c.session_id == str(row.session_id))
                 .where(composition_proposals_table.c.id == str(supersedes_proposal_id))
             ).one_or_none()
             referenced_events = tuple(
-                conn.execute(
+                connection.execute(
                     select(proposal_events_table)
                     .where(proposal_events_table.c.session_id == str(row.session_id))
                     .where(proposal_events_table.c.proposal_id == str(supersedes_proposal_id))
@@ -1879,10 +1924,14 @@ def _restore_authoritative_pipeline_proposal(
         if len(referenced_events) != 1:
             raise AuditIntegrityError("pipeline proposal supersedes target creation authority is malformed")
         referenced_payload = referenced_events[0].payload
+        referenced_schema = referenced_payload["schema"] if type(referenced_payload) is dict and "schema" in referenced_payload else None
+        referenced_draft_hash = (
+            referenced_payload["draft_hash"] if type(referenced_payload) is dict and "draft_hash" in referenced_payload else None
+        )
         if (
             type(referenced_payload) is not dict
-            or referenced_payload.get("schema") != _PIPELINE_CREATED_SCHEMA
-            or referenced_payload.get("draft_hash") != proposal.supersedes_draft_hash
+            or referenced_schema != _PIPELINE_CREATED_SCHEMA
+            or referenced_draft_hash != proposal.supersedes_draft_hash
         ):
             raise AuditIntegrityError("pipeline proposal supersedes target draft binding mismatch")
     authority = AuthoritativePipelineProposal(
@@ -1940,17 +1989,19 @@ def _require_pending_guided_checkpoint_proposal_authority(
     if reference is None:
         return None
 
-    if isinstance(conn, SessionForkCreationTransaction):
-        proposal_row = conn.read_parent_proposal(reference.proposal_id)
-        creation_rows = conn.read_parent_proposal_creation_events(reference.proposal_id)
+    if type(conn) is _ForkCreationTransaction:
+        transaction = cast(SessionForkCreationTransaction, conn)
+        proposal_row = transaction.read_parent_proposal(reference.proposal_id)
+        creation_rows = transaction.read_parent_proposal_creation_events(reference.proposal_id)
     else:
-        proposal_row = conn.execute(
+        connection = cast(Connection, conn)
+        proposal_row = connection.execute(
             select(composition_proposals_table)
             .where(composition_proposals_table.c.session_id == session_id)
             .where(composition_proposals_table.c.id == str(reference.proposal_id))
         ).one_or_none()
         creation_rows = tuple(
-            conn.execute(
+            connection.execute(
                 select(proposal_events_table)
                 .where(proposal_events_table.c.session_id == session_id)
                 .where(proposal_events_table.c.proposal_id == str(reference.proposal_id))
@@ -1990,14 +2041,18 @@ def _require_pending_guided_checkpoint_proposal_authority(
         raise AuditIntegrityError(f"{role} guided proposal authority has an invalid surface")
     if type(proposal.base) is not PresentBase:
         raise AuditIntegrityError(f"{role} guided proposal checkpoint base is malformed")
-    if isinstance(conn, SessionForkCreationTransaction):
-        base_row = conn.read_parent_state(proposal.base.state_id)
+    if type(conn) is _ForkCreationTransaction:
+        base_row = cast(SessionForkCreationTransaction, conn).read_parent_state(proposal.base.state_id)
     else:
-        base_row = conn.execute(
-            select(composition_states_table)
-            .where(composition_states_table.c.session_id == session_id)
-            .where(composition_states_table.c.id == str(proposal.base.state_id))
-        ).one_or_none()
+        base_row = (
+            cast(Connection, conn)
+            .execute(
+                select(composition_states_table)
+                .where(composition_states_table.c.session_id == session_id)
+                .where(composition_states_table.c.id == str(proposal.base.state_id))
+            )
+            .one_or_none()
+        )
     if base_row is None:
         raise AuditIntegrityError(f"{role} guided proposal base is missing or cross-session")
     base_record = service._row_to_state_record(base_row)
@@ -2115,7 +2170,7 @@ def _classify_authoritative_composition_proposal(
 ) -> AuthoritativeCompositionProposal:
     """Accept only one of the two closed current proposal event schemas."""
     payload = creation_event.payload
-    if not isinstance(payload, Mapping):
+    if type(payload) not in (dict, MappingProxyType):
         raise AuditIntegrityError("proposal creation event payload must be a mapping")
     if set(payload) == _TOOL_PROPOSAL_CREATED_FIELDS:
         expected = {
@@ -2265,9 +2320,9 @@ def _interpretation_hash_domain_v2(
 
 
 def _require_mapping(value: object, *, message: str) -> Mapping[str, Any]:
-    if not isinstance(value, Mapping):
+    if type(value) not in (dict, MappingProxyType):
         raise InterpretationPlaceholderConsumedError(message)
-    return value
+    return cast(Mapping[str, Any], value)
 
 
 def _find_llm_transform_node(
@@ -2295,7 +2350,7 @@ def _find_llm_transform_node(
             node["options"] if "options" in node else None,
             message=f"{context}: node {affected_node_id!r} has no options mapping",
         )
-        if "prompt_template" not in options or not isinstance(options["prompt_template"], str):
+        if "prompt_template" not in options or type(options["prompt_template"]) is not str:
             raise InterpretationPlaceholderConsumedError(f"{context}: node {affected_node_id!r} options.prompt_template is not a string")
         prompt_template = options["prompt_template"]
         if not prompt_template:
@@ -2391,18 +2446,18 @@ def _matching_pending_requirement_index(
     user_term: str,
     context: str,
 ) -> tuple[list[dict[str, Any]], int]:
-    if not isinstance(requirements_value, (list, tuple)):
+    if type(requirements_value) not in (list, tuple):
         raise InterpretationPlaceholderConsumedError(f"{context}: options.interpretation_requirements is not a list")
     normalized_user_term = user_term.strip()
     requirements: list[dict[str, Any]] = []
     matching_indexes: list[int] = []
-    for index, requirement_value in enumerate(requirements_value):
-        if not isinstance(requirement_value, Mapping):
+    for index, requirement_value in enumerate(cast(Sequence[Any], requirements_value)):
+        if type(requirement_value) not in (dict, MappingProxyType):
             raise InterpretationPlaceholderConsumedError(f"{context}: interpretation requirement entry is not a mapping")
         requirement = dict(requirement_value)
         requirement_kind = requirement["kind"] if "kind" in requirement else InterpretationKind.VAGUE_TERM.value
         requirement_term = requirement["user_term"]
-        if not isinstance(requirement_term, str):
+        if type(requirement_term) is not str:
             raise InterpretationPlaceholderConsumedError(f"{context}: interpretation requirement user_term is invalid")
         requirement_status = requirement["status"] if "status" in requirement else None
         if requirement_term.strip() == normalized_user_term and requirement_status == "pending" and requirement_kind == kind.value:
@@ -2431,9 +2486,9 @@ def _review_requirement_identity(
     requirement = requirements[matching_index]
     requirement_id = requirement["id"] if "id" in requirement else None
     draft = requirement["draft"] if "draft" in requirement else None
-    if not isinstance(requirement_id, str) or not requirement_id:
+    if type(requirement_id) is not str or not requirement_id:
         raise InterpretationPlaceholderConsumedError(f"{context}: review requirement id is missing or invalid")
-    if not isinstance(draft, str):
+    if type(draft) is not str:
         raise InterpretationPlaceholderConsumedError(f"{context}: review requirement draft is missing or invalid")
     return {
         "id": requirement_id,
@@ -2489,7 +2544,7 @@ def _reviewed_content_identity(
             message=f"{context}: invented_source requires source.options.{SOURCE_AUTHORING_KEY}",
         )
         content_hash = authoring["content_hash"] if "content_hash" in authoring else None
-        if not isinstance(content_hash, str) or not content_hash:
+        if type(content_hash) is not str or not content_hash:
             raise InterpretationPlaceholderConsumedError(f"{context}: source.options.{SOURCE_AUTHORING_KEY}.content_hash must be populated")
         domain["requirement"] = _review_requirement_identity(
             options,
@@ -2519,12 +2574,14 @@ def _reviewed_content_identity(
 
     if kind is InterpretationKind.VAGUE_TERM:
         raw_requirements = options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
-        structured_match = isinstance(raw_requirements, (list, tuple)) and any(
-            isinstance(requirement, Mapping)
-            and requirement.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
-            and isinstance(requirement.get("user_term"), str)
+        structured_requirements = cast(Sequence[Any], raw_requirements) if type(raw_requirements) in (list, tuple) else ()
+        structured_match = any(
+            type(requirement) in (dict, MappingProxyType)
+            and (requirement["kind"] if "kind" in requirement else InterpretationKind.VAGUE_TERM.value)
+            == InterpretationKind.VAGUE_TERM.value
+            and type(requirement["user_term"] if "user_term" in requirement else None) is str
             and requirement["user_term"].strip() == user_term.strip()
-            for requirement in raw_requirements
+            for requirement in structured_requirements
         )
         if structured_match:
             requirement_identity = _review_requirement_identity(
@@ -2540,9 +2597,9 @@ def _reviewed_content_identity(
                 )
             parts = options[PROMPT_TEMPLATE_PARTS_KEY]
             if not any(
-                isinstance(part, Mapping)
-                and part.get("kind") == "interpretation_ref"
-                and part.get("requirement_id") == requirement_identity["id"]
+                type(part) in (dict, MappingProxyType)
+                and (part["kind"] if "kind" in part else None) == "interpretation_ref"
+                and (part["requirement_id"] if "requirement_id" in part else None) == requirement_identity["id"]
                 for part in parts
             ):
                 raise InterpretationPlaceholderConsumedError(
@@ -2552,7 +2609,7 @@ def _reviewed_content_identity(
             domain["prompt_structure_hash"] = structure_hash
         else:
             prompt_template = options["prompt_template"] if "prompt_template" in options else None
-            if not isinstance(prompt_template, str):
+            if type(prompt_template) is not str:
                 raise InterpretationPlaceholderConsumedError(f"{context}: legacy vague-term review requires options.prompt_template")
             domain["legacy_prompt_hash"] = stable_hash(prompt_template)
         return stable_hash(domain)
@@ -2567,13 +2624,13 @@ def _reviewed_content_identity(
         structure_hash = prompt_structure_hash_from_options(options)
         if structure_hash is None:
             prompt_template = options["prompt_template"] if "prompt_template" in options else None
-            if not isinstance(prompt_template, str):
+            if type(prompt_template) is not str:
                 raise InterpretationPlaceholderConsumedError(f"{context}: llm_prompt_template review requires options.prompt_template")
             structure_hash = stable_hash(prompt_template)
         domain["artifact_hash"] = structure_hash
     elif kind is InterpretationKind.LLM_MODEL_CHOICE:
         model = options["model"] if "model" in options else None
-        if not isinstance(model, str) or not model:
+        if type(model) is not str or not model:
             raise InterpretationPlaceholderConsumedError(f"{context}: llm_model_choice review requires a non-empty options.model")
         domain["artifact_hash"] = model_choice_artifact_hash(model)
     elif kind is InterpretationKind.PIPELINE_DECISION:
@@ -2621,7 +2678,7 @@ def _patch_structured_interpretation_prompt(
     if INTERPRETATION_REQUIREMENTS_KEY not in options:
         return None
     requirements_value = options[INTERPRETATION_REQUIREMENTS_KEY]
-    if not isinstance(requirements_value, (list, tuple)):
+    if type(requirements_value) not in (list, tuple):
         raise InterpretationPlaceholderConsumedError(
             f"_patch_llm_transform_prompt: node {affected_node_id!r} options.interpretation_requirements is not a list"
         )
@@ -2631,18 +2688,18 @@ def _patch_structured_interpretation_prompt(
     requirements: list[dict[str, Any]] = []
     requirements_by_id: dict[str, Mapping[str, Any]] = {}
     for index, requirement_value in enumerate(requirements_value):
-        if not isinstance(requirement_value, Mapping):
+        if type(requirement_value) not in (dict, MappingProxyType):
             raise InterpretationPlaceholderConsumedError(
                 f"_patch_llm_transform_prompt: node {affected_node_id!r} interpretation requirement entry is not a mapping"
             )
         requirement = dict(requirement_value)
         requirement_id = requirement["id"]
         requirement_term = requirement["user_term"]
-        if not isinstance(requirement_id, str) or not requirement_id:
+        if type(requirement_id) is not str or not requirement_id:
             raise InterpretationPlaceholderConsumedError(
                 f"_patch_llm_transform_prompt: node {affected_node_id!r} interpretation requirement id is invalid"
             )
-        if not isinstance(requirement_term, str):
+        if type(requirement_term) is not str:
             raise InterpretationPlaceholderConsumedError(
                 f"_patch_llm_transform_prompt: node {affected_node_id!r} interpretation requirement user_term is invalid"
             )
@@ -2679,7 +2736,7 @@ def _patch_structured_interpretation_prompt(
     # The vague term is structured (a matching requirement exists); the prompt
     # parts that carry its substitution are now required.
     parts_value = options[PROMPT_TEMPLATE_PARTS_KEY] if PROMPT_TEMPLATE_PARTS_KEY in options else None
-    if not isinstance(parts_value, (list, tuple)):
+    if type(parts_value) not in (list, tuple):
         raise InterpretationPlaceholderConsumedError(
             f"_patch_llm_transform_prompt: node {affected_node_id!r} options.prompt_template_parts is required for structured interpretation resolution"
         )
@@ -2689,7 +2746,7 @@ def _patch_structured_interpretation_prompt(
     matching_requirement_id = matching_requirement["id"]
     if llm_draft is not None:
         current_draft = matching_requirement["draft"] if "draft" in matching_requirement else None
-        if not isinstance(current_draft, str) or current_draft != llm_draft:
+        if type(current_draft) is not str or current_draft != llm_draft:
             raise InterpretationPlaceholderConsumedError(
                 f"_patch_llm_transform_prompt: vague_term event draft no longer matches "
                 f"the current review requirement on node {affected_node_id!r}"
@@ -2697,15 +2754,15 @@ def _patch_structured_interpretation_prompt(
 
     rendered: list[str] = []
     matched_ref_count = 0
-    for part_value in parts_value:
-        if not isinstance(part_value, Mapping):
+    for part_value in cast(Sequence[Any], parts_value):
+        if type(part_value) not in (dict, MappingProxyType):
             raise InterpretationPlaceholderConsumedError(
                 f"_patch_llm_transform_prompt: node {affected_node_id!r} prompt_template_parts entry is not a mapping"
             )
         kind = part_value["kind"]
         if kind == "text":
             text = part_value["text"]
-            if not isinstance(text, str):
+            if type(text) is not str:
                 raise InterpretationPlaceholderConsumedError(
                     f"_patch_llm_transform_prompt: node {affected_node_id!r} text prompt part is not a string"
                 )
@@ -2716,7 +2773,7 @@ def _patch_structured_interpretation_prompt(
                 f"_patch_llm_transform_prompt: node {affected_node_id!r} unknown prompt part kind {kind!r}"
             )
         requirement_id = part_value["requirement_id"]
-        if not isinstance(requirement_id, str) or requirement_id not in requirements_by_id:
+        if type(requirement_id) is not str or requirement_id not in requirements_by_id:
             raise InterpretationPlaceholderConsumedError(
                 f"_patch_llm_transform_prompt: node {affected_node_id!r} prompt part references unknown interpretation requirement"
             )
@@ -2736,7 +2793,7 @@ def _patch_structured_interpretation_prompt(
         stored_status = stored_requirement["status"] if "status" in stored_requirement else None
         if stored_status == "resolved":
             accepted = stored_requirement["accepted_value"] if "accepted_value" in stored_requirement else None
-            if not isinstance(accepted, str):
+            if type(accepted) is not str:
                 raise InterpretationPlaceholderConsumedError(
                     f"_patch_llm_transform_prompt: resolved interpretation requirement {requirement_id!r} has no accepted value"
                 )
@@ -2974,13 +3031,14 @@ def _resolve_vague_term(
         message=f"resolve_interpretation_event: node {affected_node_id!r} options is not a mapping",
     )
     requirements_value = live_options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in live_options else None
-    has_structured_site = isinstance(requirements_value, (list, tuple)) and any(
-        isinstance(requirement, Mapping)
-        and requirement.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
-        and isinstance(requirement.get("user_term"), str)
+    structured_requirements = cast(Sequence[Any], requirements_value) if type(requirements_value) in (list, tuple) else ()
+    has_structured_site = any(
+        type(requirement) in (dict, MappingProxyType)
+        and (requirement["kind"] if "kind" in requirement else InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
+        and type(requirement["user_term"] if "user_term" in requirement else None) is str
         and requirement["user_term"].strip() == user_term.strip()
-        and requirement.get("status") == "pending"
-        for requirement in requirements_value
+        and (requirement["status"] if "status" in requirement else None) == "pending"
+        for requirement in structured_requirements
     )
     if not has_structured_site:
         if surfacing_state_record is None:
@@ -2994,7 +3052,9 @@ def _resolve_vague_term(
             surfacing_node["options"],
             message=f"resolve_interpretation_event: surfacing node {affected_node_id!r} options is not a mapping",
         )
-        if surfacing_options.get("prompt_template") != live_options.get("prompt_template"):
+        surfacing_prompt = surfacing_options["prompt_template"] if "prompt_template" in surfacing_options else None
+        live_prompt = live_options["prompt_template"] if "prompt_template" in live_options else None
+        if surfacing_prompt != live_prompt:
             raise InterpretationPlaceholderConsumedError(
                 "resolve_interpretation_event: legacy vague-term prompt no longer matches the review surface"
             )
@@ -3049,8 +3109,8 @@ def _surfacing_prompt_structure_hash(
     for node in surfacing_state_record.nodes or ():
         if node["id"] == affected_node_id:
             options = node["options"] if "options" in node else None
-            if isinstance(options, Mapping):
-                return prompt_structure_hash_from_options(options)
+            if type(options) in (dict, MappingProxyType):
+                return prompt_structure_hash_from_options(cast(Mapping[str, Any], options))
             return None
     return None
 
@@ -3074,7 +3134,7 @@ def _resolve_prompt_template_review(
         message=f"resolve_interpretation_event: node {affected_node_id!r} options is not a mapping",
     )
     prompt_template = options["prompt_template"]
-    if not isinstance(prompt_template, str):
+    if type(prompt_template) is not str:
         raise InterpretationPlaceholderConsumedError(
             f"resolve_interpretation_event: node {affected_node_id!r} options.prompt_template is not a string"
         )
@@ -3171,7 +3231,7 @@ def _resolve_invented_source(
         message=f"resolve_interpretation_event: invented_source requires source.options.{SOURCE_AUTHORING_KEY}",
     )
     content_hash = source_authoring["content_hash"] if "content_hash" in source_authoring else None
-    if not isinstance(content_hash, str) or not content_hash:
+    if type(content_hash) is not str or not content_hash:
         raise InterpretationPlaceholderConsumedError(
             f"resolve_interpretation_event: source.options.{SOURCE_AUTHORING_KEY}.content_hash must be populated"
         )
@@ -3183,7 +3243,7 @@ def _resolve_invented_source(
     )
     requirement = dict(requirements[matching_index])
     draft = requirement["draft"] if "draft" in requirement else None
-    if isinstance(draft, str) and draft != llm_draft:
+    if type(draft) is not str or draft != llm_draft:
         raise InterpretationPlaceholderConsumedError(
             "resolve_interpretation_event: invented_source event draft does not match the source review requirement draft"
         )
@@ -3234,7 +3294,7 @@ def _resolve_pipeline_decision_review(
     )
     requirement = dict(requirements[matching_index])
     draft = requirement["draft"] if "draft" in requirement else None
-    if isinstance(draft, str) and draft != llm_draft:
+    if type(draft) is not str or draft != llm_draft:
         raise InterpretationPlaceholderConsumedError(
             "resolve_interpretation_event: pipeline_decision event draft does not match the node review requirement draft"
         )
@@ -3325,7 +3385,7 @@ def _resolve_model_choice_review(
     )
     requirement = dict(requirements[matching_index])
     draft = requirement["draft"] if "draft" in requirement else None
-    if isinstance(draft, str) and draft != llm_draft:
+    if type(draft) is not str or draft != llm_draft:
         raise InterpretationPlaceholderConsumedError(
             "resolve_interpretation_event: llm_model_choice event draft does not match the node review requirement draft"
         )
@@ -3560,10 +3620,20 @@ class _SessionComposerMutations:
             if len(superseded_events) != 1:
                 raise AuditIntegrityError("superseded pipeline proposal has invalid creation authority")
             superseded_payload = superseded_events[0].payload
+            superseded_schema = (
+                superseded_payload["schema"]
+                if type(superseded_payload) in (dict, MappingProxyType) and "schema" in superseded_payload
+                else None
+            )
+            superseded_draft_hash = (
+                superseded_payload["draft_hash"]
+                if type(superseded_payload) in (dict, MappingProxyType) and "draft_hash" in superseded_payload
+                else None
+            )
             if (
-                not isinstance(superseded_payload, Mapping)
-                or superseded_payload.get("schema") != _PIPELINE_CREATED_SCHEMA
-                or superseded_payload.get("draft_hash") != proposal.supersedes_draft_hash
+                type(superseded_payload) not in (dict, MappingProxyType)
+                or superseded_schema != _PIPELINE_CREATED_SCHEMA
+                or superseded_draft_hash != proposal.supersedes_draft_hash
             ):
                 raise AuditIntegrityError("superseded pipeline proposal draft binding mismatch")
 
@@ -3655,8 +3725,10 @@ class _SessionComposerMutations:
         if type(receipt.result_blob_snapshot) is not dict:
             raise AuditIntegrityError("Tier 1: blob effect receipt result snapshot is malformed")
         if (
-            receipt.result_blob_snapshot.get("id") != receipt.blob_id
-            or receipt.result_blob_snapshot.get("session_id") != session_id
+            "id" not in receipt.result_blob_snapshot
+            or receipt.result_blob_snapshot["id"] != receipt.blob_id
+            or "session_id" not in receipt.result_blob_snapshot
+            or receipt.result_blob_snapshot["session_id"] != session_id
             or not is_lower_sha256_hex(receipt.result_blob_snapshot_hash)
             or stable_hash(receipt.result_blob_snapshot) != receipt.result_blob_snapshot_hash
         ):
@@ -4186,7 +4258,7 @@ class _GuidedSessionMutations:
         service, connection, fence, row, now = self.__state._require_exact()
         service._validate_guided_actor(actor)
         service._validate_guided_hash(response_hash, label="guided operation response_hash")
-        if isinstance(result, GuidedSessionResult):
+        if type(result) is GuidedSessionResult:
             parent = (
                 connection.execute(
                     select(sessions_table.c.user_id, sessions_table.c.auth_provider_type).where(
@@ -4685,9 +4757,12 @@ class SessionServiceImpl:
             value = conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one()
         else:
             raise NotImplementedError(f"guided operation database time not implemented for dialect {dialect}")
-        if isinstance(value, str):
-            value = datetime.fromisoformat(value)
-        if not isinstance(value, datetime):
+        if type(value) is str:
+            try:
+                value = datetime.fromisoformat(value)
+            except ValueError as exc:
+                raise AuditIntegrityError("Guided operation database clock returned malformed datetime text") from exc
+        if type(value) is not datetime:
             raise AuditIntegrityError("Guided operation database clock returned a non-datetime value")
         return SessionServiceImpl._ensure_utc(value)
 
@@ -4812,22 +4887,22 @@ class SessionServiceImpl:
 
     @staticmethod
     def _validate_guided_hash(value: str, *, label: str) -> None:
-        if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        if not is_lower_sha256_hex(value):
             raise ValueError(f"{label} must be a lowercase SHA-256 hex digest")
 
     @staticmethod
     def _validate_guided_actor(actor: str) -> None:
-        if not isinstance(actor, str) or not actor or len(actor) > 128:
+        if type(actor) is not str or not actor or len(actor) > 128:
             raise ValueError("guided operation actor must be a non-empty string of at most 128 characters")
 
     @staticmethod
     def _validate_guided_lease_seconds(lease_seconds: int) -> None:
-        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or not 1 <= lease_seconds <= 3600:
+        if type(lease_seconds) is not int or not 1 <= lease_seconds <= 3600:
             raise ValueError("guided operation lease_seconds must be an integer from 1 through 3600")
 
     @staticmethod
     def _validate_guided_identity(*, operation_id: str, kind: GuidedOperationKind, request_hash: str) -> None:
-        if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 128:
+        if type(operation_id) is not str or not 1 <= len(operation_id) <= 128:
             raise ValueError("guided operation id must be a non-empty string of at most 128 characters")
         if kind not in GUIDED_OPERATION_KIND_VALUES:
             raise ValueError("unsupported guided operation kind")
@@ -4955,7 +5030,7 @@ class SessionServiceImpl:
         if row["session_id"] != expected_session_id or row["operation_id"] != expected_operation_id:
             raise AuditIntegrityError("Tier 1: guided operation persisted identity does not match its lookup key")
         operation_id = row["operation_id"]
-        if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 128:
+        if type(operation_id) is not str or not 1 <= len(operation_id) <= 128:
             raise AuditIntegrityError("Tier 1: guided operation operation_id is invalid")
         kind = row["kind"]
         if kind not in GUIDED_OPERATION_KIND_VALUES:
@@ -4964,12 +5039,10 @@ class SessionServiceImpl:
         if status not in {"in_progress", "completed", "failed"}:
             raise AuditIntegrityError("Tier 1: guided operation status is invalid")
         request_hash = row["request_hash"]
-        try:
-            SessionServiceImpl._validate_guided_hash(request_hash, label="guided operation request_hash")
-        except ValueError as exc:
-            raise AuditIntegrityError("Tier 1: guided operation request_hash is invalid") from exc
+        if not is_lower_sha256_hex(request_hash):
+            raise AuditIntegrityError("Tier 1: guided operation request_hash is invalid")
         attempt = row["attempt"]
-        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+        if type(attempt) is not int or attempt < 1:
             raise AuditIntegrityError("Tier 1: guided operation attempt is invalid")
 
         for field in ("originating_message_id", "proposal_id", "result_state_id", "result_message_id", "result_session_id"):
@@ -4985,7 +5058,7 @@ class SessionServiceImpl:
 
         created_at = row["created_at"]
         updated_at = row["updated_at"]
-        if not isinstance(created_at, datetime) or not isinstance(updated_at, datetime):
+        if type(created_at) is not datetime or type(updated_at) is not datetime:
             raise AuditIntegrityError("Tier 1: guided operation timestamps are invalid")
         created_at = SessionServiceImpl._ensure_utc(created_at)
         updated_at = SessionServiceImpl._ensure_utc(updated_at)
@@ -4993,7 +5066,7 @@ class SessionServiceImpl:
             raise AuditIntegrityError("Tier 1: guided operation updated_at predates created_at")
         settled_at = row["settled_at"]
         if settled_at is not None:
-            if not isinstance(settled_at, datetime):
+            if type(settled_at) is not datetime:
                 raise AuditIntegrityError("Tier 1: guided operation settled_at is invalid")
             if SessionServiceImpl._ensure_utc(settled_at) < created_at:
                 raise AuditIntegrityError("Tier 1: guided operation settled_at predates created_at")
@@ -5015,7 +5088,7 @@ class SessionServiceImpl:
         if row["session_id"] != expected_session_id or row["operation_id"] != expected_operation_id:
             raise AuditIntegrityError("Tier 1: guided operation admission block identity does not match its lookup key")
         operation_id = row["operation_id"]
-        if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 128:
+        if type(operation_id) is not str or not 1 <= len(operation_id) <= 128:
             raise AuditIntegrityError("Tier 1: guided operation admission block operation_id is invalid")
         if row["kind"] != "guided_start":
             raise AuditIntegrityError("Tier 1: guided operation admission block kind is invalid")
@@ -5025,7 +5098,7 @@ class SessionServiceImpl:
             SessionServiceImpl._validate_guided_actor(row["actor"])
         except ValueError as exc:
             raise AuditIntegrityError("Tier 1: guided operation admission block actor is invalid") from exc
-        if not isinstance(row["created_at"], datetime):
+        if type(row["created_at"]) is not datetime:
             raise AuditIntegrityError("Tier 1: guided operation admission block timestamp is invalid")
         SessionServiceImpl._ensure_utc(row["created_at"])
 
@@ -5066,7 +5139,7 @@ class SessionServiceImpl:
     def _guided_in_progress_expiry(row: RowMapping) -> datetime:
         lease_token = row["lease_token"]
         lease_expires_at = row["lease_expires_at"]
-        if not isinstance(lease_token, str) or not 1 <= len(lease_token) <= 256 or not isinstance(lease_expires_at, datetime):
+        if type(lease_token) is not str or not 1 <= len(lease_token) <= 256 or type(lease_expires_at) is not datetime:
             raise AuditIntegrityError("Tier 1: in-progress guided operation has an invalid lease bundle")
         if any(row[field] is not None for field in ("settled_at", "result_kind", "result_message_id", "response_hash", "failure_code")):
             raise AuditIntegrityError("Tier 1: in-progress guided operation retained terminal residue")
@@ -5100,20 +5173,19 @@ class SessionServiceImpl:
                 )
             ):
                 raise AuditIntegrityError("Tier 1: failed guided operation retained terminal failure residue")
-            if not isinstance(row["settled_at"], datetime):
+            if type(row["settled_at"]) is not datetime:
                 raise AuditIntegrityError("Tier 1: failed guided operation is missing settled_at")
             return
         if status != "completed":
             raise AuditIntegrityError("Tier 1: guided operation terminal decoder received a non-terminal row")
         if row["lease_token"] is not None or row["lease_expires_at"] is not None or row["failure_code"] is not None:
             raise AuditIntegrityError("Tier 1: completed guided operation retained terminal residue")
-        if not isinstance(row["settled_at"], datetime):
+        if type(row["settled_at"]) is not datetime:
             raise AuditIntegrityError("Tier 1: completed guided operation is missing settled_at")
         response_hash = row["response_hash"]
-        if not isinstance(response_hash, str):
+        if type(response_hash) is not str or not is_lower_sha256_hex(response_hash):
             raise AuditIntegrityError("Tier 1: completed guided operation is missing response_hash")
         try:
-            SessionServiceImpl._validate_guided_hash(response_hash, label="guided operation response_hash")
             result_kind = row["result_kind"]
             if result_kind == "composition_state":
                 if row["kind"] in {"session_fork", "guided_plan"}:
@@ -5293,12 +5365,12 @@ class SessionServiceImpl:
                     raise AuditIntegrityError("Tier 1: in-progress guided operation lost its active parent custody")
                 prior_expiry = self._guided_in_progress_expiry(row)
                 prior_attempt = row["attempt"]
-                if not isinstance(prior_attempt, int) or isinstance(prior_attempt, bool) or prior_attempt < 1:
+                if type(prior_attempt) is not int or prior_attempt < 1:
                     raise AuditIntegrityError("Tier 1: guided operation has an invalid attempt")
                 if prior_expiry > now:
                     return GuidedOperationActive(attempt=prior_attempt, lease_expires_at=prior_expiry)
                 prior_token = row["lease_token"]
-                assert isinstance(prior_token, str)
+                assert type(prior_token) is str
                 next_attempt = prior_attempt + 1
                 lease_token = uuid.uuid4().hex
                 changed = conn.execute(
@@ -5387,7 +5459,7 @@ class SessionServiceImpl:
                 raise AuditIntegrityError("Tier 1: guided operation has an invalid status")
             expiry = self._guided_in_progress_expiry(row)
             attempt = row["attempt"]
-            if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+            if type(attempt) is not int or attempt < 1:
                 raise AuditIntegrityError("Tier 1: guided operation has an invalid attempt")
             return GuidedOperationActive(attempt=attempt, lease_expires_at=expiry, expired=expiry <= now)
 
@@ -5403,7 +5475,7 @@ class SessionServiceImpl:
         operation_id: str,
     ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None:
         """Inspect cold-start custody without entering a write transaction."""
-        if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 128:
+        if type(operation_id) is not str or not 1 <= len(operation_id) <= 128:
             raise ValueError("guided operation id must be a non-empty string of at most 128 characters")
         sid = str(session_id)
 
@@ -5437,7 +5509,7 @@ class SessionServiceImpl:
                 raise AuditIntegrityError("Tier 1: guided operation has an invalid status")
             expiry = self._guided_in_progress_expiry(row)
             attempt = row["attempt"]
-            if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+            if type(attempt) is not int or attempt < 1:
                 raise AuditIntegrityError("Tier 1: guided operation has an invalid attempt")
             return GuidedOperationActive(
                 attempt=attempt,
@@ -5461,11 +5533,9 @@ class SessionServiceImpl:
         session_operation_context: SessionOperationContext,
     ) -> GuidedOperationActive | GuidedOperationCompleted | GuidedOperationFailed | None:
         """Seal one observed missing/expired guided start under both authorities."""
-        if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 128:
+        if type(operation_id) is not str or not 1 <= len(operation_id) <= 128:
             raise ValueError("guided operation id must be a non-empty string of at most 128 characters")
-        if observed_attempt is not None and (
-            not isinstance(observed_attempt, int) or isinstance(observed_attempt, bool) or observed_attempt < 1
-        ):
+        if observed_attempt is not None and (type(observed_attempt) is not int or observed_attempt < 1):
             raise ValueError("observed_attempt must be None or a positive exact integer")
         self._validate_guided_actor(actor)
         self._validate_guided_lease_seconds(lease_seconds)
@@ -5525,7 +5595,7 @@ class SessionServiceImpl:
                     raise AuditIntegrityError("Tier 1: guided operation has an invalid status")
                 expiry = self._guided_in_progress_expiry(row)
                 attempt = row["attempt"]
-                if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+                if type(attempt) is not int or attempt < 1:
                     raise AuditIntegrityError("Tier 1: guided operation has an invalid attempt")
                 if observed_attempt != attempt or expiry > now:
                     return GuidedOperationActive(
@@ -5535,7 +5605,7 @@ class SessionServiceImpl:
                     )
 
                 prior_token = row["lease_token"]
-                assert isinstance(prior_token, str)
+                assert type(prior_token) is str
                 next_attempt = attempt + 1
                 lease_token = uuid.uuid4().hex
                 lease_expires_at = now + timedelta(seconds=lease_seconds)
@@ -5723,7 +5793,7 @@ class SessionServiceImpl:
         result: GuidedOperationResult,
     ) -> tuple[dict[str, str | None], GuidedOperationResult]:
         kind = row["kind"]
-        if isinstance(result, GuidedCompositionStateResult):
+        if type(result) is GuidedCompositionStateResult:
             if kind in {"session_fork", "guided_plan"}:
                 raise ValueError("guided operation kind requires a different result locator")
             if result.proposal_id is not None and kind not in {"guided_respond", "guided_chat"}:
@@ -5751,7 +5821,7 @@ class SessionServiceImpl:
                 },
                 normalized,
             )
-        if isinstance(result, GuidedPipelineProposalResult):
+        if type(result) is GuidedPipelineProposalResult:
             if kind != "guided_plan":
                 raise ValueError("only guided_plan may complete with a pipeline proposal locator")
             proposal_id = SessionServiceImpl._merge_guided_binding(
@@ -5777,7 +5847,7 @@ class SessionServiceImpl:
                 },
                 normalized,
             )
-        if isinstance(result, GuidedSessionResult):
+        if type(result) is GuidedSessionResult:
             if kind != "session_fork":
                 raise ValueError("only session_fork may complete with a session locator")
             session_id = SessionServiceImpl._merge_guided_binding(
@@ -5796,7 +5866,7 @@ class SessionServiceImpl:
                 },
                 GuidedSessionResult(session_id=UUID(session_id)),
             )
-        if isinstance(result, GuidedDeclinedResult):
+        if type(result) is GuidedDeclinedResult:
             if kind != "guided_plan":
                 raise ValueError("only guided_plan may complete with a decline locator")
             checkpoint_state_id = SessionServiceImpl._merge_guided_binding(
@@ -7287,8 +7357,11 @@ class SessionServiceImpl:
             if type(transition_assistant) is not TransitionAssistantDraft:
                 raise TypeError("transition_assistant must be an exact TransitionAssistantDraft")
             composer_meta = deep_thaw(settled_state.composer_meta)
-            guided_session = composer_meta.get("guided_session") if type(composer_meta) is dict else None
-            if type(guided_session) is not dict or guided_session.get("transition_consumed") is not True:
+            guided_session = composer_meta["guided_session"] if type(composer_meta) is dict and "guided_session" in composer_meta else None
+            transition_consumed = (
+                guided_session["transition_consumed"] if type(guided_session) is dict and "transition_consumed" in guided_session else None
+            )
+            if type(guided_session) is not dict or transition_consumed is not True:
                 raise AuditIntegrityError("transition assistant requires guided_session.transition_consumed=true")
         sid = str(session_id)
         pid = str(proposal_id)
@@ -7658,12 +7731,14 @@ class SessionServiceImpl:
                     .where(proposal_events_table.c.event_type == "proposal.created")
                     .where(proposal_events_table.c.proposal_id.in_([str(record.id) for record in records]))
                 ).fetchall()
-                by_proposal: dict[str, list[Any]] = {}
+                by_proposal: dict[str, list[Any]] = {str(record.id): [] for record in records}
                 for event_row in creation_rows:
-                    by_proposal.setdefault(event_row.proposal_id, []).append(event_row)
+                    if event_row.proposal_id not in by_proposal:
+                        raise AuditIntegrityError("proposal creation event escaped the constrained proposal query")
+                    by_proposal[event_row.proposal_id].append(event_row)
                 enriched: list[CompositionProposalRecord] = []
                 for record in records:
-                    events = by_proposal.get(str(record.id), [])
+                    events = by_proposal[str(record.id)]
                     if len(events) != 1:
                         raise AuditIntegrityError("composition proposal must have exactly one creation event")
                     authority = _classify_authoritative_composition_proposal(
@@ -7910,7 +7985,7 @@ class SessionServiceImpl:
         Telemetry: NONE — composition-time user decisions are audit-primary;
         no ephemeral operational signal required.
         """
-        if not isinstance(kind, InterpretationKind):
+        if type(kind) is not InterpretationKind:
             raise ValueError(f"kind must be InterpretationKind, got {type(kind).__name__}: {kind!r}")
         now = self._ensure_utc(created_at) if created_at is not None else self._now()
         sid = str(session_id)
@@ -7951,19 +8026,19 @@ class SessionServiceImpl:
                             "create_pending_interpretation_event: invented_source must target a source component "
                             f"({SOURCE_COMPONENT_ID!r} or {SOURCE_COMPONENT_ID!r}:<name>), got {affected_node_id!r}"
                         )
-                    source = sources[source_name] if isinstance(sources, Mapping) and source_name in sources else None
-                    if not isinstance(source, Mapping):
+                    source = sources[source_name] if type(sources) is dict and source_name in sources else None
+                    if type(source) is not dict:
                         raise ValueError(f"create_pending_interpretation_event: invented_source requires persisted source {source_name!r}")
                     source_options = source["options"] if "options" in source else None
-                    if not isinstance(source_options, Mapping) or SOURCE_AUTHORING_KEY not in source_options:
+                    if type(source_options) is not dict or SOURCE_AUTHORING_KEY not in source_options:
                         raise ValueError(
                             f"create_pending_interpretation_event: invented_source requires source.options.{SOURCE_AUTHORING_KEY}"
                         )
                     source_authoring = source_options[SOURCE_AUTHORING_KEY]
-                    if not isinstance(source_authoring, Mapping):
+                    if type(source_authoring) is not dict:
                         raise ValueError(f"create_pending_interpretation_event: source.options.{SOURCE_AUTHORING_KEY} must be a mapping")
                     content_hash = source_authoring["content_hash"] if "content_hash" in source_authoring else None
-                    if not isinstance(content_hash, str) or not content_hash:
+                    if type(content_hash) is not str or not content_hash:
                         raise ValueError(
                             f"create_pending_interpretation_event: source.options.{SOURCE_AUTHORING_KEY}.content_hash must be populated"
                         )
@@ -7981,7 +8056,7 @@ class SessionServiceImpl:
                         ) from exc
                     requirement = requirements[matching_index]
                     draft = requirement["draft"] if "draft" in requirement else None
-                    if isinstance(draft, str) and draft != llm_draft:
+                    if type(draft) is not str or draft != llm_draft:
                         raise ValueError(
                             "create_pending_interpretation_event: invented_source event draft does not match the source review requirement draft"
                         )
@@ -8015,7 +8090,7 @@ class SessionServiceImpl:
                         ) from exc
                     requirement = requirements[matching_index]
                     draft = requirement["draft"] if "draft" in requirement else None
-                    if isinstance(draft, str) and draft != llm_draft:
+                    if type(draft) is not str or draft != llm_draft:
                         raise ValueError(
                             "create_pending_interpretation_event: pipeline_decision event draft does not match the node review requirement draft"
                         )
@@ -8046,13 +8121,14 @@ class SessionServiceImpl:
                         requirements_value = (
                             options[INTERPRETATION_REQUIREMENTS_KEY] if INTERPRETATION_REQUIREMENTS_KEY in options else None
                         )
-                        has_structured_match = isinstance(requirements_value, (list, tuple)) and any(
-                            isinstance(requirement, Mapping)
-                            and requirement.get("kind", InterpretationKind.VAGUE_TERM.value) == InterpretationKind.VAGUE_TERM.value
-                            and isinstance(requirement.get("user_term"), str)
+                        has_structured_match = type(requirements_value) in (list, tuple) and any(
+                            type(requirement) in (dict, MappingProxyType)
+                            and (requirement["kind"] if "kind" in requirement else InterpretationKind.VAGUE_TERM.value)
+                            == InterpretationKind.VAGUE_TERM.value
+                            and type(requirement["user_term"] if "user_term" in requirement else None) is str
                             and requirement["user_term"].strip() == user_term.strip()
-                            and requirement.get("status") == "pending"
-                            for requirement in requirements_value
+                            and (requirement["status"] if "status" in requirement else None) == "pending"
+                            for requirement in cast(list[Any] | tuple[Any, ...], requirements_value)
                         )
                         if has_structured_match:
                             requirements, matching_index = _matching_pending_requirement_index(
@@ -8061,14 +8137,15 @@ class SessionServiceImpl:
                                 user_term=user_term,
                                 context="create_pending_interpretation_event",
                             )
-                            current_draft = requirements[matching_index].get("draft")
-                            if not isinstance(current_draft, str) or current_draft != llm_draft:
+                            requirement = requirements[matching_index]
+                            current_draft = requirement["draft"] if "draft" in requirement else None
+                            if type(current_draft) is not str or current_draft != llm_draft:
                                 raise ValueError(
                                     "create_pending_interpretation_event: vague_term event draft does not match "
                                     "the current review requirement draft"
                                 )
                     elif kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
-                        if "prompt_template" not in options or not isinstance(options["prompt_template"], str):
+                        if "prompt_template" not in options or type(options["prompt_template"]) is not str:
                             raise ValueError(
                                 f"create_pending_interpretation_event: node {affected_node_id!r} options.prompt_template is not a string"
                             )
@@ -8140,11 +8217,14 @@ class SessionServiceImpl:
                     # site. Return that terminal row so post-persist advisory
                     # surfacers finish without converting a successful state
                     # commit into an error response.
-                    stale_rows_to_abandon = [
-                        pending_row.id
-                        for pending_row in pending_site_rows
-                        if isinstance(pending_row.user_term, str) and pending_row.user_term.strip() == user_term.strip()
-                    ]
+                    stale_rows_to_abandon: list[str] = []
+                    for pending_row in pending_site_rows:
+                        if type(pending_row.user_term) is not str:
+                            raise AuditIntegrityError(
+                                "create_pending_interpretation_event: pending review has malformed user_term"
+                            ) from None
+                        if pending_row.user_term.strip() == user_term.strip():
+                            stale_rows_to_abandon.append(pending_row.id)
                     if not stale_rows_to_abandon:
                         raise
                     conn.execute(
@@ -8170,7 +8250,9 @@ class SessionServiceImpl:
                 rows_to_abandon: list[str] = []
                 for pending_row in pending_site_rows:
                     pending_user_term = pending_row.user_term
-                    if not isinstance(pending_user_term, str) or pending_user_term.strip() != user_term.strip():
+                    if type(pending_user_term) is not str:
+                        raise AuditIntegrityError("create_pending_interpretation_event: pending review has malformed user_term")
+                    if pending_user_term.strip() != user_term.strip():
                         continue
                     surfacing_state_row = conn.execute(
                         select(composition_states_table)
@@ -9024,7 +9106,7 @@ class SessionServiceImpl:
         Telemetry: NONE — composition-time user decisions are
         audit-primary; no ephemeral operational signal required.
         """
-        if not isinstance(kind, InterpretationKind):
+        if type(kind) is not InterpretationKind:
             raise ValueError(f"kind must be InterpretationKind, got {type(kind).__name__}: {kind!r}")
         now = self._ensure_utc(created_at) if created_at is not None else self._now()
         sid = str(session_id)
@@ -9297,9 +9379,11 @@ class SessionServiceImpl:
                 commitment = GuidedFailureAuditCohort.from_envelope(event.failure_audit_cohort)
             except (TypeError, ValueError, AuditIntegrityError) as exc:
                 raise AuditIntegrityError("guided failure audit cohort has malformed terminal-event commitment") from exc
-            event_commitments.setdefault(lineage, []).append(commitment)
+            if lineage not in event_commitments:
+                event_commitments[lineage] = []
+            event_commitments[lineage].append(commitment)
 
-        records_by_lineage: dict[GuidedFailureAuditLineage, list[ChatMessageRecord]] = {}
+        records_by_lineage: dict[GuidedFailureAuditLineage, list[ChatMessageRecord]] = {lineage: [] for lineage in event_commitments}
         for row in message_rows:
             try:
                 content = json.loads(row.content)
@@ -9329,12 +9413,12 @@ class SessionServiceImpl:
                 raise AuditIntegrityError("guided failure audit lineage content and envelope disagree")
             if content_lineage.session_id != UUID(row.session_id):
                 raise AuditIntegrityError("guided failure audit lineage names a different session")
-            if len(event_commitments.get(content_lineage, ())) != 1:
+            if content_lineage not in event_commitments or len(event_commitments[content_lineage]) != 1:
                 raise AuditIntegrityError(
                     "guided failure audit lineage has absent or ambiguous terminal-event authority; "
                     "guided failure audit cohort authority is not exact"
                 )
-            records_by_lineage.setdefault(content_lineage, []).append(self._row_to_chat_message_record(row))
+            records_by_lineage[content_lineage].append(self._row_to_chat_message_record(row))
 
         for lineage, commitments in event_commitments.items():
             if len(commitments) != 1:
@@ -9342,7 +9426,7 @@ class SessionServiceImpl:
                     "guided failure audit lineage has ambiguous terminal-event authority; "
                     "guided failure audit cohort authority is not exact"
                 )
-            records = tuple(records_by_lineage.get(lineage, ()))
+            records = tuple(records_by_lineage[lineage])
             actual = GuidedFailureAuditCohort.from_records(records)
             if actual != commitments[0]:
                 raise AuditIntegrityError("guided failure audit cohort does not match the exact durable evidence rows")
@@ -9689,8 +9773,11 @@ class SessionServiceImpl:
     ) -> TransitionResponseSettlement:
         """Persist transition consumption and its assistant response atomically."""
         composer_meta = deep_thaw(state.composer_meta)
-        guided_session = composer_meta.get("guided_session") if type(composer_meta) is dict else None
-        if type(guided_session) is not dict or guided_session.get("transition_consumed") is not True:
+        guided_session = composer_meta["guided_session"] if type(composer_meta) is dict and "guided_session" in composer_meta else None
+        transition_consumed = (
+            guided_session["transition_consumed"] if type(guided_session) is dict and "transition_consumed" in guided_session else None
+        )
+        if type(guided_session) is not dict or transition_consumed is not True:
             raise AuditIntegrityError("commit_transition_response requires guided_session.transition_consumed=true")
 
         sid = str(session_id)
@@ -10306,8 +10393,9 @@ class SessionServiceImpl:
                 pending_authorities: list[AuthoritativePipelineProposal] = []
                 for proposal_row in pending_rows:
                     proposal_id = UUID(proposal_row.id)
-                    authority = referenced_authorities.get(proposal_id)
-                    if authority is None:
+                    if proposal_id in referenced_authorities:
+                        authority = referenced_authorities[proposal_id]
+                    else:
                         authority = _restore_authoritative_pipeline_proposal(
                             conn=conn,
                             row=_proposal_record_from_row(proposal_row),
@@ -10449,9 +10537,7 @@ class SessionServiceImpl:
             raise ValueError("expected guided current state id and version must be both present or both absent")
         if expected_state_id is not None and type(expected_state_id) is not UUID:
             raise ValueError("expected guided current state id must be a UUID")
-        if expected_state_version is not None and (
-            not isinstance(expected_state_version, int) or isinstance(expected_state_version, bool) or expected_state_version < 1
-        ):
+        if expected_state_version is not None and (type(expected_state_version) is not int or expected_state_version < 1):
             raise ValueError("expected guided current state version must be a positive integer")
         current = conn.execute(
             select(composition_states_table.c.id, composition_states_table.c.version)
@@ -10836,7 +10922,7 @@ class SessionServiceImpl:
 
                 def _guided_checkpoint(composer_meta: object, *, role: str) -> GuidedSession:
                     metadata = deep_thaw(composer_meta)
-                    if type(metadata) is not dict or type(metadata.get("guided_session")) is not dict:
+                    if type(metadata) is not dict or "guided_session" not in metadata or type(metadata["guided_session"]) is not dict:
                         raise AuditIntegrityError(f"{role} deferred intent state has no exact guided checkpoint")
                     try:
                         return GuidedSession.from_dict(metadata["guided_session"])
@@ -11556,7 +11642,8 @@ class SessionServiceImpl:
                 "connections",
                 "semantic_contracts",
             ):
-                if durable_payload_json.get(key) != expected_wire["payload"].get(key):
+                expected_payload = expected_wire["payload"]
+                if key not in durable_payload_json or key not in expected_payload or durable_payload_json[key] != expected_payload[key]:
                     raise AuditIntegrityError(f"guided correction wire projection differs at {key}")
         verified_remaining_deferred_intents(
             guided=guided,
@@ -11995,19 +12082,20 @@ class SessionServiceImpl:
                     raise AuditIntegrityError("guided back-edit active proposal reference differs from authority")
                 turn_payload_json = deep_thaw(turn_payload.payload)
                 if command.edit_target.kind == "source":
-                    source_target = guided.reviewed_sources.get(command.edit_target.stable_id)
-                    if source_target is None:
+                    if command.edit_target.stable_id not in guided.reviewed_sources:
                         raise AuditIntegrityError("guided back-edit target is not an exact reviewed component")
+                    source_target = guided.reviewed_sources[command.edit_target.stable_id]
                     expected_plugin = source_target.plugin
                     expected_prefill = {"schema": {"mode": "observed"}, **dict(deep_thaw(source_target.options))}
-                    blob_ref = source_target.options.get("blob_ref")
-                    if blob_ref is not None and type(expected_prefill.get("path")) is str:
+                    blob_ref = source_target.options["blob_ref"] if "blob_ref" in source_target.options else None
+                    expected_path = expected_prefill["path"] if "path" in expected_prefill else None
+                    if blob_ref is not None and type(expected_path) is str:
                         expected_prefill["path"] = f"{BLOB_REF_PATH_PREFIX}{blob_ref}"
                     expected_prefill["on_validation_failure"] = source_target.on_validation_failure
                 else:
-                    output_target = guided.reviewed_outputs.get(command.edit_target.stable_id)
-                    if output_target is None:
+                    if command.edit_target.stable_id not in guided.reviewed_outputs:
                         raise AuditIntegrityError("guided back-edit target is not an exact reviewed component")
+                    output_target = guided.reviewed_outputs[command.edit_target.stable_id]
                     expected_plugin = output_target.plugin
                     expected_prefill = {"schema": {"mode": "observed"}, **dict(deep_thaw(output_target.options))}
                     expected_prefill["on_write_failure"] = output_target.on_write_failure
@@ -12923,7 +13011,7 @@ class SessionServiceImpl:
                         if (
                             row is None
                             or row.status != "cancelled"
-                            or not isinstance(row.error, str)
+                            or type(row.error) is not str
                             or not row.error.endswith(LANDSCAPE_RECONCILIATION_PENDING_SUFFIX)
                         ):
                             raise ValueError("Run is not an exact pending Landscape reconciliation candidate")
@@ -13041,8 +13129,8 @@ class SessionServiceImpl:
         new_message_content: str,
         authority: SessionForkAuthority,
     ) -> StagedForkSession:
-        if not isinstance(transaction, SessionForkCreationTransaction):
-            raise TypeError("transaction must implement SessionForkCreationTransaction")
+        if type(transaction) is not _ForkCreationTransaction:
+            raise TypeError("transaction must be the repository-owned SessionForkCreationTransaction")
         parent_row = transaction.read_parent_session()
         child_row, rows, state_row = transaction.read_child_snapshot()
         if (
@@ -13060,24 +13148,17 @@ class SessionServiceImpl:
         public_messages: list[ChatMessageRecord] = []
         for row in rows:
             if row.role == "audit" and row.writer_principal == "session_fork":
-                try:
-                    decoded = json.loads(row.content)
-                except (TypeError, json.JSONDecodeError):
-                    decoded = None
-                if (
-                    type(decoded) is dict
-                    and decoded.get("schema") == _FORK_BLOB_PLAN_SCHEMA
-                    and decoded.get("child_session_id") == str(child_session_id)
-                    and decoded.get("operation_id") == operation_id
-                ):
-                    plan_candidates.append(
-                        _fork_blob_plan_from_content(
-                            row.content,
-                            expected_source_session_id=parent_session_id,
-                            expected_child_session_id=child_session_id,
-                            expected_operation_id=operation_id,
-                        )
-                    )
+                row_source_session_id, row_child_session_id, row_operation_id = _fork_blob_plan_identity_from_content(row.content)
+                retained_plan = _fork_blob_plan_from_content(
+                    row.content,
+                    expected_source_session_id=row_source_session_id,
+                    expected_child_session_id=row_child_session_id,
+                    expected_operation_id=row_operation_id,
+                )
+                if row_child_session_id == child_session_id and row_operation_id == operation_id:
+                    if row_source_session_id != parent_session_id:
+                        raise AuditIntegrityError("staged fork blob plan has malformed custody binding")
+                    plan_candidates.append(retained_plan)
             if row.role != "audit":
                 public_messages.append(self._row_to_chat_message_record(row))
         if len(plan_candidates) != 1:
@@ -13306,7 +13387,7 @@ class SessionServiceImpl:
                     source_messages_by_id,
                 )
                 source_meta = deep_thaw(locked_source_state.composer_meta)
-                if type(source_meta) is dict and source_meta.get("guided_session") is not None:
+                if type(source_meta) is dict and "guided_session" in source_meta and source_meta["guided_session"] is not None:
                     from elspeth.web.composer.guided.errors import InvariantError
                     from elspeth.web.composer.guided.state_machine import GuidedSession
 
@@ -13468,7 +13549,7 @@ class SessionServiceImpl:
                 if current_state_row is not None:
                     current_record = self._row_to_state_record(current_state_row)
                     current_meta = deep_thaw(current_record.composer_meta)
-                    if type(current_meta) is dict and current_meta.get("guided_session") is not None:
+                    if type(current_meta) is dict and "guided_session" in current_meta and current_meta["guided_session"] is not None:
                         from elspeth.web.composer.guided.errors import InvariantError
                         from elspeth.web.composer.guided.state_machine import GuidedSession
 
@@ -13761,7 +13842,7 @@ class SessionServiceImpl:
             raise AuditIntegrityError(
                 f"Tier 1: run_events.event_type is {row.event_type!r}, expected one of {sorted(SESSION_RUN_EVENT_TYPE_VALUES)}"
             )
-        if not isinstance(row.data, Mapping):
+        if type(row.data) is not dict:
             raise AuditIntegrityError(f"Tier 1: run_events.data for event {row.id} is not a JSON object")
         return RunEventRecord(
             id=UUID(row.id),

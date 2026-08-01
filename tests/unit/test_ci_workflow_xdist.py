@@ -437,6 +437,35 @@ def test_static_analysis_all_prs_reject_unverified_signed_allowlist_edits() -> N
     assert gate_index < _step_index(static_analysis, "Run trust-boundary honesty-gate elspeth-lints rules")
 
 
+def test_static_analysis_ratchets_permanent_multi_rule_blankets_repo_wide_on_prs_and_pushes() -> None:
+    """The transitional blanket debt may shrink after merge but never grow."""
+    workflow = _ci_workflow()
+    static_analysis = workflow["jobs"]["static-analysis"]
+
+    step_name = "Reject touched or broadened permanent multi-rule per-file blankets"
+    step = _step(static_analysis, step_name)
+    assert "if" not in step, "blanket ratchet must run for protected pushes as well as PRs"
+    env = step.get("env")
+    assert isinstance(env, dict)
+    assert env.get("BASELINE_REF") == (
+        "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}"
+    )
+
+    run = _step_run(static_analysis, step_name)
+    assert 'if [[ "$BASELINE_REF" == "0000000000000000000000000000000000000000" ]]' in run
+    assert 'git fetch --no-tags --depth=2 origin "$GITHUB_SHA"' in run
+    assert 'BASELINE_REF="$(git rev-parse "$GITHUB_SHA^")"' in run
+    assert 'git fetch --no-tags --depth=1 origin "$BASELINE_REF"' in run
+    assert "check-per-file-blanket-ratchet" in run
+    assert '--baseline-ref "$BASELINE_REF"' in run
+    assert "--allowlist-root config/cicd" in run
+    assert "--repo-root ." in run
+
+    gate_index = _step_index(static_analysis, step_name)
+    assert gate_index < _step_index(static_analysis, "Reject unverified PR signed allowlist edits")
+    assert gate_index < _step_index(static_analysis, "Run trust-tier elspeth-lints rule")
+
+
 def test_judge_quality_never_receives_openrouter_credentials_on_prs() -> None:
     """The live-judge secret remains push-only; PRs skip the trusted job."""
     workflow = _workflow(JUDGE_GATES_WORKFLOW)

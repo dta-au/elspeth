@@ -293,6 +293,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_migrate_judge_scope(args)
     if args.command == "check-judge-coverage":
         return _run_check_judge_coverage(args)
+    if args.command == "check-per-file-blanket-ratchet":
+        return _run_check_per_file_blanket_ratchet(args)
     if args.command == "check-judge-quality":
         return _run_check_judge_quality(args)
     if args.command == "check-trust-boundary-diff":
@@ -1048,6 +1050,32 @@ def _build_parser() -> argparse.ArgumentParser:
             "Repository working tree root. Required for git commands. Defaults to "
             "the current working directory (the repo root in standard CI usage)."
         ),
+    )
+
+    check_blankets = subparsers.add_parser(
+        "check-per-file-blanket-ratchet",
+        help=(
+            "Reject permanent multi-rule per-file suppressions when matched source "
+            "files are touched, and reject new or broadened blankets while "
+            "grandfathering untouched baseline-equivalent legacy debt."
+        ),
+    )
+    check_blankets.add_argument(
+        "--baseline-ref",
+        required=True,
+        help="Git ref whose permanent multi-rule blankets form the transitional debt baseline.",
+    )
+    check_blankets.add_argument(
+        "--allowlist-root",
+        type=Path,
+        default=Path("config/cicd"),
+        help="Allowlist tree to scan recursively. Default: config/cicd.",
+    )
+    check_blankets.add_argument(
+        "--repo-root",
+        type=Path,
+        default=Path.cwd(),
+        help="Repository working tree root used for Git baseline reads.",
     )
 
     check_quality = subparsers.add_parser(
@@ -3976,6 +4004,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
             bundle,
             root=args.root,
             allowlist_dir=verification_allowlist_dir,
+            bundle_allowlist_dir=args.allowlist_dir,
         )
     except ValueError as exc:
         if (
@@ -4017,7 +4046,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
         return 2
 
     # --- Pre-write summary (pure read) ---------------------------------------
-    _emit_sign_bundle_summary(bundle, args=args)
+    _emit_sign_bundle_summary(bundle, verification=verification, args=args)
 
     if args.dry_run:
         sys.stdout.write("sign-bundle: dry-run; nothing written (re-run without --dry-run to fire).\n")
@@ -4104,7 +4133,7 @@ def _sign_bundle_signing_policy(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _emit_sign_bundle_summary(bundle: Any, *, args: argparse.Namespace) -> None:
+def _emit_sign_bundle_summary(bundle: Any, *, verification: Any, args: argparse.Namespace) -> None:
     """Print the per-lane plan + the planned operator-override action count.
 
     The planned override **count** is the deterministic, load-bearing integer the
@@ -4123,6 +4152,12 @@ def _emit_sign_bundle_summary(bundle: Any, *, args: argparse.Namespace) -> None:
         f"{len(bundle.actions)} action(s) -- "
         f"new_judgment={counts['justify']}, drift_repair={counts['drift_repair']}, "
         f"rotation={counts['rotation']}, stale_delete={counts['stale_delete']}\n"
+    )
+    census = verification.target_census
+    sys.stdout.write(
+        "sign-bundle: empty-allowlist target census -- "
+        f"raw={census.raw_target_count}, exact_covered={census.exact_covered_count}, "
+        f"per_file_covered={census.per_file_covered_count}, uncovered={census.uncovered_count}\n"
     )
     sys.stdout.write(f"sign-bundle: planned operator-override actions: {planned_override}\n")
     sys.stdout.write(
@@ -5363,6 +5398,49 @@ def _run_check_judge_coverage(args: argparse.Namespace) -> int:
         "change into a reviewed migration. Use '--operator-override' only "
         "to record an OVERRIDDEN_BY_OPERATOR verdict when the judge would "
         "BLOCK an exact entry incorrectly.\n"
+    )
+    return 1
+
+
+def _run_check_per_file_blanket_ratchet(args: argparse.Namespace) -> int:
+    """Handle the repo-wide permanent multi-rule blanket ratchet."""
+    from elspeth_lints.core.per_file_blanket_ratchet import (
+        PerFileBlanketRatchetError,
+        check_per_file_blanket_ratchet,
+    )
+
+    try:
+        report = check_per_file_blanket_ratchet(
+            allowlist_root=args.allowlist_root,
+            baseline_ref=args.baseline_ref,
+            repo_root=args.repo_root,
+        )
+    except PerFileBlanketRatchetError as exc:
+        sys.stderr.write(f"check-per-file-blanket-ratchet: cannot run: {exc}\n")
+        return 2
+
+    sys.stdout.write(
+        "check-per-file-blanket-ratchet: "
+        f"{report.head_blanket_count} permanent multi-rule blanket(s) at HEAD "
+        f"({report.grandfathered_count} grandfathered from "
+        f"{report.baseline_blanket_count} baseline); "
+        f"{len(report.violations)} violation(s).\n"
+    )
+    if report.passes:
+        return 0
+    sys.stdout.write("\nNew or broadened permanent multi-rule blankets:\n")
+    for violation in report.violations:
+        cap = "uncapped" if violation.max_hits is None else f"max_hits={violation.max_hits}"
+        touched = "" if violation.touched_file is None else f" touched_file={violation.touched_file!r}"
+        sys.stdout.write(
+            f"  {violation.source_file} :: per_file_rules[{violation.index}] "
+            f"pattern={violation.pattern!r} rules={','.join(violation.rules)} {cap}{touched}\n"
+            f"    {violation.reason}\n"
+        )
+    sys.stdout.write(
+        "\nFor touched source, replace the blanket with exact reviewed allow_hits "
+        "entries. Otherwise add an expiry, reduce it to one rule, or narrow its "
+        "rules/max_hits relative to the baseline.\n"
     )
     return 1
 

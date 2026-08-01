@@ -26,11 +26,21 @@ def record_tutorial_completed_path(completion_path: _CompletionPath) -> None:
     """Increment the tutorial completion counter with a server-derived path."""
     if completion_path not in _COMPLETION_PATHS:
         raise ValueError(f"completion_path must be one of {sorted(_COMPLETION_PATHS)!r}; got {completion_path!r}")
-    _TUTORIAL_COMPLETED_COUNTER.add(1, attributes={"completion_path": completion_path})
+    try:
+        _TUTORIAL_COMPLETED_COUNTER.add(1, attributes={"completion_path": completion_path})
+    except Exception:
+        # Operational telemetry is best-effort. The preference write that
+        # established this outcome has already committed.
+        return None
     return None
 
 
 def record_tutorial_abandoned() -> None:
     """Increment the best-effort tutorial abandon counter."""
-    _TUTORIAL_ABANDON_COUNTER.add(1, attributes={})
+    try:
+        _TUTORIAL_ABANDON_COUNTER.add(1, attributes={})
+    except Exception:
+        # A page-unload beacon must not become an application failure because
+        # an optional telemetry exporter is unavailable.
+        return None
     return None

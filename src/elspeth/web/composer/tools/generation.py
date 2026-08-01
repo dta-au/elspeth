@@ -1486,9 +1486,7 @@ def _execute_list_models(
         # own freshly-constructed accumulator dict, not a Tier-3 boundary, so
         # the offensive-programming rule rejects ``providers.get(prefix, 0)``
         # as a defensive read on data we wrote. Initialize the slot
-        # explicitly before increment instead. (``Counter`` would also work
-        # but introduces an import-shift that cascades fingerprint rotations
-        # across this whole module — keep the diff local.)
+        # explicitly before increment instead.
         providers: dict[str, int] = {}
         for m in all_models:
             prefix = m.split("/", 1)[0] if "/" in m else ""

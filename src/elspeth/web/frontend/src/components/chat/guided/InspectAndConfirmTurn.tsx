@@ -259,6 +259,15 @@ export function InspectAndConfirmTurn({
         </tbody>
       </table>
 
+      {payload.observed.samples.length === 0 && (
+        // Production payloads always arrive with samples: [] — the inspection
+        // layer redacts row content by design (emitters._build_inspect_and_confirm_turn).
+        // Without this note the header-only table reads as a rendering failure.
+        <p className="guided-inspect-empty-note">
+          Row contents aren&apos;t previewed here — confirm the column names.
+        </p>
+      )}
+
       {payload.observed.warnings.length > 0 && (
         <aside
           id={warningsId}

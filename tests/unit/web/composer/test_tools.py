@@ -6056,12 +6056,135 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
         leftovers = [p for p in self.storage_path.parent.iterdir() if p != self.storage_path]
         assert leftovers == [], f"Tempfile leaked: {leftovers}"
 
+    def test_replacement_recovery_failure_preserves_primary_exception(self) -> None:
+        """A secondary durable-recovery failure must not replace the primary fault."""
+        primary_message = "primary-replacement-publish-fault"
+        real_unlink = Path.unlink
+
+        def _fail_staging_unlink(path_self: Path, *, missing_ok: bool = False) -> None:
+            if path_self.suffix == ".stage":
+                raise OSError("staging-unlink-fault")
+            real_unlink(path_self, missing_ok=missing_ok)
+
+        with (
+            patch(
+                "elspeth.web.blobs.service._BlobReplacementCoordinator._publish_new_bytes",
+                side_effect=RuntimeError(primary_message),
+            ),
+            patch.object(Path, "unlink", _fail_staging_unlink),
+            pytest.raises(RuntimeError, match=primary_message) as exc_info,
+        ):
+            execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "x" * 100},
+                _empty_state(),
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
+            )
+
+        assert type(exc_info.value) is RuntimeError
+        notes = getattr(exc_info.value, "__notes__", ())
+        assert any("Replacement recovery failed: OSError" in note for note in notes), notes
+        assert self.storage_path.read_bytes() == self.original_content
+        assert any(path.suffix == ".stage" for path in self.storage_path.parent.iterdir())
+
+    def test_replacement_recovery_failure_preserves_quota_rejection(self) -> None:
+        """Recovery failure must not replace a mapped durable quota rejection."""
+        import os
+
+        from elspeth.contracts.blobs import BlobQuotaExceededError
+
+        quota_exc = BlobQuotaExceededError(self.session_id, current_bytes=len(self.original_content), limit_bytes=10)
+        real_replace = os.replace
+
+        def _fail_backup_restore(source: Any, destination: Any) -> None:
+            if Path(source).suffix == ".backup" and Path(destination) == self.storage_path:
+                raise OSError("backup-restore-fault")
+            real_replace(source, destination)
+
+        with (
+            patch(
+                "elspeth.web.coordination.repository._RepositoryBlobMutations.commit_blob_replacement",
+                side_effect=quota_exc,
+            ),
+            patch("elspeth.web.blobs.service.os.replace", side_effect=_fail_backup_restore),
+        ):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "x" * 100},
+                _empty_state(),
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
+            )
+
+        assert result.success is False
+        assert result.data["error"] == "Session blob quota exceeded: 100 bytes would exceed 10 byte limit."
+        notes = getattr(quota_exc, "__notes__", ())
+        assert any("Replacement recovery failed: OSError" in note for note in notes), notes
+
+    def test_committed_replacement_cleanup_failure_remains_recoverable(self) -> None:
+        """A cleanup fault must retain the committed update and its durable obligation."""
+        from elspeth.web.sessions.models import blob_replacement_cleanups_table
+
+        real_unlink = Path.unlink
+
+        def _fail_backup_unlink(path_self: Path, *, missing_ok: bool = False) -> None:
+            if path_self.suffix == ".backup":
+                raise OSError("backup-unlink-fault")
+            real_unlink(path_self, missing_ok=missing_ok)
+
+        with (
+            patch.object(Path, "unlink", _fail_backup_unlink),
+            pytest.raises(OSError, match="backup-unlink-fault"),
+        ):
+            execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "new"},
+                _empty_state(),
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                **_verbatim_blob_context(self.engine, self.session_id, "new"),
+            )
+
+        assert self.storage_path.read_bytes() == b"new"
+        with self.engine.connect() as conn:
+            replacement = conn.execute(
+                select(blob_replacement_cleanups_table).where(blob_replacement_cleanups_table.c.blob_id == self.blob_id)
+            ).one()
+        assert replacement.phase == "purge_pending"
+        assert Path(replacement.backup_path).read_bytes() == self.original_content
+
+        result = execute_tool(
+            "update_blob",
+            {"blob_id": self.blob_id, "content": "newer"},
+            _empty_state(),
+            _mock_catalog(),
+            session_engine=self.engine,
+            session_id=self.session_id,
+            **_verbatim_blob_context(self.engine, self.session_id, "newer"),
+        )
+
+        assert result.success is True
+        assert self.storage_path.read_bytes() == b"newer"
+        with self.engine.connect() as conn:
+            assert (
+                conn.execute(
+                    select(blob_replacement_cleanups_table.c.blob_id).where(blob_replacement_cleanups_table.c.blob_id == self.blob_id)
+                ).one_or_none()
+                is None
+            )
+
 
 class TestUpdateBlobSessionLockSerialisation:
-    """_execute_update_blob must acquire the session lock BEFORE _sync_get_blob.
+    """Blob update/delete mutations must acquire the shared session lock.
 
-    This is the I4 fix: the read→write→commit critical section must be
-    atomic across concurrent composer-tool callers on the same session.
+    The read→filesystem mutation→commit critical section must be atomic
+    across concurrent composer-tool callers on the same session.
     Holding the session lock externally from the test must block the
     tool call entirely — if the tool bypasses the lock, the worker
     thread completes while the main thread still holds the mutex,
@@ -6192,6 +6315,48 @@ class TestUpdateBlobSessionLockSerialisation:
         assert result_holder, "worker did not produce a result"
         assert result_holder[0].success is True, f"Update failed after lock release: {result_holder[0].data}"
         assert self.storage_path.read_bytes() == b"new-content-from-worker"
+
+    def test_delete_blob_blocks_when_session_lock_is_held(self) -> None:
+        """Delete must hold the cross-process filesystem lock through its durable ledger."""
+        import threading as stdlib_threading
+
+        from elspeth.web.sessions.locking import filesystem_session_lock
+
+        started = stdlib_threading.Event()
+        completed = stdlib_threading.Event()
+        result_holder: list[Any] = []
+
+        def worker() -> None:
+            started.set()
+            try:
+                result_holder.append(
+                    execute_tool(
+                        "delete_blob",
+                        {"blob_id": self.blob_id},
+                        _empty_state(),
+                        _mock_catalog(),
+                        session_engine=self.engine,
+                        session_id=self.session_id,
+                        data_dir=self.data_dir,
+                    )
+                )
+            finally:
+                completed.set()
+
+        with filesystem_session_lock(Path(self.data_dir), self.session_id):
+            thread = stdlib_threading.Thread(target=worker, daemon=True)
+            thread.start()
+            assert started.wait(timeout=2.0), "worker thread never entered its body"
+            assert not completed.wait(timeout=1.0), (
+                "delete_blob completed while the cross-process filesystem lock was held; "
+                "its read, durable tombstone, and filesystem mutation can race another writer"
+            )
+
+        assert completed.wait(timeout=2.0), "delete_blob did not complete after the shared lock was released"
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), "delete_blob worker failed to exit"
+        assert result_holder and result_holder[0].success is True
+        assert not self.storage_path.exists()
 
 
 class TestUpdateBlobQuotaRollbackDivergence:
