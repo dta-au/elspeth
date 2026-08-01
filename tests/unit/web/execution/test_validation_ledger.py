@@ -190,6 +190,19 @@ def test_record_pass_snapshots_the_mutable_check() -> None:
     assert result.checks[0].affected_nodes == ()
 
 
+def test_checks_returns_an_immutable_deep_snapshot_for_incremental_phase_migration() -> None:
+    ledger = ValidationLedger()
+    original = _check(CHECK_PLUGIN_ENABLEMENT, passed=True)
+    ledger.record_pass(original)
+
+    snapshot = ledger.checks
+    original.detail = "mutated original"
+    snapshot[0].detail = "mutated snapshot"
+
+    assert isinstance(snapshot, tuple)
+    assert ledger.checks[0].detail == "plugin_enablement passed"
+
+
 def test_finish_failure_snapshots_all_mutable_inputs() -> None:
     ledger = ValidationLedger()
     failed_check = _check(CHECK_PLUGIN_ENABLEMENT, passed=False)

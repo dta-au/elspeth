@@ -23,18 +23,17 @@ only to be rejected pre-token at /execute.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 import yaml
-from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.blobs_inline import BlobInlineValidationViolation
-from elspeth.contracts.secrets import ScopedWebSecretResolver, SecretRefPlacementViolation, SecretScope, WebSecretResolver
+from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.blobs_inline import (
     BLOB_INLINE_AGGREGATE_BYTE_CAP,
@@ -44,14 +43,7 @@ from elspeth.core.blobs_inline import (
 )
 from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.core.dag.models import EdgeContractError, GraphValidationError, GraphValidationWarning
-from elspeth.core.secrets import (
-    collect_credential_field_violations,
-    collect_disallowed_secret_ref_markers,
-    parse_secret_ref_marker,
-    redact_secret_refs_for_validation,
-    resolve_secret_refs,
-    secret_env_ref_name,
-)
+from elspeth.core.secrets import redact_secret_refs_for_validation, resolve_secret_refs
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
 from elspeth.engine.orchestrator.types import (
     RouteValidationError,
@@ -59,17 +51,27 @@ from elspeth.engine.orchestrator.types import (
 from elspeth.engine.orchestrator.value_source_validation import ValueSourceValidationError
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
-from elspeth.web.composer._semantic_validator import validate_semantic_contracts
 from elspeth.web.composer.state import (
     CompositionState,
-    _batch_aware_placement_error,
-    _batch_aware_required_input_fields_error,
-    _batch_distribution_profile_value_field_entries,
 )
-from elspeth.web.execution._semantic_helpers import (
-    assistance_suggestion_for,
-    serialize_semantic_contracts,
+from elspeth.web.execution._validation_authoring import (
+    _DEFAULT_PLUGIN_POLICY_SUGGESTION as _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION,
 )
+from elspeth.web.execution._validation_authoring import (
+    _collect_secret_refs as _authoring_collect_secret_refs,
+)
+from elspeth.web.execution._validation_authoring import (
+    lower_plugin_policy,
+    review_interpretations,
+    validate_batch_options,
+    validate_path_policy,
+    validate_secret_evidence,
+    validate_semantic_evidence,
+    validate_web_network_policy,
+    validate_web_resource_policy,
+)
+from elspeth.web.execution._validation_ledger import ValidationLedger
+from elspeth.web.execution._validation_model import PhaseFailure, PhaseReport
 from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
 from elspeth.web.execution.preflight import (
     RUNTIME_CHECK_GRAPH_STRUCTURE,
@@ -93,10 +95,6 @@ from elspeth.web.execution.schemas import (
     CHECK_LLM_TRACING_POLICY,
     CHECK_MANAGED_IDENTITY_POLICY,
     CHECK_OPERATOR_PROFILE_OPTIONS,
-    CHECK_OUTCOME_SECRET_REFS_NO_REFS,
-    CHECK_OUTCOME_SECRET_REFS_RESOLVED,
-    CHECK_OUTCOME_SECRET_REFS_SKIPPED_NO_SERVICE,
-    CHECK_OUTCOME_SECRET_REFS_UNRESOLVED,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
     CHECK_PATH_ALLOWLIST,
     CHECK_PLUGIN_ENABLEMENT,
@@ -111,23 +109,14 @@ from elspeth.web.execution.schemas import (
     CHECK_WEB_SCRAPE_NETWORK_POLICY,
     VALIDATION_BLOCKING_CHECK_NAMES,
     ValidationCheck,
-    ValidationCheckName,
     ValidationError,
     ValidationReadiness,
     ValidationReadinessBlocker,
     ValidationResult,
     ValidationWarning,
 )
-from elspeth.web.interpretation_state import (
-    INTERPRETATION_REVIEW_PENDING_CODE,
-    InterpretationReviewPending,
-    InterpretationReviewSite,
-    materialize_state_for_authoring,
-    materialize_state_for_execution,
-)
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
 from elspeth.web.provider_config_policy import (
     web_aws_s3_endpoint_url_policy_error,
     web_aws_s3_source_policy_error,
@@ -136,7 +125,6 @@ from elspeth.web.provider_config_policy import (
     web_llm_tracing_policy_error,
     web_rag_provider_config_policy_error,
 )
-from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields, allowed_secret_ref_fields_text
 
 # ── Check names (ordered) ─────────────────────────────────────────────
 _CHECK_PLUGIN_ENABLEMENT = CHECK_PLUGIN_ENABLEMENT
@@ -164,11 +152,6 @@ _CHECK_GRAPH = RUNTIME_CHECK_GRAPH_STRUCTURE
 _CHECK_ROUTE_TARGETS = CHECK_ROUTE_TARGETS
 _CHECK_SCHEMA = RUNTIME_CHECK_SCHEMA_COMPATIBILITY
 assert RUNTIME_GRAPH_VALIDATION_CHECKS == (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_SCHEMA)
-
-_WEB_FETCH_TRANSFORMS = frozenset({"blob_fetch", "web_scrape"})
-_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS = 30
-_WEB_BLOB_FETCH_MAX_BODY_BYTES = 10 * 1024 * 1024
-_WEB_BLOB_FETCH_INT_ADAPTER: TypeAdapter[int] = TypeAdapter(int)
 
 
 def _execution_ready() -> ValidationReadiness:
@@ -229,23 +212,29 @@ _CHECK_IDENTITY_NODE_ADVISORY = CHECK_IDENTITY_NODE_ADVISORY
 # to prevent silent reordering.
 _ALL_CHECKS = list(VALIDATION_BLOCKING_CHECK_NAMES)
 
-_PLUGIN_POLICY_CHECKS: tuple[tuple[PolicyValidationStage, ValidationCheckName], ...] = (
-    ("plugin_enablement", _CHECK_PLUGIN_ENABLEMENT),
-    ("operator_profile_options", _CHECK_OPERATOR_PROFILE_OPTIONS),
-    ("required_control_availability", _CHECK_REQUIRED_CONTROL_AVAILABILITY),
-    ("required_control_coverage", _CHECK_REQUIRED_CONTROL_COVERAGE),
-)
+# Compatibility exports retained until the diagnostics extraction task moves
+# their implementation again.
+_DEFAULT_PLUGIN_POLICY_SUGGESTION = _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION
+_collect_secret_refs = _authoring_collect_secret_refs
 
-# The four policy stages shared one suggestion, and for coverage failures the
-# "choose an available plugin" half was simply wrong advice — the plugin IS
-# available; the graph routes around it. Coverage findings therefore carry a
-# per-finding ``suggestion`` composed where the diagnosis lives
-# (``plugin_policy.validation._control_coverage_finding``, keyed on the
-# finding's reason/role, never the stage): the error-route repair ("set
-# on_error to 'discard'") is wrong advice for an input-domination
-# (prompt_shield) finding, whose repair is interposing the shield upstream.
-# This default remains for findings that carry no per-finding suggestion.
-_DEFAULT_PLUGIN_POLICY_SUGGESTION = "Choose an available plugin or repair the required control path, then validate again."
+
+def _apply_authoring_phase[T](
+    ledger: ValidationLedger,
+    report: PhaseReport[T] | PhaseFailure,
+) -> T | ValidationResult:
+    """Apply immutable phase evidence to the run-owned validation ledger."""
+    if isinstance(report, PhaseFailure):
+        for check in report.passed_checks:
+            ledger.record_pass(check)
+        return ledger.finish_failure(
+            report.failed_check,
+            errors=report.errors,
+            readiness=report.readiness,
+            semantic_contracts=report.semantic_contracts,
+        )
+    for check in report.checks:
+        ledger.record_pass(check)
+    return report.artifact
 
 
 @dataclass(frozen=True, slots=True)
@@ -563,14 +552,6 @@ def _append_skipped_checks(checks: list[ValidationCheck], from_check: str) -> No
     checks.extend(_skipped_checks(from_check, already_emitted=frozenset(check.name for check in checks)))
 
 
-def _format_interpretation_site(site: InterpretationReviewSite) -> str:
-    return f"{site.kind.value} review pending for {site.component_type} {site.component_id!r}: {site.user_term}"
-
-
-def _format_interpretation_sites(sites: Sequence[InterpretationReviewSite]) -> str:
-    return ", ".join(_format_interpretation_site(site) for site in sites)
-
-
 @dataclass(frozen=True, slots=True)
 class _IdentityFinding:
     """One detected identity-shaped passthrough between a transform and a sink.
@@ -716,40 +697,6 @@ def _find_identity_node_advisories(state: CompositionState) -> list[_IdentityFin
             )
         )
     return findings
-
-
-def _collect_secret_refs(obj: Any, env_ref_names: set[str] | None = None) -> list[tuple[str, SecretScope | None]]:
-    """Collect deferred-secret names together with their requested scope."""
-    refs: list[tuple[str, SecretScope | None]] = []
-    if isinstance(obj, Mapping):
-        marker = parse_secret_ref_marker(obj)
-        if marker is not None:
-            refs.append(marker)
-            return refs
-        for v in obj.values():
-            refs.extend(_collect_secret_refs(v, env_ref_names))
-    elif isinstance(obj, (list, tuple)):
-        for item in obj:
-            refs.extend(_collect_secret_refs(item, env_ref_names))
-    else:
-        ref = secret_env_ref_name(obj, env_ref_names or frozenset())
-        if ref is not None:
-            refs.append((ref, None))
-    return refs
-
-
-def _secret_ref_exists(
-    secret_service: WebSecretResolver,
-    user_id: str,
-    secret_ref: tuple[str, SecretScope | None],
-) -> bool:
-    """Check a deferred reference without discarding an explicit scope."""
-    name, scope = secret_ref
-    if scope is None:
-        return secret_service.has_ref(user_id, name)
-    if not isinstance(secret_service, ScopedWebSecretResolver):
-        raise TypeError("Scoped secret marker requires a ScopedWebSecretResolver")
-    return secret_service.resolve_scoped(user_id, name, scope) is not None
 
 
 def _blob_inline_component_id(field_path: str) -> str | None:
@@ -956,28 +903,9 @@ def _validate_pipeline_impl(
     checks: list[ValidationCheck] = []
     errors: list[ValidationError] = []
 
-    # Preserve which model bindings came from public operator-profile aliases
-    # before policy lowering replaces those aliases with private provider/model
-    # options.  A concrete model selected by the operator is not a model choice
-    # authored by the composer and therefore has no user review card to resolve.
-    operator_resolved_model_node_ids = frozenset(
-        node.id for node in state.nodes if node.plugin == "llm" and isinstance(node.options.get("profile"), str)
-    )
-
-    # Step 0: Empty-composition short-circuit.
-    #
-    # A CompositionState with no source, no transforms, and no outputs cannot
-    # be assembled into ElspethSettings — pydantic would raise
-    # ``2 validation errors for ElspethSettings: source/sinks Field required``,
-    # which is a Tier-3 boundary violation (internal pydantic model names
-    # leaking to a user-facing UI). It also auto-populates the post-
-    # ``exit_to_freeform`` view of any guided session, so the surface is
-    # exercised on a normal workflow, not just on hand-crafted empty configs.
-    #
-    # Return a clean ``empty_pipeline`` ValidationResult instead. The frontend
-    # subscription guard treats ``empty_pipeline`` as non-broadcast (no chat
-    # injection, no validation feedback sent to the LLM) — see
-    # ``stores/subscriptions.ts``.
+    # Empty compositions have a deliberate legacy producer shape rather than
+    # entering the ordered core ledger: no authored phase can make them
+    # executable, and engine settings diagnostics would leak internal names.
     if not state.sources and not state.nodes and not state.outputs:
         return ValidationResult(
             is_valid=False,
@@ -995,734 +923,100 @@ def _validate_pipeline_impl(
                 ValidationError(
                     component_id=None,
                     component_type=None,
-                    message=("Pipeline is empty. Add a data source and an output step to begin building."),
-                    suggestion=("Pick a data source like a CSV file or text input, and an output like CSV or JSON, then validate again."),
+                    message="Pipeline is empty. Add a data source and an output step to begin building.",
+                    suggestion="Pick a data source like a CSV file or text input, and an output like CSV or JSON, then validate again.",
                     error_code="empty_pipeline",
                 ),
             ],
-            readiness=_blocked_readiness(
-                code="empty_pipeline",
-                detail="Pipeline is empty.",
-            ),
+            readiness=_blocked_readiness(code="empty_pipeline", detail="Pipeline is empty."),
         )
 
-    # Policy checks deliberately precede path, YAML, and runtime construction.
-    # The authored state remains audit-safe; only the in-memory copy returned
-    # by policy validation contains private operator-profile bindings.
-    policy_result = validate_plugin_policy(
-        state,
-        snapshot=plugin_snapshot,
-        profile_registry=profile_registry,
-        catalog=catalog,
-    )
-    for stage, check_name in _PLUGIN_POLICY_CHECKS:
-        stage_findings = policy_result.findings_for(stage)
-        checks.append(
-            ValidationCheck(
-                name=check_name,
-                passed=not stage_findings,
-                detail=(f"{len(stage_findings)} plugin policy finding(s)." if stage_findings else f"{check_name} passed."),
-                affected_nodes=tuple(dict.fromkeys(finding.component_id for finding in stage_findings if finding.component_id is not None)),
-                outcome_code=None,
-            )
-        )
-        if stage_findings:
-            first_finding = stage_findings[0]
-            errors = [
-                ValidationError(
-                    component_id=item.component_id,
-                    component_type=item.component_type,
-                    message=item.message,
-                    suggestion=(item.suggestion if item.suggestion is not None else _DEFAULT_PLUGIN_POLICY_SUGGESTION),
-                    error_code=item.error_code,
-                )
-                for item in stage_findings
-            ]
-            _append_skipped_checks(checks, check_name)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=errors,
-                readiness=_blocked_readiness(
-                    code=first_finding.error_code,
-                    detail=first_finding.message,
-                    component_id=first_finding.component_id,
-                    component_type=first_finding.component_type,
-                ),
-            )
-    state = policy_result.executable_state
+    ledger = ValidationLedger()
 
-    # Step 1: Source + sink path allowlist check (C3/S2 defense-in-depth)
-    # Local filesystem keys in source/sink options must resolve under allowed
-    # directories. Uses the shared helpers from AD-4.
-    from elspeth.web.paths import (
-        NESTED_LOCAL_PATH_OPTION_KEYS,
-        SINK_LOCAL_PATH_OPTION_KEYS,
-        SOURCE_LOCAL_PATH_OPTION_KEYS,
-        allowed_sink_directories,
-        allowed_source_directories,
-        resolve_data_path,
-        resolve_sink_data_path,
-    )
-
-    allowed_source_dirs = allowed_source_directories(str(settings.data_dir), session_id=session_id)
-    allowed_sink_dirs = allowed_sink_directories(str(settings.data_dir), session_id=session_id)
-    path_checked = False
-    for source_name, source in state.sources.items():
-        source_options = dict(source.options)
-        source_component = "source" if source_name == "source" else f"source:{source_name}"
-        for key in SOURCE_LOCAL_PATH_OPTION_KEYS:
-            value = source_options.get(key)
-            if value is not None:
-                path_checked = True
-                resolved = resolve_data_path(value, str(settings.data_dir))
-                if not any(resolved.is_relative_to(d) for d in allowed_source_dirs):
-                    checks.append(
-                        ValidationCheck(
-                            name=_CHECK_PATH_ALLOWLIST,
-                            passed=False,
-                            detail=f"Source '{source_name}' {key} '{value}' is outside allowed source directories",
-                            affected_nodes=(source_component,),
-                            outcome_code=None,
-                        )
-                    )
-                    _append_skipped_checks(checks, _CHECK_PATH_ALLOWLIST)
-                    return ValidationResult(
-                        is_valid=False,
-                        checks=checks,
-                        errors=[
-                            ValidationError(
-                                component_id=source_component,
-                                component_type="source",
-                                message=(
-                                    f"Path traversal blocked: source '{source_name}' {key}='{value}' resolves outside allowed directories"
-                                ),
-                                suggestion="Use a file within the blobs directory.",
-                                error_code=None,
-                            ),
-                        ],
-                        readiness=_blocked_readiness(
-                            code="path_allowlist",
-                            detail=f"source '{source_name}' {key} resolves outside allowed source directories",
-                            component_id=source_component,
-                            component_type="source",
-                        ),
-                    )
-
-    # Sink path allowlist — prevents arbitrary file writes via sink options.
-    for output in state.outputs or ():
-        for key in SINK_LOCAL_PATH_OPTION_KEYS:
-            value = output.options[key] if key in output.options else None
-            if value is not None:
-                path_checked = True
-                resolved = resolve_sink_data_path(value, str(settings.data_dir), session_id=session_id)
-                if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
-                    checks.append(
-                        ValidationCheck(
-                            name=_CHECK_PATH_ALLOWLIST,
-                            passed=False,
-                            detail=f"Sink '{output.name}' {key} '{value}' is outside allowed output directories",
-                            affected_nodes=(),
-                            outcome_code=None,
-                        )
-                    )
-                    _append_skipped_checks(checks, _CHECK_PATH_ALLOWLIST)
-                    return ValidationResult(
-                        is_valid=False,
-                        checks=checks,
-                        errors=[
-                            ValidationError(
-                                component_id=output.name,
-                                component_type="sink",
-                                message=f"Path traversal blocked: sink '{output.name}' {key}='{value}' resolves outside allowed directories",
-                                suggestion="Use a path within this session's output or blob subtree.",
-                                error_code=None,
-                            ),
-                        ],
-                        readiness=_blocked_readiness(
-                            code="path_allowlist",
-                            detail=f"sink {output.name} {key} resolves outside allowed output directories",
-                            component_id=output.name,
-                            component_type="sink",
-                        ),
-                    )
-
-    # Nested transform provider_config path allowlist — RAG retrieval
-    # transforms carry a local Chroma persist_directory under
-    # options.provider_config. It is a read/write target like a sink, so it is
-    # confined to the allowed SINK directories.
-    for node in state.nodes:
-        if node.node_type != "transform":
-            continue
-        provider_config = node.options["provider_config"] if "provider_config" in node.options else None
-        if not isinstance(provider_config, Mapping):
-            continue
-        for key in NESTED_LOCAL_PATH_OPTION_KEYS:
-            value = provider_config.get(key)
-            if value is not None:
-                path_checked = True
-                resolved = resolve_sink_data_path(value, str(settings.data_dir), session_id=session_id)
-                if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
-                    checks.append(
-                        ValidationCheck(
-                            name=_CHECK_PATH_ALLOWLIST,
-                            passed=False,
-                            detail=f"Transform '{node.id}' {key} '{value}' is outside allowed output directories",
-                            affected_nodes=(),
-                            outcome_code=None,
-                        )
-                    )
-                    _append_skipped_checks(checks, _CHECK_PATH_ALLOWLIST)
-                    return ValidationResult(
-                        is_valid=False,
-                        checks=checks,
-                        errors=[
-                            ValidationError(
-                                component_id=node.id,
-                                component_type="transform",
-                                message=f"Path traversal blocked: transform '{node.id}' {key}='{value}' resolves outside allowed directories",
-                                suggestion="Use a path within this session's output or blob subtree.",
-                                error_code=None,
-                            ),
-                        ],
-                        readiness=_blocked_readiness(
-                            code="path_allowlist",
-                            detail=f"transform {node.id} {key} resolves outside allowed output directories",
-                            component_id=node.id,
-                            component_type="transform",
-                        ),
-                    )
-
-    # B11 fix: Always record the path_allowlist check
-    if path_checked:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_PATH_ALLOWLIST,
-                passed=True,
-                detail="All paths within allowed directories",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-    else:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_PATH_ALLOWLIST,
-                passed=True,
-                detail="No path option — check skipped",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-
-    web_fetch_network_errors: list[ValidationError] = []
-    for node in state.nodes:
-        if plugin_snapshot.is_trained_operator or node.plugin not in _WEB_FETCH_TRANSFORMS:
-            continue
-        http_options = node.options["http"] if "http" in node.options else None
-        if not isinstance(http_options, Mapping):
-            continue
-        if "allowed_hosts" in http_options:
-            allowed_hosts = http_options["allowed_hosts"]
-            if allowed_hosts == "allow_private":
-                message = (
-                    f"{node.plugin}.http.allowed_hosts='allow_private' is not permitted in web execution. "
-                    "Web-authored pipelines may only use public SSRF policy; private-network fetching requires "
-                    "an operator-owned runtime outside the web composer."
-                )
-            elif isinstance(allowed_hosts, Sequence) and not isinstance(allowed_hosts, str):
-                message = (
-                    f"{node.plugin}.http.allowed_hosts CIDR allowlists are not permitted in web execution. "
-                    "Web-authored pipelines may only use allowed_hosts='public_only'; private-network fetching "
-                    "requires an operator-owned runtime outside the web composer."
-                )
-            else:
-                message = None
-            if message is not None:
-                error_code = (
-                    "web_scrape_private_network_not_allowed" if node.plugin == "web_scrape" else "web_fetch_private_network_not_allowed"
-                )
-                web_fetch_network_errors.append(
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=message,
-                        suggestion=f"Set {node.plugin}.http.allowed_hosts to 'public_only' or remove the option.",
-                        error_code=error_code,
-                    )
-                )
-    if web_fetch_network_errors:
-        affected_nodes = tuple(error.component_id for error in web_fetch_network_errors if error.component_id is not None)
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_WEB_SCRAPE_NETWORK_POLICY,
-                passed=False,
-                detail="web fetch transform private-network allowlists are not permitted in web execution",
-                affected_nodes=affected_nodes,
-                outcome_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_WEB_SCRAPE_NETWORK_POLICY)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=web_fetch_network_errors,
-            readiness=_blocked_readiness(
-                code="web_scrape_network_policy",
-                detail="web fetch transform private-network allowlists are not permitted in web execution.",
-                component_id=web_fetch_network_errors[0].component_id,
-                component_type="transform",
-            ),
-        )
-
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_WEB_SCRAPE_NETWORK_POLICY,
-            passed=True,
-            detail=(
-                "No web fetch transform private-network allowlists found"
-                if not plugin_snapshot.is_trained_operator
-                else "Local trained-operator validation is exempt from the web fetch private-network policy"
-            ),
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    web_fetch_resource_errors: list[ValidationError] = []
-    if not plugin_snapshot.is_trained_operator:
-        for node in state.nodes:
-            if node.plugin != "blob_fetch":
-                continue
-            if "http" not in node.options:
-                continue
-            http_options = node.options["http"]
-            if not isinstance(http_options, Mapping):
-                web_fetch_resource_errors.append(
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=f"blob_fetch.http must be a mapping; got {type(http_options).__name__}.",
-                        suggestion="Set blob_fetch.http to a mapping of HTTP resource options.",
-                        error_code="web_fetch_resource_config_invalid",
-                    )
-                )
-                continue
-
-            if "timeout" in http_options:
-                raw_timeout = http_options["timeout"]
-                try:
-                    timeout = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(raw_timeout)
-                except PydanticValidationError:
-                    web_fetch_resource_errors.append(
-                        ValidationError(
-                            component_id=node.id,
-                            component_type="transform",
-                            message=f"blob_fetch.http.timeout must be an integer; got {type(raw_timeout).__name__}.",
-                            suggestion=f"Set blob_fetch.http.timeout to an integer from 0 to {_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS}.",
-                            error_code="web_fetch_resource_config_invalid",
-                        )
-                    )
-                else:
-                    if timeout > _WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS:
-                        web_fetch_resource_errors.append(
-                            ValidationError(
-                                component_id=node.id,
-                                component_type="transform",
-                                message=(
-                                    f"blob_fetch.http.timeout={timeout} exceeds the web execution limit of "
-                                    f"{_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} seconds."
-                                ),
-                                suggestion=f"Set blob_fetch.http.timeout to {_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} or less.",
-                                error_code="web_fetch_resource_limit_exceeded",
-                            )
-                        )
-
-            if "max_body_bytes" in http_options:
-                raw_max_body_bytes = http_options["max_body_bytes"]
-                try:
-                    max_body_bytes = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(raw_max_body_bytes)
-                except PydanticValidationError:
-                    web_fetch_resource_errors.append(
-                        ValidationError(
-                            component_id=node.id,
-                            component_type="transform",
-                            message=(f"blob_fetch.http.max_body_bytes must be an integer; got {type(raw_max_body_bytes).__name__}."),
-                            suggestion=(f"Set blob_fetch.http.max_body_bytes to an integer from 0 to {_WEB_BLOB_FETCH_MAX_BODY_BYTES}."),
-                            error_code="web_fetch_resource_config_invalid",
-                        )
-                    )
-                else:
-                    if max_body_bytes > _WEB_BLOB_FETCH_MAX_BODY_BYTES:
-                        web_fetch_resource_errors.append(
-                            ValidationError(
-                                component_id=node.id,
-                                component_type="transform",
-                                message=(
-                                    f"blob_fetch.http.max_body_bytes={max_body_bytes} exceeds the web execution limit of "
-                                    f"{_WEB_BLOB_FETCH_MAX_BODY_BYTES} bytes."
-                                ),
-                                suggestion=f"Set blob_fetch.http.max_body_bytes to {_WEB_BLOB_FETCH_MAX_BODY_BYTES} or less.",
-                                error_code="web_fetch_resource_limit_exceeded",
-                            )
-                        )
-
-    if web_fetch_resource_errors:
-        affected_nodes = tuple(error.component_id for error in web_fetch_resource_errors if error.component_id is not None)
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_WEB_FETCH_RESOURCE_POLICY,
-                passed=False,
-                detail="blob_fetch resource configuration violates the web execution policy",
-                affected_nodes=affected_nodes,
-                outcome_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_WEB_FETCH_RESOURCE_POLICY)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=web_fetch_resource_errors,
-            readiness=_blocked_readiness(
-                code=_CHECK_WEB_FETCH_RESOURCE_POLICY,
-                detail="blob_fetch resource configuration violates the web execution policy.",
-                component_id=web_fetch_resource_errors[0].component_id,
-                component_type="transform",
-            ),
-        )
-
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_WEB_FETCH_RESOURCE_POLICY,
-            passed=True,
-            detail=(
-                "No blob_fetch resource limits exceed the web execution policy"
-                if not plugin_snapshot.is_trained_operator
-                else "Local trained-operator validation is exempt from the web blob_fetch resource policy"
-            ),
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    # Step 1b: Secret ref validation — check that
-    #   (a) every wired ``{secret_ref: ...}`` / inventory ``${NAME}`` resolves
-    #       (existing missing-refs gate), AND
-    #   (b) every credential-bearing field (per ``is_secret_field``) contains
-    #       a wired secret rather than a literal placeholder string
-    #       (issue elspeth-72d1dccd44 — S1A "WILL_BE_WIRED_FROM_..." defect).
-    #
-    # The remediation note (docs/composer/evidence/composer-remediation-program-2026-05-01.md)
-    # suggested "the catalog already knows which fields require secrets."  In
-    # practice the catalog renders the per-plugin schema but does not mark
-    # credential fields; the closed list of credential-bearing field names
-    # already lives in ``elspeth.core.secrets.is_secret_field`` and is shared
-    # with the runtime fingerprinting code path.  Reusing it here keeps
-    # validate-time and runtime in lock-step — divergence would re-open the
-    # parity gap this issue was filed to close.
-    all_refs: list[tuple[str, SecretScope | None]] = []
-    env_ref_names: set[str] = set()
-    fabricated_components: list[tuple[str | None, str | None, list[str]]] = []
-    disallowed_secret_ref_components: list[tuple[str | None, str, str, list[SecretRefPlacementViolation]]] = []
-    if secret_service is not None and user_id is not None:
-        env_ref_names = {item.name for item in secret_service.list_refs(user_id)}
-        # Walk source options, node configs, and output options for secret refs
-        for source_name, source in state.sources.items():
-            source_component = "source" if source_name == "source" else f"source:{source_name}"
-            all_refs.extend(_collect_secret_refs(source.options, env_ref_names))
-            fabricated = collect_credential_field_violations(source.options, env_ref_names)
-            if fabricated:
-                fabricated_components.append((source_component, "source", fabricated))
-            disallowed = collect_disallowed_secret_ref_markers(
-                source.options,
-                env_ref_names,
-                additional_allowed_fields=allowed_secret_ref_fields("source", source.plugin),
-            )
-            if disallowed:
-                disallowed_secret_ref_components.append((source_component, "source", source.plugin, disallowed))
-        for node in state.nodes or ():
-            all_refs.extend(_collect_secret_refs(node.options, env_ref_names))
-            fabricated = collect_credential_field_violations(node.options, env_ref_names)
-            if fabricated:
-                fabricated_components.append((node.id, "transform", fabricated))
-            node_plugin = node.plugin or "<unset>"
-            disallowed = collect_disallowed_secret_ref_markers(
-                node.options,
-                env_ref_names,
-                additional_allowed_fields=allowed_secret_ref_fields("transform", node_plugin),
-            )
-            if disallowed:
-                disallowed_secret_ref_components.append((node.id, "transform", node_plugin, disallowed))
-        for output in state.outputs or ():
-            all_refs.extend(_collect_secret_refs(output.options, env_ref_names))
-            fabricated = collect_credential_field_violations(output.options, env_ref_names)
-            if fabricated:
-                fabricated_components.append((output.name, "sink", fabricated))
-            disallowed = collect_disallowed_secret_ref_markers(
-                output.options,
-                env_ref_names,
-                additional_allowed_fields=allowed_secret_ref_fields("sink", output.plugin),
-            )
-            if disallowed:
-                disallowed_secret_ref_components.append((output.name, "sink", output.plugin, disallowed))
-
-        missing_refs = [ref[0] for ref in all_refs if not _secret_ref_exists(secret_service, user_id, ref)]
-        if missing_refs or fabricated_components or disallowed_secret_ref_components:
-            detail_parts: list[str] = []
-            if missing_refs:
-                names = ", ".join(missing_refs)
-                detail_parts.append(f"Missing secret references: {names}")
-                errors.append(
-                    ValidationError(
-                        component_id=None,
-                        component_type=None,
-                        message=f"Cannot resolve secret references: {names}",
-                        suggestion="Add the missing secrets via the Secrets panel before executing.",
-                        error_code="missing_secret_ref",
-                    )
-                )
-            if fabricated_components:
-                fabricated_summary = ", ".join(f"{cid}:{','.join(fields)}" for cid, _ctype, fields in fabricated_components)
-                detail_parts.append("Literal value in credential field(s): " + fabricated_summary)
-                # Audit hygiene: name the field, never echo the value.  A value
-                # that looks like a placeholder may be a near-miss real secret
-                # and the validation response is operator-visible.
-                for component_id, component_type, fields in fabricated_components:
-                    fields_text = ", ".join(fields)
-                    errors.append(
-                        ValidationError(
-                            component_id=component_id,
-                            component_type=component_type,
-                            message=(f"Credential field(s) {fields_text} contain a literal value; expected a wired secret reference."),
-                            suggestion=(
-                                "Wire each credential field through the Secrets panel "
-                                "(produces a {secret_ref: NAME} marker) instead of typing "
-                                "the value directly."
-                            ),
-                            error_code="fabricated_secret",
-                        )
-                    )
-            if disallowed_secret_ref_components:
-                for component_id, component_type, plugin_name, violations in disallowed_secret_ref_components:
-                    violation_text = ", ".join(f"{v.field_path} -> {v.secret_name}" for v in violations)
-                    allowed_text = allowed_secret_ref_fields_text(component_type, plugin_name)
-                    detail_parts.append(f"Disallowed secret_ref for {plugin_name} {component_id}: {violation_text}")
-                    for violation in violations:
-                        errors.append(
-                            ValidationError(
-                                component_id=component_id,
-                                component_type=component_type,
-                                message=(
-                                    f"Plugin '{plugin_name}' field '{violation.field_path}' contains secret_ref "
-                                    f"'{violation.secret_name}', but only credential-bearing fields may carry secret_ref "
-                                    f"markers. Allowed credential-bearing fields for this plugin: {allowed_text}."
-                                ),
-                                suggestion=(
-                                    "Move the secret_ref marker to an actual credential field, or use a literal "
-                                    "non-secret value for wire-visible identity/configuration fields."
-                                ),
-                                error_code="disallowed_secret_ref",
-                            )
-                        )
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_SECRET_REFS,
-                    passed=False,
-                    detail="; ".join(detail_parts),
-                    affected_nodes=(),
-                    outcome_code=CHECK_OUTCOME_SECRET_REFS_UNRESOLVED,
-                )
-            )
-            _append_skipped_checks(checks, _CHECK_SECRET_REFS)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=errors,
-                readiness=_blocked_readiness(
-                    code="secret_refs",
-                    detail="Secret reference validation failed.",
-                ),
-            )
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SECRET_REFS,
-                passed=True,
-                detail=f"All {len(all_refs)} secret reference(s) resolved" if all_refs else "No secret references found",
-                affected_nodes=(),
-                outcome_code=CHECK_OUTCOME_SECRET_REFS_RESOLVED if all_refs else CHECK_OUTCOME_SECRET_REFS_NO_REFS,
-            )
-        )
-    else:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SECRET_REFS,
-                passed=True,
-                detail="No secret service — check skipped",
-                affected_nodes=(),
-                outcome_code=CHECK_OUTCOME_SECRET_REFS_SKIPPED_NO_SERVICE,
-            )
-        )
-
-    semantic_errors, semantic_contracts = validate_semantic_contracts(state)
-    if semantic_errors:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SEMANTIC_CONTRACTS,
-                passed=False,
-                detail="Semantic contract check failed",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        for entry in semantic_errors:
-            # entry.message already names plugins, fields, requirement code.
-            # Suggestion is plugin-owned — fetch from PluginAssistance.
-            errors.append(
-                ValidationError(
-                    component_id=entry.component.removeprefix("node:"),
-                    component_type="transform",
-                    message=entry.message,
-                    suggestion=assistance_suggestion_for(entry, semantic_contracts),
-                    error_code=None,
-                )
-            )
-        _append_skipped_checks(checks, _CHECK_SEMANTIC_CONTRACTS)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="semantic_contracts",
-                detail="Semantic contract check failed.",
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_SEMANTIC_CONTRACTS,
-            passed=True,
-            detail=(
-                f"All {len(semantic_contracts)} semantic contract(s) satisfied" if semantic_contracts else "No semantic contracts to check"
-            ),
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    batch_option_errors: list[tuple[str, str]] = []
-    for node in state.nodes:
-        batch_placement_error = _batch_aware_placement_error(node.id, node.node_type, node.plugin, node.output_mode)
-        if batch_placement_error is not None:
-            batch_option_errors.append((node.id, batch_placement_error))
-        batch_required_error = _batch_aware_required_input_fields_error(node.id, node.plugin, node.options)
-        if batch_required_error is not None:
-            batch_option_errors.append((node.id, batch_required_error))
-    numeric_contract_errors, _numeric_contract_warnings = _batch_distribution_profile_value_field_entries(state.sources, state.nodes)
-    for entry in numeric_contract_errors:
-        batch_option_errors.append((entry.component.removeprefix("node:"), entry.message))
-    if batch_option_errors:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_BATCH_TRANSFORM_OPTIONS,
-                passed=False,
-                detail="Batch-aware transform option check failed",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        for node_id, message in batch_option_errors:
-            errors.append(
-                ValidationError(
-                    component_id=node_id,
-                    component_type="transform",
-                    message=message,
-                    suggestion=(
-                        "Use node_type='aggregation' for batch-aware plugins; remove required_input_fields from batch-aware transform "
-                        "options and use schema.required_fields for batch input validation."
-                    ),
-                    error_code=None,
-                )
-            )
-        _append_skipped_checks(checks, _CHECK_BATCH_TRANSFORM_OPTIONS)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="batch_transform_options",
-                detail="Batch-aware transform option check failed.",
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_BATCH_TRANSFORM_OPTIONS,
-            passed=True,
-            detail="Batch-aware transform options are compatible with ADR-013",
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    materialized_state = (
-        materialize_state_for_authoring(state)
-        if allow_pending_interpretation_placeholders
-        else materialize_state_for_execution(
+    policy = _apply_authoring_phase(
+        ledger,
+        lower_plugin_policy(
             state,
-            operator_resolved_model_node_ids=operator_resolved_model_node_ids,
-        )
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=profile_registry,
+            catalog=catalog,
+        ),
     )
-    if isinstance(materialized_state, InterpretationReviewPending):
-        site_detail = _format_interpretation_sites(materialized_state.sites)
-        affected_nodes = tuple(dict.fromkeys(site.component_id for site in materialized_state.sites if site.component_type == "transform"))
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_INTERPRETATION_REVIEW,
-                passed=False,
-                detail=f"Interpretation review is pending for {site_detail}.",
-                affected_nodes=affected_nodes,
-                outcome_code=None,
-            )
-        )
-        errors.extend(
-            ValidationError(
-                component_id=site.component_id,
-                component_type=site.component_type,
-                message=_format_interpretation_site(site),
-                suggestion="Resolve the pending interpretation review before running.",
-                error_code=INTERPRETATION_REVIEW_PENDING_CODE,
-            )
-            for site in materialized_state.sites
-        )
-        _append_skipped_checks(checks, _CHECK_INTERPRETATION_REVIEW)
-        single_site = materialized_state.sites[0] if len(materialized_state.sites) == 1 else None
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code=INTERPRETATION_REVIEW_PENDING_CODE,
-                detail=site_detail,
-                component_id=single_site.component_id if single_site is not None else None,
-                component_type=single_site.component_type if single_site is not None else None,
-                authoring_valid=True,
-                completion_ready=True,
-            ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
-        )
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_INTERPRETATION_REVIEW,
-            passed=True,
-            detail="No pending interpretation review",
-            affected_nodes=(),
-            outcome_code=None,
-        )
+    if isinstance(policy, ValidationResult):
+        return policy
+
+    path_validated = _apply_authoring_phase(
+        ledger,
+        validate_path_policy(
+            policy,
+            data_dir=settings.data_dir,
+            session_id=session_id,
+        ),
     )
+    if isinstance(path_validated, ValidationResult):
+        return path_validated
+
+    network_validated = _apply_authoring_phase(
+        ledger,
+        validate_web_network_policy(path_validated, plugin_snapshot=plugin_snapshot),
+    )
+    if isinstance(network_validated, ValidationResult):
+        return network_validated
+
+    resource_validated = _apply_authoring_phase(
+        ledger,
+        validate_web_resource_policy(network_validated, plugin_snapshot=plugin_snapshot),
+    )
+    if isinstance(resource_validated, ValidationResult):
+        return resource_validated
+
+    secret_validated = _apply_authoring_phase(
+        ledger,
+        validate_secret_evidence(
+            resource_validated,
+            secret_service=secret_service,
+            user_id=user_id,
+        ),
+    )
+    if isinstance(secret_validated, ValidationResult):
+        return secret_validated
+
+    semantic_validated = _apply_authoring_phase(
+        ledger,
+        validate_semantic_evidence(secret_validated),
+    )
+    if isinstance(semantic_validated, ValidationResult):
+        return semantic_validated
+
+    batch_validated = _apply_authoring_phase(
+        ledger,
+        validate_batch_options(semantic_validated),
+    )
+    if isinstance(batch_validated, ValidationResult):
+        return batch_validated
+
+    interpretation_validated = _apply_authoring_phase(
+        ledger,
+        review_interpretations(
+            batch_validated,
+            allow_pending_placeholders=allow_pending_interpretation_placeholders,
+        ),
+    )
+    if isinstance(interpretation_validated, ValidationResult):
+        return interpretation_validated
+
+    # The materialization/runtime phases remain legacy until Tasks 6 and 7.
+    # They consume a snapshot, so authored phases never share mutable check state.
+    checks = list(ledger.checks)
+    errors = []
+    state = interpretation_validated.materialized_state
+    authored = interpretation_validated.authored
+    all_refs = list(authored.all_secret_refs)
+    env_ref_names = set(authored.env_ref_names)
+    semantic_contracts = authored.semantic_contracts
 
     # Step 2: Generate YAML
-    pipeline_yaml = yaml_generator.generate_yaml(materialized_state)
+    pipeline_yaml = yaml_generator.generate_yaml(state)
     pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(settings.data_dir), session_id=session_id)
 
     if blob_get_metadata is not None and "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml:
@@ -1758,7 +1052,7 @@ def _validate_pipeline_impl(
                     code="blob_inline_refs",
                     detail=detail,
                 ),
-                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+                semantic_contracts=list(semantic_contracts),
             )
         checks.append(
             ValidationCheck(
@@ -1830,7 +1124,7 @@ def _validate_pipeline_impl(
                     component_id=node.id,
                     component_type="transform",
                 ),
-                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+                semantic_contracts=list(semantic_contracts),
             )
     checks.append(
         ValidationCheck(
@@ -1877,7 +1171,7 @@ def _validate_pipeline_impl(
                     component_id=node.id,
                     component_type="transform",
                 ),
-                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+                semantic_contracts=list(semantic_contracts),
             )
     checks.append(
         ValidationCheck(
@@ -1930,7 +1224,7 @@ def _validate_pipeline_impl(
                     component_id=node.id,
                     component_type="transform",
                 ),
-                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+                semantic_contracts=list(semantic_contracts),
             )
     checks.append(
         ValidationCheck(
@@ -1975,7 +1269,7 @@ def _validate_pipeline_impl(
                     component_id=node.id,
                     component_type="transform",
                 ),
-                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+                semantic_contracts=list(semantic_contracts),
             )
     checks.append(
         ValidationCheck(
@@ -2022,7 +1316,7 @@ def _validate_pipeline_impl(
                 component_id=source_component,
                 component_type="source",
             ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+            semantic_contracts=list(semantic_contracts),
         )
 
     for output in state.outputs:
@@ -2059,7 +1353,7 @@ def _validate_pipeline_impl(
                 component_id=output.name,
                 component_type="sink",
             ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+            semantic_contracts=list(semantic_contracts),
         )
 
     checks.append(
@@ -2110,7 +1404,7 @@ def _validate_pipeline_impl(
                     component_id=source_component,
                     component_type="source",
                 ),
-                semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+                semantic_contracts=list(semantic_contracts),
             )
 
     checks.append(
@@ -2236,7 +1530,7 @@ def _validate_pipeline_impl(
             checks=checks,
             errors=errors,
             readiness=readiness,
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+            semantic_contracts=list(semantic_contracts),
         )
 
     # Step 4: Plugin instantiation + value-source compliance
@@ -2326,7 +1620,7 @@ def _validate_pipeline_impl(
                 component_id=errors[-1].component_id if errors else None,
                 component_type=errors[-1].component_type if errors else None,
             ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+            semantic_contracts=list(semantic_contracts),
         )
     except (PluginNotFoundError, PluginConfigError) as exc:
         comp_type = _infer_component_type_from_plugin_error(exc)
@@ -2366,7 +1660,7 @@ def _validate_pipeline_impl(
                 component_id=plugin_error_name,
                 component_type=comp_type,
             ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+            semantic_contracts=list(semantic_contracts),
         )
     except FileExistsError as exc:
         # Belt-and-braces conversion for plugins that still perform filesystem
@@ -2416,7 +1710,7 @@ def _validate_pipeline_impl(
                 detail="Plugin filesystem target validation failed.",
                 component_type="sink",
             ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+            semantic_contracts=list(semantic_contracts),
         )
 
     # Step 5: Graph construction + structural validation
@@ -2465,7 +1759,7 @@ def _validate_pipeline_impl(
                 component_id=exc.component_id,
                 component_type=exc.component_type,
             ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+            semantic_contracts=list(semantic_contracts),
         )
 
     # Step 5b: Route target resolution
@@ -2530,7 +1824,7 @@ def _validate_pipeline_impl(
                 code="route_target_resolution",
                 detail="Route target validation failed.",
             ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+            semantic_contracts=list(semantic_contracts),
         )
 
     # Step 6: Schema compatibility
@@ -2598,7 +1892,7 @@ def _validate_pipeline_impl(
                 component_id=errors[-1].component_id if errors else None,
                 component_type=errors[-1].component_type if errors else None,
             ),
-            semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+            semantic_contracts=list(semantic_contracts),
         )
 
     # Identity-node advisory — non-blocking, multi-entry.  Emitted only on the
@@ -2638,7 +1932,7 @@ def _validate_pipeline_impl(
         errors=errors,
         warnings=graph_warnings,
         readiness=_execution_ready(),
-        semantic_contracts=serialize_semantic_contracts(semantic_contracts),
+        semantic_contracts=list(semantic_contracts),
     )
 
 

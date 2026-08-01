@@ -36,6 +36,11 @@ class ValidationLedger:
     _core_count: int = field(default=0, init=False)
     _finished: bool = field(default=False, init=False)
 
+    @property
+    def checks(self) -> tuple[ValidationCheck, ...]:
+        """Return an immutable snapshot for the not-yet-extracted legacy tail."""
+        return tuple(check.model_copy(deep=True) for check in self._checks)
+
     def record_pass(self, check: ValidationCheck) -> None:
         """Record the next successful core check."""
         self._ensure_open()

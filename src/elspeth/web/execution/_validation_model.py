@@ -7,12 +7,37 @@ from typing import TYPE_CHECKING
 
 from elspeth.contracts.secrets import SecretScope
 from elspeth.web.composer.state import CompositionState
-from elspeth.web.execution.schemas import SemanticEdgeContractResponse, ValidationWarning
+from elspeth.web.execution.schemas import (
+    SemanticEdgeContractResponse,
+    ValidationCheck,
+    ValidationError,
+    ValidationReadiness,
+    ValidationWarning,
+)
 
 if TYPE_CHECKING:
     from elspeth.core.config import ElspethSettings
     from elspeth.core.dag.graph import ExecutionGraph
     from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseReport[T]:
+    """One successful phase artifact and its ordered passing checks."""
+
+    artifact: T
+    checks: tuple[ValidationCheck, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PhaseFailure:
+    """One failed phase, including any passes produced before its failure."""
+
+    passed_checks: tuple[ValidationCheck, ...]
+    failed_check: ValidationCheck
+    errors: tuple[ValidationError, ...]
+    readiness: ValidationReadiness
+    semantic_contracts: tuple[SemanticEdgeContractResponse, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +56,14 @@ class AuthoredValidatedState:
     all_secret_refs: tuple[tuple[str, SecretScope | None], ...]
     env_ref_names: frozenset[str]
     semantic_contracts: tuple[SemanticEdgeContractResponse, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class InterpretationValidatedState:
+    """Authored evidence plus the state selected by interpretation review."""
+
+    authored: AuthoredValidatedState
+    materialized_state: CompositionState
 
 
 @dataclass(frozen=True, slots=True)

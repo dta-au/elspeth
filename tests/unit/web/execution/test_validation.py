@@ -3009,6 +3009,19 @@ class TestValidatePipelineSuccess:
         assert result.is_valid is True
         assert len(result.checks) == 24
         assert all(c.passed for c in result.checks)
+        assert [check.name for check in result.checks[:11]] == [
+            "plugin_enablement",
+            "operator_profile_options",
+            "required_control_availability",
+            "required_control_coverage",
+            "path_allowlist",
+            "web_scrape_network_policy",
+            "web_fetch_resource_policy",
+            "secret_refs",
+            "semantic_contracts",
+            "batch_transform_options",
+            "interpretation_review",
+        ]
         # B11 fix: path_allowlist check is always recorded
         assert _check(result, "path_allowlist").passed is True
         assert _check(result, "web_scrape_network_policy").passed is True
