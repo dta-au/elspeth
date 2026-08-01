@@ -144,6 +144,7 @@ from elspeth.web.composer.recipes import (
 )
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.skills import assert_skill_hash_unchanged_on_disk
 from elspeth.web.composer.state import CompositionState, NodeSpec, ValidationSummary
 from elspeth.web.composer.tools import (
@@ -349,10 +350,28 @@ _LLM_API_MAX_ATTEMPTS = 3
 _LLM_API_RETRY_BASE_DELAY_SECONDS = 1.0
 
 
-def _identity_pipeline_candidate(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
-    """Return the canonical planner candidate unchanged."""
+def _required_controls_candidate_finalizer(
+    *,
+    policy_catalog: PolicyCatalogView,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    inner: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+) -> Callable[[Mapping[str, Any]], Mapping[str, Any]]:
+    """Planner candidate finalizer that auto-wires deployment-REQUIRED controls.
 
-    return candidate
+    R2-F10 (elspeth-f99655f540): every planner surface runs the
+    ``wire_required_controls`` pass on its terminal candidate so uncovered
+    graphs are repaired server-side (with acknowledgeable disclosure) instead
+    of shipping into the execution-time required-control block. ``inner``
+    composes a surface-specific finalizer (the guided reviewed-component
+    binder) BEFORE the pass, so wiring always sees the bound candidate. The
+    pass is idempotent, so re-finalizing a covered candidate is a no-op.
+    """
+
+    def finalize(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        staged = inner(candidate) if inner is not None else candidate
+        return wire_required_controls(staged, plugin_snapshot, policy_catalog)
+
+    return finalize
 
 
 _ADVISOR_ARGUMENT_KEYS: Final[frozenset[str]] = frozenset(
@@ -2543,7 +2562,10 @@ class ComposerServiceImpl:
             ),
             lifecycle=self._planner_request_lifecycle(progress),
             recorder=recorder,
-            candidate_finalizer=_identity_pipeline_candidate,
+            candidate_finalizer=_required_controls_candidate_finalizer(
+                policy_catalog=policy_catalog,
+                plugin_snapshot=plugin_snapshot,
+            ),
         )
         try:
             plan = await guided_full_planner_call
@@ -2851,7 +2873,11 @@ class ComposerServiceImpl:
             custody_config=custody_config,
             lifecycle=self._planner_request_lifecycle(progress),
             recorder=recorder,
-            candidate_finalizer=lambda candidate: bind_guided_reviewed_components(candidate, guided),
+            candidate_finalizer=_required_controls_candidate_finalizer(
+                policy_catalog=policy_catalog,
+                plugin_snapshot=plugin_snapshot,
+                inner=lambda candidate: bind_guided_reviewed_components(candidate, guided),
+            ),
         )
         try:
             plan = await guided_planner_call
@@ -3141,7 +3167,10 @@ class ComposerServiceImpl:
                     custody_config=custody_config,
                     lifecycle=self._planner_request_lifecycle(progress),
                     recorder=recorder,
-                    candidate_finalizer=lambda candidate: candidate,
+                    candidate_finalizer=_required_controls_candidate_finalizer(
+                        policy_catalog=policy_catalog,
+                        plugin_snapshot=plugin_snapshot,
+                    ),
                 )
             except PlannerDeclined as declined:
                 # Honest decline from the escape-hatch advisor turn: a
@@ -3204,6 +3233,7 @@ class ComposerServiceImpl:
         message: str,
         composition_turns_used: int,
         discovery_turns_used: int,
+        failed_turn: FailedTurnMetadata | None,
     ) -> _CallModelOutcome:
         """Phase P1 of the compose loop — one LLM call with cap enforcement.
 
@@ -3212,6 +3242,12 @@ class ComposerServiceImpl:
         A cap breach raises :class:`ComposerConvergenceError` with the
         ``tool_call_cap_exceeded`` reason directly; no carrier is returned
         in that case.
+
+        ``failed_turn`` is the driver's running metadata for the LAST
+        persisted tool-call turn — carried here only so a wall-clock timeout
+        on this call can report it (R2-F9). It is ``None`` on the first loop
+        iteration and whenever the loop runs without a session, because no
+        turn has been persisted yet.
         """
         await emit_progress(progress, model_call_progress_event(message))
         response = await self._call_llm_before_deadline(
@@ -3221,6 +3257,9 @@ class ComposerServiceImpl:
             initial_version,
             deadline,
             recorder=recorder,
+            composition_turns_used=composition_turns_used,
+            discovery_turns_used=discovery_turns_used,
+            failed_turn=failed_turn,
         )
         assistant_message = response.choices[0].message
         raw_assistant_content = assistant_message.content
@@ -3554,6 +3593,12 @@ class ComposerServiceImpl:
                     initial_version,
                     deadline,
                     recorder=recorder,
+                    # The composition counter has already been charged for
+                    # this turn (``new_composition_turns_used``); a timeout on
+                    # the B-4D-3 bonus call must report that same total.
+                    composition_turns_used=new_composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    failed_turn=failed_turn,
                 )
                 assistant_message = response.choices[0].message
                 if not assistant_message.tool_calls:
@@ -4422,6 +4467,7 @@ class ComposerServiceImpl:
                 message=message,
                 composition_turns_used=composition_turns_used,
                 discovery_turns_used=discovery_turns_used,
+                failed_turn=failed_turn,
             )
             # If no tool calls, the LLM is done — apply the final gate and return
             if not call_model.has_tool_calls:
@@ -6037,6 +6083,10 @@ class ComposerServiceImpl:
         initial_version: int,
         deadline: float,
         recorder: BufferingRecorder | None = None,
+        *,
+        composition_turns_used: int,
+        discovery_turns_used: int,
+        failed_turn: FailedTurnMetadata | None,
     ) -> Any:
         """Call the LLM with a per-call timeout derived from the deadline.
 
@@ -6052,6 +6102,21 @@ class ComposerServiceImpl:
         persistence has the per-call decision trail even when the
         budget exhaustion was a wall-clock timeout (no LLM mutation
         in this final call).
+
+        The turn counters and ``failed_turn`` are owned by the caller, so
+        both are required keyword arguments rather than defaulted ones
+        (R2-F9, elspeth-114dd261bc). The two wall-clock raises below used to
+        hardcode ``max_turns=0`` and omit ``failed_turn``, which told the
+        user the composer gave up "within 0 turns" after a multi-turn build
+        and — because the SPA's RecoveryPanel gates on ``failed_turn !=
+        null`` — hid the salvaged partial pipeline the route handler had
+        already persisted. Defaulting them would let a future call site
+        silently reintroduce exactly that.
+
+        Unlike the two budget raises in :meth:`_classify_and_charge_turn`,
+        the count reported here is the plain sum of turns already spent: a
+        wall-clock timeout does not trip (and so does not charge) either
+        turn budget.
         """
         from litellm.exceptions import APIError as LiteLLMAPIError
         from litellm.exceptions import AuthenticationError as LiteLLMAuthError
@@ -6067,12 +6132,13 @@ class ComposerServiceImpl:
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
                 raise ComposerConvergenceError.capture(
-                    max_turns=0,
+                    max_turns=composition_turns_used + discovery_turns_used,
                     budget_exhausted="timeout",
                     state=state,
                     initial_version=initial_version,
                     tool_invocations=_captured_invocations(),
                     llm_calls=_captured_llm_calls(),
+                    failed_turn=failed_turn,
                 )
             try:
                 return await self._call_llm_with_audit(
@@ -6083,12 +6149,13 @@ class ComposerServiceImpl:
                 )
             except TimeoutError:
                 raise ComposerConvergenceError.capture(
-                    max_turns=0,
+                    max_turns=composition_turns_used + discovery_turns_used,
                     budget_exhausted="timeout",
                     state=state,
                     initial_version=initial_version,
                     tool_invocations=_captured_invocations(),
                     llm_calls=_captured_llm_calls(),
+                    failed_turn=failed_turn,
                 ) from None
             except LiteLLMAuthError:
                 raise

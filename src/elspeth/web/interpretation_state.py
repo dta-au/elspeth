@@ -46,6 +46,7 @@ REGISTERED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = frozenset(
         "drop_raw_html_fields",
         "web_scrape_http_identity",
         "prompt_injection_shield_recommendation",
+        "required_control_auto_wired",
     }
 )
 # Sink-neutral wording (pack pressure-suite run 2, G6): the old "JSON output"
@@ -54,6 +55,11 @@ REGISTERED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = frozenset(
 RAW_HTML_CLEANUP_REVIEW_DRAFT: Final[str] = "Drop the scraped raw HTML and fingerprint fields before saving the output."
 WEB_SCRAPE_HTTP_IDENTITY_USER_TERM: Final[str] = "web_scrape_http_identity"
 PROMPT_SHIELD_USER_TERM: Final[str] = "prompt_injection_shield_recommendation"
+# Acknowledgeable disclosure for a control node the server spliced into the
+# graph because deployment policy makes that control REQUIRED (R2-F10,
+# elspeth-f99655f540). The row rides on the INSERTED node, staged pending by
+# ``web.composer.required_controls.wire_required_controls``.
+REQUIRED_CONTROL_AUTO_WIRED_USER_TERM: Final[str] = "required_control_auto_wired"
 PROMPT_SHIELD_WARNING_DRAFT: Final[str] = (
     "Recommend inserting azure_prompt_shield (or the deployment equivalent prompt-injection shield) "
     "between the external-content fetch step and this LLM. The current draft routes "
@@ -1236,7 +1242,34 @@ def pipeline_decision_artifact_hash(
         return _raw_html_cleanup_artifact_hash(node, all_nodes)
     if normalized == WEB_SCRAPE_HTTP_IDENTITY_USER_TERM:
         return _web_scrape_http_identity_artifact_hash(node)
+    if normalized == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM:
+        return _required_control_auto_wired_artifact_hash(node)
     raise ValueError(f"pipeline_decision_artifact_hash: unknown pipeline_decision user_term {user_term!r}")
+
+
+def _required_control_auto_wired_artifact_hash(node: NodeSpec) -> str:
+    """Material-scoped hash for the auto-wired required-control disclosure.
+
+    The review acknowledges that the server spliced this control node onto a
+    specific edge because deployment policy requires the control. The hash
+    binds to exactly that adjudication — the inserted node's identity, its
+    plugin, and the edge it occupies (input and on_success). Re-pointing the
+    node to a different edge or swapping the control implementation drifts the
+    acknowledgement; unrelated option edits (thresholds, schema mode) do not
+    change what was inserted where, so they leave the review intact.
+    """
+
+    if node.plugin is None:
+        raise ValueError("pipeline_decision_artifact_hash: required_control_auto_wired requires a plugin-bearing node")
+    return stable_hash(
+        {
+            "review_kind": "required_control_auto_wired",
+            "node_id": node.id,
+            "plugin": node.plugin,
+            "input": node.input,
+            "on_success": node.on_success,
+        }
+    )
 
 
 def _web_scrape_http_identity_artifact_hash(node: NodeSpec) -> str:

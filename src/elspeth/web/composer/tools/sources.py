@@ -54,6 +54,7 @@ from elspeth.web.composer.tools._common import (
     _pending_interpretation_requirement,
     _plugin_policy_failure,
     _prevalidate_source,
+    _prohibited_section,
     _resolver_owned_interpretation_requirement_error,
     _source_review_requirement_id,
     _validate_plugin_name,
@@ -133,14 +134,25 @@ def _handle_list_sources(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
-    return _discovery_result(state, context.catalog.list_sources())
+    return _discovery_result(
+        state,
+        {
+            "available": context.catalog.list_sources(),
+            "prohibited": _prohibited_section(context.catalog.list_prohibited_sources()),
+        },
+    )
 
 
 _LIST_SOURCES_DECLARATION = ToolDeclaration(
     name="list_sources",
     handler=_handle_list_sources,
     kind=ToolKind.DISCOVERY,
-    description="List available source plugins with name and summary.",
+    description=(
+        "List available source plugins with name and summary. The result's "
+        "`prohibited` array names any source categorically banned from the web "
+        "authoring surface by security policy, with its closed reason and "
+        "explanation — cite it when a user asks why a specific plugin is unavailable."
+    ),
     json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     cacheable=True,
 )

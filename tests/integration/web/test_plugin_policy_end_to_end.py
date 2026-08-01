@@ -418,7 +418,9 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
         _handle_list_transforms({}, empty_state, context),
         _handle_list_sinks({}, empty_state, context),
     )
-    guided_discovery = frozenset(str(PluginId(item.plugin_type, item.name)) for result in guided_results for item in result.data)
+    guided_discovery = frozenset(
+        str(PluginId(item.plugin_type, item.name)) for result in guided_results for item in result.data["available"]
+    )
     prompt = build_context_string(empty_state, view, plugin_snapshot=snapshot, schemas_loaded=frozenset())
     freeform_policy = json.loads(prompt.partition("\n")[2])["plugin_policy"]
     freeform_prompt = frozenset(freeform_policy["available_ids"])
@@ -454,7 +456,7 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
     guided_capabilities: dict[str, set[str]] = {}
     for result in guided_results:
         assert result.success is True
-        for item in result.data:
+        for item in result.data["available"]:
             plugin_id = str(PluginId(item.plugin_type, item.name))
             for declaration in item.policy_capabilities:
                 guided_capabilities.setdefault(declaration.capability.value, set()).add(plugin_id)
@@ -1056,3 +1058,143 @@ def test_validate_pipeline_resolves_server_profile_before_plugin_construction(
     assert {item.scope for item in scoped_resolutions} == {"server"}
     assert {item.value for item in scoped_resolutions} == {"server-value"}
     assert {item.fingerprint for item in scoped_resolutions} == {server_ref.fingerprint}
+
+
+def _required_control_posture(tmp_path: Path) -> tuple[WebSettings, PluginAvailabilitySnapshot, OperatorProfileRegistry, PolicyCatalogView]:
+    """Guardrail-REQUIRED deployment posture for the auto-wire acceptance test.
+
+    Mirrors ``tests.unit.web.composer.test_planner_authoring_aids.
+    _guardrail_profile_view`` but also returns the settings and profile
+    registry that ``web.execution.validation.validate_pipeline`` needs.
+    """
+    from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
+    from elspeth.web.plugin_policy.availability import build_plugin_snapshot
+
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+        llm_profiles={
+            "sonnet": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "credential_scope": "server",
+                "credential_ref": "OPENROUTER_API_KEY",
+            }
+        },
+        default_llm_profile="sonnet",
+        plugin_allowlist=("transform:aws_bedrock_prompt_shield", "transform:aws_bedrock_content_safety"),
+        plugin_preferences={
+            PluginCapability.PROMPT_SHIELD: ("transform:aws_bedrock_prompt_shield",),
+            PluginCapability.CONTENT_SAFETY: ("transform:aws_bedrock_content_safety",),
+        },
+        plugin_control_modes={
+            PluginCapability.PROMPT_SHIELD: ControlMode.REQUIRED,
+            PluginCapability.CONTENT_SAFETY: ControlMode.REQUIRED,
+        },
+        bedrock_guardrail_profiles=(
+            BedrockGuardrailProfileSettings(
+                alias="prompt-approved",
+                plugin="aws_bedrock_prompt_shield",
+                guardrail_identifier="operatorpromptguardrail",
+                guardrail_version="1",
+                region="ap-southeast-2",
+            ),
+            BedrockGuardrailProfileSettings(
+                alias="content-approved",
+                plugin="aws_bedrock_content_safety",
+                guardrail_identifier="operatorcontentguardrail",
+                guardrail_version="1",
+                region="ap-southeast-2",
+            ),
+        ),
+        bedrock_guardrail_default_profiles={
+            "aws_bedrock_prompt_shield": "prompt-approved",
+            "aws_bedrock_content_safety": "content-approved",
+        },
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+
+    class _ServerKeyInventory:
+        def has_server_ref(self, name: str) -> bool:
+            return name == "OPENROUTER_API_KEY"
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return False
+
+        def has_ref(self, principal: str, name: str) -> bool:
+            return name == "OPENROUTER_API_KEY"
+
+        def server_generation(self, name: str) -> str | None:
+            return "gen-1" if name == "OPENROUTER_API_KEY" else None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            return None
+
+    snapshot = build_plugin_snapshot(
+        policy=policy,
+        catalog=create_catalog_service(),
+        profiles=profiles,
+        principal_scope="local:autowire-e2e",
+        secret_inventory=_ServerKeyInventory(),
+        generation_key=b"autowire-e2e-key",
+    )
+    return settings, snapshot, profiles, PolicyCatalogView(create_catalog_service(), snapshot, profiles)
+
+
+def test_auto_wired_required_controls_clear_the_execution_required_control_gate(tmp_path: Path) -> None:
+    """R2-F10 end to end: a bare llm proposal is blocked at the execution
+    validator's required-control gate; after ``wire_required_controls`` the
+    same proposal builds, every required-control check passes, and the only
+    control-related residue is the ACKNOWLEDGEABLE disclosure review — the
+    pipeline is repaired, not wedged."""
+    from elspeth.web.composer import yaml_generator
+    from elspeth.web.composer.required_controls import wire_required_controls
+    from elspeth.web.composer.tools import build_set_pipeline_candidate
+    from elspeth.web.execution import validation as validation_module
+    from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+    from tests.unit.web.composer.test_planner_authoring_aids import _custody_context, _empty_state
+    from tests.unit.web.composer.test_required_control_autowire import _INLINE_CONTENT, _bare_llm_candidate
+
+    (tmp_path / "outputs").mkdir(exist_ok=True)
+    settings, snapshot, profiles, view = _required_control_posture(tmp_path)
+
+    def _validate(candidate: dict[str, Any]) -> Any:
+        context = _custody_context(tmp_path, _INLINE_CONTENT, view=view, snapshot=snapshot)
+        built = build_set_pipeline_candidate(candidate, _empty_state(), context)
+        rejection = None if built.acceptable else (built.result.data or {}).get("error")
+        assert built.acceptable is True, f"candidate rejected: {rejection}"
+        return validation_module.validate_pipeline(
+            built.result.updated_state,
+            settings,
+            yaml_generator,
+            plugin_snapshot=snapshot,
+            profile_registry=profiles,
+            catalog=create_catalog_service(),
+            secret_service=None,
+            user_id=None,
+            session_id=context.session_id,
+        )
+
+    bare = _bare_llm_candidate()
+    unwired = _validate(bare)
+    assert not unwired.is_valid
+    assert unwired.readiness.blockers
+    assert unwired.readiness.blockers[0].code == "required_control_coverage"
+
+    wired_result = _validate(wire_required_controls(bare, snapshot, view))
+    control_checks = {check.name: check.passed for check in wired_result.checks if "required_control" in check.name}
+    assert control_checks == {
+        "required_control_availability": True,
+        "required_control_coverage": True,
+    }
+    assert all("required_control" not in blocker.code for blocker in wired_result.readiness.blockers)
+    # The remaining gate is the acknowledgeable disclosure the pass staged.
+    pending = [error.message for error in wired_result.errors if error.error_code == "interpretation_review_pending"]
+    assert any(REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in message for message in pending), pending

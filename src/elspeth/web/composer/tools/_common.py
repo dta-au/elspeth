@@ -23,7 +23,7 @@ from __future__ import annotations
 # Slice 4 — additional imports for shared validation/repair helpers.
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Final, TypedDict, cast
@@ -1428,6 +1428,23 @@ _PLUGIN_UNAVAILABLE_EXPLANATIONS: Final[dict[PluginUnavailableReason, str]] = {
 
 def _plugin_unavailable_message(plugin_type: PluginKind, reason: PluginUnavailableReason) -> str:
     return f"{plugin_type} plugin selection is unavailable ({reason.value}): {_PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]}"
+
+
+def _prohibited_section(items: Sequence[Any]) -> tuple[dict[str, str], ...]:
+    """Shape ``PolicyCatalogView.list_prohibited_*`` entries for chat discovery.
+
+    Every ``item`` here already cleared ``PolicyCatalogView._prohibited`` —
+    i.e. it carries ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED``, the
+    one closed reason this section ever names (R2-F18 / elspeth-28a695d7f4).
+    Reuses the same static policy prose the attempt path
+    (``_plugin_unavailable_message``) already shows on a rejected
+    ``set_source`` — no new disclosure surface, just an earlier one, so a
+    user naming a prohibited plugin gets the reason without first trying and
+    failing.
+    """
+    reason = PluginUnavailableReason.WEB_SURFACE_PROHIBITED
+    explanation = _PLUGIN_UNAVAILABLE_EXPLANATIONS[reason]
+    return tuple({"name": item.name, "reason": reason.value, "explanation": explanation} for item in items)
 
 
 # gate/coalesce/row_union/queue are built-in node_types wired with plugin=null —

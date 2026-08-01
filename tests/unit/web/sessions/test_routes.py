@@ -5651,6 +5651,90 @@ class TestRecomposeConvergencePartialState:
                 "re-introduce the elspeth-5030f7373d split-brain symptom at a different layer."
             )
 
+    def test_wall_clock_timeout_body_carries_turn_context_and_the_elapsed_budget(self, tmp_path) -> None:
+        """R2-F9 (elspeth-114dd261bc): the timeout 422 must be self-sufficient.
+
+        The handler already persists the salvaged partial pipeline, but the
+        body used to describe the failure as "within 0 turns" with no
+        ``failed_turn`` (which is what the SPA's RecoveryPanel gates on) and
+        no way for the SPA to name the budget that actually elapsed. All
+        three now ride the same body.
+        """
+        from elspeth.contracts.errors import FailedTurnMetadata
+        from elspeth.web.composer.protocol import ComposerConvergenceError
+
+        partial = CompositionState(
+            source=None,
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=2,
+        )
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerConvergenceError(
+                max_turns=4,
+                budget_exhausted="timeout",
+                partial_state=partial,
+                failed_turn=FailedTurnMetadata(
+                    assistant_message_id=None,
+                    tool_calls_attempted=3,
+                    tool_responses_persisted=3,
+                ),
+            ),
+        )
+
+        app, _service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        session_id = client.post("/api/sessions", json={"title": "timeout"}).json()["id"]
+        response = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "Build me a pipeline"},
+        )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert detail["reason"] == "convergence_wall_clock_timeout"
+        assert detail["turns_used"] == 4, "the body must report the turns actually spent, not 0"
+        assert detail["failed_turn"]["tool_calls_attempted"] == 3
+        # _make_app pins composer_timeout_seconds=85.0; the SPA needs the
+        # server-authoritative budget to name it honestly in the error copy.
+        assert detail["timeout_seconds"] == 85.0
+        assert "partial_state" in detail
+
+    def test_budget_convergence_body_omits_the_timeout_budget(self, tmp_path) -> None:
+        """``timeout_seconds`` is meaningless for the two turn-budget causes."""
+        from elspeth.web.composer.protocol import ComposerConvergenceError
+
+        mock_composer = SimpleNamespace()
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerConvergenceError(
+                max_turns=15,
+                budget_exhausted="composition",
+                partial_state=None,
+            ),
+        )
+
+        app, _service = _make_app(tmp_path)
+        app.state.composer_service = mock_composer
+        client = TestClient(app, raise_server_exceptions=False)
+
+        session_id = client.post("/api/sessions", json={"title": "budget"}).json()["id"]
+        response = client.post(
+            f"/api/sessions/{session_id}/messages",
+            json={"content": "Build me a pipeline"},
+        )
+
+        assert response.status_code == 422, response.text
+        detail = response.json()["detail"]
+        assert detail["reason"] == "convergence_composition_budget"
+        assert "timeout_seconds" not in detail
+
     def test_convergence_redacts_blob_path_from_response_but_preserves_in_db(self, tmp_path) -> None:
         """When partial_state has a blob-backed source, the HTTP response must
         redact the internal storage path while the DB copy retains it."""

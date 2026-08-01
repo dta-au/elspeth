@@ -71,6 +71,7 @@ from elspeth.web.composer.progress import (
 )
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
+from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
 from elspeth.web.composer.state import (
     CompositionState,
@@ -1590,6 +1591,15 @@ async def prepare_pipeline_plan(
 
     if policy_catalog.snapshot is not plugin_snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
+    # R2-F10: server-derived proposals (recipe router, guided sketch) never
+    # pass through a planner candidate_finalizer, so the required-control
+    # auto-wire pass runs here — BEFORE the pipeline is sealed into a proposal
+    # and its authority hash is computed. It cannot run any later: the commit
+    # path (pipeline_commit.prepare_pipeline_proposal_commit) re-executes the
+    # exact sealed arguments under the proposal's authority-hash binding, so a
+    # commit-time mutation would be an integrity violation by construction.
+    # The pass is idempotent — a covered pipeline passes through unchanged.
+    pipeline = wire_required_controls(pipeline, plugin_snapshot, policy_catalog)
     # Server-derived plans do not send this context to a provider, but accept
     # the same explicit authority split as the model-driven entry point.
     canonical_json(reviewed_planner_context)
