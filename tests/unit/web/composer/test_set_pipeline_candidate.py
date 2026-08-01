@@ -8,6 +8,8 @@ inline-blob effects, not private control flow.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime
@@ -24,6 +26,7 @@ from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.blobs.service import BlobServiceImpl, content_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, dispatch_with_audit
@@ -39,6 +42,7 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools import sessions as sessions_tools
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY
 from elspeth.web.plugin_policy.models import (
@@ -53,7 +57,7 @@ from elspeth.web.plugin_policy.validation import (
     ProfileAwareValidationResult,
 )
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
+from elspeth.web.sessions.models import blobs_table, chat_messages_table, session_operation_fences_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 
 
@@ -256,6 +260,41 @@ def _linear_args(tmp_path: Path) -> dict[str, Any]:
     }
 
 
+def _insert_released_operation_fence(conn: Any, *, session_id: str, now: datetime) -> None:
+    conn.execute(
+        insert(session_operation_fences_table).values(
+            session_id=session_id,
+            operation_id=f"create-{session_id}",
+            lease_token=f"create-token-{session_id}",
+            operation_kind=SessionOperationKind.CREATE.value,
+            owner_instance_id="candidate-test-bootstrap",
+            operation_epoch=1,
+            lease_expires_at=now,
+            released_at=now,
+        )
+    )
+
+
+@contextmanager
+def _session_operation_context(
+    engine: Any,
+    *,
+    session_id: str,
+    operation_kind: SessionOperationKind,
+) -> Iterator[tuple[SQLiteLocalSessionOperationAuthority, SessionOperationContext]]:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    context = authority.acquire(
+        session_id=UUID(session_id),
+        operation_kind=operation_kind,
+        owner_instance_id=f"candidate-test-{uuid4()}",
+        lease_seconds=30,
+    )
+    try:
+        yield authority, context
+    finally:
+        authority.release(context)
+
+
 def _reviewed_source_harness(tmp_path: Path) -> tuple[Any, str, str, Any]:
     engine = create_session_engine(
         "sqlite:///:memory:",
@@ -278,23 +317,36 @@ def _reviewed_source_harness(tmp_path: Path) -> tuple[Any, str, str, Any]:
                     updated_at=now,
                 )
             )
+            _insert_released_operation_fence(conn, session_id=session_id, now=now)
     service = BlobServiceImpl(engine, tmp_path)
-    first_blob = asyncio.run(
-        service.create_blob(
-            UUID(first_session),
-            "first.csv",
-            b"name,score\nAda,42\n",
-            "text/csv",
+    with _session_operation_context(
+        engine,
+        session_id=first_session,
+        operation_kind=SessionOperationKind.CREATE,
+    ) as (_authority, context):
+        first_blob = asyncio.run(
+            service.create_blob(
+                UUID(first_session),
+                "first.csv",
+                b"name,score\nAda,42\n",
+                "text/csv",
+                session_operation_context=context,
+            )
         )
-    )
-    second_blob = asyncio.run(
-        service.create_blob(
-            UUID(second_session),
-            "second.csv",
-            b"name,score\nGrace,99\n",
-            "text/csv",
+    with _session_operation_context(
+        engine,
+        session_id=second_session,
+        operation_kind=SessionOperationKind.CREATE,
+    ) as (_authority, context):
+        second_blob = asyncio.run(
+            service.create_blob(
+                UUID(second_session),
+                "second.csv",
+                b"name,score\nGrace,99\n",
+                "text/csv",
+                session_operation_context=context,
+            )
         )
-    )
     return engine, first_session, second_session, (first_blob, second_blob)
 
 
@@ -1922,6 +1974,7 @@ def _session_with_user_message() -> tuple[Any, str, str]:
                 parent_assistant_id=None,
             )
         )
+        _insert_released_operation_fence(conn, session_id=session_id, now=now)
     return engine, session_id, message_id
 
 
@@ -1953,20 +2006,27 @@ def test_inline_blob_canonical_b_failure_precedes_blob_persistence(tmp_path: Pat
         "outputs": [],
     }
     state = _empty_state()
-    context = _trained_context(
-        data_dir=tmp_path,
-        session_engine=engine,
+    with _session_operation_context(
+        engine,
         session_id=session_id,
-        user_message_id=message_id,
-        user_message_content="Generate a CSV source.",
-        composer_model_identifier="test-model",
-        composer_model_version="test-model-v1",
-        composer_provider="test-provider",
-        composer_skill_hash="a" * 64,
-        tool_arguments_hash="b" * 64,
-    )
+        operation_kind=SessionOperationKind.COMPOSE,
+    ) as (authority, operation_context):
+        context = _trained_context(
+            data_dir=tmp_path,
+            session_engine=engine,
+            session_id=session_id,
+            session_operation_authority=authority,
+            session_operation_context=operation_context,
+            user_message_id=message_id,
+            user_message_content="Generate a CSV source.",
+            composer_model_identifier="test-model",
+            composer_model_version="test-model-v1",
+            composer_provider="test-provider",
+            composer_skill_hash="a" * 64,
+            tool_arguments_hash="b" * 64,
+        )
 
-    result = _execute_set_pipeline(args, state, context)
+        result = _execute_set_pipeline(args, state, context)
 
     with engine.begin() as conn:
         blob_rows = conn.execute(select(func.count()).select_from(blobs_table)).scalar_one()
@@ -2036,20 +2096,27 @@ def test_inline_blob_replacement_preserves_trusted_existing_source_requirement_i
         "edges": [],
         "outputs": [],
     }
-    context = _trained_context(
-        data_dir=tmp_path,
-        session_engine=engine,
+    with _session_operation_context(
+        engine,
         session_id=session_id,
-        user_message_id=message_id,
-        user_message_content="Generate a CSV source.",
-        composer_model_identifier="test-model",
-        composer_model_version="test-model-v1",
-        composer_provider="test-provider",
-        composer_skill_hash="a" * 64,
-        tool_arguments_hash="b" * 64,
-    )
+        operation_kind=SessionOperationKind.COMPOSE,
+    ) as (authority, operation_context):
+        context = _trained_context(
+            data_dir=tmp_path,
+            session_engine=engine,
+            session_id=session_id,
+            session_operation_authority=authority,
+            session_operation_context=operation_context,
+            user_message_id=message_id,
+            user_message_content="Generate a CSV source.",
+            composer_model_identifier="test-model",
+            composer_model_version="test-model-v1",
+            composer_provider="test-provider",
+            composer_skill_hash="a" * 64,
+            tool_arguments_hash="b" * 64,
+        )
 
-    result = _execute_set_pipeline(args, state, context)
+        result = _execute_set_pipeline(args, state, context)
 
     assert result.success, result.to_dict()
     requirements = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY]
@@ -2084,53 +2151,60 @@ async def test_current_executor_inline_blob_effects_are_single_settlement(tmp_pa
         before_chat_rows = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
         before_quota = conn.execute(select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0))).scalar_one()
 
-    context = _trained_context(
-        data_dir=tmp_path,
-        session_engine=engine,
+    with _session_operation_context(
+        engine,
         session_id=session_id,
-        user_message_id=message_id,
-        user_message_content=f"Use this CSV: {content}",
-    )
-    recorder = BufferingRecorder()
+        operation_kind=SessionOperationKind.COMPOSE,
+    ) as (authority, operation_context):
+        context = _trained_context(
+            data_dir=tmp_path,
+            session_engine=engine,
+            session_id=session_id,
+            session_operation_authority=authority,
+            session_operation_context=operation_context,
+            user_message_id=message_id,
+            user_message_content=f"Use this CSV: {content}",
+        )
+        recorder = BufferingRecorder()
 
-    candidate = build_set_pipeline_candidate(args, state, context)
+        candidate = build_set_pipeline_candidate(args, state, context)
 
-    with engine.begin() as conn:
-        candidate_blob_rows = conn.execute(select(func.count()).select_from(blobs_table)).scalar_one()
-        candidate_chat_rows = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
-        candidate_quota = conn.execute(select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0))).scalar_one()
-    candidate_files = tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file())
+        with engine.begin() as conn:
+            candidate_blob_rows = conn.execute(select(func.count()).select_from(blobs_table)).scalar_one()
+            candidate_chat_rows = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+            candidate_quota = conn.execute(select(func.coalesce(func.sum(blobs_table.c.size_bytes), 0))).scalar_one()
+        candidate_files = tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file())
 
-    assert candidate.acceptable is False  # This intentionally incomplete graph still needs outputs.
-    assert candidate.result.success is True
-    assert candidate.prepared_inline_blob is not None
-    assert candidate.result.data is None
-    assert state.to_dict() == before_state
-    assert candidate_blob_rows == before_blob_rows == 0
-    assert candidate_chat_rows == before_chat_rows == 1
-    assert candidate_quota == before_quota == 0
-    assert candidate_files == before_files == ()
-    assert recorder.invocations == ()
+        assert candidate.acceptable is False  # This intentionally incomplete graph still needs outputs.
+        assert candidate.result.success is True
+        assert candidate.prepared_inline_blob is not None
+        assert candidate.result.data is None
+        assert state.to_dict() == before_state
+        assert candidate_blob_rows == before_blob_rows == 0
+        assert candidate_chat_rows == before_chat_rows == 1
+        assert candidate_quota == before_quota == 0
+        assert candidate_files == before_files == ()
+        assert recorder.invocations == ()
 
-    audit = begin_dispatch(
-        "candidate-inline-call",
-        "set_pipeline",
-        args,
-        version_before=state.version,
-        actor="candidate-characterization",
-    )
+        audit = begin_dispatch(
+            "candidate-inline-call",
+            "set_pipeline",
+            args,
+            version_before=state.version,
+            actor="candidate-characterization",
+        )
 
-    async def _dispatch() -> Any:
-        return _execute_set_pipeline(args, state, context)
+        async def _dispatch() -> Any:
+            return _execute_set_pipeline(args, state, context)
 
-    outcome = await dispatch_with_audit(
-        recorder=recorder,
-        audit=audit,
-        do_dispatch=_dispatch,
-        version_after_provider=lambda value: value.updated_state.version,
-        arg_error_payload_factory=lambda exc: {"error": exc.args[0]},
-    )
-    result = outcome.result
+        outcome = await dispatch_with_audit(
+            recorder=recorder,
+            audit=audit,
+            do_dispatch=_dispatch,
+            version_after_provider=lambda value: value.updated_state.version,
+            arg_error_payload_factory=lambda exc: {"error": exc.args[0]},
+        )
+        result = outcome.result
 
     with engine.begin() as conn:
         rows = conn.execute(select(blobs_table).where(blobs_table.c.session_id == session_id)).mappings().all()

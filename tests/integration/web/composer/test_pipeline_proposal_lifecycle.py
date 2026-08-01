@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import threading
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
@@ -17,6 +19,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.composer_audit import ComposerToolStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder, begin_dispatch, finish_plugin_crash, finish_success
@@ -42,6 +45,7 @@ from elspeth.web.sessions.models import (
     composition_proposals_table,
     composition_states_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import CompositionStateData, StaleComposeStateError, TransitionAssistantDraft
@@ -77,6 +81,38 @@ def _insert_session(service: SessionServiceImpl, session_id: UUID) -> None:
                 updated_at=now,
             )
         )
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=str(session_id),
+                operation_id=f"create-{session_id}",
+                lease_token=f"create-token-{session_id}",
+                operation_kind=SessionOperationKind.CREATE.value,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                operation_epoch=1,
+                lease_expires_at=now,
+                released_at=now,
+            )
+        )
+
+
+@asynccontextmanager
+async def _session_operation_context(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    operation_kind: SessionOperationKind,
+) -> AsyncIterator[SessionOperationContext]:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=operation_kind,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        yield context
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 def _pipeline() -> dict[str, object]:
@@ -202,19 +238,30 @@ def _redacted_pipeline(pipeline: dict[str, object]) -> dict[str, object]:
     return redact_tool_call_arguments("set_pipeline", pipeline, telemetry=NoopRedactionTelemetry())
 
 
-async def _create(service: SessionServiceImpl, session_id: UUID, plan: PipelinePlanResult):
-    return await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=plan,
-        summary="Replace the pipeline.",
-        rationale="Requested by the operator.",
-        affects=("graph", "validation"),
-        arguments_redacted_json=_redacted_pipeline(_pipeline()),
-        actor="composer-web:user:alice",
-        composer_model_identifier="planner-model",
-        composer_model_version="planner-model-v1",
-        composer_provider="provider",
-    )
+async def _create(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    plan: PipelinePlanResult,
+    *,
+    summary: str = "Replace the pipeline.",
+    affects: tuple[str, ...] = ("graph", "validation"),
+):
+    pipeline = deep_thaw(plan.proposal.pipeline)
+    assert type(pipeline) is dict
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        return await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=plan,
+            summary=summary,
+            rationale="Requested by the operator.",
+            affects=affects,
+            arguments_redacted_json=_redacted_pipeline(pipeline),
+            actor="composer-web:user:alice",
+            composer_model_identifier="planner-model",
+            composer_model_version="planner-model-v1",
+            composer_provider="provider",
+            session_operation_context=context,
+        )
 
 
 async def _persist_dispatch(
@@ -1229,18 +1276,7 @@ async def test_prepare_pipeline_commit_revalidates_and_audits_exact_arguments_wi
     session_id = uuid4()
     _insert_session(service, session_id)
     plan = _runnable_plan(tmp_path, session_id)
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=plan,
-        summary="Replace the pipeline.",
-        rationale="Requested by the operator.",
-        affects=("graph", "validation"),
-        arguments_redacted_json=_redacted_pipeline(_runnable_pipeline(tmp_path, session_id)),
-        actor="composer-web:user:alice",
-        composer_model_identifier="planner-model",
-        composer_model_version="planner-model-v1",
-        composer_provider="provider",
-    )
+    row = await _create(service, session_id, plan)
     authority = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=row.id,
@@ -1320,18 +1356,7 @@ async def test_prepare_pipeline_commit_accepts_server_canonical_review_rows_in_p
         model_version="planner-model-v1",
         provider="test",
     )
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=plan,
-        summary="Replace the pipeline.",
-        rationale="Requested by the operator.",
-        affects=("graph", "validation"),
-        arguments_redacted_json=_redacted_pipeline(pipeline),
-        actor="composer-web:user:alice",
-        composer_model_identifier="planner-model",
-        composer_model_version="planner-model-v1",
-        composer_provider="provider",
-    )
+    row = await _create(service, session_id, plan)
     authority = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=row.id,
@@ -1381,18 +1406,7 @@ async def test_prepare_pipeline_commit_runs_blocking_policy_validation_off_event
     session_id = uuid4()
     _insert_session(service, session_id)
     plan = _runnable_plan(tmp_path, session_id)
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=plan,
-        summary="Replace the pipeline.",
-        rationale="Requested by the operator.",
-        affects=("graph",),
-        arguments_redacted_json=_redacted_pipeline(_runnable_pipeline(tmp_path, session_id)),
-        actor="composer-web:user:alice",
-        composer_model_identifier="planner-model",
-        composer_model_version="planner-model-v1",
-        composer_provider="provider",
-    )
+    row = await _create(service, session_id, plan, affects=("graph",))
     authority = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=row.id,
@@ -1461,12 +1475,14 @@ async def test_prepare_pipeline_commit_bounds_reviewed_source_db_without_blockin
 
     session_id = uuid4()
     _insert_session(service, session_id)
-    blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
-        session_id,
-        "reviewed.csv",
-        b"value\nreviewed\n",
-        "text/csv",
-    )
+    async with _session_operation_context(service, session_id, SessionOperationKind.CREATE) as context:
+        blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
+            session_id,
+            "reviewed.csv",
+            b"value\nreviewed\n",
+            "text/csv",
+            session_operation_context=context,
+        )
     source_options = {
         "schema": {"fields": ["value: str"], "mode": "flexible"},
         "path": f"blob:{blob.id}",
@@ -1532,18 +1548,7 @@ async def test_prepare_pipeline_commit_bounds_reviewed_source_db_without_blockin
         model_version="planner-model-v1",
         provider="test",
     )
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=plan,
-        summary="Use the reviewed source.",
-        rationale="Requested by the operator.",
-        affects=("source",),
-        arguments_redacted_json=_redacted_pipeline(pipeline),
-        actor="composer-web:user:alice",
-        composer_model_identifier="planner-model",
-        composer_model_version="planner-model-v1",
-        composer_provider="provider",
-    )
+    row = await _create(service, session_id, plan, summary="Use the reviewed source.", affects=("source",))
     authority = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=row.id,
@@ -1657,18 +1662,7 @@ async def test_prepare_pipeline_commit_uses_one_total_timeout_budget(
     session_id = uuid4()
     _insert_session(service, session_id)
     plan = _runnable_plan(tmp_path, session_id)
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=plan,
-        summary="Replace the pipeline.",
-        rationale="Requested by the operator.",
-        affects=("graph",),
-        arguments_redacted_json=_redacted_pipeline(_runnable_pipeline(tmp_path, session_id)),
-        actor="composer-web:user:alice",
-        composer_model_identifier="planner-model",
-        composer_model_version="planner-model-v1",
-        composer_provider="provider",
-    )
+    row = await _create(service, session_id, plan, affects=("graph",))
     authority = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=row.id,
@@ -1746,12 +1740,14 @@ async def test_wire_confirm_commit_preserves_accepted_proposal_transform_nodes(
 
     session_id = uuid4()
     _insert_session(service, session_id)
-    blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
-        session_id,
-        "project_urls.csv",
-        b"url\nhttps://example.gov.au/project-1.html\n",
-        "text/csv",
-    )
+    async with _session_operation_context(service, session_id, SessionOperationKind.CREATE) as context:
+        blob = await BlobServiceImpl(service._engine, tmp_path).create_blob(
+            session_id,
+            "project_urls.csv",
+            b"url\nhttps://example.gov.au/project-1.html\n",
+            "text/csv",
+            session_operation_context=context,
+        )
     source_options = {
         "schema": {"fields": ["url: str"], "mode": "flexible"},
         "path": f"blob:{blob.id}",
@@ -1866,18 +1862,7 @@ async def test_wire_confirm_commit_preserves_accepted_proposal_transform_nodes(
         model_version="planner-model-v1",
         provider="test",
     )
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=plan,
-        summary="Replace the pipeline.",
-        rationale="Requested by the operator.",
-        affects=("graph", "validation"),
-        arguments_redacted_json=_redacted_pipeline(finalized),
-        actor="composer-web:user:alice",
-        composer_model_identifier="planner-model",
-        composer_model_version="planner-model-v1",
-        composer_provider="provider",
-    )
+    row = await _create(service, session_id, plan)
     authority = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=row.id,
@@ -1935,18 +1920,7 @@ async def test_prepare_pipeline_commit_detects_candidate_executor_mismatch_after
     session_id = uuid4()
     _insert_session(service, session_id)
     plan = _runnable_plan(tmp_path, session_id)
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=plan,
-        summary="Replace the pipeline.",
-        rationale="Requested by the operator.",
-        affects=("graph",),
-        arguments_redacted_json=_redacted_pipeline(_runnable_pipeline(tmp_path, session_id)),
-        actor="composer-web:user:alice",
-        composer_model_identifier="planner-model",
-        composer_model_version="planner-model-v1",
-        composer_provider="provider",
-    )
+    row = await _create(service, session_id, plan, affects=("graph",))
     authority = await service.get_authoritative_pipeline_proposal(
         session_id=session_id,
         proposal_id=row.id,
