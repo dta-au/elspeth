@@ -215,9 +215,9 @@ def test_form_authored_source_seeds_observed_columns_from_its_declared_schema() 
 def test_solver_wrapper_and_atomic_provider_channels_are_closed_discriminated_unions() -> None:
     assert len(get_args(chat_solver.Step1SourceChatOutcome.__value__)) == 6
     assert len(get_args(chat_solver.Step2SinkChatOutcome.__value__)) == 5
-    assert len(get_args(guided_step_chat_module.Step1SourceChatResult.__value__)) == 6
-    assert len(get_args(guided_step_chat_module.Step2SinkChatResult.__value__)) == 5
-    assert len(get_args(guided_chat_atomic_module.GuidedChatProviderOutcome.__value__)) == 6
+    assert len(get_args(guided_step_chat_module.Step1SourceChatResult.__value__)) == 7
+    assert len(get_args(guided_step_chat_module.Step2SinkChatResult.__value__)) == 6
+    assert len(get_args(guided_chat_atomic_module.GuidedChatProviderOutcome.__value__)) == 7
 
 
 @pytest.mark.parametrize(
@@ -230,6 +230,7 @@ def test_solver_wrapper_and_atomic_provider_channels_are_closed_discriminated_un
         (chat_solver, "Step1SourceResolvedOutcome", {"resolution", "deferred_action"}),
         (chat_solver, "Step2SinkResolvedOutcome", {"sink", "assistant_message", "deferred_action"}),
         (guided_step_chat_module, "GuidedStepChatOnlyResult", {"chat"}),
+        (guided_step_chat_module, "GuidedStepDeferredClarificationResult", {"chat"}),
         (guided_step_chat_module, "GuidedStepDeferredIntentResult", {"chat", "action"}),
         (guided_step_chat_module, "GuidedStepDeferredManagementResult", {"chat", "action"}),
         (guided_step_chat_module, "Step1SourcePluginReselectedResult", {"chat", "plugin"}),
@@ -639,7 +640,7 @@ def test_step_1_source_plugin_reselection_parser_rejects_non_actions(arguments: 
 
 
 @pytest.mark.asyncio
-async def test_malformed_deferred_action_returns_repair_copy_without_an_action(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_malformed_deferred_action_degrades_to_clarification_retention_without_an_action(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
         call = SimpleNamespace(
             id="call_retain",
@@ -674,9 +675,10 @@ async def test_malformed_deferred_action_returns_repair_copy_without_an_action(m
         timeout_seconds=30.0,
     )
 
-    assert type(result) is guided_step_chat_module.GuidedStepChatOnlyResult
-    assert "couldn't verify that future-stage instruction" in result.chat.assistant_message
-    assert result.chat.error_class == "DeferredIntentActionShapeError"
+    assert type(result) is guided_step_chat_module.GuidedStepDeferredClarificationResult
+    assert "I kept that future-stage instruction" in result.chat.assistant_message
+    assert result.chat.status is ComposerChatTurnStatus.SUCCESS
+    assert result.chat.error_class is None
 
 
 _MALFORMED_DEFERRED_ARGUMENTS: tuple[object, ...] = (
@@ -747,7 +749,7 @@ _MALFORMED_DEFERRED_ARGUMENTS: tuple[object, ...] = (
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["source", "sink"])
 @pytest.mark.parametrize("arguments", _MALFORMED_DEFERRED_ARGUMENTS)
-async def test_every_malformed_deferred_terminal_payload_gets_the_bounded_deferred_repair(
+async def test_every_repair_exhausted_deferred_payload_degrades_to_clarification_retention(
     monkeypatch: pytest.MonkeyPatch,
     stage: str,
     arguments: object,
@@ -784,17 +786,15 @@ async def test_every_malformed_deferred_terminal_payload_gets_the_bounded_deferr
             timeout_seconds=30.0,
         )
 
-    assert type(result) is guided_step_chat_module.GuidedStepChatOnlyResult
-    assert result.chat.assistant_message == (
-        "I couldn't verify that future-stage instruction, so I didn't retain it. "
-        "Please restate the target stage and the structural requirement."
-    )
-    assert result.chat.error_class == "DeferredIntentActionShapeError"
+    assert type(result) is guided_step_chat_module.GuidedStepDeferredClarificationResult
+    assert "I kept that future-stage instruction" in result.chat.assistant_message
+    assert result.chat.status is ComposerChatTurnStatus.SUCCESS
+    assert result.chat.error_class is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["source", "sink"])
-async def test_mixed_deferred_and_other_terminal_calls_get_the_bounded_deferred_repair(
+async def test_malformed_pair_exhausting_repair_degrades_to_clarification_retention(
     monkeypatch: pytest.MonkeyPatch,
     stage: str,
 ) -> None:
@@ -835,8 +835,9 @@ async def test_mixed_deferred_and_other_terminal_calls_get_the_bounded_deferred_
             timeout_seconds=30.0,
         )
 
-    assert type(result) is guided_step_chat_module.GuidedStepChatOnlyResult
-    assert result.chat.error_class == "DeferredIntentActionShapeError"
+    assert type(result) is guided_step_chat_module.GuidedStepDeferredClarificationResult
+    assert result.chat.status is ComposerChatTurnStatus.SUCCESS
+    assert result.chat.error_class is None
 
 
 _VALID_DEFERRED_ARGUMENTS: dict[str, Any] = {

@@ -121,6 +121,26 @@ class GuidedStepChatOnlyResult:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class GuidedStepDeferredClarificationResult:
+    """Retain repair exhausted: degrade to durable clarification retention.
+
+    The Send carried a future-stage instruction the model could not express as
+    a well-formed ``retain_deferred_intent`` action even after the bounded
+    repair turn. Instead of discarding the instruction (the R2-F15 failure),
+    the route appends a constraint-free clarification intent
+    (:func:`elspeth.web.composer.guided.deferred_intents.create_deferred_clarification_intent`)
+    bound to the private originating message, and the chat reply asks for the
+    missing structural constraint.
+    """
+
+    chat: StepChatResult
+
+    def __post_init__(self) -> None:
+        if type(self.chat) is not StepChatResult:
+            raise TypeError("GuidedStepDeferredClarificationResult.chat must be exact")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class GuidedStepDeferredIntentResult:
     chat: StepChatResult
     action: DeferredIntentAction
@@ -194,6 +214,7 @@ type Step1SourceChatResult = (
     GuidedStepChatEmptyResult
     | GuidedStepChatOnlyResult
     | GuidedStepDeferredIntentResult
+    | GuidedStepDeferredClarificationResult
     | GuidedStepDeferredManagementResult
     | Step1SourcePluginReselectedResult
     | Step1SourceResolvedResult
@@ -203,6 +224,7 @@ type Step2SinkChatResult = (
     GuidedStepChatEmptyResult
     | GuidedStepChatOnlyResult
     | GuidedStepDeferredIntentResult
+    | GuidedStepDeferredClarificationResult
     | GuidedStepDeferredManagementResult
     | Step2SinkResolvedResult
 )
@@ -244,9 +266,14 @@ _SCAFFOLD_LEAK_MESSAGE = (
     "with the wizard controls."
 )
 
-_DEFERRED_ACTION_REPAIR_MESSAGE = (
-    "I couldn't verify that future-stage instruction, so I didn't retain it. "
-    "Please restate the target stage and the structural requirement."
+# Reply for the clarification-retention fallback: the instruction WAS kept
+# (as a constraint-free clarification intent) — the copy must say so and ask
+# for the missing structure, never claim the instruction was dropped.
+_DEFERRED_CLARIFICATION_RETAINED_MESSAGE = (
+    "I kept that future-stage instruction, but I couldn't verify its structure "
+    "yet. Tell me the target stage and the concrete structural requirement — "
+    "for example the plugin it must add or the connection it must produce — "
+    "and I'll firm it up."
 )
 
 _DEFERRED_MANAGEMENT_REPAIR_MESSAGE = (
@@ -485,7 +512,34 @@ async def resolve_step_1_source_chat_with_auto_drop(
         if type(outcome) is GuidedChatEmptyOutcome:
             return GuidedStepChatEmptyResult()
         raise GuidedSolverResponseShapeError(f"unexpected Step-1 chat outcome: {type(outcome).__name__}")
-    except (DeferredIntentActionShapeError, DeferredIntentManagementActionShapeError) as exc:
+    except DeferredIntentActionShapeError as exc:
+        # Retain repair exhausted: degrade to durable clarification retention
+        # (R2-F15) — the route appends a constraint-free clarification intent,
+        # so the user's instruction is kept, not discarded. The turn itself
+        # succeeds (status SUCCESS; ComposerChatTurn forbids an error_class on
+        # SUCCESS) — the model defect stays visible in the recorded LLM calls
+        # and this slog event.
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        slog.error(
+            "guided.step_1_deferred_intent_shape_rejected",
+            session_id=session_id,
+            user_id=user_id,
+            site=site,
+            step=GuidedStep.STEP_1_SOURCE.value,
+            exc_class=type(exc).__name__,
+            latency_ms=latency_ms,
+            degraded_to_clarification=True,
+            frames=_safe_frame_strings(exc),
+        )
+        return GuidedStepDeferredClarificationResult(
+            chat=StepChatResult(
+                assistant_message=_DEFERRED_CLARIFICATION_RETAINED_MESSAGE,
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=latency_ms,
+                error_class=None,
+            ),
+        )
+    except DeferredIntentManagementActionShapeError as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
         slog.error(
             "guided.step_1_deferred_intent_shape_rejected",
@@ -499,7 +553,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
         )
         return GuidedStepChatOnlyResult(
             chat=StepChatResult(
-                assistant_message=_DEFERRED_ACTION_REPAIR_MESSAGE,
+                assistant_message=_DEFERRED_MANAGEMENT_REPAIR_MESSAGE,
                 status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
                 latency_ms=latency_ms,
                 error_class=type(exc).__name__,
@@ -688,7 +742,31 @@ async def resolve_step_2_sink_chat_with_auto_drop(
         if type(outcome) is GuidedChatEmptyOutcome:
             return GuidedStepChatEmptyResult()
         raise GuidedSolverResponseShapeError(f"unexpected Step-2 chat outcome: {type(outcome).__name__}")
-    except (DeferredIntentActionShapeError, DeferredIntentManagementActionShapeError) as exc:
+    except DeferredIntentActionShapeError as exc:
+        # Mirror of the step-1 branch: retain repair exhausted degrades to
+        # durable clarification retention (R2-F15) rather than discarding the
+        # user's future-stage instruction.
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        slog.error(
+            "guided.step_2_deferred_intent_shape_rejected",
+            session_id=session_id,
+            user_id=user_id,
+            site=site,
+            step=GuidedStep.STEP_2_SINK.value,
+            exc_class=type(exc).__name__,
+            latency_ms=latency_ms,
+            degraded_to_clarification=True,
+            frames=_safe_frame_strings(exc),
+        )
+        return GuidedStepDeferredClarificationResult(
+            chat=StepChatResult(
+                assistant_message=_DEFERRED_CLARIFICATION_RETAINED_MESSAGE,
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=latency_ms,
+                error_class=None,
+            ),
+        )
+    except DeferredIntentManagementActionShapeError as exc:
         latency_ms = int((time.perf_counter() - started) * 1000)
         slog.error(
             "guided.step_2_deferred_intent_shape_rejected",
@@ -702,7 +780,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
         )
         return GuidedStepChatOnlyResult(
             chat=StepChatResult(
-                assistant_message=_DEFERRED_ACTION_REPAIR_MESSAGE,
+                assistant_message=_DEFERRED_MANAGEMENT_REPAIR_MESSAGE,
                 status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
                 latency_ms=latency_ms,
                 error_class=type(exc).__name__,

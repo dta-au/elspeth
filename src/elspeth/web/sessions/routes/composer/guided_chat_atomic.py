@@ -39,6 +39,7 @@ from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspec
 from elspeth.web.sessions._guided_step_chat import (
     GuidedStepChatEmptyResult,
     GuidedStepChatOnlyResult,
+    GuidedStepDeferredClarificationResult,
     GuidedStepDeferredIntentResult,
     GuidedStepDeferredManagementResult,
     Step1SourcePluginReselectedResult,
@@ -113,9 +114,11 @@ from ..guided_operations import (
     reserve_or_replay_guided_operation,
 )
 from .guided_chat_intent_management import (
+    DeferredRequestApplication,
     DeferredRequestAuthority,
     DeferredRequestCancelled,
     ManagementRewindAuthority,
+    apply_deferred_clarification,
     apply_deferred_request,
     deferred_request_management,
     deferred_request_retained_intent_id,
@@ -125,6 +128,7 @@ from .guided_chat_intent_management import (
 type GuidedChatProviderOutcome = (
     GuidedStepChatOnlyResult
     | GuidedStepDeferredIntentResult
+    | GuidedStepDeferredClarificationResult
     | GuidedStepDeferredManagementResult
     | Step1SourcePluginReselectedResult
     | Step1SourceResolvedResult
@@ -975,6 +979,7 @@ async def post_guided_chat_schema8(
                         sink_resolution = None
                         deferred_action = None
                         deferred_management_action = None
+                        deferred_clarification = False
                     elif uploaded_bind is not None:
                         # No provider work: the bind request names a file this
                         # session already holds, and its inspected facts are the
@@ -1000,6 +1005,7 @@ async def post_guided_chat_schema8(
                         sink_resolution = None
                         deferred_action = None
                         deferred_management_action = None
+                        deferred_clarification = False
                     else:
                         provider_outcome = await provider_runner(
                             session_id=session_id,
@@ -1035,6 +1041,7 @@ async def post_guided_chat_schema8(
                         deferred_management_action = (
                             provider_outcome.action if type(provider_outcome) is GuidedStepDeferredManagementResult else None
                         )
+                        deferred_clarification = type(provider_outcome) is GuidedStepDeferredClarificationResult
                     if source_resolution is not None and TurnType(frozen.current_turn["type"]) is TurnType.SCHEMA_FORM:
                         source_resolution = None
                         chat_result = StepChatResult(
@@ -1085,17 +1092,30 @@ async def post_guided_chat_schema8(
                         if deferred_action is not None and (source_resolution is not None or sink_resolution is not None)
                         else None
                     )
-                    deferred = apply_deferred_request(
-                        deferred_action,
-                        deferred_management_action,
-                        authority=DeferredRequestAuthority(
-                            guided=prospective,
-                            catalog=catalog,
-                            originating_message=originating_message,
-                            new_intent_id=uuid4(),
-                        ),
-                        chat=chat_result,
+                    deferred_authority = DeferredRequestAuthority(
+                        guided=prospective,
+                        catalog=catalog,
+                        originating_message=originating_message,
+                        new_intent_id=uuid4(),
                     )
+                    deferred: DeferredRequestApplication
+                    if deferred_clarification:
+                        # Retain repair exhausted: keep the instruction as a
+                        # constraint-free clarification intent instead of
+                        # discarding it (R2-F15). The chat copy already says
+                        # the instruction was kept and asks for the missing
+                        # structural constraint.
+                        deferred = apply_deferred_clarification(
+                            authority=deferred_authority,
+                            chat=chat_result,
+                        )
+                    else:
+                        deferred = apply_deferred_request(
+                            deferred_action,
+                            deferred_management_action,
+                            authority=deferred_authority,
+                            chat=chat_result,
+                        )
                     prospective = deferred.guided
                     chat_result = deferred.chat
                     if paired_resolution_message is not None:

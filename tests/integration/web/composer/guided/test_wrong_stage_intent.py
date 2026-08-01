@@ -1210,12 +1210,19 @@ def test_pair_of_sink_resolution_and_future_intent_applies_both_atomically(
         pytest.param("sink", "[" * 10_000 + "]" * 10_000, id="sink-json-recursion-limit"),
     ],
 )
-def test_real_route_malformed_future_action_keeps_raw_instruction_only_in_private_message(
+def test_real_route_malformed_future_action_degrades_to_durable_clarification_retention(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
     stage: str,
     arguments: object,
 ) -> None:
+    """Repair-exhausted retains keep the instruction as a clarification intent.
+
+    The instruction is never discarded (R2-F15): a retain that stays malformed
+    after its bounded repair turn is retained as a constraint-free
+    clarification intent — unclaimable by the planner, visible and manageable
+    by the user — with the raw prose confined to the private message row.
+    """
     client = composer_test_client
     session_id = _create_session(client)
     if stage == "sink":
@@ -1224,9 +1231,11 @@ def test_real_route_malformed_future_action_keeps_raw_instruction_only_in_privat
     before = client.get(f"/api/sessions/{session_id}/guided").json()
     assert before["guided_session"]["step"] == ("step_1_source" if stage == "source" else "step_2_sink")
     private_message = f"Later route the private customer-secret-needle through a transform from {stage}."
-    repair_message = (
-        "I couldn't verify that future-stage instruction, so I didn't retain it. "
-        "Please restate the target stage and the structural requirement."
+    clarification_message = (
+        "I kept that future-stage instruction, but I couldn't verify its structure "
+        "yet. Tell me the target stage and the concrete structural requirement — "
+        "for example the plugin it must add or the connection it must produce — "
+        "and I'll firm it up."
     )
     provider_calls = 0
 
@@ -1258,8 +1267,8 @@ def test_real_route_malformed_future_action_keeps_raw_instruction_only_in_privat
     # turn before the failure is terminal; an un-threadable reply (non-string
     # arguments) stays single-shot.
     assert provider_calls == (2 if isinstance(arguments, str) else 1)
-    assert response_json["assistant_message"] == repair_message
-    assert response_json["assistant_message_kind"] == "synthetic_failure"
+    assert response_json["assistant_message"] == clarification_message
+    assert response_json["assistant_message_kind"] == "assistant"
     if before["composition_state"] is None:
         assert response_json["composition_state"]["sources"] == {}
         assert response_json["composition_state"]["nodes"] == []
@@ -1270,12 +1279,19 @@ def test_real_route_malformed_future_action_keeps_raw_instruction_only_in_privat
             assert response_json["composition_state"][field_name] == before["composition_state"][field_name]
     assert private_message not in response_json["assistant_message"]
     guided = _guided(client, session_id)
-    assert guided.deferred_intents == ()
+    (intent,) = guided.deferred_intents
+    assert intent.receiving_stage == ("source" if stage == "source" else "output")
+    assert intent.target_stage == "wire_review"
+    assert intent.constraints == ()
+    assert intent.catalog_kind is None
+    assert intent.catalog_name is None
+    assert intent.message_content_hash == stable_hash(private_message)
+    assert private_message not in repr(intent.to_dict())
     # Transcript custody (R2-F15): the author's verbatim words survive in the
     # rendered transcript even when the retain FAILS all repairs.
     assert guided.chat_history[-2].content == private_message
     assert all("[Future-stage instruction submitted privately.]" not in turn.content for turn in guided.chat_history)
-    assert guided.chat_history[-1].content == repair_message
+    assert guided.chat_history[-1].content == clarification_message
     assert len(guided.chat_history) == len(before["guided_session"]["chat_history"]) + 2
     messages = asyncio.run(client.app.state.session_service.get_messages(UUID(session_id), limit=None))
     assert [content for _message_id, content in _non_root_user_rows(client, session_id)] == [private_message]
