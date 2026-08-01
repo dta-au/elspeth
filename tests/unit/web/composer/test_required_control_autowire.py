@@ -303,6 +303,21 @@ class TestAutoWireRefusals:
         safety_nodes = [node for node in nodes.values() if node.get("plugin") == "aws_bedrock_content_safety"]
         assert len(safety_nodes) == 1
 
+    def test_uncreditable_control_inserts_nothing_instead_of_churning(self, tmp_path: Path, monkeypatch: Any) -> None:
+        """If the selected implementation would not be credited by the coverage
+        authority, the pass must insert NOTHING — not chain redundant nodes
+        until the splice budget exhausts."""
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        shield_cls = get_shared_plugin_manager().get_transform_by_name("aws_bedrock_prompt_shield")
+        safety_cls = get_shared_plugin_manager().get_transform_by_name("aws_bedrock_content_safety")
+        for cls in (shield_cls, safety_cls):
+            monkeypatch.setattr(cls, "is_effective_blocking_control", classmethod(lambda _cls, **_kwargs: False))
+        candidate = _bare_llm_candidate()
+
+        assert wire_required_controls(candidate, snapshot, view) == candidate
+
     def test_malformed_candidate_is_returned_unchanged_without_raising(self, tmp_path: Path) -> None:
         """The pass runs inside the planner finalizer seam (T1): it must never
         raise on a malformed candidate — downstream validation owns rejection."""
@@ -337,6 +352,41 @@ class TestAutoWireRefusals:
         nodes = _nodes_by_id(wired)
         assert nodes["prompt_shield_auto_1"]["plugin"] == "passthrough"
         assert nodes["prompt_shield_auto_2"]["plugin"] == "aws_bedrock_prompt_shield"
+
+
+class TestServiceFinalizerFactory:
+    """The exact finalizer callable all three plan_pipeline sites now pass."""
+
+    def test_finalizer_wires_the_candidate(self, tmp_path: Path) -> None:
+        from elspeth.web.composer.service import _required_controls_candidate_finalizer
+
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        finalize = _required_controls_candidate_finalizer(policy_catalog=view, plugin_snapshot=snapshot)
+
+        wired = finalize(_bare_llm_candidate())
+
+        assert type(wired) is dict  # the planner's exact-dict finalizer contract
+        assert "prompt_shield_auto_1" in _nodes_by_id(dict(wired))
+
+    def test_inner_finalizer_runs_before_the_pass(self, tmp_path: Path) -> None:
+        """The guided reviewed-component binder composes BEFORE wiring, so the
+        pass always sees the bound candidate."""
+        from elspeth.web.composer.service import _required_controls_candidate_finalizer
+
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        seen: list[dict[str, Any]] = []
+
+        def inner(candidate: Any) -> Any:
+            seen.append(copy.deepcopy(dict(candidate)))
+            return candidate
+
+        finalize = _required_controls_candidate_finalizer(policy_catalog=view, plugin_snapshot=snapshot, inner=inner)
+        bare = _bare_llm_candidate()
+
+        wired = finalize(bare)
+
+        assert seen == [bare], "inner must receive the pre-wire candidate"
+        assert "prompt_shield_auto_1" in _nodes_by_id(dict(wired))
 
 
 class TestDisclosureRegistry:

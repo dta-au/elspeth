@@ -67,6 +67,7 @@ from elspeth.web.plugin_policy.coverage import (
     _stream_proves_output_control,
     build_output_stream_graph,
     control_coverage_findings,
+    node_has_blocking_control,
     node_has_capability,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -248,6 +249,29 @@ def _control_options(
     return options
 
 
+def _control_node_is_creditable(
+    control: Mapping[str, object],
+    *,
+    capability: PluginCapability,
+    role: ControlRole,
+    protected_fields: Sequence[str],
+) -> bool:
+    """Ask the coverage credit authority whether the authored node would count.
+
+    Guard against splice churn: if the options this pass authors were ever not
+    creditable (a selected implementation whose ``is_effective_blocking_control``
+    rejects them), the same finding would re-fire and the fixpoint would chain
+    redundant nodes until budget exhaustion. Checking creditability BEFORE
+    inserting means an un-authorable control inserts nothing and the
+    diagnosable finding stays.
+    """
+    try:
+        spec = _parse_node(control)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return node_has_blocking_control(spec, capability, role, protected_fields=frozenset(protected_fields))
+
+
 def _splice_input_control(
     nodes: list[dict[str, object]],
     *,
@@ -296,6 +320,8 @@ def _splice_input_control(
             ),
         ),
     }
+    if not _control_node_is_creditable(control, capability=capability, role=ControlRole.INPUT, protected_fields=protected_fields):
+        return False
     rewired = dict(target)
     rewired["input"] = out_stream
     nodes[index] = rewired
@@ -361,6 +387,13 @@ def _splice_output_control(
             ),
         ),
     }
+    if not _control_node_is_creditable(
+        control,
+        capability=capability,
+        role=ControlRole.OUTPUT,
+        protected_fields=tuple(sorted(protected_fields)),
+    ):
+        return False
     rewired = dict(nodes[index])
     rewired["on_success"] = in_stream
     nodes[index] = rewired
