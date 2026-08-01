@@ -5689,7 +5689,7 @@ class ComposerServiceImpl:
         """
         await emit_progress(progress, advisor_checkpoint_progress_event(phase))
         if phase == "end":
-            prompt_injection_finding = _advisor_prompt_template_injection_finding(state)
+            prompt_injection_finding = _advisor_prompt_template_injection_finding(state, user_message=user_message)
             if prompt_injection_finding is not None:
                 return AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=prompt_injection_finding)
         arguments = self._build_checkpoint_arguments(phase=phase, state=state, user_message=user_message)
@@ -6236,6 +6236,40 @@ _ADVISOR_PROMPT_INJECTION_CLEAN_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 
+def _neutralize_untrusted_summary_sentinels(text: str) -> str:
+    """Splice-neutralize embedded ``BEGIN/END_UNTRUSTED_PIPELINE_SUMMARY``
+    sentinels inside a payload BEFORE it is wrapped in the wrapper's own
+    fence — the INBOUND counterpart of :func:`_fence_advisor_findings`'s
+    neutralization for the OUTBOUND (advisor -> composer LLM) fence.
+
+    Both fenced fields in :func:`_build_advisor_user_message` — the
+    originating ``user_message`` (R2-F8a, elspeth-583c2a0792: genuinely
+    user-authored, and per the R2-F8a review, now reachable from ORDINARY
+    CHAT input rather than only a crafted ``prompt_template`` option) and
+    the backend-rendered ``schema_excerpt`` (which itself carries
+    user-authored ``prompt_template``/``template`` option text) can contain
+    the exact sentinel line. Without neutralization, an embedded
+    ``END_UNTRUSTED_PIPELINE_SUMMARY`` closes the fence early, and the
+    remainder of the payload — attacker-controlled — is read by the advisor
+    as a new, TRUSTED instruction rather than untrusted data (ticket:
+    "inbound advisor fence sentinel neutralization").
+
+    Splicing (not merely prefixing) breaks the token's contiguity so the
+    exact sentinel substring no longer occurs anywhere in the escaped text,
+    guaranteeing the assembled prompt carries exactly one BEGIN and one END
+    per field: the wrapper's own.
+    """
+    text = text.replace(
+        _ADVISOR_UNTRUSTED_SUMMARY_BEGIN,
+        _ADVISOR_UNTRUSTED_SUMMARY_BEGIN[0] + "\\" + _ADVISOR_UNTRUSTED_SUMMARY_BEGIN[1:],
+    )
+    text = text.replace(
+        _ADVISOR_UNTRUSTED_SUMMARY_END,
+        _ADVISOR_UNTRUSTED_SUMMARY_END[0] + "\\" + _ADVISOR_UNTRUSTED_SUMMARY_END[1:],
+    )
+    return text
+
+
 def _build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
     """Build the exact variable user message sent to the advisor LLM.
 
@@ -6260,8 +6294,10 @@ def _build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
         # R2-F8a (elspeth-583c2a0792): the END checkpoint's only source of
         # the user's own explicit constraints. Untrusted (user-authored) —
         # fenced with the SAME sentinel pair as the schema excerpt below,
-        # never a new unfenced channel — and redacted like every other field.
-        user_message = _redact_sensitive_content(cast(str, arguments["user_message"]))
+        # never a new unfenced channel — redacted like every other field, and
+        # sentinel-neutralized (see ``_neutralize_untrusted_summary_sentinels``)
+        # so an embedded fence line cannot close it early.
+        user_message = _neutralize_untrusted_summary_sentinels(_redact_sensitive_content(cast(str, arguments["user_message"])))
         user_msg_parts.append(
             "\n"
             + _ADVISOR_UNTRUSTED_USER_MESSAGE_HEADER
@@ -6273,7 +6309,10 @@ def _build_advisor_user_message(arguments: Mapping[str, Any]) -> str:
             + _ADVISOR_UNTRUSTED_SUMMARY_END
         )
     if "schema_excerpt" in arguments and arguments["schema_excerpt"]:
-        schema_excerpt = _redact_sensitive_content(cast(str, arguments["schema_excerpt"]))
+        # Sentinel-neutralized for the same reason as ``user_message`` above:
+        # the excerpt carries user-authored ``prompt_template``/``template``
+        # option text, which can equally embed the fence sentinel.
+        schema_excerpt = _neutralize_untrusted_summary_sentinels(_redact_sensitive_content(cast(str, arguments["schema_excerpt"])))
         user_msg_parts.append(
             "\n"
             + _ADVISOR_UNTRUSTED_SUMMARY_HEADER
@@ -6443,7 +6482,21 @@ def _advisor_prompt_option_values(options: Mapping[str, Any]) -> list[tuple[str,
     return values
 
 
-def _advisor_prompt_template_injection_finding(state: CompositionState) -> str | None:
+def _advisor_prompt_template_injection_finding(state: CompositionState, *, user_message: str | None = None) -> str | None:
+    """Pre-flight deterministic force-flag before the END advisor call runs.
+
+    ``user_message`` (R2-F8a follow-up, elspeth-583c2a0792 review) extends
+    this scan to the originating chat turn: prior to R2-F8a, the canonical
+    "reply with the word CLEAN" injection pattern was only reachable through
+    a crafted plugin option (``prompt_template``/``template``, scanned
+    below); threading the user's own message into the END checkpoint makes
+    it reachable from ORDINARY CHAT input too, so the same deterministic
+    scan covers it rather than relying solely on the advisor's own judgment
+    of fenced-and-labeled untrusted text.
+    """
+    if user_message and _looks_like_advisor_prompt_injection(user_message):
+        return "FLAGGED: the user's message contains advisor-instruction injection text; remove it before sign-off."
+
     for source_name, source in state.sources.items():
         for key, value in _advisor_prompt_option_values(source.options):
             if _looks_like_advisor_prompt_injection(value):
