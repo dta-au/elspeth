@@ -21,16 +21,10 @@ _PRODUCTION_FILES = (
 # These R5s are policy-wrong, adjudication-ready nominal checks over owned
 # concrete classes: one admits the real scoped-resolver implementation instead
 # of a runtime Protocol impostor; the other two discriminate owned closed
-# result/exception unions. The static-prompt advisory finder's
-# `isinstance(template, str)` skip guard is carried over verbatim from its
-# pre-refactor home in validation.py (63d713dc4) and is an explicit candidate
-# like its siblings. No filename/name exemption may hide any check.
+# result/exception unions. No filename/name exemption may hide any check.
 _ADJUDICATION_CANDIDATES = {
     "_validation_authoring.py": ["R5:_secret_ref_exists", "R5:review_interpretations"],
-    "_validation_diagnostics.py": [
-        "R5:_infer_component_type_from_plugin_error",
-        "R5:_find_static_llm_prompt_advisories",
-    ],
+    "_validation_diagnostics.py": ["R5:_infer_component_type_from_plugin_error"],
 }
 
 _EXPECTED_SUPPRESSION_OBSERVATIONS = {
@@ -52,6 +46,7 @@ _EXPECTED_SUPPRESSION_OBSERVATIONS = {
             "R1:_find_identity_node_advisories": 3,
             "R5:_find_identity_node_advisories": 4,
             "R1:_find_static_llm_prompt_advisories": 2,
+            "R5:_find_static_llm_prompt_advisories": 1,
         }
     ),
 }

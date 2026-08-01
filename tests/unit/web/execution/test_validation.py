@@ -1999,6 +1999,7 @@ class TestValidatePipelinePendingInterpretationPlaceholders:
                 return_value=_fake_pipeline_config(),
             ),
             patch("elspeth.web.execution.validation._find_identity_node_advisories", return_value=[]) as identity_advisories,
+            patch("elspeth.web.execution.validation._find_static_llm_prompt_advisories", return_value=[]) as static_prompt_advisories,
         ):
             result = validate_pipeline_for_trained_operator(
                 state,
@@ -2015,6 +2016,13 @@ class TestValidatePipelinePendingInterpretationPlaceholders:
         diagnostic_state = identity_advisories.call_args.args[0]
         assert diagnostic_state == state
         assert diagnostic_state.nodes[0].options["prompt_template"] == "Rate how {{ interpretation: cool }} this row is."
+
+        # The static-prompt advisory is the one finder whose subject
+        # (prompt_template) materialization rewrites, so pin its input too:
+        # it must read the authored state, never the masked/rendered one.
+        static_state = static_prompt_advisories.call_args.args[0]
+        assert static_state == state
+        assert static_state.nodes[0].options["prompt_template"] == "Rate how {{ interpretation: cool }} this row is."
 
     def test_pending_structured_interpretation_returns_typed_readiness(self) -> None:
         state = _make_state(

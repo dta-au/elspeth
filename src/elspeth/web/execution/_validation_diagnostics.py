@@ -505,7 +505,7 @@ class _StaticLLMPromptFinding:
     tier=3,
     source="composer-authored CompositionState node options (Tier-3, operator/LLM-supplied prompt_template)",
     source_param="state",
-    suppresses=("R1",),
+    suppresses=("R1", "R5"),
     invariant="returns advisory findings; unparseable or absent templates are skipped, never raised on",
 )
 def _find_static_llm_prompt_advisories(state: CompositionState) -> list[_StaticLLMPromptFinding]:

@@ -102,7 +102,6 @@ from elspeth.web.execution.schemas import (
     CHECK_GATE_FAN_OUT_ADVISORY,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
     CHECK_SETTINGS,
-    CHECK_STATIC_LLM_PROMPT_ADVISORY,
     CHECK_VALUE_SOURCE_COMPLIANCE,
     VALIDATION_BLOCKING_CHECK_NAMES,
     ValidationCheck,
@@ -124,10 +123,6 @@ assert RUNTIME_GRAPH_VALIDATION_CHECKS == (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_
 # Non-blocking, happy-path-only advisory. It deliberately stays outside the
 # canonical blocking list and is retained here as a compatibility import seam.
 _CHECK_GATE_FAN_OUT_ADVISORY = CHECK_GATE_FAN_OUT_ADVISORY
-
-# Third advisory, same non-blocking contract as the two above: flags an llm
-# transform node whose prompt_template interpolates no row data (elspeth-6bdb7e7736).
-_CHECK_STATIC_LLM_PROMPT_ADVISORY = CHECK_STATIC_LLM_PROMPT_ADVISORY
 
 
 def _execution_ready() -> ValidationReadiness:

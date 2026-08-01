@@ -17,10 +17,11 @@ advisory list, absent from VALIDATION_BLOCKING_CHECK_NAMES and _ALL_CHECKS,
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
-from unittest.mock import MagicMock, patch
+from typing import Any, cast
+from unittest.mock import MagicMock, create_autospec, patch
 
+from elspeth.core.dag.graph import ExecutionGraph
+from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -29,11 +30,14 @@ from elspeth.web.composer.state import (
     SourceSpec,
 )
 from elspeth.web.config import WebSettings
-from elspeth.web.execution.schemas import VALIDATION_BLOCKING_CHECK_NAMES, VALIDATION_CHECK_NAMES
+from elspeth.web.execution._validation_diagnostics import _find_static_llm_prompt_advisories
+from elspeth.web.execution.schemas import (
+    CHECK_STATIC_LLM_PROMPT_ADVISORY,
+    VALIDATION_BLOCKING_CHECK_NAMES,
+    VALIDATION_CHECK_NAMES,
+)
 from elspeth.web.execution.validation import (
     _ALL_CHECKS,
-    _CHECK_STATIC_LLM_PROMPT_ADVISORY,
-    _find_static_llm_prompt_advisories,
     validate_pipeline_for_trained_operator,
 )
 
@@ -107,16 +111,16 @@ def _make_state_with(
 
 def test_check_constant_value() -> None:
     """The check name string is the public contract — frontend and LLM both read it."""
-    assert _CHECK_STATIC_LLM_PROMPT_ADVISORY == "static_llm_prompt_advisory"
+    assert CHECK_STATIC_LLM_PROMPT_ADVISORY == "static_llm_prompt_advisory"
 
 
 def test_check_registered_in_validation_check_names_but_not_blocking() -> None:
     """Closed-vocabulary parity: mirrors identity_node_advisory exactly —
     registered in VALIDATION_CHECK_NAMES, absent from
     VALIDATION_BLOCKING_CHECK_NAMES and the _ALL_CHECKS skip-propagation list."""
-    assert _CHECK_STATIC_LLM_PROMPT_ADVISORY in VALIDATION_CHECK_NAMES
-    assert _CHECK_STATIC_LLM_PROMPT_ADVISORY not in VALIDATION_BLOCKING_CHECK_NAMES
-    assert _CHECK_STATIC_LLM_PROMPT_ADVISORY not in _ALL_CHECKS
+    assert CHECK_STATIC_LLM_PROMPT_ADVISORY in VALIDATION_CHECK_NAMES
+    assert CHECK_STATIC_LLM_PROMPT_ADVISORY not in VALIDATION_BLOCKING_CHECK_NAMES
+    assert CHECK_STATIC_LLM_PROMPT_ADVISORY not in _ALL_CHECKS
 
 
 def test_helper_returns_empty_list_for_empty_state() -> None:
@@ -320,25 +324,14 @@ class _YamlGeneratorDouble:
         return "source:\n  plugin: csv_source\n  options: {}"
 
 
-def _runtime_bundle_double() -> Any:
-    return SimpleNamespace(
-        source=object(),
-        sources={"source": object()},
-        source_settings=object(),
-        transforms=(),
-        sinks={"json_out": object()},
-        aggregations={},
-    )
+def _runtime_bundle_double() -> PluginBundle:
+    return cast(PluginBundle, create_autospec(PluginBundle, instance=True))
 
 
-class _RuntimeGraphDouble:
-    validation_warnings: tuple[Any, ...] = ()
-
-    def validate(self) -> None:
-        pass
-
-    def validate_edge_compatibility(self) -> None:
-        pass
+def _runtime_graph_double() -> MagicMock:
+    graph = cast(MagicMock, create_autospec(ExecutionGraph, instance=True))
+    graph.validation_warnings = ()
+    return graph
 
 
 @patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config")
@@ -356,7 +349,7 @@ def test_validate_pipeline_emits_advisory_and_does_not_block(
     yaml_gen = _YamlGeneratorDouble()
     mock_load.return_value = object()
     mock_instantiate.return_value = _runtime_bundle_double()
-    mock_build_graph.return_value = _RuntimeGraphDouble()
+    mock_build_graph.return_value = _runtime_graph_double()
     mock_assemble.return_value = object()
 
     state = _make_state_with(
@@ -374,7 +367,7 @@ def test_validate_pipeline_emits_advisory_and_does_not_block(
     )
 
     assert result.is_valid is True, "Advisory must never block Run"
-    advisories = [c for c in result.checks if c.name == _CHECK_STATIC_LLM_PROMPT_ADVISORY]
+    advisories = [c for c in result.checks if c.name == CHECK_STATIC_LLM_PROMPT_ADVISORY]
     assert len(advisories) == 1
     advisory = advisories[0]
     assert advisory.passed is True, "Advisory entries are passed=True (informational)"
@@ -416,7 +409,7 @@ def test_validate_pipeline_emits_no_advisory_for_row_bound_template(
     yaml_gen = _YamlGeneratorDouble()
     mock_load.return_value = object()
     mock_instantiate.return_value = _runtime_bundle_double()
-    mock_build_graph.return_value = _RuntimeGraphDouble()
+    mock_build_graph.return_value = _runtime_graph_double()
     mock_assemble.return_value = object()
 
     state = _make_state_with(
@@ -429,7 +422,7 @@ def test_validate_pipeline_emits_no_advisory_for_row_bound_template(
     )
 
     assert result.is_valid is True
-    advisories = [c for c in result.checks if c.name == _CHECK_STATIC_LLM_PROMPT_ADVISORY]
+    advisories = [c for c in result.checks if c.name == CHECK_STATIC_LLM_PROMPT_ADVISORY]
     assert advisories == []
 
 
@@ -450,5 +443,5 @@ def test_validate_pipeline_suppresses_advisory_on_failure_path() -> None:
     result = validate_pipeline_for_trained_operator(state, settings, _YamlGeneratorDouble())
 
     assert result.is_valid is False, "path_allowlist must block this pipeline"
-    advisories = [c for c in result.checks if c.name == _CHECK_STATIC_LLM_PROMPT_ADVISORY]
+    advisories = [c for c in result.checks if c.name == CHECK_STATIC_LLM_PROMPT_ADVISORY]
     assert advisories == [], "Advisory must NOT emit on the failure path."
