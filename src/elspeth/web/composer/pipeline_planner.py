@@ -2437,27 +2437,6 @@ async def _plan_pipeline_inner(
                 composer_provider=effective_provider,
             )
             try:
-                if (
-                    not is_hatch_turn
-                    and not nodeless_nudge_given
-                    and surface in (PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE)
-                    and supersedes_draft_hash is not None
-                    and _transform_node_count(finalized_pipeline) == 0
-                ):
-                    # Revision turn (a rejected draft is superseded — the
-                    # operator explicitly asked for changes) with zero
-                    # transform/aggregation nodes: tutorial op 1152d7e3
-                    # (2026-07-22) "converged" on exactly this shape after
-                    # blind repairs — a bare passthrough whose metadata still
-                    # claimed to scrape/summarize/clean. One coded nudge;
-                    # re-emitting the same nodeless pipeline is the escape
-                    # valve confirming deliberate pass-through intent (the
-                    # 9137456ad omit-valve pattern; bounded like
-                    # prose_nudges). Never fired on the hatch turn — the
-                    # hatch is one clean proposal or terminal, and a nudge
-                    # there guarantees failure.
-                    nodeless_nudge_given = True
-                    raise _PipelineCandidateRejected(_nodeless_revision_rejection(current_state))
                 if unproducible_output_fields and _transform_node_count(finalized_pipeline) == 0:
                     # R2-F4 (elspeth-6e311df389). The reviewed outputs declare
                     # fields no reviewed source declares or observes, and this
@@ -2476,9 +2455,46 @@ async def _plan_pipeline_inner(
                     # clears it in one turn. An identical re-emit draws the
                     # ordinary repeat notice through the shared fingerprint
                     # path rather than being waved through.
+                    #
+                    # ORDERING IS LOAD-BEARING (T1xT3, acceptance-r2 final
+                    # review): this guard must precede the nodeless-revision
+                    # nudge below. Both trigger on the same zero-transform
+                    # shape, but the nudge's omit-valve promises that an
+                    # unchanged re-emit "will be accepted" while this guard
+                    # rejects exactly that re-emit — two contradictory repair
+                    # instructions against a repair budget of 2 is a
+                    # guaranteed unrepairable path. Firing this guard first
+                    # gives the model ONE coherent instruction that names the
+                    # missing fields, and adding a transform clears both
+                    # guards' trigger in the same turn; the nudge's promise is
+                    # then only ever made when it is true.
                     raise _PipelineCandidateRejected(
                         _unproducible_output_fields_rejection(current_state, fields=unproducible_output_fields)
                     )
+                if (
+                    not is_hatch_turn
+                    and not nodeless_nudge_given
+                    and surface in (PlannerSurface.GUIDED_STAGED, PlannerSurface.TUTORIAL_PROFILE)
+                    and supersedes_draft_hash is not None
+                    and _transform_node_count(finalized_pipeline) == 0
+                ):
+                    # Revision turn (a rejected draft is superseded — the
+                    # operator explicitly asked for changes) with zero
+                    # transform/aggregation nodes: tutorial op 1152d7e3
+                    # (2026-07-22) "converged" on exactly this shape after
+                    # blind repairs — a bare passthrough whose metadata still
+                    # claimed to scrape/summarize/clean. One coded nudge;
+                    # re-emitting the same nodeless pipeline is the escape
+                    # valve confirming deliberate pass-through intent (the
+                    # 9137456ad omit-valve pattern; bounded like
+                    # prose_nudges). Never fired on the hatch turn — the
+                    # hatch is one clean proposal or terminal, and a nudge
+                    # there guarantees failure. Only reachable when
+                    # ``unproducible_output_fields`` is empty — the
+                    # satisfiability guard above owns the zero-transform shape
+                    # otherwise (see its ordering note).
+                    nodeless_nudge_given = True
+                    raise _PipelineCandidateRejected(_nodeless_revision_rejection(current_state))
                 if not is_hatch_turn and not threshold_nudge_given and stated_threshold is not None:
                     # Stated-threshold fidelity (R2-F17, elspeth-5c0c09db31).
                     # The instruction named a comparison and no gate in the
