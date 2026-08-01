@@ -10,7 +10,7 @@ Layer: L3 (application).
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from math import isfinite
 from pathlib import PurePosixPath
@@ -51,6 +51,7 @@ from elspeth.core.config import (
     _validate_node_name_chars,
 )
 from elspeth.core.dag.coalesce_merge import merge_guaranteed_fields
+from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.templates import create_sandboxed_environment
 from elspeth.web.composer._validation_probe import prepare_validation_probe_options
 from elspeth.web.composer.guided.state_machine import GuidedSession
@@ -1694,6 +1695,189 @@ def _validate_prompt_template_variable_bindings(node: NodeSpec) -> ValidationEnt
         severity="high",
         error_code="prompt_template_unbound_variables",
     )
+
+
+# The one name build_template_context injects beside the query's own
+# input_fields variables (multi_query.py): the full source row, reachable as
+# row.source_row.<column> inside a query template.
+_MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({"source_row"})
+
+
+def _parse_template_names(template: str) -> tuple[frozenset[str], frozenset[str]] | None:
+    """Parse a prompt template into (top-level names, first-level row fields).
+
+    ``{{interpretation:...}}`` placeholders are masked first — they resolve to
+    operator-accepted text upstream of rendering and are not Jinja2 names.
+    Returns None when the template does not parse; sibling rules own syntax
+    errors, so callers stay silent on that shape. Dynamic row accesses
+    (``row[expr]``) are unprovable at parse time and are deliberately not
+    reported — only the concrete field set is returned.
+    """
+    masked = INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)
+    try:
+        ast = create_sandboxed_environment().parse(masked)
+        usage = extract_jinja2_field_usage(masked)
+    except TemplateSyntaxError:
+        return None
+    return frozenset(find_undeclared_variables(ast)), usage.fields
+
+
+def _well_formed_query_entries(queries: Any) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+    """Extract (label, entry) pairs from an untrusted ``queries`` option.
+
+    Accepts the two authoring forms ``LLMConfig`` accepts (mapping keyed by
+    query name, or a list of named entries) and silently drops anything
+    malformed — entry shape is ``QueryDefinition``'s contract and is reported
+    by plugin schema validation, not double-reported here.
+    """
+    if isinstance(queries, Mapping):
+        return tuple((str(key), entry) for key, entry in queries.items() if isinstance(entry, Mapping))
+    if isinstance(queries, Sequence) and not isinstance(queries, (str, bytes)):
+        entries: list[tuple[str, Mapping[str, Any]]] = []
+        for index, item in enumerate(queries):
+            if not isinstance(item, Mapping):
+                continue
+            name = item.get("name")
+            entries.append((name if isinstance(name, str) and name else f"#{index}", item))
+        return tuple(entries)
+    return ()
+
+
+@observation_boundary(
+    tier=3,
+    source="NodeSpec carrying web-authored multi-query options (untrusted queries entries and Jinja2 text)",
+    source_param="node",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "emits high-severity ValidationEntries only for parseable effective templates of "
+        "well-formed query entries (mapping entries with a string-keyed input_fields mapping); "
+        "absent, mistyped, or unparseable pieces are skipped (sibling rules report those) "
+        "and never raised on"
+    ),
+)
+def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[ValidationEntry, ...]:
+    """Reject multi-query templates whose interpolations can never bind at render.
+
+    Each query renders its effective template — its ``template`` override when
+    present, else the node-level ``prompt_template`` — with ``row`` bound to
+    the query's synthetic context (``build_template_context`` in
+    multi_query.py: the ``input_fields`` variables plus ``source_row``) and
+    ``lookup``, under StrictUndefined. Two compose-time-provable defects:
+
+    * a top-level name outside ``{row, lookup}`` + environment globals never
+      binds in any mode — the single-prompt failure shape, so it reuses
+      ``prompt_template_unbound_variables`` (covers the legacy positional
+      ``{{ input_N }}`` idiom, which is such a bare name);
+    * a ``row.<name>`` reference outside that query's ``input_fields`` keys +
+      ``{source_row}`` raises ``Undefined variable`` when that query renders
+      (``query_template_unbound_row_fields``).
+
+    The node-level template is checked once for top-level names — and only
+    when at least one well-formed query actually falls back to it: the shipped
+    multi-query examples carry a never-rendered ``prompt_template`` beside
+    all-override queries, and flagging dead text would be a false positive.
+    A query whose ``template`` is present but not a string is skipped whole
+    (its effective template is unknowable until the schema rejection lands).
+    """
+    queries = node.options.get("queries")
+    if queries is None:
+        return ()
+    entries = _well_formed_query_entries(queries)
+    if not entries:
+        return ()
+
+    node_template = node.options.get("prompt_template")
+    node_parse = _parse_template_names(node_template) if isinstance(node_template, str) else None
+
+    errors: list[ValidationEntry] = []
+    node_template_in_use = False
+
+    for label, entry in entries:
+        input_fields = entry.get("input_fields")
+        if not isinstance(input_fields, Mapping):
+            continue
+        bound = frozenset(key for key in input_fields if isinstance(key, str))
+        if not bound:
+            continue
+
+        override = entry.get("template")
+        if isinstance(override, str):
+            parsed = _parse_template_names(override)
+            source_desc = "its template override"
+        elif override is None:
+            if node_parse is None:
+                continue
+            parsed = node_parse
+            source_desc = "the node-level prompt_template"
+            node_template_in_use = True
+        else:
+            continue
+        if parsed is None:
+            continue
+        top_level_names, row_fields = parsed
+
+        if source_desc == "its template override":
+            unbound_names = sorted(top_level_names - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
+            if unbound_names:
+                names = ", ".join(f"'{name}'" for name in unbound_names)
+                errors.append(
+                    ValidationEntry(
+                        component=f"node:{node.id}",
+                        message=(
+                            f"Query '{label}' template references {names}, which the multi-query render "
+                            "context does not define — a query template sees only 'row' (this query's "
+                            "input_fields variables plus 'row.source_row') and 'lookup', so rendering fails "
+                            "with 'Undefined variable' at runtime. Rewrite each name as '{{ row.<variable> }}' "
+                            "where <variable> is one of this query's input_fields keys, or bind it in "
+                            "input_fields first."
+                        ),
+                        severity="high",
+                        error_code="prompt_template_unbound_variables",
+                    )
+                )
+
+        unbound_fields = sorted(row_fields - bound - _MULTI_QUERY_IMPLICIT_ROW_NAMES)
+        if unbound_fields:
+            fields = ", ".join(f"'{name}'" for name in unbound_fields)
+            bound_names = ", ".join(f"'{name}'" for name in sorted(bound))
+            errors.append(
+                ValidationEntry(
+                    component=f"node:{node.id}",
+                    message=(
+                        f"Query '{label}' renders {source_desc}, which references {fields} under 'row', "
+                        f"but this query's input_fields binds only {bound_names} (plus 'source_row'). At "
+                        "render the query context contains exactly its input_fields variables, so each "
+                        "unbound reference fails with 'Undefined variable' and the query errors for every "
+                        "row. Add the missing variables to input_fields (template variable → row column), "
+                        "rename the reference to a bound variable, or use 'row.source_row.<column>' for "
+                        "direct row access."
+                    ),
+                    severity="high",
+                    error_code="query_template_unbound_row_fields",
+                )
+            )
+
+    if node_template_in_use and node_parse is not None:
+        unbound_names = sorted(node_parse[0] - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
+        if unbound_names:
+            names = ", ".join(f"'{name}'" for name in unbound_names)
+            errors.append(
+                ValidationEntry(
+                    component=f"node:{node.id}",
+                    message=(
+                        f"prompt_template references {names}, which the multi-query render context does "
+                        "not define — queries without a template override render it with 'row' bound to "
+                        "their input_fields variables (plus 'row.source_row') and 'lookup', so rendering "
+                        "fails with 'Undefined variable' at runtime. Rewrite each name as "
+                        "'{{ row.<variable> }}' with <variable> an input_fields key of every query that "
+                        "uses this template, or give those queries template overrides."
+                    ),
+                    severity="high",
+                    error_code="prompt_template_unbound_variables",
+                )
+            )
+
+    return tuple(errors)
 
 
 def _locked_input_field_set(options: Mapping[str, Any], owner: str) -> frozenset[str] | None:
@@ -3464,6 +3648,7 @@ class CompositionState:
             prompt_binding_error = _validate_prompt_template_variable_bindings(node)
             if prompt_binding_error is not None:
                 errors.append(prompt_binding_error)
+            errors.extend(_validate_multi_query_template_variable_bindings(node))
 
             # ``timeout_seconds`` is a top-level structural-barrier field.
             # Queue rejects it through queue_node_contract_error below so every

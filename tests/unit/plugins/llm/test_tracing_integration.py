@@ -67,7 +67,7 @@ def _make_multi_query_config(**overrides: Any) -> dict[str, Any]:
         "provider": "openrouter",
         "model": _OPENROUTER_MODEL,
         "api_key": "test-key",
-        "prompt_template": "Case: {{ row.field1 }} Criterion: {{ row.criterion_name }}",
+        "prompt_template": "Case: {{ row.field1 }}",
         "schema": {"mode": "observed"},
         "required_input_fields": [],
         "queries": {

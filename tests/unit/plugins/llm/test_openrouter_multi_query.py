@@ -418,13 +418,17 @@ class TestSingleQueryProcessing:
     def test_process_row_handles_template_error(self) -> None:
         """Template rendering errors return error result with details.
 
-        The template references {{ row.missing_field }} which is not provided
-        by the query's input_fields mapping, so PromptTemplate raises TemplateError
-        via StrictUndefined. This tests the error handling path without patching
-        the frozen MultiQueryStrategy dataclass.
+        The template references {{ row.source_row.missing_field }} — a column
+        the row does not carry. Config-time binding validation cannot see
+        below ``source_row`` (columns are unknown until runtime), so this
+        passes construction and PromptTemplate raises TemplateError via
+        StrictUndefined at render. This tests the error handling path without
+        patching the frozen MultiQueryStrategy dataclass.
         """
-        # Template references a variable not mapped by input_fields — triggers TemplateError
-        config = self._make_single_query_config(prompt_template="Input: {{ row.text_content }}\nMissing: {{ row.missing_field }}")
+        # source_row column absent from the row — triggers TemplateError at render
+        config = self._make_single_query_config(
+            prompt_template="Input: {{ row.text_content }}\nMissing: {{ row.source_row.missing_field }}"
+        )
         transform, _mock_provider = _make_transform_with_mock_provider(config)
 
         row = make_pipeline_row({"cs1_bg": "data", "cs1_sym": "data", "cs1_hist": "data"})
