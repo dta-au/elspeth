@@ -6107,11 +6107,28 @@ _ADVISOR_UNTRUSTED_SUMMARY_END: Final[str] = "END_UNTRUSTED_PIPELINE_SUMMARY"
 # case-SENSITIVE. The advisor prompt asks for a literal ``CLEAN``/``FLAGGED``
 # token, and a case-insensitive scan across a whole line fails OPEN on ordinary
 # adjectival prose ("the extracted data looks clean and consistent"), which
-# would silently mint a sign-off. Case-any-register replies are still accepted,
-# but only through the ANCHORED ``_ADVISOR_VERDICT_LINE_RE`` fallback below,
-# where a leading bare "clean"/"flagged" token is unambiguous.
+# would silently mint a sign-off. A reply written in the natural lowercase
+# register is still accepted, but ONLY through the LINE-START-ANCHORED
+# ``_ADVISOR_VERDICT_LINE_RE`` fallback below. That arm is anchored, so a
+# lowercase token behind a label ("Verdict: clean") is NOT accepted and is
+# re-prompted instead — deliberately fail-closed, since widening the
+# any-register surface is how adjectival prose gets back in. The uppercase
+# ``Verdict: CLEAN`` parses via the cased arm; only the lowercase variant
+# costs a retry round trip.
 _ADVISOR_VERDICT_MARKER_RE: Final[re.Pattern[str]] = re.compile(r"\b(CLEAN|FLAGGED)\b")
-_ADVISOR_VERDICT_LINE_RE: Final[re.Pattern[str]] = re.compile(r"^(CLEAN|FLAGGED)\b(?:\s*[:.\-]\s*|\s+|$)", re.IGNORECASE)
+# The anchored arm requires the marker to be the WHOLE leading token, closed by
+# a verdict-shaped terminator (``:``, ``.``, a dash, or end-of-line). The
+# previous ``|\s+|`` alternative accepted a bare token followed by any
+# whitespace, so ordinary prose that merely STARTS with the word — "clean rows
+# are emitted by the source, but the sink drops them" — signed the build off. A
+# genuine verdict token ends its clause; an adjectival one is followed by the
+# noun it modifies.
+_ADVISOR_VERDICT_LINE_RE: Final[re.Pattern[str]] = re.compile(
+    # \u2013 / \u2014 are the en/em dashes models actually type; spelled as
+    # escapes so the literal cannot be confused with an ASCII hyphen on review.
+    r"^(CLEAN|FLAGGED)\s*(?:[:.\-\u2013\u2014]|$)",
+    re.IGNORECASE,
+)
 # Each family below trips the scan ALONE (elspeth-4f7377f99d/C2): a template
 # author does not need both an "ignore/override" verb-phrase AND a
 # CLEAN-imperative in the same string to be flagged. IGNORE_RE requires the
@@ -6274,15 +6291,27 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
     those used to be declared MALFORMED and fail the build closed, which is a
     formatting quibble presented to the user as a build failure.
 
-    So: strip markdown emphasis, scan the first
-    :data:`_ADVISOR_VERDICT_SCAN_MAX_LINES` non-empty lines, and take the FIRST
-    verdict marker found. The old "reply mentions both words => malformed"
-    tripwire is gone (first-marker-wins); a genuinely verdict-less reply is
-    still MALFORMED, and the caller now spends a retry re-asking for the
-    format rather than terminating the build.
+    So: strip markdown emphasis and scan the first
+    :data:`_ADVISOR_VERDICT_SCAN_MAX_LINES` non-empty lines. The old "reply
+    mentions both words => malformed" tripwire is gone; a genuinely
+    verdict-less reply is still MALFORMED, and the caller now spends a retry
+    re-asking for the format rather than terminating the build.
+
+    **FLAGGED dominates within the scan window.** Position does NOT decide.
+    A positional rule ("first marker wins") is a fail-OPEN here, because an
+    uppercase ``CLEAN`` token occurs naturally inside well-formed NEGATIONS —
+    "Not CLEAN. FLAGGED: …", "I cannot mark this CLEAN.", "Verdict: not CLEAN
+    — FLAGGED" — every one of which is a refusal to sign off that a positional
+    rule reads AS a sign-off. So a ``CLEAN`` that coexists with a ``FLAGGED``
+    anywhere in the window is never a sign-off; only a window carrying CLEAN
+    and no FLAGGED passes. This still resolves each shape the fix exists to
+    handle (``**CLEAN**`` -> CLEAN, ``Verdict: FLAGGED`` -> FLAGGED,
+    preamble-then-verdict -> that verdict, FLAGGED-mentioning-CLEAN ->
+    FLAGGED) and errs toward blocking, the safe direction for a sign-off gate.
     """
     text = guidance.strip()
     scanned = 0
+    saw_clean = False
     for raw_line in text.splitlines():
         line = _ADVISOR_MARKDOWN_EMPHASIS_RE.sub("", raw_line).strip()
         if not line:
@@ -6290,14 +6319,21 @@ def _parse_advisor_checkpoint_guidance(guidance: str) -> AdvisorCheckpointVerdic
         scanned += 1
         if scanned > _ADVISOR_VERDICT_SCAN_MAX_LINES:
             break
-        # Cased search anywhere in the line first (``**CLEAN**``, ``Verdict:
-        # FLAGGED``, "<preamble> FLAGGED"), then the any-register ANCHORED
-        # fallback for a bare leading token written in lowercase.
-        marker = _ADVISOR_VERDICT_MARKER_RE.search(line) or _ADVISOR_VERDICT_LINE_RE.match(line)
-        if marker is None:
-            continue
-        return AdvisorCheckpointVerdict(ok=True, blocking=marker.group(1).upper() == "FLAGGED", findings_text=text)
+        # Cased scan anywhere in the line (``**CLEAN**``, ``Verdict: FLAGGED``,
+        # "<preamble> FLAGGED"), then the any-register ANCHORED fallback for a
+        # bare leading token written in lowercase.
+        markers = [match.group(1).upper() for match in _ADVISOR_VERDICT_MARKER_RE.finditer(line)]
+        if not markers:
+            anchored = _ADVISOR_VERDICT_LINE_RE.match(line)
+            if anchored is not None:
+                markers = [anchored.group(1).upper()]
+        if "FLAGGED" in markers:
+            # Dominance: nothing later in the window can un-flag a FLAGGED.
+            return AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=text)
+        saw_clean = saw_clean or bool(markers)
 
+    if saw_clean:
+        return AdvisorCheckpointVerdict(ok=True, blocking=False, findings_text=text)
     return AdvisorCheckpointVerdict(ok=False, blocking=False, findings_text=_ADVISOR_MALFORMED_USER_DETAIL, failure_class="malformed")
 
 

@@ -557,17 +557,28 @@ def test_parse_advisor_verdict_tolerates_real_model_formatting(guidance: str, ex
     assert verdict.findings_text == guidance.strip()
 
 
-def test_parse_advisor_verdict_first_marker_wins() -> None:
-    """R2-F14: the both-words tripwire is gone — the FIRST marker decides.
+def test_parse_advisor_verdict_flagged_dominates_within_scan_window() -> None:
+    """R2-F14: within the scan window, FLAGGED DOMINATES — position is irrelevant.
 
-    (The old rule declared any reply containing both words MALFORMED, which
-    fail-closed-blocked the common ``FLAGGED ... would otherwise be CLEAN``
-    shape. See the report's concern note on the CLEAN-then-FLAGGED ordering.)
+    The both-words tripwire (any reply mentioning both words => MALFORMED) is
+    gone, but "first marker wins" cannot replace it: an uppercase `CLEAN` token
+    occurs naturally inside well-formed NEGATIONS ("Not CLEAN.", "I cannot mark
+    this CLEAN.", "Verdict: not CLEAN — FLAGGED"), so a positional rule reads a
+    refusal to sign off as a sign-off. That is a fail-OPEN on the gate's whole
+    purpose.
+
+    The rule instead: a CLEAN that COEXISTS with FLAGGED anywhere in the first
+    ``_ADVISOR_VERDICT_SCAN_MAX_LINES`` non-empty lines is never a sign-off.
+    Only a window containing CLEAN and no FLAGGED passes. This still satisfies
+    every case the fix was mandated to handle — ``**CLEAN**`` -> CLEAN,
+    ``Verdict: FLAGGED`` -> FLAGGED, preamble-then-verdict -> that verdict,
+    FLAGGED-mentioning-CLEAN -> FLAGGED — and it errs toward blocking, which is
+    the safe direction for a sign-off gate.
     """
     from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
 
     clean_first = _parse_advisor_checkpoint_guidance("CLEAN: intent satisfied\nFLAGGED: sink drops the rating field")
-    assert clean_first.ok is True and clean_first.blocking is False
+    assert clean_first.ok is True and clean_first.blocking is True
 
     flagged_first = _parse_advisor_checkpoint_guidance("FLAGGED: sink drops the rating field\nCLEAN otherwise")
     assert flagged_first.ok is True and flagged_first.blocking is True
@@ -576,15 +587,80 @@ def test_parse_advisor_verdict_first_marker_wins() -> None:
 @pytest.mark.parametrize(
     "guidance",
     [
+        # Executed fail-open probes from the task review: every one of these is
+        # a well-formed REFUSAL to sign off whose prose contains an uppercase
+        # CLEAN token. Under a positional (first-marker-wins) rule each minted
+        # a CLEAN sign-off; under FLAGGED-dominance each blocks.
+        "Not CLEAN. FLAGGED: the sink drops the rating field.",
+        "This is not a CLEAN sign-off.\nFLAGGED: the sink drops the rating field.",
+        "I checked whether this pipeline is CLEAN.\nVerdict: FLAGGED",
+        "I cannot mark this CLEAN.\n\nFLAGGED — the sink drops the rating field.",
+        "Summary: this is NOT CLEAN.\nFLAGGED",
+        "Verdict: not CLEAN — FLAGGED",
+    ],
+)
+def test_parse_advisor_verdict_negation_cannot_mint_a_signoff(guidance: str) -> None:
+    """A negated CLEAN accompanied by FLAGGED must never pass the gate."""
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance(guidance)
+
+    assert verdict.ok is True
+    assert verdict.blocking is True, f"fail-open: {guidance!r} minted a sign-off"
+
+
+@pytest.mark.parametrize(
+    ("guidance", "expected_blocking"),
+    [
+        ("clean", False),
+        ("clean: intent satisfied, contracts consistent", False),
+        ("clean — nothing to flag here", False),
+        ("flagged: the sink drops the rating field", True),
+        ("flagged. the sink drops the rating field", True),
+    ],
+)
+def test_parse_advisor_verdict_anchored_lowercase_arm_survives_tightening(guidance: str, expected_blocking: bool) -> None:
+    """The any-register ANCHORED arm still accepts a bare leading token.
+
+    Tightening it (Minor 3) must not silently delete it: a reply written in the
+    natural lowercase register, where the token IS the leading token and is
+    properly terminated, is unambiguous and still parses.
+    """
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance(guidance)
+
+    assert verdict.ok is True
+    assert verdict.blocking is expected_blocking
+
+
+@pytest.mark.parametrize(
+    "guidance",
+    [
         "",
         "   \n\n  ",
         "The pipeline looks fine to me.",
+        # The anchored arm is LINE-START anchored by design: a lowercase token
+        # behind a label is not accepted. Deliberately fail-closed — the format
+        # retry re-asks for a compliant reply rather than widening the
+        # any-register surface. (The uppercase ``Verdict: CLEAN`` parses via the
+        # cased arm; only the lowercase variant costs a round trip.)
+        "Verdict: clean",
         # Beyond the bounded scan window: a verdict buried under five lines of
         # preamble is not a compliant reply and must still be re-prompted.
         "one\ntwo\nthree\nfour\nfive\nsix\nCLEAN",
         # Adjectival lowercase prose must NOT be mistaken for a verdict marker
         # (fail-OPEN risk: "the data looks clean" is not a sign-off).
         "The extracted data looks clean and the contracts are consistent.",
+        # PRE-EXISTING hole tightened in passing: the any-register ANCHORED
+        # fallback used to accept a bare token followed by ANY whitespace, so
+        # adjectival prose that merely STARTS with the word signed the build
+        # off. The token must now be the whole leading token, terminated by
+        # ``:`` / ``.`` / a dash / end-of-line.
+        "clean rows are emitted by the source, but the sink drops them",
+        "flagged records are routed to the reject sink",
+        # Same register, no terminator, no accompanying verdict -> re-prompt.
+        "clean enough for me",
     ],
 )
 def test_parse_advisor_verdict_still_declares_malformed(guidance: str) -> None:
