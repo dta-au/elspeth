@@ -428,14 +428,16 @@ def wire_required_controls(
     candidate: Mapping[str, Any],
     snapshot: PluginAvailabilitySnapshot,
     catalog: PolicyCatalogView,
-) -> dict[str, object]:
+) -> Mapping[str, Any]:
     """Splice the deployment-selected REQUIRED controls onto uncovered edges.
 
-    Returns the candidate unchanged (idempotence; malformed candidates;
-    recommend-mode or unselected capabilities) or a copy with control nodes
-    inserted, each staging its ``required_control_auto_wired`` disclosure.
-    Never raises on candidate content — this runs inside the planner
-    finalizer seam where an unprefixed exception is a terminal failure.
+    Returns the candidate object ITSELF unchanged (identity, not an equal
+    copy — the finalizer contract; idempotence, malformed candidates,
+    recommend-mode or unselected capabilities) or a new dict with control
+    nodes inserted, each staging its ``required_control_auto_wired``
+    disclosure. Never raises on candidate content — this runs inside the
+    planner finalizer seam where an unprefixed exception is a terminal
+    failure.
     """
     if catalog.snapshot is not snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
@@ -450,16 +452,19 @@ def wire_required_controls(
             # the required_control_unavailable finding — operator problem.
             continue
         selections[capability] = selected
-    result = dict(candidate)
+    # Every no-op path returns the INPUT OBJECT, not an equal copy: the
+    # finalizer seam's pre-existing contract (pinned by
+    # test_shared_planner_surfaces) is identity on no-op, which keeps
+    # byte-exactness/authority hashing downstream trivially intact.
     if not selections:
-        return result
+        return candidate
     state = _parse_candidate_state(candidate)
     if state is None:
-        return result
+        return candidate
     llm_node_count = sum(1 for node in state.nodes if node_has_capability(node, PluginCapability.LLM))
     if llm_node_count == 0:
         # Coverage findings only exist for LLM nodes; skip the catalog sweep.
-        return result
+        return candidate
 
     summaries = _plugin_summaries(catalog)
     # SECURITY: an alias-less selection whose required options would come from
@@ -474,14 +479,14 @@ def wire_required_controls(
         if alias is not None or _direct_control_options_are_deployable(summaries, plugin_name)
     }
     if not selections:
-        return result
+        return candidate
     working_nodes = [dict(node) for node in candidate["nodes"]]
     changed = False
     # Each successful splice permanently covers at least one finding, so the
     # fixpoint needs at most two insertions (input + output) per LLM node.
     budget = 2 * llm_node_count
     for _ in range(budget):
-        working_candidate = {**result, "nodes": working_nodes}
+        working_candidate = {**candidate, "nodes": working_nodes}
         state = _parse_candidate_state(working_candidate)
         if state is None:
             # A splice produced an unparseable candidate — impossible by
@@ -528,7 +533,8 @@ def wire_required_controls(
         if not progressed:
             break
     if not changed:
-        return result
+        return candidate
+    result: dict[str, object] = dict(candidate)
     result["nodes"] = working_nodes
     return result
 

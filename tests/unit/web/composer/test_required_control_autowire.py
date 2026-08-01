@@ -236,7 +236,7 @@ class TestAutoWireSplicing:
         view, snapshot = _direct_control_view(tmp_path)
         candidate = _bare_llm_candidate()
 
-        assert wire_required_controls(candidate, snapshot, view) == candidate
+        assert wire_required_controls(candidate, snapshot, view) is candidate
 
         # The finding stays for the author/operator — never a done-looking
         # disclosure over placeholder config.
@@ -286,8 +286,11 @@ class TestAutoWireIdempotence:
         wired = wire_required_controls(_bare_llm_candidate(), snapshot, view)
         rewired = wire_required_controls(wired, snapshot, view)
 
-        assert rewired == wired
-        assert len(rewired["nodes"]) == len(wired["nodes"])
+        # Identity, not just equality: a no-op finalizer must return the SAME
+        # object (the pre-existing contract pinned by
+        # test_shared_planner_surfaces — load-bearing for byte-exactness and
+        # authority hashing downstream).
+        assert rewired is wired
 
     def test_already_covered_graph_is_returned_unchanged(self, tmp_path: Path) -> None:
         from elspeth.web.composer.planner_authoring_aids import fork_coalesce_exemplar_args
@@ -296,9 +299,32 @@ class TestAutoWireIdempotence:
         covered = fork_coalesce_exemplar_args(view)
         assert covered is not None
 
-        result = wire_required_controls(covered, snapshot, view)
+        assert wire_required_controls(covered, snapshot, view) is covered
 
-        assert result == covered
+    def test_every_no_op_path_is_identity_preserving(self, tmp_path: Path) -> None:
+        """Regression (fix round 2): the pass returned a NEW equal dict on
+        no-op paths, breaking the finalizer identity contract pinned by
+        tests/integration/web/composer/guided/test_shared_planner_surfaces.py.
+        Every refusal path must return the input object itself — including for
+        read-only mapping inputs such as a frozen proposal pipeline."""
+        from types import MappingProxyType
+
+        # Recommend mode (no REQUIRED selections).
+        view, snapshot = _guardrail_profile_view(tmp_path, control_mode="recommend")
+        candidate = _bare_llm_candidate()
+        assert wire_required_controls(candidate, snapshot, view) is candidate
+
+        # REQUIRED posture, but no LLM node / empty frozen candidate.
+        req_view, req_snapshot = _guardrail_profile_view(tmp_path)
+        frozen = MappingProxyType({"sources": MappingProxyType({}), "nodes": (), "edges": (), "outputs": ()})
+        assert wire_required_controls(frozen, req_snapshot, req_view) is frozen
+
+        # REQUIRED posture through the service finalizer factory (the seam the
+        # regression test exercises).
+        from elspeth.web.composer.service import _required_controls_candidate_finalizer
+
+        finalize = _required_controls_candidate_finalizer(policy_catalog=req_view, plugin_snapshot=req_snapshot)
+        assert finalize(frozen) is frozen
 
 
 class TestAutoWireRefusals:
@@ -306,7 +332,7 @@ class TestAutoWireRefusals:
         view, snapshot = _guardrail_profile_view(tmp_path, control_mode="recommend")
         candidate = _bare_llm_candidate()
 
-        assert wire_required_controls(candidate, snapshot, view) == candidate
+        assert wire_required_controls(candidate, snapshot, view) is candidate
 
     def test_required_but_unselected_inserts_nothing(self) -> None:
         from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
@@ -334,7 +360,7 @@ class TestAutoWireRefusals:
         view = PolicyCatalogView(catalog, unselected, MagicMock(spec=OperatorProfileRegistry))
         candidate = _bare_llm_candidate()
 
-        assert wire_required_controls(candidate, unselected, view) == candidate
+        assert wire_required_controls(candidate, unselected, view) is candidate
 
     def test_unprovable_prompt_fields_leave_the_input_finding_alone(self, tmp_path: Path) -> None:
         """A dynamic row access defeats field-scoped shielding: insert nothing on
@@ -395,7 +421,7 @@ class TestAutoWireRefusals:
             monkeypatch.setattr(cls, "is_effective_blocking_control", classmethod(lambda _cls, **_kwargs: False))
         candidate = _bare_llm_candidate()
 
-        assert wire_required_controls(candidate, snapshot, view) == candidate
+        assert wire_required_controls(candidate, snapshot, view) is candidate
 
     def test_malformed_candidate_is_returned_unchanged_without_raising(self, tmp_path: Path) -> None:
         """The pass runs inside the planner finalizer seam (T1): it must never
@@ -407,7 +433,7 @@ class TestAutoWireRefusals:
             {"nodes": [{"id": "x"}], "edges": [], "outputs": "nope"},
             {},
         ):
-            assert wire_required_controls(malformed, snapshot, view) == malformed
+            assert wire_required_controls(malformed, snapshot, view) is malformed
 
     def test_deterministic_ids_skip_authored_collisions(self, tmp_path: Path) -> None:
         view, snapshot = _guardrail_profile_view(tmp_path)
