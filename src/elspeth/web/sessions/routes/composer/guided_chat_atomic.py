@@ -980,6 +980,7 @@ async def post_guided_chat_schema8(
                         deferred_action = None
                         deferred_management_action = None
                         deferred_clarification = False
+                        deferred_paired_resolution = False
                     elif uploaded_bind is not None:
                         # No provider work: the bind request names a file this
                         # session already holds, and its inspected facts are the
@@ -1006,6 +1007,7 @@ async def post_guided_chat_schema8(
                         deferred_action = None
                         deferred_management_action = None
                         deferred_clarification = False
+                        deferred_paired_resolution = False
                     else:
                         provider_outcome = await provider_runner(
                             session_id=session_id,
@@ -1038,6 +1040,9 @@ async def post_guided_chat_schema8(
                             deferred_action = provider_outcome.deferred_action
                         else:
                             deferred_action = None
+                        deferred_paired_resolution = deferred_action is not None and (
+                            type(provider_outcome) is Step1SourceResolvedResult or type(provider_outcome) is Step2SinkResolvedResult
+                        )
                         deferred_management_action = (
                             provider_outcome.action if type(provider_outcome) is GuidedStepDeferredManagementResult else None
                         )
@@ -1085,13 +1090,11 @@ async def post_guided_chat_schema8(
 
                     occurrence_was_prospective = not (current_guided.history and current_guided.history[-1].response_hash is None)
                     # On a resolve+retain pair, the disposition copy from
-                    # apply_deferred_request must not displace the resolution's
-                    # own assistant message — both applications stay visible.
-                    paired_resolution_message = (
-                        chat_result.assistant_message
-                        if deferred_action is not None and (source_resolution is not None or sink_resolution is not None)
-                        else None
-                    )
+                    # apply_deferred_request must not displace the message the
+                    # resolution half produced — both applications (or the
+                    # guard's explanation for a withheld resolution, e.g. the
+                    # advisory-only schema form) stay visible.
+                    paired_resolution_message = chat_result.assistant_message if deferred_paired_resolution else None
                     deferred_authority = DeferredRequestAuthority(
                         guided=prospective,
                         catalog=catalog,
