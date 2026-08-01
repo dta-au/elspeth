@@ -12,6 +12,7 @@ from uuid import UUID
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.execution.completion_gates import CompletionGateFacts
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.protocol import RunRecord
@@ -105,6 +106,7 @@ class ExecutionService(Protocol):
         *,
         user_id: str | None = None,
         session_id: UUID | None = None,
+        completion_gates: CompletionGateFacts | None = None,
     ) -> ValidationResult:
         """Async dry-run validation for an already materialized composition state.
 
@@ -113,6 +115,11 @@ class ExecutionService(Protocol):
         composition version. When provided, ``session_id`` scopes inline blob
         metadata lookups to the same session boundary that execution enforces
         before linking blobs to runs.
+
+        ``completion_gates`` carries persisted composer completion-gate facts
+        parsed off the caller's ``composition_states`` record; the recompute
+        cannot rediscover those turn events, so the implementation merges them
+        into the returned readiness (withholding ``completion_ready`` only).
         """
         ...
 

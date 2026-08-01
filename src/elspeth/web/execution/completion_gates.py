@@ -138,9 +138,24 @@ def parse_completion_gates(
     explicit "no gates withheld". Tier 1: this is our own persisted data, so
     a malformed shape means corruption or writer drift — raise, never skip
     the gate.
+
+    Tier-model adjudication note (R1 ``.get()`` / R5 ``isinstance()`` below):
+    this function is the ADR-032 parse point for a JSON-round-tripped
+    envelope read back off our own ``composition_states`` row. The ``.get()``
+    calls are sentinel probes for keys whose ABSENCE is a legal, meaningful
+    state (`no envelope written` / `no gate withheld`) — never a silent
+    default: every present-but-malformed shape raises, and the two
+    ``isinstance(..., Mapping)`` checks are shape validation that constructs
+    the owned ``CompletionGateFacts`` type, not defensive masking of a code
+    bug. If this function ever stops raising on malformed present values, or
+    starts being fed anything other than the ``composer_meta`` mapping of a
+    ``composition_states`` record, that reasoning is invalid and the
+    suppressions should be withdrawn.
     """
     if composer_meta is None:
         return None
+    # Sentinel probe: rows written before this envelope existed (and
+    # fork/revert paths) legitimately lack the key.
     raw = composer_meta.get(COMPLETION_GATES_META_KEY)
     if raw is None:
         return None
@@ -149,11 +164,15 @@ def parse_completion_gates(
     unknown = set(raw) - {_ADVISOR_SIGNOFF_GATE_KEY}
     if unknown:
         raise ValueError(f"Tier 1: composer_meta.completion_gates has unknown gate keys {sorted(unknown)!r}")
+    # Sentinel probe: the writer persists {} on every clean compose turn, so
+    # a missing gate key means "not withheld", not corruption.
     raw_signoff = raw.get(_ADVISOR_SIGNOFF_GATE_KEY)
     if raw_signoff is None:
         return CompletionGateFacts(advisor_signoff=None)
     if not isinstance(raw_signoff, Mapping):
         raise ValueError(f"Tier 1: completion_gates.advisor_signoff is {type(raw_signoff).__name__}, expected a mapping")
+    # From here every probe is get-then-assert: a missing or malformed field
+    # falls through to a raise, so no absence is ever silently defaulted.
     status = raw_signoff.get("status")
     if status != _GATE_STATUS_BLOCKED:
         raise ValueError(f"Tier 1: completion_gates.advisor_signoff.status is {status!r}, expected {_GATE_STATUS_BLOCKED!r}")

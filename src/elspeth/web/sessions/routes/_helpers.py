@@ -257,6 +257,9 @@ class _SessionComposeLockRegistry:
 
     async def get_lock(self, session_id: str) -> asyncio.Lock:
         async with self._ensure_locks_lock():
+            # Tier note: lazy per-session lock cache — a miss means this
+            # session has not needed a lock yet, not corrupted state; the
+            # WeakValueDictionary drops entries when their sessions go away.
             lock = self._session_locks.get(session_id)
             if lock is None:
                 lock = asyncio.Lock()
@@ -1488,7 +1491,13 @@ _CLIENT_DISCONNECT_CANCEL_MARKER = "elspeth_client_disconnected"
 
 
 def _is_client_disconnect_cancel(exc: asyncio.CancelledError) -> bool:
-    """True when ``exc`` was delivered by :func:`_cancel_on_client_disconnect`."""
+    """True when ``exc`` was delivered by :func:`_cancel_on_client_disconnect`.
+
+    Tier note: the ``getattr`` default is a cooperative-marker probe, not
+    defensive masking — the marker attribute is stamped onto the exception by
+    ``_cancel_on_client_disconnect`` alone, so its absence is the ordinary
+    "external cancel" case, never a hidden bug.
+    """
     return bool(getattr(exc, _CLIENT_DISCONNECT_CANCEL_MARKER, False))
 
 

@@ -76,6 +76,7 @@ from elspeth.web.composer.yaml_generator import (
     generate_public_yaml,
 )
 from elspeth.web.config import WebSettings
+from elspeth.web.execution.completion_gates import CompletionGateFacts, parse_completion_gates
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import composer_completion_events_table
 from elspeth.web.shareable_reviews.models import (
@@ -156,6 +157,7 @@ class _ExecutionServiceLike(Protocol):
         *,
         user_id: str | None = None,
         session_id: UUID | None = None,
+        completion_gates: CompletionGateFacts | None = None,
     ) -> Any: ...
 
 
@@ -367,8 +369,16 @@ class ShareableReviewService:
         composition_state = state_from_record(state_record)
         # session_id scopes the sink path allowlist (blobs/<session_id>/) and
         # inline-blob metadata lookups; omitting it fails closed to outputs-only
-        # and rejects states that /validate and /execute accept.
-        validation = await self._execution_service.validate_state(composition_state, user_id=user_id, session_id=session_id)
+        # and rejects states that /validate and /execute accept. Persisted
+        # completion-gate facts (advisor sign-off, R2-F14) are threaded from the
+        # record so the share-time validation reports the same readiness the
+        # composer and /validate report.
+        validation = await self._execution_service.validate_state(
+            composition_state,
+            user_id=user_id,
+            session_id=session_id,
+            completion_gates=parse_completion_gates(state_record.composer_meta),
+        )
         if not validation.is_valid:
             raise CompositionNotRunnableError(
                 reason="validation_failed",

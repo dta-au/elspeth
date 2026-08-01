@@ -226,12 +226,15 @@ class _SessionServiceDouble:
         self.list_interpretation_events = _InterpretationEventRecordsDispatch(events_by_source_and_state or {})
 
 
-def _make_session_service(events_by_source_and_state=None):
+def _make_session_service(events_by_source_and_state=None, composer_meta=None):
     record = type("CompositionStateRecordDouble", (), {})()
     # record.id is read by ReadinessService.compute_snapshot as a UUID
     # (CompositionStateRecord.id — protocol.py:369). Pin a deterministic
     # value so test events bound to this id are correctly scoped.
     record.id = _TEST_COMPOSITION_STATE_ID
+    # record.composer_meta feeds parse_completion_gates — Tier-1 direct
+    # attribute access in compute_snapshot, so the double must carry it.
+    record.composer_meta = composer_meta
     return _SessionServiceDouble(record, events_by_source_and_state or {})
 
 
@@ -539,6 +542,48 @@ def test_compute_snapshot_validates_already_read_state():
         state,
         user_id="alice",
         session_id=UUID("11111111-1111-1111-1111-111111111111"),
+        completion_gates=None,
+    )
+
+
+def test_compute_snapshot_passes_persisted_completion_gates():
+    """The record's completion_gates envelope reaches the readiness recompute."""
+    from elspeth.web.execution.completion_gates import AdvisorSignoffGateFact, CompletionGateFacts
+
+    state = _state(transforms=(("t", "passthrough"),))
+    exec_svc = _ExecutionServiceDouble(_OK)
+    svc = ReadinessService(
+        execution_service=exec_svc,
+        session_service=_make_session_service(
+            composer_meta={
+                "completion_gates": {
+                    "advisor_signoff": {
+                        "status": "blocked",
+                        "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                        "for_graph": "0" * 64,
+                    }
+                }
+            }
+        ),
+        scoped_secret_resolver=_ScopedSecretResolverDouble(()),
+        settings=_SettingsDouble(payload_store_retention_days=90),
+        state_from_record=lambda _record: state,
+    )
+
+    asyncio.run(
+        svc.compute_snapshot(
+            session_id=UUID("11111111-1111-1111-1111-111111111111"),
+            user_id="alice",
+        )
+    )
+
+    ((args, kwargs),) = exec_svc.validate_state.calls
+    assert args == (state,)
+    assert kwargs["completion_gates"] == CompletionGateFacts(
+        advisor_signoff=AdvisorSignoffGateFact(
+            detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+            for_graph="0" * 64,
+        )
     )
 
 
