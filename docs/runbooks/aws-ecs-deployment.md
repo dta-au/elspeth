@@ -3354,12 +3354,12 @@ case "$SCENARIO_B_COGNITO_POOL_OWNED" in true|false) ;; *) exit 1 ;; esac
 # service-linked role re-creates that exact log-group name minutes after the
 # cluster goes INACTIVE (a final metrics flush), and the recreated group is
 # untagged and outside every Terraform state, so `orphan-sweep`'s tag query
-# cannot see it. The `cleanup_container_insights_log_group` best-effort step
-# below (called from the disposable-cleanup sequence, after both scenario
-# destroys and the ECR/identity/bootstrap steps have bought the flush enough
-# wall-clock time) is the corresponding cleanup; a same-namespace redeploy
-# retry that still hits `ResourceAlreadyExistsException` on `CreateLogGroup`
-# should re-run it or set `-var=adopt_container_insights_log_group=true`.
+# cannot see it. `cleanup_container_insights_log_group` below (called from
+# the disposable-cleanup sequence, after both scenario destroys and the
+# ECR/identity/bootstrap steps have bought the flush enough wall-clock time)
+# is the corresponding cleanup; a same-namespace redeploy retry that still
+# hits `ResourceAlreadyExistsException` on `CreateLogGroup` should re-run it
+# or set `-var=adopt_container_insights_log_group=true`.
 destroy_scenario() {
   local scenario_id="$1" directory="$2" vars="$3" binding="$4"
   local binding_file="$5" approval_file="$6" surface="$7"
@@ -3569,32 +3569,54 @@ else
 fi
 
 # R2-D3 (elspeth-a229c247a1): delete each scenario's Container Insights
-# performance log group. ECS's service-linked role re-creates it, untagged,
-# minutes after the cluster goes INACTIVE (a final metrics flush) — outside
-# every Terraform state and invisible to the tagged orphan-sweep below. By
-# this point in the sequence, the scenario destroys plus the ECR, identity,
-# and shared-bootstrap cleanup above have already spent real wall-clock time,
-# but the flush is not guaranteed to have landed, so this step tolerates
-# ResourceNotFoundException (not yet re-created, or already gone) and is
-# best-effort: it never fails the cleanup run, and re-running the whole
-# sequence re-attempts it. If a later same-namespace redeploy still hits
-# `ResourceAlreadyExistsException` on `CreateLogGroup`, delete it manually or
-# set `-var=adopt_container_insights_log_group=true` on that apply.
-# Deliberately bypasses aws_capture: aws_capture treats any non-zero exit as
-# fatal, but ResourceNotFoundException here is an expected, non-fatal outcome
-# (the flush had not landed yet, or a prior run already deleted it), and the
-# command carries no secret material worth its output-sanitization.
+# performance log group if ECS's service-linked role has already re-created
+# it. That role re-creates the group, untagged, minutes after the cluster
+# goes INACTIVE (a final metrics flush) — outside every Terraform state and
+# invisible to the tagged orphan-sweep below. This follows the same
+# check-then-act idiom as delete_ecr_tag() above: describe first, and treat
+# "not found" as a normal, successful no-op (the flush may not have landed
+# by the time this runs, or a prior cleanup already deleted it) rather than
+# tolerating a delete-time failure. Every AWS call routes through
+# aws_capture, so a real failure — AccessDenied, throttling, a malformed
+# region — surfaces as a genuine, non-swallowed error instead of being
+# caught by a blanket `|| true`. This does not call checkpoint_cleanup (no
+# new cleanup-manifest surface; `_CLEANUP_SURFACES` in
+# aws_ecs_acceptance/manifest_schema.py is a closed, set-equality-validated
+# enum and adding to it is a separate change), but a real failure still
+# fails the overall cleanup run via cleanup_failures, exactly like
+# ecr_baseline/ecr_candidate above. If a later same-namespace redeploy still
+# hits `ResourceAlreadyExistsException` on `CreateLogGroup` (the flush
+# landed after this step ran), delete it manually or set
+# `-var=adopt_container_insights_log_group=true` on that apply.
 cleanup_container_insights_log_group() {
-  local inventory="$1" cluster log_group
-  test -f "$inventory" || return 0
-  cluster=$(jq -er '.values.ECS_CLUSTER // empty' "$inventory") || return 0
-  test -n "$cluster" || return 0
-  log_group="/aws/ecs/containerinsights/${cluster}/performance"
-  aws logs delete-log-group --region "$AWS_REGION" \
-    --log-group-name "$log_group" >/dev/null 2>&1 || true
+  local inventory="$1"
+  if (
+    set -Eeuo pipefail
+    test -f "$inventory" || exit 0
+    cluster=$(jq -er '.values.ECS_CLUSTER // empty' "$inventory") || exit 0
+    test -n "$cluster" || exit 0
+    log_group="/aws/ecs/containerinsights/${cluster}/performance"
+    listing="$(aws_capture aws logs describe-log-groups --region "$AWS_REGION" \
+      --log-group-name-prefix "$log_group" --output json)"
+    count="$(jq --arg name "$log_group" '[.logGroups[]? | select(.logGroupName == $name)] | length' <<<"$listing")"
+    test "$count" = 0 || test "$count" = 1
+    if test "$count" = 0; then
+      exit 0
+    fi
+    aws_capture aws logs delete-log-group --region "$AWS_REGION" \
+      --log-group-name "$log_group" >/dev/null
+  ); then
+    return 0
+  else
+    return 1
+  fi
 }
-cleanup_container_insights_log_group "$SCENARIO_A_INVENTORY"
-cleanup_container_insights_log_group "$SCENARIO_B_INVENTORY"
+if ! cleanup_container_insights_log_group "$SCENARIO_A_INVENTORY"; then
+  cleanup_failures+=(container_insights_log_group_a)
+fi
+if ! cleanup_container_insights_log_group "$SCENARIO_B_INVENTORY"; then
+  cleanup_failures+=(container_insights_log_group_b)
+fi
 
 ORPHAN_RECEIPT_DIR=$(dirname -- "$SANITIZED_ORPHAN_RECEIPT")
 test ! -e "$SANITIZED_ORPHAN_RECEIPT" || {
