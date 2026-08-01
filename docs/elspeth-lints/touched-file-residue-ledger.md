@@ -85,9 +85,30 @@ additional stale residue or trust-tier obligation.
 
 Unresolved stale residue for this entry: **0 sites**.
 
+## Entry 3: Release sync review of execution validation
+
+- Date: 2026-08-01
+- Release authority: `origin/release/0.7.2@80c1a85d1`
+- Discovered by: merge-conflict resolution and full touched-file review
+- Corrected merge: `1f446465b`
+- Result: 2 corrected sites in the existing test-double/type-contract drift
+  pattern class
+
+| Pattern | Sites | Exact surface | Plausible detector |
+|---|---:|---|---|
+| Test-double/type-contract drift | 2 | `_runtime_bundle_double` used `SimpleNamespace` plus `Any`; `_RuntimeGraphDouble` was a bespoke unspecced carrier returning `Any` in `test_gate_fan_out_advisory.py` | Existing test-double/carrier rule: reject `SimpleNamespace`, bespoke structural carriers, and `Any` where an autospecced owned type is available |
+
+Both sites arrived from the release side of the merge and were replaced with
+autospecced owned `PluginBundle` and `ExecutionGraph` instances while porting
+the release advisory into the refactored validation pipeline. No new recurring
+pattern class was required.
+
+Unresolved stale residue for this entry: **0 sites**.
+
 ## Running totals
 
 | Features reviewed | Corrected sites | Pattern classes recorded | Unresolved residue |
 |---:|---:|---:|---:|
 | 1 | 100 | 9 | 0 |
 | 1 | 101 | 10 | 0 |
+| 1 | 103 | 10 | 0 |
