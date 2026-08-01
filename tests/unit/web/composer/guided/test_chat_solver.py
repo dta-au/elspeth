@@ -1084,6 +1084,120 @@ async def test_step_2_pair_with_malformed_retain_is_repaired_then_applies_both(m
     assert "Not applied" in by_id["c_sink_1"]
 
 
+_PAIR_CONFIG_INVALID_SINK_ARGUMENTS: dict[str, Any] = {
+    "resolution": "sink",
+    "output": {
+        "name": "results",
+        "plugin": "json",
+        # flexible-without-fields fails the json sink's config model
+        # (observed live: elspeth-a88c07cd47).
+        "options": {"path": "out.jsonl", "schema": {"mode": "flexible"}},
+        "required_fields": [],
+        "schema_mode": "observed",
+        "on_write_failure": "discard",
+    },
+    "assistant_message": "Saved the results as a JSON Lines file.",
+}
+
+
+@pytest.mark.asyncio
+async def test_step_2_pair_with_config_invalid_sink_at_cap_returns_retain_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A parsed valid retain must survive the sink half never becoming config-valid.
+
+    Previously the discovery-cap exhaustion fell to the advisory fallback and
+    silently DISCARDED the parsed deferred action — the exact R2-F15 defect
+    shape the manual promises never happens.
+    """
+    calls: list[dict[str, Any]] = []
+
+    async def stubborn_pair(**kwargs: Any) -> _FakeLLMResponse:
+        calls.append(kwargs)
+        tool_calls = [
+            SimpleNamespace(
+                id=f"c_sink_{len(calls)}",
+                function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_CONFIG_INVALID_SINK_ARGUMENTS)),
+            ),
+            SimpleNamespace(
+                id=f"c_retain_{len(calls)}",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", stubborn_pair)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save results as jsonl, and later add the passthrough transform.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+        max_discovery_iters=2,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
+    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_step_2_pair_with_shape_invalid_sink_returns_retain_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pair whose sink half fails its shape contract keeps the valid retain."""
+
+    async def shape_invalid_pair(**_kwargs: Any) -> _FakeLLMResponse:
+        tool_calls = [
+            SimpleNamespace(id="c_sink", function=SimpleNamespace(name="resolve_sink", arguments="{}")),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", shape_invalid_pair)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save results as jsonl, and later add the passthrough transform.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
+    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+
+
+@pytest.mark.asyncio
+async def test_step_1_pair_with_shape_invalid_source_returns_retain_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pair whose source half fails its shape contract keeps the valid retain."""
+
+    async def shape_invalid_pair(**_kwargs: Any) -> _FakeLLMResponse:
+        tool_calls = [
+            SimpleNamespace(id="c_source", function=SimpleNamespace(name="resolve_source", arguments="{}")),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", shape_invalid_pair)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Use these JSON rows, and later add the passthrough transform.",
+        plugin_hint="json",
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentOutcome
+    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+
+
 @pytest.mark.asyncio
 async def test_step_2_pair_wrapper_threads_deferred_action(monkeypatch: pytest.MonkeyPatch) -> None:
     async def pair_acompletion(**_kwargs: Any) -> _FakeLLMResponse:

@@ -12,20 +12,24 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import event, func, select
 
+from elspeth.contracts.blobs import BlobQuotaExceededError
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind, PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.guided import chat_solver
+from elspeth.web.composer.guided.chat_solver import Step1SourceChatResolution
 from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentAction,
     DeferredIntentCancelAction,
     DeferredIntentEditAction,
     DeferredIntentManagementAction,
 )
+from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.intent_management import deferred_intent_management_option
 from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
+from elspeth.web.composer.guided.resolved import SinkOutputResolved, SinkResolved
 from elspeth.web.composer.guided.stage_subjects import (
     ComponentCountConstraint,
     EdgeRouteConstraint,
@@ -39,6 +43,8 @@ from elspeth.web.plugin_policy.models import PluginAvailability, PluginAvailabil
 from elspeth.web.sessions._guided_step_chat import (
     GuidedStepDeferredIntentResult,
     GuidedStepDeferredManagementResult,
+    Step1SourceResolvedResult,
+    Step2SinkResolvedResult,
     StepChatResult,
 )
 from elspeth.web.sessions.converters import state_from_record
@@ -242,6 +248,67 @@ def _post(
     )
 
 
+def _text_outside_chat_history(response_json: object) -> str:
+    """Serialize a guided chat/respond response with the transcript excised.
+
+    The rendered transcript legitimately carries the author's verbatim words
+    (R2-F15 transcript custody) — both at ``guided_session.chat_history`` and
+    in the persisted checkpoint mirror at
+    ``composition_state.composer_meta.guided_session.chat_history``. Every
+    OTHER response surface — next_turn payloads, composition state proper,
+    assistant messages, terminal state — must still never echo the private
+    prose. This keeps the blanket needle guard on those surfaces.
+    """
+    scrubbed = json.loads(json.dumps(response_json))
+    if isinstance(scrubbed, dict):
+        guided_session = scrubbed.get("guided_session")
+        if isinstance(guided_session, dict):
+            guided_session.pop("chat_history", None)
+        composition_state = scrubbed.get("composition_state")
+        if isinstance(composition_state, dict):
+            composer_meta = composition_state.get("composer_meta")
+            if isinstance(composer_meta, dict):
+                meta_guided = composer_meta.get("guided_session")
+                if isinstance(meta_guided, dict):
+                    meta_guided.pop("chat_history", None)
+    return json.dumps(scrubbed)
+
+
+def _pair_sink_provider(sink: SinkResolved, action: DeferredIntentAction) -> Callable[..., Awaitable[GuidedChatProviderOutcome]]:
+    async def run(**_kwargs: object) -> GuidedChatProviderOutcome:
+        return Step2SinkResolvedResult(
+            chat=StepChatResult(
+                assistant_message="Output set to JSON.",
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=1,
+                error_class=None,
+            ),
+            sink=sink,
+            deferred_action=action,
+        )
+
+    return run
+
+
+def _pair_source_provider(
+    resolution: Step1SourceChatResolution,
+    action: DeferredIntentAction,
+) -> Callable[..., Awaitable[GuidedChatProviderOutcome]]:
+    async def run(**_kwargs: object) -> GuidedChatProviderOutcome:
+        return Step1SourceResolvedResult(
+            chat=StepChatResult(
+                assistant_message=resolution.assistant_message,
+                status=ComposerChatTurnStatus.SUCCESS,
+                latency_ms=1,
+                error_class=None,
+            ),
+            resolution=resolution,
+            deferred_action=action,
+        )
+
+    return run
+
+
 def _guided(client: TestClient, session_id: str):
     record = asyncio.run(client.app.state.session_service.get_current_state(UUID(session_id)))
     assert record is not None
@@ -355,7 +422,7 @@ def test_unique_future_catalog_intent_is_private_atomic_retryable_and_restart_du
     assert first.status_code == 200, first.json()
     first_json = first.json()
     assert first_json["assistant_message"] == "I saved that instruction for the topology stage."
-    assert private_message not in first_json["assistant_message"]
+    assert private_message not in _text_outside_chat_history(first_json)
     assert "provider provisional text" not in first.text
     guided = _guided(client, session_id)
     assert len(guided.deferred_intents) == 1
@@ -484,7 +551,7 @@ def test_cancel_requires_explicit_user_authority_then_removes_only_the_named_int
     assert first.status_code == 200, first.json()
     assert first.json()["assistant_message"] == "I cancelled that saved topology instruction."
     assert _guided(client, session_id).deferred_intents == ()
-    assert private_cancel_request not in first.json()["assistant_message"]
+    assert private_cancel_request not in _text_outside_chat_history(first.json())
     assert _guided(client, session_id).chat_history[-2].content == private_cancel_request
     retry = _post(
         client,
@@ -1193,10 +1260,278 @@ def test_pair_of_sink_resolution_and_future_intent_applies_both_atomically(
     assert next_turn["type"] == "schema_form"
     assert next_turn["payload"]["prefilled"]["path"] == out_path
     # The raw mixed message stays out of every non-user surface.
+    assert private_message not in _text_outside_chat_history(body)
     messages = asyncio.run(client.app.state.session_service.get_messages(UUID(session_id), limit=None))
     assert [content for _message_id, content in _non_root_user_rows(client, session_id)] == [private_message]
     assert all(private_message not in message.content for message in messages if message.role != "user")
     assert all(private_message not in repr(message.tool_calls) for message in messages if message.role != "user")
+
+
+def _inline_source_resolution() -> Step1SourceChatResolution:
+    return Step1SourceChatResolution(
+        assistant_message="Created the JSON rows as the source.",
+        plugin="json",
+        filename="rows.json",
+        mime_type="application/json",
+        content='[{"line": "alpha"}]',
+        options={"schema": {"mode": "observed", "guaranteed_fields": ["line"]}},
+        observed_columns=("line",),
+        sample_rows=({"line": "alpha"},),
+        on_validation_failure="discard",
+    )
+
+
+def test_pair_with_config_invalid_sink_prefill_still_retains_and_says_so(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sink half fails the route's prefill re-check; the retain half must stay visible.
+
+    Previously the failure copy displaced the whole composed message: the
+    intent settled durably while the turn claimed "I didn't change your
+    pipeline" (review finding 1).
+    """
+    client = composer_test_client
+    session_id = _create_session(client)
+    TestStepChatCrossStep._seed_csv_blob(client, session_id)
+    TestStepChatCrossStep._configure_csv_source(client, session_id)
+    before = client.get(f"/api/sessions/{session_id}/guided").json()
+    assert before["guided_session"]["step"] == "step_2_sink"
+    private_message = "Save results as jsonl with the private pair-needle, and later add passthrough."
+    invalid_sink = SinkResolved(
+        outputs=(
+            SinkOutputResolved(
+                name="main",
+                plugin="json",
+                # flexible-without-fields fails the json sink's config model.
+                options={"path": "out.jsonl", "schema": {"mode": "flexible"}},
+                required_fields=(),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+        )
+    )
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _pair_sink_provider(invalid_sink, _action()))
+
+    response = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=before["next_turn"]["turn_token"],
+        message=private_message,
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["assistant_message"] == (
+        "I couldn't apply that output configuration because it fails the "
+        "selected plugin's validation, so I didn't change your pipeline. "
+        "Describe the output again and I'll rebuild it. "
+        "I saved that instruction for the topology stage."
+    )
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    guided = _guided(client, session_id)
+    (intent,) = guided.deferred_intents
+    assert intent.target_stage == "topology"
+    assert intent.message_content_hash == stable_hash(private_message)
+    assert private_message not in _text_outside_chat_history(body)
+
+
+def test_pair_with_rejected_transition_still_retains_and_says_so(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sink transition is rejected after retention; the message must say both."""
+    client = composer_test_client
+    session_id = _create_session(client)
+    TestStepChatCrossStep._seed_csv_blob(client, session_id)
+    TestStepChatCrossStep._configure_csv_source(client, session_id)
+    before = client.get(f"/api/sessions/{session_id}/guided").json()
+    assert before["guided_session"]["step"] == "step_2_sink"
+    private_message = "Save results as jsonl with the private pair-needle, and later add passthrough."
+    valid_sink = SinkResolved(
+        outputs=(
+            SinkOutputResolved(
+                name="main",
+                plugin="json",
+                options={
+                    "path": _outputs_path(client, "pair_transition.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                required_fields=(),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+        )
+    )
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _pair_sink_provider(valid_sink, _action()))
+
+    def _forced_rejection(*_args: object, **_kwargs: object) -> object:
+        raise InvariantError("forced pair transition failure")
+
+    monkeypatch.setattr(guided_route, "_schema8_answer_and_project_next", _forced_rejection)
+    response = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=before["next_turn"]["turn_token"],
+        message=private_message,
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["assistant_message"] == (
+        "I couldn't apply that configuration, so I didn't change your pipeline. "
+        "Review the wizard fields and try again, or keep going with the wizard controls. "
+        "I saved that instruction for the topology stage."
+    )
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    guided = _guided(client, session_id)
+    (intent,) = guided.deferred_intents
+    assert intent.target_stage == "topology"
+    assert private_message not in _text_outside_chat_history(body)
+
+
+def test_pair_with_storage_failed_inline_source_still_retains_and_says_so(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The inline source cannot be stored after retention; the message says both."""
+    client = composer_test_client
+    session_id = _create_session(client)
+    before = client.get(f"/api/sessions/{session_id}/guided").json()
+    assert before["guided_session"]["step"] == "step_1_source"
+    private_message = "Use these JSON rows with the private pair-needle, and later add passthrough."
+    monkeypatch.setattr(
+        guided_route,
+        "_run_guided_chat_provider_attempt",
+        _pair_source_provider(_inline_source_resolution(), _action()),
+    )
+
+    async def _quota_exhausted(**_kwargs: object) -> object:
+        raise BlobQuotaExceededError(session_id, current_bytes=1, limit_bytes=1)
+
+    monkeypatch.setattr(guided_chat_atomic, "_step_1_inline_source_inspection_facts", _quota_exhausted)
+    response = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=before["next_turn"]["turn_token"],
+        message=private_message,
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["assistant_message"] == (
+        "I could not store the generated source content because this "
+        "session's storage quota is full. Remove an uploaded file or "
+        "provide a smaller source, then try again. "
+        "I saved that instruction for the topology stage."
+    )
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    guided = _guided(client, session_id)
+    (intent,) = guided.deferred_intents
+    assert intent.target_stage == "topology"
+    assert private_message not in _text_outside_chat_history(body)
+
+
+def test_guarded_schema_form_pair_keeps_not_applied_signal_and_retains(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The advisory-only schema form withholds the pair's source half.
+
+    The composed turn must keep the guard's synthetic-failure status and
+    error_class (review finding 2) while the retain half still settles and
+    both facts stay visible in the message.
+    """
+    client = composer_test_client
+    session_id = _create_session(client)
+    TestStepChatCrossStep._seed_csv_blob(client, session_id)
+    selected = TestStepChatCrossStep._respond(client, session_id, chosen=["csv"])
+    assert selected["next_turn"]["type"] == "schema_form"
+    private_message = "Use this CSV with the private pair-needle, and later add passthrough."
+
+    async def pair_completion(**_kwargs: object) -> SimpleNamespace:
+        tool_calls = [
+            SimpleNamespace(
+                id="c_source",
+                function=SimpleNamespace(
+                    name="resolve_source",
+                    arguments=json.dumps(
+                        {
+                            "resolution": "source",
+                            "plugin": "csv",
+                            "filename": "rows.csv",
+                            "mime_type": "text/csv",
+                            "content": "text,note\nHello,world\n",
+                            "options": {"schema": {"mode": "observed", "guaranteed_fields": ["text", "note"]}},
+                            "observed_columns": ["text", "note"],
+                            "sample_rows": [{"text": "Hello", "note": "world"}],
+                            "assistant_message": "Created the CSV rows as the source.",
+                        }
+                    ),
+                ),
+            ),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(
+                    name="retain_deferred_intent",
+                    arguments=json.dumps(
+                        {
+                            "target_stage": "topology",
+                            "catalog_kind": "transform",
+                            "catalog_name": "passthrough",
+                            "redacted_summary": "Include the named transform during topology authoring.",
+                            "constraints": [
+                                {
+                                    "kind": "component_count",
+                                    "component_kind": "node",
+                                    "plugin_kind": "transform",
+                                    "plugin_name": "passthrough",
+                                    "operator": "at_least",
+                                    "count": 1,
+                                }
+                            ],
+                        }
+                    ),
+                ),
+            ),
+        ]
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_completion)
+    response = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=selected["next_turn"]["turn_token"],
+        message=private_message,
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert body["assistant_message"] == (
+        "I did not apply generated source content. Review the current source form and "
+        "submit it through the wizard controls. "
+        "I saved that instruction for the topology stage."
+    )
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    guided = _guided(client, session_id)
+    (intent,) = guided.deferred_intents
+    assert intent.receiving_stage == "source"
+    assert intent.target_stage == "topology"
+    assert intent.catalog_name == "passthrough"
+    assert intent.message_content_hash == stable_hash(private_message)
+    # The wizard is untouched: the source form is still the live turn.
+    assert body["next_turn"]["type"] == "schema_form"
+    assert private_message not in _text_outside_chat_history(body)
 
 
 @pytest.mark.parametrize(
@@ -1277,7 +1612,7 @@ def test_real_route_malformed_future_action_degrades_to_durable_clarification_re
     else:
         for field_name in ("sources", "nodes", "edges", "outputs"):
             assert response_json["composition_state"][field_name] == before["composition_state"][field_name]
-    assert private_message not in response_json["assistant_message"]
+    assert private_message not in _text_outside_chat_history(response_json)
     guided = _guided(client, session_id)
     (intent,) = guided.deferred_intents
     assert intent.receiving_stage == ("source" if stage == "source" else "output")
@@ -1369,7 +1704,7 @@ def test_real_route_rejects_free_form_option_literal_without_leaking_private_pro
     assert response_json["assistant_message"] == (
         "I couldn't safely retain that as a future-stage instruction. Please clarify the target stage and structural requirement."
     )
-    assert private_message not in response_json["assistant_message"]
+    assert private_message not in _text_outside_chat_history(response_json)
     guided = _guided(client, session_id)
     assert guided.deferred_intents == ()
     assert guided.chat_history[-2].content == private_message
@@ -1416,7 +1751,7 @@ def test_exact_policy_denial_wins_over_same_name_visible_in_another_kind_at_each
 
     assert response.status_code == 200, response.json()
     assert response.json()["assistant_message"] == "The transform plugin 'llm' is not enabled by the current policy."
-    assert private_message not in response.json()["assistant_message"]
+    assert private_message not in _text_outside_chat_history(response.json())
     guided = _guided(client, session_id)
     assert guided.deferred_intents == ()
     assert guided.chat_history[-2].content == private_message
@@ -1476,7 +1811,7 @@ def test_boolean_property_schema_is_repairable_and_does_not_write_a_deferred_int
     assert response.json()["assistant_message"] == (
         "I couldn't safely retain that as a future-stage instruction. Please clarify the target stage and structural requirement."
     )
-    assert private_message not in response.json()["assistant_message"]
+    assert private_message not in _text_outside_chat_history(response.json())
     guided = _guided(client, session_id)
     assert guided.deferred_intents == ()
     assert guided.chat_history[-2].content == private_message

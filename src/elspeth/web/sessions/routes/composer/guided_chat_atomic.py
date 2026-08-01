@@ -181,6 +181,21 @@ class _UploadedSourceBind:
     intermediate: tuple[_IntermediateOccurrence, ...]
 
 
+def _with_pair_disposition(chat: StepChatResult, disposition: str | None) -> StepChatResult:
+    """Append a pair's retain disposition to a resolution-half failure copy.
+
+    When a resolve+retain pair's RESOLUTION half fails after the intent was
+    applied (storage failure, prefill re-check, transition rejection), the
+    failure copy must not hide the durable retention — otherwise the turn
+    claims "I didn't change your pipeline" while the settlement appended an
+    intent, and a resending user piles up duplicates (R2-F15 review finding 1).
+    The failure status and error_class stay scoped to the resolution half.
+    """
+    if disposition is None:
+        return chat
+    return _replace(chat, assistant_message=f"{chat.assistant_message} {disposition}")
+
+
 def _unsupported_stage(step: GuidedStep) -> HTTPException:
     return HTTPException(
         status_code=409,
@@ -1094,7 +1109,7 @@ async def post_guided_chat_schema8(
                     # resolution half produced — both applications (or the
                     # guard's explanation for a withheld resolution, e.g. the
                     # advisory-only schema form) stay visible.
-                    paired_resolution_message = chat_result.assistant_message if deferred_paired_resolution else None
+                    paired_resolution_chat = chat_result if deferred_paired_resolution else None
                     deferred_authority = DeferredRequestAuthority(
                         guided=prospective,
                         catalog=catalog,
@@ -1121,11 +1136,24 @@ async def post_guided_chat_schema8(
                         )
                     prospective = deferred.guided
                     chat_result = deferred.chat
-                    if paired_resolution_message is not None:
-                        chat_result = _replace(
-                            chat_result,
-                            assistant_message=f"{paired_resolution_message} {chat_result.assistant_message}",
-                        )
+                    deferred_disposition_message: str | None = None
+                    if paired_resolution_chat is not None:
+                        deferred_disposition_message = deferred.chat.assistant_message
+                        composed_message = f"{paired_resolution_chat.assistant_message} {deferred.chat.assistant_message}"
+                        if paired_resolution_chat.status is ComposerChatTurnStatus.SUCCESS:
+                            chat_result = _replace(chat_result, assistant_message=composed_message)
+                        else:
+                            # A withheld resolution half (advisory-only schema
+                            # form) keeps its synthetic-failure status and
+                            # error_class so the transcript and audit retain
+                            # the not-applied signal; the retain disposition
+                            # stays visible in the message (review finding 2).
+                            chat_result = StepChatResult(
+                                assistant_message=composed_message,
+                                status=paired_resolution_chat.status,
+                                latency_ms=deferred.chat.latency_ms,
+                                error_class=paired_resolution_chat.error_class,
+                            )
                     retained_intent_id = deferred_request_retained_intent_id(deferred)
                     management = deferred_request_management(deferred)
                     settled_management_action = management.action if management is not None else None
@@ -1149,23 +1177,26 @@ async def post_guided_chat_schema8(
                             )
                         except (BlobQuotaExceededError, UnicodeEncodeError) as materialize_exc:
                             source_resolution = None
-                            chat_result = StepChatResult(
-                                assistant_message=(
-                                    (
-                                        "I could not store the generated source content because this "
-                                        "session's storage quota is full. Remove an uploaded file or "
-                                        "provide a smaller source, then try again."
-                                    )
-                                    if isinstance(materialize_exc, BlobQuotaExceededError)
-                                    else (
-                                        "I could not store the generated source content because it "
-                                        "contains characters that cannot be encoded. Describe the "
-                                        "source again or upload the file directly."
-                                    )
+                            chat_result = _with_pair_disposition(
+                                StepChatResult(
+                                    assistant_message=(
+                                        (
+                                            "I could not store the generated source content because this "
+                                            "session's storage quota is full. Remove an uploaded file or "
+                                            "provide a smaller source, then try again."
+                                        )
+                                        if isinstance(materialize_exc, BlobQuotaExceededError)
+                                        else (
+                                            "I could not store the generated source content because it "
+                                            "contains characters that cannot be encoded. Describe the "
+                                            "source again or upload the file directly."
+                                        )
+                                    ),
+                                    status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                                    latency_ms=chat_result.latency_ms,
+                                    error_class="InlineSourceNotApplied",
                                 ),
-                                status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
-                                latency_ms=chat_result.latency_ms,
-                                error_class="InlineSourceNotApplied",
+                                deferred_disposition_message,
                             )
                     source_reselection_facts: SourceInspectionFacts | None = None
                     if source_plugin_reselection is not None:
@@ -1198,15 +1229,18 @@ async def post_guided_chat_schema8(
                                 rejection_code=prefill_config_rejection.rejection_code,
                                 exc_class=prefill_config_rejection.exception_class,
                             )
-                            chat_result = StepChatResult(
-                                assistant_message=(
-                                    "I couldn't apply that output configuration because it fails the "
-                                    "selected plugin's validation, so I didn't change your pipeline. "
-                                    "Describe the output again and I'll rebuild it."
+                            chat_result = _with_pair_disposition(
+                                StepChatResult(
+                                    assistant_message=(
+                                        "I couldn't apply that output configuration because it fails the "
+                                        "selected plugin's validation, so I didn't change your pipeline. "
+                                        "Describe the output again and I'll rebuild it."
+                                    ),
+                                    status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                                    latency_ms=chat_result.latency_ms,
+                                    error_class="SinkPrefillConfigRejected",
                                 ),
-                                status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
-                                latency_ms=chat_result.latency_ms,
-                                error_class="SinkPrefillConfigRejected",
+                                deferred_disposition_message,
                             )
                             sink_resolution = None
                         else:
@@ -1311,14 +1345,17 @@ async def post_guided_chat_schema8(
                             )
                             transition_succeeded = True
                         except (PluginConfigError, InvariantError, TypeError, ValueError):
-                            chat_result = StepChatResult(
-                                assistant_message=(
-                                    "I couldn't apply that configuration, so I didn't change your pipeline. "
-                                    "Review the wizard fields and try again, or keep going with the wizard controls."
+                            chat_result = _with_pair_disposition(
+                                StepChatResult(
+                                    assistant_message=(
+                                        "I couldn't apply that configuration, so I didn't change your pipeline. "
+                                        "Review the wizard fields and try again, or keep going with the wizard controls."
+                                    ),
+                                    status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                                    latency_ms=chat_result.latency_ms,
+                                    error_class="StepTransitionRejected",
                                 ),
-                                status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
-                                latency_ms=chat_result.latency_ms,
-                                error_class="StepTransitionRejected",
+                                deferred_disposition_message,
                             )
                             next_turn = current_turn
                             prepared_next = planned_current

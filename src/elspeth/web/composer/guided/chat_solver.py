@@ -1768,10 +1768,23 @@ async def maybe_resolve_step_1_source_chat(
                     status = ComposerLLMCallStatus.SUCCESS
                     return reselection
                 if not isinstance(arguments, str):
+                    if is_retained_pair and deferred is not None:
+                        # The pair's retain half is valid; keep it rather than
+                        # discarding the instruction with the defective source
+                        # (R2-F15: never silently dropped).
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return GuidedChatDeferredIntentOutcome(action=deferred)
                     raise GuidedSolverResponseShapeError(
                         f"{function.name} function.arguments must be a JSON string; got {type(arguments).__name__}"
                     )
-                result = _parse_step_1_source_tool_arguments(arguments, plugin_hint=plugin_hint)
+                try:
+                    result = _parse_step_1_source_tool_arguments(arguments, plugin_hint=plugin_hint)
+                except GuidedToolArgumentShapeError:
+                    if is_retained_pair and deferred is not None:
+                        # Same retention rule for a shape-invalid source half.
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return GuidedChatDeferredIntentOutcome(action=deferred)
+                    raise
                 status = ComposerLLMCallStatus.SUCCESS
                 return Step1SourceResolvedOutcome(resolution=result, deferred_action=deferred)
             # No resolve_source call: the model judged the message doesn't carry
@@ -2255,6 +2268,12 @@ async def maybe_resolve_step_2_sink_chat(
     # tool result (consuming one loop iteration) instead of terminalizing the
     # whole Send.
     deferred_repair_used = False
+    # A pair's VALID parsed retain must survive its sink half never becoming
+    # acceptable: if the loop would otherwise end without a terminal outcome
+    # (config-invalid sink at the iteration cap, a prose decline, or a
+    # hallucinated-tool fallback after the pair round), the retain applies
+    # alone rather than being silently discarded (R2-F15 review finding 3).
+    pending_deferred: DeferredIntentAction | None = None
     iterations = max(1, iteration_cap)
     for _iteration in range(iterations):
         request_messages = list(messages)
@@ -2327,6 +2346,8 @@ async def maybe_resolve_step_2_sink_chat(
                 if deferred is not None and not is_retained_pair:
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredIntentOutcome(action=deferred)
+                if is_retained_pair and deferred is not None:
+                    pending_deferred = deferred
                 function = sink_calls[0].function if is_retained_pair else terminal_calls[0].function
                 if function is None:  # pragma: no cover - filtered immediately above
                     raise GuidedSolverResponseShapeError("step-2 terminal action has no function")
@@ -2336,14 +2357,32 @@ async def maybe_resolve_step_2_sink_chat(
                     status = ComposerLLMCallStatus.SUCCESS
                     return GuidedChatDeferredManagementOutcome(action=management)
                 if not isinstance(arguments, str):
+                    if pending_deferred is not None:
+                        # The pair's retain half is valid; keep it rather than
+                        # discarding the instruction with the defective sink.
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return GuidedChatDeferredIntentOutcome(action=pending_deferred)
                     raise GuidedSolverResponseShapeError(
                         f"{function.name} function.arguments must be a JSON string; got {type(arguments).__name__}"
                     )
-                sink, assistant = _parse_step_2_sink_tool_arguments(arguments)
+                try:
+                    sink, assistant = _parse_step_2_sink_tool_arguments(arguments)
+                except GuidedToolArgumentShapeError:
+                    if pending_deferred is not None:
+                        # Same retention rule for a shape-invalid sink half.
+                        status = ComposerLLMCallStatus.SUCCESS
+                        return GuidedChatDeferredIntentOutcome(action=pending_deferred)
+                    raise
                 config_rejection = resolved_sink_config_error(sink)
                 if config_rejection is None:
                     status = ComposerLLMCallStatus.SUCCESS
-                    return Step2SinkResolvedOutcome(sink=sink, assistant_message=assistant, deferred_action=deferred)
+                    # A pending retain from an earlier pair round still applies
+                    # when the model resends only the corrected sink.
+                    return Step2SinkResolvedOutcome(
+                        sink=sink,
+                        assistant_message=assistant,
+                        deferred_action=deferred if deferred is not None else pending_deferred,
+                    )
                 # Config-invalid resolution: thread the rejection back as the
                 # tool result so the model can correct itself within the same
                 # Send (answering EVERY call id — a paired retain is told it was
@@ -2379,6 +2418,12 @@ async def maybe_resolve_step_2_sink_chat(
             # carries a hallucinated tool call is a more suspicious shape and
             # must not have its prose trusted either (falls through instead).
             if not tool_calls:
+                if pending_deferred is not None:
+                    # The model declined to resend the pair after its sink half
+                    # was rejected; the valid retain still applies rather than
+                    # being silently discarded with the reply.
+                    status = ComposerLLMCallStatus.SUCCESS
+                    return GuidedChatDeferredIntentOutcome(action=pending_deferred)
                 content = message.content
                 if content is None or not str(content).strip():
                     status = ComposerLLMCallStatus.SUCCESS
@@ -2393,6 +2438,9 @@ async def maybe_resolve_step_2_sink_chat(
             # dispatching anything.
             discovery_calls = [tc for tc in tool_calls if tc.function is not None and tc.function.name in allowed_discovery]
             if not discovery_calls or len(discovery_calls) != len(tool_calls):
+                if pending_deferred is not None:
+                    status = ComposerLLMCallStatus.SUCCESS
+                    return GuidedChatDeferredIntentOutcome(action=pending_deferred)
                 status = ComposerLLMCallStatus.SUCCESS
                 return GuidedChatEmptyOutcome()
             if len(discovery_calls) > tool_call_cap:
@@ -2478,7 +2526,11 @@ async def maybe_resolve_step_2_sink_chat(
                 error_message=error_message,
             )
 
-    # Discovery iteration cap reached without a resolve_sink — advisory fallback.
+    # Discovery iteration cap reached without a resolve_sink. A pair's valid
+    # retain half still applies alone (R2-F15: the instruction is never
+    # silently discarded); otherwise degrade to the advisory fallback.
+    if pending_deferred is not None:
+        return GuidedChatDeferredIntentOutcome(action=pending_deferred)
     return GuidedChatEmptyOutcome()
 
 
