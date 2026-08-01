@@ -1043,7 +1043,6 @@ allowed_dict_patterns:
   - "src/elspeth/web/execution/preflight.py:audit_safe_resolved_config:return"
   - "src/elspeth/web/execution/preflight.py:restore_options:component"
   - "src/elspeth/web/execution/service.py:_trained_operator_catalog_and_snapshot:kwargs"
-  - "src/elspeth/web/execution/validation.py:_trained_operator_validation_context:kwargs"
   - "src/elspeth/web/composer/tools/transforms.py:_normalized_splice_node_projection:return"
   - "src/elspeth/web/composer/tools/transforms.py:_execute_splice_transform:args"
   - "src/elspeth/web/composer/tools/transforms.py:_handle_splice_transform:arguments"

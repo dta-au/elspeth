@@ -9,6 +9,7 @@ W18 fix: Only typed exceptions are caught — no bare except Exception.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,7 +27,6 @@ from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError, GraphValidationError, GraphValidationWarning
-from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
 from elspeth.web.composer.state import (
     CompositionState,
@@ -37,8 +37,9 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.execution import validation as validation_module
 from elspeth.web.execution.protocol import YamlGenerator
-from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE, ValidationCheck
+from elspeth.web.execution.schemas import CHECK_OUTCOME_SKIPPED_AFTER_FAILURE, ValidationCheck, ValidationResult
 from elspeth.web.execution.validation import (
     _ALL_CHECKS,
     _CHECK_SETTINGS,
@@ -46,7 +47,6 @@ from elspeth.web.execution.validation import (
     _build_edge_contract_suggestion,
     _collect_secret_refs,
     _format_edge_contract_failure,
-    _infer_component_type_from_plugin_error,
     _reframe_settings_missing_parts,
 )
 from elspeth.web.execution.validation import validate_pipeline as _validate_pipeline
@@ -201,6 +201,19 @@ def _make_settings(data_dir: str = "/tmp/test_data") -> WebSettings:
 def _check(result, name: str):
     """Look up a validation check by name, not position."""
     return next(c for c in result.checks if c.name == name)
+
+
+def _assert_complete_failure_ledger(result: Any, failed_name: str) -> None:
+    from elspeth.web.execution.schemas import VALIDATION_BLOCKING_CHECK_NAMES
+
+    assert [check.name for check in result.checks] == list(VALIDATION_BLOCKING_CHECK_NAMES)
+    failed_index = VALIDATION_BLOCKING_CHECK_NAMES.index(failed_name)
+    assert all(check.passed for check in result.checks[:failed_index])
+    assert result.checks[failed_index].passed is False
+    assert result.checks[failed_index].outcome_code is None
+    assert all(
+        check.passed is False and check.outcome_code == CHECK_OUTCOME_SKIPPED_AFTER_FAILURE for check in result.checks[failed_index + 1 :]
+    )
 
 
 def test_disabled_plugin_fails_before_constructor() -> None:
@@ -512,6 +525,190 @@ def _runtime_graph_mock(
     return cast(MagicMock, graph)
 
 
+def test_validate_pipeline_public_signature_is_stable_through_boundary_decorator() -> None:
+    expected = (
+        "(state: 'CompositionState', settings: 'ValidationSettings', yaml_generator: 'YamlGenerator', *, "
+        "plugin_snapshot: 'PluginAvailabilitySnapshot', profile_registry: 'OperatorProfileRegistry | None', "
+        "catalog: 'CatalogService', secret_service: 'WebSecretResolver | None' = None, user_id: 'str | None' = None, "
+        "blob_get_metadata: 'Callable[[UUID], BlobRecord | None] | None' = None, "
+        "allow_pending_interpretation_placeholders: 'bool' = False, session_id: 'str | None' = None) -> 'ValidationResult'"
+    )
+
+    assert str(inspect.signature(validation_module.validate_pipeline)) == expected
+    assert inspect.signature(validation_module.validate_pipeline) == inspect.signature(validation_module.validate_pipeline.__wrapped__)
+
+
+def test_trained_operator_wrapper_forwards_through_public_facade(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _make_state()
+    settings = _make_settings()
+    yaml_generator = _FakeYamlGenerator()
+    catalog = create_catalog_service()
+    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    profile_registry = MagicMock(spec=OperatorProfileRegistry)
+    secret_service = FakeSecretService(available_refs=set())
+
+    def blob_get_metadata(_blob_id: object) -> None:
+        return None
+
+    expected_result = create_autospec(ValidationResult, instance=True)
+    facade = create_autospec(validation_module.validate_pipeline, return_value=expected_result)
+    monkeypatch.setattr(validation_module, "validate_pipeline", facade)
+
+    result = validation_module.validate_pipeline_for_trained_operator(
+        state,
+        settings,
+        yaml_generator,
+        plugin_snapshot=plugin_snapshot,
+        profile_registry=profile_registry,
+        catalog=catalog,
+        secret_service=secret_service,
+        user_id="operator-1",
+        blob_get_metadata=blob_get_metadata,
+        allow_pending_interpretation_placeholders=True,
+        session_id="session-1",
+    )
+
+    assert result is expected_result
+    facade.assert_called_once_with(
+        state,
+        settings,
+        yaml_generator,
+        plugin_snapshot=plugin_snapshot,
+        profile_registry=profile_registry,
+        catalog=catalog,
+        secret_service=secret_service,
+        user_id="operator-1",
+        blob_get_metadata=blob_get_metadata,
+        allow_pending_interpretation_placeholders=True,
+        session_id="session-1",
+    )
+
+
+def test_public_facade_resolves_runtime_dependencies_at_call_time() -> None:
+    state = _make_state(outputs=(_make_output(),))
+    settings = _make_settings()
+    yaml_generator = _FakeYamlGenerator("sources: {}\nsinks: {}\n")
+    catalog = create_catalog_service()
+    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    graph = _runtime_graph_mock()
+
+    with (
+        patch("elspeth.web.execution.validation.load_settings_from_yaml_string", return_value=_fake_settings()) as load_settings,
+        patch(
+            "elspeth.web.execution.validation.instantiate_runtime_plugins",
+            return_value=_FakeRuntimeBundle(),
+        ) as instantiate_plugins,
+        patch("elspeth.web.execution.validation.build_runtime_graph", return_value=graph) as build_graph,
+        patch(
+            "elspeth.web.execution.validation.assemble_and_validate_pipeline_config",
+            return_value=_fake_pipeline_config(),
+        ) as validate_routes,
+    ):
+        result = validation_module.validate_pipeline(
+            state,
+            settings,
+            yaml_generator,
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=None,
+            catalog=catalog,
+            session_id="test-session",
+        )
+
+    assert result.is_valid is True
+    load_settings.assert_called_once()
+    instantiate_plugins.assert_called_once()
+    build_graph.assert_called_once()
+    validate_routes.assert_called_once()
+
+
+def test_public_facade_resolves_bounded_and_dict_loaders_at_call_time() -> None:
+    state = _make_state(outputs=(_make_output(),))
+    settings = _make_settings()
+    yaml_generator = _FakeYamlGenerator(
+        """sources:
+  primary:
+    plugin: csv
+    on_success: primary
+    options:
+      api_key:
+        secret_ref: MY_KEY
+sinks:
+  primary:
+    plugin: csv
+    options: {}
+"""
+    )
+    catalog = create_catalog_service()
+    plugin_snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    parsed_config = {
+        "sources": {
+            "primary": {
+                "plugin": "csv",
+                "on_success": "primary",
+                "options": {"api_key": {"secret_ref": "MY_KEY"}},
+            }
+        },
+        "sinks": {"primary": {"plugin": "csv", "options": {}}},
+    }
+
+    with (
+        patch("elspeth.web.execution.validation.load_bounded_pipeline_yaml", return_value=parsed_config) as load_yaml,
+        patch(
+            "elspeth.web.execution.validation.load_settings_from_config_dict",
+            side_effect=ValueError("stop after facade dependency capture"),
+        ) as load_settings,
+    ):
+        result = validation_module.validate_pipeline(
+            state,
+            settings,
+            yaml_generator,
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=None,
+            catalog=catalog,
+            session_id="test-session",
+        )
+
+    assert result.is_valid is False
+    load_yaml.assert_called_once()
+    load_settings.assert_called_once()
+
+
+def test_validation_pipeline_delegates_to_injected_impl_with_its_dependencies() -> None:
+    """The pipeline threads its captured dependencies into the injected impl
+    and converts a PhaseTermination escape into that termination's result —
+    the two behaviors ValidationPipeline actually owns."""
+    from elspeth.web.execution._validation_model import PhaseTermination
+    from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
+
+    dependencies = ValidationDependencies(
+        load_yaml=validation_module.load_bounded_pipeline_yaml,
+        load_settings_yaml=validation_module.load_settings_from_yaml_string,
+        load_settings_dict=validation_module.load_settings_from_config_dict,
+        instantiate_plugins=validation_module.instantiate_runtime_plugins,
+        build_graph=validation_module.build_runtime_graph,
+        validate_routes=validation_module.assemble_and_validate_pipeline_config,
+    )
+    sentinel_result = MagicMock(spec=ValidationResult)
+    seen: dict[str, Any] = {}
+
+    def run_impl(*args: Any, **kwargs: Any) -> Any:
+        seen["dependencies"] = kwargs["dependencies"]
+        raise PhaseTermination(sentinel_result)
+
+    catalog = create_catalog_service()
+    result = ValidationPipeline(dependencies, run_impl=run_impl).run(
+        _make_state(),
+        _make_settings(),
+        MagicMock(spec=YamlGenerator),
+        plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(catalog),
+        profile_registry=None,
+        catalog=catalog,
+    )
+
+    assert seen["dependencies"] is dependencies
+    assert result is sentinel_result
+
+
 @dataclass(frozen=True)
 class _FakeNodeInfo:
     config: dict[str, Any]
@@ -771,6 +968,35 @@ class TestValidatePipelineMissingPartReframe:
 
 class TestValidatePipelinePathAllowlist:
     """C3/S2: Source path allowlist check — defense-in-depth."""
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            _make_state(source_options={"path": "/outside/source.csv"}),
+            _make_state(
+                source_options={},
+                outputs=(_make_output(options={"path": "/outside/sink.csv"}),),
+            ),
+            _make_state(
+                source_options={},
+                nodes=(
+                    _make_node(
+                        plugin="rag_retrieval",
+                        options={
+                            "provider": "chroma",
+                            "provider_config": {"persist_directory": "/outside/chroma"},
+                        },
+                    ),
+                ),
+            ),
+        ],
+        ids=("source-path", "sink-path", "nested-transform-persist-directory"),
+    )
+    def test_path_failure_preserves_complete_ordered_ledger(self, state: CompositionState) -> None:
+        result = validate_pipeline_for_trained_operator(state, _make_settings(), _FakeYamlGenerator())
+
+        assert result.is_valid is False
+        _assert_complete_failure_ledger(result, "path_allowlist")
 
     def test_path_within_blobs_passes(self) -> None:
         state = _make_state(
@@ -1772,6 +1998,52 @@ class TestValidatePipelineBatchTransformOptions:
 
 class TestValidatePipelinePendingInterpretationPlaceholders:
     """Runtime preflight must distinguish composer authoring from execution."""
+
+    def test_materialized_yaml_and_authored_advisory_use_distinct_states(self) -> None:
+        state = _make_state(
+            nodes=(
+                _make_node(
+                    plugin="llm",
+                    options={"prompt_template": "Rate how {{ interpretation: cool }} this row is."},
+                ),
+            )
+        )
+        yaml_generator = _FakeYamlGenerator()
+        graph = _runtime_graph_mock()
+
+        with (
+            patch("elspeth.web.execution.validation.load_settings_from_yaml_string", return_value=_fake_settings()),
+            patch("elspeth.web.execution.validation.instantiate_runtime_plugins", return_value=_FakeRuntimeBundle()),
+            patch("elspeth.web.execution.validation.build_runtime_graph", return_value=graph),
+            patch(
+                "elspeth.web.execution.validation.assemble_and_validate_pipeline_config",
+                return_value=_fake_pipeline_config(),
+            ),
+            patch("elspeth.web.execution.validation._find_identity_node_advisories", return_value=[]) as identity_advisories,
+            patch("elspeth.web.execution.validation._find_static_llm_prompt_advisories", return_value=[]) as static_prompt_advisories,
+        ):
+            result = validate_pipeline_for_trained_operator(
+                state,
+                _make_settings(),
+                yaml_generator,
+                allow_pending_interpretation_placeholders=True,
+            )
+
+        assert result.is_valid is True
+        materialized_state = yaml_generator.rendered_states[0]
+        assert materialized_state.nodes[0].options["prompt_template"] == "Rate how pending interpretation this row is."
+        assert materialized_state != state
+
+        diagnostic_state = identity_advisories.call_args.args[0]
+        assert diagnostic_state == state
+        assert diagnostic_state.nodes[0].options["prompt_template"] == "Rate how {{ interpretation: cool }} this row is."
+
+        # The static-prompt advisory is the one finder whose subject
+        # (prompt_template) materialization rewrites, so pin its input too:
+        # it must read the authored state, never the masked/rendered one.
+        static_state = static_prompt_advisories.call_args.args[0]
+        assert static_state == state
+        assert static_state.nodes[0].options["prompt_template"] == "Rate how {{ interpretation: cool }} this row is."
 
     def test_pending_structured_interpretation_returns_typed_readiness(self) -> None:
         state = _make_state(
@@ -2805,6 +3077,19 @@ class TestValidatePipelineSuccess:
         assert result.is_valid is True
         assert len(result.checks) == 24
         assert all(c.passed for c in result.checks)
+        assert [check.name for check in result.checks[:11]] == [
+            "plugin_enablement",
+            "operator_profile_options",
+            "required_control_availability",
+            "required_control_coverage",
+            "path_allowlist",
+            "web_scrape_network_policy",
+            "web_fetch_resource_policy",
+            "secret_refs",
+            "semantic_contracts",
+            "batch_transform_options",
+            "interpretation_review",
+        ]
         # B11 fix: path_allowlist check is always recorded
         assert _check(result, "path_allowlist").passed is True
         assert _check(result, "web_scrape_network_policy").passed is True
@@ -4300,50 +4585,6 @@ class TestSecretRefResolutionBeforeSettingsLoad:
         assert _check(result, "settings_load").passed is True
 
 
-class TestInferComponentTypeFromPluginError:
-    """Tests for _infer_component_type_from_plugin_error dispatch."""
-
-    def test_plugin_config_error_with_source_type(self) -> None:
-        """PluginConfigError with component_type='source' returns 'source'."""
-        exc = PluginConfigError(
-            "Invalid CSV config",
-            cause="missing path",
-            plugin_class="CsvSourceConfig",
-            component_type="source",
-        )
-        assert _infer_component_type_from_plugin_error(exc) == "source"
-
-    def test_plugin_config_error_with_sink_type(self) -> None:
-        """PluginConfigError with component_type='sink' returns 'sink'."""
-        exc = PluginConfigError(
-            "Invalid JSON config",
-            cause="bad format",
-            plugin_class="JsonSinkConfig",
-            component_type="sink",
-        )
-        assert _infer_component_type_from_plugin_error(exc) == "sink"
-
-    def test_plugin_config_error_with_transform_type(self) -> None:
-        """PluginConfigError with component_type='transform' returns 'transform'."""
-        exc = PluginConfigError(
-            "Invalid field mapper config",
-            cause="missing mappings",
-            plugin_class="FieldMapperConfig",
-            component_type="transform",
-        )
-        assert _infer_component_type_from_plugin_error(exc) == "transform"
-
-    def test_plugin_config_error_without_component_type(self) -> None:
-        """PluginConfigError raised outside from_dict() has no component_type."""
-        exc = PluginConfigError("Generic config error")
-        assert _infer_component_type_from_plugin_error(exc) is None
-
-    def test_plugin_not_found_error_returns_none(self) -> None:
-        """PluginNotFoundError always returns None — no component_type attribute."""
-        exc = PluginNotFoundError("No plugin named 'foobar'")
-        assert _infer_component_type_from_plugin_error(exc) is None
-
-
 class TestValidatePipelineRuntimePathResolution:
     @staticmethod
     def _loaded_yaml_from_settings_loader(mock_load: MagicMock) -> str:
@@ -4631,6 +4872,12 @@ sinks:
         assert _check(result, "graph_structure").passed is True
         assert _check(result, "route_target_resolution").passed is True
         assert _check(result, "schema_compatibility").passed is False
+        _assert_complete_failure_ledger(result, "schema_compatibility")
+        assert [check.name for check in result.checks[-3:]] == [
+            "state_exists",
+            "advisor_signoff",
+            "proof_diagnostics",
+        ]
 
 
 class TestEdgeContractFailureFormatting:

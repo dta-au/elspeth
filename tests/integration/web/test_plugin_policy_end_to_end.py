@@ -946,7 +946,7 @@ def test_validate_pipeline_resolves_server_profile_before_plugin_construction(
     scoped_resolutions = []
     generic_resolution_names: list[str] = []
 
-    class _RecordingResolver:
+    class _RecordingResolver(ScopedSecretResolver):
         def list_refs(self, user_id: str):
             return delegate.list_refs(user_id)
 
@@ -1045,7 +1045,7 @@ def test_validate_pipeline_resolves_server_profile_before_plugin_construction(
         plugin_snapshot=snapshot,
         profile_registry=profiles,
         catalog=create_catalog_service(),
-        secret_service=_RecordingResolver(),
+        secret_service=_RecordingResolver(service, "local"),
         user_id="alice",
         session_id="session-profile-validation",
     )

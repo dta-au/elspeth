@@ -18,7 +18,7 @@ Spec: docs-archive/specs/2026-08-01-composer-completion-gate-persistence-design.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, TypedDict
 
@@ -27,6 +27,7 @@ from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import (
     ADVISOR_SIGNOFF_BLOCKED_CODE,
     CHECK_ADVISOR_SIGNOFF,
+    VALIDATION_CHECK_NAMES,
     ValidationCheck,
     ValidationReadiness,
     ValidationReadinessBlocker,
@@ -81,6 +82,51 @@ class CompletionGateFacts:
     """Parsed ``completion_gates`` envelope. ``None`` fields = gate not withheld."""
 
     advisor_signoff: AdvisorSignoffGateFact | None
+
+
+def _reconcile_advisor_check(checks: Sequence[ValidationCheck], *, detail: str) -> list[ValidationCheck]:
+    """Replace every prior advisor record with one canonically ordered failure."""
+    replacement = ValidationCheck(
+        name=CHECK_ADVISOR_SIGNOFF,
+        passed=False,
+        detail=detail,
+        affected_nodes=(),
+        outcome_code=None,
+    )
+    reconciled = [check for check in checks if check.name != CHECK_ADVISOR_SIGNOFF]
+    advisor_rank = VALIDATION_CHECK_NAMES.index(CHECK_ADVISOR_SIGNOFF)
+    for index, check in enumerate(reconciled):
+        if VALIDATION_CHECK_NAMES.index(check.name) > advisor_rank:
+            reconciled.insert(index, replacement)
+            break
+    else:
+        reconciled.append(replacement)
+    return reconciled
+
+
+def _reconcile_advisor_blocker(
+    blockers: Sequence[ValidationReadinessBlocker],
+    *,
+    detail: str,
+) -> list[ValidationReadinessBlocker]:
+    """Replace duplicate advisor blockers while retaining the first slot."""
+    replacement = ValidationReadinessBlocker(
+        code=ADVISOR_SIGNOFF_BLOCKED_CODE,
+        component_id="pipeline",
+        component_type="pipeline",
+        detail=detail,
+    )
+    reconciled: list[ValidationReadinessBlocker] = []
+    replaced = False
+    for blocker in blockers:
+        if blocker.code != ADVISOR_SIGNOFF_BLOCKED_CODE:
+            reconciled.append(blocker)
+        elif not replaced:
+            reconciled.append(replacement)
+            replaced = True
+    if not replaced:
+        reconciled.append(replacement)
+    return reconciled
 
 
 def completion_gate_fingerprint(state: CompositionState) -> str:
@@ -206,29 +252,12 @@ def merge_completion_gates(
     detail = fact.detail if current else ADVISOR_SIGNOFF_PENDING_DETAIL
     return result.model_copy(
         update={
-            "checks": [
-                *result.checks,
-                ValidationCheck(
-                    name=CHECK_ADVISOR_SIGNOFF,
-                    passed=False,
-                    detail=detail,
-                    affected_nodes=(),
-                    outcome_code=None,
-                ),
-            ],
+            "checks": _reconcile_advisor_check(result.checks, detail=detail),
             "readiness": ValidationReadiness(
                 authoring_valid=result.readiness.authoring_valid,
                 execution_ready=result.readiness.execution_ready,
                 completion_ready=False,
-                blockers=[
-                    *result.readiness.blockers,
-                    ValidationReadinessBlocker(
-                        code=ADVISOR_SIGNOFF_BLOCKED_CODE,
-                        component_id="pipeline",
-                        component_type="pipeline",
-                        detail=detail,
-                    ),
-                ],
+                blockers=_reconcile_advisor_blocker(result.readiness.blockers, detail=detail),
             ),
         }
     )

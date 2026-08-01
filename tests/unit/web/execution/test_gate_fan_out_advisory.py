@@ -16,10 +16,11 @@ names the duplication and both remedies, and it never blocks.
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any
-from unittest.mock import MagicMock, patch
+from typing import cast
+from unittest.mock import MagicMock, create_autospec, patch
 
+from elspeth.core.dag.graph import ExecutionGraph
+from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -247,25 +248,14 @@ class _YamlGeneratorDouble:
         return "source:\n  plugin: csv_source\n  options: {}"
 
 
-def _runtime_bundle_double() -> Any:
-    return SimpleNamespace(
-        source=object(),
-        sources={"source": object()},
-        source_settings=object(),
-        transforms=(),
-        sinks={"high_value": object(), "standard": object()},
-        aggregations={},
-    )
+def _runtime_bundle_double() -> PluginBundle:
+    return cast(PluginBundle, create_autospec(PluginBundle, instance=True))
 
 
-class _RuntimeGraphDouble:
-    validation_warnings: tuple[Any, ...] = ()
-
-    def validate(self) -> None:
-        pass
-
-    def validate_edge_compatibility(self) -> None:
-        pass
+def _runtime_graph_double() -> MagicMock:
+    graph = cast(MagicMock, create_autospec(ExecutionGraph, instance=True))
+    graph.validation_warnings = ()
+    return graph
 
 
 @patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config")
@@ -281,7 +271,7 @@ def test_advisory_is_emitted_without_blocking_the_run(
     """The whole point: the author is told, and the pipeline still runs."""
     mock_load.return_value = object()
     mock_instantiate.return_value = _runtime_bundle_double()
-    mock_build_graph.return_value = _RuntimeGraphDouble()
+    mock_build_graph.return_value = _runtime_graph_double()
     mock_assemble.return_value = object()
 
     state = _state(
