@@ -2358,7 +2358,12 @@ async def post_guided_respond(
         resolve_guided_correction_target,
         verified_remaining_deferred_intents,
     )
-    from elspeth.web.composer.guided.protocol import PROPOSAL_RATIONALE_TEMPLATE, PROPOSAL_SUMMARY_TEMPLATE
+    from elspeth.web.composer.guided.protocol import (
+        GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT,
+        GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT,
+        PROPOSAL_RATIONALE_TEMPLATE,
+        PROPOSAL_SUMMARY_TEMPLATE,
+    )
     from elspeth.web.composer.guided.state_machine import GuidedProposalRef
     from elspeth.web.composer.pipeline_commit import (
         PipelineCommitConfig,
@@ -2895,6 +2900,7 @@ async def post_guided_respond(
                         prepared_current: PreparedGuidedJsonPayload,
                         pending_payloads: tuple[PreparedGuidedJsonPayload, ...],
                         tool_invocation_count: int | None = None,
+                        user_instruction: str | None = None,
                     ) -> GuidedRespondResponse:
                         """Persist an escape-hatch decline as an ordinary chat turn.
 
@@ -2918,22 +2924,45 @@ async def post_guided_respond(
                         over from the enclosing retry loop (B023: a closure
                         binds the loop variable, not its per-iteration value)
                         are threaded through as explicit parameters instead.
+
+                        ``user_instruction`` is the author's verbatim prose when
+                        this attempt was driven by one (the step-3 revision
+                        instruction, the step-4 wiring correction). It is
+                        recorded ahead of the decline so the transcript reads as
+                        a request and its refusal (R2-F6); without it the
+                        decline renders as a reply to nothing. The auto-plan
+                        caller has no author prose and passes nothing.
                         """
 
+                        decline_ts_iso = datetime.now(UTC).isoformat()
+                        instruction_turns = (
+                            ()
+                            if user_instruction is None
+                            else (
+                                ChatTurn(
+                                    role=ChatRole.USER,
+                                    content=user_instruction,
+                                    seq=base_guided.chat_turn_seq,
+                                    step=base_guided.step,
+                                    ts_iso=decline_ts_iso,
+                                ),
+                            )
+                        )
                         declined_guided = _replace(
                             base_guided,
                             chat_history=(
                                 *base_guided.chat_history,
+                                *instruction_turns,
                                 ChatTurn(
                                     role=ChatRole.ASSISTANT,
                                     content=decline_text,
-                                    seq=base_guided.chat_turn_seq,
+                                    seq=base_guided.chat_turn_seq + len(instruction_turns),
                                     step=base_guided.step,
-                                    ts_iso=datetime.now(UTC).isoformat(),
+                                    ts_iso=decline_ts_iso,
                                     assistant_message_kind="assistant",
                                 ),
                             ),
-                            chat_turn_seq=base_guided.chat_turn_seq + 1,
+                            chat_turn_seq=base_guided.chat_turn_seq + len(instruction_turns) + 1,
                         )
                         declined_state = _replace(current_state, guided_session=declined_guided)
                         declined_state_dict = declined_state.to_dict()
@@ -3319,6 +3348,7 @@ async def post_guided_respond(
                                     current_turn=current_turn,
                                     prepared_current=_planned_current,
                                     pending_payloads=tuple(prepared_payloads),
+                                    user_instruction=revision_instruction,
                                 )
                             plan, catalog_ids = outcome
                             projection = build_guided_proposal_projection(
@@ -3351,6 +3381,46 @@ async def post_guided_respond(
                                     supersedes_draft_hash=authority.proposal.draft_hash,
                                 ),
                             )
+                            if revision_instruction is not None:
+                                # Transcript custody (R2-F6): a prose revision is
+                                # the author's own words driving a full re-plan.
+                                # It was durable only inside the turn_response
+                                # payload and a canned TurnRecord summary, so the
+                                # rendered transcript showed a new proposal with
+                                # no trace of the request. Record the verbatim
+                                # instruction plus one server-authored outcome
+                                # line on the same channel /guided/chat writes, at
+                                # the step the author was on (``guided.step``, the
+                                # pre-mutation session). No settlement mirror is
+                                # needed: stage_guided_pipeline_proposal verifies
+                                # the checkpoint field by field (reviewed facts,
+                                # deferred intents, correction custody, active
+                                # proposal, history head) and never
+                                # whole-object-compares the guided session, unlike
+                                # the component back-edit rewind.
+                                revision_ts_iso = datetime.now(UTC).isoformat()
+                                successor_guided = _replace(
+                                    successor_guided,
+                                    chat_history=(
+                                        *successor_guided.chat_history,
+                                        ChatTurn(
+                                            role=ChatRole.USER,
+                                            content=revision_instruction,
+                                            seq=successor_guided.chat_turn_seq,
+                                            step=guided.step,
+                                            ts_iso=revision_ts_iso,
+                                        ),
+                                        ChatTurn(
+                                            role=ChatRole.ASSISTANT,
+                                            content=GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT,
+                                            seq=successor_guided.chat_turn_seq + 1,
+                                            step=guided.step,
+                                            ts_iso=revision_ts_iso,
+                                            assistant_message_kind="assistant",
+                                        ),
+                                    ),
+                                    chat_turn_seq=successor_guided.chat_turn_seq + 2,
+                                )
                             successor_state = _replace(state, guided_session=successor_guided)
                             state_dict = successor_state.to_dict()
                             is_valid, validation_errors = _guided_persisted_validity(successor_state, catalog=catalog)
@@ -3696,6 +3766,7 @@ async def post_guided_respond(
                                     current_turn=current_turn,
                                     prepared_current=_planned_current,
                                     pending_payloads=tuple(prepared_payloads),
+                                    user_instruction=correction_message.content,
                                 )
                             plan, catalog_ids = outcome
                             projection = build_guided_proposal_projection(
@@ -3743,6 +3814,36 @@ async def post_guided_respond(
                                     supersedes_proposal_id=authority.row.id,
                                     supersedes_draft_hash=authority.proposal.draft_hash,
                                 ),
+                            )
+                            # Transcript custody (R2-F6), same posture as the
+                            # step-3 prose revision above: correction_feedback is
+                            # the author's verbatim prose driving a full re-plan.
+                            # It was already durable as a chat_messages row and a
+                            # correction_messages custody reference, but neither
+                            # is the rendered transcript, so the wiring simply
+                            # changed with no record of who asked for what.
+                            correction_ts_iso = datetime.now(UTC).isoformat()
+                            successor_guided = _replace(
+                                successor_guided,
+                                chat_history=(
+                                    *successor_guided.chat_history,
+                                    ChatTurn(
+                                        role=ChatRole.USER,
+                                        content=correction_message.content,
+                                        seq=successor_guided.chat_turn_seq,
+                                        step=guided.step,
+                                        ts_iso=correction_ts_iso,
+                                    ),
+                                    ChatTurn(
+                                        role=ChatRole.ASSISTANT,
+                                        content=GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT,
+                                        seq=successor_guided.chat_turn_seq + 1,
+                                        step=guided.step,
+                                        ts_iso=correction_ts_iso,
+                                        assistant_message_kind="assistant",
+                                    ),
+                                ),
+                                chat_turn_seq=successor_guided.chat_turn_seq + 2,
                             )
                             successor_state = _replace(state, guided_session=successor_guided)
                             state_dict = successor_state.to_dict()
@@ -4561,7 +4662,16 @@ async def post_guided_respond(
                         )
                     raise AuditIntegrityError("Guided RESPOND could not record its terminal failure") from None
                 else:
-                    raise_guided_operation_failure(failed)
+                    # R2-F4: when the planner exhausted its budget on a request
+                    # that carried a known unproducible-output-field gap, name
+                    # the gap instead of handing back a bare retry instruction.
+                    # Read off the escaping planner error rather than
+                    # recomputed from the guided session, which may not be
+                    # bound yet at this generic handler.
+                    raise_guided_operation_failure(
+                        failed,
+                        unproducible_output_fields=(exc.unproducible_output_fields if isinstance(exc, _PlannerFailureExc) else ()),
+                    )
 
         if rejoin_after_lock:
             joined = await reserve_or_replay_guided_operation(

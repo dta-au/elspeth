@@ -1266,6 +1266,7 @@ class ComposerService(Protocol):
         session_id: str | None,
         recorder: BufferingRecorder | None,
         progress: ComposerProgressSink | None = None,
+        user_message: str | None = None,
     ) -> AdvisorCheckpointVerdict:
         """Run the deterministic END advisor sign-off checkpoint (phase='end').
 
@@ -1279,6 +1280,11 @@ class ComposerService(Protocol):
 
         ``recorder`` threads the advisor call's audit sidecar; ``progress``
         (when set) receives a ``calling_model`` event before the call.
+        ``user_message`` (R2-F8a, elspeth-583c2a0792) is the originating user
+        chat turn, forwarded so the advisor can verify the pipeline against
+        the user's own explicit constraints (schema mode, field names/types,
+        named plugins/values); optional, bounded, and rendered inside the
+        existing untrusted fence.
         """
         ...
 

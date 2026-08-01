@@ -34,6 +34,10 @@ from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.capability_skill import PlannerCapabilityManifest
+from elspeth.web.composer.guided.protocol import (
+    GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT,
+    GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT,
+)
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
@@ -716,6 +720,221 @@ class TestStep2IntraStep:
             envelope for message in audit_messages for envelope in (message.tool_calls or ()) if envelope.get("_kind") == "llm_call_audit"
         ]
         assert llm_audits == []
+
+    @pytest.mark.parametrize("provider_heeds_gap", (True, False))
+    def test_rootless_step_3_entry_with_unproducible_output_fields_never_seals_the_sketch(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        provider_heeds_gap: bool,
+    ) -> None:
+        """R2-F4: an unsatisfiable zero-transform sketch is never a complete answer.
+
+        The reviewed source observes ``order_id, region``; step-2 field review
+        declares ``client`` and ``amount_aud`` on top of them. The
+        server-synthesized pass-through has zero transforms, so nothing in it
+        can ever produce those two fields, yet the sketch was sealed as a green
+        "Starting sketch" — an unbuildable pipeline presented as complete,
+        because the sketch never merged the declared fields into the sink's
+        ``schema.required_fields`` and the sink-contract check therefore
+        skipped. The guided seam holds both facts (source observed/declared
+        fields, output required fields), so it must skip the sketch and route
+        to the provider planner with the gap named in the reviewed planner
+        context.
+
+        Both parameters assert the same two invariants — no server-synthesized
+        pass-through proposal is sealed, and the gap reaches the planner. They
+        differ in what the provider does with the named gap:
+
+        - ``True``: the planner adds a transform, and an ordinary provider
+          proposal is sealed.
+        - ``False``: the planner ignores the gap and re-proposes the same bare
+          zero-transform pass-through. The diversion alone would not save this
+          — the candidate is provider-authored, so it would seal as a COMPLETE
+          normal proposal and re-open R2-F4 one layer down. The planner loop
+          must therefore refuse every zero-transform candidate while the gap
+          stands (``passthrough_cannot_produce_declared_fields``), and the
+          resulting exhaustion must hand the operator the missing field names
+          rather than a bare "retry the request".
+        """
+        import elspeth.web.composer.service as service_module
+
+        app = composer_test_client.app
+        session_id = _create_session(composer_test_client)
+        _seed_blob(composer_test_client, session_id, content="order_id,region\n1,north\n2,south\n")
+        _get_guided(composer_test_client, session_id)
+        selected = _respond(composer_test_client, session_id, chosen=["csv"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={"plugin": "csv", "options": selected["next_turn"]["payload"]["prefilled"]},
+        )
+        _respond(composer_test_client, session_id, edited_values={"columns": ["order_id", "region"]})
+        _finish_review(composer_test_client, session_id, "source")
+        _respond(composer_test_client, session_id, chosen=["json"])
+        _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "json",
+                "options": {
+                    "path": _outputs_path(composer_test_client, session_id, "unproducible.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+            },
+        )
+        reviewed = _respond(
+            composer_test_client,
+            session_id,
+            chosen=["order_id", "region"],
+            custom_inputs=["client", "amount_aud"],
+        )
+        guided_facts = _full_guided_session(reviewed)
+        source_name = next(iter(guided_facts["reviewed_sources"].values()))["name"]
+        assert next(iter(guided_facts["reviewed_outputs"].values()))["required_fields"] == [
+            "order_id",
+            "region",
+            "client",
+            "amount_aud",
+        ]
+
+        monkeypatch.setattr(
+            ComposerServiceImpl,
+            "_compute_availability",
+            lambda _self: ComposerAvailability(
+                available=True,
+                provider="test",
+                model="test/guided-planner",
+                reason=None,
+            ),
+        )
+        app.state.composer_service = ComposerServiceImpl(
+            app.state.catalog_service,
+            app.state.settings.model_copy(update={"composer_model": "test/guided-planner"}),
+            sessions_service=app.state.session_service,
+            session_engine=app.state.session_engine,
+            secret_service=app.state.scoped_secret_resolver,
+            plugin_snapshot_factory=lambda user_id: app.state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id)),
+            operator_profile_registry=app.state.operator_profile_registry,
+        )
+
+        planner_contexts: list[Mapping[str, Any]] = []
+        real_plan_pipeline = service_module.plan_pipeline
+
+        def recording_plan_pipeline(**kwargs: Any):
+            planner_contexts.append(kwargs["reviewed_planner_context"])
+            return real_plan_pipeline(**kwargs)
+
+        monkeypatch.setattr(service_module, "plan_pipeline", recording_plan_pipeline)
+
+        gap_closing_nodes = [
+            {
+                "id": "derive_missing_fields",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "planner_rows",
+                "on_success": "planned_sink",
+                "on_error": "discard",
+                "options": {
+                    "schema": {"mode": "observed"},
+                    "mapping": {"order_id": "client", "region": "amount_aud"},
+                },
+            }
+        ]
+        planner_pipeline = {
+            "sources": {
+                source_name: {
+                    "plugin": "csv",
+                    "options": {},
+                    "on_success": "planner_rows" if provider_heeds_gap else "planned_sink",
+                    "on_validation_failure": "discard",
+                }
+            },
+            "nodes": gap_closing_nodes if provider_heeds_gap else [],
+            "edges": [],
+            "outputs": [
+                {
+                    "sink_name": "planned_sink",
+                    "plugin": "json",
+                    "options": {},
+                    "on_write_failure": "abort",
+                }
+            ],
+        }
+
+        async def terminal_completion(**_kwargs: Any) -> _PlannerResponse:
+            return _PlannerResponse(
+                choices=[
+                    _PlannerChoice(
+                        message=_PlannerMessage(
+                            content=None,
+                            tool_calls=[
+                                _PlannerToolCall(
+                                    id="guided-terminal",
+                                    function=_PlannerFunction(
+                                        name="emit_pipeline_proposal",
+                                        arguments=json.dumps({"pipeline": planner_pipeline}),
+                                    ),
+                                )
+                            ],
+                        )
+                    )
+                ],
+                usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+            )
+
+        monkeypatch.setattr(service_module, "_litellm_acompletion", terminal_completion)
+
+        from structlog.testing import capture_logs
+
+        with capture_logs() as planner_logs:
+            settled = _post_current_response(
+                composer_test_client,
+                session_id,
+                component_action={"action": "finish", "component_kind": "output"},
+            )
+
+        if provider_heeds_gap:
+            assert settled.status_code == 200, settled.json()
+            assert settled.json()["next_turn"]["type"] == "propose_pipeline"
+        else:
+            # Every zero-transform candidate is refused while the gap stands,
+            # so the planner burns its budget and the request terminates. The
+            # 502 is the planner loop's exhaustion SURFACE, not the contract
+            # under test; what is pinned is that the operator is handed the
+            # missing field names instead of a bare retry instruction.
+            assert settled.status_code == 502, settled.json()
+            failure_detail = settled.json()["detail"]
+            assert failure_detail["failure_code"] == "invalid_provider_response"
+            assert failure_detail["unproducible_output_fields"] == ["amount_aud", "client"]
+            assert "amount_aud" in failure_detail["detail"] and "client" in failure_detail["detail"]
+            # The guided surface records its planner disposition as a
+            # structured log rather than a durable audit row
+            # (``_log_guided_planner_failure``), so that is where the closed
+            # rejection code the loop actually hit is observable.
+            rejection_codes = {
+                code
+                for entry in planner_logs
+                if entry.get("event") == "composer.guided_planner_failure"
+                for code in entry.get("rejection_codes", ())
+            }
+            assert "passthrough_cannot_produce_declared_fields" in rejection_codes, planner_logs
+        with app.state.session_engine.connect() as conn:
+            proposals = conn.execute(
+                select(
+                    composition_proposals_table.c.composer_model_identifier,
+                    composition_proposals_table.c.composer_provider,
+                ).where(composition_proposals_table.c.session_id == session_id)
+            ).all()
+        assert all(row.composer_model_identifier != "composer-guided-passthrough-synthesis" for row in proposals), (
+            "an unsatisfiable pass-through sketch must never be sealed as the answer"
+        )
+        assert all(row.composer_provider != "server" for row in proposals)
+        assert len(planner_contexts) == 1, "the unsatisfiable sketch must route to the provider planner"
+        gap = planner_contexts[0]["unproducible_output_fields"]
+        assert [entry["fields"] for entry in gap] == [["amount_aud", "client"]]
 
     @pytest.mark.parametrize(
         ("profile", "expected_surface"),
@@ -1593,6 +1812,240 @@ class TestStep2IntraStep:
         assert replay.status_code == 200, replay.json()
         assert replay.json() == body
         assert captured == {}
+
+    def test_prose_revision_records_the_instruction_in_the_transcript(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """R2-F6: a transform-stage instruction is transcript evidence.
+
+        The docked-composer instruction drove a full re-plan but was recorded
+        only as a ``TurnRecord`` summary, so reloading the session showed a new
+        proposal with no trace of what the author asked for. The settlement now
+        appends the author's verbatim words plus one server-authored outcome
+        line to ``chat_history`` — the same channel ``/guided/chat`` writes and
+        the frontend renders — and the operation still replays byte-identically.
+        """
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="prose-transcript.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        before = _full_guided_session(staged)
+        instruction = "Add a deduplication transform before the output."
+        request_payload = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": payload["proposal_id"],
+            "draft_hash": payload["draft_hash"],
+            "edited_values": {"revision_instruction": instruction},
+        }
+
+        revised = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+
+        assert revised.status_code == 200, revised.json()
+        body = revised.json()
+        guided = _full_guided_session(body)
+        history = guided["chat_history"]
+        assert len(history) == len(before["chat_history"]) + 2
+        user_turn, assistant_turn = history[-2], history[-1]
+        assert user_turn["role"] == "user"
+        assert user_turn["content"] == instruction
+        assert user_turn["step"] == "step_3_transforms"
+        assert user_turn["assistant_message_kind"] is None
+        assert user_turn["synthetic_failure_reason"] is None
+        assert assistant_turn["role"] == "assistant"
+        assert assistant_turn["content"] == GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT
+        assert assistant_turn["step"] == "step_3_transforms"
+        assert assistant_turn["assistant_message_kind"] == "assistant"
+        assert assistant_turn["synthetic_failure_reason"] is None
+        assert user_turn["seq"] == before["chat_turn_seq"]
+        assert assistant_turn["seq"] == before["chat_turn_seq"] + 1
+        assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
+        # The narrow wire projection the frontend renders carries the same pair.
+        assert body["guided_session"]["chat_history"][-2:] == [user_turn, assistant_turn]
+
+        # Settlement/replay verification still holds: the same request replays
+        # the identical settled body, and a reload projects the same transcript.
+        replay = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+        assert replay.status_code == 200, replay.json()
+        assert replay.json() == body
+        assert _get_guided(composer_test_client, session_id)["guided_session"]["chat_history"][-2:] == [user_turn, assistant_turn]
+
+    def test_declined_prose_revision_records_the_instruction_before_the_decline(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R2-F6: a declined instruction is still transcript evidence.
+
+        The decline path already appends the advisor's words. Without the
+        instruction ahead of them the transcript reads as a refusal of nothing,
+        and the author's request is lost entirely because a decline stages no
+        proposal and persists no correction message.
+        """
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+        decline_text = "I could not fit that instruction to the reviewed components."
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="declined-prose.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        before = _full_guided_session(staged)
+
+        async def decline_planner(**_kwargs: object) -> object:
+            return GuidedPlannerDecline(decline_text=decline_text)
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            decline_planner,
+        )
+        instruction = "Add a transform that cannot exist."
+        declined = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {"revision_instruction": instruction},
+            },
+        )
+
+        assert declined.status_code == 200, declined.json()
+        guided = _full_guided_session(declined.json())
+        history = guided["chat_history"]
+        assert len(history) == len(before["chat_history"]) + 2
+        assert [(entry["role"], entry["content"], entry["step"]) for entry in history[-2:]] == [
+            ("user", instruction, "step_3_transforms"),
+            ("assistant", decline_text, "step_3_transforms"),
+        ]
+        assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
+        # The decline stages nothing: the pending proposal survives untouched.
+        assert guided["active_proposal"]["proposal_id"] == payload["proposal_id"]
+
+    def test_wire_correction_records_the_feedback_in_the_transcript(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """R2-F6: the wire-stage correction is the same transcript evidence.
+
+        ``correction_feedback`` is persisted as a chat_messages row and bound
+        into ``correction_messages`` custody, but never reached the rendered
+        transcript. It is the author's verbatim prose driving a full re-plan,
+        exactly like the transform-stage instruction, so it is recorded the
+        same way — at ``step_4_wire``.
+        """
+        session_id = _create_session(composer_test_client)
+        self._stage_proposal(composer_test_client, session_id, filename="wire-transcript.jsonl")
+        reviewed = _review_wiring(composer_test_client, session_id)
+        wire_turn = reviewed["next_turn"]
+        wire_payload = wire_turn["payload"]
+        before = _full_guided_session(reviewed)
+        feedback = "Route the reviewed source through the requested processing before the output."
+        request_payload = {
+            "operation_id": str(uuid4()),
+            "turn_token": wire_turn["turn_token"],
+            "proposal_id": wire_payload["proposal_id"],
+            "draft_hash": wire_payload["draft_hash"],
+            "edit_target": wire_payload["connections"][0]["from_endpoint"],
+            "correction_feedback": feedback,
+        }
+
+        corrected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+
+        assert corrected.status_code == 200, corrected.json()
+        body = corrected.json()
+        guided = _full_guided_session(body)
+        history = guided["chat_history"]
+        assert len(history) == len(before["chat_history"]) + 2
+        user_turn, assistant_turn = history[-2], history[-1]
+        assert user_turn["role"] == "user"
+        assert user_turn["content"] == feedback
+        assert user_turn["step"] == "step_4_wire"
+        assert assistant_turn["role"] == "assistant"
+        assert assistant_turn["content"] == GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT
+        assert assistant_turn["step"] == "step_4_wire"
+        assert assistant_turn["assistant_message_kind"] == "assistant"
+        assert assistant_turn["synthetic_failure_reason"] is None
+        assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
+
+        replay = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+        assert replay.status_code == 200, replay.json()
+        assert replay.json() == body
+
+    def test_declined_wire_correction_records_the_feedback_before_the_decline(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R2-F6: the step-4 decline composes with the wire turn too.
+
+        The decline settles ``base_guided`` unmutated, so at step 4 the appended
+        pair lands on a session that still holds a live active proposal and an
+        unanswered confirm_wiring turn — a different shape from the step-3
+        decline. A declined correction persists no chat_messages row either, so
+        without this the feedback is lost outright.
+        """
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+        decline_text = "I could not rewire the graph the way you asked."
+        session_id = _create_session(composer_test_client)
+        self._stage_proposal(composer_test_client, session_id, filename="declined-wire.jsonl")
+        reviewed = _review_wiring(composer_test_client, session_id)
+        wire_turn = reviewed["next_turn"]
+        wire_payload = wire_turn["payload"]
+        before = _full_guided_session(reviewed)
+
+        async def decline_planner(**_kwargs: object) -> object:
+            return GuidedPlannerDecline(decline_text=decline_text)
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            decline_planner,
+        )
+        feedback = "Rewire this through a component that does not exist."
+        declined = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": wire_turn["turn_token"],
+                "proposal_id": wire_payload["proposal_id"],
+                "draft_hash": wire_payload["draft_hash"],
+                "edit_target": wire_payload["connections"][0]["from_endpoint"],
+                "correction_feedback": feedback,
+            },
+        )
+
+        assert declined.status_code == 200, declined.json()
+        body = declined.json()
+        guided = _full_guided_session(body)
+        history = guided["chat_history"]
+        assert len(history) == len(before["chat_history"]) + 2
+        assert [(entry["role"], entry["content"], entry["step"]) for entry in history[-2:]] == [
+            ("user", feedback, "step_4_wire"),
+            ("assistant", decline_text, "step_4_wire"),
+        ]
+        assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
+        # The decline stages nothing: the reviewed proposal and its unanswered
+        # wire turn survive, so the operator retries with a fresh operation_id.
+        assert guided["step"] == "step_4_wire"
+        assert guided["active_proposal"]["proposal_id"] == wire_payload["proposal_id"]
+        assert body["next_turn"]["type"] == "confirm_wiring"
+        assert _get_guided(composer_test_client, session_id)["next_turn"]["turn_token"] == wire_turn["turn_token"]
 
     def test_competing_respond_answers_fast_coded_conflict_during_planner_settlement(
         self,

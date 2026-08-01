@@ -696,6 +696,17 @@ _PROPOSAL_BLOCKER_CATEGORY: Mapping[str, str] = {
 }
 PROPOSAL_SUMMARY_TEMPLATE = "guided.proposal.summary.full_graph.v1"
 PROPOSAL_RATIONALE_TEMPLATE = "guided.proposal.rationale.review_required.v1"
+# Transcript custody (R2-F6): the transform-stage prose revision and the
+# wire-stage correction are author-written instructions that drive a full
+# re-plan, but they arrived through ``/guided/respond`` and so never reached
+# ``GuidedSession.chat_history`` — the transcript the operator reads back.
+# The settlement branches append the author's verbatim instruction plus one
+# of these server-authored outcome lines, so the conversation reads as a
+# request and its answer rather than an unexplained new proposal. Named
+# constants (not inline literals) so the assertion in the integration tests
+# binds the exact rendered text.
+GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT = "I re-planned the whole pipeline with that instruction. Review the updated proposal below."
+GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT = "I re-planned the pipeline with that wiring correction. Review the updated wiring below."
 _PROPOSAL_BLOCKER_SUMMARY: Mapping[str, str] = {
     "pipeline_invalid": "guided.proposal.blocker.pipeline_invalid.v1",
     "policy_review_required": "guided.proposal.blocker.policy_review_required.v1",

@@ -649,8 +649,13 @@ that owns the request has already been reviewed, guided opens the stable
 back/edit flow for that stage instead. Early-stage work is stored as interaction
 facts rather than a frozen partial pipeline, so a later requirement triggers a
 typed rewind to the affected stage and a replan — never an "unsupported
-topology" dead-end. (An unavailable plugin, by contrast, remains a distinct
-catalog/availability error.)
+topology" dead-end. A message that mixes a current-stage answer with a
+future-stage instruction applies both: the current stage is configured and the
+instruction is saved in the same turn. If guided cannot immediately verify the
+structure of a future-stage instruction, it still keeps it — as a pending
+instruction awaiting clarification — and asks you for the missing detail
+rather than dropping the request. (An unavailable plugin, by contrast, remains
+a distinct catalog/availability error.)
 
 ### Validation, interpretation, and sign-off
 

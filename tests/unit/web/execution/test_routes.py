@@ -152,6 +152,7 @@ def _composition_state_record(
     session_id: UUID,
     state_id: UUID,
     version: int = 7,
+    composer_meta: dict | None = None,
 ) -> CompositionStateRecord:
     return CompositionStateRecord(
         id=state_id,
@@ -166,6 +167,7 @@ def _composition_state_record(
         created_at=datetime.now(UTC),
         derived_from_state_id=None,
         sources={},
+        composer_meta=composer_meta,
     )
 
 
@@ -382,6 +384,50 @@ class TestValidateEndpoint:
         svc.validate_state.assert_awaited_once()
         validated_state = svc.validate_state.await_args.args[0]
         assert validated_state.version == 7
+
+    @pytest.mark.asyncio
+    async def test_validate_state_id_passes_persisted_completion_gates(self) -> None:
+        """The state_id branch parses the record's completion-gate envelope."""
+        from elspeth.web.execution.completion_gates import AdvisorSignoffGateFact, CompletionGateFacts
+
+        session_id = uuid4()
+        state_id = uuid4()
+        svc = _execution_service()
+        svc.validate_state = AsyncMock(
+            spec=ExecutionService.validate_state,
+            return_value=ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness()),
+        )
+        app = _create_test_app(execution_service=svc)
+        app.state.session_service.get_state = AsyncMock(
+            spec=SessionServiceProtocol.get_state,
+            return_value=_composition_state_record(
+                session_id=session_id,
+                state_id=state_id,
+                composer_meta={
+                    "completion_gates": {
+                        "advisor_signoff": {
+                            "status": "blocked",
+                            "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                            "for_graph": "0" * 64,
+                        }
+                    }
+                },
+            ),
+        )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                f"/api/sessions/{session_id}/validate",
+                params={"state_id": str(state_id)},
+            )
+            assert resp.status_code == 200
+
+        svc.validate_state.assert_awaited_once()
+        assert svc.validate_state.await_args.kwargs["completion_gates"] == CompletionGateFacts(
+            advisor_signoff=AdvisorSignoffGateFact(
+                detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                for_graph="0" * 64,
+            )
+        )
 
     @pytest.mark.asyncio
     async def test_validate_state_id_hides_missing_state(self) -> None:

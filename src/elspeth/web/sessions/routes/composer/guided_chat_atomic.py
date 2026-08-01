@@ -39,7 +39,9 @@ from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspec
 from elspeth.web.sessions._guided_step_chat import (
     GuidedStepChatEmptyResult,
     GuidedStepChatOnlyResult,
+    GuidedStepDeferredClarificationResult,
     GuidedStepDeferredIntentResult,
+    GuidedStepDeferredIntentWithheldResolutionResult,
     GuidedStepDeferredManagementResult,
     Step1SourcePluginReselectedResult,
     Step1SourceResolvedResult,
@@ -113,9 +115,11 @@ from ..guided_operations import (
     reserve_or_replay_guided_operation,
 )
 from .guided_chat_intent_management import (
+    DeferredRequestApplication,
     DeferredRequestAuthority,
     DeferredRequestCancelled,
     ManagementRewindAuthority,
+    apply_deferred_clarification,
     apply_deferred_request,
     deferred_request_management,
     deferred_request_retained_intent_id,
@@ -125,6 +129,8 @@ from .guided_chat_intent_management import (
 type GuidedChatProviderOutcome = (
     GuidedStepChatOnlyResult
     | GuidedStepDeferredIntentResult
+    | GuidedStepDeferredIntentWithheldResolutionResult
+    | GuidedStepDeferredClarificationResult
     | GuidedStepDeferredManagementResult
     | Step1SourcePluginReselectedResult
     | Step1SourceResolvedResult
@@ -175,6 +181,21 @@ class _UploadedSourceBind:
     next_turn: Turn
     next_payload: PreparedGuidedJsonPayload
     intermediate: tuple[_IntermediateOccurrence, ...]
+
+
+def _with_pair_disposition(chat: StepChatResult, disposition: str | None) -> StepChatResult:
+    """Append a pair's retain disposition to a resolution-half failure copy.
+
+    When a resolve+retain pair's RESOLUTION half fails after the intent was
+    applied (storage failure, prefill re-check, transition rejection), the
+    failure copy must not hide the durable retention — otherwise the turn
+    claims "I didn't change your pipeline" while the settlement appended an
+    intent, and a resending user piles up duplicates (R2-F15 review finding 1).
+    The failure status and error_class stay scoped to the resolution half.
+    """
+    if disposition is None:
+        return chat
+    return _replace(chat, assistant_message=f"{chat.assistant_message} {disposition}")
 
 
 def _unsupported_stage(step: GuidedStep) -> HTTPException:
@@ -975,6 +996,8 @@ async def post_guided_chat_schema8(
                         sink_resolution = None
                         deferred_action = None
                         deferred_management_action = None
+                        deferred_clarification = False
+                        deferred_paired_resolution = False
                     elif uploaded_bind is not None:
                         # No provider work: the bind request names a file this
                         # session already holds, and its inspected facts are the
@@ -1000,6 +1023,8 @@ async def post_guided_chat_schema8(
                         sink_resolution = None
                         deferred_action = None
                         deferred_management_action = None
+                        deferred_clarification = False
+                        deferred_paired_resolution = False
                     else:
                         provider_outcome = await provider_runner(
                             session_id=session_id,
@@ -1021,10 +1046,32 @@ async def post_guided_chat_schema8(
                             provider_outcome.plugin if type(provider_outcome) is Step1SourcePluginReselectedResult else None
                         )
                         sink_resolution = provider_outcome.sink if type(provider_outcome) is Step2SinkResolvedResult else None
-                        deferred_action = provider_outcome.action if type(provider_outcome) is GuidedStepDeferredIntentResult else None
+                        if type(provider_outcome) is GuidedStepDeferredIntentResult:
+                            deferred_action = provider_outcome.action
+                        elif type(provider_outcome) is GuidedStepDeferredIntentWithheldResolutionResult:
+                            # Retain-alone: the pair's resolution half was
+                            # withheld; its chat carries the scoped not-applied
+                            # failure and composes with the disposition below,
+                            # exactly like the F1 contract.
+                            deferred_action = provider_outcome.action
+                        elif type(provider_outcome) is Step1SourceResolvedResult:
+                            # A resolve+retain PAIR: the resolution applies at
+                            # this stage AND the future-stage instruction is
+                            # retained in the same settlement (R2-F15).
+                            deferred_action = provider_outcome.deferred_action
+                        elif type(provider_outcome) is Step2SinkResolvedResult:
+                            deferred_action = provider_outcome.deferred_action
+                        else:
+                            deferred_action = None
+                        deferred_paired_resolution = deferred_action is not None and (
+                            type(provider_outcome) is Step1SourceResolvedResult
+                            or type(provider_outcome) is Step2SinkResolvedResult
+                            or type(provider_outcome) is GuidedStepDeferredIntentWithheldResolutionResult
+                        )
                         deferred_management_action = (
                             provider_outcome.action if type(provider_outcome) is GuidedStepDeferredManagementResult else None
                         )
+                        deferred_clarification = type(provider_outcome) is GuidedStepDeferredClarificationResult
                     if source_resolution is not None and TurnType(frozen.current_turn["type"]) is TurnType.SCHEMA_FORM:
                         source_resolution = None
                         chat_result = StepChatResult(
@@ -1067,19 +1114,56 @@ async def post_guided_chat_schema8(
                         raise AuditIntegrityError("Guided Chat turn custody changed after provider work")
 
                     occurrence_was_prospective = not (current_guided.history and current_guided.history[-1].response_hash is None)
-                    deferred = apply_deferred_request(
-                        deferred_action,
-                        deferred_management_action,
-                        authority=DeferredRequestAuthority(
-                            guided=prospective,
-                            catalog=catalog,
-                            originating_message=originating_message,
-                            new_intent_id=uuid4(),
-                        ),
-                        chat=chat_result,
+                    # On a resolve+retain pair, the disposition copy from
+                    # apply_deferred_request must not displace the message the
+                    # resolution half produced — both applications (or the
+                    # guard's explanation for a withheld resolution, e.g. the
+                    # advisory-only schema form) stay visible.
+                    paired_resolution_chat = chat_result if deferred_paired_resolution else None
+                    deferred_authority = DeferredRequestAuthority(
+                        guided=prospective,
+                        catalog=catalog,
+                        originating_message=originating_message,
+                        new_intent_id=uuid4(),
                     )
+                    deferred: DeferredRequestApplication
+                    if deferred_clarification:
+                        # Retain repair exhausted: keep the instruction as a
+                        # constraint-free clarification intent instead of
+                        # discarding it (R2-F15). The chat copy already says
+                        # the instruction was kept and asks for the missing
+                        # structural constraint.
+                        deferred = apply_deferred_clarification(
+                            authority=deferred_authority,
+                            chat=chat_result,
+                        )
+                    else:
+                        deferred = apply_deferred_request(
+                            deferred_action,
+                            deferred_management_action,
+                            authority=deferred_authority,
+                            chat=chat_result,
+                        )
                     prospective = deferred.guided
                     chat_result = deferred.chat
+                    deferred_disposition_message: str | None = None
+                    if paired_resolution_chat is not None:
+                        deferred_disposition_message = deferred.chat.assistant_message
+                        composed_message = f"{paired_resolution_chat.assistant_message} {deferred.chat.assistant_message}"
+                        if paired_resolution_chat.status is ComposerChatTurnStatus.SUCCESS:
+                            chat_result = _replace(chat_result, assistant_message=composed_message)
+                        else:
+                            # A withheld resolution half (advisory-only schema
+                            # form) keeps its synthetic-failure status and
+                            # error_class so the transcript and audit retain
+                            # the not-applied signal; the retain disposition
+                            # stays visible in the message (review finding 2).
+                            chat_result = StepChatResult(
+                                assistant_message=composed_message,
+                                status=paired_resolution_chat.status,
+                                latency_ms=deferred.chat.latency_ms,
+                                error_class=paired_resolution_chat.error_class,
+                            )
                     retained_intent_id = deferred_request_retained_intent_id(deferred)
                     management = deferred_request_management(deferred)
                     settled_management_action = management.action if management is not None else None
@@ -1103,23 +1187,26 @@ async def post_guided_chat_schema8(
                             )
                         except (BlobQuotaExceededError, UnicodeEncodeError) as materialize_exc:
                             source_resolution = None
-                            chat_result = StepChatResult(
-                                assistant_message=(
-                                    (
-                                        "I could not store the generated source content because this "
-                                        "session's storage quota is full. Remove an uploaded file or "
-                                        "provide a smaller source, then try again."
-                                    )
-                                    if isinstance(materialize_exc, BlobQuotaExceededError)
-                                    else (
-                                        "I could not store the generated source content because it "
-                                        "contains characters that cannot be encoded. Describe the "
-                                        "source again or upload the file directly."
-                                    )
+                            chat_result = _with_pair_disposition(
+                                StepChatResult(
+                                    assistant_message=(
+                                        (
+                                            "I could not store the generated source content because this "
+                                            "session's storage quota is full. Remove an uploaded file or "
+                                            "provide a smaller source, then try again."
+                                        )
+                                        if isinstance(materialize_exc, BlobQuotaExceededError)
+                                        else (
+                                            "I could not store the generated source content because it "
+                                            "contains characters that cannot be encoded. Describe the "
+                                            "source again or upload the file directly."
+                                        )
+                                    ),
+                                    status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                                    latency_ms=chat_result.latency_ms,
+                                    error_class="InlineSourceNotApplied",
                                 ),
-                                status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
-                                latency_ms=chat_result.latency_ms,
-                                error_class="InlineSourceNotApplied",
+                                deferred_disposition_message,
                             )
                     source_reselection_facts: SourceInspectionFacts | None = None
                     if source_plugin_reselection is not None:
@@ -1152,15 +1239,18 @@ async def post_guided_chat_schema8(
                                 rejection_code=prefill_config_rejection.rejection_code,
                                 exc_class=prefill_config_rejection.exception_class,
                             )
-                            chat_result = StepChatResult(
-                                assistant_message=(
-                                    "I couldn't apply that output configuration because it fails the "
-                                    "selected plugin's validation, so I didn't change your pipeline. "
-                                    "Describe the output again and I'll rebuild it."
+                            chat_result = _with_pair_disposition(
+                                StepChatResult(
+                                    assistant_message=(
+                                        "I couldn't apply that output configuration because it fails the "
+                                        "selected plugin's validation, so I didn't change your pipeline. "
+                                        "Describe the output again and I'll rebuild it."
+                                    ),
+                                    status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                                    latency_ms=chat_result.latency_ms,
+                                    error_class="SinkPrefillConfigRejected",
                                 ),
-                                status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
-                                latency_ms=chat_result.latency_ms,
-                                error_class="SinkPrefillConfigRejected",
+                                deferred_disposition_message,
                             )
                             sink_resolution = None
                         else:
@@ -1265,14 +1355,17 @@ async def post_guided_chat_schema8(
                             )
                             transition_succeeded = True
                         except (PluginConfigError, InvariantError, TypeError, ValueError):
-                            chat_result = StepChatResult(
-                                assistant_message=(
-                                    "I couldn't apply that configuration, so I didn't change your pipeline. "
-                                    "Review the wizard fields and try again, or keep going with the wizard controls."
+                            chat_result = _with_pair_disposition(
+                                StepChatResult(
+                                    assistant_message=(
+                                        "I couldn't apply that configuration, so I didn't change your pipeline. "
+                                        "Review the wizard fields and try again, or keep going with the wizard controls."
+                                    ),
+                                    status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                                    latency_ms=chat_result.latency_ms,
+                                    error_class="StepTransitionRejected",
                                 ),
-                                status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
-                                latency_ms=chat_result.latency_ms,
-                                error_class="StepTransitionRejected",
+                                deferred_disposition_message,
                             )
                             next_turn = current_turn
                             prepared_next = planned_current
@@ -1281,14 +1374,15 @@ async def post_guided_chat_schema8(
                     if resulting_guided is None:  # pragma: no cover
                         raise AuditIntegrityError("Guided Chat transition removed its checkpoint")
                     finished_at = datetime.now(UTC)
-                    is_private_future_instruction = (
-                        deferred_action is not None
-                        or deferred_management_action is not None
-                        or chat_result.error_class in {"DeferredIntentActionShapeError", "DeferredIntentManagementActionShapeError"}
-                    )
+                    # Transcript custody (R2-F15): the rendered transcript always
+                    # carries the author's verbatim words — including deferred
+                    # retains, failed retains, and management commands. Privacy
+                    # is enforced at the provider/audit boundary (later-stage
+                    # prompts see only the rendered durable_summary; audit rows
+                    # carry hashes), never by blanking the user's own turn.
                     user_turn = ChatTurn(
                         role=ChatRole.USER,
-                        content=("[Future-stage instruction submitted privately.]" if is_private_future_instruction else body.message),
+                        content=body.message,
                         seq=resulting_guided.chat_turn_seq,
                         step=prospective.step,
                         ts_iso=finished_at.isoformat(),
@@ -1322,6 +1416,13 @@ async def post_guided_chat_schema8(
                                 # a rejected application, not provider weather
                                 # (inv-f1 incidental 2).
                                 "SinkPrefillConfigRejected",
+                                # Retain-alone: the pair's resolution half was
+                                # withheld while the retain applied — the
+                                # not-applied signal is scoped to that half
+                                # (round-2 review finding).
+                                "PairedResolutionShapeRejected",
+                                "PairedResolutionConfigRejected",
+                                "PairedResolutionNotResent",
                             }
                             else "quality_guard"
                             if chat_result.error_class == "AssistantScaffoldLeakError"
