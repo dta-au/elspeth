@@ -881,6 +881,86 @@ def test_active_proposal_future_wire_management_always_invalidates_and_rewinds_w
     assert replay.json() == body
 
 
+def test_step3_chat_before_a_prose_revision_yields_one_ordered_transcript(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2-F6 interleaving: /guided/chat and /guided/respond share one counter.
+
+    ``/guided/chat`` is admitted at step 3 exactly when a deferred intent is
+    pending, so a chat turn and a prose revision can interleave at the same
+    step. Every other R2-F6 test starts from an empty transcript, where a
+    wrong-seq-base regression is invisible (0 is 0 either way). This one pins a
+    non-zero base: the step-1 deferral writes seq 0/1, the step-3 chat writes
+    2/3, and the revision must continue at 4/5 in one strictly increasing,
+    correctly attributed sequence.
+    """
+    from elspeth.web.composer.guided.protocol import GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT
+
+    client = composer_test_client
+    session_id, retained, staged = _stage_schema8_topology_intent_proposal(client, monkeypatch)
+    proposal = staged["next_turn"]["payload"]
+    base = _guided(client, session_id)
+    assert base.chat_turn_seq == 2, "the step-1 deferral must already have written a user/assistant pair"
+
+    # A binding mismatch (right token, wrong intent id) is deliberately NOT
+    # applied, so the session stays at step 3 with its proposal intact and the
+    # turn is recorded as a synthetic failure — the interleaved shape this test
+    # needs without rewinding the wizard.
+    monkeypatch.setattr(
+        guided_route,
+        "_run_guided_chat_provider_attempt",
+        _management_provider(
+            DeferredIntentCancelAction(
+                intent_id=str(uuid4()),
+                selection_token=deferred_intent_management_option(retained).selection_token,
+            )
+        ),
+    )
+    chat_message = "Cancel the topology constraint I saved earlier."
+    chatted = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=staged["next_turn"]["turn_token"],
+        message=chat_message,
+    )
+    assert chatted.status_code == 200, chatted.json()
+    assert chatted.json()["assistant_message_kind"] == "synthetic_failure"
+    after_chat = _guided(client, session_id)
+    assert after_chat.step.value == "step_3_transforms"
+    assert after_chat.chat_turn_seq == 4
+    assert after_chat.active_proposal is not None
+
+    instruction = "Add a deduplication transform before the output."
+    revised = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json={
+            "operation_id": str(uuid4()),
+            "turn_token": chatted.json()["next_turn"]["turn_token"],
+            "proposal_id": proposal["proposal_id"],
+            "draft_hash": proposal["draft_hash"],
+            "edited_values": {"revision_instruction": instruction},
+        },
+    )
+
+    assert revised.status_code == 200, revised.json()
+    guided = _guided(client, session_id)
+    assert [(turn.role.value, turn.seq, turn.step.value) for turn in guided.chat_history] == [
+        ("user", 0, "step_1_source"),
+        ("assistant", 1, "step_1_source"),
+        ("user", 2, "step_3_transforms"),
+        ("assistant", 3, "step_3_transforms"),
+        ("user", 4, "step_3_transforms"),
+        ("assistant", 5, "step_3_transforms"),
+    ]
+    assert guided.chat_history[2].content == chat_message
+    assert guided.chat_history[4].content == instruction
+    assert guided.chat_history[5].content == GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT
+    assert guided.chat_history[5].assistant_message_kind == "assistant"
+    assert guided.chat_turn_seq == 6
+
+
 def test_management_provider_api_error_completes_unavailable_turn_without_mutating_intent_or_active_proposal(
     composer_test_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
