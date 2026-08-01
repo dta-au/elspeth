@@ -34,13 +34,8 @@ from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
-from elspeth.core.dag.models import EdgeContractError, GraphValidationError, GraphValidationWarning
-from elspeth.core.secrets import redact_secret_refs_for_validation, resolve_secret_refs
+from elspeth.core.dag.models import EdgeContractError, GraphValidationWarning
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
-from elspeth.engine.orchestrator.types import (
-    RouteValidationError,
-)
-from elspeth.engine.orchestrator.value_source_validation import ValueSourceValidationError
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.web.composer.state import (
@@ -74,6 +69,15 @@ from elspeth.web.execution._validation_materialization import (
 )
 from elspeth.web.execution._validation_model import PhaseFailure, PhaseReport
 from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
+from elspeth.web.execution._validation_runtime import (
+    build_identity_advisory_checks,
+    load_runtime_settings,
+    validate_graph_structure,
+    validate_route_targets,
+    validate_runtime_plugins,
+    validate_schema_compatibility,
+    validate_value_source_compliance,
+)
 from elspeth.web.execution.preflight import (
     RUNTIME_CHECK_GRAPH_STRUCTURE,
     RUNTIME_CHECK_PLUGIN_INSTANTIATION,
@@ -838,9 +842,6 @@ def _validate_pipeline_impl(
         profile_registry: Frozen operator-profile resolver registry. Required
             when the snapshot exposes operator-profiled plugin aliases.
     """
-    checks: list[ValidationCheck] = []
-    errors: list[ValidationError] = []
-
     # Empty compositions have a deliberate legacy producer shape rather than
     # entering the ordered core ledger: no authored phase can make them
     # executable, and engine settings diagnostics would leak internal names.
@@ -1005,529 +1006,77 @@ def _validate_pipeline_impl(
     if isinstance(provider_validated, ValidationResult):
         return provider_validated
 
-    # Runtime phases remain legacy until Task 7. They consume immutable
-    # materialization evidence and never share mutable phase check state.
-    checks = list(ledger.checks)
-    errors = []
-    authored = provider_validated.authored
-    policy_state = authored.policy.state
-    all_refs = list(authored.all_secret_refs)
-    env_ref_names = set(authored.env_ref_names)
-    semantic_contracts = authored.semantic_contracts
-    pipeline_yaml = provider_validated.pipeline_yaml
+    loaded = _apply_phase(
+        ledger,
+        load_runtime_settings(
+            provider_validated,
+            secret_service=secret_service,
+            user_id=user_id,
+            load_yaml=dependencies.load_yaml,
+            load_settings_yaml=dependencies.load_settings_yaml,
+            load_settings_dict=dependencies.load_settings_dict,
+            reframe_missing_parts=_reframe_settings_missing_parts,
+        ),
+    )
+    if isinstance(loaded, ValidationResult):
+        return loaded
 
-    # Step 3: Settings loading
-    #
-    # Always uses load_settings_from_yaml_string() — the same loader the
-    # execution service uses (in _run_pipeline).  This ensures validation
-    # exercises the exact same code path as execution, preventing
-    # false-pass or false-fail results from loader differences.
-    #
-    # When secret refs are present, resolve them before loading.
-    # Resolved secrets stay in process memory — never written to disk.
-    #
-    # SecretResolutionError is NOT caught: if a ref is missing here,
-    # Step 1b's existence check was wrong — that's an internal bug
-    # and must crash per the W18 rule.
-    try:
-        settings_config: dict[str, Any] | None = None
-        if secret_service is not None and user_id is not None and all_refs:
-            config_dict = dependencies.load_yaml(pipeline_yaml)
-            if not isinstance(config_dict, dict):
-                raise TypeError(
-                    f"generate_yaml() produced non-dict YAML (got {type(config_dict).__name__}) — this is a bug in the YAML generator"
-                )
-            resolved_dict, _resolutions = resolve_secret_refs(
-                config_dict,
-                secret_service,
-                user_id,
-                env_ref_names=env_ref_names,
-            )
-            settings_config = resolved_dict
-        elif secret_service is None and "secret_ref" in pipeline_yaml:
-            # No-resolver path (YAML-export preflight withholds the resolver so
-            # resolved secret values can never reach plugin error prose). A wired
-            # {secret_ref: NAME} marker is valid wiring, but plugin config models
-            # type credential fields as ``str`` (e.g. OpenRouter ``api_key: str``)
-            # — an unsubstituted marker dict fails instantiation with "Input
-            # should be a valid string" and false-rejects an exportable pipeline.
-            # Substitute a benign placeholder so structural validation proceeds.
-            # The export YAML is generated separately from the original state
-            # (generate_public_yaml), so the real marker is preserved on the wire
-            # — the placeholder lives only in this loader-local copy.
-            config_dict = dependencies.load_yaml(pipeline_yaml)
-            if isinstance(config_dict, dict):
-                settings_config = redact_secret_refs_for_validation(config_dict)
+    instantiated = _apply_phase(
+        ledger,
+        validate_runtime_plugins(
+            loaded,
+            plugin_snapshot=plugin_snapshot,
+            instantiate_plugins=dependencies.instantiate_plugins,
+            infer_component_type=_infer_component_type_from_plugin_error,
+        ),
+    )
+    if isinstance(instantiated, ValidationResult):
+        return instantiated
 
-        # Web-authored pipeline YAML must never expand host ${VAR} placeholders
-        # (parity with the execution path). Known secret inventory names are
-        # resolved above via resolve_secret_refs; any remaining ${VAR} is
-        # user-authored data, not a host-environment lookup.
-        if settings_config is None:
-            elspeth_settings = dependencies.load_settings_yaml(pipeline_yaml, expand_env_vars=False)
-        else:
-            elspeth_settings = dependencies.load_settings_dict(settings_config, expand_env_vars=False)
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SETTINGS,
-                passed=True,
-                detail="Settings loaded successfully",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-    except (PydanticValidationError, ValueError, TypeError) as exc:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SETTINGS,
-                passed=False,
-                detail=str(exc),
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        # Reframe the specific "a required top-level part is missing" failure
-        # (source or sink) into novice-register findings instead of leaking the
-        # raw pydantic dump ("<field> Field required [type=missing] … For
-        # further information visit https://errors.pydantic.dev/…"), which is a
-        # Tier-3 boundary violation on the four surfaces that render
-        # ``errors[].message`` — the rail strip, audit panel, wire-stage
-        # blockers, and chat transcript (elspeth-901a404926). Detected from the
-        # *structured* ``exc.errors()`` (type == "missing" on sources / sinks),
-        # never by parsing ``str(exc)`` — the human string is version-stamped
-        # and fragile. The raw dump is retained above in ``ValidationCheck``
-        # ``detail`` (and the Landscape trail) for the engineer read; other
-        # settings failures still surface ``str(exc)`` verbatim.
-        reframed = _reframe_settings_missing_parts(exc) if isinstance(exc, PydanticValidationError) else []
-        if reframed:
-            errors.extend(reframed)
-            readiness = _blocked_readiness(
-                code="incomplete_pipeline",
-                detail="Pipeline is missing a required source or output.",
-            )
-        else:
-            errors.append(
-                ValidationError(
-                    component_id=None,
-                    component_type=None,
-                    message=str(exc),
-                    suggestion=None,
-                    error_code=None,
-                )
-            )
-            readiness = _blocked_readiness(
-                code="settings_load",
-                detail="Settings failed to load.",
-            )
-        _append_skipped_checks(checks, _CHECK_SETTINGS)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=readiness,
-            semantic_contracts=list(semantic_contracts),
-        )
+    value_source_validated = _apply_phase(ledger, validate_value_source_compliance(instantiated))
+    if isinstance(value_source_validated, ValidationResult):
+        return value_source_validated
 
-    # Step 4: Plugin instantiation + value-source compliance
-    #
-    # ``instantiate_plugins_from_config`` now runs the value-source walker
-    # against ``bundle.transforms`` before returning, so a hallucinated
-    # model identifier (or any field that violates a plugin's
-    # VALUE_SOURCES declaration) raises ``ValueSourceValidationError``
-    # from inside this call. We disambiguate the two failure classes by
-    # exception type:
-    #
-    # * ``PluginNotFoundError`` / ``PluginConfigError`` / ``FileExistsError``
-    #   → the bundle was never built; PLUGINS check failed, value-source
-    #   compliance is skipped via cascade (it could not run).
-    # * ``ValueSourceValidationError`` → the bundle was built successfully
-    #   but rejected by the walker; PLUGINS check passed, VALUE_SOURCE
-    #   compliance check failed, downstream checks skipped via cascade.
-    try:
-        bundle = dependencies.instantiate_plugins(elspeth_settings, plugin_snapshot=plugin_snapshot)
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_PLUGINS,
-                passed=True,
-                detail="All plugins instantiated",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_VALUE_SOURCE_COMPLIANCE,
-                passed=True,
-                detail="All declared value sources satisfied",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-    except ValueSourceValidationError as exc:
-        # Bundle was built — instantiation succeeded — but the walker
-        # rejected one or more declared field values. Surface PLUGINS
-        # as passed, VALUE_SOURCE as failed.
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_PLUGINS,
-                passed=True,
-                detail="All plugins instantiated",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_VALUE_SOURCE_COMPLIANCE,
-                passed=False,
-                detail=str(exc),
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        # Each finding names a single ``component_id`` field-violation —
-        # surface them as separate ValidationError records so the composer
-        # UI can attribute each to its node. ``finding`` is a
-        # :class:`ValueSourceFinding` carrying the attribution structurally
-        # — no string parsing, no silent ``component_id=None`` fallback.
-        for finding in exc.findings:
-            errors.append(
-                ValidationError(
-                    component_id=finding.component_id,
-                    component_type="transform",
-                    message=finding.format(),
-                    suggestion=(
-                        "Use the list_models composer tool to pick a known "
-                        "model identifier; for Azure transforms, leave 'model' "
-                        "empty so it inherits from 'deployment_name'."
-                    ),
-                    error_code=None,
-                )
-            )
-        _append_skipped_checks(checks, _CHECK_VALUE_SOURCE_COMPLIANCE)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="value_source_compliance",
-                detail="Value-source compliance failed.",
-                component_id=errors[-1].component_id if errors else None,
-                component_type=errors[-1].component_type if errors else None,
-            ),
-            semantic_contracts=list(semantic_contracts),
-        )
-    except (PluginNotFoundError, PluginConfigError) as exc:
-        comp_type = _infer_component_type_from_plugin_error(exc)
-        plugin_error_name: str | None = exc.plugin_name if isinstance(exc, PluginConfigError) else None
-        # Prefer cause (validation detail) over str(exc) which includes the
-        # internal class name prefix (e.g. "Invalid configuration for CSVSourceConfig: ...").
-        if isinstance(exc, PluginConfigError) and exc.cause is not None and plugin_error_name is not None:
-            detail = f"Invalid configuration for {comp_type} '{plugin_error_name}': {exc.cause}"
-        else:
-            detail = str(exc)
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_PLUGINS,
-                passed=False,
-                detail=detail,
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        errors.append(
-            ValidationError(
-                component_id=plugin_error_name,
-                component_type=comp_type,
-                message=detail,
-                suggestion=None,
-                error_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_PLUGINS)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="plugin_instantiation",
-                detail="Plugin instantiation failed.",
-                component_id=plugin_error_name,
-                component_type=comp_type,
-            ),
-            semantic_contracts=list(semantic_contracts),
-        )
-    except FileExistsError as exc:
-        # Belt-and-braces conversion for plugins that still perform filesystem
-        # collision checks during construction. Built-in local file sinks skip
-        # this check during runtime preflight and defer it to first write.
-        # Known raise sites in ``plugins/infrastructure/output_paths.py``:
-        #
-        # * line 48 — ``collision_policy="fail_if_exists"`` and the target path
-        #   already exists.
-        # * line 73 — ``collision_policy="auto_increment"`` and 9999 sibling
-        #   slots are all taken.
-        #
-        # Per CLAUDE.md trust tiers, the existing-file condition is a Tier 3
-        # boundary fact (external filesystem state), not a Tier 1 invariant
-        # break — convert to a structured validation result here so the
-        # composer ``/validate`` and ``/messages`` paths surface a 422-class
-        # diagnostic instead of an opaque 500 ``composer_plugin_error``. The
-        # exception does not carry sink-name attribution at this layer
-        # (sinks raise ``FileExistsError`` directly without wrapping); the
-        # message text contains the path, which is operator-actionable.
-        detail = str(exc)
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_PLUGINS,
-                passed=False,
-                detail=detail,
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        errors.append(
-            ValidationError(
-                component_id=None,
-                component_type="sink",
-                message=detail,
-                suggestion=("Set collision_policy='auto_increment' to pick a free sibling path automatically, or choose a different path."),
-                error_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_PLUGINS)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="plugin_instantiation",
-                detail="Plugin filesystem target validation failed.",
-                component_type="sink",
-            ),
-            semantic_contracts=list(semantic_contracts),
-        )
+    graphed = _apply_phase(
+        ledger,
+        validate_graph_structure(
+            value_source_validated,
+            build_graph=dependencies.build_graph,
+            warning_to_validation_warning=_graph_warning_to_validation_warning,
+        ),
+    )
+    if isinstance(graphed, ValidationResult):
+        return graphed
 
-    # Step 5: Graph construction + structural validation
-    try:
-        graph = dependencies.build_graph(elspeth_settings, bundle)
-        graph.validate()
-        graph_warnings = [_graph_warning_to_validation_warning(warning) for warning in graph.validation_warnings]
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_GRAPH,
-                passed=True,
-                detail="Graph structure is valid"
-                if not graph_warnings
-                else f"Graph structure is valid with {len(graph_warnings)} warning(s)",
-                affected_nodes=tuple(warning.component_id for warning in graph_warnings if warning.component_id is not None),
-                outcome_code=None,
-            )
-        )
-    except GraphValidationError as exc:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_GRAPH,
-                passed=False,
-                detail=str(exc),
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        errors.append(
-            ValidationError(
-                component_id=exc.component_id,
-                component_type=exc.component_type,
-                message=str(exc),
-                suggestion=None,
-                error_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_GRAPH)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="graph_structure",
-                detail="Graph validation failed.",
-                component_id=exc.component_id,
-                component_type=exc.component_type,
-            ),
-            semantic_contracts=list(semantic_contracts),
-        )
+    routes_validated = _apply_phase(
+        ledger,
+        validate_route_targets(graphed, validate_routes=dependencies.validate_routes),
+    )
+    if isinstance(routes_validated, ValidationResult):
+        return routes_validated
 
-    # Step 5b: Route target resolution
-    #
-    # The orchestrator's pre-init runs four route-target validators that
-    # ``graph.validate()`` does not cover:
-    # ``validate_route_destinations``, ``validate_transform_error_sinks``,
-    # ``validate_source_quarantine_destination``, and
-    # ``validate_sink_failsink_destinations``. Without this step the composer's
-    # ``/validate`` returns ``is_valid: true`` for pipelines whose
-    # ``on_error`` / ``on_validation_failure`` / ``on_write_failure`` /
-    # ``gates[*].routes[*]`` reference a non-existent sink, and the runtime
-    # then rejects them at ``/execute`` pre-token (issue elspeth-127de6865a).
-    #
-    # ``OrchestrationInvariantError`` is intentionally NOT caught — it
-    # signals a framework bug (e.g. transform on_error is None when
-    # TransformSettings requires it) and must surface as a 500, not as a
-    # per-pipeline validation failure.
-    try:
-        dependencies.validate_routes(
-            sources=bundle.sources,
-            transforms=bundle.transforms,
-            sinks=bundle.sinks,
-            aggregations=bundle.aggregations,
-            settings=elspeth_settings,
-            graph=graph,
-        )
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_ROUTE_TARGETS,
-                passed=True,
-                detail="All route targets resolve to existing sinks",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-    except RouteValidationError as exc:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_ROUTE_TARGETS,
-                passed=False,
-                detail=str(exc),
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        errors.append(
-            ValidationError(
-                component_id=None,
-                component_type=None,
-                message=str(exc),
-                suggestion=("Use 'discard' to drop rows without routing, or wire the destination to an existing sink."),
-                error_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_ROUTE_TARGETS)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="route_target_resolution",
-                detail="Route target validation failed.",
-            ),
-            semantic_contracts=list(semantic_contracts),
-        )
+    schema_validated = _apply_phase(
+        ledger,
+        validate_schema_compatibility(
+            routes_validated,
+            edge_patch_target_for_node_id=_edge_patch_target_for_node_id,
+            format_edge_contract_failure=_format_edge_contract_failure,
+        ),
+    )
+    if isinstance(schema_validated, ValidationResult):
+        return schema_validated
 
-    # Step 6: Schema compatibility
-    try:
-        graph.validate_edge_compatibility()
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SCHEMA,
-                passed=True,
-                detail="All edge schemas compatible",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-    except GraphValidationError as exc:
-        # ValidationCheck.detail keeps the legacy single-line prose so the
-        # operator-facing /validate response and dashboard run-status panel
-        # render the same compact summary they always have. The richer
-        # multi-line message + suggestion live on the ValidationError below
-        # and surface to the composer LLM.
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_SCHEMA,
-                passed=False,
-                detail=str(exc),
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        if isinstance(exc, EdgeContractError):
-            consumer_target = _edge_patch_target_for_node_id(
-                exc.to_node_id,
-                state=policy_state,
-                graph=graph,
-                component_type=exc.component_type,
-            )
-            edge_message, edge_suggestion = _format_edge_contract_failure(exc, state=policy_state, graph=graph)
-            errors.append(
-                ValidationError(
-                    component_id=consumer_target.component_id,
-                    component_type=consumer_target.component_type,
-                    message=edge_message,
-                    suggestion=edge_suggestion,
-                    error_code=None,
-                )
-            )
-        else:
-            errors.append(
-                ValidationError(
-                    component_id=exc.component_id,
-                    component_type=exc.component_type,
-                    message=str(exc),
-                    suggestion=None,
-                    error_code=None,
-                )
-            )
-        _append_skipped_checks(checks, _CHECK_SCHEMA)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=errors,
-            readiness=_blocked_readiness(
-                code="schema_compatibility",
-                detail="Schema compatibility failed.",
-                component_id=errors[-1].component_id if errors else None,
-                component_type=errors[-1].component_type if errors else None,
-            ),
-            semantic_contracts=list(semantic_contracts),
-        )
+    for advisory in build_identity_advisory_checks(
+        schema_validated,
+        find_identity_node_advisories=_find_identity_node_advisories,
+    ):
+        ledger.record_advisory(advisory)
 
-    # Identity-node advisory — non-blocking, multi-entry.  Emitted only on the
-    # happy path (after every structural check has passed) so structural errors
-    # are not drowned in cosmetic noise.  One ValidationCheck per detected node;
-    # the detail string names the offending node, its upstream, and its
-    # downstream sink, plus the repair action so the composer LLM can self-correct
-    # on the next turn.  See dispatch-prompt-floofy-noodle.md plan + skill lines
-    # 758-768 (Concept-5 exemption) and 1517-1518 (fork-branch exemption).
-    for identity_finding in _find_identity_node_advisories(policy_state):
-        sink_mode_text = (
-            f", which uses schema.mode: {identity_finding.sink_schema_mode}" if identity_finding.sink_schema_mode is not None else ""
-        )
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_IDENTITY_NODE_ADVISORY,
-                passed=True,
-                detail=(
-                    f"Node '{identity_finding.node_id}' is an identity-shaped passthrough "
-                    f"between '{identity_finding.upstream_id}' and sink '{identity_finding.sink_name}'"
-                    f"{sink_mode_text}.  The sink accepts the upstream row directly; "
-                    f"the passthrough adds an audit hop with no contract benefit.  "
-                    f"Consider removing it and wiring '{identity_finding.upstream_id}'.on_success "
-                    f"directly to '{identity_finding.sink_name}'."
-                ),
-                # Structured node attribution for the audit-readiness panel's
-                # provenance row (see docs/composer/ux-redesign-2026-05/14a
-                # §"Six rows — projection mapping").
-                affected_nodes=(identity_finding.node_id,),
-                outcome_code=None,
-            )
-        )
-
-    return ValidationResult(
-        is_valid=True,
-        checks=checks,
-        errors=errors,
-        warnings=graph_warnings,
+    authored = schema_validated.instantiated.loaded.materialized.authored
+    return ledger.finish_success(
         readiness=_execution_ready(),
-        semantic_contracts=list(semantic_contracts),
+        warnings=schema_validated.graph_warnings,
+        semantic_contracts=authored.semantic_contracts,
     )
 
 

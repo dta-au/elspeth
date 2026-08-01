@@ -119,6 +119,18 @@ class LoadedRuntime:
     materialized: MaterializedYaml
     settings: ElspethSettings
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "materialized", _snapshot_materialized_evidence(self.materialized))
+
+
+def _snapshot_materialized_evidence(materialized: MaterializedYaml) -> MaterializedYaml:
+    """Detach validation evidence while preserving admitted state identity."""
+    return MaterializedYaml(
+        authored=materialized.authored,
+        materialized_state=materialized.materialized_state,
+        pipeline_yaml=materialized.pipeline_yaml,
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class InstantiatedRuntime:
@@ -126,6 +138,14 @@ class InstantiatedRuntime:
 
     loaded: LoadedRuntime
     bundle: PluginBundle
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "loaded", _snapshot_loaded_evidence(self.loaded))
+
+
+def _snapshot_loaded_evidence(loaded: LoadedRuntime) -> LoadedRuntime:
+    """Detach the loaded envelope without cloning engine settings."""
+    return LoadedRuntime(materialized=loaded.materialized, settings=loaded.settings)
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,3 +155,16 @@ class GraphedRuntime:
     instantiated: InstantiatedRuntime
     graph: ExecutionGraph
     graph_warnings: tuple[ValidationWarning, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "instantiated", _snapshot_instantiated_evidence(self.instantiated))
+        object.__setattr__(
+            self,
+            "graph_warnings",
+            tuple(warning.model_copy(deep=True) for warning in self.graph_warnings),
+        )
+
+
+def _snapshot_instantiated_evidence(instantiated: InstantiatedRuntime) -> InstantiatedRuntime:
+    """Detach the instantiated envelope without cloning live plugins."""
+    return InstantiatedRuntime(loaded=instantiated.loaded, bundle=instantiated.bundle)
