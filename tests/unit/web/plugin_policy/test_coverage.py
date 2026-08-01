@@ -7,6 +7,9 @@ from dataclasses import replace
 import pytest
 
 from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -20,6 +23,19 @@ from elspeth.web.plugin_policy.coverage import (
     build_output_stream_graph,
     control_coverage_findings,
 )
+
+
+@pytest.fixture
+def llm_source_policy_manager(monkeypatch: pytest.MonkeyPatch) -> PluginManager:
+    """Register the non-public LLM source without changing discovery."""
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
+    monkeypatch.setattr(
+        "elspeth.web.plugin_policy.coverage.get_shared_plugin_manager",
+        lambda: manager,
+    )
+    return manager
 
 
 def _node(
@@ -73,6 +89,44 @@ def _state(*nodes: NodeSpec, source_target: str = "llm_in", sinks: tuple[str, ..
             options={"path": "rows.csv", "schema": {"mode": "observed"}},
             on_validation_failure="discard",
         ),
+        nodes=nodes,
+        edges=(),
+        outputs=tuple(
+            OutputSpec(
+                name=name,
+                plugin="json",
+                options={"path": f"{name}.jsonl", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            )
+            for name in sinks
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def _llm_source_state(
+    *nodes: NodeSpec,
+    source_name: str = "source",
+    on_success: str = "main",
+    on_validation_failure: str = "discard",
+    response_field: str = "llm_response",
+    other_sources: dict[str, SourceSpec] | None = None,
+    sinks: tuple[str, ...] = ("main",),
+) -> CompositionState:
+    sources = dict(other_sources or {})
+    sources[source_name] = SourceSpec(
+        plugin="llm",
+        on_success=on_success,
+        options={
+            "prompt_template": "Write one concise audit briefing.",
+            "lookup": {"audience": "operators"},
+            "response_field": response_field,
+        },
+        on_validation_failure=on_validation_failure,
+    )
+    return CompositionState(
+        sources=sources,
         nodes=nodes,
         edges=(),
         outputs=tuple(
@@ -189,6 +243,25 @@ def _mapper(
 )
 def test_prompt_shield_input_coverage(state: CompositionState, covered: bool) -> None:
     assert (control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()) is covered
+
+
+def test_prompt_shield_coverage_ignores_malformed_source_success_stream_without_raising() -> None:
+    state = _state(_llm())
+    state = replace(
+        state,
+        sources={
+            "source": replace(
+                state.sources["source"],
+                on_success=[],  # type: ignore[arg-type]
+            )
+        },
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("judge", "transform"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -655,6 +728,310 @@ def test_content_safety_output_coverage_requires_llm_field_scope(
     )
 
     assert (control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()) is covered
+
+
+def test_llm_source_content_safety_finding_has_stable_component_identity(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state()
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type, finding.reason) for finding in findings] == [
+        ("source", "source", "output_not_post_dominated")
+    ]
+
+
+def test_named_llm_source_finding_uses_qualified_component_id(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(source_name="briefing")
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source:briefing", "source"),
+    ]
+
+
+def test_llm_source_capability_uses_nominal_source_registry(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    class SourceOnlyLLM(LLMSource):
+        name = "source_only_llm"
+        determinism = LLMSource.determinism
+
+    llm_source_policy_manager.register(create_dynamic_hookimpl([SourceOnlyLLM], "elspeth_get_source"))
+    state = _llm_source_state()
+    state = replace(
+        state,
+        sources={"source": replace(state.sources["source"], plugin="source_only_llm")},
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source", "source"),
+    ]
+
+
+def test_malformed_source_plugin_defers_to_plugin_enablement_without_raising(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state()
+    state = replace(
+        state,
+        sources={"source": replace(state.sources["source"], plugin=[])},  # type: ignore[arg-type]
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
+
+
+def test_llm_source_prompt_is_not_subject_to_prompt_shield(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state()
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+@pytest.mark.parametrize(
+    ("safety_fields", "covered"),
+    [
+        (("briefing",), True),
+        (("llm_response",), False),
+        (("briefing_usage", "briefing_model"), False),
+    ],
+)
+def test_llm_source_content_safety_covers_only_configured_response_field(
+    llm_source_policy_manager: PluginManager,
+    safety_fields: tuple[str, ...],
+    covered: bool,
+) -> None:
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main", fields=safety_fields),
+        on_success="safe_in",
+        response_field="briefing",
+    )
+
+    assert (control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()) is covered
+
+
+def test_llm_source_ignores_transform_only_query_shapes_when_selecting_protected_field(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main", fields=("ignored_briefing",)),
+        on_success="safe_in",
+        response_field="briefing",
+    )
+    source = state.sources["source"]
+    state = replace(
+        state,
+        sources={
+            "source": replace(
+                source,
+                options={
+                    **source.options,
+                    "queries": {"ignored": {"input_fields": {}}},
+                },
+            )
+        },
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+
+def test_llm_source_malformed_options_are_unprovable_and_fail_closed(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    safety = replace(
+        _safety("safety", "safe_in", "main"),
+        options={"detect_only": False, "fields": "all"},
+    )
+    state = _llm_source_state(safety, on_success="safe_in")
+    state = replace(
+        state,
+        sources={"source": replace(state.sources["source"], options=[])},  # type: ignore[arg-type]
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source", "source"),
+    ]
+
+
+def test_llm_source_content_safety_must_post_dominate_every_success_path(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(
+        _node(
+            "fanout",
+            None,
+            "generated",
+            None,
+            node_type="gate",
+            routes={"all": "fork"},
+            fork_to=("safe_in", "unsafe_in"),
+        ),
+        _safety("safety", "safe_in", "safe"),
+        _node("unsafe", "passthrough", "unsafe_in", "unsafe"),
+        on_success="generated",
+        sinks=("safe", "unsafe"),
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source", "source"),
+    ]
+
+
+@pytest.mark.parametrize("invalid_stream", [[], None, 7])
+def test_llm_source_malformed_success_stream_fails_closed_without_raising(
+    llm_source_policy_manager: PluginManager,
+    invalid_stream: object,
+) -> None:
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main"),
+        on_success="safe_in",
+    )
+    state = replace(
+        state,
+        sources={
+            "source": replace(
+                state.sources["source"],
+                on_success=invalid_stream,  # type: ignore[arg-type]
+            )
+        },
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source", "source"),
+    ]
+
+
+def test_llm_source_non_exact_success_stream_fails_closed(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    class StreamAlias(str):
+        pass
+
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main"),
+        on_success=StreamAlias("safe_in"),
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+
+def test_llm_source_direct_sink_success_is_uncovered(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(on_success="main")
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+
+def test_llm_source_validation_failure_sink_is_unrepairable_even_when_success_is_covered(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main"),
+        on_success="safe_in",
+        on_validation_failure="quarantine",
+        sinks=("main", "quarantine"),
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type, finding.reason, finding.uncovered_stream) for finding in findings] == [
+        (
+            "source",
+            "source",
+            "output_validation_failure_route_not_post_dominated",
+            "quarantine",
+        )
+    ]
+
+
+def test_llm_source_validation_failure_discard_is_accepted_when_success_is_covered(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main"),
+        on_success="safe_in",
+        on_validation_failure="discard",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
+
+
+def test_llm_source_validation_failure_requires_exact_discard_literal(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    class DiscardAlias(str):
+        pass
+
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main"),
+        on_success="safe_in",
+        on_validation_failure=DiscardAlias("discard"),
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("source", "output_validation_failure_route_not_post_dominated"),
+    ]
+
+
+def test_llm_source_and_transform_findings_have_stable_mixed_order(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(
+        _llm(input_stream="rows", on_success="main"),
+        source_name="zeta",
+        on_success="main",
+        other_sources={
+            "rows": SourceSpec("csv", "rows", {}, "discard"),
+            "alpha": SourceSpec(
+                "llm",
+                "main",
+                {"prompt_template": "Alpha", "response_field": "alpha_response"},
+                "discard",
+            ),
+        },
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source:alpha", "source"),
+        ("source:zeta", "source"),
+        ("judge", "transform"),
+    ]
+
+
+def test_malformed_source_name_has_stable_typed_finding_without_sort_failure(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(source_name="valid")
+    malformed = state.sources["valid"]
+    sources: dict[object, SourceSpec] = {
+        "rows": SourceSpec("csv", "unused", {}, "discard"),
+        7: malformed,
+    }
+    state = replace(state, sources=sources)  # type: ignore[arg-type]
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source:<invalid>", "source"),
+    ]
 
 
 def test_content_safety_output_coverage_follows_field_mapper_rename_downstream() -> None:

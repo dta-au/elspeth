@@ -9,7 +9,7 @@ W18 fix: Only typed exceptions are caught — no bare except Exception.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -275,6 +275,101 @@ def test_required_prompt_shield_coverage_fails_before_constructor() -> None:
     ]
     assert result.errors[0].component_id == "test_node"
     assert result.errors[0].error_code == "required_control_coverage"
+    constructor.assert_not_called()
+
+
+def test_required_content_safety_for_llm_source_fails_closed_with_source_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Execution rejects an unrepairable source failure route before construction."""
+    from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+    from elspeth.plugins.infrastructure.manager import PluginManager
+    from elspeth.plugins.sources.llm.source import LLMSource
+    from elspeth.web.dependencies import create_catalog_service
+
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
+    monkeypatch.setattr(
+        "elspeth.web.plugin_policy.coverage.get_shared_plugin_manager",
+        lambda: manager,
+    )
+
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+    llm_source_id = PluginId("source", "llm")
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="required-source-control-policy",
+        principal_scope="local:alice",
+        available=unrestricted.available | {llm_source_id},
+        unavailable=(),
+        selected=unrestricted.selected,
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        control_modes=((PluginCapability.CONTENT_SAFETY, ControlMode.REQUIRED),),
+        binding_generation_fingerprint="required-source-control-generation",
+    )
+    state = CompositionState(
+        source=SourceSpec(
+            plugin="llm",
+            on_success="transform_in",
+            options={
+                "prompt_template": "Write one audit briefing.",
+                "response_field": "briefing",
+            },
+            on_validation_failure="quarantine",
+        ),
+        nodes=(
+            replace(
+                _make_node(
+                    plugin="azure_content_safety",
+                    options={"detect_only": False, "fields": ["briefing"]},
+                ),
+                on_success="primary",
+            ),
+        ),
+        edges=(),
+        outputs=(_make_output(), _make_output(name="quarantine")),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+    with patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as constructor:
+        result = validate_pipeline_for_trained_operator(
+            state,
+            _make_settings(),
+            _FakeYamlGenerator(),
+            plugin_snapshot=snapshot,
+        )
+        malformed_result = validate_pipeline_for_trained_operator(
+            CompositionState(
+                source=SourceSpec(
+                    plugin="llm",
+                    on_success=[],  # type: ignore[arg-type]
+                    options=[],  # type: ignore[arg-type]
+                    on_validation_failure=[],  # type: ignore[arg-type]
+                ),
+                nodes=(),
+                edges=(),
+                outputs=(_make_output(),),
+                metadata=PipelineMetadata(),
+                version=1,
+            ),
+            _make_settings(),
+            _FakeYamlGenerator(),
+            plugin_snapshot=snapshot,
+        )
+
+    assert result.is_valid is False
+    assert result.errors[0].error_code == "required_control_coverage"
+    assert result.errors[0].component_id == "source"
+    assert result.errors[0].component_type == "source"
+    assert "on_validation_failure" in result.errors[0].message
+    assert result.readiness.blockers[0].component_id == "source"
+    assert result.readiness.blockers[0].component_type == "source"
+    assert malformed_result.is_valid is False
+    assert malformed_result.errors[0].error_code == "required_control_coverage"
+    assert malformed_result.errors[0].component_id == "source"
+    assert malformed_result.errors[0].component_type == "source"
     constructor.assert_not_called()
 
 
