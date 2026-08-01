@@ -476,7 +476,7 @@ def _pipeline_with_short_form_llm_review(data_dir: Path) -> dict[str, Any]:
                     "provider": "openrouter",
                     "model": "anthropic/claude-sonnet-4.6",
                     "api_key": {"secret_ref": "OPENROUTER_API_KEY"},
-                    "prompt_template": "Summarise {{ text }}",
+                    "prompt_template": "Summarise {{ row.text }}",
                     "interpretation_requirements": [
                         {
                             "kind": "pipeline_decision",
