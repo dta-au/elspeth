@@ -80,6 +80,22 @@ def _ready_readiness() -> ValidationReadiness:
     )
 
 
+def _pending_readiness() -> ValidationReadiness:
+    return ValidationReadiness(
+        authoring_valid=True,
+        execution_ready=False,
+        completion_ready=True,
+        blockers=[
+            ValidationReadinessBlocker(
+                code="interpretation_review_pending",
+                component_id="llm_1",
+                component_type="transform",
+                detail="Interpretation review is pending.",
+            )
+        ],
+    )
+
+
 def _warning(code: str) -> ValidationWarning:
     return ValidationWarning(
         component_id=None,
@@ -157,6 +173,51 @@ def test_finish_failure_preserves_prefix_and_completes_canonical_cascade() -> No
     assert result.is_valid is False
 
 
+def test_record_pass_snapshots_the_mutable_check() -> None:
+    ledger = ValidationLedger()
+    original = _check(CHECK_PLUGIN_ENABLEMENT, passed=True)
+    ledger.record_pass(original)
+
+    original.detail = "mutated after record_pass"
+    original.affected_nodes = ("mutated",)
+    result = ledger.finish_failure(
+        _check("operator_profile_options", passed=False),
+        errors=(_error("blocked"),),
+        readiness=_blocked_readiness(),
+    )
+
+    assert result.checks[0].detail == "plugin_enablement passed"
+    assert result.checks[0].affected_nodes == ()
+
+
+def test_finish_failure_snapshots_all_mutable_inputs() -> None:
+    ledger = ValidationLedger()
+    failed_check = _check(CHECK_PLUGIN_ENABLEMENT, passed=False)
+    error = _error("blocked")
+    readiness = _blocked_readiness()
+    semantic_contract = _semantic_contract()
+
+    result = ledger.finish_failure(
+        failed_check,
+        errors=(error,),
+        readiness=readiness,
+        semantic_contracts=(semantic_contract,),
+    )
+    failed_check.detail = "mutated failed check"
+    error.message = "mutated error"
+    readiness.authoring_valid = True
+    readiness.blockers[0].detail = "mutated blocker"
+    readiness.blockers.clear()
+    semantic_contract.outcome = "conflict"
+
+    assert result.checks[0].detail == "plugin_enablement failed"
+    assert result.errors[0].message == "blocked"
+    assert result.readiness.authoring_valid is False
+    assert len(result.readiness.blockers) == 1
+    assert result.readiness.blockers[0].detail == "Validation failed."
+    assert result.semantic_contracts[0].outcome == "satisfied"
+
+
 def test_duplicate_core_name_raises() -> None:
     ledger = ValidationLedger()
     ledger.record_pass(_check(CHECK_PLUGIN_ENABLEMENT, passed=True))
@@ -191,6 +252,26 @@ def test_advisory_before_all_core_passes_raises() -> None:
         ledger.record_advisory(_check(CHECK_IDENTITY_NODE_ADVISORY, passed=True))
 
 
+def test_record_advisory_snapshots_the_mutable_check() -> None:
+    ledger = ValidationLedger()
+    _record_all_core_passes(ledger)
+    original = ValidationCheck(
+        name=CHECK_IDENTITY_NODE_ADVISORY,
+        passed=True,
+        detail="identity advisory",
+        affected_nodes=("identity_1",),
+        outcome_code=None,
+    )
+    ledger.record_advisory(original)
+
+    original.detail = "mutated after record_advisory"
+    original.affected_nodes = ("mutated",)
+    result = ledger.finish_success(readiness=_ready_readiness())
+
+    assert result.checks[-1].detail == "identity advisory"
+    assert result.checks[-1].affected_nodes == ("identity_1",)
+
+
 @pytest.mark.parametrize("advisory_count", [0, 2])
 def test_finish_success_permits_zero_or_more_identity_advisories(advisory_count: int) -> None:
     ledger = ValidationLedger()
@@ -219,6 +300,106 @@ def test_finish_success_permits_zero_or_more_identity_advisories(advisory_count:
     assert result.warnings == [_warning("graph.warning")]
     assert result.readiness == _ready_readiness()
     assert result.semantic_contracts == [_semantic_contract()]
+
+
+def test_finish_success_snapshots_all_mutable_inputs() -> None:
+    ledger = ValidationLedger()
+    _record_all_core_passes(ledger)
+    readiness = _ready_readiness()
+    warning = _warning("graph.warning")
+    semantic_contract = _semantic_contract()
+
+    result = ledger.finish_success(
+        readiness=readiness,
+        warnings=(warning,),
+        semantic_contracts=(semantic_contract,),
+    )
+    readiness.completion_ready = False
+    readiness.blockers.append(
+        ValidationReadinessBlocker(
+            code="mutated",
+            component_id=None,
+            component_type=None,
+            detail="mutated",
+        )
+    )
+    warning.message = "mutated warning"
+    semantic_contract.outcome = "conflict"
+
+    assert result.readiness.completion_ready is True
+    assert result.readiness.blockers == []
+    assert result.warnings[0].message == "Graph warning."
+    assert result.semantic_contracts[0].outcome == "satisfied"
+
+
+@pytest.mark.parametrize(
+    ("authoring_valid", "execution_ready", "completion_ready", "has_blocker"),
+    [
+        (False, True, True, False),
+        (True, False, True, False),
+        (True, True, False, False),
+        (True, True, True, True),
+    ],
+)
+def test_finish_success_rejects_inconsistent_readiness(
+    authoring_valid: bool,
+    execution_ready: bool,
+    completion_ready: bool,
+    has_blocker: bool,
+) -> None:
+    ledger = ValidationLedger()
+    _record_all_core_passes(ledger)
+    readiness = ValidationReadiness(
+        authoring_valid=authoring_valid,
+        execution_ready=execution_ready,
+        completion_ready=completion_ready,
+        blockers=([_blocked_readiness().blockers[0]] if has_blocker else []),
+    )
+
+    with pytest.raises(RuntimeError, match="successful readiness"):
+        ledger.finish_success(readiness=readiness)
+
+
+def test_finish_failure_rejects_execution_ready_readiness() -> None:
+    readiness = _blocked_readiness()
+    readiness.execution_ready = True
+
+    with pytest.raises(RuntimeError, match="execution_ready=False"):
+        ValidationLedger().finish_failure(
+            _check(CHECK_PLUGIN_ENABLEMENT, passed=False),
+            errors=(_error("blocked"),),
+            readiness=readiness,
+        )
+
+
+def test_finish_failure_requires_a_readiness_blocker() -> None:
+    readiness = _blocked_readiness()
+    readiness.blockers.clear()
+
+    with pytest.raises(RuntimeError, match="at least one blocker"):
+        ValidationLedger().finish_failure(
+            _check(CHECK_PLUGIN_ENABLEMENT, passed=False),
+            errors=(_error("blocked"),),
+            readiness=readiness,
+        )
+
+
+def test_finish_failure_allows_pending_interpretation_readiness() -> None:
+    ledger = ValidationLedger()
+    failed_name: ValidationCheckName = "interpretation_review"
+    for name in CORE_VALIDATION_CHECK_NAMES[: CORE_VALIDATION_CHECK_NAMES.index(failed_name)]:
+        ledger.record_pass(_check(name, passed=True))
+
+    result = ledger.finish_failure(
+        _check(failed_name, passed=False),
+        errors=(_error("pending interpretation"),),
+        readiness=_pending_readiness(),
+    )
+
+    assert result.readiness.authoring_valid is True
+    assert result.readiness.execution_ready is False
+    assert result.readiness.completion_ready is True
+    assert result.readiness.blockers[0].code == "interpretation_review_pending"
 
 
 def test_finish_success_before_all_core_passes_raises() -> None:

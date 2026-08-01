@@ -42,7 +42,7 @@ class ValidationLedger:
         if not check.passed:
             raise RuntimeError(f"record_pass requires a passed check; {check.name} failed")
         self._require_next_core(check.name)
-        self._checks.append(check)
+        self._checks.append(check.model_copy(deep=True))
         self._core_count += 1
 
     def record_advisory(self, check: ValidationCheck) -> None:
@@ -54,7 +54,7 @@ class ValidationLedger:
             raise RuntimeError(f"{check.name} is not an identity_node_advisory check")
         if not check.passed:
             raise RuntimeError("identity_node_advisory records must pass")
-        self._checks.append(check)
+        self._checks.append(check.model_copy(deep=True))
 
     def finish_failure(
         self,
@@ -69,27 +69,34 @@ class ValidationLedger:
         if failed_check.passed:
             raise RuntimeError(f"finish_failure requires a failed check; {failed_check.name} passed")
         self._require_next_core(failed_check.name)
+        if readiness.execution_ready:
+            raise RuntimeError("failed validation readiness must set execution_ready=False")
+        if not readiness.blockers:
+            raise RuntimeError("failed validation readiness requires at least one blocker")
 
-        self._checks.append(failed_check)
+        failed_check_snapshot = failed_check.model_copy(deep=True)
+        readiness_snapshot = readiness.model_copy(deep=True)
+        semantic_contract_snapshots = [contract.model_copy(deep=True) for contract in semantic_contracts]
+        self._checks.append(failed_check_snapshot)
         self._core_count += 1
-        failed_index = VALIDATION_BLOCKING_CHECK_NAMES.index(failed_check.name)
+        failed_index = VALIDATION_BLOCKING_CHECK_NAMES.index(failed_check_snapshot.name)
         self._checks.extend(
             ValidationCheck(
                 name=name,
                 passed=False,
-                detail=f"Skipped: {failed_check.name} failed",
+                detail=f"Skipped: {failed_check_snapshot.name} failed",
                 affected_nodes=(),
                 outcome_code=CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
             )
             for name in VALIDATION_BLOCKING_CHECK_NAMES[failed_index + 1 :]
         )
-        self._errors.extend(errors)
+        self._errors.extend(error.model_copy(deep=True) for error in errors)
         result = ValidationResult(
             is_valid=False,
             checks=list(self._checks),
             errors=list(self._errors),
-            readiness=readiness,
-            semantic_contracts=list(semantic_contracts),
+            readiness=readiness_snapshot,
+            semantic_contracts=semantic_contract_snapshots,
         )
         self._finished = True
         return result
@@ -105,13 +112,15 @@ class ValidationLedger:
         self._ensure_open()
         if self._core_count != len(CORE_VALIDATION_CHECK_NAMES):
             raise RuntimeError("successful validation requires all 24 core checks to pass")
+        if not (readiness.authoring_valid and readiness.execution_ready and readiness.completion_ready) or readiness.blockers:
+            raise RuntimeError("successful readiness requires all readiness axes true and no blockers")
         result = ValidationResult(
             is_valid=True,
             checks=list(self._checks),
             errors=[],
-            warnings=list(warnings),
-            readiness=readiness,
-            semantic_contracts=list(semantic_contracts),
+            warnings=[warning.model_copy(deep=True) for warning in warnings],
+            readiness=readiness.model_copy(deep=True),
+            semantic_contracts=[contract.model_copy(deep=True) for contract in semantic_contracts],
         )
         self._finished = True
         return result
