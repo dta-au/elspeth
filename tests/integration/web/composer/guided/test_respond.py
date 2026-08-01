@@ -34,6 +34,10 @@ from elspeth.web.auth.models import UserIdentity
 from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.capability_skill import PlannerCapabilityManifest
+from elspeth.web.composer.guided.protocol import (
+    GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT,
+    GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT,
+)
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
@@ -1808,6 +1812,240 @@ class TestStep2IntraStep:
         assert replay.status_code == 200, replay.json()
         assert replay.json() == body
         assert captured == {}
+
+    def test_prose_revision_records_the_instruction_in_the_transcript(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """R2-F6: a transform-stage instruction is transcript evidence.
+
+        The docked-composer instruction drove a full re-plan but was recorded
+        only as a ``TurnRecord`` summary, so reloading the session showed a new
+        proposal with no trace of what the author asked for. The settlement now
+        appends the author's verbatim words plus one server-authored outcome
+        line to ``chat_history`` — the same channel ``/guided/chat`` writes and
+        the frontend renders — and the operation still replays byte-identically.
+        """
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="prose-transcript.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        before = _full_guided_session(staged)
+        instruction = "Add a deduplication transform before the output."
+        request_payload = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": payload["proposal_id"],
+            "draft_hash": payload["draft_hash"],
+            "edited_values": {"revision_instruction": instruction},
+        }
+
+        revised = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+
+        assert revised.status_code == 200, revised.json()
+        body = revised.json()
+        guided = _full_guided_session(body)
+        history = guided["chat_history"]
+        assert len(history) == len(before["chat_history"]) + 2
+        user_turn, assistant_turn = history[-2], history[-1]
+        assert user_turn["role"] == "user"
+        assert user_turn["content"] == instruction
+        assert user_turn["step"] == "step_3_transforms"
+        assert user_turn["assistant_message_kind"] is None
+        assert user_turn["synthetic_failure_reason"] is None
+        assert assistant_turn["role"] == "assistant"
+        assert assistant_turn["content"] == GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT
+        assert assistant_turn["step"] == "step_3_transforms"
+        assert assistant_turn["assistant_message_kind"] == "assistant"
+        assert assistant_turn["synthetic_failure_reason"] is None
+        assert user_turn["seq"] == before["chat_turn_seq"]
+        assert assistant_turn["seq"] == before["chat_turn_seq"] + 1
+        assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
+        # The narrow wire projection the frontend renders carries the same pair.
+        assert body["guided_session"]["chat_history"][-2:] == [user_turn, assistant_turn]
+
+        # Settlement/replay verification still holds: the same request replays
+        # the identical settled body, and a reload projects the same transcript.
+        replay = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+        assert replay.status_code == 200, replay.json()
+        assert replay.json() == body
+        assert _get_guided(composer_test_client, session_id)["guided_session"]["chat_history"][-2:] == [user_turn, assistant_turn]
+
+    def test_declined_prose_revision_records_the_instruction_before_the_decline(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R2-F6: a declined instruction is still transcript evidence.
+
+        The decline path already appends the advisor's words. Without the
+        instruction ahead of them the transcript reads as a refusal of nothing,
+        and the author's request is lost entirely because a decline stages no
+        proposal and persists no correction message.
+        """
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+        decline_text = "I could not fit that instruction to the reviewed components."
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="declined-prose.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        before = _full_guided_session(staged)
+
+        async def decline_planner(**_kwargs: object) -> object:
+            return GuidedPlannerDecline(decline_text=decline_text)
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            decline_planner,
+        )
+        instruction = "Add a transform that cannot exist."
+        declined = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {"revision_instruction": instruction},
+            },
+        )
+
+        assert declined.status_code == 200, declined.json()
+        guided = _full_guided_session(declined.json())
+        history = guided["chat_history"]
+        assert len(history) == len(before["chat_history"]) + 2
+        assert [(entry["role"], entry["content"], entry["step"]) for entry in history[-2:]] == [
+            ("user", instruction, "step_3_transforms"),
+            ("assistant", decline_text, "step_3_transforms"),
+        ]
+        assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
+        # The decline stages nothing: the pending proposal survives untouched.
+        assert guided["active_proposal"]["proposal_id"] == payload["proposal_id"]
+
+    def test_wire_correction_records_the_feedback_in_the_transcript(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """R2-F6: the wire-stage correction is the same transcript evidence.
+
+        ``correction_feedback`` is persisted as a chat_messages row and bound
+        into ``correction_messages`` custody, but never reached the rendered
+        transcript. It is the author's verbatim prose driving a full re-plan,
+        exactly like the transform-stage instruction, so it is recorded the
+        same way — at ``step_4_wire``.
+        """
+        session_id = _create_session(composer_test_client)
+        self._stage_proposal(composer_test_client, session_id, filename="wire-transcript.jsonl")
+        reviewed = _review_wiring(composer_test_client, session_id)
+        wire_turn = reviewed["next_turn"]
+        wire_payload = wire_turn["payload"]
+        before = _full_guided_session(reviewed)
+        feedback = "Route the reviewed source through the requested processing before the output."
+        request_payload = {
+            "operation_id": str(uuid4()),
+            "turn_token": wire_turn["turn_token"],
+            "proposal_id": wire_payload["proposal_id"],
+            "draft_hash": wire_payload["draft_hash"],
+            "edit_target": wire_payload["connections"][0]["from_endpoint"],
+            "correction_feedback": feedback,
+        }
+
+        corrected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+
+        assert corrected.status_code == 200, corrected.json()
+        body = corrected.json()
+        guided = _full_guided_session(body)
+        history = guided["chat_history"]
+        assert len(history) == len(before["chat_history"]) + 2
+        user_turn, assistant_turn = history[-2], history[-1]
+        assert user_turn["role"] == "user"
+        assert user_turn["content"] == feedback
+        assert user_turn["step"] == "step_4_wire"
+        assert assistant_turn["role"] == "assistant"
+        assert assistant_turn["content"] == GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT
+        assert assistant_turn["step"] == "step_4_wire"
+        assert assistant_turn["assistant_message_kind"] == "assistant"
+        assert assistant_turn["synthetic_failure_reason"] is None
+        assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
+
+        replay = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+        assert replay.status_code == 200, replay.json()
+        assert replay.json() == body
+
+    def test_declined_wire_correction_records_the_feedback_before_the_decline(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """R2-F6: the step-4 decline composes with the wire turn too.
+
+        The decline settles ``base_guided`` unmutated, so at step 4 the appended
+        pair lands on a session that still holds a live active proposal and an
+        unanswered confirm_wiring turn — a different shape from the step-3
+        decline. A declined correction persists no chat_messages row either, so
+        without this the feedback is lost outright.
+        """
+        from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline
+
+        decline_text = "I could not rewire the graph the way you asked."
+        session_id = _create_session(composer_test_client)
+        self._stage_proposal(composer_test_client, session_id, filename="declined-wire.jsonl")
+        reviewed = _review_wiring(composer_test_client, session_id)
+        wire_turn = reviewed["next_turn"]
+        wire_payload = wire_turn["payload"]
+        before = _full_guided_session(reviewed)
+
+        async def decline_planner(**_kwargs: object) -> object:
+            return GuidedPlannerDecline(decline_text=decline_text)
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            decline_planner,
+        )
+        feedback = "Rewire this through a component that does not exist."
+        declined = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": wire_turn["turn_token"],
+                "proposal_id": wire_payload["proposal_id"],
+                "draft_hash": wire_payload["draft_hash"],
+                "edit_target": wire_payload["connections"][0]["from_endpoint"],
+                "correction_feedback": feedback,
+            },
+        )
+
+        assert declined.status_code == 200, declined.json()
+        body = declined.json()
+        guided = _full_guided_session(body)
+        history = guided["chat_history"]
+        assert len(history) == len(before["chat_history"]) + 2
+        assert [(entry["role"], entry["content"], entry["step"]) for entry in history[-2:]] == [
+            ("user", feedback, "step_4_wire"),
+            ("assistant", decline_text, "step_4_wire"),
+        ]
+        assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
+        # The decline stages nothing: the reviewed proposal and its unanswered
+        # wire turn survive, so the operator retries with a fresh operation_id.
+        assert guided["step"] == "step_4_wire"
+        assert guided["active_proposal"]["proposal_id"] == wire_payload["proposal_id"]
+        assert body["next_turn"]["type"] == "confirm_wiring"
+        assert _get_guided(composer_test_client, session_id)["next_turn"]["turn_token"] == wire_turn["turn_token"]
 
     def test_competing_respond_answers_fast_coded_conflict_during_planner_settlement(
         self,
