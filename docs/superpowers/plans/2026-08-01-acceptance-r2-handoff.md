@@ -18,11 +18,12 @@ reviewed. Working tree clean.
 | Per-task reports | same directory, `task-N-report.md` |
 | Cold-install agent prompt (run 3) | `docs-archive/acceptance/agent-prompt-aws-cold-install-r3.md` (offline by design) |
 
-**Verification status:** `elspeth-lints check` passed. The full
-`pytest tests/ -n 12` was re-running at handoff — the *previous* full run on the
-same tree was **35,620 passed / 1 failed**, and that one failure (T21's runbook
-contract) is fixed in `853dd2dfb`. Staging smoke, redeploy and the live
-10-exercise run were **deliberately not started**, at the operator's
+**Verification status:** **fully green.** `pytest tests/ -n 12` →
+**35,649 passed, 27 skipped, 1 xfailed, 0 failed** (14m19s) at `18c06d49f`, and
+`elspeth-lints check` exit 0. This is a clean pre-refactor baseline: any failure
+after the engine refactor merges is attributable to the refactor, not to the
+sprint. Staging smoke, redeploy and the live 10-exercise run were
+**deliberately not started**, at the operator's
 instruction, so the engine refactor folds into one verification pass.
 
 ## What the refactor merge should watch
