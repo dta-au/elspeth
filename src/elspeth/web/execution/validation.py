@@ -28,19 +28,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
-import yaml
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.blobs import BlobRecord
-from elspeth.contracts.blobs_inline import BlobInlineValidationViolation
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary
-from elspeth.core.blobs_inline import (
-    BLOB_INLINE_AGGREGATE_BYTE_CAP,
-    BLOB_INLINE_PER_REF_BYTE_CAP,
-    _substitute_blob_content_refs_for_validation,
-    _validate_blob_content_refs_sync,
-)
 from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.core.dag.models import EdgeContractError, GraphValidationError, GraphValidationWarning
 from elspeth.core.secrets import redact_secret_refs_for_validation, resolve_secret_refs
@@ -71,6 +63,15 @@ from elspeth.web.execution._validation_authoring import (
     validate_web_resource_policy,
 )
 from elspeth.web.execution._validation_ledger import ValidationLedger
+from elspeth.web.execution._validation_materialization import (
+    materialize_validation_yaml,
+    validate_aws_s3_endpoint_url_policy,
+    validate_aws_s3_source_policy,
+    validate_llm_base_url_policy,
+    validate_llm_retry_budget_policy,
+    validate_llm_tracing_policy,
+    validate_managed_identity_policy,
+)
 from elspeth.web.execution._validation_model import PhaseFailure, PhaseReport
 from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
 from elspeth.web.execution.preflight import (
@@ -80,20 +81,12 @@ from elspeth.web.execution.preflight import (
     RUNTIME_GRAPH_VALIDATION_CHECKS,
     build_runtime_graph,
     instantiate_runtime_plugins,
-    resolve_runtime_yaml_paths,
 )
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import (
-    CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-    CHECK_AWS_S3_SOURCE_POLICY,
     CHECK_BATCH_TRANSFORM_OPTIONS,
-    CHECK_BLOB_INLINE_REFS,
     CHECK_IDENTITY_NODE_ADVISORY,
     CHECK_INTERPRETATION_REVIEW,
-    CHECK_LLM_BASE_URL_POLICY,
-    CHECK_LLM_RETRY_BUDGET_POLICY,
-    CHECK_LLM_TRACING_POLICY,
-    CHECK_MANAGED_IDENTITY_POLICY,
     CHECK_OPERATOR_PROFILE_OPTIONS,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
     CHECK_PATH_ALLOWLIST,
@@ -117,14 +110,6 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-from elspeth.web.provider_config_policy import (
-    web_aws_s3_endpoint_url_policy_error,
-    web_aws_s3_source_policy_error,
-    web_llm_base_url_policy_error,
-    web_llm_retry_budget_policy_error,
-    web_llm_tracing_policy_error,
-    web_rag_provider_config_policy_error,
-)
 
 # ── Check names (ordered) ─────────────────────────────────────────────
 _CHECK_PLUGIN_ENABLEMENT = CHECK_PLUGIN_ENABLEMENT
@@ -135,16 +120,9 @@ _CHECK_PATH_ALLOWLIST = CHECK_PATH_ALLOWLIST
 _CHECK_WEB_SCRAPE_NETWORK_POLICY = CHECK_WEB_SCRAPE_NETWORK_POLICY
 _CHECK_WEB_FETCH_RESOURCE_POLICY = CHECK_WEB_FETCH_RESOURCE_POLICY
 _CHECK_SECRET_REFS = CHECK_SECRET_REFS
-_CHECK_BLOB_INLINE_REFS = CHECK_BLOB_INLINE_REFS
 _CHECK_SEMANTIC_CONTRACTS = CHECK_SEMANTIC_CONTRACTS
 _CHECK_BATCH_TRANSFORM_OPTIONS = CHECK_BATCH_TRANSFORM_OPTIONS
 _CHECK_INTERPRETATION_REVIEW = CHECK_INTERPRETATION_REVIEW
-_CHECK_MANAGED_IDENTITY_POLICY = CHECK_MANAGED_IDENTITY_POLICY
-_CHECK_LLM_RETRY_BUDGET_POLICY = CHECK_LLM_RETRY_BUDGET_POLICY
-_CHECK_LLM_BASE_URL_POLICY = CHECK_LLM_BASE_URL_POLICY
-_CHECK_LLM_TRACING_POLICY = CHECK_LLM_TRACING_POLICY
-_CHECK_AWS_S3_ENDPOINT_URL_POLICY = CHECK_AWS_S3_ENDPOINT_URL_POLICY
-_CHECK_AWS_S3_SOURCE_POLICY = CHECK_AWS_S3_SOURCE_POLICY
 _CHECK_SETTINGS = CHECK_SETTINGS
 _CHECK_PLUGINS = RUNTIME_CHECK_PLUGIN_INSTANTIATION
 _CHECK_VALUE_SOURCE_COMPLIANCE = CHECK_VALUE_SOURCE_COMPLIANCE
@@ -218,7 +196,7 @@ _DEFAULT_PLUGIN_POLICY_SUGGESTION = _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION
 _collect_secret_refs = _authoring_collect_secret_refs
 
 
-def _apply_authoring_phase[T](
+def _apply_phase[T](
     ledger: ValidationLedger,
     report: PhaseReport[T] | PhaseFailure,
 ) -> T | ValidationResult:
@@ -699,46 +677,6 @@ def _find_identity_node_advisories(state: CompositionState) -> list[_IdentityFin
     return findings
 
 
-def _blob_inline_component_id(field_path: str) -> str | None:
-    if field_path == "(aggregate)":
-        return None
-    if field_path.startswith("source."):
-        return "source"
-    if field_path.startswith("node:"):
-        component, _separator, _rest = field_path.partition(".")
-        return component[len("node:") :]
-    if field_path.startswith("output:"):
-        component, _separator, _rest = field_path.partition(".")
-        return component[len("output:") :]
-    return field_path
-
-
-def _blob_inline_component_type(field_path: str) -> str | None:
-    if field_path == "(aggregate)":
-        return None
-    if field_path.startswith("source."):
-        return "source"
-    if field_path.startswith("node:"):
-        return "transform"
-    if field_path.startswith("output:"):
-        return "sink"
-    return None
-
-
-def _blob_inline_validation_detail(violations: list[BlobInlineValidationViolation]) -> str:
-    return "; ".join(f"{violation.field_path}: {violation.category}" for violation in violations)
-
-
-def _blob_inline_validation_error(violation: BlobInlineValidationViolation) -> ValidationError:
-    return ValidationError(
-        component_id=_blob_inline_component_id(violation.field_path),
-        component_type=_blob_inline_component_type(violation.field_path),
-        message=f"Inline content blob reference at {violation.field_path} is {violation.category}: {violation.detail}",
-        suggestion="Verify the blob exists, is ready, is under the configured size caps, and matches the pinned sha256.",
-        error_code=f"{violation.category}_inline_blob_content",
-    )
-
-
 # The two required-with-no-default top-level parts of ElspethSettings (see
 # core/config.py). A composition missing either fails assembly with a raw
 # pydantic "Field required" dump; ``_reframe_settings_missing_parts`` maps each
@@ -933,7 +871,7 @@ def _validate_pipeline_impl(
 
     ledger = ValidationLedger()
 
-    policy = _apply_authoring_phase(
+    policy = _apply_phase(
         ledger,
         lower_plugin_policy(
             state,
@@ -945,7 +883,7 @@ def _validate_pipeline_impl(
     if isinstance(policy, ValidationResult):
         return policy
 
-    path_validated = _apply_authoring_phase(
+    path_validated = _apply_phase(
         ledger,
         validate_path_policy(
             policy,
@@ -956,21 +894,21 @@ def _validate_pipeline_impl(
     if isinstance(path_validated, ValidationResult):
         return path_validated
 
-    network_validated = _apply_authoring_phase(
+    network_validated = _apply_phase(
         ledger,
         validate_web_network_policy(path_validated, plugin_snapshot=plugin_snapshot),
     )
     if isinstance(network_validated, ValidationResult):
         return network_validated
 
-    resource_validated = _apply_authoring_phase(
+    resource_validated = _apply_phase(
         ledger,
         validate_web_resource_policy(network_validated, plugin_snapshot=plugin_snapshot),
     )
     if isinstance(resource_validated, ValidationResult):
         return resource_validated
 
-    secret_validated = _apply_authoring_phase(
+    secret_validated = _apply_phase(
         ledger,
         validate_secret_evidence(
             resource_validated,
@@ -981,21 +919,21 @@ def _validate_pipeline_impl(
     if isinstance(secret_validated, ValidationResult):
         return secret_validated
 
-    semantic_validated = _apply_authoring_phase(
+    semantic_validated = _apply_phase(
         ledger,
         validate_semantic_evidence(secret_validated),
     )
     if isinstance(semantic_validated, ValidationResult):
         return semantic_validated
 
-    batch_validated = _apply_authoring_phase(
+    batch_validated = _apply_phase(
         ledger,
         validate_batch_options(semantic_validated),
     )
     if isinstance(batch_validated, ValidationResult):
         return batch_validated
 
-    interpretation_validated = _apply_authoring_phase(
+    interpretation_validated = _apply_phase(
         ledger,
         review_interpretations(
             batch_validated,
@@ -1005,422 +943,78 @@ def _validate_pipeline_impl(
     if isinstance(interpretation_validated, ValidationResult):
         return interpretation_validated
 
-    # The materialization/runtime phases remain legacy until Tasks 6 and 7.
-    # They consume a snapshot, so authored phases never share mutable check state.
+    materialized = _apply_phase(
+        ledger,
+        materialize_validation_yaml(
+            interpretation_validated,
+            yaml_generator=yaml_generator,
+            data_dir=settings.data_dir,
+            session_id=session_id,
+            blob_get_metadata=blob_get_metadata,
+            load_yaml=dependencies.load_yaml,
+        ),
+    )
+    if isinstance(materialized, ValidationResult):
+        return materialized
+
+    managed_identity_validated = _apply_phase(
+        ledger,
+        validate_managed_identity_policy(materialized),
+    )
+    if isinstance(managed_identity_validated, ValidationResult):
+        return managed_identity_validated
+
+    retry_budget_validated = _apply_phase(
+        ledger,
+        validate_llm_retry_budget_policy(managed_identity_validated),
+    )
+    if isinstance(retry_budget_validated, ValidationResult):
+        return retry_budget_validated
+
+    base_url_validated = _apply_phase(
+        ledger,
+        validate_llm_base_url_policy(retry_budget_validated),
+    )
+    if isinstance(base_url_validated, ValidationResult):
+        return base_url_validated
+
+    tracing_validated = _apply_phase(
+        ledger,
+        validate_llm_tracing_policy(base_url_validated),
+    )
+    if isinstance(tracing_validated, ValidationResult):
+        return tracing_validated
+
+    endpoint_validated = _apply_phase(
+        ledger,
+        validate_aws_s3_endpoint_url_policy(
+            tracing_validated,
+            plugin_snapshot=plugin_snapshot,
+        ),
+    )
+    if isinstance(endpoint_validated, ValidationResult):
+        return endpoint_validated
+
+    provider_validated = _apply_phase(
+        ledger,
+        validate_aws_s3_source_policy(
+            endpoint_validated,
+            plugin_snapshot=plugin_snapshot,
+        ),
+    )
+    if isinstance(provider_validated, ValidationResult):
+        return provider_validated
+
+    # Runtime phases remain legacy until Task 7. They consume immutable
+    # materialization evidence and never share mutable phase check state.
     checks = list(ledger.checks)
     errors = []
-    authored = interpretation_validated.authored
+    authored = provider_validated.authored
     policy_state = authored.policy.state
-    materialized_state = interpretation_validated.materialized_state
     all_refs = list(authored.all_secret_refs)
     env_ref_names = set(authored.env_ref_names)
     semantic_contracts = authored.semantic_contracts
-
-    # Step 2: Generate YAML
-    pipeline_yaml = yaml_generator.generate_yaml(materialized_state)
-    pipeline_yaml = resolve_runtime_yaml_paths(pipeline_yaml, str(settings.data_dir), session_id=session_id)
-
-    if blob_get_metadata is not None and "blob_ref" in pipeline_yaml and "inline_content" in pipeline_yaml:
-        config_dict = dependencies.load_yaml(pipeline_yaml)
-        if type(config_dict) is not dict:
-            raise TypeError(
-                f"generate_yaml() produced non-dict YAML (got {type(config_dict).__name__}) — this is a bug in the YAML generator"
-            )
-        blob_violations = _validate_blob_content_refs_sync(
-            blob_get_metadata,
-            config_dict,
-            per_ref_byte_cap=BLOB_INLINE_PER_REF_BYTE_CAP,
-            aggregate_byte_cap=BLOB_INLINE_AGGREGATE_BYTE_CAP,
-        )
-        if blob_violations:
-            detail = _blob_inline_validation_detail(blob_violations)
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_BLOB_INLINE_REFS,
-                    passed=False,
-                    detail=detail,
-                    affected_nodes=(),
-                    outcome_code=None,
-                )
-            )
-            errors.extend(_blob_inline_validation_error(violation) for violation in blob_violations)
-            _append_skipped_checks(checks, _CHECK_BLOB_INLINE_REFS)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=errors,
-                readiness=_blocked_readiness(
-                    code="blob_inline_refs",
-                    detail=detail,
-                ),
-                semantic_contracts=list(semantic_contracts),
-            )
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_BLOB_INLINE_REFS,
-                passed=True,
-                detail="All inline-content blob references are valid",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-        pipeline_yaml = yaml.dump(_substitute_blob_content_refs_for_validation(config_dict), default_flow_style=False)
-    elif blob_get_metadata is None:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_BLOB_INLINE_REFS,
-                passed=True,
-                detail="No blob metadata service — check skipped",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-    else:
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_BLOB_INLINE_REFS,
-                passed=True,
-                detail="No inline-content blob references found",
-                affected_nodes=(),
-                outcome_code=None,
-            )
-        )
-
-    # managed_identity_policy (#8) and llm_retry_budget_policy (#9) run here to
-    # match their declared position in VALIDATION_BLOCKING_CHECK_NAMES — AFTER
-    # web_scrape_network_policy (#2) through blob_inline_refs (#7). Emitting them
-    # earlier left their pass records in ``checks`` before an earlier-declared
-    # gate could fail, which suppressed the canonical skipped-after-failure record
-    # and made the trail report a later gate passing under an earlier failure.
-    for node in policy_state.nodes:
-        if node.node_type != "transform":
-            continue
-        provider_policy_error = web_rag_provider_config_policy_error(node.options)
-        if provider_policy_error is not None:
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_MANAGED_IDENTITY_POLICY,
-                    passed=False,
-                    detail=f"Transform '{node.id}' uses disallowed managed identity provider_config",
-                    affected_nodes=(node.id,),
-                    outcome_code=None,
-                )
-            )
-            _append_skipped_checks(checks, _CHECK_MANAGED_IDENTITY_POLICY)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=[
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=provider_policy_error,
-                        suggestion="Use api_key authentication or an operator-controlled named connector/allowlist.",
-                        error_code=None,
-                    ),
-                ],
-                readiness=_blocked_readiness(
-                    code=_CHECK_MANAGED_IDENTITY_POLICY,
-                    detail=f"transform {node.id} enables managed identity from web-authored provider_config",
-                    component_id=node.id,
-                    component_type="transform",
-                ),
-                semantic_contracts=list(semantic_contracts),
-            )
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_MANAGED_IDENTITY_POLICY,
-            passed=True,
-            detail="No web-authored managed identity provider_config",
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    for node in policy_state.nodes:
-        if node.node_type != "transform":
-            continue
-        llm_retry_policy_error = web_llm_retry_budget_policy_error(node.plugin, node.options)
-        if llm_retry_policy_error is not None:
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_LLM_RETRY_BUDGET_POLICY,
-                    passed=False,
-                    detail=f"Transform '{node.id}' uses disallowed sequential multi-query LLM retry budget",
-                    affected_nodes=(node.id,),
-                    outcome_code=None,
-                )
-            )
-            _append_skipped_checks(checks, _CHECK_LLM_RETRY_BUDGET_POLICY)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=[
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=llm_retry_policy_error,
-                        suggestion=(
-                            "Set max_capacity_retry_seconds to a small positive value or configure pool_size > 1 for pooled retry handling."
-                        ),
-                        error_code=None,
-                    ),
-                ],
-                readiness=_blocked_readiness(
-                    code=_CHECK_LLM_RETRY_BUDGET_POLICY,
-                    detail=f"transform {node.id} uses an unsafe sequential multi-query LLM retry budget",
-                    component_id=node.id,
-                    component_type="transform",
-                ),
-                semantic_contracts=list(semantic_contracts),
-            )
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_LLM_RETRY_BUDGET_POLICY,
-            passed=True,
-            detail="No unsafe web-authored sequential multi-query LLM retry budget",
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    # llm_base_url_policy (#10) — web-authored OpenRouter LLM nodes may not
-    # override base_url. The api_key resolves server-side (possibly a server-
-    # scoped secret the author cannot read), so a custom base_url would direct
-    # the server's bearer to an author-chosen destination — a credential-egress
-    # / SSRF vector. The plugin config-validator tolerates HTTP loopback for the
-    # CLI dev examples; this web-execution gate is the boundary that makes the
-    # single-machine threat model not leak into the hosted path. Mirrors the
-    # managed_identity / web_scrape network policies.
-    for node in policy_state.nodes:
-        if node.node_type != "transform":
-            continue
-        llm_base_url_policy_error = web_llm_base_url_policy_error(node.plugin, node.options)
-        if llm_base_url_policy_error is not None:
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_LLM_BASE_URL_POLICY,
-                    passed=False,
-                    detail=f"Transform '{node.id}' overrides OpenRouter base_url in a web-authored pipeline",
-                    affected_nodes=(node.id,),
-                    outcome_code=None,
-                )
-            )
-            _append_skipped_checks(checks, _CHECK_LLM_BASE_URL_POLICY)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=[
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=llm_base_url_policy_error,
-                        suggestion="Remove the base_url option to use the canonical OpenRouter endpoint.",
-                        error_code="llm_base_url_not_allowed",
-                    ),
-                ],
-                readiness=_blocked_readiness(
-                    code=_CHECK_LLM_BASE_URL_POLICY,
-                    detail=f"transform {node.id} overrides OpenRouter base_url in a web-authored pipeline",
-                    component_id=node.id,
-                    component_type="transform",
-                ),
-                semantic_contracts=list(semantic_contracts),
-            )
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_LLM_BASE_URL_POLICY,
-            passed=True,
-            detail="No web-authored OpenRouter base_url override",
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    for node in policy_state.nodes:
-        if node.node_type != "transform":
-            continue
-        llm_tracing_policy_error = web_llm_tracing_policy_error(node.plugin, node.options)
-        if llm_tracing_policy_error is not None:
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_LLM_TRACING_POLICY,
-                    passed=False,
-                    detail=f"Transform '{node.id}' configures tracing in a web-authored pipeline",
-                    affected_nodes=(node.id,),
-                    outcome_code=None,
-                )
-            )
-            _append_skipped_checks(checks, _CHECK_LLM_TRACING_POLICY)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=[
-                    ValidationError(
-                        component_id=node.id,
-                        component_type="transform",
-                        message=llm_tracing_policy_error,
-                        suggestion="Remove tracing; tracing destinations and credentials are operator-controlled.",
-                        error_code="llm_tracing_not_allowed",
-                    ),
-                ],
-                readiness=_blocked_readiness(
-                    code=_CHECK_LLM_TRACING_POLICY,
-                    detail=f"transform {node.id} configures tracing in a web-authored pipeline",
-                    component_id=node.id,
-                    component_type="transform",
-                ),
-                semantic_contracts=list(semantic_contracts),
-            )
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_LLM_TRACING_POLICY,
-            passed=True,
-            detail="No web-authored LLM tracing configuration",
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    for source_name, source in policy_state.sources.items():
-        endpoint_policy_error = (
-            None if plugin_snapshot.is_trained_operator else web_aws_s3_endpoint_url_policy_error(source.plugin, source.options)
-        )
-        if endpoint_policy_error is None:
-            continue
-        source_component = "source" if source_name == "source" else f"source:{source_name}"
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-                passed=False,
-                detail=f"Source '{source_name}' sets aws_s3 endpoint_url in a web-authored pipeline",
-                affected_nodes=(source_component,),
-                outcome_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_AWS_S3_ENDPOINT_URL_POLICY)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=[
-                ValidationError(
-                    component_id=source_component,
-                    component_type="source",
-                    message=endpoint_policy_error,
-                    suggestion="Remove endpoint_url and use operator-controlled AWS configuration.",
-                    error_code="aws_s3_endpoint_url_not_allowed",
-                )
-            ],
-            readiness=_blocked_readiness(
-                code=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-                detail=f"source {source_component} sets aws_s3 endpoint_url in a web-authored pipeline",
-                component_id=source_component,
-                component_type="source",
-            ),
-            semantic_contracts=list(semantic_contracts),
-        )
-
-    for output in policy_state.outputs:
-        endpoint_policy_error = (
-            None if plugin_snapshot.is_trained_operator else web_aws_s3_endpoint_url_policy_error(output.plugin, output.options)
-        )
-        if endpoint_policy_error is None:
-            continue
-        checks.append(
-            ValidationCheck(
-                name=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-                passed=False,
-                detail=f"Sink '{output.name}' sets aws_s3 endpoint_url in a web-authored pipeline",
-                affected_nodes=(output.name,),
-                outcome_code=None,
-            )
-        )
-        _append_skipped_checks(checks, _CHECK_AWS_S3_ENDPOINT_URL_POLICY)
-        return ValidationResult(
-            is_valid=False,
-            checks=checks,
-            errors=[
-                ValidationError(
-                    component_id=output.name,
-                    component_type="sink",
-                    message=endpoint_policy_error,
-                    suggestion="Remove endpoint_url and use operator-controlled AWS configuration.",
-                    error_code="aws_s3_endpoint_url_not_allowed",
-                )
-            ],
-            readiness=_blocked_readiness(
-                code=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-                detail=f"sink {output.name} sets aws_s3 endpoint_url in a web-authored pipeline",
-                component_id=output.name,
-                component_type="sink",
-            ),
-            semantic_contracts=list(semantic_contracts),
-        )
-
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_AWS_S3_ENDPOINT_URL_POLICY,
-            passed=True,
-            detail=(
-                "No web-authored aws_s3 endpoint_url override"
-                if not plugin_snapshot.is_trained_operator
-                else "Local trained-operator validation is exempt from the web aws_s3 endpoint_url policy"
-            ),
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
-
-    if not plugin_snapshot.is_trained_operator:
-        for source_name, source in policy_state.sources.items():
-            source_policy_error = web_aws_s3_source_policy_error(source.plugin)
-            if source_policy_error is None:
-                continue
-            source_component = "source" if source_name == "source" else f"source:{source_name}"
-            checks.append(
-                ValidationCheck(
-                    name=_CHECK_AWS_S3_SOURCE_POLICY,
-                    passed=False,
-                    detail=f"Source '{source_name}' uses aws_s3 in a web-authored pipeline",
-                    affected_nodes=(source_component,),
-                    outcome_code=None,
-                )
-            )
-            _append_skipped_checks(checks, _CHECK_AWS_S3_SOURCE_POLICY)
-            return ValidationResult(
-                is_valid=False,
-                checks=checks,
-                errors=[
-                    ValidationError(
-                        component_id=source_component,
-                        component_type="source",
-                        message=source_policy_error,
-                        suggestion=("Use an operator-controlled connector, allowlisted ingestion job, or batch/CLI runtime for S3 reads."),
-                        error_code="aws_s3_source_not_allowed",
-                    )
-                ],
-                readiness=_blocked_readiness(
-                    code=_CHECK_AWS_S3_SOURCE_POLICY,
-                    detail=f"source {source_component} uses aws_s3 in a web-authored pipeline",
-                    component_id=source_component,
-                    component_type="source",
-                ),
-                semantic_contracts=list(semantic_contracts),
-            )
-
-    checks.append(
-        ValidationCheck(
-            name=_CHECK_AWS_S3_SOURCE_POLICY,
-            passed=True,
-            detail=(
-                "Web-authored pipeline does not use an aws_s3 source"
-                if not plugin_snapshot.is_trained_operator
-                else "Local trained-operator validation is exempt from the web aws_s3 source policy"
-            ),
-            affected_nodes=(),
-            outcome_code=None,
-        )
-    )
+    pipeline_yaml = provider_validated.pipeline_yaml
 
     # Step 3: Settings loading
     #
