@@ -114,7 +114,7 @@ def test_quarantined_row_boundaries_sweep_row_union_timeouts() -> None:
     row_union_executor.check_timeouts.assert_called_with("variant_union")
 
 
-def test_empty_first_fetch_with_pre_set_shutdown_records_interrupted_not_exhausted() -> None:
+def test_shutdown_set_during_empty_first_fetch_records_interrupted_without_eof_flush() -> None:
     driver = SourceIterationDriver(
         events=MagicMock(spec=EventBusProtocol),
         span_factory=MagicMock(spec=SpanFactory),
@@ -131,8 +131,6 @@ def test_empty_first_fetch_with_pre_set_shutdown_records_interrupted_not_exhaust
     source.on_success = "default"
     sink = MagicMock(spec=SinkProtocol)
     sink.name = "default"
-    driver.load_source_with_events = lambda run_id, ctx, active_source: iter(())  # type: ignore[method-assign]
-
     loop_ctx = LoopContext(
         counters=ExecutionCounters(),
         pending_tokens={"default": []},
@@ -144,11 +142,18 @@ def test_empty_first_fetch_with_pre_set_shutdown_records_interrupted_not_exhaust
         coalesce_node_map={},
     )
     shutdown_event = threading.Event()
-    shutdown_event.set()
+
+    def interrupt_during_first_fetch() -> Any:
+        shutdown_event.set()
+        return
+        yield
+
+    driver.load_source_with_events = lambda run_id, ctx, active_source: interrupt_during_first_fetch()  # type: ignore[method-assign]
 
     with (
         patch("elspeth.engine.orchestrator.source_iteration.track_operation", _null_track_operation),
         patch("elspeth.engine.orchestrator.source_iteration.record_schema_contract", return_value=True),
+        patch("elspeth.engine.orchestrator.source_iteration.run_end_of_input_barrier_flush") as end_of_input_flush,
     ):
         result = driver.run_main_processing_loop(
             loop_ctx,
@@ -159,7 +164,7 @@ def test_empty_first_fetch_with_pre_set_shutdown_records_interrupted_not_exhaust
             active_source_name="llm",
             active_source=source,
             shutdown_event=shutdown_event,
-            flush_end_of_input=False,
+            flush_end_of_input=True,
         )
 
     assert result.interrupted is True
@@ -167,3 +172,4 @@ def test_empty_first_fetch_with_pre_set_shutdown_records_interrupted_not_exhaust
     assert states == [RunSourceLifecycleState.LOADING, RunSourceLifecycleState.INTERRUPTED]
     assert RunSourceLifecycleState.EXHAUSTED not in states
     processor.process_row.assert_not_called()
+    end_of_input_flush.assert_not_called()

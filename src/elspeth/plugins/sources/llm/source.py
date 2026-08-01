@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Generator, Iterator, Mapping
 from functools import reduce
@@ -12,6 +13,7 @@ import structlog
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from pydantic import Field as PydanticField
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import Determinism, PluginSchema, SourceRow
 from elspeth.contracts.contexts import LifecycleContext, SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder
@@ -52,20 +54,39 @@ logger = structlog.get_logger(__name__)
 class _LLMSourceLoadSession(Iterator[SourceRow]):
     """Own the load iterator and its exactly-once resource teardown."""
 
-    def __init__(self, source: LLMSource, rows: Generator[SourceRow, None, None]) -> None:
+    def __init__(
+        self,
+        source: LLMSource,
+        rows: Generator[SourceRow, None, None],
+        shutdown_event: threading.Event | None,
+    ) -> None:
         self._source = source
         self._rows = rows
+        self._shutdown_event = shutdown_event
         self._closed = False
 
     def __next__(self) -> SourceRow:
         if self._closed:
+            raise StopIteration
+        if self._shutdown_event is not None and self._shutdown_event.is_set():
+            self._closed = True
+            try:
+                self._rows.close()
+            except contract_errors.TIER_1_ERRORS:
+                raise
+            except Exception as exc:
+                self._source._report_cleanup_failure(resource="load_iterator", error=exc, suppressed=True)
+            finally:
+                self._source._release_load_resources(suppress_errors=True)
             raise StopIteration
         try:
             return next(self._rows)
         except StopIteration:
             self._closed = True
             self._source._release_load_resources(
-                suppress_errors=self._source._validation_failure_handled,
+                suppress_errors=(
+                    self._source._validation_failure_handled or (self._shutdown_event is not None and self._shutdown_event.is_set())
+                ),
             )
             raise
         except BaseException:
@@ -203,7 +224,7 @@ class LLMSource(BaseSource):
         self._tracer: LangfuseTracer | None = None
         self._provider = None
         self._run_id: str | None = None
-        self._start_operation_id: str | None = None
+        self._load_operation_id: str | None = None
         self._telemetry_emit: TelemetryEmitCallback = make_warn_telemetry_before_start(logger)
         self._limiter: Any = None
         self._load_started = False
@@ -220,7 +241,6 @@ class LLMSource(BaseSource):
         self.close()
 
         self._run_id = ctx.run_id
-        self._start_operation_id = self._validated_optional_operation_id(ctx.operation_id)
         self._telemetry_emit = ctx.telemetry_emit
         limiter_name = (
             "azure_openai"
@@ -242,14 +262,6 @@ class LLMSource(BaseSource):
             raise
 
     @staticmethod
-    def _validated_optional_operation_id(operation_id: object) -> str | None:
-        if operation_id is None:
-            return None
-        if type(operation_id) is not str or not operation_id.strip():
-            raise FrameworkBugError("LLMSource lifecycle operation_id must be a non-empty string when present")
-        return operation_id
-
-    @staticmethod
     def _require_load_operation_id(operation_id: object) -> str:
         if type(operation_id) is not str or not operation_id.strip():
             raise FrameworkBugError("LLMSource.load requires a non-empty source-load operation_id")
@@ -261,10 +273,9 @@ class LLMSource(BaseSource):
         if self._provider is None or not self._on_start_called:
             raise FrameworkBugError("LLMSource.on_start() must initialize the provider before load()")
         operation_id = self._require_load_operation_id(ctx.operation_id)
-        if self._start_operation_id is not None and operation_id != self._start_operation_id:
-            raise FrameworkBugError("LLMSource.load operation_id differs from the lifecycle source-load operation")
+        self._load_operation_id = operation_id
         self._load_started = True
-        return _LLMSourceLoadSession(self, self._load_once(operation_id, ctx))
+        return _LLMSourceLoadSession(self, self._load_once(operation_id, ctx), ctx.shutdown_event)
 
     def _load_once(self, operation_id: str, ctx: SourceContext) -> Generator[SourceRow, None, None]:
         provider = self._provider
@@ -498,13 +509,37 @@ class LLMSource(BaseSource):
     def close(self) -> None:
         self._release_load_resources(suppress_errors=False)
 
+    def _report_cleanup_failure(self, *, resource: str, error: Exception, suppressed: bool) -> None:
+        """Emit cleanup health or acknowledge why correlation is unavailable."""
+        if self._run_id is not None and self._load_operation_id is not None:
+            emit_resource_cleanup_failed(
+                self._telemetry_emit,
+                run_id=self._run_id,
+                component="llm_source",
+                resource=resource,
+                error=error,
+                suppressed=suppressed,
+                state_id=None,
+                operation_id=self._load_operation_id,
+                token_id=None,
+                logger=logger,
+            )
+            return
+        logger.warning(
+            "resource_cleanup_telemetry_failed",
+            component="llm_source",
+            resource=resource,
+            cleanup_error_type=type(error).__name__,
+            failure_reason="missing_operation_parent",
+            run_id=self._run_id,
+        )
+
     def _release_load_resources(self, *, suppress_errors: bool) -> None:
         """Detach and close every resource, preserving any primary load outcome."""
         provider, self._provider = self._provider, None
         tracer, self._tracer = self._tracer, None
-        telemetry_emit = self._telemetry_emit
         self._limiter = None
-        failures: list[BaseException] = []
+        failures: list[Exception] = []
         for resource, close_resource in (
             ("provider", provider.close if provider is not None else None),
             ("tracer", tracer.flush if tracer else None),
@@ -513,28 +548,11 @@ class LLMSource(BaseSource):
                 continue
             try:
                 close_resource()
-            except BaseException as exc:
+            except contract_errors.TIER_1_ERRORS:
+                raise
+            except Exception as exc:
                 failures.append(exc)
-                if self._run_id is not None and self._start_operation_id is not None:
-                    emit_resource_cleanup_failed(
-                        telemetry_emit,
-                        run_id=self._run_id,
-                        component="llm_source",
-                        resource=resource,
-                        error=exc,
-                        suppressed=suppress_errors,
-                        state_id=None,
-                        operation_id=self._start_operation_id,
-                        token_id=None,
-                        logger=logger,
-                    )
-                else:
-                    logger.warning(
-                        "resource_cleanup_telemetry_failed",
-                        component="llm_source",
-                        resource=resource,
-                        error_type="MissingCorrelation",
-                    )
+                self._report_cleanup_failure(resource=resource, error=exc, suppressed=suppress_errors)
         self._telemetry_emit = make_warn_telemetry_before_start(logger)
         if failures and not suppress_errors:
             raise failures[0]

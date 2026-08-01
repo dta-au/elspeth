@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Generator
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -373,6 +373,109 @@ def test_pre_set_shutdown_before_first_next_has_no_request_row_or_trace(
     assert tracer.errors == []
 
 
+@pytest.mark.parametrize(
+    ("provider_close_fails", "tracer_flush_fails"),
+    [(True, False), (False, True), (True, True)],
+    ids=["provider", "tracer", "provider-and-tracer"],
+)
+def test_pre_set_shutdown_remains_primary_when_cleanup_fails(
+    source: LLMSource,
+    source_context: PluginContext,
+    provider_close_fails: bool,
+    tracer_flush_fails: bool,
+) -> None:
+    events: list[object] = []
+    provider = FakeProvider(
+        close_error=RuntimeError("provider cleanup failed") if provider_close_fails else None,
+    )
+    tracer = RecordingTracer()
+    if tracer_flush_fails:
+
+        def fail_tracer_flush() -> None:
+            tracer.flush_calls += 1
+            raise RuntimeError("tracer cleanup failed")
+
+        tracer.flush = MagicMock(side_effect=fail_tracer_flush)  # type: ignore[method-assign]
+    _install_provider(source, provider)
+    source._tracer = tracer
+    source._telemetry_emit = events.append
+    shutdown_event = threading.Event()
+    shutdown_event.set()
+    source_context.shutdown_event = shutdown_event
+
+    rows = list(source.load(source_context))
+
+    assert rows == []
+    assert provider.calls == 0
+    assert provider.close_calls == 1
+    assert tracer.successes == []
+    assert tracer.errors == []
+    assert tracer.flush_calls == 1
+    assert source._provider is None
+    assert source._tracer is None
+    operation_id = source_context.operation_id
+    assert operation_id is not None
+    expected_resources = set()
+    if provider_close_fails:
+        expected_resources.add("provider")
+    if tracer_flush_fails:
+        expected_resources.add("tracer")
+    assert {event.resource for event in events} == expected_resources  # type: ignore[attr-defined]
+    assert all(event.run_id == source_context.run_id for event in events)  # type: ignore[attr-defined]
+    assert all(event.operation_id == operation_id for event in events)  # type: ignore[attr-defined]
+    assert all(event.state_id is None for event in events)  # type: ignore[attr-defined]
+    assert all(event.token_id is None for event in events)  # type: ignore[attr-defined]
+    assert all(event.suppressed is True for event in events)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("failing_resource", ["provider", "tracer"])
+def test_shutdown_does_not_suppress_tier_one_resource_cleanup_failure(
+    source: LLMSource,
+    source_context: PluginContext,
+    failing_resource: str,
+) -> None:
+    provider = FakeProvider(
+        close_error=FrameworkBugError("provider cleanup invariant failed") if failing_resource == "provider" else None,
+    )
+    tracer = RecordingTracer()
+    if failing_resource == "tracer":
+        tracer.flush = MagicMock(side_effect=FrameworkBugError("tracer cleanup invariant failed"))  # type: ignore[method-assign]
+    _install_provider(source, provider)
+    source._tracer = tracer
+    shutdown_event = threading.Event()
+    shutdown_event.set()
+    source_context.shutdown_event = shutdown_event
+
+    with pytest.raises(FrameworkBugError, match="cleanup invariant failed"):
+        list(source.load(source_context))
+
+    assert provider.calls == 0
+    assert provider.close_calls == 1
+    assert tracer.successes == []
+    assert tracer.errors == []
+    assert source._provider is None
+    assert source._tracer is None
+
+
+def test_shutdown_does_not_suppress_tier_one_generator_close_failure(
+    source: LLMSource,
+    source_context: PluginContext,
+) -> None:
+    rows = MagicMock()
+    rows.close.side_effect = FrameworkBugError("generator close invariant failed")
+    shutdown_event = threading.Event()
+    shutdown_event.set()
+    source_context.shutdown_event = shutdown_event
+
+    with (
+        patch.object(source, "_load_once", return_value=cast("Generator[SourceRow, None, None]", rows)),
+        pytest.raises(FrameworkBugError, match="generator close invariant failed"),
+    ):
+        list(source.load(source_context))
+
+    rows.close.assert_called_once_with()
+
+
 def test_generator_close_does_not_surface_cleanup_failure(
     source: LLMSource,
     source_context: PluginContext,
@@ -402,27 +505,72 @@ def test_standalone_close_surfaces_cleanup_failure_once(
     assert source._provider is None
 
 
-def test_cleanup_failure_emits_bounded_system_health_telemetry(
-    source: LLMSource,
+def test_real_lifecycle_order_correlates_post_load_cleanup_telemetry(
+    openrouter_config: Callable[..., dict[str, Any]],
+    source_context: PluginContext,
 ) -> None:
+    operation_id = source_context.operation_id
+    assert operation_id is not None
+    source_context.operation_id = None
+    source = LLMSource(openrouter_config(response_field="answer"))
     events: list[object] = []
+    source_context.telemetry_emit = events.append
+    source.on_start(source_context)
+    assert source._load_operation_id is None  # type: ignore[attr-defined]
+
     provider = FakeProvider(close_error=RuntimeError("cleanup failed with secret material"))
     _install_provider(source, provider)
-    source._telemetry_emit = events.append
+    source_context.operation_id = operation_id
 
-    with pytest.raises(RuntimeError, match="cleanup failed"):
-        source.close()
+    rows = source.load(source_context)
+    assert source._load_operation_id == operation_id  # type: ignore[attr-defined]
+    cast(Generator[SourceRow, None, None], rows).close()
 
     assert len(events) == 1
     event = events[0]
     assert type(event).__name__ == "ResourceCleanupFailed"
     assert event.run_id == "test-run"  # type: ignore[attr-defined]
-    assert event.operation_id == source._start_operation_id  # type: ignore[attr-defined]
+    assert event.operation_id == operation_id  # type: ignore[attr-defined]
+    assert event.state_id is None  # type: ignore[attr-defined]
+    assert event.token_id is None  # type: ignore[attr-defined]
     assert event.component == "llm_source"  # type: ignore[attr-defined]
     assert event.resource == "provider"  # type: ignore[attr-defined]
     assert event.error_type == "RuntimeError"  # type: ignore[attr-defined]
-    assert event.suppressed is False  # type: ignore[attr-defined]
+    assert event.suppressed is True  # type: ignore[attr-defined]
     assert "secret" not in repr(event)
+
+
+def test_initialization_cleanup_without_load_operation_emits_no_correlated_event(
+    openrouter_config: Callable[..., dict[str, Any]],
+    source_context: PluginContext,
+) -> None:
+    source_context.operation_id = None
+    events: list[object] = []
+    source_context.telemetry_emit = events.append
+    provider = FakeProvider(close_error=RuntimeError("provider cleanup failed"))
+    source = LLMSource(openrouter_config(response_field="answer"))
+
+    with (
+        patch.object(source, "_create_provider", return_value=provider),
+        patch(
+            "elspeth.plugins.sources.llm.source.create_langfuse_tracer",
+            side_effect=RuntimeError("tracer initialization failed"),
+        ),
+        patch("elspeth.plugins.sources.llm.source.logger") as mock_logger,
+        pytest.raises(RuntimeError, match="tracer initialization failed"),
+    ):
+        source.on_start(source_context)
+
+    assert provider.close_calls == 1
+    assert events == []
+    mock_logger.warning.assert_called_once_with(
+        "resource_cleanup_telemetry_failed",
+        component="llm_source",
+        resource="provider",
+        cleanup_error_type="RuntimeError",
+        failure_reason="missing_operation_parent",
+        run_id="test-run",
+    )
 
 
 def test_cleanup_telemetry_failure_logs_last_resort_without_replacing_primary(

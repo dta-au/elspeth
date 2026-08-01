@@ -143,8 +143,7 @@ class TestConsoleExporterExportBehavior:
             resource="audited_http_client",
             error_type="RuntimeError",
             suppressed=True,
-            state_id="state-1",
-            token_id="token-1",
+            operation_id="source-load-op-1",
         )
 
         exporter.export(event)
@@ -156,6 +155,9 @@ class TestConsoleExporterExportBehavior:
         assert parsed["resource"] == "audited_http_client"
         assert parsed["error_type"] == "RuntimeError"
         assert parsed["suppressed"] is True
+        assert parsed["operation_id"] == "source-load-op-1"
+        assert parsed["state_id"] is None
+        assert parsed["token_id"] is None
         assert "error_message" not in parsed
 
     def test_json_format_with_gate_event(self) -> None:

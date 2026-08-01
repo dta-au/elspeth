@@ -584,6 +584,7 @@ class SourceIterationDriver:
                     else:
                         pending_source_item = next(source_iterator)
                 except StopIteration:
+                    interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
                     source_exhausted = not interrupted_by_shutdown
 
                 # Deferred recording flags — field resolution after first iteration,
@@ -629,7 +630,8 @@ class SourceIterationDriver:
                                 else:
                                     source_item = next(source_iterator)
                             except StopIteration:
-                                source_exhausted = True
+                                interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
+                                source_exhausted = not interrupted_by_shutdown
                                 break
 
                         current_source_row_index = source_row_index
