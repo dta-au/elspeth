@@ -67,6 +67,7 @@ from elspeth.web.composer.state import (
     _batch_distribution_profile_value_field_entries,
     _coalesce_branch_connections,
     _coalesce_branch_names,
+    _parse_template_names,
     gate_condition_is_constant,
     gate_route_destinations,
 )
@@ -110,6 +111,7 @@ from elspeth.web.execution.schemas import (
     CHECK_SECRET_REFS,
     CHECK_SEMANTIC_CONTRACTS,
     CHECK_SETTINGS,
+    CHECK_STATIC_LLM_PROMPT_ADVISORY,
     CHECK_VALUE_SOURCE_COMPLIANCE,
     CHECK_WEB_FETCH_RESOURCE_POLICY,
     CHECK_WEB_SCRAPE_NETWORK_POLICY,
@@ -229,6 +231,10 @@ _CHECK_IDENTITY_NODE_ADVISORY = CHECK_IDENTITY_NODE_ADVISORY
 
 # Second advisory, same non-blocking contract as the identity advisory above.
 _CHECK_GATE_FAN_OUT_ADVISORY = CHECK_GATE_FAN_OUT_ADVISORY
+
+# Third advisory, same non-blocking contract as the two above: flags an llm
+# transform node whose prompt_template interpolates no row data (elspeth-6bdb7e7736).
+_CHECK_STATIC_LLM_PROMPT_ADVISORY = CHECK_STATIC_LLM_PROMPT_ADVISORY
 
 # _CHECK_VALUE_SOURCE_COMPLIANCE slots between _CHECK_PLUGINS (typed configs
 # now exist) and _CHECK_GRAPH (so a hallucinated model fails before any DAG
@@ -674,6 +680,76 @@ def _find_gate_fan_out_advisories(state: CompositionState) -> list[_GateFanOutFi
                 destinations=tuple(sorted(destinations)),
             )
         )
+    return findings
+
+
+@dataclass(frozen=True, slots=True)
+class _StaticLLMPromptFinding:
+    """One llm transform node whose prompt_template interpolates no row data.
+
+    Attributes:
+        node_id: ID of the offending node.
+    """
+
+    node_id: str
+
+
+@observation_boundary(
+    tier=3,
+    source="composer-authored CompositionState node options (Tier-3, operator/LLM-supplied prompt_template)",
+    source_param="state",
+    suppresses=("R1",),
+    invariant="returns advisory findings; unparseable or absent templates are skipped, never raised on",
+)
+def _find_static_llm_prompt_advisories(state: CompositionState) -> list[_StaticLLMPromptFinding]:
+    """Detect llm transform nodes whose prompt_template references no row data.
+
+    A node is flagged iff ALL of the following hold:
+
+    1. ``node_type == "transform"`` and ``plugin == "llm"``.
+    2. ``options["queries"]`` is absent (single-prompt mode). Multi-query
+       nodes render each query's own per-query context
+       (``build_template_context`` in multi_query.py), so the node-level
+       ``prompt_template`` is out of scope here — the same ``queries is
+       None`` boundary ``_validate_prompt_template_variable_bindings`` uses.
+    3. ``options["prompt_template"]`` is a string that parses (after masking
+       ``{{interpretation:...}}`` placeholders, which resolve to
+       operator-accepted text upstream of rendering and are not Jinja2
+       names — same masking the sibling unbound-variable guard applies).
+    4. The parsed template's top-level names (``_parse_template_names``,
+       reused from ``composer/state.py`` rather than re-parsing) do not
+       include ``"row"``. This catches every access shape — ``row.field``,
+       ``row["field"]``, ``row[expr]``, and ``{% for x in row %}`` — because
+       any reference to ``row`` makes it an undeclared top-level name,
+       whether or not it resolves to a concrete field. A template with no
+       ``row`` reference renders byte-identical for every input row.
+
+    ``lookup.*``-only templates ARE flagged: ``PromptTemplate`` binds
+    ``lookup`` once at construction from static YAML data (see
+    ``plugins/transforms/llm/templates.py`` — "Static lookup data from YAML
+    file") and never re-binds it per row, so a lookup-only template is just
+    as static as a template with no interpolation at all.
+
+    Returns:
+        List of :class:`_StaticLLMPromptFinding`, one per detected node.
+        Empty when nothing was detected.
+    """
+    findings: list[_StaticLLMPromptFinding] = []
+    for node in state.nodes:
+        if node.node_type != "transform" or node.plugin != "llm":
+            continue
+        if node.options.get("queries") is not None:
+            continue
+        template = node.options.get("prompt_template")
+        if not isinstance(template, str):
+            continue
+        parsed = _parse_template_names(template)
+        if parsed is None:
+            continue
+        top_level_names, _row_fields = parsed
+        if "row" in top_level_names:
+            continue
+        findings.append(_StaticLLMPromptFinding(node_id=node.id))
     return findings
 
 
@@ -2694,6 +2770,30 @@ def validate_pipeline(
                     "different destinations."
                 ),
                 affected_nodes=(fan_out_finding.node_id,),
+                outcome_code=None,
+            )
+        )
+
+    # Static-prompt LLM advisory — same non-blocking, happy-path-only contract
+    # as the two advisories above. Operator direction (elspeth-6bdb7e7736):
+    # a static-prompt llm transform is essentially a *source* shape
+    # (generating rows) mis-declared as a transform, and an llm source
+    # plugin kind may exist in future — so this never escalates to a
+    # rejection, now or later.
+    for static_prompt_finding in _find_static_llm_prompt_advisories(state):
+        checks.append(
+            ValidationCheck(
+                name=_CHECK_STATIC_LLM_PROMPT_ADVISORY,
+                passed=True,
+                detail=(
+                    f"Node '{static_prompt_finding.node_id}' has a prompt_template that interpolates no row "
+                    "data, so every row receives an identical prompt to the model — one call would do the "
+                    "same work as looping over every row. If the intent is transformation, add a 'row.*' "
+                    "reference so each row's prompt reflects its own data. If the intent is generation "
+                    "(producing rows from a fixed prompt, not transforming existing ones), that is a "
+                    "source-shaped need the 'llm' transform kind cannot express today."
+                ),
+                affected_nodes=(static_prompt_finding.node_id,),
                 outcome_code=None,
             )
         )
