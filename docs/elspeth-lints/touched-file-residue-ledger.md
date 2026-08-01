@@ -125,6 +125,33 @@ allowlist, signature, staging bundle, or trust-tier rule was changed.
 
 Unresolved stale residue for this entry: **0 sites**.
 
+## Entry 5: Second release sync — static-prompt advisory port
+
+- Date: 2026-08-01
+- Release authority: `origin/release/0.7.2@931637f0d`
+- Discovered by: merge-conflict resolution, independent port-plan review, and
+  full touched-file review
+- Merges: `b2e074dc4`, `6dda8c447`; corrected commit: `57194b07b`
+- Result: 11 corrected sites across 2 existing and 1 new pattern classes
+
+| Pattern | Sites | Exact surface | Plausible detector |
+|---|---:|---|---|
+| Stale coupling to private aliases | 8 | Release's `test_static_llm_prompt_advisory.py` imported `_CHECK_STATIC_LLM_PROMPT_ADVISORY` from the facade (1 import + 7 usages), forcing recreation of an Entry-1 dead alias; migrated to the `schemas` constant | Existing candidate: AST ban on importing facade `_CHECK_*` aliases |
+| Test-double/type-contract drift | 2 | `_runtime_bundle_double` (`SimpleNamespace` + `Any`) and bespoke `_RuntimeGraphDouble` — the same two shapes Entry 3 corrected in the sibling gate test | Existing test-double/carrier rule |
+| Boundary suppression narrower than body obligations | 1 | `_find_static_llm_prompt_advisories` declared `suppresses=("R1",)` while its `isinstance(template, str)` Tier-3 skip guard is the same honest-parsing R5 shape the sibling identity finder suppresses; on release the resulting unsuppressed R5 was invisible because no per-file conformance pin existed there | Compare each `observation_boundary.suppresses` against scanner observations for the decorated body; flag observed-but-undeclared rules |
+
+The port itself (finder into `_validation_diagnostics.py`, builder into
+`_validation_runtime.py`, facade emission loop appended after the gate
+fan-out loop to keep check ranks monotone for completion-gate reconciliation)
+is intentional feature work, not residue. The three stale
+`_reframe_settings_missing_parts` signed allowlist entries keyed to
+`web/execution/validation.py` remain untouched release-end stale-delete
+obligations. `_CHECK_GATE_FAN_OUT_ADVISORY` remains the one surviving facade
+alias, pending its own test migration; tracked separately rather than folded
+into this port.
+
+Unresolved stale residue for this entry: **0 sites**.
+
 ## Running totals
 
 | Features reviewed | Corrected sites | Pattern classes recorded | Unresolved residue |
@@ -133,3 +160,4 @@ Unresolved stale residue for this entry: **0 sites**.
 | 1 | 101 | 10 | 0 |
 | 1 | 103 | 10 | 0 |
 | 1 | 105 | 12 | 0 |
+| 1 | 116 | 13 | 0 |
