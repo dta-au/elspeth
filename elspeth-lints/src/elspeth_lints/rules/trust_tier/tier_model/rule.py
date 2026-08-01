@@ -529,22 +529,6 @@ class TierModelVisitor(ast.NodeVisitor):
         "web/execution/routes.py": frozenset({"_run_integrity_http"}),
         "web/execution/schemas.py": frozenset({"_enforce_data_type"}),
         "web/execution/service.py": frozenset({"_on_pipeline_done", "_run_pipeline", "_sanitize_error_for_client"}),
-        # These Tier-3 validation diagnostics moved verbatim out of the public
-        # facade. Keep the existing two audited contexts on their concrete new
-        # module and names; arbitrary diagnostics helpers remain R5 findings.
-        "web/execution/_validation_diagnostics.py": frozenset(
-            {
-                "_find_identity_node_advisories",
-                "_infer_component_type_from_plugin_error",
-            }
-        ),
-        "web/execution/validation.py": frozenset(
-            {
-                "_collect_secret_refs",
-                "_mask_pending_interpretation_placeholders_for_authoring_preflight",
-                "validate_pipeline",
-            }
-        ),
         "web/sessions/_auto_title.py": frozenset({"_auto_title_exception_class", "maybe_auto_title_session"}),
         "web/sessions/routes.py": frozenset(
             {

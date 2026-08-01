@@ -968,10 +968,15 @@ class TestR5IsinstanceClassification:
 
     @pytest.mark.parametrize(
         "helper_name",
-        ("_find_identity_node_advisories", "_infer_component_type_from_plugin_error"),
+        (
+            "_collect_secret_refs",
+            "_find_identity_node_advisories",
+            "_infer_component_type_from_plugin_error",
+            "_mask_pending_interpretation_placeholders_for_authoring_preflight",
+            "validate_pipeline",
+        ),
     )
-    def test_execution_validation_diagnostic_boundary_moved_narrowly(self, helper_name: str) -> None:
-        """The extracted helper keeps its audited R5 status only at its new path."""
+    def test_execution_validation_helper_names_receive_no_closed_exemption(self, helper_name: str) -> None:
         source = dedent(f"""
             def {helper_name}(value):
                 if isinstance(value, dict):
@@ -979,18 +984,7 @@ class TestR5IsinstanceClassification:
                 return None
         """)
 
-        assert self._r5_findings(source, filename="web/execution/_validation_diagnostics.py") == []
         assert len(self._r5_findings(source, filename="web/execution/validation.py")) == 1
-
-    def test_execution_validation_diagnostics_does_not_gain_a_broad_path_exemption(self) -> None:
-        """Unlisted helpers in the new module remain ordinary R5 findings."""
-        source = dedent("""
-            def ordinary_diagnostic(value):
-                if isinstance(value, dict):
-                    return value
-                return None
-        """)
-
         assert len(self._r5_findings(source, filename="web/execution/_validation_diagnostics.py")) == 1
 
     @pytest.mark.parametrize(

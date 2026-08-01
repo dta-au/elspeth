@@ -9,15 +9,58 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol, cast
+from typing import Protocol, cast
+
+from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError, GraphValidationWarning
-from elspeth.plugins.infrastructure.config_base import PluginConfigError
-from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.web.composer.state import CompositionState
-from elspeth.web.execution._validation_authoring import _collect_secret_refs as _collect_secret_refs
-from elspeth.web.execution.schemas import ValidationWarning
+from elspeth.web.execution.schemas import ValidationError, ValidationWarning
+
+_SETTINGS_MISSING_PART_REFRAMES: dict[str, tuple[str, str, str]] = {
+    "sources": (
+        "missing_source",
+        "Add a data source so your pipeline has data to read.",
+        "Pick a data source like a CSV file or text input, then validate again.",
+    ),
+    "sinks": (
+        "missing_sink",
+        "Add an output step so your pipeline has somewhere to send its results.",
+        "Pick an output like CSV or JSON and connect your last step to it, then validate again.",
+    ),
+}
+
+
+@observation_boundary(
+    tier=3,
+    source="structured Pydantic errors derived from composer-authored runtime settings",
+    source_param="exc",
+    suppresses=("R1", "R5"),
+    invariant="returns stable novice-register findings for known missing top-level parts and an empty list otherwise",
+)
+def _reframe_settings_missing_parts(exc: PydanticValidationError) -> list[ValidationError]:
+    """Reframe missing required source/sink settings without parsing prose."""
+    missing_parts: set[str] = set()
+    for error in exc.errors():
+        if error.get("type") != "missing":
+            continue
+        loc = error.get("loc") or ()
+        part = loc[0] if loc else None
+        if isinstance(part, str) and part in _SETTINGS_MISSING_PART_REFRAMES:
+            missing_parts.add(part)
+    return [
+        ValidationError(
+            component_id=None,
+            component_type=None,
+            message=_SETTINGS_MISSING_PART_REFRAMES[part][1],
+            suggestion=_SETTINGS_MISSING_PART_REFRAMES[part][2],
+            error_code=_SETTINGS_MISSING_PART_REFRAMES[part][0],
+        )
+        for part in _SETTINGS_MISSING_PART_REFRAMES
+        if part in missing_parts
+    ]
 
 
 def _graph_warning_to_validation_warning(warning: GraphValidationWarning) -> ValidationWarning:
@@ -45,7 +88,7 @@ class _EdgePatchTargetResolver(Protocol):
         dag_node_id: str,
         *,
         state: CompositionState | None,
-        graph: Any | None,
+        graph: ExecutionGraph | None,
         component_type: str | None,
     ) -> _EdgePatchTarget: ...
 
@@ -94,7 +137,7 @@ def _unmapped_schema_patch_target(dag_node_id: str, component_type: str | None) 
     )
 
 
-def _source_name_for_dag_source(state: CompositionState, graph: Any, dag_source_id: str) -> str | None:
+def _source_name_for_dag_source(state: CompositionState, graph: ExecutionGraph, dag_source_id: str) -> str | None:
     node_info = graph.get_node_info(dag_source_id)
     config = node_info.config
     if "source_name" in config:
@@ -106,7 +149,7 @@ def _source_name_for_dag_source(state: CompositionState, graph: Any, dag_source_
     return None
 
 
-def _edge_patch_targets_by_dag_id(state: CompositionState, graph: Any) -> dict[str, _EdgePatchTarget]:
+def _edge_patch_targets_by_dag_id(state: CompositionState, graph: ExecutionGraph) -> dict[str, _EdgePatchTarget]:
     """Map runtime DAG node IDs back to composer patch-tool targets."""
     targets: dict[str, _EdgePatchTarget] = {}
     nodes_by_id = {node.id: node for node in state.nodes}
@@ -163,7 +206,7 @@ def _edge_patch_target_for_node_id(
     dag_node_id: str,
     *,
     state: CompositionState | None = None,
-    graph: Any | None = None,
+    graph: ExecutionGraph | None = None,
     component_type: str | None = None,
 ) -> _EdgePatchTarget:
     """Resolve a DAG node ID to the composer component/tool that can patch it."""
@@ -178,25 +221,11 @@ def _edge_patch_target_for_node_id(
     return _unmapped_schema_patch_target(dag_node_id, component_type)
 
 
-def _infer_component_type_from_plugin_error(
-    exc: PluginNotFoundError | PluginConfigError,
-) -> str | None:
-    """Extract component type from plugin error metadata.
-
-    Reads PluginConfigError.component_type directly — set by from_dict()
-    from the config class hierarchy's _plugin_component_type attribute.
-    Returns None for PluginNotFoundError or when component_type was not set.
-    """
-    if isinstance(exc, PluginConfigError):
-        return exc.component_type
-    return None
-
-
 def _format_edge_contract_failure(
     exc: EdgeContractError,
     *,
     state: CompositionState | None = None,
-    graph: Any | None = None,
+    graph: ExecutionGraph | None = None,
 ) -> tuple[str, str]:
     """Build LLM-actionable (message, suggestion) pair from a structured edge-contract error.
 
@@ -266,7 +295,7 @@ def _build_edge_contract_suggestion(
     exc: EdgeContractError,
     *,
     state: CompositionState | None = None,
-    graph: Any | None = None,
+    graph: ExecutionGraph | None = None,
 ) -> str:
     """Compose the action-oriented suggestion text for an edge-contract failure."""
     return _build_edge_contract_suggestion_with_resolver(
@@ -281,7 +310,7 @@ def _build_edge_contract_suggestion_with_resolver(
     exc: EdgeContractError,
     *,
     state: CompositionState | None,
-    graph: Any | None,
+    graph: ExecutionGraph | None,
     resolve_target: _EdgePatchTargetResolver,
 ) -> str:
     """Build patch advice through an explicitly supplied component resolver."""
@@ -361,7 +390,7 @@ class _IdentityFinding:
     tier=3,
     source="composer-authored CompositionState sink/node options (Tier-3, operator/LLM-supplied)",
     source_param="state",
-    suppresses=("R1",),
+    suppresses=("R1", "R5"),
     invariant="returns advisory findings; every malformed-options branch returns/continues, never raises on state",
 )
 def _find_identity_node_advisories(state: CompositionState) -> list[_IdentityFinding]:

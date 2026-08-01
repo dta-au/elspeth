@@ -22,6 +22,16 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 
 - Scoped test runs miss cross-cutting gates — run the full `pytest tests/`
   before merging.
+- Treat the trust-tier gate as a catch-obvious-bug-hiding check, not a death
+  pact. Review every touched production file, fix genuine violations, and use
+  approved boundary metadata only for honest Tier-3 parsing. If one narrow
+  finding is genuinely policy-wrong, keep the clearest correct code and leave
+  it ready for adjudication. Never add aliases, padding, reordering, dead code,
+  or semantic distortion merely to preserve or reduce signature churn: binding
+  churn is an honest release obligation. Never hand-edit signatures; agents
+  leave or stage key-free work and the operator signs only when the package or
+  release is complete. Keep `AGENTS.md` and `CLAUDE.md` tracked so every
+  worktree inherits this posture.
 - Validate by trust domain ([ADR-032](docs/architecture/adr/032-validate-by-trust-domain.md)):
   nominally type what ELSPETH owns (`isinstance` against a concrete class we
   define), parse what it does not (sentinel `getattr` + value assertions +

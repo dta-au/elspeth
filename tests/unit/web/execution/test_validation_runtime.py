@@ -10,6 +10,7 @@ import pytest
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.contracts.data import CompatibilityResult
 from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError, GraphValidationError, GraphValidationWarning
@@ -19,6 +20,7 @@ from elspeth.engine.orchestrator.value_source_validation import ValueSourceFindi
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.execution._validation_diagnostics import _EdgePatchTarget, _IdentityFinding
 from elspeth.web.execution._validation_model import (
     AuthoredValidatedState,
     GraphedRuntime,
@@ -269,7 +271,6 @@ def test_plugin_and_value_source_successes_are_separate_ordered_phases() -> None
         loaded,
         plugin_snapshot=_snapshot(),
         instantiate_plugins=instantiate,
-        infer_component_type=lambda exc: "transform",
     )
     assert isinstance(plugins, PhaseReport)
     values = validate_value_source_compliance(plugins.artifact)
@@ -291,7 +292,6 @@ def test_value_source_failure_records_plugin_pass_and_attributed_errors() -> Non
         _loaded(),
         plugin_snapshot=_snapshot(),
         instantiate_plugins=_autospec_callable(instantiate_runtime_plugins, side_effect=error),
-        infer_component_type=lambda exc: "transform",
     )
 
     assert isinstance(result, PhaseFailure)
@@ -324,7 +324,6 @@ def test_plugin_phase_discriminates_expected_construction_failures(error: Except
         _loaded(),
         plugin_snapshot=_snapshot(),
         instantiate_plugins=_autospec_callable(instantiate_runtime_plugins, side_effect=error),
-        infer_component_type=lambda exc: component_type,
     )
 
     assert isinstance(result, PhaseFailure)
@@ -348,7 +347,6 @@ def test_plugin_phase_propagates_unexpected_exceptions() -> None:
                 instantiate_runtime_plugins,
                 side_effect=RuntimeError("plugin invariant"),
             ),
-            infer_component_type=lambda exc: None,
         )
 
 
@@ -444,7 +442,7 @@ def test_schema_phase_uses_authored_policy_state_for_rich_edge_diagnostics() -> 
         to_node_id="consumer",
         producer_schema_name="Producer",
         consumer_schema_name="Consumer",
-        compatibility_result=cast(Any, SimpleNamespace()),
+        compatibility_result=CompatibilityResult(compatible=False, missing_fields=("value",)),
         component_type="transform",
     )
     graph.validate_edge_compatibility.side_effect = edge_error
@@ -455,12 +453,23 @@ def test_schema_phase_uses_authored_policy_state_for_rich_edge_diagnostics() -> 
     )
     seen: list[CompositionState] = []
 
-    def edge_target(node_id: str, *, state: CompositionState, graph: Any, component_type: str | None) -> Any:
+    def edge_target(
+        node_id: str,
+        *,
+        state: CompositionState,
+        graph: ExecutionGraph,
+        component_type: str | None,
+    ) -> _EdgePatchTarget:
         del node_id, graph, component_type
         seen.append(state)
-        return SimpleNamespace(component_id="composer_consumer", component_type="transform")
+        return _EdgePatchTarget(
+            component_id="composer_consumer",
+            component_type="transform",
+            display_name="composer consumer",
+            schema_patch_tool_call="patch_node_options()",
+        )
 
-    def format_edge(exc: EdgeContractError, *, state: CompositionState, graph: Any) -> tuple[str, str]:
+    def format_edge(exc: EdgeContractError, *, state: CompositionState, graph: ExecutionGraph) -> tuple[str, str]:
         del exc, graph
         seen.append(state)
         return "rich edge message", "rich edge suggestion"
@@ -515,7 +524,7 @@ def test_identity_advisory_checks_use_policy_state_and_preserve_exact_prose() ->
         graph=cast(Any, _graph()),
         graph_warnings=(),
     )
-    finding = SimpleNamespace(
+    finding = _IdentityFinding(
         node_id="passthrough",
         upstream_id="producer",
         sink_name="primary",
@@ -523,7 +532,7 @@ def test_identity_advisory_checks_use_policy_state_and_preserve_exact_prose() ->
     )
     seen: list[CompositionState] = []
 
-    def finder(state: CompositionState) -> list[Any]:
+    def finder(state: CompositionState) -> list[_IdentityFinding]:
         seen.append(state)
         return [finding]
 
