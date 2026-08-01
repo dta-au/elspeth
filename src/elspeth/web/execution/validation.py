@@ -23,9 +23,8 @@ only to be rejected pre-token at /execute.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from pydantic import ValidationError as PydanticValidationError
@@ -34,18 +33,14 @@ from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
-from elspeth.core.dag.models import EdgeContractError, GraphValidationWarning
+from elspeth.core.dag.models import EdgeContractError
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
-from elspeth.plugins.infrastructure.config_base import PluginConfigError
-from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.web.composer.state import (
     CompositionState,
 )
+from elspeth.web.execution import _validation_diagnostics as _diagnostics
 from elspeth.web.execution._validation_authoring import (
     _DEFAULT_PLUGIN_POLICY_SUGGESTION as _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION,
-)
-from elspeth.web.execution._validation_authoring import (
-    _collect_secret_refs as _authoring_collect_secret_refs,
 )
 from elspeth.web.execution._validation_authoring import (
     lower_plugin_policy,
@@ -56,6 +51,9 @@ from elspeth.web.execution._validation_authoring import (
     validate_semantic_evidence,
     validate_web_network_policy,
     validate_web_resource_policy,
+)
+from elspeth.web.execution._validation_diagnostics import (
+    _collect_secret_refs as _diagnostics_collect_secret_refs,
 )
 from elspeth.web.execution._validation_ledger import ValidationLedger
 from elspeth.web.execution._validation_materialization import (
@@ -110,7 +108,6 @@ from elspeth.web.execution.schemas import (
     ValidationReadiness,
     ValidationReadinessBlocker,
     ValidationResult,
-    ValidationWarning,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
@@ -169,17 +166,6 @@ def _blocked_readiness(
     )
 
 
-def _graph_warning_to_validation_warning(warning: GraphValidationWarning) -> ValidationWarning:
-    component_id = warning.node_ids[0] if warning.node_ids else None
-    return ValidationWarning(
-        component_id=component_id,
-        component_type="graph",
-        message=warning.message,
-        suggestion=None,
-        warning_code=warning.code,
-    )
-
-
 # Advisory check — non-blocking, multi-entry (one ValidationCheck per
 # detected node, all sharing this name).  Deliberately NOT included in
 # _ALL_CHECKS: that list governs the "skipped check" propagation when an
@@ -194,10 +180,28 @@ _CHECK_IDENTITY_NODE_ADVISORY = CHECK_IDENTITY_NODE_ADVISORY
 # to prevent silent reordering.
 _ALL_CHECKS = list(VALIDATION_BLOCKING_CHECK_NAMES)
 
-# Compatibility exports retained until the diagnostics extraction task moves
-# their implementation again.
 _DEFAULT_PLUGIN_POLICY_SUGGESTION = _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION
-_collect_secret_refs = _authoring_collect_secret_refs
+
+# Keep the extracted diagnostic helpers available through this long-standing
+# facade.  Besides preserving imports and live monkeypatch seams, these aliases
+# retain the module-AST bindings of the signed settings reframer below.  Judge
+# metadata deliberately binds to exact syntax positions, so removing facade
+# nodes would make an otherwise behavior-preserving extraction increase drift.
+_collect_secret_refs = _diagnostics_collect_secret_refs
+_graph_warning_to_validation_warning = _diagnostics._graph_warning_to_validation_warning
+_EdgePatchTarget = _diagnostics._EdgePatchTarget
+_node_schema_patch_target = _diagnostics._node_schema_patch_target
+_source_schema_patch_target = _diagnostics._source_schema_patch_target
+_output_schema_patch_target = _diagnostics._output_schema_patch_target
+_unmapped_schema_patch_target = _diagnostics._unmapped_schema_patch_target
+_source_name_for_dag_source = _diagnostics._source_name_for_dag_source
+_edge_patch_targets_by_dag_id = _diagnostics._edge_patch_targets_by_dag_id
+_edge_patch_target_for_node_id = _diagnostics._edge_patch_target_for_node_id
+_infer_component_type_from_plugin_error = _diagnostics._infer_component_type_from_plugin_error
+_IdentityFinding = _diagnostics._IdentityFinding
+_find_identity_node_advisories = _diagnostics._find_identity_node_advisories
+_format_edge_contract_message = _diagnostics._format_edge_contract_message
+_build_edge_contract_suggestion_with_resolver = _diagnostics._build_edge_contract_suggestion_with_resolver
 
 
 def _apply_phase[T](
@@ -219,154 +223,19 @@ def _apply_phase[T](
     return report.artifact
 
 
-@dataclass(frozen=True, slots=True)
-class _EdgePatchTarget:
-    component_id: str
-    component_type: str | None
-    display_name: str
-    schema_patch_tool_call: str
-
-
-def _node_schema_patch_target(component_id: str, component_type: str | None) -> _EdgePatchTarget:
-    display_name = f"node '{component_id}' (row_union)" if component_type == "row_union" else f"{component_type or 'node'} '{component_id}'"
-    return _EdgePatchTarget(
-        component_id=component_id,
-        component_type=component_type,
-        display_name=display_name,
-        schema_patch_tool_call=f"patch_node_options(node_id='{component_id}', patch={{'schema': {{...}}}})",
-    )
-
-
-def _source_schema_patch_target(source_name: str, plugin_name: str | None) -> _EdgePatchTarget:
-    component_id = "source" if source_name == "source" else f"source:{source_name}"
-    if source_name == "source":
-        display = "source" if plugin_name is None else f"source '{plugin_name}'"
-        schema_patch_tool_call = "patch_source_options(patch={'schema': {...}})"
-    else:
-        display = f"source '{source_name}'" if plugin_name is None else f"source '{source_name}' ({plugin_name})"
-        schema_patch_tool_call = f"patch_source_options(source_name={source_name!r}, patch={{'schema': {{...}}}})"
-    return _EdgePatchTarget(
-        component_id=component_id,
-        component_type="source",
-        display_name=display,
-        schema_patch_tool_call=schema_patch_tool_call,
-    )
-
-
-def _output_schema_patch_target(sink_name: str) -> _EdgePatchTarget:
-    return _EdgePatchTarget(
-        component_id=sink_name,
-        component_type="sink",
-        display_name=f"output '{sink_name}'",
-        schema_patch_tool_call=f"patch_output_options(sink_name='{sink_name}', patch={{'schema': {{...}}}})",
-    )
-
-
-def _unmapped_schema_patch_target(dag_node_id: str, component_type: str | None) -> _EdgePatchTarget:
-    return _EdgePatchTarget(
-        component_id=dag_node_id,
-        component_type=component_type,
-        display_name=f"unmapped DAG node '{dag_node_id}'",
-        schema_patch_tool_call="get_pipeline_state(component='all')  # inspect composer IDs before patching this DAG node",
-    )
-
-
-def _source_name_for_dag_source(state: CompositionState, graph: Any, dag_source_id: str) -> str | None:
-    node_info = graph.get_node_info(dag_source_id)
-    config = node_info.config
-    if "source_name" in config:
-        source_name = cast(str, config["source_name"])
-        if source_name in state.sources:
-            return source_name
-    if len(state.sources) == 1:
-        return next(iter(state.sources))
-    return None
-
-
-def _edge_patch_targets_by_dag_id(state: CompositionState, graph: Any) -> dict[str, _EdgePatchTarget]:
-    """Map runtime DAG node IDs back to composer patch-tool targets."""
-    targets: dict[str, _EdgePatchTarget] = {}
-    nodes_by_id = {node.id: node for node in state.nodes}
-
-    if state.sources:
-        for source_id in graph.get_sources():
-            dag_source_id = str(source_id)
-            source_name = _source_name_for_dag_source(state, graph, dag_source_id)
-            if source_name is None:
-                continue
-            source = state.sources[source_name]
-            targets[dag_source_id] = _source_schema_patch_target(source_name, source.plugin)
-
-    transform_nodes = [node for node in state.nodes if node.node_type == "transform"]
-    transform_id_map = graph.get_transform_id_map()
-    for sequence, dag_node_id in transform_id_map.items():
-        if sequence >= len(transform_nodes):
-            continue
-        node = transform_nodes[sequence]
-        targets[str(dag_node_id)] = _node_schema_patch_target(node.id, node.node_type)
-
-    config_gate_id_map = graph.get_config_gate_id_map()
-    for gate_name, dag_node_id in config_gate_id_map.items():
-        component_id = str(gate_name)
-        node_type = nodes_by_id[component_id].node_type if component_id in nodes_by_id else "gate"
-        targets[str(dag_node_id)] = _node_schema_patch_target(component_id, node_type)
-
-    aggregation_id_map = graph.get_aggregation_id_map()
-    for aggregation_name, dag_node_id in aggregation_id_map.items():
-        component_id = str(aggregation_name)
-        node_type = nodes_by_id[component_id].node_type if component_id in nodes_by_id else "aggregation"
-        targets[str(dag_node_id)] = _node_schema_patch_target(component_id, node_type)
-
-    coalesce_id_map = graph.get_coalesce_id_map()
-    for coalesce_name, dag_node_id in coalesce_id_map.items():
-        component_id = str(coalesce_name)
-        node_type = nodes_by_id[component_id].node_type if component_id in nodes_by_id else "coalesce"
-        targets[str(dag_node_id)] = _node_schema_patch_target(component_id, node_type)
-
-    row_union_id_map = graph.get_row_union_id_map()
-    for row_union_name, dag_node_id in row_union_id_map.items():
-        component_id = str(row_union_name)
-        node_type = nodes_by_id[component_id].node_type if component_id in nodes_by_id else "row_union"
-        targets[str(dag_node_id)] = _node_schema_patch_target(component_id, node_type)
-
-    sink_id_map = graph.get_sink_id_map()
-    for sink_name, dag_node_id in sink_id_map.items():
-        targets[str(dag_node_id)] = _output_schema_patch_target(str(sink_name))
-
-    return targets
-
-
-def _edge_patch_target_for_node_id(
-    dag_node_id: str,
+def _build_edge_contract_suggestion(
+    exc: EdgeContractError,
     *,
     state: CompositionState | None = None,
     graph: Any | None = None,
-    component_type: str | None = None,
-) -> _EdgePatchTarget:
-    """Resolve a DAG node ID to the composer component/tool that can patch it."""
-    if state is None or graph is None:
-        return _node_schema_patch_target(dag_node_id, component_type)
-
-    targets = _edge_patch_targets_by_dag_id(state, graph)
-    if not targets:
-        return _node_schema_patch_target(dag_node_id, component_type)
-    if dag_node_id in targets:
-        return targets[dag_node_id]
-    return _unmapped_schema_patch_target(dag_node_id, component_type)
-
-
-def _infer_component_type_from_plugin_error(
-    exc: PluginNotFoundError | PluginConfigError,
-) -> str | None:
-    """Extract component type from plugin error metadata.
-
-    Reads PluginConfigError.component_type directly — set by from_dict()
-    from the config class hierarchy's _plugin_component_type attribute.
-    Returns None for PluginNotFoundError or when component_type was not set.
-    """
-    if isinstance(exc, PluginConfigError):
-        return exc.component_type
-    return None
+) -> str:
+    """Compatibility wrapper preserving the facade's live patch target."""
+    return _build_edge_contract_suggestion_with_resolver(
+        exc,
+        state=state,
+        graph=graph,
+        resolve_target=_edge_patch_target_for_node_id,
+    )
 
 
 def _format_edge_contract_failure(
@@ -375,138 +244,8 @@ def _format_edge_contract_failure(
     state: CompositionState | None = None,
     graph: Any | None = None,
 ) -> tuple[str, str]:
-    """Build LLM-actionable (message, suggestion) pair from a structured edge-contract error.
-
-    The composer surfaces both fields verbatim into the assistant's reply when
-    runtime preflight rejects a completion claim. Empirically (cohort
-    diagnosis 2026-05-07), models converge on retry only when the message
-    names the producer/consumer node IDs and per-field issues, AND the
-    suggestion lists concrete tool-call shapes for the fix. Prose like
-    "Type mismatches: f (expected X, got Y)" by itself routinely caused the
-    model to surrender mid-loop because there was no obvious next move.
-
-    Format choices:
-      - Producer/consumer are introduced by NODE ID first (the model uses
-        these as ``node_id=`` arguments), then by SCHEMA NAME (informational
-        — schema classes are baked-in plugin contracts, the model can't
-        target them directly).
-      - Each ``CompatibilityResult`` issue category gets its own bullet
-        block. We keep the original "expected ... got ..." nomenclature
-        from ``CompatibilityResult.error_message`` for continuity, but
-        switch to "consumer requires ... producer emits ..." prose because
-        empirically the composer LLM mis-grounds "expected/got" against
-        the validator's perspective rather than the data-flow direction.
-      - The suggestion leads with option (a) (patch consumer) because the
-        dominant captured failure mode is consumer over-declaration. The
-        producer-side option is listed second with the caveat that plugin
-        output schemas are baked-in.
-    """
-    result = exc.compatibility_result
-    issue_lines: list[str] = []
-    if result.missing_fields:
-        issue_lines.append("Missing required fields (consumer requires, producer does not guarantee):")
-        for field_name in result.missing_fields:
-            issue_lines.append(f"  - '{field_name}'")
-    if result.type_mismatches:
-        issue_lines.append("Type mismatches:")
-        for field_name, expected, actual in result.type_mismatches:
-            issue_lines.append(f"  - field '{field_name}': consumer requires '{expected}', producer emits '{actual}'")
-    if result.constraint_mismatches:
-        issue_lines.append("Constraint mismatches:")
-        for field_name, reason in result.constraint_mismatches:
-            issue_lines.append(f"  - field '{field_name}': {reason}")
-    if result.extra_fields:
-        issue_lines.append("Extra fields forbidden by consumer (producer emits, consumer rejects):")
-        for field_name in result.extra_fields:
-            issue_lines.append(f"  - '{field_name}'")
-
-    issues_block = "\n".join(issue_lines) if issue_lines else "(no per-field detail available)"
-
-    message = (
-        f"Edge contract violation between producer node '{exc.from_node_id}' "
-        f"(schema '{exc.producer_schema_name}') and consumer node '{exc.to_node_id}' "
-        f"(schema '{exc.consumer_schema_name}'):\n"
-        f"{issues_block}"
-    )
-
-    suggestion = _build_edge_contract_suggestion(exc, state=state, graph=graph)
-    return message, suggestion
-
-
-def _build_edge_contract_suggestion(
-    exc: EdgeContractError,
-    *,
-    state: CompositionState | None = None,
-    graph: Any | None = None,
-) -> str:
-    """Compose the action-oriented suggestion text for an edge-contract failure.
-
-    Split out from ``_format_edge_contract_failure`` so the suggestion text
-    can be unit-tested without exercising the full message-building flow,
-    and so future tuning of the suggestion (e.g., emitting different prose
-    for missing-field vs type-mismatch cases) keeps the message format
-    stable.
-    """
-    result = exc.compatibility_result
-    has_type_mismatch = bool(result.type_mismatches)
-    has_missing = bool(result.missing_fields)
-    has_extras = bool(result.extra_fields)
-    consumer = _edge_patch_target_for_node_id(
-        exc.to_node_id,
-        state=state,
-        graph=graph,
-        component_type=exc.component_type,
-    )
-    producer = _edge_patch_target_for_node_id(
-        exc.from_node_id,
-        state=state,
-        graph=graph,
-        component_type=None,
-    )
-
-    if producer.component_type == "row_union":
-        return "\n".join(
-            (
-                f"The plugin-free row_union '{producer.component_id}' exposes an engine-owned observed schema; "
-                "it has no plugin schema options to patch.",
-                f"Relax the real downstream consumer {consumer.display_name} so it accepts the released branch rows.",
-                f"Tool: {consumer.schema_patch_tool_call}",
-            )
-        )
-    if consumer.component_type == "row_union":
-        return "\n".join(
-            (
-                f"The plugin-free row_union '{consumer.component_id}' has no consumer schema options to patch.",
-                f"Repair the real branch producer {producer.display_name} whose output contract failed at the barrier.",
-                f"Tool: {producer.schema_patch_tool_call}",
-            )
-        )
-
-    parts: list[str] = []
-    parts.append("Most edge-contract failures come from the consumer over-declaring fields it doesn't operate on. Try option (a) first.")
-    parts.append("")
-    parts.append(f"  (a) Relax the consumer's input schema on {consumer.display_name}. Either:")
-    if has_type_mismatch:
-        parts.append("      - Change the declared field type(s) to match what the producer emits (see Type mismatches above).")
-    if has_missing:
-        parts.append("      - Drop missing required fields from the consumer's required_fields if the consumer doesn't actually need them.")
-    if has_extras:
-        parts.append(
-            "      - Switch the consumer's input schema mode to 'flexible' or 'observed' so it accepts the producer's extra fields."
-        )
-    parts.append(
-        "      - Or switch the consumer's input schema mode to 'flexible' so it accepts the producer's full output without redeclaring every field."
-    )
-    parts.append(f"      Tool: {consumer.schema_patch_tool_call}")
-    parts.append("")
-    parts.append(
-        f"  (b) Patch the producer {producer.display_name}. Note: plugin output schemas are largely baked-in by the plugin's contract — "
-        f"this option only works if you mis-declared the producer's schema in your initial set_pipeline / upsert_node call. "
-        f"If the producer is using its plugin's default output contract, option (a) is the only fix."
-    )
-    parts.append(f"      Tool: {producer.schema_patch_tool_call}")
-
-    return "\n".join(parts)
+    """Compatibility wrapper preserving the facade's live suggestion patch."""
+    return _format_edge_contract_message(exc), _build_edge_contract_suggestion(exc, state=state, graph=graph)
 
 
 def _skipped_checks(from_check: str, *, already_emitted: frozenset[str] = frozenset()) -> list[ValidationCheck]:
@@ -532,153 +271,6 @@ def _skipped_checks(from_check: str, *, already_emitted: frozenset[str] = frozen
 
 def _append_skipped_checks(checks: list[ValidationCheck], from_check: str) -> None:
     checks.extend(_skipped_checks(from_check, already_emitted=frozenset(check.name for check in checks)))
-
-
-@dataclass(frozen=True, slots=True)
-class _IdentityFinding:
-    """One detected identity-shaped passthrough between a transform and a sink.
-
-    Emitted by ``_find_identity_node_advisories``; consumed by the advisory
-    block in ``validate_pipeline``.  All four fields are scalars, so
-    ``frozen=True`` is sufficient (no ``deep_freeze`` guard needed).
-
-    Attributes:
-        node_id: ID of the passthrough node itself.
-        upstream_id: ID of the producer feeding the passthrough's input
-            (or "source" when the source feeds it directly).
-        sink_name: Name of the downstream sink (output) the passthrough emits to.
-        sink_schema_mode: Schema mode of the sink ("fixed" / "flexible" /
-            "observed"), or ``None`` when the sink declares no schema mode.
-            Used purely for the advisory's detail string — not a detection input.
-    """
-
-    node_id: str
-    upstream_id: str
-    sink_name: str
-    sink_schema_mode: str | None
-
-
-@observation_boundary(
-    tier=3,
-    source="composer-authored CompositionState sink/node options (Tier-3, operator/LLM-supplied)",
-    source_param="state",
-    suppresses=("R1",),
-    invariant="returns advisory findings; every malformed-options branch returns/continues, never raises on state",
-)
-def _find_identity_node_advisories(state: CompositionState) -> list[_IdentityFinding]:
-    """Detect identity-shaped passthrough transforms between a real transform and a sink.
-
-    A node is flagged iff ALL of the following hold:
-
-    1. ``node_type == "transform"`` and ``plugin == "passthrough"`` (literal
-       string check — deliberately narrow per dispatch; broader registry-based
-       detection of ``passes_through_input`` plugins is out of scope).
-    2. Exactly one upstream producer feeds ``node.input`` (single inbound).
-    3. ``on_success`` targets exactly one sink (output by name) — the
-       downstream must be a sink, not another transform.
-    4. The node has no fork machinery (``fork_to``, ``routes`` empty).
-    5. ``options["schema"]["fields"]`` is missing or empty (not Concept-5
-       schema-anchoring per ``pipeline_composer.md:758-768``).
-    6. The upstream node is NOT a structural ``gate``, ``queue``, or
-       ``row_union``. These boundaries make a downstream passthrough
-       structurally meaningful even when it leaves row fields unchanged.
-
-    Returns:
-        List of :class:`_IdentityFinding`, one per detected node.  Empty when
-        nothing was detected.
-    """
-    findings: list[_IdentityFinding] = []
-
-    output_by_name = {output.name: output for output in state.outputs}
-    nodes_by_id = {node.id: node for node in state.nodes}
-
-    # Producer index: maps a connection-target name (the value carried by an
-    # upstream's on_success / on_error / route value / fork_to entry) back to
-    # the producer node id.  Used to find a node's upstream by matching its
-    # input field.  Explicit "if key not in dict" preserves first-writer-wins
-    # semantics; the schema validator rejects duplicate connection targets
-    # earlier in the pipeline so collisions here would already have surfaced.
-    producer_by_target: dict[str, str] = {}
-
-    def _record(target: str, producer_id: str) -> None:
-        if target not in producer_by_target:
-            producer_by_target[target] = producer_id
-
-    for source_name, source in state.sources.items():
-        if source.on_success:
-            producer_id = "source" if source_name == "source" else f"source:{source_name}"
-            producer_by_target[source.on_success] = producer_id
-    for upstream in state.nodes:
-        if upstream.on_success:
-            _record(upstream.on_success, upstream.id)
-        if upstream.on_error:
-            _record(upstream.on_error, upstream.id)
-        if upstream.routes:
-            for route_target in upstream.routes.values():
-                _record(route_target, upstream.id)
-        if upstream.fork_to:
-            for fork_target in upstream.fork_to:
-                _record(fork_target, upstream.id)
-    # Canonicalize declared queues: a queue interleaves many producers under
-    # its own id, so the queue itself — not whichever source registered first —
-    # is the canonical producer of that connection (elspeth-a5b86149d4).
-    for node in state.nodes:
-        if node.node_type == "queue":
-            producer_by_target[node.id] = node.id
-
-    for node in state.nodes:
-        # Rule 1: identity passthrough plugin (literal name).
-        if node.node_type != "transform" or node.plugin != "passthrough":
-            continue
-        # Rule 4: no fork machinery on the node itself.
-        if node.fork_to or node.routes:
-            continue
-        # Rule 3: on_success must point to exactly one sink (output).
-        if node.on_success is None or node.on_success not in output_by_name:
-            continue
-        sink = output_by_name[node.on_success]
-        # Rule 2: must have an upstream producer.  Absence means the pipeline
-        # has a dangling input ref, which a structural check will already have
-        # surfaced; the advisory simply skips the node.
-        if node.input not in producer_by_target:
-            continue
-        upstream_id = producer_by_target[node.input]
-        # Rule 6: upstream is not a gate, queue, or row union. A gate-fork's per-branch
-        # passthrough is the documented legitimate pattern (skill lines
-        # 1517-1518); a queue interleaves fan-in with an observed/unknown schema,
-        # so a downstream passthrough is doing real structural work, not dead
-        # weight (elspeth-a5b86149d4). A row union is likewise a real correlated
-        # barrier. ``upstream_id == "source"`` is not in
-        # nodes_by_id; the source is neither, so falling through is correct.
-        if upstream_id in nodes_by_id and nodes_by_id[upstream_id].node_type in ("gate", "queue", "row_union"):
-            continue
-        # Rule 5: passthrough has no schema.fields anchor (Concept-5 exemption
-        # per skill lines 758-768).  ``options`` values are Tier-3 (LLM- or
-        # operator-supplied), so isinstance() dispatches the optional schema
-        # block legitimately — a non-Mapping value means "no schema declared".
-        schema_block = node.options["schema"] if "schema" in node.options else None
-        if isinstance(schema_block, Mapping):
-            fields = schema_block.get("fields")
-            if isinstance(fields, (list, tuple)) and len(fields) > 0:
-                continue
-        # Compute sink schema mode for the advisory's detail string.  Same
-        # Tier-3 dispatch: sink options are operator-supplied, schema may be
-        # absent or shaped differently than expected.
-        sink_schema_mode: str | None = None
-        sink_schema_block = sink.options.get("schema")
-        if isinstance(sink_schema_block, Mapping):
-            mode = sink_schema_block.get("mode")
-            if isinstance(mode, str):
-                sink_schema_mode = mode
-        findings.append(
-            _IdentityFinding(
-                node_id=node.id,
-                upstream_id=upstream_id,
-                sink_name=sink.name,
-                sink_schema_mode=sink_schema_mode,
-            )
-        )
-    return findings
 
 
 # The two required-with-no-default top-level parts of ElspethSettings (see
