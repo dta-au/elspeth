@@ -884,6 +884,14 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Ask the operator for the deployment's abuse contact email and scraping reason, or leave the http block for the operator "
         "to fill — never invent an email or domain.",
     ),
+    (
+        r"prompt_template_unbound_variables|prompt render context does not define",
+        "A prompt_template interpolates bare variable names the render context does not define — templates see row data only "
+        "as 'row.<field>' and lookup data as 'lookup.<key>', so rendering raises 'Undefined variable' at runtime and none of "
+        "the row's data reaches the model.",
+        "Rewrite each bare name as '{{ row.<field> }}' using a field the upstream schema provides (e.g. '{{ text }}' becomes "
+        "'{{ row.text }}'), or '{{ lookup.<key> }}' for lookup data, or remove the reference.",
+    ),
     # Deployment security policy, not a wiring mistake: no repair to the
     # candidate can make an aws_s3 SOURCE acceptable on the web surface, so the
     # explanation must say so outright or the planner burns its whole repair
@@ -997,6 +1005,10 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "coalesce_on_success_unknown_sink",
     "aggregation_trigger_invalid",
     "web_scrape_http_identity_invalid",
+    # ── Prompt-context binding guard (R2-F17 compounding; elspeth-bea314a89b) ─
+    # A prompt_template interpolating names outside {row, lookup} crashes at
+    # render under StrictUndefined and sends no row data to the model.
+    "prompt_template_unbound_variables",
     # ── Pre-application semantic rejections (tutorial op 1152d7e3 closure) ──
     # Previously codeless _failure_result sites: the planner saw only the
     # 'validation_error' placeholder while the actionable message was redacted.

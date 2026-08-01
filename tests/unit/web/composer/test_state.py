@@ -2778,6 +2778,153 @@ class TestWebScrapeAbuseContactValidation:
         assert not messages
 
 
+class TestPromptTemplateUnboundVariables:
+    """LLM prompt templates render with exactly ``{row, lookup}`` under
+    StrictUndefined (``PromptTemplate.render``), so a bare ``{{ text }}``
+    raises ``TemplateError: Undefined variable`` at runtime and the model
+    receives none of the row's data. Composer validation must reject such
+    templates with the closed, repairable ``prompt_template_unbound_variables``
+    code instead of letting the pipeline crash live (R2-F17 compounding
+    finding, elspeth-bea314a89b).
+    """
+
+    def _state_with_llm(self, prompt_template: str) -> CompositionState:
+        node = NodeSpec(
+            id="classify",
+            node_type="transform",
+            plugin="llm",
+            input="rows",
+            on_success="classified",
+            on_error="discard",
+            options={"prompt_template": prompt_template, "model": "test-model"},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        return CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+    def _unbound_errors(self, state: CompositionState) -> list[ValidationEntry]:
+        return [e for e in state.validate().errors if e.error_code == "prompt_template_unbound_variables"]
+
+    def test_rejects_bare_variable_template(self) -> None:
+        """The acceptance-run shape: every interpolation is an unbound bare name."""
+        state = self._state_with_llm("Classify: {{ text }}")
+        errors = self._unbound_errors(state)
+        assert errors, "Expected prompt_template_unbound_variables for bare {{ text }}"
+        entry = errors[0]
+        assert entry.component == "node:classify"
+        assert entry.severity == "high"
+        assert "'text'" in entry.message
+        assert "row." in entry.message
+
+    def test_rejects_mixed_template_with_unbound_name(self) -> None:
+        """A template can reference row fields AND still crash on a stray bare
+        name — StrictUndefined raises on the unbound one regardless."""
+        state = self._state_with_llm("Compare {{ row.summary }} against {{ reference }}")
+        errors = self._unbound_errors(state)
+        assert errors
+        assert "'reference'" in errors[0].message
+        assert "'summary'" not in errors[0].message
+
+    def test_names_all_unbound_variables_sorted(self) -> None:
+        state = self._state_with_llm("{{ zeta }} then {{ alpha }}")
+        errors = self._unbound_errors(state)
+        assert errors
+        assert errors[0].message.index("'alpha'") < errors[0].message.index("'zeta'")
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "Classify: {{ row.text }}",
+            'Classify: {{ row["Original Header"] }}',
+            "Instructions: {{ lookup.instructions }}",
+            "Rate how {{interpretation:cool}} this row is.",
+            "Rate how {{ interpretation: primary colour }} this page is.",
+            "Static prompt with no interpolation at all.",
+            "{% set t = row.text %}Classify: {{ t }}",
+            "{% for x in row %}{{ x }}{% endfor %}",
+            "{{ range(3) | join(', ') }}",  # env global, defined at render time
+            "",
+        ],
+    )
+    def test_accepts_bound_or_static_templates(self, template: str) -> None:
+        state = self._state_with_llm(template)
+        assert not self._unbound_errors(state), f"False positive for {template!r}"
+
+    def test_masked_interpretation_placeholder_does_not_hide_unbound_names(self) -> None:
+        """Placeholders are masked before parsing, but bare names elsewhere in
+        the same template must still be caught."""
+        state = self._state_with_llm("Rate how {{interpretation:cool}} this {{ item }} is.")
+        errors = self._unbound_errors(state)
+        assert errors
+        assert "'item'" in errors[0].message
+
+    def test_syntax_error_template_is_not_this_rules_business(self) -> None:
+        """Unparseable templates are reported by other layers; this rule must
+        stay silent rather than mask the syntax problem."""
+        state = self._state_with_llm("Classify: {{ text")
+        assert not self._unbound_errors(state)
+
+    def test_skips_nodes_without_prompt_template(self) -> None:
+        node = NodeSpec(
+            id="rename",
+            node_type="transform",
+            plugin="field_mapper",
+            input="rows",
+            on_success="renamed",
+            on_error="discard",
+            options={"mapping": {"a": "b"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=None,
+            nodes=(node,),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        assert not self._unbound_errors(state)
+
+    def test_skips_multi_query_nodes(self) -> None:
+        """Multi-query mode renders with a different context: each query's
+        ``input_fields`` maps template variables to row columns directly
+        (``build_template_context`` in multi_query.py), so bare names are the
+        documented idiom there. Mirrors the ``queries is None`` scoping of
+        ``LLMConfig._validate_required_input_fields_appear_in_template``."""
+        state = self._state_with_llm("Classify {{ text }}.")
+        options = dict(state.nodes[0].options)
+        options["queries"] = [{"name": "classify", "input_fields": {"text": "body"}}]
+        node = replace(state.nodes[0], options=options)
+        state = replace(state, nodes=(node,))
+        assert not self._unbound_errors(state)
+
+    def test_skips_non_string_prompt_template(self) -> None:
+        """A mistyped prompt_template is the plugin schema's problem — this
+        rule only reasons about string templates."""
+        state = self._state_with_llm("Classify: {{ row.text }}")
+        options = dict(state.nodes[0].options)
+        options["prompt_template"] = {"not": "a-string"}
+        node = replace(state.nodes[0], options=options)
+        state = replace(state, nodes=(node,))
+        assert not self._unbound_errors(state)
+
+
 class TestSchemaContractValidation:
     """Tests for schema contract validation (pass 9) in CompositionState.validate()."""
 
