@@ -105,6 +105,26 @@ pattern class was required.
 
 Unresolved stale residue for this entry: **0 sites**.
 
+## Entry 4: Completion-gate and trust-regression review findings
+
+- Date: 2026-08-01
+- Review anchor: `f4c5b640d`
+- Corrected commit: `45ea4e541`
+- Discovered by: read-only post-integration review
+- Result: 2 corrected sites across 2 new recurring pattern classes
+
+| Pattern | Sites | Exact surface | Plausible detector |
+|---|---:|---|---|
+| Terminal-record merge non-idempotence | 1 | `merge_completion_gates` appended a second `advisor_signoff` after `ValidationLedger.finish_failure` had already emitted the canonical skipped terminal slot; repeated merges also accumulated checks and blockers | Replay durable-fact merges over successful, failed-ledger, and already-merged results; assert canonical rank, per-check cardinality, blocker cardinality, and idempotence |
+| Trust regression path/suppression blindness | 1 | `test_validation_trust_tier.py` discarded suppression observations, while the synthetic named-exemption regression tested `_collect_secret_refs` under `validation.py` and `_validation_diagnostics.py` instead of its owner `_validation_authoring.py` | Require trust tests to bind each named helper to its production file and snapshot both active findings and suppression observations; mutation-test closed-list exemptions at the real path |
+
+The completion-gate parser's five R1 sentinel probes and two R5 Mapping shape
+checks remain explicit, regression-pinned release-signing candidates. They are
+well-defined fail-closed parsing obligations, not unresolved stale residue; no
+allowlist, signature, staging bundle, or trust-tier rule was changed.
+
+Unresolved stale residue for this entry: **0 sites**.
+
 ## Running totals
 
 | Features reviewed | Corrected sites | Pattern classes recorded | Unresolved residue |
@@ -112,3 +132,4 @@ Unresolved stale residue for this entry: **0 sites**.
 | 1 | 100 | 9 | 0 |
 | 1 | 101 | 10 | 0 |
 | 1 | 103 | 10 | 0 |
+| 1 | 105 | 12 | 0 |
