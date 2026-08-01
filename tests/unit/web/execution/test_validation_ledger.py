@@ -15,6 +15,7 @@ from elspeth.web.execution._validation_model import (
     MaterializedYaml,
     PhaseFailure,
     PhaseReport,
+    PhaseTermination,
     PolicyLoweredState,
 )
 from elspeth.web.execution.schemas import (
@@ -190,6 +191,25 @@ def test_phase_failure_snapshots_all_caller_owned_evidence_on_construction() -> 
     assert len(failure.readiness.blockers) == 1
     assert failure.readiness.blockers[0].detail == "Validation failed."
     assert failure.semantic_contracts[0].outcome == "satisfied"
+
+
+def test_phase_outcomes_apply_without_runner_side_type_discrimination() -> None:
+    ledger = ValidationLedger()
+    report = PhaseReport(artifact="artifact", checks=(_check(CHECK_PLUGIN_ENABLEMENT, passed=True),))
+
+    assert report.apply(ledger) == "artifact"
+
+    failure = PhaseFailure(
+        passed_checks=(),
+        failed_check=_check("operator_profile_options", passed=False),
+        errors=(_error("blocked"),),
+        readiness=_blocked_readiness(),
+    )
+    with pytest.raises(PhaseTermination) as captured:
+        failure.apply(ledger)
+
+    assert captured.value.result.is_valid is False
+    assert [check.name for check in captured.value.result.checks] == list(VALIDATION_BLOCKING_CHECK_NAMES)
 
 
 def test_finish_failure_preserves_prefix_and_completes_canonical_cascade() -> None:

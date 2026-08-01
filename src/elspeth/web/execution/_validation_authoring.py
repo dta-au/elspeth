@@ -9,12 +9,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from pydantic import TypeAdapter
 from pydantic import ValidationError as PydanticValidationError
 
-from elspeth.contracts.secrets import ScopedWebSecretResolver, SecretRefPlacementViolation, SecretScope, WebSecretResolver
+from elspeth.contracts.secrets import SecretRefPlacementViolation, SecretScope, WebSecretResolver
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.secrets import (
     collect_credential_field_violations,
     collect_disallowed_secret_ref_markers,
@@ -70,6 +70,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.plugin_policy.validation import PolicyValidationStage, validate_plugin_policy
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields, allowed_secret_ref_fields_text
+from elspeth.web.secrets.service import ScopedSecretResolver
 
 _PLUGIN_POLICY_CHECKS: tuple[tuple[PolicyValidationStage, ValidationCheckName], ...] = (
     ("plugin_enablement", CHECK_PLUGIN_ENABLEMENT),
@@ -92,6 +93,40 @@ class SecretValidatedState:
     policy: PolicyLoweredState
     all_secret_refs: tuple[tuple[str, SecretScope | None], ...]
     env_ref_names: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedResourceLimit:
+    value: int | None
+    error: ValidationError | None
+
+    def __post_init__(self) -> None:
+        if (self.value is None) == (self.error is None):
+            raise ValueError("_ParsedResourceLimit requires exactly one of value or error")
+
+
+def _parse_resource_limit(
+    raw_value: object,
+    *,
+    component_id: str,
+    option_name: str,
+    maximum: int,
+) -> _ParsedResourceLimit:
+    """Parse one Pydantic-derived web limit into an explicit typed outcome."""
+    try:
+        value = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(raw_value)
+    except PydanticValidationError:
+        return _ParsedResourceLimit(
+            value=None,
+            error=ValidationError(
+                component_id=component_id,
+                component_type="transform",
+                message=f"blob_fetch.http.{option_name} must be an integer; got {type(raw_value).__name__}.",
+                suggestion=f"Set blob_fetch.http.{option_name} to an integer from 0 to {maximum}.",
+                error_code="web_fetch_resource_config_invalid",
+            ),
+        )
+    return _ParsedResourceLimit(value=value, error=None)
 
 
 def _blocked_readiness(
@@ -118,6 +153,48 @@ def _blocked_readiness(
     )
 
 
+def _path_value_failure(
+    *,
+    component_id: str,
+    component_type: str,
+    option_name: str,
+    detail: str,
+) -> PhaseFailure:
+    """Return the canonical typed failure for one malformed authored path."""
+    return PhaseFailure(
+        passed_checks=(),
+        failed_check=ValidationCheck(
+            name=CHECK_PATH_ALLOWLIST,
+            passed=False,
+            detail=detail,
+            affected_nodes=(),
+            outcome_code=None,
+        ),
+        errors=(
+            ValidationError(
+                component_id=component_id,
+                component_type=component_type,
+                message=detail,
+                suggestion=f"Set {option_name} to a valid path within this session's allowed directories.",
+                error_code=None,
+            ),
+        ),
+        readiness=_blocked_readiness(
+            code="path_allowlist",
+            detail=detail,
+            component_id=component_id,
+            component_type=component_type,
+        ),
+    )
+
+
+@observation_boundary(
+    tier=3,
+    source="composer-authored nodes and options entering plugin-policy validation",
+    source_param="state",
+    suppresses=("R1", "R5"),
+    invariant="returns typed policy evidence or a typed validation failure for unsupported authored values",
+)
 def lower_plugin_policy(
     state: CompositionState,
     *,
@@ -177,6 +254,13 @@ def lower_plugin_policy(
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="composer-authored source, sink, and provider path options",
+    source_param="policy",
+    suppresses=("R1", "R5"),
+    invariant="returns typed path-policy evidence or a typed validation failure; external path values do not escape unvalidated",
+)
 def validate_path_policy(
     policy: PolicyLoweredState,
     *,
@@ -207,8 +291,23 @@ def validate_path_policy(
             value = source_options.get(key)
             if value is None:
                 continue
+            if type(value) is not str:
+                return _path_value_failure(
+                    component_id=source_component,
+                    component_type="source",
+                    option_name=key,
+                    detail=f"Source '{source_name}' {key} must be a string path; got {type(value).__name__}",
+                )
             path_checked = True
-            resolved = resolve_data_path(value, data_dir_text)
+            try:
+                resolved = resolve_data_path(value, data_dir_text)
+            except (OSError, TypeError, ValueError):
+                return _path_value_failure(
+                    component_id=source_component,
+                    component_type="source",
+                    option_name=key,
+                    detail=f"Source '{source_name}' {key} is not a valid path",
+                )
             if not any(resolved.is_relative_to(directory) for directory in allowed_source_dirs):
                 return PhaseFailure(
                     passed_checks=(),
@@ -241,8 +340,23 @@ def validate_path_policy(
             value = output.options[key] if key in output.options else None
             if value is None:
                 continue
+            if type(value) is not str:
+                return _path_value_failure(
+                    component_id=output.name,
+                    component_type="sink",
+                    option_name=key,
+                    detail=f"Sink '{output.name}' {key} must be a string path; got {type(value).__name__}",
+                )
             path_checked = True
-            resolved = resolve_sink_data_path(value, data_dir_text, session_id=session_id)
+            try:
+                resolved = resolve_sink_data_path(value, data_dir_text, session_id=session_id)
+            except (OSError, TypeError, ValueError):
+                return _path_value_failure(
+                    component_id=output.name,
+                    component_type="sink",
+                    option_name=key,
+                    detail=f"Sink '{output.name}' {key} is not a valid path",
+                )
             if not any(resolved.is_relative_to(directory) for directory in allowed_sink_dirs):
                 return PhaseFailure(
                     passed_checks=(),
@@ -280,8 +394,23 @@ def validate_path_policy(
             value = provider_config.get(key)
             if value is None:
                 continue
+            if type(value) is not str:
+                return _path_value_failure(
+                    component_id=node.id,
+                    component_type="transform",
+                    option_name=key,
+                    detail=f"Transform '{node.id}' {key} must be a string path; got {type(value).__name__}",
+                )
             path_checked = True
-            resolved = resolve_sink_data_path(value, data_dir_text, session_id=session_id)
+            try:
+                resolved = resolve_sink_data_path(value, data_dir_text, session_id=session_id)
+            except (OSError, TypeError, ValueError):
+                return _path_value_failure(
+                    component_id=node.id,
+                    component_type="transform",
+                    option_name=key,
+                    detail=f"Transform '{node.id}' {key} is not a valid path",
+                )
             if not any(resolved.is_relative_to(directory) for directory in allowed_sink_dirs):
                 return PhaseFailure(
                     passed_checks=(),
@@ -316,6 +445,13 @@ def validate_path_policy(
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="composer-authored web fetch network options",
+    source_param="policy",
+    suppresses=("R5",),
+    invariant="returns typed policy evidence or a typed validation failure for every disallowed network shape",
+)
 def validate_web_network_policy(
     policy: PolicyLoweredState,
     *,
@@ -383,6 +519,13 @@ def validate_web_network_policy(
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="composer-authored web fetch resource options",
+    source_param="policy",
+    suppresses=("R5",),
+    invariant="returns typed policy evidence or explicit typed conversion errors for malformed resource limits",
+)
 def validate_web_resource_policy(
     policy: PolicyLoweredState,
     *,
@@ -408,60 +551,50 @@ def validate_web_resource_policy(
                 continue
             if "timeout" in http_options:
                 raw_timeout = http_options["timeout"]
-                try:
-                    timeout = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(raw_timeout)
-                except PydanticValidationError:
+                parsed_timeout = _parse_resource_limit(
+                    raw_timeout,
+                    component_id=node.id,
+                    option_name="timeout",
+                    maximum=_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS,
+                )
+                if parsed_timeout.error is not None:
+                    errors.append(parsed_timeout.error)
+                elif parsed_timeout.value is not None and parsed_timeout.value > _WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS:
                     errors.append(
                         ValidationError(
                             component_id=node.id,
                             component_type="transform",
-                            message=f"blob_fetch.http.timeout must be an integer; got {type(raw_timeout).__name__}.",
-                            suggestion=f"Set blob_fetch.http.timeout to an integer from 0 to {_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS}.",
-                            error_code="web_fetch_resource_config_invalid",
+                            message=(
+                                f"blob_fetch.http.timeout={parsed_timeout.value} exceeds the web execution limit of "
+                                f"{_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} seconds."
+                            ),
+                            suggestion=f"Set blob_fetch.http.timeout to {_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} or less.",
+                            error_code="web_fetch_resource_limit_exceeded",
                         )
                     )
-                else:
-                    if timeout > _WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS:
-                        errors.append(
-                            ValidationError(
-                                component_id=node.id,
-                                component_type="transform",
-                                message=(
-                                    f"blob_fetch.http.timeout={timeout} exceeds the web execution limit of "
-                                    f"{_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} seconds."
-                                ),
-                                suggestion=f"Set blob_fetch.http.timeout to {_WEB_BLOB_FETCH_MAX_TIMEOUT_SECONDS} or less.",
-                                error_code="web_fetch_resource_limit_exceeded",
-                            )
-                        )
             if "max_body_bytes" in http_options:
                 raw_max_body_bytes = http_options["max_body_bytes"]
-                try:
-                    max_body_bytes = _WEB_BLOB_FETCH_INT_ADAPTER.validate_python(raw_max_body_bytes)
-                except PydanticValidationError:
+                parsed_max_body_bytes = _parse_resource_limit(
+                    raw_max_body_bytes,
+                    component_id=node.id,
+                    option_name="max_body_bytes",
+                    maximum=_WEB_BLOB_FETCH_MAX_BODY_BYTES,
+                )
+                if parsed_max_body_bytes.error is not None:
+                    errors.append(parsed_max_body_bytes.error)
+                elif parsed_max_body_bytes.value is not None and parsed_max_body_bytes.value > _WEB_BLOB_FETCH_MAX_BODY_BYTES:
                     errors.append(
                         ValidationError(
                             component_id=node.id,
                             component_type="transform",
-                            message=f"blob_fetch.http.max_body_bytes must be an integer; got {type(raw_max_body_bytes).__name__}.",
-                            suggestion=f"Set blob_fetch.http.max_body_bytes to an integer from 0 to {_WEB_BLOB_FETCH_MAX_BODY_BYTES}.",
-                            error_code="web_fetch_resource_config_invalid",
+                            message=(
+                                f"blob_fetch.http.max_body_bytes={parsed_max_body_bytes.value} exceeds the web execution limit of "
+                                f"{_WEB_BLOB_FETCH_MAX_BODY_BYTES} bytes."
+                            ),
+                            suggestion=f"Set blob_fetch.http.max_body_bytes to {_WEB_BLOB_FETCH_MAX_BODY_BYTES} or less.",
+                            error_code="web_fetch_resource_limit_exceeded",
                         )
                     )
-                else:
-                    if max_body_bytes > _WEB_BLOB_FETCH_MAX_BODY_BYTES:
-                        errors.append(
-                            ValidationError(
-                                component_id=node.id,
-                                component_type="transform",
-                                message=(
-                                    f"blob_fetch.http.max_body_bytes={max_body_bytes} exceeds the web execution limit of "
-                                    f"{_WEB_BLOB_FETCH_MAX_BODY_BYTES} bytes."
-                                ),
-                                suggestion=f"Set blob_fetch.http.max_body_bytes to {_WEB_BLOB_FETCH_MAX_BODY_BYTES} or less.",
-                                error_code="web_fetch_resource_limit_exceeded",
-                            )
-                        )
     if errors:
         return PhaseFailure(
             passed_checks=(),
@@ -491,7 +624,14 @@ def validate_web_resource_policy(
     )
 
 
-def _collect_secret_refs(obj: Any, env_ref_names: set[str] | frozenset[str] | None = None) -> list[tuple[str, SecretScope | None]]:
+@observation_boundary(
+    tier=3,
+    source="composer-authored nested plugin options and secret markers",
+    source_param="obj",
+    suppresses=("R5",),
+    invariant="returns only normalized secret names/scopes and ignores non-marker leaves",
+)
+def _collect_secret_refs(obj: object, env_ref_names: set[str] | frozenset[str] | None = None) -> list[tuple[str, SecretScope | None]]:
     """Collect deferred-secret names together with their requested scope."""
     refs: list[tuple[str, SecretScope | None]] = []
     if isinstance(obj, Mapping):
@@ -519,8 +659,10 @@ def _secret_ref_exists(
     name, scope = secret_ref
     if scope is None:
         return secret_service.has_ref(user_id, name)
-    if not isinstance(secret_service, ScopedWebSecretResolver):
-        raise TypeError("Scoped secret marker requires a ScopedWebSecretResolver")
+    # Adjudication candidate: nominal admission of an owned dependency; the
+    # runtime-checkable Protocol is intentionally not an authority check.
+    if not isinstance(secret_service, ScopedSecretResolver):
+        raise TypeError("Scoped secret validation requires the owned ScopedSecretResolver.resolve_scoped dependency")
     return secret_service.resolve_scoped(user_id, name, scope) is not None
 
 
@@ -780,6 +922,8 @@ def review_interpretations(
             operator_resolved_model_node_ids=authored.policy.operator_resolved_model_node_ids,
         )
     )
+    # Adjudication candidate: this is nominal discrimination of an ELSPETH-owned
+    # closed result union, not defensive shape checking at a trust boundary.
     if isinstance(materialized_state, InterpretationReviewPending):
         site_detail = _format_interpretation_sites(materialized_state.sites)
         affected_nodes = tuple(dict.fromkeys(site.component_id for site in materialized_state.sites if site.component_type == "transform"))

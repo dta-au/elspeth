@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Never
 
 from elspeth.contracts.secrets import SecretScope
 from elspeth.web.composer.state import CompositionState
@@ -19,6 +19,16 @@ if TYPE_CHECKING:
     from elspeth.core.config import ElspethSettings
     from elspeth.core.dag.graph import ExecutionGraph
     from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
+    from elspeth.web.execution._validation_ledger import ValidationLedger
+    from elspeth.web.execution.schemas import ValidationResult
+
+
+class PhaseTermination(Exception):
+    """Typed early termination after a phase has finalized the run ledger."""
+
+    def __init__(self, result: ValidationResult) -> None:
+        super().__init__("execution validation terminated")
+        self.result = result
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +40,12 @@ class PhaseReport[T]:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "checks", tuple(check.model_copy(deep=True) for check in self.checks))
+
+    def apply(self, ledger: ValidationLedger) -> T:
+        """Record successful evidence and return the phase artifact."""
+        for check in self.checks:
+            ledger.record_pass(check)
+        return self.artifact
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +67,19 @@ class PhaseFailure:
             self,
             "semantic_contracts",
             tuple(contract.model_copy(deep=True) for contract in self.semantic_contracts),
+        )
+
+    def apply(self, ledger: ValidationLedger) -> Never:
+        """Finalize the ledger and terminate the ordered phase sequence."""
+        for check in self.passed_checks:
+            ledger.record_pass(check)
+        raise PhaseTermination(
+            ledger.finish_failure(
+                self.failed_check,
+                errors=self.errors,
+                readiness=self.readiness,
+                semantic_contracts=self.semantic_contracts,
+            )
         )
 
 

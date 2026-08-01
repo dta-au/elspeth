@@ -22,6 +22,18 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 
 - Scoped test runs miss cross-cutting gates — run the full `pytest tests/`
   before merging.
+- Treat the trust-tier gate as a catch-obvious-bug-hiding check, not a death
+  pact. Review every touched file in full, not only changed lines; apply the
+  trust-tier rules to production code and clean related tests, configuration,
+  and docs to house style. Use approved boundary metadata only for honest
+  Tier-3 parsing. If one narrow finding is genuinely policy-wrong, keep the
+  clearest correct code and leave it ready for adjudication. Never add aliases,
+  padding, reordering, dead code, or semantic distortion merely to preserve or
+  reduce signature churn: binding churn is an honest release obligation. Never
+  hand-edit signatures; agents
+  leave or stage key-free work and the operator signs only when the package or
+  release is complete. Keep `AGENTS.md` and `CLAUDE.md` tracked so every
+  worktree inherits this posture.
 - Validate by trust domain ([ADR-032](docs/architecture/adr/032-validate-by-trust-domain.md)):
   nominally type what ELSPETH owns (`isinstance` against a concrete class we
   define), parse what it does not (sentinel `getattr` + value assertions +
@@ -173,4 +185,4 @@ obligation is to follow the trust-tier standards and avoid introducing new
 defects or drift. The operator signs once, at package completion, after churn
 has settled.
 
-The `trust_tier.tier_model` lint allowlist seals each judge-gated suppression with an operator-held HMAC signature. Acquiring, repairing, or rotating those signatures runs across a two-actor seam: an agent **stages** a worklist key-free via the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`: `stage_scan` / `stage_status` / `verify_signatures` / `stage_preview` / `stage_rekey`), and the **operator** fires it with the key via the `elspeth-lints` CLI (`sign-bundle` / `rekey`). **Staging asserts; firing verifies** — the operator step re-derives every binding from the live tree and aborts before any write on staleness. An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody rule, elspeth-b3a3335c9f) and signing never runs in CI. Do not hand-edit a `judge_metadata_signature` or resurrect the old per-release signing runbooks — stage a bundle and have the operator fire it. All judging — including the final signature verdict — runs on the agentic harness with read-only tool access (`--judge-transport agent --judge-tools readonly`, 2026-07-09 policy): the judge explores the tree before ruling, and its rationale is secret-scrubbed before persist. The full workflow lives in the `judge-signature-workflow` skill and `docs/judge-signature-handoff.md`.
+The `trust_tier.tier_model` lint allowlist seals each judge-gated suppression with an operator-held HMAC signature. Acquiring, repairing, or rotating those signatures runs across a two-actor seam: an agent **stages** a worklist key-free via the `elspeth-judge` MCP server (`mcp__elspeth-judge__*`: `stage_scan` / `stage_status` / `verify_signatures` / `stage_preview` / `stage_rekey`), and the **operator** fires it with the key via the `elspeth-lints` CLI (`sign-bundle` / `rekey`). **Staging asserts; firing verifies** — the operator step re-derives every binding from the live tree and aborts before any write on staleness. An agent must NEVER hold `ELSPETH_JUDGE_METADATA_HMAC_KEY` (the [O1] custody rule, elspeth-b3a3335c9f) and signing never runs in CI. Do not hand-edit a `judge_metadata_signature` or resurrect the old per-release signing runbooks — stage a bundle and have the operator fire it. All judging — including the final signature verdict — normally runs on the Codex CLI harness with read-only tool access (`--judge-transport codex-cli --judge-tools readonly`): the judge explores the tree before ruling, and its rationale is secret-scrubbed before persist. The legacy `agent` transport is accepted with read-only tools but is not the normal signing path. The full workflow lives in the `judge-signature-workflow` skill and `docs/judge-signature-handoff.md`.

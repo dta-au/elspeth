@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
 from elspeth.contracts.data import CompatibilityResult
 from elspeth.core.dag.models import EdgeContractError, GraphValidationWarning
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.infrastructure.manager import PluginNotFoundError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.execution import _validation_authoring as authoring
 from elspeth.web.execution import _validation_diagnostics as diagnostics
 from elspeth.web.execution import validation as validation_facade
 
@@ -32,19 +32,39 @@ def _edge_error() -> EdgeContractError:
 def test_facade_diagnostic_exports_are_the_direct_implementations() -> None:
     """Legacy imports and patch targets must keep resolving by identity."""
     exported_names = (
-        "_collect_secret_refs",
-        "_infer_component_type_from_plugin_error",
         "_edge_patch_target_for_node_id",
         "_find_identity_node_advisories",
         "_graph_warning_to_validation_warning",
+        "_infer_component_type_from_plugin_error",
     )
 
     for name in exported_names:
         assert getattr(validation_facade, name) is getattr(diagnostics, name)
+    assert validation_facade._collect_secret_refs is authoring._collect_secret_refs
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            PluginConfigError(
+                "Invalid CSV config",
+                cause="missing path",
+                plugin_class="CsvSourceConfig",
+                component_type="source",
+            ),
+            "source",
+        ),
+        (PluginConfigError("Generic config error"), None),
+        (PluginNotFoundError("No plugin named 'missing'"), None),
+    ],
+)
+def test_plugin_error_component_type_compatibility(error: PluginConfigError | PluginNotFoundError, expected: str | None) -> None:
+    assert validation_facade._infer_component_type_from_plugin_error(error) == expected
 
 
 def test_facade_edge_suggestion_preserves_live_patch_target(monkeypatch: pytest.MonkeyPatch) -> None:
-    patched_target = SimpleNamespace(
+    patched_target = diagnostics._EdgePatchTarget(
         component_id="patched",
         component_type="transform",
         display_name="patched component",
@@ -74,7 +94,7 @@ def test_direct_secret_collection_preserves_depth_first_order_and_scope() -> Non
         ],
     }
 
-    assert diagnostics._collect_secret_refs(payload, {"ENV_TOKEN"}) == [
+    assert authoring._collect_secret_refs(payload, {"ENV_TOKEN"}) == [
         ("SOURCE_TOKEN", "server"),
         ("NODE_TOKEN", None),
         ("ENV_TOKEN", None),
@@ -90,12 +110,6 @@ def test_direct_graph_warning_conversion_preserves_first_node_attribution() -> N
     assert result.component_type == "graph"
     assert result.message == "review this edge"
     assert result.warning_code == "graph.warning"
-
-
-def test_direct_plugin_error_attribution_uses_owned_metadata() -> None:
-    error = PluginConfigError("bad output", component_type="sink")
-
-    assert diagnostics._infer_component_type_from_plugin_error(error) == "sink"
 
 
 def test_direct_identity_advisory_handles_empty_state() -> None:

@@ -38,7 +38,7 @@ class ValidationLedger:
 
     @property
     def checks(self) -> tuple[ValidationCheck, ...]:
-        """Return an immutable snapshot for the not-yet-extracted legacy tail."""
+        """Return an immutable snapshot for compatibility and diagnostics."""
         return tuple(check.model_copy(deep=True) for check in self._checks)
 
     def record_pass(self, check: ValidationCheck) -> None:

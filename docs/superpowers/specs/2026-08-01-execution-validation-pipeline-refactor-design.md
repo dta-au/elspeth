@@ -1,8 +1,11 @@
 # Execution Validation Pipeline Refactor Design
 
-**Status:** Approved for implementation by the operator on 2026-08-01
+**Status:** Implemented locally on 2026-08-01; final integration gates pending
 **Tracking:** `elspeth-39d6d479c0`
 **Integration branch:** `codex/execution-validation-pipeline`
+**Implementation context:** integrated through `6c4d843c7`; trust and
+house-style closeout continues from `1a2fda249` on
+`codex/execution-validation-trust-cleanup`
 
 ## Purpose
 
@@ -13,6 +16,27 @@ preserving the production admission path and every public API contract.
 
 The refactor must not touch Composer state implementation. Another workstream
 owns that surface. `CompositionState` remains an input contract only.
+
+## Implementation closeout
+
+The delivered architecture follows this design with three explicit deviations:
+
+- No `ValidationRequest` carrier was introduced. Public call arguments remain
+  explicit, while injected runtime functions live in the immutable
+  `ValidationDependencies` carrier. A second request-shaped bag would duplicate
+  the public signature without strengthening a phase boundary.
+- `PhaseReport.apply(ledger)` records successful evidence and returns its typed
+  artifact. `PhaseFailure.apply(ledger)` finishes the failure result and raises
+  `PhaseTermination`; `ValidationPipeline.run()` catches that terminal signal
+  once. This removes repeated result-type discrimination from the facade while
+  keeping one ledger owner.
+- Full touched-file trust cleanup removed linter name/path exemptions,
+  signature-padding aliases, and type-erasure seams. A scanner regression leaves
+  exactly three adjudication-ready R5 findings: `_secret_ref_exists` and
+  `review_interpretations` in `_validation_authoring.py`, plus
+  `_infer_component_type_from_plugin_error` in `_validation_diagnostics.py`.
+  Each is a nominal check over ELSPETH-owned concrete classes; no signed
+  allowlist or judge signature was changed.
 
 ## Current problem
 
@@ -123,9 +147,11 @@ all runtime blocking phases succeed.
 
 ### Pipeline contexts
 
-Use explicit typed carriers rather than a single untyped mutable bag:
+Use explicit typed carriers rather than a single untyped mutable bag. The
+implemented dependency carrier and phase artifacts are:
 
-- `ValidationRequest`: immutable caller inputs and injected runtime functions;
+- `ValidationDependencies`: immutable injected runtime functions; caller inputs
+  remain explicit on the public facade and runner;
 - `PolicyLoweredState`: executable state plus operator-resolved model IDs;
 - `AuthoredValidatedState`: secret inventory and semantic evidence;
 - `MaterializedYaml`: materialized state and the exact runtime YAML;

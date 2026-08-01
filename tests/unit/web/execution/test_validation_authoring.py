@@ -8,11 +8,12 @@ from typing import Any, cast
 
 import pytest
 
-from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem
+from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem, SecretScope
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution._validation_authoring import (
     SecretValidatedState,
+    _ParsedResourceLimit,
     lower_plugin_policy,
     review_interpretations,
     validate_batch_options,
@@ -29,9 +30,10 @@ from elspeth.web.execution._validation_model import (
     PhaseReport,
     PolicyLoweredState,
 )
-from elspeth.web.execution.schemas import SemanticEdgeContractResponse
+from elspeth.web.execution.schemas import SemanticEdgeContractResponse, ValidationError
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, PROMPT_TEMPLATE_PARTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.secrets.service import ScopedSecretResolver
 
 
 def _source(options: dict[str, object] | None = None, *, plugin: str = "csv", on_success: str = "node_in") -> SourceSpec:
@@ -147,6 +149,66 @@ class _SecretService:
         if name not in self.available:
             return None
         return ResolvedSecret(name=name, value="test", scope="user", fingerprint="a" * 64)
+
+    def resolve_scoped(self, user_id: str, name: str, scope: SecretScope) -> ResolvedSecret | None:
+        del scope
+        return self.resolve(user_id, name)
+
+
+class _OwnedScopedSecretService(ScopedSecretResolver):
+    def __init__(self, available: frozenset[str]) -> None:
+        self.available = available
+
+    def list_refs(self, user_id: str) -> list[SecretInventoryItem]:
+        return [SecretInventoryItem(name=name, scope="server", available=True, reason=None) for name in sorted(self.available)]
+
+    def has_ref(self, user_id: str, name: str) -> bool:
+        return name in self.available
+
+    def resolve(self, user_id: str, name: str) -> ResolvedSecret | None:
+        return self.resolve_scoped(user_id, name, "server")
+
+    def resolve_scoped(self, user_id: str, name: str, scope: str) -> ResolvedSecret | None:
+        if name not in self.available:
+            return None
+        return ResolvedSecret(name=name, value="test", scope=scope, fingerprint="a" * 64)
+
+
+def test_scoped_secret_marker_rejects_miswired_owned_resolver_loudly() -> None:
+    state = _state(source=_source({"api_key": {"secret_ref": "API_KEY", "secret_scope": "server"}}))
+
+    with pytest.raises(TypeError, match="resolve_scoped"):
+        validate_secret_evidence(
+            _policy(state),
+            secret_service=_SecretService(frozenset({"API_KEY"})),
+            user_id="alice",
+        )
+
+
+def test_scoped_secret_marker_accepts_owned_nominal_resolver() -> None:
+    state = _state(source=_source({"api_key": {"secret_ref": "API_KEY", "secret_scope": "server"}}))
+
+    result = validate_secret_evidence(
+        _policy(state),
+        secret_service=_OwnedScopedSecretService(frozenset({"API_KEY"})),
+        user_id="alice",
+    )
+
+    assert isinstance(result, PhaseReport)
+    assert result.artifact.all_secret_refs == (("API_KEY", "server"),)
+
+
+@pytest.mark.parametrize("bad_path", (123, {"nested": "path"}, "bad\x00path"))
+def test_path_phase_returns_typed_failure_for_malformed_authored_paths(bad_path: object) -> None:
+    result = validate_path_policy(
+        _policy(_state(source=_source({"path": bad_path}))),
+        data_dir=Path("/tmp/test_data"),
+        session_id="test-session",
+    )
+
+    assert isinstance(result, PhaseFailure)
+    assert result.failed_check.name == "path_allowlist"
+    assert result.errors[0].component_id == "source"
 
 
 def test_policy_lowering_returns_typed_state_and_four_canonical_checks() -> None:
@@ -289,6 +351,40 @@ def test_web_resource_phase_returns_typed_failure() -> None:
     assert result.failed_check.affected_nodes == ("node", "node")
     assert [error.error_code for error in result.errors] == [
         "web_fetch_resource_limit_exceeded",
+        "web_fetch_resource_limit_exceeded",
+    ]
+
+
+def test_resource_limit_outcome_rejects_ambiguous_state() -> None:
+    error = ValidationError(
+        component_id="node",
+        component_type="transform",
+        message="bad limit",
+        suggestion=None,
+        error_code="web_fetch_resource_config_invalid",
+    )
+
+    with pytest.raises(ValueError, match="exactly one"):
+        _ParsedResourceLimit(value=None, error=None)
+    with pytest.raises(ValueError, match="exactly one"):
+        _ParsedResourceLimit(value=1, error=error)
+
+
+def test_web_resource_phase_accumulates_conversion_and_limit_errors_in_option_order() -> None:
+    state = _state(
+        nodes=(
+            _node(
+                plugin="blob_fetch",
+                options={"http": {"timeout": "not-an-int", "max_body_bytes": 10 * 1024 * 1024 + 1}},
+            ),
+        )
+    )
+
+    result = validate_web_resource_policy(_policy(state), plugin_snapshot=_web_snapshot())
+
+    assert isinstance(result, PhaseFailure)
+    assert [error.error_code for error in result.errors] == [
+        "web_fetch_resource_config_invalid",
         "web_fetch_resource_limit_exceeded",
     ]
 

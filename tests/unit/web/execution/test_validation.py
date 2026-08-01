@@ -27,7 +27,6 @@ from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError, GraphValidationError, GraphValidationWarning
-from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
 from elspeth.web.composer.state import (
     CompositionState,
@@ -48,7 +47,6 @@ from elspeth.web.execution.validation import (
     _build_edge_contract_suggestion,
     _collect_secret_refs,
     _format_edge_contract_failure,
-    _infer_component_type_from_plugin_error,
     _reframe_settings_missing_parts,
 )
 from elspeth.web.execution.validation import validate_pipeline as _validate_pipeline
@@ -4556,50 +4554,6 @@ class TestSecretRefResolutionBeforeSettingsLoad:
         # In-memory loader was used — same path as execution service
         mock_load_string.assert_called_once()
         assert _check(result, "settings_load").passed is True
-
-
-class TestInferComponentTypeFromPluginError:
-    """Tests for _infer_component_type_from_plugin_error dispatch."""
-
-    def test_plugin_config_error_with_source_type(self) -> None:
-        """PluginConfigError with component_type='source' returns 'source'."""
-        exc = PluginConfigError(
-            "Invalid CSV config",
-            cause="missing path",
-            plugin_class="CsvSourceConfig",
-            component_type="source",
-        )
-        assert _infer_component_type_from_plugin_error(exc) == "source"
-
-    def test_plugin_config_error_with_sink_type(self) -> None:
-        """PluginConfigError with component_type='sink' returns 'sink'."""
-        exc = PluginConfigError(
-            "Invalid JSON config",
-            cause="bad format",
-            plugin_class="JsonSinkConfig",
-            component_type="sink",
-        )
-        assert _infer_component_type_from_plugin_error(exc) == "sink"
-
-    def test_plugin_config_error_with_transform_type(self) -> None:
-        """PluginConfigError with component_type='transform' returns 'transform'."""
-        exc = PluginConfigError(
-            "Invalid field mapper config",
-            cause="missing mappings",
-            plugin_class="FieldMapperConfig",
-            component_type="transform",
-        )
-        assert _infer_component_type_from_plugin_error(exc) == "transform"
-
-    def test_plugin_config_error_without_component_type(self) -> None:
-        """PluginConfigError raised outside from_dict() has no component_type."""
-        exc = PluginConfigError("Generic config error")
-        assert _infer_component_type_from_plugin_error(exc) is None
-
-    def test_plugin_not_found_error_returns_none(self) -> None:
-        """PluginNotFoundError always returns None — no component_type attribute."""
-        exc = PluginNotFoundError("No plugin named 'foobar'")
-        assert _infer_component_type_from_plugin_error(exc) is None
 
 
 class TestValidatePipelineRuntimePathResolution:

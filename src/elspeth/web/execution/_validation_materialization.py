@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 from uuid import UUID
 
 import yaml
@@ -131,7 +131,7 @@ def materialize_validation_yaml(
     data_dir: Path,
     session_id: str | None,
     blob_get_metadata: Callable[[UUID], BlobRecord | None] | None,
-    load_yaml: Callable[[str], Any],
+    load_yaml: Callable[[str], object],
 ) -> PhaseReport[MaterializedYaml] | PhaseFailure:
     """Generate the exact runtime YAML and validate inline-blob metadata."""
     pipeline_yaml = yaml_generator.generate_yaml(interpretation.materialized_state)
@@ -141,7 +141,7 @@ def materialize_validation_yaml(
         loaded = load_yaml(pipeline_yaml)
         if type(loaded) is not dict:
             raise TypeError(f"generate_yaml() produced non-dict YAML (got {type(loaded).__name__}) — this is a bug in the YAML generator")
-        config_dict = cast(dict[str, Any], loaded)
+        config_dict = cast(dict[str, object], loaded)
         blob_violations = _validate_blob_content_refs_sync(
             blob_get_metadata,
             config_dict,

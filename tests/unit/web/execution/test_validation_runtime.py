@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Never, cast
 from unittest.mock import ANY, MagicMock, create_autospec
 
 import pytest
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
-from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
+from elspeth.contracts.data import CompatibilityResult
+from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError, GraphValidationError, GraphValidationWarning
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
@@ -18,7 +18,9 @@ from elspeth.engine.orchestrator.types import RouteValidationError
 from elspeth.engine.orchestrator.value_source_validation import ValueSourceFinding, ValueSourceValidationError
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
+from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.execution._validation_diagnostics import _EdgePatchTarget, _IdentityFinding
 from elspeth.web.execution._validation_model import (
     AuthoredValidatedState,
     GraphedRuntime,
@@ -91,18 +93,22 @@ def _materialized(
 
 
 def _loaded(materialized: MaterializedYaml | None = None) -> LoadedRuntime:
-    return LoadedRuntime(materialized=materialized or _materialized(), settings=cast(Any, SimpleNamespace(name="settings")))
+    return LoadedRuntime(materialized=materialized or _materialized(), settings=_settings())
 
 
-def _bundle() -> Any:
-    return SimpleNamespace(sources={"source": object()}, transforms=[object()], sinks={"sink": object()}, aggregations={})
+def _settings() -> ElspethSettings:
+    return cast(ElspethSettings, create_autospec(ElspethSettings, instance=True))
+
+
+def _bundle() -> PluginBundle:
+    return cast(PluginBundle, create_autospec(PluginBundle, instance=True))
 
 
 def _instantiated(loaded: LoadedRuntime | None = None) -> InstantiatedRuntime:
-    return InstantiatedRuntime(loaded=loaded or _loaded(), bundle=cast(Any, _bundle()))
+    return InstantiatedRuntime(loaded=loaded or _loaded(), bundle=_bundle())
 
 
-def _autospec_callable(target: Any, **configuration: Any) -> MagicMock:
+def _autospec_callable(target: object, **configuration: Any) -> MagicMock:
     return cast(MagicMock, create_autospec(target, **configuration))
 
 
@@ -118,7 +124,7 @@ def _unexpected_edge_target(
     state: CompositionState,
     graph: ExecutionGraph,
     component_type: str | None,
-) -> Any:
+) -> Never:
     del dag_node_id, state, graph, component_type
     raise AssertionError("edge target resolver must not be called")
 
@@ -133,15 +139,15 @@ def _unexpected_edge_formatter(
     raise AssertionError("edge formatter must not be called")
 
 
-def _graphed(graph: Any | None = None) -> GraphedRuntime:
-    return GraphedRuntime(instantiated=_instantiated(), graph=cast(Any, graph or _graph()), graph_warnings=())
+def _graphed(graph: ExecutionGraph | None = None) -> GraphedRuntime:
+    return GraphedRuntime(instantiated=_instantiated(), graph=graph or _graph(), graph_warnings=())
 
 
 def _snapshot() -> PluginAvailabilitySnapshot:
     return PluginAvailabilitySnapshot.create(
         policy_hash="runtime-phase-test",
         principal_scope="local:test",
-        available=(),
+        available=frozenset(),
         unavailable=(),
         selected=(),
         usable_profile_aliases=(),
@@ -175,7 +181,7 @@ def _reframe_missing(exc: PydanticValidationError) -> list[ValidationError]:
 
 def test_settings_phase_loads_exact_yaml_without_host_expansion_and_detaches_evidence() -> None:
     materialized = _materialized(pipeline_yaml="sources: {}\nsinks: {}\n")
-    parsed_settings = object()
+    parsed_settings = _settings()
     load_yaml = _autospec_callable(load_bounded_pipeline_yaml)
     load_settings_yaml = _autospec_callable(load_settings_from_yaml_string, return_value=parsed_settings)
     load_settings_dict = _autospec_callable(load_settings_from_config_dict)
@@ -269,7 +275,6 @@ def test_plugin_and_value_source_successes_are_separate_ordered_phases() -> None
         loaded,
         plugin_snapshot=_snapshot(),
         instantiate_plugins=instantiate,
-        infer_component_type=lambda exc: "transform",
     )
     assert isinstance(plugins, PhaseReport)
     values = validate_value_source_compliance(plugins.artifact)
@@ -291,7 +296,6 @@ def test_value_source_failure_records_plugin_pass_and_attributed_errors() -> Non
         _loaded(),
         plugin_snapshot=_snapshot(),
         instantiate_plugins=_autospec_callable(instantiate_runtime_plugins, side_effect=error),
-        infer_component_type=lambda exc: "transform",
     )
 
     assert isinstance(result, PhaseFailure)
@@ -324,7 +328,6 @@ def test_plugin_phase_discriminates_expected_construction_failures(error: Except
         _loaded(),
         plugin_snapshot=_snapshot(),
         instantiate_plugins=_autospec_callable(instantiate_runtime_plugins, side_effect=error),
-        infer_component_type=lambda exc: component_type,
     )
 
     assert isinstance(result, PhaseFailure)
@@ -348,7 +351,6 @@ def test_plugin_phase_propagates_unexpected_exceptions() -> None:
                 instantiate_runtime_plugins,
                 side_effect=RuntimeError("plugin invariant"),
             ),
-            infer_component_type=lambda exc: None,
         )
 
 
@@ -444,23 +446,34 @@ def test_schema_phase_uses_authored_policy_state_for_rich_edge_diagnostics() -> 
         to_node_id="consumer",
         producer_schema_name="Producer",
         consumer_schema_name="Consumer",
-        compatibility_result=cast(Any, SimpleNamespace()),
+        compatibility_result=CompatibilityResult(compatible=False, missing_fields=("value",)),
         component_type="transform",
     )
     graph.validate_edge_compatibility.side_effect = edge_error
     graphed = GraphedRuntime(
         instantiated=_instantiated(_loaded(_materialized(policy_state=policy_state, materialized_state=materialized_state))),
-        graph=cast(Any, graph),
+        graph=graph,
         graph_warnings=(),
     )
     seen: list[CompositionState] = []
 
-    def edge_target(node_id: str, *, state: CompositionState, graph: Any, component_type: str | None) -> Any:
-        del node_id, graph, component_type
+    def edge_target(
+        dag_node_id: str,
+        *,
+        state: CompositionState,
+        graph: ExecutionGraph,
+        component_type: str | None,
+    ) -> _EdgePatchTarget:
+        del dag_node_id, graph, component_type
         seen.append(state)
-        return SimpleNamespace(component_id="composer_consumer", component_type="transform")
+        return _EdgePatchTarget(
+            component_id="composer_consumer",
+            component_type="transform",
+            display_name="composer consumer",
+            schema_patch_tool_call="patch_node_options()",
+        )
 
-    def format_edge(exc: EdgeContractError, *, state: CompositionState, graph: Any) -> tuple[str, str]:
+    def format_edge(exc: EdgeContractError, *, state: CompositionState, graph: ExecutionGraph) -> tuple[str, str]:
         del exc, graph
         seen.append(state)
         return "rich edge message", "rich edge suggestion"
@@ -512,10 +525,10 @@ def test_identity_advisory_checks_use_policy_state_and_preserve_exact_prose() ->
     policy_state = _state()
     graphed = GraphedRuntime(
         instantiated=_instantiated(_loaded(_materialized(policy_state=policy_state, materialized_state=_state()))),
-        graph=cast(Any, _graph()),
+        graph=_graph(),
         graph_warnings=(),
     )
-    finding = SimpleNamespace(
+    finding = _IdentityFinding(
         node_id="passthrough",
         upstream_id="producer",
         sink_name="primary",
@@ -523,7 +536,7 @@ def test_identity_advisory_checks_use_policy_state_and_preserve_exact_prose() ->
     )
     seen: list[CompositionState] = []
 
-    def finder(state: CompositionState) -> list[Any]:
+    def finder(state: CompositionState) -> list[_IdentityFinding]:
         seen.append(state)
         return [finding]
 
@@ -539,15 +552,15 @@ def test_identity_advisory_checks_use_policy_state_and_preserve_exact_prose() ->
 
 def test_runtime_carriers_snapshot_envelopes_but_preserve_executable_identities() -> None:
     materialized = _materialized()
-    settings = object()
-    loaded = LoadedRuntime(materialized=materialized, settings=cast(Any, settings))
+    settings = _settings()
+    loaded = LoadedRuntime(materialized=materialized, settings=settings)
     materialized.authored.semantic_contracts[0].outcome = "conflict"
     assert loaded.materialized is not materialized
     assert loaded.materialized.authored.semantic_contracts[0].outcome == "satisfied"
     assert loaded.settings is settings
 
     bundle = _bundle()
-    instantiated = InstantiatedRuntime(loaded=loaded, bundle=cast(Any, bundle))
+    instantiated = InstantiatedRuntime(loaded=loaded, bundle=bundle)
     loaded.materialized.authored.semantic_contracts[0].outcome = "conflict"
     assert instantiated.loaded is not loaded
     assert instantiated.loaded.materialized.authored.semantic_contracts[0].outcome == "satisfied"
@@ -562,7 +575,7 @@ def test_runtime_carriers_snapshot_envelopes_but_preserve_executable_identities(
         suggestion=None,
         warning_code="WARN",
     )
-    graphed = GraphedRuntime(instantiated=instantiated, graph=cast(Any, graph), graph_warnings=(warning,))
+    graphed = GraphedRuntime(instantiated=instantiated, graph=graph, graph_warnings=(warning,))
     instantiated.loaded.materialized.authored.semantic_contracts[0].outcome = "unknown"
     warning.message = "mutated"
     assert graphed.instantiated is not instantiated

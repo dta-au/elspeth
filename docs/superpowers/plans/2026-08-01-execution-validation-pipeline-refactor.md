@@ -8,6 +8,20 @@
 
 **Tech Stack:** Python 3.13, dataclasses, pydantic response models, pytest, Ruff/mypy through repository gates, Loomweave, Filigree, Wardline.
 
+**Status (2026-08-01):** Tasks 1–8 are implemented locally through integration
+commit `6c4d843c7` on `codex/execution-validation-pipeline`; trust and house-style
+closeout continues from `1a2fda249` on
+`codex/execution-validation-trust-cleanup`. Task 9 remains open for final
+integration testing and tracker closeout.
+
+**Delivered deviations:** The implementation did not add the proposed
+`ValidationRequest` carrier; public arguments remain explicit and only injected
+functions are grouped in `ValidationDependencies`. Phase termination uses
+`PhaseReport.apply()` / `PhaseFailure.apply()` plus one `PhaseTermination` catch
+in the runner. The touched-file trust review removed signature-churn workarounds
+and records three explicit nominal R5 adjudication candidates in the scanner
+regression; it did not edit or sign the tier-model allowlist.
+
 ---
 
 ## Branch order
@@ -25,7 +39,7 @@ inspection. Each later branch starts from the updated integration branch.
 - Modify: `tests/unit/web/execution/test_validation.py`
 - Modify: `tests/unit/web/execution/test_preflight_side_effects.py:413-426`
 
-- [ ] **Step 1: Add a complete-failure-ledger assertion helper**
+- [x] **Step 1: Add a complete-failure-ledger assertion helper**
 
 Add beside `_check()` in `test_validation.py`:
 
@@ -44,7 +58,7 @@ def _assert_complete_failure_ledger(result: Any, failed_name: str) -> None:
     )
 ```
 
-- [ ] **Step 2: Add a failing regression for all three path families**
+- [x] **Step 2: Add a failing regression for all three path families**
 
 Create a parametrized test covering source `path`, sink `path`, and nested
 transform `provider_config.persist_directory`. Each value must resolve outside
@@ -64,7 +78,7 @@ assert path_check.passed is False
 assert "persist_directory" in path_check.detail
 ```
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation.py -k 'path_failure_preserves' -q
@@ -73,7 +87,7 @@ assert "persist_directory" in path_check.detail
 Expected: all parametrized cases fail because the first emitted name is
 `path_allowlist`, not `plugin_enablement`.
 
-- [ ] **Step 4: Preserve the accumulated list in each path branch**
+- [x] **Step 4: Preserve the accumulated list in each path branch**
 
 For source, sink, and nested-transform path failures, replace the fresh-list
 return with this sequence:
@@ -100,7 +114,7 @@ return ValidationResult(
 Retain each branch's existing detail, affected nodes, error, and readiness
 objects exactly; only list ownership changes.
 
-- [ ] **Step 5: Run GREEN and neighboring tests**
+- [x] **Step 5: Run GREEN and neighboring tests**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation.py tests/unit/web/execution/test_preflight_side_effects.py -q
@@ -108,7 +122,7 @@ objects exactly; only list ownership changes.
 
 Expected: pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/elspeth/web/execution/validation.py tests/unit/web/execution/test_validation.py tests/unit/web/execution/test_preflight_side_effects.py
@@ -122,7 +136,7 @@ git commit -m "fix(web): preserve policy checks on path rejection"
 - Modify: `src/elspeth/web/execution/validation.py:2493-2558`
 - Modify: `tests/unit/web/execution/test_validation.py:4594-4634`
 
-- [ ] **Step 1: Extend the schema failure regression**
+- [x] **Step 1: Extend the schema failure regression**
 
 After the existing schema assertions, add:
 
@@ -135,7 +149,7 @@ assert [check.name for check in result.checks[-3:]] == [
 ]
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation.py::TestValidatePipelineRuntimeCheckBoundaries::test_schema_failure_uses_schema_check -q
@@ -143,7 +157,7 @@ assert [check.name for check in result.checks[-3:]] == [
 
 Expected: fail because the last three skipped records are absent.
 
-- [ ] **Step 3: Append the canonical skipped tail**
+- [x] **Step 3: Append the canonical skipped tail**
 
 Immediately before the schema-failure `ValidationResult`, add:
 
@@ -153,7 +167,7 @@ _append_skipped_checks(checks, _CHECK_SCHEMA)
 
 Do not change error formatting, component attribution, or readiness.
 
-- [ ] **Step 4: Run GREEN and the validation module**
+- [x] **Step 4: Run GREEN and the validation module**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation.py -q
@@ -161,7 +175,7 @@ Do not change error formatting, component attribution, or readiness.
 
 Expected: pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/elspeth/web/execution/validation.py tests/unit/web/execution/test_validation.py
@@ -176,7 +190,7 @@ git commit -m "fix(web): complete schema validation cascade"
 - Create: `src/elspeth/web/execution/_validation_ledger.py`
 - Create: `tests/unit/web/execution/test_validation_ledger.py`
 
-- [ ] **Step 1: Write failing ledger unit tests**
+- [x] **Step 1: Write failing ledger unit tests**
 
 Test the following public-internal behaviors through `ValidationLedger`:
 
@@ -203,7 +217,7 @@ Also assert duplicate core names, out-of-order core names, a pass after failure,
 and an advisory before all 24 core passes raise `RuntimeError`. Assert that
 empty-state and outer-layer synthetic shapes are not model-level ledger inputs.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation_ledger.py -q
@@ -211,7 +225,7 @@ empty-state and outer-layer synthetic shapes are not model-level ledger inputs.
 
 Expected: import failure because the new modules do not exist.
 
-- [ ] **Step 3: Add carrier types**
+- [x] **Step 3: Add carrier types**
 
 Define frozen, slotted dataclasses in `_validation_model.py`:
 
@@ -239,14 +253,14 @@ Add `LoadedRuntime`, `InstantiatedRuntime`, and `GraphedRuntime` with concrete
 settings, bundle, graph, and ordered graph-warning fields. Keep engine-only
 types behind `TYPE_CHECKING` where importing them would create cycles.
 
-- [ ] **Step 4: Implement `ValidationLedger`**
+- [x] **Step 4: Implement `ValidationLedger`**
 
 Use `VALIDATION_BLOCKING_CHECK_NAMES` as the sole order authority. Define the
 24-name core prefix ending at `schema_compatibility`; `finish_failure()` emits
 the full canonical skipped suffix, while `finish_success()` requires all 24
 core names and permits zero or more `identity_node_advisory` records.
 
-- [ ] **Step 5: Run GREEN and type/lint checks**
+- [x] **Step 5: Run GREEN and type/lint checks**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation_ledger.py -q
@@ -256,7 +270,7 @@ core names and permits zero or more `identity_node_advisory` records.
 
 Expected: pass.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/elspeth/web/execution/_validation_model.py src/elspeth/web/execution/_validation_ledger.py tests/unit/web/execution/test_validation_ledger.py
@@ -272,19 +286,19 @@ git commit -m "refactor(web): add typed validation ledger"
 - Modify: `tests/unit/web/execution/test_validation.py`
 - Modify: `tests/integration/web/test_plugin_policy_end_to_end.py`
 
-- [ ] **Step 1: Add characterization tests for facade identity**
+- [x] **Step 1: Add characterization tests for facade identity**
 
 Pin exact `inspect.signature(validate_pipeline)`, wrapper forwarding, and the
 five facade patch targets. For each injected runtime function, patch the name
 on `elspeth.web.execution.validation` and assert the patched function is called
 through the public entry point.
 
-- [ ] **Step 2: Run RED for the requested runner surface**
+- [x] **Step 2: Run RED for the requested runner surface**
 
 Add a test importing `ValidationPipeline` and constructing it from an explicit
 `ValidationDependencies` dataclass. The test must fail before the module exists.
 
-- [ ] **Step 3: Implement call-time dependency capture**
+- [x] **Step 3: Implement call-time dependency capture**
 
 In `validation.py`, build `ValidationDependencies` inside `validate_pipeline()`
 from current module globals:
@@ -303,13 +317,13 @@ dependencies = ValidationDependencies(
 Delegate to `ValidationPipeline(dependencies).run(...)`. Keep the observation
 decorator and exact public signature on the facade function.
 
-- [ ] **Step 4: Keep behavior delegated to the legacy body initially**
+- [x] **Step 4: Keep behavior delegated to the legacy body initially**
 
 Move the existing body behind one runner method without changing stage order or
 `try` scopes. This commit establishes injection and ownership only; it must not
 mix phase extraction or behavior changes.
 
-- [ ] **Step 5: Verify**
+- [x] **Step 5: Verify**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation.py tests/integration/web/test_plugin_policy_end_to_end.py -q
@@ -317,7 +331,7 @@ mix phase extraction or behavior changes.
 
 Expected: pass with all existing facade patches still effective.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/elspeth/web/execution/_validation_pipeline.py src/elspeth/web/execution/validation.py tests/unit/web/execution/test_validation.py tests/integration/web/test_plugin_policy_end_to_end.py
@@ -333,14 +347,14 @@ git commit -m "refactor(web): introduce execution validation runner"
 - Modify: `tests/unit/web/execution/test_validation.py`
 - Create: `tests/unit/web/execution/test_validation_authoring.py`
 
-- [ ] **Step 1: Write phase tests first**
+- [x] **Step 1: Write phase tests first**
 
 Test policy lowering, source/sink/nested path failures, web network/resource
 failures, secret evidence, semantic evidence, batch validation, and pending
 interpretation. Each test asserts a typed carrier or `PhaseFailure`, never a
 mock call to a private helper.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation_authoring.py -q
@@ -348,14 +362,14 @@ mock call to a private helper.
 
 Expected: import failures for the new phase functions.
 
-- [ ] **Step 3: Move authored checks in canonical order**
+- [x] **Step 3: Move authored checks in canonical order**
 
 Create concrete functions returning `PhaseReport[T]`. They do not mutate the
 ledger. The runner applies reports and terminates on the first `PhaseFailure`.
 Retain the empty-pipeline short circuit in the facade/runner as an explicit
 legacy producer shape.
 
-- [ ] **Step 4: Run public differential tests**
+- [x] **Step 4: Run public differential tests**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation_authoring.py tests/unit/web/execution/test_validation.py -q
@@ -363,7 +377,7 @@ legacy producer shape.
 
 Expected: pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/elspeth/web/execution/_validation_authoring.py src/elspeth/web/execution/_validation_pipeline.py tests/unit/web/execution/test_validation_authoring.py tests/unit/web/execution/test_validation.py
@@ -379,14 +393,14 @@ git commit -m "refactor(web): extract authored validation phases"
 - Create: `tests/unit/web/execution/test_validation_materialization.py`
 - Modify: `tests/unit/web/execution/test_validate_blob_inline.py`
 
-- [ ] **Step 1: Write phase tests first**
+- [x] **Step 1: Write phase tests first**
 
 Cover YAML/path materialization, metadata-only blob validation and substitution,
 managed identity, LLM retry/base URL/tracing, S3 endpoint, and S3-source policy.
 Assert that provider checks execute after the blob check even though they do not
 consume its data.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation_materialization.py -q
@@ -394,14 +408,14 @@ consume its data.
 
 Expected: import failures.
 
-- [ ] **Step 3: Extract without broadening exception catches**
+- [x] **Step 3: Extract without broadening exception catches**
 
 YAML generation and path-resolution exceptions remain uncaught. Blob
 substitution produces the exact YAML consumed by settings loading. Schema
 diagnostics continue to retain the policy-lowered state separately from the
 materialized state.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation_materialization.py tests/unit/web/execution/test_validate_blob_inline.py tests/unit/web/execution/test_validation.py -q
@@ -419,14 +433,14 @@ git commit -m "refactor(web): extract validation materialization phases"
 - Modify: `tests/unit/web/execution/test_validation.py`
 - Modify: `tests/unit/web/execution/test_validation_value_source.py`
 
-- [ ] **Step 1: Write phase tests first**
+- [x] **Step 1: Write phase tests first**
 
 Cover settings typed catches and missing-part reframing, plugin/value-source
 exception discrimination, graph warnings, graph errors, route errors, schema
 errors, rich `EdgeContractError` formatting, and unexpected exception
 propagation.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation_runtime.py -q
@@ -434,7 +448,7 @@ propagation.
 
 Expected: import failures.
 
-- [ ] **Step 3: Extract with exact stage-local catches**
+- [x] **Step 3: Extract with exact stage-local catches**
 
 Keep four separate catches:
 
@@ -448,7 +462,7 @@ except RouteValidationError: ...
 The schema phase has its own `GraphValidationError` catch. Do not add a
 runner-wide `except Exception`.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation_runtime.py tests/unit/web/execution/test_validation.py tests/unit/web/execution/test_validation_value_source.py tests/integration/pipeline/test_composer_runtime_agreement.py -q
@@ -466,25 +480,25 @@ git commit -m "refactor(web): extract runtime validation phases"
 - Modify: `tests/unit/web/execution/test_validation.py`
 - Modify: `tests/unit/web/execution/test_identity_node_advisory.py`
 
-- [ ] **Step 1: Add import-compatibility tests**
+- [x] **Step 1: Add import-compatibility tests**
 
 Pin existing imports of `_build_edge_contract_suggestion`,
 `_format_edge_contract_failure`, `_collect_secret_refs`,
 `_infer_component_type_from_plugin_error`, and
 `_reframe_settings_missing_parts` from the facade module.
 
-- [ ] **Step 2: Run RED for the diagnostics module**
+- [x] **Step 2: Run RED for the diagnostics module**
 
 Add direct behavior tests importing the same implementations from
 `_validation_diagnostics`; expect import failure before creation.
 
-- [ ] **Step 3: Move diagnostic logic and re-export**
+- [x] **Step 3: Move diagnostic logic and re-export**
 
 Move edge-contract formatting, blob/settings reframing, and identity detection.
 Import those names into `validation.py` so existing imports continue to resolve.
 Do not change output prose or ordering.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 ```bash
 .venv/bin/pytest tests/unit/web/execution/test_validation.py tests/unit/web/execution/test_identity_node_advisory.py -q

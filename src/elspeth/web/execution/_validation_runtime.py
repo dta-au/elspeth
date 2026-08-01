@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 from pydantic import ValidationError as PydanticValidationError
 
@@ -46,9 +46,12 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
+if TYPE_CHECKING:
+    from elspeth.web.execution._validation_diagnostics import _EdgePatchTarget, _IdentityFinding
+
 
 class _YamlLoader(Protocol):
-    def __call__(self, yaml_content: str) -> Any: ...
+    def __call__(self, yaml_content: str) -> object: ...
 
 
 class _YamlSettingsLoader(Protocol):
@@ -88,7 +91,7 @@ class _EdgePatchTargetResolver(Protocol):
         state: CompositionState,
         graph: ExecutionGraph,
         component_type: str | None,
-    ) -> Any: ...
+    ) -> _EdgePatchTarget: ...
 
 
 class _EdgeFormatter(Protocol):
@@ -102,7 +105,7 @@ class _EdgeFormatter(Protocol):
 
 
 class _IdentityFinder(Protocol):
-    def __call__(self, state: CompositionState) -> Sequence[Any]: ...
+    def __call__(self, state: CompositionState) -> Sequence[_IdentityFinding]: ...
 
 
 def _blocked_readiness(
@@ -141,6 +144,43 @@ def _semantic_contracts(materialized: MaterializedYaml) -> tuple[SemanticEdgeCon
     return materialized.authored.semantic_contracts
 
 
+def _load_yaml_mapping(load_yaml: _YamlLoader, pipeline_yaml: str) -> dict[str, object]:
+    """Admit only the owned concrete mapping shape produced by bounded YAML loading."""
+    loaded = load_yaml(pipeline_yaml)
+    if type(loaded) is not dict:
+        raise TypeError(f"generate_yaml() produced non-dict YAML (got {type(loaded).__name__}) — this is a bug in the YAML generator")
+    return cast(dict[str, object], loaded)
+
+
+def _settings_failure(
+    materialized: MaterializedYaml,
+    exc: PydanticValidationError | ValueError | TypeError,
+    *,
+    reframed: tuple[ValidationError, ...] = (),
+) -> PhaseFailure:
+    if reframed:
+        errors = reframed
+        readiness = _blocked_readiness(code="incomplete_pipeline", detail="Pipeline is missing a required source or output.")
+    else:
+        errors = (
+            ValidationError(
+                component_id=None,
+                component_type=None,
+                message=str(exc),
+                suggestion=None,
+                error_code=None,
+            ),
+        )
+        readiness = _blocked_readiness(code="settings_load", detail="Settings failed to load.")
+    return PhaseFailure(
+        passed_checks=(),
+        failed_check=_check(CHECK_SETTINGS, passed=False, detail=str(exc)),
+        errors=errors,
+        readiness=readiness,
+        semantic_contracts=materialized.authored.semantic_contracts,
+    )
+
+
 def load_runtime_settings(
     materialized: MaterializedYaml,
     *,
@@ -155,13 +195,9 @@ def load_runtime_settings(
     pipeline_yaml = materialized.pipeline_yaml
     authored = materialized.authored
     try:
-        settings_config: dict[str, Any] | None = None
+        settings_config: dict[str, object] | None = None
         if secret_service is not None and user_id is not None and authored.all_secret_refs:
-            config_dict = load_yaml(pipeline_yaml)
-            if not isinstance(config_dict, dict):
-                raise TypeError(
-                    f"generate_yaml() produced non-dict YAML (got {type(config_dict).__name__}) — this is a bug in the YAML generator"
-                )
+            config_dict = _load_yaml_mapping(load_yaml, pipeline_yaml)
             resolved_dict, _resolutions = resolve_secret_refs(
                 config_dict,
                 secret_service,
@@ -170,40 +206,17 @@ def load_runtime_settings(
             )
             settings_config = resolved_dict
         elif secret_service is None and "secret_ref" in pipeline_yaml:
-            config_dict = load_yaml(pipeline_yaml)
-            if isinstance(config_dict, dict):
-                settings_config = redact_secret_refs_for_validation(config_dict)
+            config_dict = _load_yaml_mapping(load_yaml, pipeline_yaml)
+            settings_config = redact_secret_refs_for_validation(config_dict)
 
         if settings_config is None:
             runtime_settings = load_settings_yaml(pipeline_yaml, expand_env_vars=False)
         else:
             runtime_settings = load_settings_dict(settings_config, expand_env_vars=False)
-    except (PydanticValidationError, ValueError, TypeError) as exc:
-        reframed = reframe_missing_parts(exc) if isinstance(exc, PydanticValidationError) else []
-        if reframed:
-            errors = tuple(reframed)
-            readiness = _blocked_readiness(
-                code="incomplete_pipeline",
-                detail="Pipeline is missing a required source or output.",
-            )
-        else:
-            errors = (
-                ValidationError(
-                    component_id=None,
-                    component_type=None,
-                    message=str(exc),
-                    suggestion=None,
-                    error_code=None,
-                ),
-            )
-            readiness = _blocked_readiness(code="settings_load", detail="Settings failed to load.")
-        return PhaseFailure(
-            passed_checks=(),
-            failed_check=_check(CHECK_SETTINGS, passed=False, detail=str(exc)),
-            errors=errors,
-            readiness=readiness,
-            semantic_contracts=authored.semantic_contracts,
-        )
+    except PydanticValidationError as exc:
+        return _settings_failure(materialized, exc, reframed=tuple(reframe_missing_parts(exc)))
+    except (ValueError, TypeError) as exc:
+        return _settings_failure(materialized, exc)
 
     return PhaseReport(
         artifact=LoadedRuntime(materialized=materialized, settings=runtime_settings),
@@ -216,7 +229,6 @@ def validate_runtime_plugins(
     *,
     plugin_snapshot: PluginAvailabilitySnapshot,
     instantiate_plugins: _PluginInstantiator,
-    infer_component_type: Callable[[PluginNotFoundError | PluginConfigError], str | None],
 ) -> PhaseReport[InstantiatedRuntime] | PhaseFailure:
     """Instantiate plugins, discriminating the embedded value-source walker."""
     semantic_contracts = _semantic_contracts(loaded.materialized)
@@ -248,10 +260,10 @@ def validate_runtime_plugins(
             ),
             semantic_contracts=semantic_contracts,
         )
-    except (PluginNotFoundError, PluginConfigError) as exc:
-        component_type = infer_component_type(exc)
-        plugin_name = exc.plugin_name if isinstance(exc, PluginConfigError) else None
-        if isinstance(exc, PluginConfigError) and exc.cause is not None and plugin_name is not None:
+    except PluginConfigError as exc:
+        component_type = exc.component_type
+        plugin_name = exc.plugin_name
+        if exc.cause is not None and plugin_name is not None:
             detail = f"Invalid configuration for {component_type} '{plugin_name}': {exc.cause}"
         else:
             detail = str(exc)
@@ -273,6 +285,23 @@ def validate_runtime_plugins(
                 component_id=plugin_name,
                 component_type=component_type,
             ),
+            semantic_contracts=semantic_contracts,
+        )
+    except PluginNotFoundError as exc:
+        detail = str(exc)
+        return PhaseFailure(
+            passed_checks=(),
+            failed_check=_check(RUNTIME_CHECK_PLUGIN_INSTANTIATION, passed=False, detail=detail),
+            errors=(
+                ValidationError(
+                    component_id=None,
+                    component_type=None,
+                    message=detail,
+                    suggestion=None,
+                    error_code=None,
+                ),
+            ),
+            readiness=_blocked_readiness(code="plugin_instantiation", detail="Plugin instantiation failed."),
             semantic_contracts=semantic_contracts,
         )
     except FileExistsError as exc:
@@ -417,31 +446,42 @@ def validate_schema_compatibility(
     """Validate edge schemas using authored policy state for diagnostics."""
     try:
         graphed.graph.validate_edge_compatibility()
-    except GraphValidationError as exc:
+    except EdgeContractError as exc:
         policy_state = graphed.instantiated.loaded.materialized.authored.policy.state
-        if isinstance(exc, EdgeContractError):
-            consumer_target = edge_patch_target_for_node_id(
-                exc.to_node_id,
-                state=policy_state,
-                graph=graphed.graph,
-                component_type=exc.component_type,
-            )
-            message, suggestion = format_edge_contract_failure(exc, state=policy_state, graph=graphed.graph)
-            error = ValidationError(
-                component_id=consumer_target.component_id,
-                component_type=consumer_target.component_type,
-                message=message,
-                suggestion=suggestion,
-                error_code=None,
-            )
-        else:
-            error = ValidationError(
-                component_id=exc.component_id,
-                component_type=exc.component_type,
-                message=str(exc),
-                suggestion=None,
-                error_code=None,
-            )
+        consumer_target = edge_patch_target_for_node_id(
+            exc.to_node_id,
+            state=policy_state,
+            graph=graphed.graph,
+            component_type=exc.component_type,
+        )
+        message, suggestion = format_edge_contract_failure(exc, state=policy_state, graph=graphed.graph)
+        error = ValidationError(
+            component_id=consumer_target.component_id,
+            component_type=consumer_target.component_type,
+            message=message,
+            suggestion=suggestion,
+            error_code=None,
+        )
+        return PhaseFailure(
+            passed_checks=(),
+            failed_check=_check(RUNTIME_CHECK_SCHEMA_COMPATIBILITY, passed=False, detail=str(exc)),
+            errors=(error,),
+            readiness=_blocked_readiness(
+                code="schema_compatibility",
+                detail="Schema compatibility failed.",
+                component_id=error.component_id,
+                component_type=error.component_type,
+            ),
+            semantic_contracts=_semantic_contracts(graphed.instantiated.loaded.materialized),
+        )
+    except GraphValidationError as exc:
+        error = ValidationError(
+            component_id=exc.component_id,
+            component_type=exc.component_type,
+            message=str(exc),
+            suggestion=None,
+            error_code=None,
+        )
         return PhaseFailure(
             passed_checks=(),
             failed_check=_check(RUNTIME_CHECK_SCHEMA_COMPATIBILITY, passed=False, detail=str(exc)),

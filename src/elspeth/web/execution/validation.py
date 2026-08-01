@@ -27,20 +27,21 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
-from pydantic import ValidationError as PydanticValidationError
-
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
+from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
 from elspeth.web.composer.state import (
     CompositionState,
 )
-from elspeth.web.execution import _validation_diagnostics as _diagnostics
 from elspeth.web.execution._validation_authoring import (
     _DEFAULT_PLUGIN_POLICY_SUGGESTION as _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION,
+)
+from elspeth.web.execution._validation_authoring import (
+    _collect_secret_refs as _collect_secret_refs,
 )
 from elspeth.web.execution._validation_authoring import (
     lower_plugin_policy,
@@ -53,7 +54,15 @@ from elspeth.web.execution._validation_authoring import (
     validate_web_resource_policy,
 )
 from elspeth.web.execution._validation_diagnostics import (
-    _collect_secret_refs as _diagnostics_collect_secret_refs,
+    _build_edge_contract_suggestion_with_resolver,
+    _edge_patch_target_for_node_id,
+    _find_identity_node_advisories,
+    _format_edge_contract_message,
+    _graph_warning_to_validation_warning,
+    _reframe_settings_missing_parts,
+)
+from elspeth.web.execution._validation_diagnostics import (
+    _infer_component_type_from_plugin_error as _infer_component_type_from_plugin_error,
 )
 from elspeth.web.execution._validation_ledger import ValidationLedger
 from elspeth.web.execution._validation_materialization import (
@@ -86,22 +95,9 @@ from elspeth.web.execution.preflight import (
 )
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import (
-    CHECK_BATCH_TRANSFORM_OPTIONS,
-    CHECK_IDENTITY_NODE_ADVISORY,
-    CHECK_INTERPRETATION_REVIEW,
-    CHECK_OPERATOR_PROFILE_OPTIONS,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
-    CHECK_PATH_ALLOWLIST,
-    CHECK_PLUGIN_ENABLEMENT,
-    CHECK_REQUIRED_CONTROL_AVAILABILITY,
-    CHECK_REQUIRED_CONTROL_COVERAGE,
-    CHECK_ROUTE_TARGETS,
-    CHECK_SECRET_REFS,
-    CHECK_SEMANTIC_CONTRACTS,
     CHECK_SETTINGS,
     CHECK_VALUE_SOURCE_COMPLIANCE,
-    CHECK_WEB_FETCH_RESOURCE_POLICY,
-    CHECK_WEB_SCRAPE_NETWORK_POLICY,
     VALIDATION_BLOCKING_CHECK_NAMES,
     ValidationCheck,
     ValidationError,
@@ -112,23 +108,10 @@ from elspeth.web.execution.schemas import (
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginSnapshotAuthority
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 
-# ── Check names (ordered) ─────────────────────────────────────────────
-_CHECK_PLUGIN_ENABLEMENT = CHECK_PLUGIN_ENABLEMENT
-_CHECK_OPERATOR_PROFILE_OPTIONS = CHECK_OPERATOR_PROFILE_OPTIONS
-_CHECK_REQUIRED_CONTROL_AVAILABILITY = CHECK_REQUIRED_CONTROL_AVAILABILITY
-_CHECK_REQUIRED_CONTROL_COVERAGE = CHECK_REQUIRED_CONTROL_COVERAGE
-_CHECK_PATH_ALLOWLIST = CHECK_PATH_ALLOWLIST
-_CHECK_WEB_SCRAPE_NETWORK_POLICY = CHECK_WEB_SCRAPE_NETWORK_POLICY
-_CHECK_WEB_FETCH_RESOURCE_POLICY = CHECK_WEB_FETCH_RESOURCE_POLICY
-_CHECK_SECRET_REFS = CHECK_SECRET_REFS
-_CHECK_SEMANTIC_CONTRACTS = CHECK_SEMANTIC_CONTRACTS
-_CHECK_BATCH_TRANSFORM_OPTIONS = CHECK_BATCH_TRANSFORM_OPTIONS
-_CHECK_INTERPRETATION_REVIEW = CHECK_INTERPRETATION_REVIEW
 _CHECK_SETTINGS = CHECK_SETTINGS
 _CHECK_PLUGINS = RUNTIME_CHECK_PLUGIN_INSTANTIATION
 _CHECK_VALUE_SOURCE_COMPLIANCE = CHECK_VALUE_SOURCE_COMPLIANCE
 _CHECK_GRAPH = RUNTIME_CHECK_GRAPH_STRUCTURE
-_CHECK_ROUTE_TARGETS = CHECK_ROUTE_TARGETS
 _CHECK_SCHEMA = RUNTIME_CHECK_SCHEMA_COMPATIBILITY
 assert RUNTIME_GRAPH_VALIDATION_CHECKS == (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_SCHEMA)
 
@@ -166,68 +149,24 @@ def _blocked_readiness(
     )
 
 
-# Advisory check — non-blocking, multi-entry (one ValidationCheck per
-# detected node, all sharing this name).  Deliberately NOT included in
-# _ALL_CHECKS: that list governs the "skipped check" propagation when an
-# earlier pass/fail check fails.  This advisory uses ``passed=True`` for
-# every entry and is emitted only on the happy-path return, so structural
-# errors are never drowned in cosmetic noise.
-_CHECK_IDENTITY_NODE_ADVISORY = CHECK_IDENTITY_NODE_ADVISORY
-
 # _CHECK_VALUE_SOURCE_COMPLIANCE slots between _CHECK_PLUGINS (typed configs
 # now exist) and _CHECK_GRAPH (so a hallucinated model fails before any DAG
-# work). The position is asserted by tests/unit/web/execution/test_validation.py
-# to prevent silent reordering.
+# work). A focused regression pins this canonical position.
 _ALL_CHECKS = list(VALIDATION_BLOCKING_CHECK_NAMES)
 
 _DEFAULT_PLUGIN_POLICY_SUGGESTION = _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION
 
-# Keep the extracted diagnostic helpers available through this long-standing
-# facade.  Besides preserving imports and live monkeypatch seams, these aliases
-# retain the module-AST bindings of the signed settings reframer below.  Judge
-# metadata deliberately binds to exact syntax positions, so removing facade
-# nodes would make an otherwise behavior-preserving extraction increase drift.
-_collect_secret_refs = _diagnostics_collect_secret_refs
-_graph_warning_to_validation_warning = _diagnostics._graph_warning_to_validation_warning
-_EdgePatchTarget = _diagnostics._EdgePatchTarget
-_node_schema_patch_target = _diagnostics._node_schema_patch_target
-_source_schema_patch_target = _diagnostics._source_schema_patch_target
-_output_schema_patch_target = _diagnostics._output_schema_patch_target
-_unmapped_schema_patch_target = _diagnostics._unmapped_schema_patch_target
-_source_name_for_dag_source = _diagnostics._source_name_for_dag_source
-_edge_patch_targets_by_dag_id = _diagnostics._edge_patch_targets_by_dag_id
-_edge_patch_target_for_node_id = _diagnostics._edge_patch_target_for_node_id
-_infer_component_type_from_plugin_error = _diagnostics._infer_component_type_from_plugin_error
-_IdentityFinding = _diagnostics._IdentityFinding
-_find_identity_node_advisories = _diagnostics._find_identity_node_advisories
-_format_edge_contract_message = _diagnostics._format_edge_contract_message
-_build_edge_contract_suggestion_with_resolver = _diagnostics._build_edge_contract_suggestion_with_resolver
 
-
-def _apply_phase[T](
-    ledger: ValidationLedger,
-    report: PhaseReport[T] | PhaseFailure,
-) -> T | ValidationResult:
-    """Apply immutable phase evidence to the run-owned validation ledger."""
-    if isinstance(report, PhaseFailure):
-        for check in report.passed_checks:
-            ledger.record_pass(check)
-        return ledger.finish_failure(
-            report.failed_check,
-            errors=report.errors,
-            readiness=report.readiness,
-            semantic_contracts=report.semantic_contracts,
-        )
-    for check in report.checks:
-        ledger.record_pass(check)
-    return report.artifact
+def _apply_phase[T](ledger: ValidationLedger, outcome: PhaseReport[T] | PhaseFailure) -> T:
+    """Apply one typed outcome; failures terminate through ``PhaseTermination``."""
+    return outcome.apply(ledger)
 
 
 def _build_edge_contract_suggestion(
     exc: EdgeContractError,
     *,
     state: CompositionState | None = None,
-    graph: Any | None = None,
+    graph: ExecutionGraph | None = None,
 ) -> str:
     """Compatibility wrapper preserving the facade's live patch target."""
     return _build_edge_contract_suggestion_with_resolver(
@@ -242,9 +181,14 @@ def _format_edge_contract_failure(
     exc: EdgeContractError,
     *,
     state: CompositionState | None = None,
-    graph: Any | None = None,
+    graph: ExecutionGraph | None = None,
 ) -> tuple[str, str]:
-    """Compatibility wrapper preserving the facade's live suggestion patch."""
+    """Preserve the live patch seam and the LLM-actionable diagnostic contract.
+
+    Messages ground both ends by node ID. Suggestions expose concrete patch
+    tool calls and lead with the consumer-side repair before the narrower
+    producer-side alternative.
+    """
     return _format_edge_contract_message(exc), _build_edge_contract_suggestion(exc, state=state, graph=graph)
 
 
@@ -271,61 +215,6 @@ def _skipped_checks(from_check: str, *, already_emitted: frozenset[str] = frozen
 
 def _append_skipped_checks(checks: list[ValidationCheck], from_check: str) -> None:
     checks.extend(_skipped_checks(from_check, already_emitted=frozenset(check.name for check in checks)))
-
-
-# The two required-with-no-default top-level parts of ElspethSettings (see
-# core/config.py). A composition missing either fails assembly with a raw
-# pydantic "Field required" dump; ``_reframe_settings_missing_parts`` maps each
-# to a novice-register finding keyed on this table.
-_SETTINGS_MISSING_PART_REFRAMES: dict[str, tuple[str, str, str]] = {
-    # pydantic loc field -> (error_code, message, suggestion)
-    "sources": (
-        "missing_source",
-        "Add a data source so your pipeline has data to read.",
-        "Pick a data source like a CSV file or text input, then validate again.",
-    ),
-    "sinks": (
-        "missing_sink",
-        "Add an output step so your pipeline has somewhere to send its results.",
-        "Pick an output like CSV or JSON and connect your last step to it, then validate again.",
-    ),
-}
-
-
-def _reframe_settings_missing_parts(exc: PydanticValidationError) -> list[ValidationError]:
-    """Reframe ElspethSettings "Field required" failures on the required
-    top-level parts (``sources`` / ``sinks``) into novice-register findings.
-
-    Returns one finding per missing part, in a stable source-before-sink order
-    (so a lone-transform composition surfaces two honest findings). Returns
-    ``[]`` when the failure is anything other than a missing top-level part —
-    the caller then falls back to ``str(exc)``. Detection is over the
-    *structured* ``exc.errors()`` (``type == "missing"`` at the top of ``loc``),
-    never the version-stamped human ``str(exc)`` text.
-    """
-    missing_parts: set[str] = set()
-    for error in exc.errors():
-        if error.get("type") != "missing":
-            continue
-        loc = error.get("loc") or ()
-        # pydantic ``loc`` entries are ``int | str`` (ints index list fields);
-        # our required parts are top-level string keys, so narrow to str.
-        part = loc[0] if loc else None
-        if isinstance(part, str) and part in _SETTINGS_MISSING_PART_REFRAMES:
-            missing_parts.add(part)
-    # Emit in the canonical source-before-sink order regardless of pydantic's
-    # error ordering, so the paired findings read consistently.
-    return [
-        ValidationError(
-            component_id=None,
-            component_type=None,
-            message=_SETTINGS_MISSING_PART_REFRAMES[part][1],
-            suggestion=_SETTINGS_MISSING_PART_REFRAMES[part][2],
-            error_code=_SETTINGS_MISSING_PART_REFRAMES[part][0],
-        )
-        for part in _SETTINGS_MISSING_PART_REFRAMES
-        if part in missing_parts
-    ]
 
 
 @observation_boundary(
@@ -473,9 +362,6 @@ def _validate_pipeline_impl(
             catalog=catalog,
         ),
     )
-    if isinstance(policy, ValidationResult):
-        return policy
-
     path_validated = _apply_phase(
         ledger,
         validate_path_policy(
@@ -484,23 +370,14 @@ def _validate_pipeline_impl(
             session_id=session_id,
         ),
     )
-    if isinstance(path_validated, ValidationResult):
-        return path_validated
-
     network_validated = _apply_phase(
         ledger,
         validate_web_network_policy(path_validated, plugin_snapshot=plugin_snapshot),
     )
-    if isinstance(network_validated, ValidationResult):
-        return network_validated
-
     resource_validated = _apply_phase(
         ledger,
         validate_web_resource_policy(network_validated, plugin_snapshot=plugin_snapshot),
     )
-    if isinstance(resource_validated, ValidationResult):
-        return resource_validated
-
     secret_validated = _apply_phase(
         ledger,
         validate_secret_evidence(
@@ -509,23 +386,14 @@ def _validate_pipeline_impl(
             user_id=user_id,
         ),
     )
-    if isinstance(secret_validated, ValidationResult):
-        return secret_validated
-
     semantic_validated = _apply_phase(
         ledger,
         validate_semantic_evidence(secret_validated),
     )
-    if isinstance(semantic_validated, ValidationResult):
-        return semantic_validated
-
     batch_validated = _apply_phase(
         ledger,
         validate_batch_options(semantic_validated),
     )
-    if isinstance(batch_validated, ValidationResult):
-        return batch_validated
-
     interpretation_validated = _apply_phase(
         ledger,
         review_interpretations(
@@ -533,9 +401,6 @@ def _validate_pipeline_impl(
             allow_pending_placeholders=allow_pending_interpretation_placeholders,
         ),
     )
-    if isinstance(interpretation_validated, ValidationResult):
-        return interpretation_validated
-
     materialized = _apply_phase(
         ledger,
         materialize_validation_yaml(
@@ -547,37 +412,22 @@ def _validate_pipeline_impl(
             load_yaml=dependencies.load_yaml,
         ),
     )
-    if isinstance(materialized, ValidationResult):
-        return materialized
-
     managed_identity_validated = _apply_phase(
         ledger,
         validate_managed_identity_policy(materialized),
     )
-    if isinstance(managed_identity_validated, ValidationResult):
-        return managed_identity_validated
-
     retry_budget_validated = _apply_phase(
         ledger,
         validate_llm_retry_budget_policy(managed_identity_validated),
     )
-    if isinstance(retry_budget_validated, ValidationResult):
-        return retry_budget_validated
-
     base_url_validated = _apply_phase(
         ledger,
         validate_llm_base_url_policy(retry_budget_validated),
     )
-    if isinstance(base_url_validated, ValidationResult):
-        return base_url_validated
-
     tracing_validated = _apply_phase(
         ledger,
         validate_llm_tracing_policy(base_url_validated),
     )
-    if isinstance(tracing_validated, ValidationResult):
-        return tracing_validated
-
     endpoint_validated = _apply_phase(
         ledger,
         validate_aws_s3_endpoint_url_policy(
@@ -585,9 +435,6 @@ def _validate_pipeline_impl(
             plugin_snapshot=plugin_snapshot,
         ),
     )
-    if isinstance(endpoint_validated, ValidationResult):
-        return endpoint_validated
-
     provider_validated = _apply_phase(
         ledger,
         validate_aws_s3_source_policy(
@@ -595,9 +442,6 @@ def _validate_pipeline_impl(
             plugin_snapshot=plugin_snapshot,
         ),
     )
-    if isinstance(provider_validated, ValidationResult):
-        return provider_validated
-
     loaded = _apply_phase(
         ledger,
         load_runtime_settings(
@@ -610,25 +454,15 @@ def _validate_pipeline_impl(
             reframe_missing_parts=_reframe_settings_missing_parts,
         ),
     )
-    if isinstance(loaded, ValidationResult):
-        return loaded
-
     instantiated = _apply_phase(
         ledger,
         validate_runtime_plugins(
             loaded,
             plugin_snapshot=plugin_snapshot,
             instantiate_plugins=dependencies.instantiate_plugins,
-            infer_component_type=_infer_component_type_from_plugin_error,
         ),
     )
-    if isinstance(instantiated, ValidationResult):
-        return instantiated
-
     value_source_validated = _apply_phase(ledger, validate_value_source_compliance(instantiated))
-    if isinstance(value_source_validated, ValidationResult):
-        return value_source_validated
-
     graphed = _apply_phase(
         ledger,
         validate_graph_structure(
@@ -637,16 +471,10 @@ def _validate_pipeline_impl(
             warning_to_validation_warning=_graph_warning_to_validation_warning,
         ),
     )
-    if isinstance(graphed, ValidationResult):
-        return graphed
-
     routes_validated = _apply_phase(
         ledger,
         validate_route_targets(graphed, validate_routes=dependencies.validate_routes),
     )
-    if isinstance(routes_validated, ValidationResult):
-        return routes_validated
-
     schema_validated = _apply_phase(
         ledger,
         validate_schema_compatibility(
@@ -655,9 +483,6 @@ def _validate_pipeline_impl(
             format_edge_contract_failure=_format_edge_contract_failure,
         ),
     )
-    if isinstance(schema_validated, ValidationResult):
-        return schema_validated
-
     for advisory in build_identity_advisory_checks(
         schema_validated,
         find_identity_node_advisories=_find_identity_node_advisories,
@@ -681,9 +506,12 @@ def validate_pipeline_for_trained_operator(
     """Explicit non-web validation root preserving CLI and local-tool neutrality."""
     from elspeth.web.dependencies import create_catalog_service
 
-    plugin_snapshot = kwargs.pop("plugin_snapshot", None)
-    catalog, plugin_snapshot = _trained_operator_validation_context(kwargs, plugin_snapshot, create_catalog_service)
-    profile_registry = kwargs.pop("profile_registry", None)
+    plugin_snapshot = kwargs["plugin_snapshot"] if "plugin_snapshot" in kwargs else None
+    profile_registry = kwargs["profile_registry"] if "profile_registry" in kwargs else None
+    catalog = kwargs["catalog"] if "catalog" in kwargs else create_catalog_service()
+    reserved = frozenset({"plugin_snapshot", "profile_registry", "catalog"})
+    forwarded = {key: value for key, value in kwargs.items() if key not in reserved}
+    catalog, plugin_snapshot = _trained_operator_validation_context(catalog, plugin_snapshot)
     return validate_pipeline(
         state,
         settings,
@@ -691,7 +519,7 @@ def validate_pipeline_for_trained_operator(
         plugin_snapshot=plugin_snapshot,
         profile_registry=profile_registry,
         catalog=catalog,
-        **kwargs,
+        **forwarded,
     )
 
 
@@ -700,12 +528,10 @@ if TYPE_CHECKING:
 
 
 def _trained_operator_validation_context(
-    kwargs: dict[str, Any],
+    catalog: CatalogService,
     plugin_snapshot: PluginAvailabilitySnapshot | None,
-    catalog_factory: Callable[[], CatalogService],
 ) -> tuple[CatalogService, PluginAvailabilitySnapshot]:
-    """Consume the local catalog and normalize a caller-supplied snapshot."""
-    catalog = kwargs.pop("catalog") if "catalog" in kwargs else catalog_factory()
+    """Normalize a caller-supplied snapshot without mutating forwarded options."""
     if plugin_snapshot is None:
         return catalog, PluginAvailabilitySnapshot.for_trained_operator(catalog)
     if plugin_snapshot.is_trained_operator:
