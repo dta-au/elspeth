@@ -167,6 +167,82 @@ const COMPOSE_TIMEOUT_MESSAGE =
   "ELSPETH took too long to compose a response. Try a smaller request or split it into multiple steps.";
 const COMPOSE_CANCELLED_MESSAGE =
   "Composition stopped. You can revise your request and send it again.";
+// The two turn-budget convergence causes: the model kept calling tools
+// without settling, so the user's lever is a smaller request.
+const CONVERGENCE_BUDGET_MESSAGE =
+  "ELSPETH couldn't complete the composition after multiple attempts. Try breaking your request into smaller steps.";
+
+/**
+ * Copy for a 422 `error_type: "convergence"` failure (R2-F9,
+ * elspeth-114dd261bc).
+ *
+ * A wall-clock timeout is a different event from a turn-budget exhaustion and
+ * needs different copy: nothing was "attempted multiple times" — the clock ran
+ * out — and the route handler has already persisted whatever pipeline the run
+ * had built as a new composition-state version, which the next turn resumes
+ * from. Saying otherwise sends the user off to rebuild work that still exists.
+ *
+ * Three honesty rules encoded here:
+ *  - the elapsed budget is named only when the body reported it
+ *    (`timeout_seconds`), never derived from the client's abort ceiling;
+ *  - the saved-draft sentence appears only when a `partial_state` actually
+ *    rode the response;
+ *  - the backend's own `recovery_text` is appended rather than paraphrased,
+ *    so the chat copy and the /composer-progress snapshot cannot drift.
+ */
+function formatConvergenceError(apiErr: ApiError): string {
+  if (apiErr.reason !== "convergence_wall_clock_timeout") {
+    return CONVERGENCE_BUDGET_MESSAGE;
+  }
+  const seconds = apiErr.timeout_seconds;
+  const elapsed =
+    typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0
+      ? ` (${Math.round(seconds)}s)`
+      : "";
+  const outcome =
+    apiErr.partial_state != null
+      ? "Your partial pipeline was saved — continue from it or retry."
+      : "No pipeline changes had been saved yet — retry, or try a smaller request.";
+  const recovery =
+    typeof apiErr.recovery_text === "string" ? apiErr.recovery_text.trim() : "";
+  const headline = `ELSPETH ran out of time${elapsed}. ${outcome}`;
+  return recovery ? `${headline} ${recovery}` : headline;
+}
+
+/**
+ * Fold a convergence 422's salvaged draft into the store.
+ *
+ * The route handler saved `partial_state` as a NEW composition-state version
+ * (provenance `convergence_persist`) and `get_current_state` returns the
+ * highest version, so the partial IS what the next turn resumes from. Keeping
+ * the pre-request graph on screen contradicts the server and the copy above.
+ *
+ * `recoveryStartedCompositionVersion` moves with it: that baseline exists to
+ * catch a CONCURRENT third-party edit before RecoveryPanel's Apply overwrites
+ * it, and this fold-in is neither concurrent nor third-party — leaving it
+ * behind would make every timeout Apply raise a false alarm.
+ */
+function convergencePartialStatePatch(
+  apiErr: ApiError,
+  selectedNodeId: string | null,
+): {
+  compositionState?: CompositionState;
+  selectedNodeId?: null;
+  recoveryStartedCompositionVersion?: number;
+} {
+  const partial =
+    apiErr.error_type === "convergence" ? apiErr.partial_state : null;
+  if (partial == null) {
+    return {};
+  }
+  const nodeStillExists =
+    !selectedNodeId || partial.nodes.some((node) => node.id === selectedNodeId);
+  return {
+    compositionState: partial,
+    recoveryStartedCompositionVersion: partial.version,
+    ...(nodeStillExists ? {} : { selectedNodeId: null }),
+  };
+}
 const GUIDED_START_CLEARED_MESSAGE =
   "Guided setup stopped or timed out before staging. You can revise your request and send it again.";
 const GUIDED_START_IN_PROGRESS_MESSAGE =
@@ -1639,8 +1715,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         const apiErr = err as ApiError;
         // Error dispatch based on HTTP status + error_type field
         if (apiErr.status === 422 && apiErr.error_type === "convergence") {
-          errorMessage =
-            "ELSPETH couldn't complete the composition after multiple attempts. Try breaking your request into smaller steps.";
+          errorMessage = formatConvergenceError(apiErr);
         } else if (
           apiErr.status === 502 &&
           apiErr.error_type === "llm_unavailable"
@@ -1683,6 +1758,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (get().activeSessionId !== activeSessionId) {
         return;
       }
+      // Applied AFTER recoveryPatch below so a salvaged draft rebaselines the
+      // apply-confirmation gate onto the version the store now shows.
+      const partialStatePatch = isComposeAbort(err)
+        ? {}
+        : convergencePartialStatePatch(apiErr, get().selectedNodeId);
       set((state) => ({
         isComposing: false,
         error: errorMessage,
@@ -1704,6 +1784,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             : existing,
         ),
         ...recoveryPatch,
+        ...partialStatePatch,
       }));
       if (isComposeAbort(err)) {
         // The turn ran (and was cancelled) server-side; pull its durable
@@ -2122,7 +2203,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             : apiErr.status === 502 && apiErr.error_type === "llm_auth_error"
               ? formatLlmAuthError(apiErr)
               : apiErr.status === 422 && apiErr.error_type === "convergence"
-                ? "ELSPETH couldn't complete the composition after multiple attempts. Try breaking your request into smaller steps."
+                ? formatConvergenceError(apiErr)
                 : apiErr.detail ?? "Failed to send message. Please try again.";
       }
       const apiErr = err as ApiError;
@@ -2143,6 +2224,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
       if (get().activeSessionId !== activeSessionId) {
         return;
       }
+      // Mirror of the sendMessage catch: the shared 422 handler already
+      // persisted the salvaged draft, so both entry points must show it.
+      const partialStatePatch = isComposeAbort(err)
+        ? {}
+        : convergencePartialStatePatch(apiErr, get().selectedNodeId);
       set((state) => ({
         isComposing: false,
         error: errorMessage,
@@ -2157,6 +2243,7 @@ export const useSessionStore = create<SessionState>((set, get) => ({
             : existing,
         ),
         ...recoveryPatch,
+        ...partialStatePatch,
       }));
       if (isComposeAbort(err)) {
         // The recompose turn ran (and was cancelled) server-side; pull its

@@ -2117,6 +2117,16 @@ async def _handle_convergence_error(
         # names the next practical action for each class" criterion.
         "recovery_text": progress.likely_next,
     }
+    if progress.reason == "convergence_wall_clock_timeout":
+        # The elapsed budget, server-authoritative (R2-F9,
+        # elspeth-114dd261bc). The SPA's timeout copy names this number, and
+        # the only honest source is the deployment's configured wall clock —
+        # NOT the client's own abort ceiling, which is that value plus a
+        # grace constant and falls back to a checked-in default whenever the
+        # boot /api/system/status fetch has not landed. Carried ONLY on the
+        # timeout reason: the two turn-budget causes did not exhaust a clock,
+        # so the field would be noise there.
+        response_body["timeout_seconds"] = settings.composer_timeout_seconds
     if exc.failed_turn is not None:
         response_body["failed_turn"] = await _failed_turn_response_body(service, session_id, exc.failed_turn)
     persisted_state_id: UUID | None = None
