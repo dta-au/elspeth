@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import sys
 import tempfile
 import threading
 from collections.abc import Mapping
@@ -1123,10 +1124,10 @@ _CREATE_BLOB_DECLARATION = ToolDeclaration(
 #      clobbering B's committed content.  File = ``old_A``, DB row =
 #      ``new_B`` metadata: silent file/DB divergence with no signal.
 #
-# The composer tool layer is the only writer with this
-# read→write→commit shape.  ``BlobServiceImpl.create_blob`` allocates a
-# unique storage_path per blob, so it cannot hit this race; only the
-# update path shares a storage_path between sequential writers.
+# The update and delete composer tools both mutate an existing blob's storage
+# path and DB row, so both take this lock around their complete read→filesystem
+# mutation→commit sequences. ``BlobServiceImpl.create_blob`` allocates a unique
+# storage_path per blob and cannot hit this same-path race.
 #
 # Serialising per-session (rather than per-blob) is deliberate: composer
 # blob operations are low-frequency and a human typically interacts with
@@ -1136,13 +1137,10 @@ _CREATE_BLOB_DECLARATION = ToolDeclaration(
 #
 # The registry is a plain dict protected by a registry mutex.  A
 # ``WeakValueDictionary`` cannot hold ``threading.Lock`` because the
-# lock primitive does not support weak references.  Stale entries
-# accumulate at roughly one entry per unique session_id observed during
-# process lifetime (~150 bytes each) — negligible for the expected
-# deployment (hundreds of sessions per server process).  If this ever
-# becomes a concern, ``clear_session_blob_lock(session_id)`` below is
-# the single-site cleanup hook; today there is no caller because
-# session teardown is not yet observable from this module.
+# lock primitive does not support weak references. Stale entries accumulate at
+# roughly one entry per unique session_id observed during process lifetime
+# (~150 bytes each), which is negligible for the expected deployment (hundreds
+# of sessions per server process).
 #
 # PROCESS-LOCAL CORRECTNESS PRECONDITION:
 # This registry holds Python ``threading.Lock`` objects — in-process
@@ -1355,6 +1353,7 @@ def _execute_update_blob(
         )
         tmp_path = Path(tmp_name)
         replaced = False
+        cleanup_primary_result: ToolResult | None = None
         try:
             with os.fdopen(tmp_fd, "wb") as tmp_file:
                 tmp_file.write(content_bytes)
@@ -1489,7 +1488,8 @@ def _execute_update_blob(
                 # cleanup in the outer finally, storage_path is
                 # unchanged.  Surface as tool-failure so the compose
                 # loop treats the rejection as recoverable.
-                return _failure_result(state, blocked.user_message)
+                cleanup_primary_result = _failure_result(state, blocked.user_message)
+                return cleanup_primary_result
             except _BlobQuotaExceededInTxn as quota_exc:
                 # Quota raised BEFORE ``os.replace`` ran; storage_path
                 # is unchanged.  If for any reason ``replaced`` is True
@@ -1517,7 +1517,8 @@ def _execute_update_blob(
                             f"new content while the DB row retains the prior "
                             f"size_bytes/content_hash.  Manual reconciliation required."
                         ) from rollback_exc
-                return _failure_result(state, quota_exc.user_message)
+                cleanup_primary_result = _failure_result(state, quota_exc.user_message)
+                return cleanup_primary_result
             except Exception as primary_exc:
                 # DB-layer fault (commit OSError, UPDATE I/O error,
                 # SQLAlchemy error) or ``os.replace`` fault.  If
@@ -1547,13 +1548,27 @@ def _execute_update_blob(
                         )
                 raise
         finally:
+            # Capture a propagating exception before the cleanup handler
+            # temporarily replaces ``sys.exception()`` with cleanup_exc.
+            # This preserves KeyboardInterrupt/SystemExit primacy without a
+            # broad ``except BaseException`` interception point.
+            cleanup_primary_exc = sys.exception()
             # Unconditional tempfile cleanup.  On the happy path
             # ``os.replace`` moves the inode and ``tmp_path`` vanishes
             # (unlink becomes a no-op via missing_ok).  On every
             # failure path the tempfile still exists and must be
             # removed to prevent inode exhaustion and leakage of
             # uncommitted content to any directory listing.
-            tmp_path.unlink(missing_ok=True)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError as cleanup_exc:
+                if cleanup_primary_exc is not None:
+                    cleanup_primary_exc.add_note(
+                        f"Temporary blob cleanup failed for {tmp_path} "
+                        f"({type(cleanup_exc).__name__}: {cleanup_exc}). Manual cleanup required."
+                    )
+                elif cleanup_primary_result is None and not replaced:
+                    raise
 
         return _discovery_result(
             state,
@@ -1607,6 +1622,23 @@ def _execute_delete_blob(
     if blob_id_error is not None:
         return _failure_result(state, blob_id_error)
 
+    with _session_blob_lock(session_id):
+        return _execute_delete_blob_locked(
+            blob_id=blob_id,
+            state=state,
+            session_engine=session_engine,
+            session_id=session_id,
+        )
+
+
+def _execute_delete_blob_locked(
+    *,
+    blob_id: str,
+    state: CompositionState,
+    session_engine: Engine,
+    session_id: str,
+) -> ToolResult:
+    """Delete one blob while the caller holds its session blob lock."""
     blob = _sync_get_blob(session_engine, blob_id, session_id)
     if blob is None:
         return _failure_result(state, f"Blob '{blob_id}' not found.")

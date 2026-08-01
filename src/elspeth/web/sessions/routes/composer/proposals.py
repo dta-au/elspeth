@@ -45,15 +45,6 @@ from .pipeline_settlement import (
 router = APIRouter()
 
 
-_PROPOSAL_COMPOSER_CONTEXT_FIELDS: tuple[str, ...] = (
-    "composer_model_identifier",
-    "composer_model_version",
-    "composer_provider",
-    "composer_skill_hash",
-    "tool_arguments_hash",
-)
-
-
 @observation_boundary(
     tier=3,
     source="persisted LLM tool-call arguments of a stored CompositionProposalRecord (Tier-3 on read-back)",
@@ -83,7 +74,14 @@ def _missing_proposal_composer_context(
     *,
     user_message_content: str | None,
 ) -> tuple[str, ...]:
-    missing = [name for name in _PROPOSAL_COMPOSER_CONTEXT_FIELDS if getattr(proposal, name) is None]
+    context_fields = (
+        ("composer_model_identifier", proposal.composer_model_identifier),
+        ("composer_model_version", proposal.composer_model_version),
+        ("composer_provider", proposal.composer_provider),
+        ("composer_skill_hash", proposal.composer_skill_hash),
+        ("tool_arguments_hash", proposal.tool_arguments_hash),
+    )
+    missing = [name for name, value in context_fields if value is None]
     if user_message_content is None:
         missing.insert(0, "user_message_content")
     return tuple(missing)

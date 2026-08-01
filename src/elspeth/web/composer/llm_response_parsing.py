@@ -606,9 +606,11 @@ def _json_safe_provider_artifact(value: Any) -> Any:
             depth=0,
             active_container_ids=set(),
         )
-    except Exception:
-        # The sentinel is closed and value-free. Provider-controlled methods,
-        # reprs, keys, and exception text never enter the audit record.
+    except JsonBoundaryError:
+        # The sentinel is closed and value-free. Provider values, reprs, keys,
+        # and rejection text never enter the audit record. Unexpected internal
+        # failures still propagate instead of being mislabeled as bad provider
+        # data.
         return PROVIDER_ARTIFACT_UNAVAILABLE
 
 

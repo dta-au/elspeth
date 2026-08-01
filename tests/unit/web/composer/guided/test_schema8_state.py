@@ -941,6 +941,23 @@ def test_source_and_output_edit_targets_resolve_only_reviewed_components() -> No
         replace(pending_output_session, active_edit_target=ComponentTarget(kind="output", stable_id=OUTPUT_A))
 
 
+def test_malformed_active_edit_target_is_not_laundered_into_absence() -> None:
+    """The owned target contract fails before overlap policy can mislabel it."""
+    with pytest.raises(TypeError, match="active_edit_target must be ComponentTarget or None"):
+        GuidedSession(
+            step=GuidedStep.STEP_1_SOURCE,
+            source_order=(SOURCE_A,),
+            reviewed_sources={SOURCE_A: _source("incoming", "/data/incoming.csv")},
+            pending_source_intents={SOURCE_A: _source_intent(name="incoming")},
+            active_edit_target=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_state_machine_does_not_reexport_resolved_sink_compatibility_facade() -> None:
+    """Callers import the resolved carrier from its owning module."""
+    assert "SinkResolved" not in vars(state_machine)
+
+
 @pytest.mark.parametrize(
     ("active_kind", "pending_kind", "pending_id", "pending_phase"),
     [

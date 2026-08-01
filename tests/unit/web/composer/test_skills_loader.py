@@ -33,6 +33,20 @@ class TestLoadSkill:
         assert isinstance(content, str)
         assert len(content) > 0
 
+    def test_pipeline_composer_does_not_tell_model_to_surface_backend_owned_reviews(self) -> None:
+        content = load_skill("pipeline_composer")
+        normalized = " ".join(content.split())
+
+        assert "`llm_prompt_template` | backend (auto-staged on every LLM node) | backend" in content
+        assert '`kind="llm_prompt_template"` | You author any LLM `prompt_template`' not in content
+        assert "except backend-owned `llm_prompt_template` rows" in normalized
+
+    def test_pipeline_composer_preflight_uses_authored_requirement_shape(self) -> None:
+        content = load_skill("pipeline_composer")
+
+        assert "Every requirement object has exactly `kind`, `user_term`, and `draft`." in content
+        assert "Every requirement object has `id`, `kind`, `user_term`, `status`, and `draft`." not in content
+
     def test_missing_skill_raises_file_not_found(self) -> None:
         """Requesting a non-existent skill must crash — not return empty."""
         with pytest.raises(FileNotFoundError):

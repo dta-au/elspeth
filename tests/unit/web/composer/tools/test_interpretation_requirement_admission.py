@@ -82,6 +82,24 @@ def _canonical_pending_requirement(
     }
 
 
+def test_authoring_serializer_fails_loudly_on_owned_requirement_contract_violation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The owned serializer's impossible item shape must not be passed through."""
+
+    def _malformed_owned_serialization(_options: Any) -> dict[str, Any]:
+        return {INTERPRETATION_REQUIREMENTS_KEY: [None]}
+
+    monkeypatch.setattr(
+        common_tools,
+        "serialize_authoring_review_options",
+        _malformed_owned_serialization,
+    )
+
+    with pytest.raises(TypeError):
+        common_tools._serialize_authoring_options({})
+
+
 _MALFORMED_PRESENT_VALUES: Final[tuple[Any, ...]] = (
     None,
     {},

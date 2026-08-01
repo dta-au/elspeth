@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import BaseModel
+
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.execution.runtime_preflight import RuntimePreflightEntry, RuntimePreflightKey
@@ -34,13 +36,12 @@ def tool_result_mutated_composition_state(
 
 def pydantic_default(obj: Any) -> Any:
     """JSON serializer fallback for Pydantic models in tool results."""
-    try:
-        return obj.model_dump()
-    except AttributeError:
+    if not isinstance(obj, BaseModel):
         raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable") from None
+    return obj.model_dump()
 
 
-def serialize_tool_result(result: Any) -> str:
+def serialize_tool_result(result: ToolResult) -> str:
     """Serialize a ToolResult to JSON, handling Pydantic models in data."""
     return json.dumps(result.to_dict(), default=pydantic_default)
 

@@ -39,9 +39,6 @@ from elspeth.web.composer.guided.resolved import (
     SinkOutputResolved as SinkOutputResolved,
 )
 from elspeth.web.composer.guided.resolved import (
-    SinkResolved as SinkResolved,
-)
-from elspeth.web.composer.guided.resolved import (
     SourceResolved as SourceResolved,
 )
 from elspeth.web.composer.pipeline_proposal import AbsentBase, PresentBase, ProposalBase, reviewed_anchor_hash
@@ -987,6 +984,8 @@ class GuidedSession:
             raise InvariantError("GuidedSession.chat_turn_seq must be the exact next unused persisted chat seq")
         if self.root_intent_message_id is not None:
             _canonical_uuid_text(self.root_intent_message_id, "GuidedSession.root_intent_message_id")
+        if self.active_edit_target is not None and type(self.active_edit_target) is not ComponentTarget:
+            raise TypeError("active_edit_target must be ComponentTarget or None")
         if type(self.correction_messages) is not tuple or any(
             type(reference) is not GuidedCorrectionMessageRef for reference in self.correction_messages
         ):
@@ -1038,7 +1037,7 @@ class GuidedSession:
         object.__setattr__(self, "pending_output_intents", pending_outputs)
         source_overlap = set(reviewed_sources) & set(pending_sources)
         output_overlap = set(reviewed_outputs) & set(pending_outputs)
-        active_target = self.active_edit_target if type(self.active_edit_target) is ComponentTarget else None
+        active_target = self.active_edit_target
         if active_target is not None and active_target.kind == "source":
             if pending_outputs or (pending_sources and set(pending_sources) != {active_target.stable_id}):
                 raise InvariantError("GuidedSession active source edit may only coexist with its own inspection_review intent")
@@ -1142,8 +1141,6 @@ class GuidedSession:
                 previous = positions[intent_id]
 
         if self.active_edit_target is not None:
-            if type(self.active_edit_target) is not ComponentTarget:
-                raise TypeError("active_edit_target must be ComponentTarget or None")
             target = self.active_edit_target
             if target.kind == "source" and target.stable_id not in reviewed_sources:
                 raise InvariantError("GuidedSession active_edit_target source does not resolve")

@@ -651,8 +651,6 @@ async def cancel_tutorial_run(
     Idempotent: when no active run exists (never started, already terminal)
     the response is ``cancelled=False``, never an error.
     """
-    from uuid import UUID
-
     session_uuid = UUID(session_id)
     await verify_session_ownership(session_uuid, user, request)
 

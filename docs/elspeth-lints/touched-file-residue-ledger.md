@@ -181,6 +181,29 @@ counted as residue sites.
 
 Unresolved stale residue for this entry: **0 sites**.
 
+## Entry 7: Web Sessions and Composer recursive trust cleanup
+
+- Date: 2026-08-02
+- Review anchor: `442fa3393`
+- Scope: `src/elspeth/web/sessions/**` and `src/elspeth/web/composer/**`
+- Discovered by: recursive trust-tier cleanup and independent full-file review
+- Result: 34 corrected sites across 2 existing and 1 new recurring pattern classes
+
+| Pattern | Sites | Exact surface | Plausible detector |
+|---|---:|---|---|
+| Signature-churn manipulation | 20 | Three dead import pins, five signed-layout local-import blocks, artificial `post_guided_convert` placement, and two false-green AST/order tests in the guided route surface (11); four placement/EOF comment blocks plus the locally pinned Jinja import in `composer/service.py` (5); placement/fingerprint comments in `composer/audit.py`, `composer/tools/generation.py`, `sessions/routes/_helpers.py`, and `sessions/routes/guided_operations.py` (4) | Reject comments and `noqa` rationales containing signature/fingerprint/AST-position vocabulary; flag local imports without a demonstrated cycle; mutation-test route-order assertions by moving the handler to its logical lifecycle position |
+| Dead compatibility and stale coupling | 9 | Redundant local UUID import in `tutorial_service.py` (1); dead `PIPELINE_COMPOSER_SKILL_FILENAME` and `PIPELINE_COMPOSER_SKILL_HASH` exports plus three tests coupled to the cached compatibility hash (5); dead `state_machine.SinkResolved` re-export and its fixture import (2); `tools/blobs.py` comment describing a nonexistent cleanup hook (1) | Zero-reference private/export graph with an explicit compatibility manifest; forbid cached-content-hash assertions when the authoritative content can be hashed directly; documented-symbol existence check over touched comments |
+| Documentation/guidance drift | 5 | `pipeline_composer.md` twice required callers to surface backend-owned `llm_prompt_template` rows, repeated that contradiction in the requirement matrix and termination checklist, and documented a five-field preflight object although the authored tool contract accepts exactly three fields | Cross-check skill prose and tables against tool JSON schemas and ownership metadata; require repeated requirement matrices/checklists to agree on the same owner and payload shape |
+
+The recursive review also corrected intentional trust-boundary and correctness
+defects; those behavior changes are excluded from the residue count. Honest
+Tier-3 vendor parsing findings, inherited signed drift, and proven stale
+allowlist entries remain separate key-free adjudication/signing obligations.
+No allowlist, judge signature, staged-review bundle, or signing workflow was
+modified.
+
+Unresolved stale residue for this entry: **0 sites**.
+
 ## Running totals
 
 | Features reviewed | Corrected sites | Pattern classes recorded | Unresolved residue |
@@ -191,3 +214,4 @@ Unresolved stale residue for this entry: **0 sites**.
 | 2 | 105 | 12 | 0 |
 | 2 | 116 | 13 | 0 |
 | 2 | 122 | 13 | 0 |
+| 3 | 156 | 14 | 0 |

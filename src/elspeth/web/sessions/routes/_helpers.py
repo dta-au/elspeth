@@ -744,14 +744,14 @@ def _interpretation_event_response(event: InterpretationEventRecord) -> Interpre
         affected_node_id=event.affected_node_id,
         tool_call_id=event.tool_call_id,
         user_term=event.user_term,
-        kind=event.kind.value if event.kind is not None else None,
+        kind=event.kind,
         llm_draft=event.llm_draft,
         accepted_value=event.accepted_value,
-        choice=event.choice.value,
+        choice=event.choice,
         created_at=event.created_at,
         resolved_at=event.resolved_at,
         actor=event.actor,
-        interpretation_source=event.interpretation_source.value,
+        interpretation_source=event.interpretation_source,
         model_identifier=event.model_identifier,
         model_version=event.model_version,
         provider=event.provider,
@@ -1513,18 +1513,29 @@ async def _persist_llm_calls(
             ) from save_err
 
 
-_CLIENT_DISCONNECT_CANCEL_MARKER = "elspeth_client_disconnected"
+_CLIENT_DISCONNECT_CANCEL_MARKER = object()
 
 
 def _is_client_disconnect_cancel(exc: asyncio.CancelledError) -> bool:
     """True when ``exc`` was delivered by :func:`_cancel_on_client_disconnect`.
 
-    Tier note: the ``getattr`` default is a cooperative-marker probe, not
-    defensive masking — the marker attribute is stamped onto the exception by
-    ``_cancel_on_client_disconnect`` alone, so its absence is the ordinary
-    "external cancel" case, never a hidden bug.
+    The private token is passed through ``Task.cancel(message)`` and therefore
+    arrives in the concrete ``CancelledError.args`` contract. Absence is the
+    ordinary external-cancel case.
     """
-    return bool(getattr(exc, _CLIENT_DISCONNECT_CANCEL_MARKER, False))
+    return len(exc.args) == 1 and exc.args[0] is _CLIENT_DISCONNECT_CANCEL_MARKER
+
+
+def _failure_log_request_id(request: Request) -> str | None:
+    """Read an optional request id without probing Starlette's dynamic State."""
+    scope = request.scope
+    if "state" not in scope:
+        return None
+    state = scope["state"]
+    if type(state) is not dict or "request_id" not in state:
+        return None
+    request_id = state["request_id"]
+    return request_id if type(request_id) is str else None
 
 
 @contextlib.asynccontextmanager
@@ -1582,7 +1593,7 @@ async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
                 return
             if message["type"] == "http.disconnect":
                 triggered = True
-                task.cancel()
+                task.cancel(_CLIENT_DISCONNECT_CANCEL_MARKER)
                 return
 
     watcher = asyncio.create_task(_watch_disconnect())
@@ -1601,8 +1612,12 @@ async def _cancel_on_client_disconnect(request: Request) -> AsyncIterator[None]:
         # leave it unmarked so the route's cancelled-path re-raises and
         # the task keeps unwinding as genuinely cancelled (the mirror of
         # the else-branch's ``cancelling()`` re-check below).
-        if triggered and task.uncancel() == 0:
-            setattr(exc, _CLIENT_DISCONNECT_CANCEL_MARKER, True)
+        if triggered:
+            remaining_cancellations = task.uncancel()
+            if remaining_cancellations == 0:
+                exc.args = (_CLIENT_DISCONNECT_CANCEL_MARKER,)
+            elif len(exc.args) == 1 and exc.args[0] is _CLIENT_DISCONNECT_CANCEL_MARKER:
+                exc.args = ()
         raise
     else:
         # Normal exit: resolve completion races BEFORE the route resumes
@@ -2133,8 +2148,7 @@ async def _handle_convergence_error(
     Symmetric with :func:`_handle_plugin_crash` and
     :func:`_handle_runtime_preflight_failure` — the same recovery shape
     (``preflight_exception_policy="persist_invalid"``, partial-state
-    persistence, SQLAlchemyError fail-soft) and the same signature
-    placement of ``user_id`` between ``session_id`` and ``log_prefix``.
+    persistence, SQLAlchemyError fail-soft).
 
     Args:
         exc: The convergence error with optional partial_state.
@@ -2923,6 +2937,7 @@ __all__ = [
     "_composition_proposal_response",
     "_extract_runtime_model_snapshot",
     "_failed_turn_response_body",
+    "_failure_log_request_id",
     "_first_message_line",
     "_get_composer_progress_registry",
     "_get_session_compose_lock_registry",

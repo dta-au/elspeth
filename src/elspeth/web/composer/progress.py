@@ -94,11 +94,11 @@ class ComposerProgressRegistry:
     def end_request(self, session_id: str) -> None:
         """Release one in-flight compose request for ``session_id``."""
         with self._lock:
-            remaining = self._inflight.get(session_id, 0) - 1
+            remaining = self._inflight[session_id] - 1
             if remaining > 0:
                 self._inflight[session_id] = remaining
             else:
-                self._inflight.pop(session_id, None)
+                del self._inflight[session_id]
 
     async def publish(
         self,
