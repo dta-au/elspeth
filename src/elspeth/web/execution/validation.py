@@ -2501,7 +2501,7 @@ def validate_pipeline(
             errors.append(
                 ValidationError(
                     component_id=finding.component_id,
-                    component_type="transform",
+                    component_type=finding.component_type,
                     message=finding.format(),
                     suggestion=(
                         "Use the list_models composer tool to pick a known "

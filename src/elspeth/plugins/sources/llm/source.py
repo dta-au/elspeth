@@ -22,7 +22,9 @@ from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.contracts.value_source import register_value_source_plugin
 from elspeth.core.landscape.plugin_audit_writer import PluginAuditWriterAdapter
+from elspeth.core.llm_profiles import require_lowered_llm_profile_alias
 from elspeth.plugins.infrastructure.base import BaseSource
 from elspeth.plugins.infrastructure.clients.base import TelemetryEmitCallback
 from elspeth.plugins.infrastructure.clients.llm import LLMClientError
@@ -138,10 +140,6 @@ class LLMSource(BaseSource):
         "      schema: {mode: observed}\n"
         "      on_validation_failure: discard"
     )
-    discovery_secret_requirements: Mapping[str, tuple[str, ...]] = {
-        "api_key": ("AZURE_OPENAI_API_KEY", "OPENROUTER_API_KEY", "ELSPETH_LLM_GATEWAY_API_KEY"),
-    }
-
     _provider: LLMProvider | None
 
     @classmethod
@@ -182,11 +180,20 @@ class LLMSource(BaseSource):
         }
 
     def __init__(self, config: dict[str, Any]) -> None:
-        super().__init__(config)
-        config_cls = self.get_config_model(config)
+        profile_alias = require_lowered_llm_profile_alias(config)
+        if profile_alias is None:
+            base_config = config
+        else:
+            # Consume the nominal admission proof at the plugin boundary and
+            # retain only the opaque plain-string alias in audit config.
+            base_config = dict(config)
+            base_config["profile_alias"] = profile_alias
+        super().__init__(base_config)
+        provider_config = {key: value for key, value in base_config.items() if key != "profile_alias"}
+        config_cls = self.get_config_model(provider_config)
         self._config = cast(
             "AzureOpenAILLMSourceConfig | OpenRouterLLMSourceConfig | BedrockLLMSourceConfig | GatewayLLMSourceConfig",
-            config_cls.from_dict(config, plugin_name=self.name),
+            config_cls.from_dict(provider_config, plugin_name=self.name),
         )
 
         self._model = self._config.model
@@ -229,6 +236,13 @@ class LLMSource(BaseSource):
         self._limiter: Any = None
         self._load_started = False
         self._validation_failure_handled = False
+
+    @property
+    def provider_config(
+        self,
+    ) -> AzureOpenAILLMSourceConfig | OpenRouterLLMSourceConfig | BedrockLLMSourceConfig | GatewayLLMSourceConfig:
+        """Return the strict typed provider config used by cross-cutting preflight checks."""
+        return self._config
 
     def on_start(self, ctx: LifecycleContext) -> None:
         super().on_start(ctx)
@@ -593,6 +607,9 @@ class LLMSource(BaseSource):
                 "Choose quarantine when an invalid generated row must remain inspectable; choose discard only for intentional dropping.",
             ),
         )
+
+
+register_value_source_plugin(LLMSource, config_attr="provider_config")
 
 
 __all__ = ["LLMSource"]

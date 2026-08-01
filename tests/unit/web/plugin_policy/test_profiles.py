@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from typing import Any, cast
 
 import pytest
 from jsonschema import Draft202012Validator
@@ -10,6 +11,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.engine.orchestrator.preflight import check_config_value_sources
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.plugins.sources.llm import LLMSource
 from elspeth.plugins.transforms.llm.providers.azure import AzureOpenAIConfig
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig
 from elspeth.web.catalog.schemas import PluginSchemaInfo
@@ -491,6 +493,190 @@ def test_profile_lowering_splits_executable_and_audit_safe_options() -> None:
         "response_field": "summary",
     }
     assert "OPENROUTER_API_KEY" not in repr(lowered)
+
+
+def test_llm_source_uses_internal_profile_resolver_without_public_discovery() -> None:
+    registry = _profile_registry()
+    source_id = PluginId("source", "llm")
+
+    lowered = registry.lower_options(
+        source_id,
+        alias="bedrock-task-role",
+        safe_options={
+            "prompt_template": "Write one audit briefing.",
+            "response_field": "briefing",
+            "schema": {"mode": "observed"},
+            "on_validation_failure": "discard",
+        },
+    )
+
+    assert lowered.executable_options["provider"] == "bedrock"
+    assert lowered.executable_options["model"] == "bedrock/anthropic.claude-3-haiku-20240307-v1:0"
+    assert deep_thaw(lowered.audit_safe_options)["profile"] == "bedrock-task-role"
+    assert "profile_alias" not in lowered.executable_options
+
+    # Web attribution is carried by the authored audit-safe profile selector
+    # and frozen policy selection, so executable provider config needs no
+    # forgeable retained alias and remains directly constructible.
+    source = LLMSource(cast(dict[str, Any], deep_thaw(lowered.executable_options)))
+    assert "profile_alias" not in source.config
+    assert source.provider_config.provider == "bedrock"
+
+
+def test_llm_source_profile_alias_is_not_authorable_as_a_safe_option() -> None:
+    registry = _profile_registry()
+
+    with pytest.raises(ValueError, match="private_profile_option"):
+        registry.lower_options(
+            PluginId("source", "llm"),
+            alias="bedrock-task-role",
+            safe_options={
+                "profile_alias": "forged",
+                "prompt_template": "Write one audit briefing.",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            },
+        )
+
+
+def test_llm_source_profile_resolver_fails_closed_for_unknown_alias_and_wrong_kind() -> None:
+    registry = _profile_registry()
+    safe_options: dict[str, object] = {
+        "prompt_template": "Write one audit briefing.",
+        "schema": {"mode": "observed"},
+        "on_validation_failure": "discard",
+    }
+
+    with pytest.raises(ValueError, match="profile_unavailable"):
+        registry.lower_options(
+            PluginId("source", "llm"),
+            alias="not-configured",
+            safe_options=safe_options,
+        )
+    with pytest.raises(ValueError, match="plugin_has_no_operator_profile"):
+        registry.lower_options(
+            PluginId("sink", "llm"),
+            alias="tutorial",
+            safe_options=safe_options,
+        )
+
+
+@pytest.mark.parametrize(
+    ("alias", "expected_aliases"),
+    [
+        ("tutorial", ("tutorial", "bedrock-task-role", "gateway-task")),
+        (None, ()),
+    ],
+)
+def test_llm_source_profile_availability_enumerates_only_configured_aliases(
+    alias: str | None,
+    expected_aliases: tuple[str, ...],
+) -> None:
+    registry = (
+        _profile_registry()
+        if alias is not None
+        else OperatorProfileRegistry(
+            policy=compile_web_plugin_policy(
+                registry=get_shared_plugin_manager(),
+                settings=RuntimeWebPluginConfig.from_settings(_settings()),
+            ),
+            settings=RuntimeWebPluginConfig.from_settings(_settings()),
+        )
+    )
+
+    class _Inventory:
+        def server_generation(self, name: str) -> str | None:
+            return "present" if name in {"OPENROUTER_API_KEY", "GATEWAY_BEARER_TOKEN"} else None
+
+        def user_generation(self, principal: str, name: str) -> str | None:
+            del principal, name
+            return None
+
+        def has_server_ref(self, name: str) -> bool:
+            return self.server_generation(name) is not None
+
+        def has_user_ref(self, principal: str, name: str) -> bool:
+            return self.user_generation(principal, name) is not None
+
+    states = registry.profile_availability(
+        PluginId("source", "llm"),
+        principal="local:alice",
+        inventory=_Inventory(),
+    )
+
+    assert tuple(state.alias for state in states if state.usable) == expected_aliases
+    selected = registry.selected_profile_alias(
+        PluginId("source", "llm"),
+        usable_aliases=expected_aliases,
+    )
+    assert selected == alias
+
+
+@pytest.mark.parametrize(
+    ("alias", "profile"),
+    [
+        (
+            "azure-task",
+            {
+                "provider": "azure",
+                "model": "deployment",
+                "credential_scope": "server",
+                "credential_ref": "AZURE_OPENAI_API_KEY",
+                "endpoint": "https://example.openai.azure.com",
+                "deployment_name": "deployment",
+            },
+        ),
+        (
+            "openrouter-task",
+            {
+                "provider": "openrouter",
+                "model": "openai/gpt-5-mini",
+                "credential_scope": "server",
+                "credential_ref": "OPENROUTER_API_KEY",
+            },
+        ),
+        (
+            "bedrock-task",
+            {
+                "provider": "bedrock",
+                "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+                "region_name": "ap-southeast-2",
+            },
+        ),
+        (
+            "gateway-task",
+            {
+                "provider": "gateway",
+                "model": "standard",
+                "credential_scope": "server",
+                "credential_ref": "GATEWAY_BEARER_TOKEN",
+                "endpoint": "https://gateway.example.com/v1",
+                "contract_major": 1,
+                "required_capabilities": ["text", "usage"],
+            },
+        ),
+    ],
+)
+def test_each_profile_provider_lowers_into_source_config(alias: str, profile: dict[str, object]) -> None:
+    runtime = RuntimeWebPluginConfig.from_settings(_settings(llm_profiles={alias: profile}, default_llm_profile=alias))
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    registry = OperatorProfileRegistry(policy=policy, settings=runtime)
+    lowered = registry.lower_options(
+        PluginId("source", "llm"),
+        alias=alias,
+        safe_options={
+            "prompt_template": "Write one audit briefing.",
+            "schema": {"mode": "observed"},
+            "on_validation_failure": "discard",
+        },
+    )
+    executable = deep_thaw(lowered.executable_options)
+    if "api_key" in executable:
+        executable["api_key"] = "resolved-secret"
+
+    source = LLMSource(executable)
+
+    assert source.provider_config.provider == profile["provider"]
 
 
 def test_azure_profile_lowering_honors_deployment_derived_model_contract() -> None:

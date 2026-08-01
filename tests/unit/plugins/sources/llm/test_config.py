@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -18,6 +18,7 @@ from elspeth.plugins.sources.llm.config import (
     OpenRouterLLMSourceConfig,
 )
 from elspeth.plugins.transforms.llm import build_llm_source_output_schema_config
+from elspeth.plugins.transforms.llm.transform import LLMTransform
 
 TRANSFORM_ONLY_FIELDS = {
     "required_input_fields",
@@ -349,3 +350,12 @@ def test_each_provider_accepts_its_single_request_config(
 ) -> None:
     cfg = SOURCE_PROVIDER_CONFIGS[provider].from_dict(provider_configs[provider], plugin_name="llm")
     assert cfg.provider == provider
+
+
+@pytest.mark.parametrize("provider", ["azure", "openrouter", "bedrock", "gateway"])
+def test_source_provider_schema_stays_in_parity_with_transform_single_request_fields(provider: str) -> None:
+    transform_model = LLMTransform.discriminated_variants()[1][provider]
+    source_model = SOURCE_PROVIDER_CONFIGS[provider]
+
+    assert set(source_model.model_fields) == (set(transform_model.model_fields) - TRANSFORM_ONLY_FIELDS) | {"on_validation_failure"}
+    assert cast(Any, source_model).VALUE_SOURCES == cast(Any, transform_model).VALUE_SOURCES

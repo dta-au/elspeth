@@ -4,17 +4,22 @@ from __future__ import annotations
 
 import json
 import socket
+from collections.abc import Mapping, Sequence
 from functools import partial
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
+from pydantic import SecretBytes
 
 from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, load_settings_from_yaml_string, resolve_config
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode, plugin_preflight_mode_enabled
 from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
 from elspeth.plugins.sinks.csv_sink import CSVSink
 from elspeth.plugins.sources.csv_source import CSVSource
+from elspeth.plugins.sources.llm import LLMSource
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec
@@ -52,7 +57,7 @@ def _web_settings(tmp_path: Path) -> WebSettings:
         composer_max_discovery_turns=5,
         composer_timeout_seconds=30.0,
         composer_rate_limit_per_minute=60,
-        shareable_link_signing_key=b"\x00" * 32,
+        shareable_link_signing_key=SecretBytes(b"\x00" * 32),
     )
 
 
@@ -373,6 +378,83 @@ def test_preflight_mode_instantiates_external_plugins_without_network(
     assert bundle.sinks
 
 
+def test_llm_source_constructor_is_network_free_without_executable_profile_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _forbid_socket_calls(monkeypatch)
+    config = {
+        "provider": "openrouter",
+        "model": "openai/gpt-5-mini",
+        "api_key": "resolved-secret",
+        "prompt_template": "Write one audit briefing.",
+        "schema": {"mode": "observed"},
+        "on_validation_failure": "discard",
+    }
+
+    with (
+        patch.object(LLMSource, "_create_provider", autospec=True) as create_provider,
+        plugin_preflight_mode(True),
+    ):
+        source = LLMSource(config)
+
+    create_provider.assert_not_called()
+    assert "profile_alias" not in source.config
+    assert source.provider_config.provider == "openrouter"
+
+
+def test_llm_source_audit_projection_uses_authored_profile_and_restores_executable_config() -> None:
+    source = LLMSource(
+        {
+            "provider": "openrouter",
+            "model": "openai/gpt-5-mini",
+            "api_key": "resolved-secret",
+            "prompt_template": "Write one audit briefing.",
+            "schema": {"mode": "observed"},
+            "on_validation_failure": "discard",
+        }
+    )
+    bundle = cast(
+        Any,
+        SimpleNamespace(
+            sources={"generated_brief": source},
+            transforms=(),
+            aggregations={},
+            sinks={},
+        ),
+    )
+    audit_safe = {
+        "sources": {
+            "generated_brief": {
+                "plugin": "llm",
+                "on_success": "output",
+                "options": {
+                    "profile": "source-profile",
+                    "prompt_template": "Write one audit briefing.",
+                    "schema": {"mode": "observed"},
+                    "on_validation_failure": "discard",
+                },
+            }
+        },
+        "transforms": [],
+        "aggregations": [],
+        "sinks": {},
+    }
+    snapshot = _snapshot_with_profiles((PluginId("source", "llm"), "source-profile"))
+    executable_config = source.config
+
+    with execution_preflight._audit_safe_plugin_configs(
+        bundle,
+        audit_safe_settings=audit_safe,
+        plugin_snapshot=snapshot,
+    ):
+        assert source.config["profile"] == "source-profile"
+        assert "provider" not in source.config
+        assert "api_key" not in source.config
+
+    assert source.config is executable_config
+    assert "profile_alias" not in source.config
+
+
 @pytest.mark.asyncio
 async def test_run_sync_in_worker_preserves_preflight_mode_for_plugin_constructors(
     monkeypatch: pytest.MonkeyPatch,
@@ -457,6 +539,32 @@ def test_runtime_mode_default_does_not_enable_preflight_context(
         "instantiate plugins with plugin_preflight_mode_enabled() == False. "
         f"Observed: {observed}"
     )
+
+
+def test_runtime_factory_includes_sources_in_the_value_source_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from elspeth.engine.orchestrator import preflight as orchestrator_preflight
+
+    settings = load_settings_from_yaml_string(_minimal_csv_pipeline_yaml(tmp_path))
+    original = orchestrator_preflight.validate_value_source_compliance
+    observed_sources: list[dict[str, object]] = []
+
+    def record_value_source_inputs(
+        transforms: Sequence[Any],
+        *,
+        sources: Mapping[str, object] | None = None,
+    ) -> None:
+        assert sources is not None
+        observed_sources.append(dict(sources))
+        original(transforms, sources=sources)
+
+    monkeypatch.setattr(orchestrator_preflight, "validate_value_source_compliance", record_value_source_inputs)
+
+    bundle = instantiate_plugins_from_config(settings, preflight_mode=True)
+
+    assert observed_sources == [dict(bundle.sources)]
 
 
 def test_web_runtime_rejects_disabled_plugin_before_any_constructor(

@@ -30,6 +30,7 @@ SECRET_REF_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,255}\Z")
 # so the private-field allowlist cannot silently diverge between them.
 LLM_PROFILE_PRIVATE_FIELDS = frozenset(
     {
+        "profile_alias",
         "provider",
         "model",
         "api_key",
@@ -60,10 +61,38 @@ LLM_PROFILE_PRIVATE_FIELDS = frozenset(
 )
 
 
+class LoweredLLMProfileAlias(str):
+    """Nominal proof that an alias came from trusted profile lowering.
+
+    ``profile_alias`` is reserved provenance, not an authorable provider
+    option. A distinct owned scalar lets the in-memory batch lowering path
+    carry that provenance through Pydantic's ``dict[str, Any]`` options while
+    ordinary YAML/JSON strings fail closed. Serialization deliberately erases
+    the proof; persisted executable config is not a trusted lowering product.
+    """
+
+    __slots__ = ()
+
+
 def validate_profile_alias(alias: str) -> str:
     if PROFILE_ALIAS_PATTERN.fullmatch(alias) is None:
         raise ValueError("profile alias must be a lowercase opaque identifier")
     return alias
+
+
+def make_lowered_llm_profile_alias(alias: str) -> LoweredLLMProfileAlias:
+    """Create the owned alias marker at the trusted lowering seam."""
+    return LoweredLLMProfileAlias(validate_profile_alias(alias))
+
+
+def require_lowered_llm_profile_alias(config: Mapping[str, object]) -> str | None:
+    """Return a trusted retained alias, rejecting author-forged strings."""
+    if "profile_alias" not in config:
+        return None
+    alias = config["profile_alias"]
+    if type(alias) is not LoweredLLMProfileAlias:
+        raise ValueError("profile_alias is reserved for trusted LLM profile lowering")
+    return str(alias)
 
 
 class LLMProfileSettings(BaseModel):

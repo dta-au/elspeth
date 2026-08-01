@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import pytest
 
+from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.plugins.sources.llm import LLMSource
+from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
@@ -84,6 +88,178 @@ def _build(settings: WebSettings, *, principal: str = "local:alice", inventory: 
 
 
 _AWS_S3_ALLOWLIST = ("source:aws_s3", "sink:aws_s3")
+
+
+class _InternalLLMSourceCatalog:
+    """Task-8-only catalog seam; real built-in discovery remains disabled."""
+
+    _summary = PluginSummary(
+        name="llm",
+        description="internal LLM source",
+        plugin_type="source",
+        config_fields=[],
+        web_config_authority=WebConfigAuthority.OPERATOR_PROFILED,
+        policy_capabilities=(CapabilityDeclaration(PluginCapability.LLM),),
+        secret_requirements=(),
+    )
+    _schema = PluginSchemaInfo(
+        name="llm",
+        plugin_type="source",
+        description="internal LLM source",
+        json_schema={},
+        knob_schema={"fields": []},
+        web_config_authority=WebConfigAuthority.OPERATOR_PROFILED,
+        policy_capabilities=(CapabilityDeclaration(PluginCapability.LLM),),
+        secret_requirements=(),
+    )
+
+    def list_sources(self) -> list[PluginSummary]:
+        return [self._summary]
+
+    def list_transforms(self) -> list[PluginSummary]:
+        return []
+
+    def list_sinks(self) -> list[PluginSummary]:
+        return []
+
+    def get_schema(self, plugin_type: Literal["source", "transform", "sink"], name: str) -> PluginSchemaInfo:
+        if plugin_type != "source" or name != "llm":
+            raise ValueError("unknown internal plugin")
+        return self._schema
+
+    def post_call_hints(
+        self,
+        *,
+        plugin_type: Literal["source", "transform", "sink"],
+        plugin_name: str,
+        tool_name: str,
+        config_snapshot: object,
+    ) -> tuple[str, ...]:
+        del plugin_type, plugin_name, tool_name, config_snapshot
+        return ()
+
+
+def _build_internal_llm_source(
+    profile: dict[str, object] | None,
+    *,
+    inventory: _Inventory | None = None,
+    principal: str = "local:alice",
+) -> PluginAvailabilitySnapshot:
+    source_id = PluginId("source", "llm")
+    settings = _settings(
+        llm_profiles={} if profile is None else {"source-profile": profile},
+        default_llm_profile=None if profile is None else "source-profile",
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = WebPluginPolicy.create(
+        required=frozenset({source_id}),
+        configured_optional=frozenset(),
+        preferences=(),
+        control_modes=(),
+        plugin_code_identities=((source_id, "1.0.0", "internal-task-8"),),
+    )
+    return build_plugin_snapshot(
+        policy=policy,
+        catalog=_InternalLLMSourceCatalog(),
+        profiles=OperatorProfileRegistry(policy=policy, settings=runtime),
+        principal_scope=principal,
+        secret_inventory=inventory or _Inventory(),
+        generation_key=b"task-8-internal-source-generation-key",
+    )
+
+
+def test_llm_source_has_no_flat_discovery_credential_requirement() -> None:
+    assert LLMSource.discovery_secret_requirements == {}
+
+
+def test_keyless_bedrock_source_profile_is_available_with_empty_inventory() -> None:
+    snapshot = _build_internal_llm_source(
+        {
+            "provider": "bedrock",
+            "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+        }
+    )
+
+    source_id = PluginId("source", "llm")
+    assert source_id in snapshot.available
+    assert dict(snapshot.usable_profile_aliases)[source_id] == ("source-profile",)
+
+
+@pytest.mark.parametrize(
+    ("provider", "scope", "credential_ref", "profile_options"),
+    [
+        (
+            "azure",
+            "server",
+            "AZURE_SOURCE_KEY",
+            {
+                "model": "deployment",
+                "endpoint": "https://example.openai.azure.com",
+                "deployment_name": "deployment",
+            },
+        ),
+        ("openrouter", "server", "OPENROUTER_SOURCE_KEY", {"model": "openai/gpt-5-mini"}),
+        ("openrouter", "user", "OPENROUTER_PERSONAL_KEY", {"model": "openai/gpt-5-mini"}),
+        (
+            "gateway",
+            "server",
+            "GATEWAY_SOURCE_KEY",
+            {
+                "model": "standard",
+                "endpoint": "https://gateway.example.com/v1",
+                "contract_major": 1,
+                "required_capabilities": ["text", "usage"],
+            },
+        ),
+    ],
+)
+def test_credentialed_source_profile_requires_its_exact_scoped_inventory_ref(
+    provider: str,
+    scope: str,
+    credential_ref: str,
+    profile_options: dict[str, object],
+) -> None:
+    principal = "local:alice"
+    profile = {
+        "provider": provider,
+        "credential_scope": scope,
+        "credential_ref": credential_ref,
+        **profile_options,
+    }
+    wrong = _build_internal_llm_source(
+        profile,
+        principal=principal,
+        inventory=_Inventory(
+            server=frozenset({"WRONG_KEY"}),
+            users={principal: frozenset({"WRONG_KEY"})},
+        ),
+    )
+    correct_inventory = (
+        _Inventory(server=frozenset({credential_ref}), server_generations={credential_ref: "private-generation"})
+        if scope == "server"
+        else _Inventory(
+            users={principal: frozenset({credential_ref})},
+            user_generations={(principal, credential_ref): "private-generation"},
+        )
+    )
+    correct = _build_internal_llm_source(profile, principal=principal, inventory=correct_inventory)
+
+    source_id = PluginId("source", "llm")
+    assert source_id not in wrong.available
+    assert dict(wrong.usable_profile_aliases)[source_id] == ()
+    assert source_id in correct.available
+    assert dict(correct.usable_profile_aliases)[source_id] == ("source-profile",)
+    assert credential_ref not in repr(correct)
+    assert "private-generation" not in repr(correct)
+
+
+def test_llm_source_with_no_configured_profile_fails_closed() -> None:
+    snapshot = _build_internal_llm_source(None)
+    source_id = PluginId("source", "llm")
+
+    assert source_id not in snapshot.available
+    assert dict(snapshot.usable_profile_aliases)[source_id] == ()
+    assert [item.reason for item in snapshot.unavailable if item.plugin_id == source_id] == [PluginUnavailableReason.PROFILE_UNAVAILABLE]
 
 
 def test_web_prohibited_source_is_a_declined_authorization_not_an_offer() -> None:

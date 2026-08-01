@@ -38,6 +38,7 @@ from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginC
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.value_source import register_value_source_plugin
+from elspeth.core.llm_profiles import require_lowered_llm_profile_alias
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
 from elspeth.plugins.infrastructure.clients.llm import ContextLengthError, LLMClientError
@@ -1131,7 +1132,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:961feb6d3c35fbc2"
+    source_file_hash: str | None = "sha256:2162a412737490ac"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1313,11 +1314,19 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             probe_provider.close()
 
     def __init__(self, config: dict[str, Any]) -> None:
-        super().__init__(config)
+        profile_alias = require_lowered_llm_profile_alias(config)
+        if profile_alias is None:
+            base_config = config
+        else:
+            # Consume the nominal admission proof at the plugin boundary and
+            # retain only the opaque plain-string alias in audit config.
+            base_config = dict(config)
+            base_config["profile_alias"] = profile_alias
+        super().__init__(base_config)
 
         # Provider dispatch from single registry.
         # config is user YAML (Tier 3 boundary) — distinguish missing key from unknown value.
-        provider_name = config.get("provider")
+        provider_name = base_config.get("provider")
         if provider_name is None:
             raise ValueError(f"LLM config missing required 'provider' key. Valid providers: {sorted(_PROVIDERS)}")
         if provider_name not in _PROVIDERS:
@@ -1326,19 +1335,21 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
 
         # `profile_alias` is a provenance-only marker the batch/CLI operator
         # profile catalog lowering pass (core.config._lower_llm_profile_nodes)
-        # leaves in `self.config` (set by BaseTransform.__init__ above, from
-        # the SAME `config` dict) purely so the DAG's per-node audit config
-        # and the run's settings_json snapshot can answer "which llm_profiles
-        # alias did this node use" — no provider config model declares this
-        # field, and every provider config class forbids extra fields, so it
-        # must be excluded before validation rather than declared on
-        # LLMConfig itself. Named distinctly from the authored `profile`
-        # selector key on purpose: keying the retained alias as `profile`
-        # here would put a lowered node right back into the exact shape
+        # leaves in `self.config` (converted from its nominal admission marker
+        # to an ordinary string before BaseTransform.__init__ above) purely so
+        # the DAG's per-node audit config and the run's settings_json snapshot
+        # can answer "which llm_profiles alias did this node use" — no provider
+        # config model declares this field, and every provider config class
+        # forbids extra fields, so it must be excluded before validation rather
+        # than declared on LLMConfig itself. Named distinctly from the authored
+        # `profile` selector key on purpose: keying the retained alias as
+        # `profile` here would put a lowered node right back into the exact shape
         # _lower_llm_profile_nodes's own ambiguity check rejects (`profile`
         # + `provider` both present), making that pass unsafe to run twice
         # over its own output.
-        provider_config = {key: value for key, value in config.items() if key != "profile_alias"} if "profile_alias" in config else config
+        provider_config = (
+            {key: value for key, value in base_config.items() if key != "profile_alias"} if "profile_alias" in base_config else base_config
+        )
 
         # Parse config with provider-specific model.
         # config_cls is one of the registered provider config classes at runtime;

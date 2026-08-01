@@ -476,11 +476,16 @@ class OperatorProfileRegistry:
         from elspeth.web.plugin_policy.models import PluginId
 
         self._policy = policy
+        llm_transform_resolver = _LLMProfileResolver(
+            settings.llm_profiles,
+            preferred_alias=settings.default_llm_profile,
+        )
         self._resolvers: dict[PluginId, OperatorProfileResolver] = {
-            PluginId("transform", "llm"): _LLMProfileResolver(
+            PluginId("source", "llm"): _LLMProfileResolver(
                 settings.llm_profiles,
                 preferred_alias=settings.default_llm_profile,
-            )
+            ),
+            PluginId("transform", "llm"): llm_transform_resolver,
         }
         defaults = dict(settings.bedrock_guardrail_default_profiles)
         for plugin_name in ("aws_bedrock_prompt_shield", "aws_bedrock_content_safety"):

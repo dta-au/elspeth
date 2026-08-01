@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +28,7 @@ class ValueSourceFinding:
     component_id: str
     field_name: str
     reason: str
+    component_type: Literal["source", "transform"] = "transform"
 
     def __post_init__(self) -> None:
         if not self.component_id:
@@ -35,6 +37,8 @@ class ValueSourceFinding:
             raise ValueError("ValueSourceFinding.field_name must be non-empty")
         if not self.reason:
             raise ValueError("ValueSourceFinding.reason must be non-empty")
+        if self.component_type not in ("source", "transform"):
+            raise ValueError("ValueSourceFinding.component_type must be 'source' or 'transform'")
 
     def format(self) -> str:
         """Render as a human-readable string for log/check-detail surfaces.
