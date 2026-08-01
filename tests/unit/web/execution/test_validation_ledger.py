@@ -345,6 +345,44 @@ def test_advisory_before_all_core_passes_raises() -> None:
         ledger.record_advisory(_check(CHECK_IDENTITY_NODE_ADVISORY, passed=True))
 
 
+def test_record_pass_refuses_a_failed_check() -> None:
+    """The guard that stops a failing check being recorded in the passing prefix."""
+    ledger = ValidationLedger()
+
+    with pytest.raises(RuntimeError, match="requires a passed check"):
+        ledger.record_pass(_check(CHECK_PLUGIN_ENABLEMENT, passed=False))
+
+
+def test_record_advisory_refuses_an_unregistered_name() -> None:
+    """Advisories come from the closed registered set — a core name is refused."""
+    ledger = ValidationLedger()
+    _record_all_core_passes(ledger)
+
+    with pytest.raises(RuntimeError, match="not a registered advisory check"):
+        ledger.record_advisory(_check(CHECK_PLUGIN_ENABLEMENT, passed=True))
+
+
+def test_record_advisory_refuses_a_failed_advisory() -> None:
+    """Advisories are passed=True by contract; a failed one must not be recorded."""
+    ledger = ValidationLedger()
+    _record_all_core_passes(ledger)
+
+    with pytest.raises(RuntimeError, match="advisory records must pass"):
+        ledger.record_advisory(_check(CHECK_IDENTITY_NODE_ADVISORY, passed=False))
+
+
+def test_finish_failure_refuses_a_passed_check() -> None:
+    """The guard that stops a passing check being reported as the terminal failure."""
+    ledger = ValidationLedger()
+
+    with pytest.raises(RuntimeError, match="requires a failed check"):
+        ledger.finish_failure(
+            _check(CHECK_PLUGIN_ENABLEMENT, passed=True),
+            errors=(_error("blocked"),),
+            readiness=_blocked_readiness(),
+        )
+
+
 def test_record_advisory_snapshots_the_mutable_check() -> None:
     ledger = ValidationLedger()
     _record_all_core_passes(ledger)

@@ -49,14 +49,14 @@ from elspeth.web.execution.schemas import (
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 
-def _state() -> CompositionState:
+def _state(*, version: int = 1) -> CompositionState:
     return CompositionState(
         source=None,
         nodes=(),
         edges=(),
         outputs=(),
         metadata=PipelineMetadata(),
-        version=1,
+        version=version,
     )
 
 
@@ -437,8 +437,10 @@ def test_route_phase_catches_only_route_validation_error() -> None:
 
 
 def test_schema_phase_uses_authored_policy_state_for_rich_edge_diagnostics() -> None:
+    # Distinct by value, not just identity: version=2 makes an accidental
+    # swap to the materialized state fail the equality assertions below.
     policy_state = _state()
-    materialized_state = _state()
+    materialized_state = _state(version=2)
     graph = _graph()
     edge_error = EdgeContractError(
         "edge mismatch",
@@ -486,6 +488,8 @@ def test_schema_phase_uses_authored_policy_state_for_rich_edge_diagnostics() -> 
 
     assert isinstance(result, PhaseFailure)
     assert seen == [policy_state, policy_state]
+    assert seen[0] is policy_state
+    assert seen[1] is policy_state
     assert result.failed_check.detail == "edge mismatch"
     assert result.errors[0].component_id == "composer_consumer"
     assert result.errors[0].message == "rich edge message"
@@ -522,9 +526,12 @@ def test_schema_phase_plain_error_and_success_preserve_exact_graph() -> None:
 
 
 def test_identity_advisory_checks_use_policy_state_and_preserve_exact_prose() -> None:
+    # materialized_state differs by value (version=2) so this test can tell
+    # the two states apart; the identity assertion below then proves the
+    # finder received the authored policy state, never the materialized one.
     policy_state = _state()
     graphed = GraphedRuntime(
-        instantiated=_instantiated(_loaded(_materialized(policy_state=policy_state, materialized_state=_state()))),
+        instantiated=_instantiated(_loaded(_materialized(policy_state=policy_state, materialized_state=_state(version=2)))),
         graph=_graph(),
         graph_warnings=(),
     )
@@ -543,6 +550,7 @@ def test_identity_advisory_checks_use_policy_state_and_preserve_exact_prose() ->
     checks = build_identity_advisory_checks(graphed, find_identity_node_advisories=finder)
 
     assert seen == [policy_state]
+    assert seen[0] is policy_state
     assert len(checks) == 1
     assert checks[0].name == "identity_node_advisory"
     assert checks[0].affected_nodes == ("passthrough",)

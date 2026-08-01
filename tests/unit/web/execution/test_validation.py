@@ -673,7 +673,11 @@ sinks:
     load_settings.assert_called_once()
 
 
-def test_validation_pipeline_constructs_from_explicit_dependencies() -> None:
+def test_validation_pipeline_delegates_to_injected_impl_with_its_dependencies() -> None:
+    """The pipeline threads its captured dependencies into the injected impl
+    and converts a PhaseTermination escape into that termination's result —
+    the two behaviors ValidationPipeline actually owns."""
+    from elspeth.web.execution._validation_model import PhaseTermination
     from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
 
     dependencies = ValidationDependencies(
@@ -684,8 +688,24 @@ def test_validation_pipeline_constructs_from_explicit_dependencies() -> None:
         build_graph=validation_module.build_runtime_graph,
         validate_routes=validation_module.assemble_and_validate_pipeline_config,
     )
+    sentinel_result = MagicMock(name="validation_result")
+    seen: dict[str, Any] = {}
 
-    assert ValidationPipeline(dependencies).dependencies is dependencies
+    def run_impl(*args: Any, **kwargs: Any) -> Any:
+        seen["dependencies"] = kwargs["dependencies"]
+        raise PhaseTermination(sentinel_result)
+
+    result = ValidationPipeline(dependencies, run_impl=run_impl).run(
+        MagicMock(name="state"),
+        MagicMock(name="settings"),
+        MagicMock(name="yaml_generator"),
+        plugin_snapshot=MagicMock(name="plugin_snapshot"),
+        profile_registry=None,
+        catalog=MagicMock(name="catalog"),
+    )
+
+    assert seen["dependencies"] is dependencies
+    assert result is sentinel_result
 
 
 @dataclass(frozen=True)

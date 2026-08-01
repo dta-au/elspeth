@@ -21,10 +21,20 @@ _PRODUCTION_FILES = (
 # These R5s are policy-wrong, adjudication-ready nominal checks over owned
 # concrete classes: one admits the real scoped-resolver implementation instead
 # of a runtime Protocol impostor; the other two discriminate owned closed
-# result/exception unions. No filename/name exemption may hide any check.
+# result/exception unions. The `_reframe_settings_missing_parts` R1/R5 trio
+# ran ACTIVE at base under three judge-signed allowlist entries whose
+# rationales explicitly ruled the decorator mechanism inapplicable; the move
+# to `_validation_diagnostics.py` staled those path-keyed signatures, so the
+# findings run active here as re-adjudication candidates for the release-end
+# signing ceremony. No filename/name exemption may hide any check.
 _ADJUDICATION_CANDIDATES = {
     "_validation_authoring.py": ["R5:_secret_ref_exists", "R5:review_interpretations"],
-    "_validation_diagnostics.py": ["R5:_infer_component_type_from_plugin_error"],
+    "_validation_diagnostics.py": [
+        "R1:_reframe_settings_missing_parts",
+        "R1:_reframe_settings_missing_parts",
+        "R5:_reframe_settings_missing_parts",
+        "R5:_infer_component_type_from_plugin_error",
+    ],
 }
 
 _EXPECTED_SUPPRESSION_OBSERVATIONS = {
@@ -41,8 +51,6 @@ _EXPECTED_SUPPRESSION_OBSERVATIONS = {
     ),
     "_validation_diagnostics.py": Counter(
         {
-            "R1:_reframe_settings_missing_parts": 2,
-            "R5:_reframe_settings_missing_parts": 1,
             "R1:_find_identity_node_advisories": 3,
             "R5:_find_identity_node_advisories": 4,
             "R1:_find_static_llm_prompt_advisories": 2,

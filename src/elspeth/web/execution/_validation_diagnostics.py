@@ -42,15 +42,20 @@ _SETTINGS_MISSING_PART_REFRAMES: dict[str, tuple[str, str, str]] = {
 }
 
 
-@observation_boundary(
-    tier=3,
-    source="structured Pydantic errors derived from composer-authored runtime settings",
-    source_param="exc",
-    suppresses=("R1", "R5"),
-    invariant="returns stable novice-register findings for known missing top-level parts and an empty list otherwise",
-)
 def _reframe_settings_missing_parts(exc: PydanticValidationError) -> list[ValidationError]:
-    """Reframe missing required source/sink settings without parsing prose."""
+    """Reframe missing required source/sink settings without parsing prose.
+
+    Deliberately NOT decorated with ``observation_boundary``: all three prior
+    judge verdicts for this helper's R1/R5 sites (see
+    ``config/cicd/enforce_tier_model/web.yaml``,
+    ``_reframe_settings_missing_parts`` entries) ruled the suppressions valid
+    as rule misfires but explicitly ruled the decorator mechanism
+    inapplicable — a structured ``PydanticValidationError`` is not a raw
+    external-data parameter requiring a function-scoped Tier-3 boundary. The
+    move to this file staled those path-keyed signatures, so the findings run
+    ACTIVE here as re-adjudication candidates for the release-end signing
+    ceremony (pinned in ``test_validation_trust_tier.py``).
+    """
     missing_parts: set[str] = set()
     for error in exc.errors():
         if error.get("type") != "missing":

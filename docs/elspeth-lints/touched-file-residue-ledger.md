@@ -157,7 +157,7 @@ Unresolved stale residue for this entry: **0 sites**.
 | Features reviewed | Corrected sites | Pattern classes recorded | Unresolved residue |
 |---:|---:|---:|---:|
 | 1 | 100 | 9 | 0 |
-| 1 | 101 | 10 | 0 |
-| 1 | 103 | 10 | 0 |
-| 1 | 105 | 12 | 0 |
-| 1 | 116 | 13 | 0 |
+| 2 | 101 | 10 | 0 |
+| 2 | 103 | 10 | 0 |
+| 2 | 105 | 12 | 0 |
+| 2 | 116 | 13 | 0 |

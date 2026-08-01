@@ -2,59 +2,49 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
 
-from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.secrets import WebSecretResolver
-from elspeth.core.config import AggregationSettings, ElspethSettings
-from elspeth.core.dag.graph import ExecutionGraph
-from elspeth.core.dag.wiring import WiredTransform
-from elspeth.engine.orchestrator.types import PipelineConfig
-from elspeth.plugins.infrastructure.runtime_factory import PluginBundle
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution._validation_model import PhaseTermination
+from elspeth.web.execution._validation_runtime import (
+    _DictSettingsLoader,
+    _GraphBuilder,
+    _PluginInstantiator,
+    _RouteValidator,
+    _YamlLoader,
+    _YamlSettingsLoader,
+)
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 
 
-class _YamlLoader(Protocol):
-    def __call__(self, yaml_content: str) -> object: ...
+class _ValidationRunImpl(Protocol):
+    """One full execution-validation run, terminated phases already applied."""
 
-
-class _YamlSettingsLoader(Protocol):
-    def __call__(self, yaml_content: str, *, expand_env_vars: bool = False) -> ElspethSettings: ...
-
-
-class _DictSettingsLoader(Protocol):
-    def __call__(self, config_dict: Mapping[str, object], *, expand_env_vars: bool = False) -> ElspethSettings: ...
-
-
-class _PluginInstantiator(Protocol):
-    def __call__(self, settings: ElspethSettings, *, plugin_snapshot: PluginAvailabilitySnapshot) -> PluginBundle: ...
-
-
-class _GraphBuilder(Protocol):
-    def __call__(self, settings: ElspethSettings, bundle: PluginBundle) -> ExecutionGraph: ...
-
-
-class _RouteValidator(Protocol):
     def __call__(
         self,
+        state: CompositionState,
+        settings: ValidationSettings,
+        yaml_generator: YamlGenerator,
         *,
-        sources: Mapping[str, SourceProtocol],
-        transforms: Sequence[WiredTransform],
-        sinks: Mapping[str, SinkProtocol],
-        aggregations: Mapping[str, tuple[TransformProtocol, AggregationSettings]],
-        settings: ElspethSettings,
-        graph: ExecutionGraph,
-    ) -> PipelineConfig: ...
+        plugin_snapshot: PluginAvailabilitySnapshot,
+        profile_registry: OperatorProfileRegistry | None,
+        catalog: CatalogService,
+        secret_service: WebSecretResolver | None = None,
+        user_id: str | None = None,
+        blob_get_metadata: Callable[[UUID], BlobRecord | None] | None = None,
+        allow_pending_interpretation_placeholders: bool = False,
+        session_id: str | None = None,
+        dependencies: ValidationDependencies,
+    ) -> ValidationResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,9 +61,15 @@ class ValidationDependencies:
 
 @dataclass(frozen=True, slots=True)
 class ValidationPipeline:
-    """Own one execution-validation run without changing legacy behavior."""
+    """Own one execution-validation run without changing legacy behavior.
+
+    The implementation is injected at construction (the facade passes its
+    ``_validate_pipeline_impl``) so this module never imports back into the
+    facade — imports stay top-level in both directions.
+    """
 
     dependencies: ValidationDependencies
+    run_impl: _ValidationRunImpl
 
     def run(
         self,
@@ -90,11 +86,9 @@ class ValidationPipeline:
         allow_pending_interpretation_placeholders: bool = False,
         session_id: str | None = None,
     ) -> ValidationResult:
-        """Delegate to the behavior-preserving private implementation."""
-        from elspeth.web.execution.validation import _validate_pipeline_impl
-
+        """Delegate to the injected implementation, converting terminations."""
         try:
-            return _validate_pipeline_impl(
+            return self.run_impl(
                 state,
                 settings,
                 yaml_generator,

@@ -259,7 +259,7 @@ def validate_pipeline(
         build_graph=build_runtime_graph,
         validate_routes=assemble_and_validate_pipeline_config,
     )
-    return ValidationPipeline(dependencies).run(
+    return ValidationPipeline(dependencies, run_impl=_validate_pipeline_impl).run(
         state,
         settings,
         yaml_generator,
@@ -520,16 +520,25 @@ def validate_pipeline_for_trained_operator(
     state: CompositionState,
     settings: ValidationSettings,
     yaml_generator: YamlGenerator,
+    *,
+    plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+    profile_registry: OperatorProfileRegistry | None = None,
+    catalog: CatalogService | None = None,
     **kwargs: Any,
 ) -> ValidationResult:
-    """Explicit non-web validation root preserving CLI and local-tool neutrality."""
+    """Explicit non-web validation root preserving CLI and local-tool neutrality.
+
+    The three routing options are explicit keyword parameters rather than
+    ``kwargs`` mining: at base this used ``kwargs.pop(key, default)`` (two
+    active R9 findings), which a mid-refactor rewrite turned into
+    membership ternaries — semantically identical but invisible to the R9
+    detector. Naming the parameters removes the dict-mining pattern itself
+    instead of laundering it.
+    """
     from elspeth.web.dependencies import create_catalog_service
 
-    plugin_snapshot = kwargs["plugin_snapshot"] if "plugin_snapshot" in kwargs else None
-    profile_registry = kwargs["profile_registry"] if "profile_registry" in kwargs else None
-    catalog = kwargs["catalog"] if "catalog" in kwargs else create_catalog_service()
-    reserved = frozenset({"plugin_snapshot", "profile_registry", "catalog"})
-    forwarded = {key: value for key, value in kwargs.items() if key not in reserved}
+    if catalog is None:
+        catalog = create_catalog_service()
     catalog, plugin_snapshot = _trained_operator_validation_context(catalog, plugin_snapshot)
     return validate_pipeline(
         state,
@@ -538,7 +547,7 @@ def validate_pipeline_for_trained_operator(
         plugin_snapshot=plugin_snapshot,
         profile_registry=profile_registry,
         catalog=catalog,
-        **forwarded,
+        **kwargs,
     )
 
 
