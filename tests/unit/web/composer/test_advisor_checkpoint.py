@@ -732,6 +732,98 @@ def test_parse_advisor_verdict_negation_cannot_mint_a_signoff(guidance: str) -> 
 
 
 @pytest.mark.parametrize(
+    "guidance",
+    [
+        # T9xT8 verdict-window spoof (acceptance-r2 final review, must-fix 1):
+        # the END rubric (R2-F8a) instructs the advisor to QUOTE the user's
+        # explicit constraints. A quoted bare uppercase CLEAN inside the first
+        # five non-empty lines, with the advisor's REAL verdict below the old
+        # scan window, parsed as a silent sign-off — no format re-prompt fired
+        # because parsing "succeeded". FLAGGED dominance must span the WHOLE
+        # reply, not only the scan window.
+        (
+            'You wrote: "keep the output CLEAN, fixed schema, csv sink."\n'
+            "Constraint 1: fixed schema mode — satisfied.\n"
+            "Constraint 2: csv sink — satisfied.\n"
+            "Constraint 3: one output — satisfied.\n"
+            "Constraint 4: no llm nodes — satisfied.\n"
+            "But the field contract is broken.\n"
+            "FLAGGED: the sink drops the rating field."
+        ),
+        # Same shape with the quoted CLEAN on the window's LAST line and the
+        # verdict immediately after it (line 6, first line past the window).
+        (
+            "I verified each of your stated constraints.\n"
+            "Constraint 1: fixed schema mode — satisfied.\n"
+            "Constraint 2: csv sink — satisfied.\n"
+            "Constraint 3: one output — satisfied.\n"
+            'Constraint 4: you asked for "CLEAN rows only" — satisfied.\n'
+            "FLAGGED: the sink drops the rating field."
+        ),
+        # The buried verdict may itself be lowercase: the any-register FLAGGED
+        # arm (terminator-guarded) must also span the whole reply.
+        (
+            'You wrote: "keep the output CLEAN, fixed schema, csv sink."\n'
+            "Constraint 1: fixed schema mode — satisfied.\n"
+            "Constraint 2: csv sink — satisfied.\n"
+            "Constraint 3: one output — satisfied.\n"
+            "Constraint 4: no llm nodes — satisfied.\n"
+            "But the field contract is broken.\n"
+            "Verdict: flagged. The sink drops the rating field."
+        ),
+    ],
+)
+def test_parse_advisor_verdict_flagged_below_window_beats_quoted_clean(guidance: str) -> None:
+    """A quoted CLEAN in the window must not outrank a FLAGGED below it."""
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance(guidance)
+
+    assert verdict.ok is True
+    assert verdict.blocking is True, f"fail-open: {guidance!r} minted a sign-off past the scan window"
+    assert verdict.failure_class == "none"
+
+
+@pytest.mark.parametrize(
+    "guidance",
+    [
+        # Parked T8 residual, folded in: FLAGGED detection is widened to
+        # case-insensitive (fail-CLOSED direction — a false FLAGGED costs a
+        # repair turn, never mints a sign-off). The widened arm requires a
+        # verdict-shaped terminator so adjectival prose ("flagged records are
+        # routed...") still does not match; that case stays pinned malformed
+        # in test_parse_advisor_verdict_still_declares_malformed.
+        "Verdict: flagged",
+        "Verdict: Flagged — the sink drops the rating field",
+        "The verdict is flagged.",
+        "My conclusion: flagged — the sink drops the rating field.",
+    ],
+)
+def test_parse_advisor_verdict_lowercase_flagged_with_terminator_blocks(guidance: str) -> None:
+    """Any-register FLAGGED behind a label/prose blocks instead of re-prompting."""
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance(guidance)
+
+    assert verdict.ok is True
+    assert verdict.blocking is True
+
+
+def test_parse_advisor_verdict_clean_acceptance_stays_window_bounded() -> None:
+    """FLAGGED scans the whole reply; CLEAN acceptance stays bounded.
+
+    The bounded window exists so a rambling reply cannot bury a sign-off under
+    arbitrary prose — widening CLEAN acceptance alongside FLAGGED would reopen
+    exactly that fail-open, so a CLEAN below the window still re-prompts."""
+    from elspeth.web.composer.service import _parse_advisor_checkpoint_guidance
+
+    verdict = _parse_advisor_checkpoint_guidance("one\ntwo\nthree\nfour\nfive\nsix\nCLEAN")
+
+    assert verdict.ok is False
+    assert verdict.failure_class == "malformed"
+
+
+@pytest.mark.parametrize(
     ("guidance", "expected_blocking"),
     [
         ("clean", False),
