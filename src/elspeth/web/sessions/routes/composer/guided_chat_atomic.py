@@ -1304,14 +1304,15 @@ async def post_guided_chat_schema8(
                     if resulting_guided is None:  # pragma: no cover
                         raise AuditIntegrityError("Guided Chat transition removed its checkpoint")
                     finished_at = datetime.now(UTC)
-                    is_private_future_instruction = (
-                        deferred_action is not None
-                        or deferred_management_action is not None
-                        or chat_result.error_class in {"DeferredIntentActionShapeError", "DeferredIntentManagementActionShapeError"}
-                    )
+                    # Transcript custody (R2-F15): the rendered transcript always
+                    # carries the author's verbatim words — including deferred
+                    # retains, failed retains, and management commands. Privacy
+                    # is enforced at the provider/audit boundary (later-stage
+                    # prompts see only the rendered durable_summary; audit rows
+                    # carry hashes), never by blanking the user's own turn.
                     user_turn = ChatTurn(
                         role=ChatRole.USER,
-                        content=("[Future-stage instruction submitted privately.]" if is_private_future_instruction else body.message),
+                        content=body.message,
                         seq=resulting_guided.chat_turn_seq,
                         step=prospective.step,
                         ts_iso=finished_at.isoformat(),

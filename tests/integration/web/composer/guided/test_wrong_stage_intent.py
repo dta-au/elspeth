@@ -355,7 +355,7 @@ def test_unique_future_catalog_intent_is_private_atomic_retryable_and_restart_du
     assert first.status_code == 200, first.json()
     first_json = first.json()
     assert first_json["assistant_message"] == "I saved that instruction for the topology stage."
-    assert private_message not in first.text
+    assert private_message not in first_json["assistant_message"]
     assert "provider provisional text" not in first.text
     guided = _guided(client, session_id)
     assert len(guided.deferred_intents) == 1
@@ -367,7 +367,11 @@ def test_unique_future_catalog_intent_is_private_atomic_retryable_and_restart_du
     assert intent.message_content_hash == stable_hash(private_message)
     assert guided.active_proposal is None
     assert private_message not in repr(intent.to_dict())
-    assert guided.chat_history[-2].content == "[Future-stage instruction submitted privately.]"
+    # Transcript custody (R2-F15): the author's own transcript shows their own
+    # words; privacy is enforced at the provider/audit boundary, not by
+    # blanking the user's turn.
+    assert guided.chat_history[-2].content == private_message
+    assert all("[Future-stage instruction submitted privately.]" not in turn.content for turn in guided.chat_history)
 
     messages = asyncio.run(client.app.state.session_service.get_messages(UUID(session_id), limit=None))
     assert _non_root_user_rows(client, session_id) == [(intent.originating_message_id, private_message)]
@@ -480,7 +484,8 @@ def test_cancel_requires_explicit_user_authority_then_removes_only_the_named_int
     assert first.status_code == 200, first.json()
     assert first.json()["assistant_message"] == "I cancelled that saved topology instruction."
     assert _guided(client, session_id).deferred_intents == ()
-    assert private_cancel_request not in first.text
+    assert private_cancel_request not in first.json()["assistant_message"]
+    assert _guided(client, session_id).chat_history[-2].content == private_cancel_request
     retry = _post(
         client,
         session_id,
@@ -1263,10 +1268,13 @@ def test_real_route_malformed_future_action_keeps_raw_instruction_only_in_privat
     else:
         for field_name in ("sources", "nodes", "edges", "outputs"):
             assert response_json["composition_state"][field_name] == before["composition_state"][field_name]
-    assert private_message not in response.text
+    assert private_message not in response_json["assistant_message"]
     guided = _guided(client, session_id)
     assert guided.deferred_intents == ()
-    assert guided.chat_history[-2].content == "[Future-stage instruction submitted privately.]"
+    # Transcript custody (R2-F15): the author's verbatim words survive in the
+    # rendered transcript even when the retain FAILS all repairs.
+    assert guided.chat_history[-2].content == private_message
+    assert all("[Future-stage instruction submitted privately.]" not in turn.content for turn in guided.chat_history)
     assert guided.chat_history[-1].content == repair_message
     assert len(guided.chat_history) == len(before["guided_session"]["chat_history"]) + 2
     messages = asyncio.run(client.app.state.session_service.get_messages(UUID(session_id), limit=None))
@@ -1345,10 +1353,11 @@ def test_real_route_rejects_free_form_option_literal_without_leaking_private_pro
     assert response_json["assistant_message"] == (
         "I couldn't safely retain that as a future-stage instruction. Please clarify the target stage and structural requirement."
     )
-    assert private_message not in response.text
+    assert private_message not in response_json["assistant_message"]
     guided = _guided(client, session_id)
     assert guided.deferred_intents == ()
-    assert guided.chat_history[-2].content == "[Future-stage instruction submitted privately.]"
+    assert guided.chat_history[-2].content == private_message
+    assert all("[Future-stage instruction submitted privately.]" not in turn.content for turn in guided.chat_history)
     messages = asyncio.run(client.app.state.session_service.get_messages(UUID(session_id), limit=None))
     assert [content for _message_id, content in _non_root_user_rows(client, session_id)] == [private_message]
     assert all(private_message not in message.content for message in messages if message.role != "user")
@@ -1391,10 +1400,10 @@ def test_exact_policy_denial_wins_over_same_name_visible_in_another_kind_at_each
 
     assert response.status_code == 200, response.json()
     assert response.json()["assistant_message"] == "The transform plugin 'llm' is not enabled by the current policy."
-    assert private_message not in response.text
+    assert private_message not in response.json()["assistant_message"]
     guided = _guided(client, session_id)
     assert guided.deferred_intents == ()
-    assert guided.chat_history[-2].content == "[Future-stage instruction submitted privately.]"
+    assert guided.chat_history[-2].content == private_message
     messages = asyncio.run(client.app.state.session_service.get_messages(UUID(session_id), limit=None))
     assert [content for _message_id, content in _non_root_user_rows(client, session_id)] == [private_message]
     assert all(private_message not in message.content for message in messages if message.role != "user")
@@ -1451,10 +1460,10 @@ def test_boolean_property_schema_is_repairable_and_does_not_write_a_deferred_int
     assert response.json()["assistant_message"] == (
         "I couldn't safely retain that as a future-stage instruction. Please clarify the target stage and structural requirement."
     )
-    assert private_message not in response.text
+    assert private_message not in response.json()["assistant_message"]
     guided = _guided(client, session_id)
     assert guided.deferred_intents == ()
-    assert guided.chat_history[-2].content == "[Future-stage instruction submitted privately.]"
+    assert guided.chat_history[-2].content == private_message
 
 
 @pytest.mark.parametrize(
