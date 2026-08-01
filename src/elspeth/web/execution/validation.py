@@ -38,6 +38,7 @@ from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline
 from elspeth.web.composer.state import (
     CompositionState,
 )
+from elspeth.web.execution import _validation_diagnostics as _diagnostics
 from elspeth.web.execution._validation_authoring import (
     _DEFAULT_PLUGIN_POLICY_SUGGESTION as _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION,
 )
@@ -52,15 +53,7 @@ from elspeth.web.execution._validation_authoring import (
     validate_web_resource_policy,
 )
 from elspeth.web.execution._validation_diagnostics import (
-    _build_edge_contract_suggestion_with_resolver,
-    _edge_patch_target_for_node_id,
-    _find_identity_node_advisories,
-    _format_edge_contract_message,
-    _graph_warning_to_validation_warning,
-    _infer_component_type_from_plugin_error,
-)
-from elspeth.web.execution._validation_diagnostics import (
-    _collect_secret_refs as _collect_secret_refs,
+    _collect_secret_refs as _diagnostics_collect_secret_refs,
 )
 from elspeth.web.execution._validation_ledger import ValidationLedger
 from elspeth.web.execution._validation_materialization import (
@@ -188,6 +181,27 @@ _CHECK_IDENTITY_NODE_ADVISORY = CHECK_IDENTITY_NODE_ADVISORY
 _ALL_CHECKS = list(VALIDATION_BLOCKING_CHECK_NAMES)
 
 _DEFAULT_PLUGIN_POLICY_SUGGESTION = _AUTHORING_DEFAULT_PLUGIN_POLICY_SUGGESTION
+
+# Keep the extracted diagnostic helpers available through this long-standing
+# facade.  Besides preserving imports and live monkeypatch seams, these aliases
+# retain the module-AST bindings of the signed settings reframer below.  Judge
+# metadata deliberately binds to exact syntax positions, so removing facade
+# nodes would make an otherwise behavior-preserving extraction increase drift.
+_collect_secret_refs = _diagnostics_collect_secret_refs
+_graph_warning_to_validation_warning = _diagnostics._graph_warning_to_validation_warning
+_EdgePatchTarget = _diagnostics._EdgePatchTarget
+_node_schema_patch_target = _diagnostics._node_schema_patch_target
+_source_schema_patch_target = _diagnostics._source_schema_patch_target
+_output_schema_patch_target = _diagnostics._output_schema_patch_target
+_unmapped_schema_patch_target = _diagnostics._unmapped_schema_patch_target
+_source_name_for_dag_source = _diagnostics._source_name_for_dag_source
+_edge_patch_targets_by_dag_id = _diagnostics._edge_patch_targets_by_dag_id
+_edge_patch_target_for_node_id = _diagnostics._edge_patch_target_for_node_id
+_infer_component_type_from_plugin_error = _diagnostics._infer_component_type_from_plugin_error
+_IdentityFinding = _diagnostics._IdentityFinding
+_find_identity_node_advisories = _diagnostics._find_identity_node_advisories
+_format_edge_contract_message = _diagnostics._format_edge_contract_message
+_build_edge_contract_suggestion_with_resolver = _diagnostics._build_edge_contract_suggestion_with_resolver
 
 
 def _apply_phase[T](
