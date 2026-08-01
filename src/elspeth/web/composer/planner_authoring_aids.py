@@ -274,14 +274,20 @@ def _prompt_shield_rules(
 ) -> list[str]:
     """Shield-staging rules quoting the registered review constants verbatim.
 
-    Required mode wires the selected implementation. Recommend mode stages the
-    advisory review row whether or not an implementation is selected, using
-    the deployment-available draft when it is. The review is ADVISORY end-to-end
-    (warnings only, excluded from the blocking contract), so no rejection code
-    ever teaches it on a repair turn — these aids are the only lever. Tutorial finalizer
-    battery (dim_c under-flag): the replan planner non-deterministically
-    omitted the row on the scrape→summarize llm node. Constants are imported
-    from ``interpretation_state`` so the taught row can never drift from the
+    Required mode is auto-wired server-side (R2-F10, elspeth-f99655f540):
+    ``required_controls.wire_required_controls`` splices the selected shield
+    onto any uncovered llm input at proposal time and stages a
+    ``required_control_auto_wired`` disclosure card, so the aids teach the
+    guarantee instead of demanding manual wiring — and drop the
+    shield-recommendation row, whose exposure the wired shield removes.
+    Recommend mode stages the advisory review row whether or not an
+    implementation is selected, using the deployment-available draft when it
+    is. The review is ADVISORY end-to-end (warnings only, excluded from the
+    blocking contract), so no rejection code ever teaches it on a repair
+    turn — these aids are the only lever. Tutorial finalizer battery (dim_c
+    under-flag): the replan planner non-deterministically omitted the row on
+    the scrape→summarize llm node. Constants are imported from
+    ``interpretation_state`` so the taught row can never drift from the
     contract (the 52322ebe1 discipline); the draft is chosen by the LIVE
     snapshot's shield selection, mirroring the warning→available upgrade the
     server itself applies, and memoizes correctly because the aids cache is
@@ -290,16 +296,19 @@ def _prompt_shield_rules(
     producers = " or ".join(sorted(untrusted_producers))
     if shield_plugin is not None and shield_required:
         return [
-            f"An authorized prompt-injection shield is available in this deployment: {shield_plugin}. "
-            f"When an llm transform consumes externally-controlled content (any path from a {producers} "
-            f"output reaches its input), WIRE a {shield_plugin} transform between that producer node and "
-            "the llm node — its input is the producer node's on_success connection, and its on_success "
-            "is the llm node's input. This is required, not advisory: untrusted text must not "
-            "reach the model unshielded.",
-            "Load the shield's schema and assistance through the capability catalog before authoring "
-            "it, and configure it from that schema alone.",
-            f"With the shield wired, do NOT also stage the {PROMPT_SHIELD_USER_TERM} review row — the "
-            "exposure it warns about no longer exists.",
+            f"This deployment REQUIRES a prompt-injection shield and has selected {shield_plugin}. "
+            "You do not need to wire it yourself: when a proposal's llm input is not already "
+            f"covered, ELSPETH automatically splices a {shield_plugin} transform onto that input "
+            "edge and stages a required_control_auto_wired disclosure card for the operator to "
+            f"acknowledge. You MAY wire a {shield_plugin} transform explicitly (between the "
+            f"{producers} producer and the llm node) when you want to control its placement; the "
+            "auto-wire pass leaves a covered graph untouched.",
+            "Auto-wiring can only scope the shield to PROVABLE prompt fields: keep every prompt "
+            "row access static ('{{ row.field }}', never '{{ row[key] }}') so the protected field "
+            "set can be derived.",
+            f"Do NOT stage the {PROMPT_SHIELD_USER_TERM} review row on those llm nodes — with the "
+            "shield wired (by you or by the auto-wire pass) the exposure it warns about no longer "
+            "exists.",
         ]
     draft = PROMPT_SHIELD_AVAILABLE_DRAFT if shield_plugin is not None else PROMPT_SHIELD_WARNING_DRAFT
     availability = (
@@ -336,21 +345,28 @@ def _content_safety_rules(*, safety_plugin: str) -> list[str]:
     half-truth that produced an unrepairable rejection: an author who wired the
     control exactly as told and quarantined failures to a sink was rejected for
     an edge these rules never mentioned.
+
+    Like the shield's required branch, the on_success edge is auto-wired
+    server-side (R2-F10): the aids teach the guarantee and keep only the
+    on_error discipline, which the auto-wire pass cannot repair — no control
+    can sit on an error branch, so a quarantine sink stays an operator
+    decision.
     """
     return [
-        f"An authorized content-safety control is available in this deployment: {safety_plugin}. "
-        f"WIRE a {safety_plugin} transform on the llm node's on_success output — its input is the "
-        "llm node's on_success connection, and its on_success carries the screened rows onward. "
-        "This is required, not advisory: model-generated content must be screened before it is "
-        "written out.",
-        f"Screening is checked on EVERY output edge of the llm node, not just on_success. An "
-        f"on_error edge names a SINK (or 'discard') and nothing else, so it cannot pass through "
-        f"{safety_plugin} — set the llm node's on_error to 'discard', and likewise for any "
-        f"transform between the llm node and {safety_plugin}. Only downstream OF the "
-        f"{safety_plugin} transform may on_error name a quarantine sink. Keeping failed llm rows "
-        "in a quarantine sink is an operator decision (relax the control mode, or run under the "
-        "CLI/batch runtime), never something to author around.",
-        "Load its schema and assistance through the capability catalog before authoring it, and configure it from that schema alone.",
+        f"This deployment REQUIRES the {safety_plugin} content-safety control on every path "
+        "carrying llm output. You do not need to wire it yourself: when a proposal's llm "
+        f"on_success path is not already covered, ELSPETH automatically splices a {safety_plugin} "
+        "transform onto that edge and stages a required_control_auto_wired disclosure card for "
+        f"the operator to acknowledge. You MAY wire a {safety_plugin} transform explicitly when "
+        "you want to control its placement; the auto-wire pass leaves a covered graph untouched.",
+        f"Screening is checked on EVERY output edge of the llm node, not just on_success — and "
+        f"auto-wiring covers ONLY the on_success edge. An on_error edge names a SINK (or "
+        f"'discard') and nothing else, so it cannot pass through {safety_plugin} — set the llm "
+        f"node's on_error to 'discard', and likewise for any transform between the llm node and "
+        f"{safety_plugin}. Only downstream OF the {safety_plugin} transform may on_error name a "
+        "quarantine sink. Keeping failed llm rows in a quarantine sink is an operator decision "
+        "(relax the control mode, or run under the CLI/batch runtime), never something to author "
+        "around.",
     ]
 
 

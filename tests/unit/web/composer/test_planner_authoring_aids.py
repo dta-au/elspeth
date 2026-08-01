@@ -1216,6 +1216,59 @@ class TestPromptShieldRules:
         assert PROMPT_SHIELD_USER_TERM in rendered
 
 
+class TestRequiredModeAutoWireAids:
+    """R2-F10: REQUIRED mode is auto-wired server-side — the aids teach the
+    guarantee (and drop the shield-recommendation row) instead of demanding
+    manual wiring. RECOMMEND mode keeps the advisory regime, pinned by the
+    existing advisory tests."""
+
+    def test_required_shield_rules_teach_auto_wiring_not_manual_wiring(self, tmp_path: Path) -> None:
+        from elspeth.web.interpretation_state import (
+            PROMPT_SHIELD_USER_TERM,
+            REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
+        )
+
+        view, _snapshot = _guardrail_profile_view(tmp_path)
+
+        rendered = "\n".join(build_planner_authoring_aids(view)["prompt_shield"]["rules"])
+        assert "automatically splices" in rendered
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in rendered
+        assert "aws_bedrock_prompt_shield" in rendered
+        # The manual mandate is retired; the drop-the-recommendation-row rule stays.
+        assert "WIRE a" not in rendered
+        assert f"Do NOT stage the {PROMPT_SHIELD_USER_TERM} review row" in rendered
+
+    def test_required_content_safety_rules_teach_auto_wiring_and_keep_on_error_discipline(self, tmp_path: Path) -> None:
+        from elspeth.web.interpretation_state import REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+
+        view, _snapshot = _guardrail_profile_view(tmp_path)
+
+        rendered = "\n".join(build_planner_authoring_aids(view)["content_safety"]["rules"])
+        assert "automatically splices" in rendered
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in rendered
+        assert "WIRE a" not in rendered
+        # Auto-wiring cannot repair an error route — the on_error discipline stays taught.
+        assert "on_error" in rendered
+        assert "'discard'" in rendered
+        assert "operator decision" in rendered
+
+    def test_required_but_unselected_shield_keeps_the_warning_advisory(self, tmp_path: Path) -> None:
+        """REQUIRED with no selected implementation is the operator-problem
+        posture: nothing can be auto-wired, so the aids must not claim it."""
+        from elspeth.web.composer.planner_authoring_aids import _prompt_shield_rules
+        from elspeth.web.interpretation_state import PROMPT_SHIELD_WARNING_DRAFT
+
+        rendered = "\n".join(
+            _prompt_shield_rules(
+                shield_plugin=None,
+                shield_required=True,
+                untrusted_producers=("web_scrape",),
+            )
+        )
+        assert "automatically splices" not in rendered
+        assert PROMPT_SHIELD_WARNING_DRAFT in rendered
+
+
 class TestModelCustody:
     """Suite run 1 G2 (8/8): never-invent had no sanctioned alternative."""
 
