@@ -14,6 +14,10 @@ from typing import Any, Literal, TypedDict
 
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
+)
 
 DecisionCategory = Literal[
     "error_routing",
@@ -21,6 +25,7 @@ DecisionCategory = Literal[
     "model",
     "output",
     "plugin_option",
+    "policy_control",
     "source",
 ]
 DecisionProvenance = Literal[
@@ -28,6 +33,7 @@ DecisionProvenance = Literal[
     "default",
     "explicit_source_required",
     "picked",
+    "policy_required",
 ]
 
 
@@ -133,7 +139,36 @@ def _node_entries(node: NodeSpec) -> list[ImplicitDecisionEntry]:
                 candidate_alternatives=_ROUTING_ALTERNATIVES,
             )
         )
+    if _is_auto_wired_control(node):
+        # Server-inserted required control (R2-F10): the whole NODE is a
+        # decision made on the operator's behalf by deployment policy, so it
+        # gets one dedicated entry over and above its per-option rows. The
+        # detection is state-derived — the staged required_control_auto_wired
+        # disclosure row — never a node-id naming convention.
+        entries.append(
+            _entry(
+                f"node.{node_id}.auto_wired_control",
+                node.plugin,
+                category="policy_control",
+                provenance="policy_required",
+                note=(
+                    "Control node inserted automatically because deployment policy REQUIRES "
+                    "this control; acknowledged through the required_control_auto_wired "
+                    "pipeline_decision review."
+                ),
+            )
+        )
     return entries
+
+
+def _is_auto_wired_control(node: NodeSpec) -> bool:
+    """Detect a server-inserted required control by its staged disclosure row."""
+    requirements = node.options.get(INTERPRETATION_REQUIREMENTS_KEY)
+    if not isinstance(requirements, Sequence) or isinstance(requirements, (str, bytes)):
+        return False
+    return any(
+        isinstance(row, Mapping) and str(row.get("user_term", "")).strip() == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM for row in requirements
+    )
 
 
 def _output_entries(output: OutputSpec) -> list[ImplicitDecisionEntry]:
