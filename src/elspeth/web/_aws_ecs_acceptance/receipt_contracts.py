@@ -168,7 +168,7 @@ def _expected_schema_facts(scenario_id: str) -> dict[str, object]:
             else None
         ),
         "structural_changes": (_SCENARIO_B_STRUCTURAL_CHANGES if scenario_id == "B" else "initial_create"),
-        "semantics_only_changes": ("guided_coalesce_timeout_seconds_required" if scenario_id == "B" else "none"),
+        "semantics_only_changes": ("guided_coalesce_timeout_seconds_and_node_options_summary_required" if scenario_id == "B" else "none"),
         "archive_export_decision": ("required_before_forward_migration" if scenario_id == "B" else "not_applicable"),
         "destructive_reset_required": False,
     }

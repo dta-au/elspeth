@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from dataclasses import replace
 from itertools import permutations, product
 from typing import get_type_hints
@@ -130,6 +131,109 @@ def _proposal(guided: GuidedSession, *, supersedes_draft_hash: str | None = None
         covered_deferred_intent_ids=(),
         supersedes_draft_hash=supersedes_draft_hash,
     )
+
+
+def _field_mapper_proposal(guided: GuidedSession) -> PipelineProposal:
+    """A proposal whose transform carries both allowlisted knobs and a canary."""
+
+    return PipelineProposal.create(
+        pipeline={
+            "sources": {
+                "primary": {
+                    "plugin": "csv",
+                    "on_success": "rows",
+                    "options": {"credentials": {"secret_ref": CANARIES[1]}},
+                    "on_validation_failure": "discard",
+                }
+            },
+            "nodes": [
+                {
+                    "id": "clean",
+                    "node_type": "transform",
+                    "plugin": "field_mapper",
+                    "input": "rows",
+                    "on_success": "cleaned",
+                    "on_error": "discard",
+                    "options": {
+                        "mapping": {"given_name": "first_name", "meta.source": "origin"},
+                        "select_only": True,
+                        "description": CANARIES[4],
+                    },
+                }
+            ],
+            "edges": [],
+            "outputs": [
+                {
+                    "name": "cleaned",
+                    "plugin": "json",
+                    "options": {"path": CANARIES[4]},
+                    "on_write_failure": "discard",
+                }
+            ],
+        },
+        base=PresentBase(state_id=CHECKPOINT_ID, composition_content_hash="a" * 64),
+        reviewed_facts=guided_private_reviewed_facts(guided),
+        surface=PlannerSurface.GUIDED_STAGED,
+        repair_count=0,
+        skill_hash=stable_hash("guided planner skill"),
+        covered_deferred_intent_ids=(),
+        supersedes_draft_hash=None,
+    )
+
+
+def test_projected_node_options_survive_persistence_and_reverify_byte_for_byte() -> None:
+    """R2-F3: the projected option summary is part of the verified authority.
+
+    ``verify_guided_proposal_projection`` byte-compares a PERSISTED payload
+    against a live rebuild, so a summary whose rendering is not deterministic
+    across the persist/thaw round trip would raise ``AuditIntegrityError`` on
+    session reload rather than fail cosmetically. Every other projection test
+    uses a plugin outside the allowlist, where the summary is always empty.
+    """
+    guided = _guided()
+    proposal = _field_mapper_proposal(guided)
+    catalog_ids = {
+        "source": frozenset({"csv"}),
+        "transform": frozenset({"field_mapper"}),
+        "sink": frozenset({"json"}),
+    }
+
+    payload = build_guided_proposal_projection(
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog_ids,
+    )
+
+    assert payload["nodes"][0]["node_options_summary"] == [
+        {"key": "mapping", "value": "given_name → first_name, meta.source → origin"},
+        {"key": "select_only", "value": "only the mapped fields are kept"},
+    ]
+    # The non-allowlisted neighbour option must not ride along.
+    assert all(canary not in repr(payload) for canary in CANARIES)
+
+    # Round-trip exactly as the payload store does before the reload verifier
+    # re-derives the projection from private authority.
+    persisted = json.loads(json.dumps(payload))
+    assert validate_payload(TurnType.PROPOSE_PIPELINE, persisted) is None
+    verify_guided_proposal_projection(
+        payload=persisted,
+        proposal_id=PROPOSAL_ID,
+        proposal=proposal,
+        guided=guided,
+        catalog_plugin_ids=catalog_ids,
+    )
+
+    tampered = json.loads(json.dumps(payload))
+    tampered["nodes"][0]["node_options_summary"][0]["value"] = "given_name → surname"
+    with pytest.raises(AuditIntegrityError, match="projection"):
+        verify_guided_proposal_projection(
+            payload=tampered,
+            proposal_id=PROPOSAL_ID,
+            proposal=proposal,
+            guided=guided,
+            catalog_plugin_ids=catalog_ids,
+        )
 
 
 def _mixed_gate_guided() -> GuidedSession:

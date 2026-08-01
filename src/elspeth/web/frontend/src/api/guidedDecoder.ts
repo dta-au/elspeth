@@ -12,6 +12,7 @@ import type {
   InspectAndConfirmPayload,
   KnobField,
   MultiSelectWithCustomPayload,
+  NodeOptionSummary,
   Option,
   ProposalBlocker,
   ProposalEndpoint,
@@ -185,6 +186,21 @@ function arrayValue(value: unknown, path: string): unknown[] {
 
 function stringArray(value: unknown, path: string): string[] {
   return arrayValue(value, path).map((item, index) => stringValue(item, `${path}[${index}]`));
+}
+
+/** The allowlisted node options the backend already rendered as display text
+ *  (R2-F3). The key vocabulary is server-owned and enforced server-side, so
+ *  this seam pins the SHAPE — an exact {key, value} string pair — and leaves
+ *  which keys are publishable to the projection's own allowlist. */
+function nodeOptionsSummary(value: unknown, path: string): NodeOptionSummary[] {
+  return arrayValue(value, path).map((item, index) => {
+    const entryPath = `${path}[${index}]`;
+    const entry = exactRecord(item, entryPath, ["key", "value"]);
+    return {
+      key: stringValue(entry.key, `${entryPath}.key`),
+      value: stringValue(entry.value, `${entryPath}.value`),
+    };
+  });
 }
 
 function jsonValue(value: unknown, path: string): unknown {
@@ -542,7 +558,10 @@ function validateProposalPayload(value: unknown, path: string): void {
   });
   const nodes = arrayValue(payload.nodes, `${path}.nodes`).map((item, index): DecodedProposalNode => {
     const nodePath = `${path}.nodes[${index}]`;
-    const node = exactRecord(item, nodePath, ["stable_id", "label", "node_type", "plugin", "behavior"]);
+    const node = exactRecord(item, nodePath, [
+      "stable_id", "label", "node_type", "plugin", "behavior", "node_options_summary",
+    ]);
+    nodeOptionsSummary(node.node_options_summary, `${nodePath}.node_options_summary`);
     const stableId = canonicalUuid(node.stable_id, `${nodePath}.stable_id`);
     addComponent(stableId, "node", `${nodePath}.stable_id`);
     if (stringValue(node.label, `${nodePath}.label`) !== `node-${index + 1}`) invalid(`${nodePath}.label`, "not exact server ordinal");
@@ -1111,7 +1130,7 @@ function decodeSchemaPayload(value: unknown, path: string): SchemaFormPayload {
       item,
       fieldPath,
       ["name", "label", "kind", "required", "nullable"],
-      ["description", "tier", "default", "enum", "item_kind", "visible_when", "placeholder"],
+      ["description", "tier", "default", "enum", "item_kind", "visible_when", "placeholder", "required_when"],
     );
     const tier = field.tier === undefined ? undefined : stringValue(field.tier, `${fieldPath}.tier`);
     if (tier !== undefined && tier !== "essential" && tier !== "common" && tier !== "advanced") {
@@ -1126,6 +1145,12 @@ function decodeSchemaPayload(value: unknown, path: string): SchemaFormPayload {
     const visibleWhen = field.visible_when === undefined
       ? undefined
       : exactRecord(field.visible_when, `${fieldPath}.visible_when`, ["field", "equals"]);
+    // Conditional requiredness (R2-F2). Same predicate shape as visible_when,
+    // but the target may name a LATER field — it gates whether an
+    // always-rendered knob must be filled, not whether it renders.
+    const requiredWhen = field.required_when === undefined
+      ? undefined
+      : exactRecord(field.required_when, `${fieldPath}.required_when`, ["field", "equals"]);
     return {
       name: stringValue(field.name, `${fieldPath}.name`),
       label: stringValue(field.label, `${fieldPath}.label`),
@@ -1148,6 +1173,14 @@ function decodeSchemaPayload(value: unknown, path: string): SchemaFormPayload {
             visible_when: {
               field: stringValue(visibleWhen.field, `${fieldPath}.visible_when.field`),
               equals: jsonValue(visibleWhen.equals, `${fieldPath}.visible_when.equals`),
+            },
+          }),
+      ...(requiredWhen === undefined
+        ? {}
+        : {
+            required_when: {
+              field: stringValue(requiredWhen.field, `${fieldPath}.required_when.field`),
+              equals: jsonValue(requiredWhen.equals, `${fieldPath}.required_when.equals`),
             },
           }),
     };
@@ -1465,7 +1498,9 @@ function decodeProposalPayload(value: unknown, path: string): ProposePipelinePay
   });
   const nodes = arrayValue(payload.nodes, `${path}.nodes`).map((item, index) => {
     const nodePath = `${path}.nodes[${index}]`;
-    const node = exactRecord(item, nodePath, ["stable_id", "label", "node_type", "plugin", "behavior"]);
+    const node = exactRecord(item, nodePath, [
+      "stable_id", "label", "node_type", "plugin", "behavior", "node_options_summary",
+    ]);
     const rawType = decodeProposalNodeType(node.node_type, `${nodePath}.node_type`);
     const plugin = node.plugin === null
       ? null
@@ -1476,6 +1511,7 @@ function decodeProposalPayload(value: unknown, path: string): ProposePipelinePay
       node_type: rawType,
       plugin,
       behavior: decodeProposalBehavior(node.behavior, rawType, nodePath),
+      node_options_summary: nodeOptionsSummary(node.node_options_summary, `${nodePath}.node_options_summary`),
     };
   });
   return {
@@ -1615,7 +1651,7 @@ function decodeWirePayload(value: unknown, path: string): WireStageData {
       const nodePath = `${path}.nodes[${index}]`;
       const node = exactRecord(item, nodePath, [
         "stable_id", "label", "node_type", "plugin", "behavior", "required_fields", "guaranteed_fields",
-        "row_cardinality", "structured_output_fields",
+        "row_cardinality", "structured_output_fields", "node_options_summary",
       ]);
       const nodeType = decodeProposalNodeType(node.node_type, `${nodePath}.node_type`);
       const rowCardinality = decodeCardinality(
@@ -1665,6 +1701,7 @@ function decodeWirePayload(value: unknown, path: string): WireStageData {
             };
           },
         ),
+        node_options_summary: nodeOptionsSummary(node.node_options_summary, `${nodePath}.node_options_summary`),
       };
     }),
     outputs: arrayValue(payload.outputs, `${path}.outputs`).map((item, index) => {

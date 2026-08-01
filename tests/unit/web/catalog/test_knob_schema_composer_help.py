@@ -22,9 +22,17 @@ from elspeth.plugins.infrastructure.config_base import (
     COMPOSER_SCHEMA_EXAMPLE,
     COMPOSER_SCHEMA_PLACEHOLDER,
     DataPluginConfig,
+    LocalFileSinkConfig,
     PathConfig,
 )
-from elspeth.web.catalog.knob_schema import KnobField, lower_model_to_knob_schema
+from elspeth.plugins.sinks.json_sink import JSONSinkConfig
+from elspeth.web.catalog.knob_schema import (
+    KnobField,
+    KnobSchema,
+    KnobSchemaLoweringError,
+    lower_model_to_knob_schema,
+    validate_knob_schema,
+)
 
 
 def _lower(model_cls: type[BaseModel]) -> dict[str, KnobField]:
@@ -163,3 +171,89 @@ def test_schema_placeholder_is_attached_to_the_schema_knob() -> None:
     assert isinstance(extra, dict)
     assert extra["composer_placeholder"] == COMPOSER_SCHEMA_PLACEHOLDER
     assert _lower(DataPluginConfig)["schema"]["placeholder"] == COMPOSER_SCHEMA_PLACEHOLDER
+
+
+# ── composer_required_when: conditional requiredness (R2-F2) ─────────────────
+#
+# Pydantic field-level requiredness is the only requiredness the lowering knew
+# about, so ``collision_policy`` (``default=None``) lowered ``required: False``
+# while the composer rejects a runnable file sink that omits it
+# (``web/composer/tools/_common.py`` —
+# ``validate_composer_file_sink_collision_policy``). The form therefore let the
+# user press Continue into a guaranteed rejection. ``required_when`` carries the
+# composer's own rule onto the knob so the form can gate on it.
+
+
+def test_collision_policy_lowers_required_when_mode_is_write() -> None:
+    """The composer's mode='write' collision rule reaches the form as a predicate."""
+    fields = _lower(LocalFileSinkConfig)
+
+    assert fields["collision_policy"]["required_when"] == {"field": "mode", "equals": "write"}
+    # Pydantic-level requiredness is unchanged: YAML may still omit the field.
+    assert fields["collision_policy"]["required"] is False
+
+
+def test_collision_policy_help_names_auto_increment_as_the_safe_default() -> None:
+    """The correct guidance existed only as an LLM-only hint; the form needs it too."""
+    description = _lower(LocalFileSinkConfig)["collision_policy"]["description"]
+
+    assert "auto_increment" in description
+    assert "safe default" in description
+    # The stale "Optional" framing must be gone from both surfaces.
+    assert "Optional" not in description
+    yaml_description = LocalFileSinkConfig.model_fields["collision_policy"].description
+    assert yaml_description is not None
+    assert not yaml_description.startswith("Optional")
+    assert "mode='write'" in yaml_description
+    assert "'append_or_create' only with mode='append'" in yaml_description
+
+
+def test_required_when_may_reference_a_later_declared_field() -> None:
+    """Unlike visible_when, a required_when target need not be declared first.
+
+    ``mode`` is declared on the concrete sink subclass and therefore lowers
+    AFTER ``collision_policy`` (which lives on ``LocalFileSinkConfig``). A
+    required_when predicate only reads sibling form state — every field is
+    rendered — so declaration order is irrelevant and the ordering rule
+    visible_when enforces must not be ported.
+    """
+    schema = lower_model_to_knob_schema(JSONSinkConfig, plugin_kind="sink", plugin_name="json")
+    names = [field["name"] for field in schema["fields"]]
+    assert names.index("collision_policy") < names.index("mode")
+
+    validate_knob_schema(schema, plugin_kind="sink", plugin_name="json")
+
+
+def test_required_when_target_must_exist() -> None:
+    """A predicate naming no field at all is a lowering bug, not a silent no-op."""
+    schema: KnobSchema = {
+        "fields": [
+            {
+                "name": "knob",
+                "label": "Knob",
+                "kind": "text",
+                "required": False,
+                "nullable": False,
+                "required_when": {"field": "nonexistent", "equals": "x"},
+            }
+        ]
+    }
+
+    with pytest.raises(KnobSchemaLoweringError, match="required_when"):
+        validate_knob_schema(schema, plugin_kind="sink", plugin_name="fixture")
+
+
+@pytest.mark.parametrize("value", [42, "mode", {"field": "mode"}, {"field": "mode", "equals": "write", "or": 1}])
+def test_malformed_composer_required_when_crashes_at_lowering(value: object) -> None:
+    """A malformed extra is our own mistake in a model we author — crash, never degrade."""
+    model_cls: type[BaseModel] = type(
+        "MalformedRequiredWhenModel",
+        (BaseModel,),
+        {
+            "__annotations__": {"knob": str},
+            "knob": Field(default=None, json_schema_extra={"composer_required_when": value}),
+        },
+    )
+
+    with pytest.raises(TypeError, match="composer_required_when"):
+        lower_model_to_knob_schema(model_cls, plugin_kind="sink", plugin_name="fixture")

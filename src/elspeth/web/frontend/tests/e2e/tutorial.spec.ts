@@ -178,6 +178,7 @@ const wireTurn: Record<string, unknown> = {
         node_type: "transform",
         plugin: "web_scrape",
         behavior: { kind: "transform" },
+        node_options_summary: [],
         required_fields: ["url"],
         guaranteed_fields: ["url", "html"],
         row_cardinality: {
@@ -193,6 +194,7 @@ const wireTurn: Record<string, unknown> = {
         node_type: "transform",
         plugin: "llm_rate",
         behavior: { kind: "transform" },
+        node_options_summary: [],
         required_fields: ["html"],
         guaranteed_fields: ["url", "score", "rationale"],
         row_cardinality: {

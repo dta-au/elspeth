@@ -186,7 +186,14 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        reference persisted schema-10 payloads that omit it, so they are
 #        rejected at startup instead of failing lazily during guided replay.
 #        This is a semantic-only hard cut; guided checkpoint schema stays 10.
-SESSION_SCHEMA_EPOCH = 40
+#   41 -> guided propose-pipeline and confirm-wiring nodes require a
+#        ``node_options_summary`` key, including the empty list (R2-F3: the
+#        review cards render a transform's key options, not just its behavior
+#        discriminant). Epoch 40 sessions reference persisted payloads that
+#        omit it, so a stored proposal would fail its projection verifier —
+#        and its wire turn would fail frontend decode — mid-replay. Reject
+#        those stores at startup instead. Guided checkpoint schema stays 10.
+SESSION_SCHEMA_EPOCH = 41
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"

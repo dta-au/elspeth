@@ -1104,11 +1104,15 @@ static options**: `bucket_field` and `key_field` name the input fields holding
 the bucket and key, so one manifest row drives one document. `version_field` is
 optional and pins a specific S3 object version.
 
-Because those references come from row data, the manifest source must **declare
-the fields as a fixed schema**. `required_input_fields` is a graph-validated
-contract: against a dynamic (`mode: observed`) producer the graph fails to build
-with `Schema contract violation … Producer (csv) guarantees: (none - dynamic
-schema)`. This complete example runs as written:
+Because those references come from row data, the manifest source must
+**guarantee** `doc_bucket`/`doc_key` as required declared fields.
+`required_input_fields` is a graph-validated contract, and either `mode:
+fixed` or `mode: flexible` satisfies it as long as the two fields are declared
+required — fields marked optional with `?` are not guaranteed, since a
+producer is allowed to omit them. Only a fully-dynamic `mode: observed`
+producer fails: the graph fails to build with `Schema contract violation …
+Producer (csv) guarantees: (none - dynamic schema)`. This complete example
+runs as written:
 
 ```yaml
 sources:
@@ -1119,7 +1123,7 @@ sources:
       path: /app/input/manifest.csv
       on_validation_failure: discard   # required on the csv source
       schema:
-        mode: fixed                    # required: proves doc_bucket/doc_key exist
+        mode: fixed                    # fixed or flexible both work here; proves doc_bucket/doc_key exist
         fields:
           - "doc_id: str"
           - "doc_bucket: str"

@@ -14,6 +14,7 @@ import {
   type ReadOnlyPipelineGraphEdge,
   type ReadOnlyPipelineGraphNode,
 } from "./ReadOnlyPipelineGraph";
+import { nodeOptionText } from "./WireStageTurn";
 import { WireReviewList, type WireReviewItem } from "./WireReviewList";
 
 interface ProposePipelineTurnProps {
@@ -352,6 +353,12 @@ export function ProposePipelineTurn({
                   ? gateSummary(node.behavior, node.stable_id, payload.graph.edges, labelById)
                   : behaviorSummary(node.behavior)}
               </span>
+              {/* R2-F3: the behavior discriminant alone made every transform
+                  read as "transforms each incoming item"; the allowlisted key
+                  options say what this one actually does. */}
+              {node.node_options_summary.map((entry) => (
+                <p key={entry.key}>{nodeOptionText(entry)}</p>
+              ))}
             </li>
           ))}
           {payload.outputs.map((output) => (

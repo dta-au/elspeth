@@ -1,5 +1,5 @@
 import { useId, useState } from "react";
-import type { GuidedEditTarget, ProposalFlow, ProposalNodeBehavior, WireRowCardinality, WireStageData } from "@/types/guided";
+import type { GuidedEditTarget, NodeOptionSummary, ProposalFlow, ProposalNodeBehavior, WireRowCardinality, WireStageData } from "@/types/guided";
 import { focusAcknowledgementCard } from "../AcknowledgementCard";
 import { stepLabelForPlugin } from "../interpretationStepLabel";
 import { WireReviewList } from "./WireReviewList";
@@ -80,8 +80,11 @@ export function buildEntityNames(data: WireStageData): Map<string, string> {
   return names;
 }
 
-/** Plain-language connection state: "(contract unchecked)" is engineer
- *  register; a first-run user reads "not yet checked". */
+/** Plain-language connection state, the register-shifted sibling of
+ *  ``rawEdgeRow``'s parenthesised technical status: a first-run user reads
+ *  "not yet checked" where the raw row says "contract not statically checked".
+ *  Both are deliberately cause-free — the payload does not carry WHY the
+ *  validator omitted the contract. */
 function edgeStatus(edge: WireEdge): string {
   if (edge.satisfied === true) return "connected";
   if (edge.satisfied === false) return "not connected correctly";
@@ -225,15 +228,31 @@ function behaviorDetails(
   }
 }
 
+/** "Mapping: a → b" — the server-owned option key as a sentence-case label
+ *  beside the value the backend already rendered (R2-F3). */
+export function nodeOptionText(entry: NodeOptionSummary): string {
+  const label = humanToken(entry.key);
+  return `${label.charAt(0).toUpperCase()}${label.slice(1)}: ${entry.value}`;
+}
+
 /** The verbatim engineer-grade row, preserved behind the Technical details
  *  expander for operators (same idiom as the validation summary's raw dump). */
 function rawEdgeRow(edge: WireEdge, routeKeys: ReadonlyMap<string, string>): string {
+  // A null contract is CAUSE-FREE on the wire and must render that way. The
+  // validator omits an EdgeContract for at least four different reasons —
+  // ADR-007 producer abstention with a NON-empty sink_required
+  // (state.py:2846-2874), the error-continue paths that skip a node outright
+  // (state.py:2637-2673), discard edges (emitters.py), and the genuinely
+  // nothing-required case. The payload cannot tell them apart, so the row
+  // reports only that no STATIC verdict exists; naming any one cause would
+  // assert three falsehoods. (The prior "(contract unchecked)" was rejected for
+  // implying a check still pending.)
   const status =
     edge.satisfied === true
       ? "(connected)"
       : edge.satisfied === false
         ? "(not satisfied)"
-        : "(contract unchecked)";
+        : "(contract not statically checked)";
   const missing =
     edge.missing_fields.length > 0
       ? ` Missing fields: ${edge.missing_fields.join(", ")}`
@@ -414,6 +433,9 @@ export function WireStageTurn({
                   <p>{fieldsText("Required", node.required_fields)}</p>
                   <p>{fieldsText("Guaranteed", node.guaranteed_fields)}</p>
                   {behaviorDetails(node.behavior, routeDestinationFor(node.stable_id)).map((detail) => <p key={detail}>{detail}</p>)}
+                  {node.node_options_summary.map((entry) => (
+                    <p key={entry.key}>{nodeOptionText(entry)}</p>
+                  ))}
                   {node.structured_output_fields.length > 0 ? (
                     <ul aria-label={`${node.label} structured output fields`}>
                       {node.structured_output_fields.map((field) => (

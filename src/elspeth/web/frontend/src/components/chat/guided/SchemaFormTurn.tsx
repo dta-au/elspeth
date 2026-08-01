@@ -57,7 +57,7 @@ export function SchemaFormTurn({ payload, onSubmit, disabled = false, isTutorial
       // value rode silently through to submit because canSubmit only inspected
       // required fields and never checked validity.
       if (fieldHasError(field, value)) return true;
-      if (!field.required) return false;
+      if (!isRequiredNow(field, values)) return false;
       if (field.kind === "checkbox") return false;
       if (value === undefined || value === null || value === "") return true;
       return Array.isArray(value) && value.length === 0;
@@ -82,7 +82,7 @@ export function SchemaFormTurn({ payload, onSubmit, disabled = false, isTutorial
       // string "null" that submittedValue parses to null, so we test the resolved
       // value, not the raw input. Required-field validation is unaffected;
       // nullable optional fields still send null (null is meaningful there).
-      if (value === null && !field.required && !field.nullable) {
+      if (value === null && !isRequiredNow(field, values) && !field.nullable) {
         continue;
       }
       submitted[field.name] = value;
@@ -121,7 +121,7 @@ export function SchemaFormTurn({ payload, onSubmit, disabled = false, isTutorial
         // below names it too).
         (() => {
           const summaryRows = visibleFields().filter(
-            (f) => f.required || !isEmptyValue(f, values[f.name]),
+            (f) => isRequiredNow(f, values) || !isEmptyValue(f, values[f.name]),
           );
           if (summaryRows.length === 0) {
             return (
@@ -154,6 +154,7 @@ export function SchemaFormTurn({ payload, onSubmit, disabled = false, isTutorial
             <KnobFieldRenderer
               key={field.name}
               field={field}
+              required={isRequiredField(field, values)}
               value={values[field.name]}
               onChange={(value) => onChange(field.name, value)}
               idPrefix={reactId}
@@ -317,13 +318,30 @@ function submittedValue(field: KnobField, value: unknown): unknown {
   return value;
 }
 
+// Whether a field must be filled GIVEN the current form state. `required` is
+// the plugin model's own field-level requiredness; `required_when` carries a
+// rule the model cannot express but the composer enforces anyway — a local file
+// sink must choose a `collision_policy` under `mode='write'`, though the field
+// is `default=None` and lowers `required: false` (R2-F2). Reading only
+// `field.required` let the form report such a knob optional and hand the user a
+// Continue button that walked straight into a backend rejection.
+//
+// The predicate reads sibling form state, so unlike `visible_when` its target
+// may be declared LATER in the field list (`collision_policy` lives on
+// LocalFileSinkConfig, `mode` on the concrete sink subclass).
+function isRequiredNow(field: KnobField, state: FormValues): boolean {
+  if (field.required) return true;
+  if (!field.required_when) return false;
+  return state[field.required_when.field] === field.required_when.equals;
+}
+
 // Whether a field participates in the required-marker / aria-required treatment.
 // Mirrors canSubmit's required predicate: a checkbox always carries a boolean
 // value, so the form never treats one as unmet — marking it required (visibly or
 // programmatically) would contradict that, so the marker tracks exactly the
 // predicate the gate enforces.
-function isRequiredField(field: KnobField): boolean {
-  return field.required && field.kind !== "checkbox";
+function isRequiredField(field: KnobField, state: FormValues): boolean {
+  return isRequiredNow(field, state) && field.kind !== "checkbox";
 }
 
 // True when the field's current value is in a state the form already knows is
@@ -360,11 +378,16 @@ function describedBy(...ids: Array<string | undefined>): string | undefined {
 // not read "star") while the screen-reader-only "(required)" carries the cue in
 // the accessible name; aria-required on the control (set per branch) conveys the
 // state programmatically. Non-required fields render the label alone.
-function FieldLabel({ field, htmlFor }: { field: KnobField; htmlFor: string }) {
+//
+// `required` arrives as a prop rather than being derived here: with
+// `required_when` the answer depends on current form state, which only the
+// component holds. One boolean computed once per render keeps the marker, the
+// aria state, and the submit gate reading the same predicate.
+function FieldLabel({ field, htmlFor, required }: { field: KnobField; htmlFor: string; required: boolean }) {
   return (
     <label htmlFor={htmlFor} className="guided-schema-label">
       {field.label}
-      {isRequiredField(field) && (
+      {required && (
         <>
           <span className="guided-schema-required-marker" aria-hidden="true">
             {" *"}
@@ -378,6 +401,7 @@ function FieldLabel({ field, htmlFor }: { field: KnobField; htmlFor: string }) {
 
 function KnobFieldRenderer({
   field,
+  required,
   value,
   onChange,
   idPrefix,
@@ -385,6 +409,7 @@ function KnobFieldRenderer({
   isTutorial = false,
 }: {
   field: KnobField;
+  required: boolean;
   value: unknown;
   onChange: (value: unknown) => void;
   idPrefix: string;
@@ -393,7 +418,6 @@ function KnobFieldRenderer({
 }) {
   const id = `${idPrefix}-${field.name}`;
   const descriptionId = field.description ? `${id}-description` : undefined;
-  const required = isRequiredField(field);
 
   switch (field.kind) {
     case "text":
@@ -439,7 +463,7 @@ function KnobFieldRenderer({
       const displayString = maskPathLeak ? friendlyBlobRef(rawString) : rawString;
       return (
         <div className="guided-schema-field-row">
-          <FieldLabel field={field} htmlFor={id} />
+          <FieldLabel field={field} htmlFor={id} required={required} />
           <input
             id={id}
             type="text"
@@ -477,7 +501,7 @@ function KnobFieldRenderer({
       const errorId = hasError ? `${id}-error` : undefined;
       return (
         <div className="guided-schema-field-row">
-          <FieldLabel field={field} htmlFor={id} />
+          <FieldLabel field={field} htmlFor={id} required={required} />
           <input
             id={id}
             type="number"
@@ -531,7 +555,7 @@ function KnobFieldRenderer({
             onChange={(event) => onChange(event.target.checked)}
             disabled={disabled}
           />
-          <FieldLabel field={field} htmlFor={id} />
+          <FieldLabel field={field} htmlFor={id} required={required} />
           {field.description && (
             <p id={descriptionId} className="guided-schema-hint">
               {field.description}
@@ -542,7 +566,7 @@ function KnobFieldRenderer({
     case "enum":
       return (
         <div className="guided-schema-field-row">
-          <FieldLabel field={field} htmlFor={id} />
+          <FieldLabel field={field} htmlFor={id} required={required} />
           <select
             id={id}
             className="guided-schema-select"
@@ -553,7 +577,7 @@ function KnobFieldRenderer({
             onChange={(event) => onChange(event.target.value)}
             disabled={disabled}
           >
-            <option value="" disabled={field.required}>
+            <option value="" disabled={required}>
               Select...
             </option>
             {(field.enum ?? []).map((option) => (
@@ -572,7 +596,7 @@ function KnobFieldRenderer({
     case "string-list":
       return (
         <div className="guided-schema-field-row">
-          <FieldLabel field={field} htmlFor={id} />
+          <FieldLabel field={field} htmlFor={id} required={required} />
           <textarea
             id={id}
             className="guided-schema-textarea"
@@ -603,7 +627,7 @@ function KnobFieldRenderer({
       const errorId = hasError ? `${id}-error` : undefined;
       return (
         <div className="guided-schema-field-row">
-          <FieldLabel field={field} htmlFor={id} />
+          <FieldLabel field={field} htmlFor={id} required={required} />
           <textarea
             id={id}
             className={`guided-schema-textarea${hasError ? " guided-schema-textarea--error" : ""}`}

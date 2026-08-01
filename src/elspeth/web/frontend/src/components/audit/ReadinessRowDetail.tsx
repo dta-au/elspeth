@@ -24,7 +24,7 @@ import { useEffect, useId, useMemo, useRef } from "react";
 import { OPEN_GRAPH_MODAL_EVENT } from "@/lib/composer-events";
 import { useSessionStore } from "../../stores/sessionStore";
 import type { ReadinessRow, ValidationError } from "../../types/api";
-import { resolveNodePlugin, stepLabelForPlugin } from "../chat/interpretationStepLabel";
+import { stepLabelForNodeId } from "../chat/interpretationStepLabel";
 import {
   humaniseValidationMessage,
   makePhraseFor,
@@ -53,10 +53,8 @@ export function ReadinessRowDetail({ row, validationErrors, onClose }: Readiness
   // Memoised (elspeth-40d6efac2b): avoids rebuilding + re-tokenising the
   // phrase map on every render of this drawer.
   const phraseFor = useMemo(() => makePhraseFor(compositionState), [compositionState]);
-  const stepLabelFor = (componentId: string): string | null => {
-    const plugin = resolveNodePlugin(compositionState, componentId);
-    return plugin === null ? null : stepLabelForPlugin(plugin);
-  };
+  const stepLabelFor = (componentId: string): string | null =>
+    stepLabelForNodeId(compositionState, componentId);
 
   // Humanise the validation row's findings; leave other rows' prose untouched.
   const humanisedFindings =

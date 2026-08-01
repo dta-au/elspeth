@@ -20,7 +20,7 @@
       },
       {
         "default": null,
-        "description": "Optional local output collision policy. 'fail_if_exists' refuses an existing write target; 'auto_increment' picks a free sibling path; 'append_or_create' is valid with append mode.",
+        "description": "Required when mode is 'write'. 'auto_increment' is the safe default \u2014 it picks a free sibling path. 'fail_if_exists' refuses an existing write target. 'append_or_create' only with mode='append'.",
         "enum": [
           "fail_if_exists",
           "auto_increment",
@@ -30,7 +30,11 @@
         "label": "Collision Policy",
         "name": "collision_policy",
         "nullable": true,
-        "required": false
+        "required": false,
+        "required_when": {
+          "equals": "write",
+          "field": "mode"
+        }
       },
       {
         "description": "String field written as one line per row.",

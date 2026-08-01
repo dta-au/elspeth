@@ -1714,6 +1714,7 @@ describe("ChatPanel mode discriminator", () => {
       guidedSession: activeGuidedSession(),
       guidedNextTurn: singleSelectTurn(),
       compositionState: sourceLlmCsvComposition(),
+      compositionStateLoaded: true,
     });
 
     const { container } = render(<ChatPanel />);
@@ -1752,6 +1753,7 @@ describe("ChatPanel mode discriminator", () => {
       guidedSession: activeGuidedSession(),
       guidedNextTurn: singleSelectTurn(),
       compositionState: sourceLlmCsvComposition(),
+      compositionStateLoaded: true,
     });
 
     const { container } = render(
@@ -1800,6 +1802,7 @@ describe("ChatPanel mode discriminator", () => {
       },
       guidedNextTurn: singleSelectTurn(),
       compositionState: sourceLlmCsvComposition(),
+      compositionStateLoaded: true,
     });
 
     const { container } = render(<ChatPanel />);
@@ -1849,6 +1852,7 @@ describe("ChatPanel mode discriminator", () => {
       guidedSession: activeGuidedSession(),
       guidedNextTurn: singleSelectTurn(),
       compositionState: sourceLlmCsvComposition(),
+      compositionStateLoaded: true,
     });
     useExecutionStore.setState({
       validationResult: {
@@ -1900,6 +1904,7 @@ describe("ChatPanel mode discriminator", () => {
       guidedSession: activeGuidedSession(),
       guidedNextTurn: singleSelectTurn(),
       compositionState: sourceLlmCsvComposition(),
+      compositionStateLoaded: true,
     });
     // validationResult populates in the tutorial too (the auto-validate
     // subscription is version-keyed / mode-agnostic), so the in-column signal
@@ -2551,6 +2556,7 @@ describe("ChatPanel mode discriminator", () => {
       },
       guidedNextTurn: singleSelectTurn(),
       compositionState: sourceLlmCsvComposition(),
+      compositionStateLoaded: true,
     });
 
     const { container } = render(
@@ -4009,6 +4015,7 @@ assistant_message_kind: "synthetic_failure",
       },
       guidedTerminal: terminal,
       compositionState: sourceLlmCsvComposition(),
+      compositionStateLoaded: true,
     });
     useExecutionStore.setState({
       validationResult: {
