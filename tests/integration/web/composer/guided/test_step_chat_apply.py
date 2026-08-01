@@ -49,6 +49,7 @@ async def _resolved_source_provider(**_kwargs: object) -> GuidedChatProviderOutc
             error_class=None,
         ),
         resolution=resolution,
+        deferred_action=None,
     )
 
 
@@ -156,6 +157,7 @@ def test_step_2_chat_projects_sink_selection_without_committing_an_output(
                 error_class=None,
             ),
             sink=sink,
+            deferred_action=None,
         )
 
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", sink_provider)

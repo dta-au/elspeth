@@ -717,6 +717,30 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         'Use routes={"true": <destination>, "false": <destination>}. For a pure fan-out gate: condition=\'True\', routes={"true": "fork", "false": "fork"}, fork_to=[<branch connections>]. Only string-returning conditions may use custom route labels.',
     ),
     (
+        r"gate_condition_ignores_stated_threshold",
+        "The instruction states a comparison (a threshold on a field), but every gate in the candidate has a constant "
+        "condition. A constant condition makes no per-row decision, so the stated rule is expressed nowhere in the "
+        "pipeline and every row takes the same path — with a fan-out gate that means every row is written to every "
+        "destination. The rejection's 'detail' quotes the comparison from the instruction verbatim.",
+        "Author the comparison as the gate's condition — e.g. condition=\"row['amount'] > 500\" — and point "
+        'routes={"true": <one destination>, "false": <the other destination>} at the two DIFFERENT destinations '
+        "(drop fork_to; a fork delivers to every branch). "
+        "If the constant fan-out was genuinely intended — every row to every destination — re-emit the same pipeline "
+        "unchanged and it will be accepted.",
+    ),
+    (
+        r"passthrough_cannot_produce_declared_fields",
+        "The candidate has no transform or aggregation nodes, so every row it writes is exactly the row the source "
+        "read — but the reviewed outputs declare fields that no reviewed source declares or observes. Nothing in this "
+        "pipeline can put those fields on a row. The rejection's 'detail' names them; they are also visible as "
+        "outputs[].required_fields in the reviewed planner context, minus every source's observed_columns and "
+        "declared_fields.",
+        "Add the transform node(s) that produce the named fields — for a straight rename or copy from an existing "
+        "column a field_mapper with the appropriate mapping is enough; for derived or generated values use the "
+        "transform that computes them — and wire the source through them to the sink. Re-emitting the same "
+        "zero-transform pipeline will be rejected again with this same code.",
+    ),
+    (
         r"proposal_missing_requested_transforms",
         "The revision candidate contains no transform or aggregation nodes, but the operator's revision instruction asked for processing — a bare source-to-sink pass-through would ship a pipeline that silently performs none of the requested work behind a confident name.",
         "Re-emit with the transform nodes the revision instruction requests, as a minimal delta: keep the reviewed source and sink wiring unchanged and add only the processing nodes. "
@@ -868,6 +892,14 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Rewrite each bare name as '{{ row.<field> }}' using a field the upstream schema provides (e.g. '{{ text }}' becomes "
         "'{{ row.text }}'), or '{{ lookup.<key> }}' for lookup data, or remove the reference.",
     ),
+    (
+        r"query_template_unbound_row_fields|input_fields binds only",
+        "A multi-query LLM template references 'row.<variable>' names the query never binds — each query renders with 'row' "
+        "holding exactly its input_fields variables plus 'source_row', so an unbound reference raises 'Undefined variable' "
+        "at runtime and that query fails for every row.",
+        "Bind each missing name in that query's input_fields (template variable → row column), rename the reference to a "
+        "variable the query already binds, or use '{{ row.source_row.<column> }}' for direct access to the source row.",
+    ),
     # Deployment security policy, not a wiring mistake: no repair to the
     # candidate can make an aws_s3 SOURCE acceptable on the web surface, so the
     # explanation must say so outright or the planner burns its whole repair
@@ -985,6 +1017,10 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # A prompt_template interpolating names outside {row, lookup} crashes at
     # render under StrictUndefined and sends no row data to the model.
     "prompt_template_unbound_variables",
+    # ── Multi-query row-binding guard (elspeth-bea314a89b follow-up) ───────
+    # A multi-query template referencing row.<name> outside that query's
+    # input_fields + {source_row} fails that query at render for every row.
+    "query_template_unbound_row_fields",
     # ── Pre-application semantic rejections (tutorial op 1152d7e3 closure) ──
     # Previously codeless _failure_result sites: the planner saw only the
     # 'validation_error' placeholder while the actionable message was redacted.
@@ -995,6 +1031,15 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # A revision candidate netting zero transform nodes drew one coded nudge
     # instead of silently shipping a passthrough with aspirational metadata.
     "proposal_missing_requested_transforms",
+    # ── Unproducible declared output fields (R2-F4, 2026-08-01) ────────────
+    # Planner-loop only: pairs the reviewed guided facts (what the sources
+    # carry vs what the outputs declare) with the candidate's node count.
+    # No structural validator sees both.
+    "passthrough_cannot_produce_declared_fields",
+    # ── Stated-threshold fidelity guard (R2-F17, 2026-08-01) ───────────────
+    # Planner-loop only: the instruction is the evidence, so no structural
+    # validator can raise this. The shape it rejects is legal everywhere else.
+    "gate_condition_ignores_stated_threshold",
     # ── Deployment policy refusal (F14b, 2026-07-31) ───────────────────────
     # Reaches planner feedback from the authoritative source gate; the planner
     # must learn the refusal is categorical rather than repair around it.

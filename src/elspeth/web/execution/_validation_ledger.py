@@ -7,10 +7,10 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from elspeth.web.execution.schemas import (
-    CHECK_IDENTITY_NODE_ADVISORY,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
     RUNTIME_CHECK_SCHEMA_COMPATIBILITY,
     VALIDATION_BLOCKING_CHECK_NAMES,
+    VALIDATION_CHECK_NAMES,
     SemanticEdgeContractResponse,
     ValidationCheck,
     ValidationCheckName,
@@ -23,6 +23,9 @@ from elspeth.web.execution.schemas import (
 _CORE_CHECK_COUNT: Final = 24
 _SCHEMA_CHECK_INDEX = VALIDATION_BLOCKING_CHECK_NAMES.index(RUNTIME_CHECK_SCHEMA_COMPATIBILITY)
 CORE_VALIDATION_CHECK_NAMES: Final[tuple[ValidationCheckName, ...]] = VALIDATION_BLOCKING_CHECK_NAMES[: _SCHEMA_CHECK_INDEX + 1]
+ADVISORY_VALIDATION_CHECK_NAMES: Final[frozenset[ValidationCheckName]] = frozenset(VALIDATION_CHECK_NAMES) - frozenset(
+    VALIDATION_BLOCKING_CHECK_NAMES
+)
 if len(CORE_VALIDATION_CHECK_NAMES) != _CORE_CHECK_COUNT:
     raise AssertionError("core validation checks must be the 24-name canonical prefix through schema_compatibility")
 
@@ -51,14 +54,14 @@ class ValidationLedger:
         self._core_count += 1
 
     def record_advisory(self, check: ValidationCheck) -> None:
-        """Record one successful identity advisory after all core checks."""
+        """Record one registered successful advisory after all core checks."""
         self._ensure_open()
         if self._core_count != len(CORE_VALIDATION_CHECK_NAMES):
-            raise RuntimeError("identity advisories require all 24 core checks to pass first")
-        if check.name != CHECK_IDENTITY_NODE_ADVISORY:
-            raise RuntimeError(f"{check.name} is not an identity_node_advisory check")
+            raise RuntimeError("advisories require all 24 core checks to pass first")
+        if check.name not in ADVISORY_VALIDATION_CHECK_NAMES:
+            raise RuntimeError(f"{check.name} is not a registered advisory check")
         if not check.passed:
-            raise RuntimeError("identity_node_advisory records must pass")
+            raise RuntimeError("advisory records must pass")
         self._checks.append(check.model_copy(deep=True))
 
     def finish_failure(

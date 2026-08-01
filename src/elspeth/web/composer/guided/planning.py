@@ -31,6 +31,7 @@ from elspeth.web.composer.guided.protocol import (
     validate_payload,
     validate_proposal_catalog_refs,
 )
+from elspeth.web.composer.guided.resolved import SinkOutputResolved
 from elspeth.web.composer.guided.stage_subjects import (
     ComponentCountConstraint,
     EdgeRouteConstraint,
@@ -567,6 +568,90 @@ def _sink_options_with_declared_required_fields(
     return options
 
 
+def guided_reviewed_sink_options(reviewed_output: SinkOutputResolved) -> dict[str, JsonValue]:
+    """Return one reviewed sink's options with its declared contract materialized.
+
+    The single seam every pipeline carrying a reviewed output must pass
+    through: the planner-authored candidate binder below, and the
+    server-synthesized zero-transform sketch in
+    ``ComposerServiceImpl.plan_guided_pipeline``. Those two seams had diverged —
+    the sketch merged nothing, so step-2's declared output fields never reached
+    ``options.schema.required_fields`` and the sink-contract check skipped
+    (R2-F4). Both call ``guided_reviewed_sink_options`` now so a future third
+    pipeline builder cannot re-open the same gap.
+    """
+    if type(reviewed_output) is not SinkOutputResolved:
+        raise TypeError("reviewed_output must be an exact SinkOutputResolved")
+    options = cast(dict[str, JsonValue], deep_thaw(reviewed_output.options))
+    if not reviewed_output.required_fields:
+        # Empty declared fields never reach the merge helper: the options stay
+        # byte-identical, per its documented precondition.
+        return options
+    return _sink_options_with_declared_required_fields(options, reviewed_output.required_fields)
+
+
+def guided_unproducible_output_fields(guided: GuidedSession) -> tuple[dict[str, JsonValue], ...]:
+    """Name the declared output fields a zero-transform pipeline cannot produce.
+
+    A pass-through pipeline emits exactly what the reviewed sources carry, so a
+    declared sink field that appears in no source's observed columns and in no
+    source's explicitly declared schema fields is unproducible without a
+    transform. Candidate validation cannot be the guard here (R2-F4): before
+    ``guided_reviewed_sink_options`` the sink carried no ``required_fields`` at
+    all, so the sink-contract check skipped outright and sealed the sketch
+    green. Merging them helps only when the producer PARTICIPATES in
+    propagation — a blob-inspected source resolves an explicit ``flexible``
+    schema and does, but a source whose schema stays ``observed`` abstains
+    under ADR-007 and the check emits no contract at all — and even when it
+    does fire it is an opaque ``sink_contract_violation`` the planner burns its
+    repair budget on. The guided seam holds both halves of the fact BEFORE any
+    pipeline is built, so it names the gap here and lets the caller act on it.
+
+    Advisory shape only — this reports; the caller decides. The returned
+    projection is provider-safe: every value is already in
+    ``guided_redacted_planner_context`` (source ``observed_columns`` /
+    ``declared_fields``, output ``required_fields``), so naming the gap adds no
+    new egress. Values are plain JSON (sorted lists of ``str``) because the
+    planner context is canonicalized before it reaches a provider.
+    """
+    if type(guided) is not GuidedSession:
+        raise TypeError("guided must be an exact GuidedSession")
+    available: set[str] = set()
+    for stable_id in guided.source_order:
+        source = guided.reviewed_sources[stable_id]
+        available.update(source.observed_columns)
+        available.update(reviewed_schema_declared_field_names(source.options.get("schema")))
+    gaps: list[dict[str, JsonValue]] = []
+    for stable_id in guided.output_order:
+        output = guided.reviewed_outputs[stable_id]
+        missing = sorted(set(output.required_fields) - available)
+        if missing:
+            gaps.append({"stable_id": stable_id, "fields": cast(JsonValue, missing)})
+    return tuple(gaps)
+
+
+def guided_unproducible_output_field_names(guided: GuidedSession) -> tuple[str, ...]:
+    """Flatten :func:`guided_unproducible_output_fields` to sorted field names.
+
+    The planner loop and the operator-visible failure both want "which fields
+    is nothing producing", not "which sink declared them" — a zero-transform
+    candidate is wrong for the union, and the repair is the same whichever sink
+    asked. Derived from the per-output projection rather than recomputed so the
+    two can never disagree about what the gap is.
+
+    Every name here is a field the OPERATOR typed. Step-2 field review admits
+    ``chosen`` only from ``_candidate_fields`` (the reviewed sources' observed
+    columns) and forbids ``custom_inputs`` from overlapping them, so a name
+    that survives the set difference came from ``custom_inputs`` verbatim.
+    """
+    names: set[str] = set()
+    for gap in guided_unproducible_output_fields(guided):
+        fields = gap["fields"]
+        assert type(fields) is list  # built above as list[str]
+        names.update(cast(list[str], fields))
+    return tuple(sorted(names))
+
+
 def bind_guided_reviewed_components(
     pipeline: Mapping[str, Any],
     guided: GuidedSession,
@@ -629,12 +714,7 @@ def bind_guided_reviewed_components(
         candidate_name = candidate.get("sink_name", candidate.get("name"))
         if type(candidate_name) is str and candidate_name != reviewed_output.name:
             output_rename[candidate_name] = reviewed_output.name
-        rebound_options = cast(dict[str, JsonValue], deep_thaw(reviewed_output.options))
-        if reviewed_output.required_fields:
-            rebound_options = _sink_options_with_declared_required_fields(
-                rebound_options,
-                reviewed_output.required_fields,
-            )
+        rebound_options = guided_reviewed_sink_options(reviewed_output)
         rebound_outputs.append(
             {
                 "sink_name": reviewed_output.name,
@@ -1333,6 +1413,9 @@ __all__ = [
     "guided_private_reviewed_facts",
     "guided_redacted_current_state_context",
     "guided_redacted_planner_context",
+    "guided_reviewed_sink_options",
+    "guided_unproducible_output_field_names",
+    "guided_unproducible_output_fields",
     "require_guided_correction_target_changed",
     "resolve_guided_correction_target",
     "verified_remaining_deferred_intents",

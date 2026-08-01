@@ -123,6 +123,7 @@ from elspeth.web.composer.telemetry_phase8 import (
 from elspeth.web.composer.tools import _DATA_ERROR_KEY, ToolResult, execute_tool
 from elspeth.web.composer.yaml_generator import generate_public_yaml
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
+from elspeth.web.execution.completion_gates import COMPLETION_GATES_META_KEY, completion_gates_meta_value
 from elspeth.web.execution.schemas import RunAccounting, RunStatusResponse, ValidationResult
 from elspeth.web.execution.validation import validate_pipeline
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter, get_rate_limiter
@@ -256,6 +257,9 @@ class _SessionComposeLockRegistry:
 
     async def get_lock(self, session_id: str) -> asyncio.Lock:
         async with self._ensure_locks_lock():
+            # Tier note: lazy per-session lock cache — a miss means this
+            # session has not needed a lock yet, not corrupted state; the
+            # WeakValueDictionary drops entries when their sessions go away.
             lock = self._session_locks.get(session_id)
             if lock is None:
                 lock = asyncio.Lock()
@@ -1487,7 +1491,13 @@ _CLIENT_DISCONNECT_CANCEL_MARKER = "elspeth_client_disconnected"
 
 
 def _is_client_disconnect_cancel(exc: asyncio.CancelledError) -> bool:
-    """True when ``exc`` was delivered by :func:`_cancel_on_client_disconnect`."""
+    """True when ``exc`` was delivered by :func:`_cancel_on_client_disconnect`.
+
+    Tier note: the ``getattr`` default is a cooperative-marker probe, not
+    defensive masking — the marker attribute is stamped onto the exception by
+    ``_cancel_on_client_disconnect`` alone, so its absence is the ordinary
+    "external cancel" case, never a hidden bug.
+    """
     return bool(getattr(exc, _CLIENT_DISCONNECT_CANCEL_MARKER, False))
 
 
@@ -1815,6 +1825,20 @@ async def _state_data_from_composer_state(
     if state.guided_session is not None and "guided_session" not in surface_meta:
         surface_meta["guided_session"] = state.guided_session.to_dict()
     persisted_composer_meta = merge_implicit_decisions_meta(surface_meta, state)
+    # Completion-gate facts (advisor sign-off first) are durable only here:
+    # the key is OVERWRITTEN on every compose-preflight save — populated when
+    # the preflight withheld completion, empty when it did not — so a stale
+    # blocked fact cannot survive a clean turn. Exact-type dispatch mirrors
+    # the ``_RuntimePreflightOutcome`` convention above: a captured
+    # ``_RuntimePreflightFailed`` persists ``is_valid=False`` and carries no
+    # gate verdict.
+    persisted_composer_meta = {
+        **persisted_composer_meta,
+        COMPLETION_GATES_META_KEY: completion_gates_meta_value(
+            runtime if type(runtime) is ValidationResult else None,
+            state,
+        ),
+    }
     normalized_persisted_errors = validation_errors_for_composer_surface(
         composer_meta=persisted_composer_meta,
         is_valid=persisted_is_valid,

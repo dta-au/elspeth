@@ -1070,6 +1070,7 @@ class TestExecutionFlow:
         assert validate_state.await_args.kwargs == {
             "user_id": "alice",
             "session_id": session_id,
+            "completion_gates": None,
         }
 
     @pytest.mark.asyncio
@@ -1112,6 +1113,92 @@ class TestExecutionFlow:
         assert worker_call.keywords["secret_service"] is service._secret_service
         assert worker_call.keywords["user_id"] == "alice"
         assert callable(worker_call.keywords["blob_get_metadata"])
+
+    @pytest.mark.asyncio
+    async def test_validate_state_merges_persisted_completion_gate(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """A persisted advisor sign-off blocker survives the fresh recompute."""
+        from elspeth.web.execution.completion_gates import (
+            AdvisorSignoffGateFact,
+            CompletionGateFacts,
+            completion_gate_fingerprint,
+        )
+        from elspeth.web.execution.schemas import ADVISOR_SIGNOFF_BLOCKED_CODE
+
+        state = state_from_record(mock_session_service.get_current_state.return_value)
+        recomputed = ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=True,
+                execution_ready=True,
+                completion_ready=True,
+                blockers=[],
+            ),
+        )
+        facts = CompletionGateFacts(
+            advisor_signoff=AdvisorSignoffGateFact(
+                detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                for_graph=completion_gate_fingerprint(state),
+            )
+        )
+
+        with patch("elspeth.web.execution.service.run_sync_in_worker", new_callable=AsyncMock) as run_worker:
+            run_worker.return_value = recomputed
+            result = await service.validate_state(state, user_id="alice", session_id=uuid4(), completion_gates=facts)
+
+        assert result.is_valid is True
+        assert result.readiness.authoring_valid is True
+        assert result.readiness.execution_ready is True
+        assert result.readiness.completion_ready is False
+        assert [blocker.code for blocker in result.readiness.blockers] == [ADVISOR_SIGNOFF_BLOCKED_CODE]
+
+    @pytest.mark.asyncio
+    async def test_validate_passes_record_completion_gates_to_validate_state(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """validate() parses the record's composer_meta and threads the facts through."""
+        from elspeth.web.execution.completion_gates import AdvisorSignoffGateFact, CompletionGateFacts
+
+        session_id = uuid4()
+        mock_session_service.get_current_state.return_value.composer_meta = {
+            "completion_gates": {
+                "advisor_signoff": {
+                    "status": "blocked",
+                    "detail": "The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                    "for_graph": "0" * 64,
+                }
+            }
+        }
+        expected = ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=True,
+                execution_ready=True,
+                completion_ready=True,
+                blockers=[],
+            ),
+        )
+        validate_state = AsyncMock(spec=service.validate_state, return_value=expected)
+        service.validate_state = validate_state  # type: ignore[method-assign]
+
+        await service.validate(session_id, user_id="alice")
+
+        validate_state.assert_awaited_once()
+        assert validate_state.await_args.kwargs["completion_gates"] == CompletionGateFacts(
+            advisor_signoff=AdvisorSignoffGateFact(
+                detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+                for_graph="0" * 64,
+            )
+        )
 
     @pytest.mark.asyncio
     async def test_get_status_returns_run_status(self, service: ExecutionServiceImpl, mock_session_service: MagicMock) -> None:

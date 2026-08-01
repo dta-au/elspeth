@@ -442,7 +442,7 @@ export type ValidationCheckOutcomeCode = (typeof VALIDATION_CHECK_OUTCOME_CODE_V
  * removal/repair guidance in `detail` that the UI must not hide behind a
  * collapsed "Validation passed" banner.
  */
-export const VALIDATION_ADVISORY_CHECK_NAMES = ["identity_node_advisory"] as const;
+export const VALIDATION_ADVISORY_CHECK_NAMES = ["identity_node_advisory", "gate_fan_out_advisory"] as const;
 
 export interface ValidationCheck {
   name: string;

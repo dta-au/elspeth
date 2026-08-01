@@ -29,6 +29,7 @@ from elspeth.web.execution._validation_model import (
     PhaseReport,
 )
 from elspeth.web.execution.schemas import (
+    CHECK_GATE_FAN_OUT_ADVISORY,
     CHECK_IDENTITY_NODE_ADVISORY,
     CHECK_ROUTE_TARGETS,
     CHECK_SETTINGS,
@@ -47,7 +48,7 @@ from elspeth.web.execution.schemas import (
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 if TYPE_CHECKING:
-    from elspeth.web.execution._validation_diagnostics import _EdgePatchTarget, _IdentityFinding
+    from elspeth.web.execution._validation_diagnostics import _EdgePatchTarget, _GateFanOutFinding, _IdentityFinding
 
 
 class _YamlLoader(Protocol):
@@ -106,6 +107,10 @@ class _EdgeFormatter(Protocol):
 
 class _IdentityFinder(Protocol):
     def __call__(self, state: CompositionState) -> Sequence[_IdentityFinding]: ...
+
+
+class _GateFanOutFinder(Protocol):
+    def __call__(self, state: CompositionState) -> Sequence[_GateFanOutFinding]: ...
 
 
 def _blocked_readiness(
@@ -526,6 +531,36 @@ def build_identity_advisory_checks(
                     "the passthrough adds an audit hop with no contract benefit.  "
                     f"Consider removing it and wiring '{finding.upstream_id}'.on_success "
                     f"directly to '{finding.sink_name}'."
+                ),
+                affected_nodes=(finding.node_id,),
+            )
+        )
+    return tuple(checks)
+
+
+def build_gate_fan_out_advisory_checks(
+    graphed: GraphedRuntime,
+    *,
+    find_gate_fan_out_advisories: _GateFanOutFinder,
+) -> tuple[ValidationCheck, ...]:
+    """Build non-blocking constant-gate fan-out advisories after validation."""
+    policy_state = graphed.instantiated.loaded.materialized.authored.policy.state
+    checks: list[ValidationCheck] = []
+    for finding in find_gate_fan_out_advisories(policy_state):
+        destination_text = ", ".join(f"'{destination}'" for destination in finding.destinations)
+        checks.append(
+            _check(
+                CHECK_GATE_FAN_OUT_ADVISORY,
+                passed=True,
+                detail=(
+                    f"Gate '{finding.node_id}' has the constant condition {finding.condition!r}, "
+                    "so it makes no per-row decision, and both of its routes deliver to the same "
+                    f"destinations ({destination_text}). Every row will be written to all "
+                    f"{len(finding.destinations)} of them. If that fan-out is intended, nothing "
+                    "needs to change. If each row was meant to land in exactly one destination, "
+                    "replace the condition with the rule that decides between them (for example "
+                    "\"row['amount'] > 500\") and point the 'true' and 'false' routes at "
+                    "different destinations."
                 ),
                 affected_nodes=(finding.node_id,),
             )

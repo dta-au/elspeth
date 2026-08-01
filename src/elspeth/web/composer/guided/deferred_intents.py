@@ -1011,3 +1011,42 @@ def create_deferred_stage_intent(
         message_content_hash=stable_hash(originating_message_content),
         constraints=action.constraints,
     )
+
+
+def create_deferred_clarification_intent(
+    *,
+    receiving_stage: StageName,
+    intent_id: str,
+    originating_message_id: str,
+    originating_message_content: str,
+) -> DeferredStageIntent:
+    """Retain a structurally unverified future-stage instruction durably.
+
+    Last-resort retention (R2-F15 / elspeth-a96b2f1b0a): when the model cannot
+    express the user's future-stage instruction as a well-formed action even
+    after the bounded repair turn, the instruction is kept as a constraint-free
+    clarification intent instead of being discarded. The empty constraint set
+    makes it permanently unclaimable by the planner
+    (:func:`evaluate_deferred_intent_coverage` rejects claims on
+    constraint-free intents), so it stays visibly pending until the user
+    cancels it or edits it into a structural instruction. ``wire_review`` is
+    the latest stage and therefore strictly later than every stage that offers
+    ``retain_deferred_intent``. The summary is rendered from closed facts only
+    — never from user prose; the prose lives solely in the private message row
+    this intent binds by id and content hash.
+    """
+
+    _require_nonempty_exact_str(originating_message_content, "originating_message_content")
+    return DeferredStageIntent.create(
+        intent_id=intent_id,
+        receiving_stage=receiving_stage,
+        target_stage="wire_review",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary=(
+            "Future-stage instruction retained without verified structure; needs the target stage and a concrete structural requirement."
+        ),
+        originating_message_id=originating_message_id,
+        message_content_hash=stable_hash(originating_message_content),
+        constraints=(),
+    )

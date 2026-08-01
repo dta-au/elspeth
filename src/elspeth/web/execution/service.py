@@ -80,6 +80,11 @@ from elspeth.web.composer._semantic_validator import validate_semantic_contracts
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.accounting import load_run_accounting_from_db
+from elspeth.web.execution.completion_gates import (
+    CompletionGateFacts,
+    merge_completion_gates,
+    parse_completion_gates,
+)
 from elspeth.web.execution.errors import (
     BlobSourcePathMismatchError,
     MalformedBlobRefError,
@@ -1262,7 +1267,12 @@ class ExecutionServiceImpl:
             )
 
         composition_state = state_from_record(state_record)
-        return await self.validate_state(composition_state, user_id=user_id, session_id=session_id)
+        return await self.validate_state(
+            composition_state,
+            user_id=user_id,
+            session_id=session_id,
+            completion_gates=parse_completion_gates(state_record.composer_meta),
+        )
 
     async def validate_state(
         self,
@@ -1270,6 +1280,7 @@ class ExecutionServiceImpl:
         *,
         user_id: str | None = None,
         session_id: UUID | None = None,
+        completion_gates: CompletionGateFacts | None = None,
     ) -> ValidationResult:
         """Dry-run validation for an already-read composition state.
 
@@ -1278,6 +1289,13 @@ class ExecutionServiceImpl:
         state between adjacent readiness calculations. When supplied,
         ``session_id`` scopes inline-blob metadata lookups to the same session
         boundary enforced by ``link_blob_to_run()`` at execution time.
+
+        ``completion_gates`` carries persisted composer completion-gate facts
+        parsed off the state's ``composition_states`` row (advisor sign-off,
+        R2-F14). The recompute cannot rediscover those events, so callers that
+        hold the record pass them here and the merged result withholds
+        ``completion_ready`` accordingly. ``None`` — no record at hand, or no
+        envelope ever written — leaves the recompute untouched.
         """
         from functools import partial
 
@@ -1296,7 +1314,7 @@ class ExecutionServiceImpl:
                 return None
             return record
 
-        return cast(
+        result = cast(
             ValidationResult,
             await run_sync_in_worker(
                 partial(
@@ -1314,6 +1332,7 @@ class ExecutionServiceImpl:
                 ),
             ),
         )
+        return merge_completion_gates(result, completion_gates, state)
 
     async def verify_run_ownership(self, user: UserIdentity, run_id: str) -> bool:
         """Verify that a run belongs to the authenticated user's session.

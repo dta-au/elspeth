@@ -168,6 +168,7 @@ class _FakeExecutionService:
         *,
         user_id: str | None = None,
         session_id: UUID | None = None,
+        completion_gates: Any = None,
     ) -> ValidationResult:
         self.validate_state_await_count += 1
         self.validate_state_session_ids.append(session_id)

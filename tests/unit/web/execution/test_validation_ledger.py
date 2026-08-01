@@ -19,6 +19,7 @@ from elspeth.web.execution._validation_model import (
     PolicyLoweredState,
 )
 from elspeth.web.execution.schemas import (
+    CHECK_GATE_FAN_OUT_ADVISORY,
     CHECK_IDENTITY_NODE_ADVISORY,
     CHECK_OUTCOME_SECRET_REFS_NO_REFS,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
@@ -362,6 +363,20 @@ def test_record_advisory_snapshots_the_mutable_check() -> None:
 
     assert result.checks[-1].detail == "identity advisory"
     assert result.checks[-1].affected_nodes == ("identity_1",)
+
+
+def test_finish_success_accepts_each_registered_advisory_name() -> None:
+    ledger = ValidationLedger()
+    _record_all_core_passes(ledger)
+    for advisory_name in (CHECK_IDENTITY_NODE_ADVISORY, CHECK_GATE_FAN_OUT_ADVISORY):
+        ledger.record_advisory(_check(advisory_name, passed=True))
+
+    result = ledger.finish_success(readiness=_ready_readiness())
+
+    assert [check.name for check in result.checks[24:]] == [
+        CHECK_IDENTITY_NODE_ADVISORY,
+        CHECK_GATE_FAN_OUT_ADVISORY,
+    ]
 
 
 @pytest.mark.parametrize("advisory_count", [0, 2])

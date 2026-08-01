@@ -134,6 +134,12 @@ def _make_config(*, provider: str = "azure", **overrides: Any) -> dict[str, Any]
 def _make_multi_query_config(*, provider: str = "azure", **overrides: Any) -> dict[str, Any]:
     """Build LLMTransform config with multi-query specs."""
     config = _make_config(provider=provider, **overrides)
+    # Queries bind the template variable ``text_content`` (→ row column
+    # ``text``), and queries without an override render the node-level
+    # template — so it must interpolate ``row.text_content``, not ``row.text``
+    # (the single-query default from _make_config).
+    if "prompt_template" not in overrides:
+        config["prompt_template"] = "Process this: {{ row.text_content }}"
     config["queries"] = {
         "quality": {
             "input_fields": {"text_content": "text"},

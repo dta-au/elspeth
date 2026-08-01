@@ -56,6 +56,7 @@ from elspeth.web.execution._validation_authoring import (
 from elspeth.web.execution._validation_diagnostics import (
     _build_edge_contract_suggestion_with_resolver,
     _edge_patch_target_for_node_id,
+    _find_gate_fan_out_advisories,
     _find_identity_node_advisories,
     _format_edge_contract_message,
     _graph_warning_to_validation_warning,
@@ -77,6 +78,7 @@ from elspeth.web.execution._validation_materialization import (
 from elspeth.web.execution._validation_model import PhaseFailure, PhaseReport
 from elspeth.web.execution._validation_pipeline import ValidationDependencies, ValidationPipeline
 from elspeth.web.execution._validation_runtime import (
+    build_gate_fan_out_advisory_checks,
     build_identity_advisory_checks,
     load_runtime_settings,
     validate_graph_structure,
@@ -95,6 +97,7 @@ from elspeth.web.execution.preflight import (
 )
 from elspeth.web.execution.protocol import ValidationSettings, YamlGenerator
 from elspeth.web.execution.schemas import (
+    CHECK_GATE_FAN_OUT_ADVISORY,
     CHECK_OUTCOME_SKIPPED_AFTER_FAILURE,
     CHECK_SETTINGS,
     CHECK_VALUE_SOURCE_COMPLIANCE,
@@ -114,6 +117,10 @@ _CHECK_VALUE_SOURCE_COMPLIANCE = CHECK_VALUE_SOURCE_COMPLIANCE
 _CHECK_GRAPH = RUNTIME_CHECK_GRAPH_STRUCTURE
 _CHECK_SCHEMA = RUNTIME_CHECK_SCHEMA_COMPATIBILITY
 assert RUNTIME_GRAPH_VALIDATION_CHECKS == (_CHECK_PLUGINS, _CHECK_GRAPH, _CHECK_SCHEMA)
+
+# Non-blocking, happy-path-only advisory. It deliberately stays outside the
+# canonical blocking list and is retained here as a compatibility import seam.
+_CHECK_GATE_FAN_OUT_ADVISORY = CHECK_GATE_FAN_OUT_ADVISORY
 
 
 def _execution_ready() -> ValidationReadiness:
@@ -486,6 +493,11 @@ def _validate_pipeline_impl(
     for advisory in build_identity_advisory_checks(
         schema_validated,
         find_identity_node_advisories=_find_identity_node_advisories,
+    ):
+        ledger.record_advisory(advisory)
+    for advisory in build_gate_fan_out_advisory_checks(
+        schema_validated,
+        find_gate_fan_out_advisories=_find_gate_fan_out_advisories,
     ):
         ledger.record_advisory(advisory)
 

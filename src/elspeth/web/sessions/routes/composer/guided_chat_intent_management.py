@@ -20,6 +20,7 @@ from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentManagementAction,
     DeferredIntentRejected,
     DeferredIntentUnsupported,
+    create_deferred_clarification_intent,
     create_deferred_stage_intent,
     validate_deferred_intent_action,
 )
@@ -330,6 +331,35 @@ def apply_deferred_request(
     return DeferredRequestUnchanged(guided=authority.guided, chat=chat)
 
 
+def apply_deferred_clarification(
+    *,
+    authority: DeferredRequestAuthority,
+    chat: StepChatResult,
+) -> DeferredRequestRetained:
+    """Append the constraint-free clarification intent for one failed retain.
+
+    Last-resort retention (R2-F15): the Send carried a future-stage
+    instruction the model could not express as a well-formed action even after
+    its bounded repair turn. The instruction is kept as a clarification intent
+    bound to the private originating message; the settlement command carries
+    ``retained_deferred_intent_id`` exactly like an ordinary retain, so
+    ``_verify_guided_deferred_intent_append`` verifies the append and message
+    binding unchanged.
+    """
+    retained = create_deferred_clarification_intent(
+        receiving_stage=_guided_stage_name(authority.guided.step),
+        intent_id=str(authority.new_intent_id),
+        originating_message_id=str(authority.originating_message.message_id),
+        originating_message_content=authority.originating_message.content,
+    )
+    prospective = replace(authority.guided, deferred_intents=(*authority.guided.deferred_intents, retained))
+    return DeferredRequestRetained(
+        guided=prospective,
+        chat=chat,
+        retained_intent_id=authority.new_intent_id,
+    )
+
+
 def deferred_request_retained_intent_id(application: DeferredRequestApplication) -> UUID | None:
     if type(application) is DeferredRequestRetained:
         return application.retained_intent_id
@@ -436,12 +466,14 @@ def maybe_prepare_schema8_management_rewind(
 
 
 __all__ = [
+    "DeferredRequestApplication",
     "DeferredRequestAuthority",
     "DeferredRequestCancelled",
     "DeferredRequestEdited",
     "DeferredRequestRetained",
     "DeferredRequestUnchanged",
     "ManagementRewindAuthority",
+    "apply_deferred_clarification",
     "apply_deferred_request",
     "deferred_request_management",
     "deferred_request_retained_intent_id",

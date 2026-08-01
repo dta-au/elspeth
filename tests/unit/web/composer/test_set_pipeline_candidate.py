@@ -1353,7 +1353,7 @@ def _structured_llm_args(tmp_path: Path) -> dict[str, Any]:
                 "deployment_name": "candidate-test",
                 "endpoint": "https://candidate-test.openai.azure.com",
                 "api_key": {"secret_ref": "AZURE_OPENAI_API_KEY"},
-                "prompt_template": "Classify {{ text }}",
+                "prompt_template": "Classify {{ row.text }}",
                 # Multi-query execution must use the pooled path so capacity
                 # retries are bounded by the configured pool controller.
                 "pool_size": 2,
@@ -1361,7 +1361,7 @@ def _structured_llm_args(tmp_path: Path) -> dict[str, Any]:
                     {
                         "name": "colour",
                         "input_fields": {"text": "text"},
-                        "template": "Classify {{ text }}",
+                        "template": "Classify {{ row.text }}",
                         "response_format": "structured",
                         "output_fields": [
                             {"suffix": "label", "type": "string"},
@@ -1398,14 +1398,14 @@ def _secret_bearing_structured_fork_coalesce_args(tmp_path: Path) -> dict[str, A
             "deployment_name": "candidate-test",
             "endpoint": "https://candidate-test.openai.azure.com",
             "api_key": {"secret_ref": "AZURE_OPENAI_API_KEY"},
-            "prompt_template": "Classify {{ text }}",
+            "prompt_template": "Classify {{ row.text }}",
             "required_input_fields": ["text"],
             "pool_size": 2,
             "queries": [
                 {
                     "name": "colour",
                     "input_fields": {"text": "text"},
-                    "template": "Classify {{ text }}",
+                    "template": "Classify {{ row.text }}",
                     "response_format": "structured",
                     "output_fields": [
                         {"suffix": "label", "type": "string"},
@@ -1475,7 +1475,7 @@ _EXPECTED_STATE_HASHES = {
     "fork_coalesce": "dedfc6a9066d6e5f6fa609bae7ed07c840f082224e63480a3a2b0788ebb2e850",
     "gate": "c0380bca12a88112057ce36547ab39547eb691c03a8751e27f2371593b5abb9e",
     "aggregation": "427cde0492596be8a65cf854e3183de0c868f31fb7a24884d4bd86963fbb22cd",
-    "structured_llm": "8cadfc3dd2b39c64cadb92e4af9994dfacb218afb6f70ad5c9f90cc190037ffc",
+    "structured_llm": "80d31be6e69ef6937144e9ba5305aa90eaa1f1f8046040c3bb5e17567322f964",
     "multi_output": "a8e0698429a06efa22423ebc37033b585f1b6cdc225eb2501b4d69ee6b67ad8a",
 }
 
@@ -1804,14 +1804,14 @@ def test_current_executor_reopens_stale_authoritative_review(tmp_path: Path) -> 
         nodes=(replace(original_node, options={**original_options, INTERPRETATION_REQUIREMENTS_KEY: [resolved]}),),
     )
     changed_args = _structured_llm_args(tmp_path)
-    changed_args["nodes"][0]["options"]["prompt_template"] = "Reclassify {{ text }}"
+    changed_args["nodes"][0]["options"]["prompt_template"] = "Reclassify {{ row.text }}"
 
     result = _execute_set_pipeline(changed_args, previous, _trained_context(data_dir=tmp_path))
 
     assert result.success and result.validation.is_valid
     reconciled = result.updated_state.nodes[0].options[INTERPRETATION_REQUIREMENTS_KEY]
     current = next(item for item in reconciled if item["kind"] == "llm_prompt_template")
-    assert current["draft"] == "Reclassify {{ text }}"
+    assert current["draft"] == "Reclassify {{ row.text }}"
     assert current["status"] == "pending"
     assert current["event_id"] is None
     assert current["accepted_value"] is None

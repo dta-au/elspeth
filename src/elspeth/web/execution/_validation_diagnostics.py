@@ -18,7 +18,13 @@ from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError, GraphValidationWarning
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError
-from elspeth.web.composer.state import CompositionState
+from elspeth.web.composer.state import (
+    CompositionState,
+    _coalesce_branch_connections,
+    _coalesce_branch_names,
+    gate_condition_is_constant,
+    gate_route_destinations,
+)
 from elspeth.web.execution.schemas import ValidationError, ValidationWarning
 
 _SETTINGS_MISSING_PART_REFRAMES: dict[str, tuple[str, str, str]] = {
@@ -351,6 +357,15 @@ class _IdentityFinding:
     sink_schema_mode: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class _GateFanOutFinding:
+    """One constant gate that sends every row to the same terminal outputs."""
+
+    node_id: str
+    condition: str
+    destinations: tuple[str, ...]
+
+
 @observation_boundary(
     tier=3,
     source="composer-authored CompositionState sink/node options (Tier-3, operator/LLM-supplied)",
@@ -424,6 +439,51 @@ def _find_identity_node_advisories(state: CompositionState) -> list[_IdentityFin
                 upstream_id=upstream_id,
                 sink_name=sink.name,
                 sink_schema_mode=sink_schema_mode,
+            )
+        )
+    return findings
+
+
+@observation_boundary(
+    tier=3,
+    source="composer-authored CompositionState gate routes (Tier-3, operator/LLM-supplied)",
+    source_param="state",
+    suppresses=("R5",),
+    invariant="returns advisory findings for resolved legal fan-out shapes and never raises on malformed authored routes",
+)
+def _find_gate_fan_out_advisories(state: CompositionState) -> list[_GateFanOutFinding]:
+    """Detect constant gates that deliver every row to the same outputs.
+
+    The legal fan-out macro and a dropped routing condition have the same graph
+    shape, so this remains advisory. Per-branch work and barrier rejoins are
+    differentiated uses and are excluded.
+    """
+    consumed: set[str] = set()
+    for node in state.nodes:
+        if node.node_type in ("coalesce", "row_union"):
+            consumed.update(_coalesce_branch_names(node.branches))
+            consumed.update(_coalesce_branch_connections(node.branches))
+        elif node.input:
+            consumed.add(node.input)
+
+    findings: list[_GateFanOutFinding] = []
+    for node in state.nodes:
+        if node.node_type != "gate" or node.plugin is not None:
+            continue
+        if node.condition is None or not gate_condition_is_constant(node.condition):
+            continue
+        if node.routes is None or set(node.routes) != {"true", "false"}:
+            continue
+        destinations = gate_route_destinations(node, node.routes["true"])
+        if destinations != gate_route_destinations(node, node.routes["false"]):
+            continue
+        if len(destinations) < 2 or destinations & consumed:
+            continue
+        findings.append(
+            _GateFanOutFinding(
+                node_id=node.id,
+                condition=node.condition,
+                destinations=tuple(sorted(destinations)),
             )
         )
     return findings

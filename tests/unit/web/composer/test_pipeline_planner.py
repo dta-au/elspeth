@@ -39,6 +39,7 @@ from elspeth.web.composer.guided.planning import guided_redacted_current_state_c
 from elspeth.web.composer.guided.prompts import load_step_planner_skill
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.pipeline_planner import (
+    _REPEAT_NOTICE,
     PLANNER_DISCOVERY_TOOL_NAMES,
     PipelinePlannerError,
     PlannerBudgetPolicy,
@@ -599,6 +600,7 @@ async def _plan(
     claim_evaluator: Any = None,
     rendered_skill: str | None = None,
     supersedes_draft_hash: str | None = None,
+    candidate_finalizer: Any = None,
 ) -> Any:
     # Candidate validation needs the real plugin contracts.  ``tool_context``
     # remains in the test signature so the standard composer fixture proves
@@ -616,6 +618,7 @@ async def _plan(
         ),
         reviewed_facts={"request": "Build the requested pipeline."},
         reviewed_planner_context={"request": "Build the requested pipeline."},
+        unproducible_output_fields=(),
         eligible_deferred_intent_ids=eligible_deferred_intent_ids,
         claim_evaluator=claim_evaluator,
         supersedes_draft_hash=supersedes_draft_hash,
@@ -632,7 +635,7 @@ async def _plan(
         custody_config=custody_config or _custody(tmp_path),
         lifecycle=lifecycle or _lifecycle(),
         recorder=recorder or BufferingRecorder(),
-        candidate_finalizer=lambda candidate: candidate,
+        candidate_finalizer=candidate_finalizer or (lambda candidate: candidate),
     )
 
 
@@ -3128,6 +3131,211 @@ async def test_pydantic_invalid_terminal_draft_gets_bounded_schema_repair(
     }
 
 
+_CANONICAL_SCHEMA_FEEDBACK = {
+    "success": False,
+    "validation": {
+        "is_valid": False,
+        "errors": [
+            {
+                "component": "pipeline",
+                "severity": "high",
+                "error_code": "canonical_schema",
+                "error_class": "SchemaValidationError",
+            }
+        ],
+    },
+}
+
+
+def _missing_source_feedback() -> dict[str, Any]:
+    explanation, suggested_fix = explain_validation_code("no_source_configured") or ("", "")
+    return {
+        "success": False,
+        "validation": {
+            "is_valid": False,
+            "errors": [
+                {
+                    "component": "rejected_mutation",
+                    "severity": "high",
+                    "error_code": "no_source_configured",
+                    "error_class": "ValidationError",
+                    "explanation": explanation,
+                    "suggested_fix": suggested_fix,
+                }
+            ],
+        },
+        "guidance": "To expand any code, call explain_validation_error with the exact code string.",
+    }
+
+
+def _sourceless_pipeline(data_dir: Path) -> dict[str, Any]:
+    """A terminal candidate naming no source at all.
+
+    Legal against the terminal schema: ``SetPipelineArgumentsModel`` leaves
+    both ``source`` and ``sources`` optional, so a re-plan "delta" candidate
+    that drops the source block validates and reaches the finalizer.
+    """
+    pipeline = _pipeline(data_dir)
+    del pipeline["source"]
+    return pipeline
+
+
+def _binder_style_finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Stand in for ``bind_guided_reviewed_components``'s sources contract."""
+    if candidate.get("sources") is None and candidate.get("source") is None:
+        raise AuditIntegrityError("guided planner candidate does not identify reviewed sources")
+    return candidate
+
+
+@pytest.mark.asyncio
+async def test_freeform_sources_omitted_candidate_gets_bounded_no_source_repair(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Characterize the repair the freeform surface already produces.
+
+    Pins the exact feedback the guided surface must match — the parity the
+    planner-side guard preserves rather than replacing with a bare schema
+    complaint.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    assert proposal.proposal.repair_count == 1
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _missing_source_feedback()
+
+
+@pytest.mark.asyncio
+async def test_guided_sources_omitted_candidate_gets_bounded_repair_not_integrity_error(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A sources-free candidate is an authoring slip, not an integrity breach.
+
+    The guided binder answers that shape with ``AuditIntegrityError``; before
+    the planner-side guard that error escaped the loop as a terminal 500
+    (elspeth-bcc6bdac99) instead of one budgeted repair turn.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        candidate_finalizer=_binder_style_finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 1
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _missing_source_feedback()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("surface", "finalizer"),
+    [
+        (PlannerSurface.FREEFORM, None),
+        (PlannerSurface.GUIDED_STAGED, _binder_style_finalizer),
+    ],
+)
+async def test_repeated_sources_omitted_candidate_draws_the_repeat_notice(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    surface: PlannerSurface,
+    finalizer: Any,
+) -> None:
+    """A re-emitted sourceless candidate is told it changed nothing.
+
+    Rejecting the shape in the planner loop must not drop it out of rejection
+    fingerprinting: an identical rejection repeating across attempts is a
+    feedback-quality defect the loop has to name, not silently burn budget on.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _sourceless_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=2,
+        surface=surface,
+        candidate_finalizer=finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 2
+    first = json.loads(completion.requests[1]["messages"][-1]["content"])
+    second = json.loads(completion.requests[2]["messages"][-1]["content"])
+    assert first == _missing_source_feedback()
+    assert second == {**_missing_source_feedback(), "repeat_notice": _REPEAT_NOTICE}
+
+
+@pytest.mark.asyncio
+async def test_binder_candidate_shape_defect_gets_bounded_schema_repair(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Every remaining binder candidate-shape defect is repairable too."""
+    attempts: list[Mapping[str, Any]] = []
+
+    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        attempts.append(candidate)
+        if len(attempts) == 1:
+            raise AuditIntegrityError("guided planner candidate sources differ from reviewed authority")
+        return candidate
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        candidate_finalizer=finalizer,
+    )
+
+    assert proposal.proposal.repair_count == 1
+    assert len(attempts) == 2
+    assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _CANONICAL_SCHEMA_FEEDBACK
+
+
+@pytest.mark.asyncio
+async def test_finalizer_integrity_error_outside_candidate_shape_stays_terminal(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A genuine integrity breach is never downgraded into repair feedback."""
+
+    def finalizer(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        raise AuditIntegrityError("reviewed source authority hash does not match the sealed session")
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    with pytest.raises(AuditIntegrityError, match="reviewed source authority hash"):
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            surface=PlannerSurface.GUIDED_STAGED,
+            candidate_finalizer=finalizer,
+        )
+
+
 @pytest.mark.asyncio
 async def test_reported_completion_token_overage_is_audited_then_rejected(
     tmp_path: Path,
@@ -5029,3 +5237,231 @@ async def test_planner_summary_on_exhaustion_carries_the_full_code_history(
     # BOTH rounds' codes survive — the blindspot this trail exists to close.
     assert [entry["attempt"] for entry in summary["rejection_history"]] == [1, 2]
     assert all(entry["codes"] for entry in summary["rejection_history"])
+
+
+# ── Stated-threshold fidelity guard (R2-F17, elspeth-5c0c09db31) ────────────
+
+
+def _pipeline_with_constant_gate(data_dir: Path) -> dict[str, Any]:
+    """A VALID fan-out plan: one constant-condition gate forking to two sinks.
+
+    This is the shape acceptance run 2 got when it asked for ``amount > 500``
+    routing — and it is also the shape ``pipeline_composer.md`` teaches for
+    genuine dual outputs. Only the instruction tells the two apart.
+    """
+    pipeline = _pipeline(data_dir)
+    pipeline["nodes"] = [
+        {
+            "id": "split",
+            "node_type": "gate",
+            "input": "rows",
+            "condition": "True",
+            "routes": {"true": "fork", "false": "fork"},
+            "fork_to": ["high_value", "standard"],
+        }
+    ]
+    pipeline["outputs"] = [
+        {
+            "sink_name": name,
+            "plugin": "json",
+            "options": {
+                "path": f"outputs/{name}.jsonl",
+                "schema": {"mode": "observed"},
+                "format": "jsonl",
+                "mode": "write",
+                "collision_policy": "auto_increment",
+            },
+            "on_write_failure": "discard",
+        }
+        for name in ("high_value", "standard")
+    ]
+    return pipeline
+
+
+def _pipeline_with_conditional_gate(data_dir: Path) -> dict[str, Any]:
+    pipeline = _pipeline_with_constant_gate(data_dir)
+    pipeline["nodes"][0]["condition"] = "row['amount'] > 500"
+    pipeline["nodes"][0]["routes"] = {"true": "high_value", "false": "standard"}
+    del pipeline["nodes"][0]["fork_to"]
+    return pipeline
+
+
+class TestStatedThresholdDetector:
+    """False-positive posture: the detector fires only on a real comparison."""
+
+    @pytest.mark.parametrize(
+        ("instruction", "expected"),
+        [
+            ("Route rows with amount > 500 to high_value.", "amount > 500"),
+            ("Send rows where score>=0.85 to the review sink.", "score>=0.85"),
+            ("Anything greater than 500 goes to high_value.", "greater than 500"),
+            ("Rows at least 10 dollars go to paid.", "at least 10"),
+            ("Split on amount below 100.", "below 100"),
+        ],
+    )
+    def test_comparison_language_is_detected(self, instruction: str, expected: str) -> None:
+        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
+
+        assert _stated_threshold_in(instruction) == expected
+
+    @pytest.mark.parametrize(
+        "instruction",
+        [
+            # Comparison wording bound to a number, but about a LIMIT, not a
+            # route. Firing here would tell a model to author a gate condition
+            # for a pipeline that never asked for one — and a compliant model
+            # would turn a correct fan-out into a wrong pipeline. Under a
+            # repair_budget of 1 that is REPAIR_EXHAUSTED with no proposal.
+            "Summarise each row in under 50 words, then fan out to both sinks.",
+            "Truncate descriptions over 40 characters and write both copies.",
+            "Keep at most 100 rows and fan every row out to both sinks.",
+            "Use a temperature below 0.5 for the summariser.",
+            # The same limit prose alongside a REAL routing verb from
+            # _ROUTING_INTENT_PATTERN — the cases the disjoint-vocabulary
+            # negatives above never exercise. Two independent defences must
+            # hold: the unit noun after the number, and the clause boundary
+            # between the limit and the routing verb.
+            "Summarise each row in under 50 words and send the results to the sink.",
+            "Split the rows into two sinks and keep at most 100 rows.",
+            "Split into more than 2 branches.",
+            "Route the summary (limit under 50 words) to both sinks.",
+            # Clause separation alone, with a unit noun that is not listed.
+            "Summarise in under 50 milliseconds. Route every row to both sinks.",
+        ],
+    )
+    def test_limit_prose_is_not_read_as_a_routing_threshold(self, instruction: str) -> None:
+        """Three halves must hold: a comparison, routing intent, same clause, no unit noun."""
+        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
+
+        assert _stated_threshold_in(instruction) is None
+
+    @pytest.mark.parametrize(
+        "instruction",
+        [
+            "Fan out every row to both sinks.",
+            "Wire the source -> summarise -> json sink.",
+            "Add the transform above the gate.",
+            "Summarise each row and write the result.",
+            "",
+        ],
+    )
+    def test_prose_without_a_threshold_is_not_detected(self, instruction: str) -> None:
+        from elspeth.web.composer.pipeline_planner import _stated_threshold_in
+
+        assert _stated_threshold_in(instruction) is None
+
+
+@pytest.mark.asyncio
+async def test_constant_gate_against_a_stated_threshold_gets_one_coded_nudge_then_valve(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """AWS acceptance run 2, R2-F17: the stated threshold never reached the gate.
+
+    Asked to route on ``amount > 500``, the planner authored a constant-condition
+    fan-out that would write every row to BOTH sinks. The shape is legal, so it
+    draws ONE coded repair naming the comparison verbatim; re-emitting the same
+    pipeline is the valve for a genuinely intended fan-out.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Add a gate that routes rows with amount > 500 to high_value and every other row to standard.",
+    )
+
+    assert proposal.proposal.repair_count == 1
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    assert feedback["success"] is False
+    codes = [error["error_code"] for error in feedback["validation"]["errors"]]
+    assert codes == ["gate_condition_ignores_stated_threshold"]
+    error = feedback["validation"]["errors"][0]
+    assert error["explanation"]
+    assert error["suggested_fix"]
+    # The comparison the operator stated, verbatim — without it the planner
+    # cannot author the condition it dropped.
+    assert "amount > 500" in error["detail"]
+
+
+@pytest.mark.asyncio
+async def test_fan_out_instruction_without_a_threshold_is_never_nudged(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The documented fan-out macro must pass untouched — both halves must hold."""
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Fan every row out to both the high_value and standard sinks.",
+    )
+
+    assert proposal.proposal.repair_count == 0
+
+
+@pytest.mark.asyncio
+async def test_authored_condition_satisfies_the_stated_threshold(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A candidate that DID author the condition is accepted first time."""
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_conditional_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Add a gate that routes rows with amount > 500 to high_value and every other row to standard.",
+    )
+
+    assert proposal.proposal.repair_count == 0
+
+
+@pytest.mark.asyncio
+async def test_threshold_guard_reads_the_current_stage_intent_not_the_message_transcript(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Guided-staged provenance: earlier-stage text must not trip a later stage.
+
+    ``sessions/routes/composer/guided.py:3263-3268`` deliberately splits the
+    two: ``planner_intent`` is the CURRENT stage's instruction alone, while the
+    root-plus-instruction concatenation goes to
+    ``PlannerOriginatingMessage.content``. The guard reads ``intent``, so a
+    threshold stated at an earlier stage cannot reject a later stage's legal
+    fan-out. Pinned here because the split lives in a route, one refactor away
+    from being "simplified" into a single concatenated string.
+    """
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        intent="Fan every row out to both the high_value and standard sinks.",
+        originating_message=PlannerOriginatingMessage(
+            session_id=_TEST_SESSION_ID,
+            message_id="00000000-0000-4000-8000-000000000001",
+            content=(
+                "Route rows with amount > 500 to high_value and everything else to standard.\n\n"
+                "Fan every row out to both the high_value and standard sinks."
+            ),
+            user_id="user-1",
+        ),
+    )
+
+    assert proposal.proposal.repair_count == 0

@@ -845,6 +845,11 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._attempt_preflight_repair:llm_messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._maybe_run_early_checkpoint:llm_messages (list)"
   - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_checkpoint_arguments:return"
+  # R2-F14 (elspeth-5403f346c0): the format-retry helper returns a COPY of that
+  # same checkpoint-argument dict with the verdict-format re-prompt appended to
+  # ``problem_summary``. Identical shape, identical rationale — it cannot be a
+  # TypedDict without ``_build_checkpoint_arguments`` becoming one first.
+  - "src/elspeth/web/composer/service.py:_advisor_arguments_with_format_reprompt:return"
   # Guided chat audit records hash the exact LiteLLM/OpenAI chat-completion
   # message list sent to the provider. The payload shape is the provider API
   # boundary ({role, content, optional tool fields}) and is intentionally open.
@@ -1022,6 +1027,10 @@ allowed_dict_patterns:
   - "src/elspeth/web/composer/guided/profile.py:WorkflowProfile.from_dict:d"
   - "src/elspeth/web/composer/guided/_discovery.py:_assistant_tool_calls_message:return"
   - "src/elspeth/web/composer/guided/_discovery.py:_execute_discovery_call:return"
+  # Retain-repair thread: OpenAI/LiteLLM wire-shape provider messages
+  # (assistant tool-call turn + role=tool results), same shape family as
+  # _assistant_tool_calls_message above.
+  - "src/elspeth/web/composer/guided/chat_solver.py:_deferred_intent_repair_thread:return (list)"
   - "src/elspeth/web/composer/tools/_dispatch.py:get_discovery_tool_definitions:return (list)"
   - "src/elspeth/web/composer/tools/_dispatch.py:_closed_root_schema:return"
   # Current branch reconciliation: intentional heterogeneous telemetry,

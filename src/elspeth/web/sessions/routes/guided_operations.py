@@ -134,21 +134,56 @@ def guided_response_hash(response: BaseModel) -> str:
     return stable_hash(strict_response.model_dump(mode="json"))
 
 
-def raise_guided_operation_failure(outcome: GuidedOperationFailed) -> Never:
-    """Raise the closed HTTP failure represented by a terminal operation."""
+def raise_guided_operation_failure(
+    outcome: GuidedOperationFailed,
+    *,
+    unproducible_output_fields: tuple[str, ...] = (),
+) -> Never:
+    """Raise the closed HTTP failure represented by a terminal operation.
+
+    ``unproducible_output_fields`` names the reviewed output fields no reviewed
+    source declares or observes, when the planner exhausted its budget on a
+    request that carried that gap (R2-F4). Without it the operator reads only
+    "the provider returned an invalid response" — a dead end — while the server
+    holds the exact, actionable cause. Guided-only by construction: freeform has
+    no reviewed output, so the mirrored freeform table in
+    ``routes/_helpers.py::_FREEFORM_PLANNER_FAILURE_HTTP`` deliberately has no
+    counterpart. That is the same guided-only divergence as "highlighted" in the
+    ``policy_blocked`` copy, and for the same reason — this surface knows a fact
+    the other cannot.
+
+    The names are the operator's own step-2 ``custom_inputs`` strings (field
+    review admits ``chosen`` only from the reviewed sources' observed columns
+    and forbids custom names from overlapping them), so returning them to the
+    same operator discloses nothing. They ride BOTH as a structured field for
+    API consumers and appended to ``detail``, because the web client projects
+    only a fixed set of envelope keys and would otherwise drop the structured
+    form silently.
+    """
 
     safe = _SAFE_FAILURES.get(outcome.failure_code)
     if safe is None:
         raise AuditIntegrityError("Guided operation returned an unknown failure code")
+    if type(unproducible_output_fields) is not tuple or any(type(field) is not str for field in unproducible_output_fields):
+        raise TypeError("unproducible_output_fields must be an exact string tuple")
     status_code, detail = safe
-    raise HTTPException(
-        status_code=status_code,
-        detail={
-            "error_type": "guided_operation_terminal_failure",
-            "failure_code": outcome.failure_code,
-            "detail": detail,
-        },
-    )
+    body: dict[str, object] = {
+        "error_type": "guided_operation_terminal_failure",
+        "failure_code": outcome.failure_code,
+        "detail": detail,
+    }
+    if unproducible_output_fields:
+        body["unproducible_output_fields"] = list(unproducible_output_fields)
+        # States only what is known — that nothing reviewed supplies these
+        # fields — never that the pipeline "would fail at runtime", which this
+        # surface cannot prove for a source whose field inventory is unknown
+        # rather than empty.
+        body["detail"] = (
+            f"{detail} No reviewed source declares or observes these output fields: "
+            f"{', '.join(unproducible_output_fields)}. Add a step that produces them, or remove them "
+            "from the output's fields."
+        )
+    raise HTTPException(status_code=status_code, detail=body)
 
 
 async def _replay_completed[ResponseT: BaseModel](
