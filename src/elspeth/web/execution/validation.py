@@ -1037,18 +1037,19 @@ def validate_pipeline(
                 path_checked = True
                 resolved = resolve_data_path(value, str(settings.data_dir))
                 if not any(resolved.is_relative_to(d) for d in allowed_source_dirs):
+                    checks.append(
+                        ValidationCheck(
+                            name=_CHECK_PATH_ALLOWLIST,
+                            passed=False,
+                            detail=f"Source '{source_name}' {key} '{value}' is outside allowed source directories",
+                            affected_nodes=(source_component,),
+                            outcome_code=None,
+                        )
+                    )
+                    _append_skipped_checks(checks, _CHECK_PATH_ALLOWLIST)
                     return ValidationResult(
                         is_valid=False,
-                        checks=[
-                            ValidationCheck(
-                                name=_CHECK_PATH_ALLOWLIST,
-                                passed=False,
-                                detail=f"Source '{source_name}' {key} '{value}' is outside allowed source directories",
-                                affected_nodes=(source_component,),
-                                outcome_code=None,
-                            ),
-                            *_skipped_checks(_CHECK_PATH_ALLOWLIST),
-                        ],
+                        checks=checks,
                         errors=[
                             ValidationError(
                                 component_id=source_component,
@@ -1076,18 +1077,19 @@ def validate_pipeline(
                 path_checked = True
                 resolved = resolve_sink_data_path(value, str(settings.data_dir), session_id=session_id)
                 if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
+                    checks.append(
+                        ValidationCheck(
+                            name=_CHECK_PATH_ALLOWLIST,
+                            passed=False,
+                            detail=f"Sink '{output.name}' {key} '{value}' is outside allowed output directories",
+                            affected_nodes=(),
+                            outcome_code=None,
+                        )
+                    )
+                    _append_skipped_checks(checks, _CHECK_PATH_ALLOWLIST)
                     return ValidationResult(
                         is_valid=False,
-                        checks=[
-                            ValidationCheck(
-                                name=_CHECK_PATH_ALLOWLIST,
-                                passed=False,
-                                detail=f"Sink '{output.name}' {key} '{value}' is outside allowed output directories",
-                                affected_nodes=(),
-                                outcome_code=None,
-                            ),
-                            *_skipped_checks(_CHECK_PATH_ALLOWLIST),
-                        ],
+                        checks=checks,
                         errors=[
                             ValidationError(
                                 component_id=output.name,
@@ -1121,18 +1123,19 @@ def validate_pipeline(
                 path_checked = True
                 resolved = resolve_sink_data_path(value, str(settings.data_dir), session_id=session_id)
                 if not any(resolved.is_relative_to(d) for d in allowed_sink_dirs):
+                    checks.append(
+                        ValidationCheck(
+                            name=_CHECK_PATH_ALLOWLIST,
+                            passed=False,
+                            detail=f"Transform '{node.id}' {key} '{value}' is outside allowed output directories",
+                            affected_nodes=(),
+                            outcome_code=None,
+                        )
+                    )
+                    _append_skipped_checks(checks, _CHECK_PATH_ALLOWLIST)
                     return ValidationResult(
                         is_valid=False,
-                        checks=[
-                            ValidationCheck(
-                                name=_CHECK_PATH_ALLOWLIST,
-                                passed=False,
-                                detail=f"Transform '{node.id}' {key} '{value}' is outside allowed output directories",
-                                affected_nodes=(),
-                                outcome_code=None,
-                            ),
-                            *_skipped_checks(_CHECK_PATH_ALLOWLIST),
-                        ],
+                        checks=checks,
                         errors=[
                             ValidationError(
                                 component_id=node.id,

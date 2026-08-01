@@ -203,6 +203,19 @@ def _check(result, name: str):
     return next(c for c in result.checks if c.name == name)
 
 
+def _assert_complete_failure_ledger(result: Any, failed_name: str) -> None:
+    from elspeth.web.execution.schemas import VALIDATION_BLOCKING_CHECK_NAMES
+
+    assert [check.name for check in result.checks] == list(VALIDATION_BLOCKING_CHECK_NAMES)
+    failed_index = VALIDATION_BLOCKING_CHECK_NAMES.index(failed_name)
+    assert all(check.passed for check in result.checks[:failed_index])
+    assert result.checks[failed_index].passed is False
+    assert result.checks[failed_index].outcome_code is None
+    assert all(
+        check.passed is False and check.outcome_code == CHECK_OUTCOME_SKIPPED_AFTER_FAILURE for check in result.checks[failed_index + 1 :]
+    )
+
+
 def test_disabled_plugin_fails_before_constructor() -> None:
     """Policy rejection is the first non-empty-state check and precedes runtime construction."""
     from elspeth.web.dependencies import create_catalog_service
@@ -771,6 +784,35 @@ class TestValidatePipelineMissingPartReframe:
 
 class TestValidatePipelinePathAllowlist:
     """C3/S2: Source path allowlist check — defense-in-depth."""
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            _make_state(source_options={"path": "/outside/source.csv"}),
+            _make_state(
+                source_options={},
+                outputs=(_make_output(options={"path": "/outside/sink.csv"}),),
+            ),
+            _make_state(
+                source_options={},
+                nodes=(
+                    _make_node(
+                        plugin="rag_retrieval",
+                        options={
+                            "provider": "chroma",
+                            "provider_config": {"persist_directory": "/outside/chroma"},
+                        },
+                    ),
+                ),
+            ),
+        ],
+        ids=("source-path", "sink-path", "nested-transform-persist-directory"),
+    )
+    def test_path_failure_preserves_complete_ordered_ledger(self, state: CompositionState) -> None:
+        result = validate_pipeline_for_trained_operator(state, _make_settings(), _FakeYamlGenerator())
+
+        assert result.is_valid is False
+        _assert_complete_failure_ledger(result, "path_allowlist")
 
     def test_path_within_blobs_passes(self) -> None:
         state = _make_state(

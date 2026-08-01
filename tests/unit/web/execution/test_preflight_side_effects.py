@@ -419,9 +419,9 @@ def test_validate_pipeline_rejects_chroma_persist_directory_outside_data_dir(tmp
     )
 
     assert result.is_valid is False
-    assert result.checks[0].name == "path_allowlist"
-    assert result.checks[0].passed is False
-    assert "persist_directory" in result.checks[0].detail
+    path_check = next(check for check in result.checks if check.name == "path_allowlist")
+    assert path_check.passed is False
+    assert "persist_directory" in path_check.detail
 
 
 def test_runtime_mode_default_does_not_enable_preflight_context(
