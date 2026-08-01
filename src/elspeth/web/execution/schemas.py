@@ -91,6 +91,11 @@ CHECK_IDENTITY_NODE_ADVISORY: Final[ValidationCheckName] = "identity_node_adviso
 CHECK_GATE_FAN_OUT_ADVISORY: Final[ValidationCheckName] = "gate_fan_out_advisory"
 CHECK_STATE_EXISTS: Final[ValidationCheckName] = "state_exists"
 CHECK_ADVISOR_SIGNOFF: Final[ValidationCheckName] = "advisor_signoff"
+# Readiness-blocker code for a withheld advisor sign-off. Single-sourced here
+# so the composer finalizer, the persisted gate-fact merge
+# (execution/completion_gates.py), and the frontend routing discriminant
+# cannot drift.
+ADVISOR_SIGNOFF_BLOCKED_CODE: Final[str] = "advisor_signoff_blocked"
 CHECK_PROOF_DIAGNOSTICS: Final[ValidationCheckName] = "proof_diagnostics"
 
 VALIDATION_BLOCKING_CHECK_NAMES: tuple[ValidationCheckName, ...] = (

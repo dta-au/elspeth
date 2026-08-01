@@ -165,6 +165,7 @@ from elspeth.web.execution.runtime_preflight import (
     RuntimePreflightKey,
 )
 from elspeth.web.execution.schemas import (
+    ADVISOR_SIGNOFF_BLOCKED_CODE,
     CHECK_ADVISOR_SIGNOFF,
     CHECK_INTERPRETATION_REVIEW,
     CHECK_PROOF_DIAGNOSTICS,
@@ -6813,7 +6814,7 @@ def _render_interpolated_row_fields(node: NodeSpec) -> str:
 # ``_orphaned_interpretation_review_validation``. The method that consumes it
 # (``ComposerServiceImpl._advisor_blocked_result``) lives in the class body.
 # ---------------------------------------------------------------------------
-_ADVISOR_SIGNOFF_BLOCKED_CODE: Final[str] = "advisor_signoff_blocked"
+_ADVISOR_SIGNOFF_BLOCKED_CODE: Final[str] = ADVISOR_SIGNOFF_BLOCKED_CODE
 # Mirrors the orphan gate's check-name convention so the synthetic fail-closed
 # result names a stable check the UI/audit can key on.
 _ADVISOR_SIGNOFF_BLOCKED_CHECK_NAME: Final[ValidationCheckName] = CHECK_ADVISOR_SIGNOFF
