@@ -13,6 +13,8 @@ from elspeth.web.execution._validation_model import (
     InstantiatedRuntime,
     LoadedRuntime,
     MaterializedYaml,
+    PhaseFailure,
+    PhaseReport,
     PolicyLoweredState,
 )
 from elspeth.web.execution.schemas import (
@@ -150,6 +152,46 @@ def test_core_names_are_the_24_name_canonical_prefix() -> None:
     assert CORE_VALIDATION_CHECK_NAMES[-1] == "schema_compatibility"
 
 
+def test_phase_report_snapshots_caller_owned_checks_on_construction() -> None:
+    check = _check(CHECK_PLUGIN_ENABLEMENT, passed=True)
+
+    report = PhaseReport(artifact="artifact", checks=(check,))
+    check.detail = "mutated caller-owned check"
+    check.affected_nodes = ("mutated",)
+
+    assert report.checks[0].detail == "plugin_enablement passed"
+    assert report.checks[0].affected_nodes == ()
+
+
+def test_phase_failure_snapshots_all_caller_owned_evidence_on_construction() -> None:
+    passed_check = _check(CHECK_PLUGIN_ENABLEMENT, passed=True)
+    failed_check = _check("operator_profile_options", passed=False)
+    error = _error("blocked")
+    readiness = _blocked_readiness()
+    semantic_contract = _semantic_contract()
+
+    failure = PhaseFailure(
+        passed_checks=(passed_check,),
+        failed_check=failed_check,
+        errors=(error,),
+        readiness=readiness,
+        semantic_contracts=(semantic_contract,),
+    )
+    passed_check.detail = "mutated pass"
+    failed_check.detail = "mutated failure"
+    error.message = "mutated error"
+    readiness.blockers[0].detail = "mutated blocker"
+    readiness.blockers.clear()
+    semantic_contract.outcome = "conflict"
+
+    assert failure.passed_checks[0].detail == "plugin_enablement passed"
+    assert failure.failed_check.detail == "operator_profile_options failed"
+    assert failure.errors[0].message == "blocked"
+    assert len(failure.readiness.blockers) == 1
+    assert failure.readiness.blockers[0].detail == "Validation failed."
+    assert failure.semantic_contracts[0].outcome == "satisfied"
+
+
 def test_finish_failure_preserves_prefix_and_completes_canonical_cascade() -> None:
     ledger = ValidationLedger()
     ledger.record_pass(_check("plugin_enablement", passed=True))
@@ -190,6 +232,19 @@ def test_record_pass_snapshots_the_mutable_check() -> None:
     assert result.checks[0].affected_nodes == ()
 
 
+def test_checks_returns_an_immutable_deep_snapshot_for_incremental_phase_migration() -> None:
+    ledger = ValidationLedger()
+    original = _check(CHECK_PLUGIN_ENABLEMENT, passed=True)
+    ledger.record_pass(original)
+
+    snapshot = ledger.checks
+    original.detail = "mutated original"
+    snapshot[0].detail = "mutated snapshot"
+
+    assert isinstance(snapshot, tuple)
+    assert ledger.checks[0].detail == "plugin_enablement passed"
+
+
 def test_finish_failure_snapshots_all_mutable_inputs() -> None:
     ledger = ValidationLedger()
     failed_check = _check(CHECK_PLUGIN_ENABLEMENT, passed=False)
@@ -216,6 +271,23 @@ def test_finish_failure_snapshots_all_mutable_inputs() -> None:
     assert len(result.readiness.blockers) == 1
     assert result.readiness.blockers[0].detail == "Validation failed."
     assert result.semantic_contracts[0].outcome == "satisfied"
+
+
+def test_finish_failure_result_mutation_does_not_flow_back_into_ledger() -> None:
+    ledger = ValidationLedger()
+    result = ledger.finish_failure(
+        _check(CHECK_PLUGIN_ENABLEMENT, passed=False),
+        errors=(_error("blocked"),),
+        readiness=_blocked_readiness(),
+    )
+
+    result.checks[0].detail = "mutated terminal result"
+    result.checks[-1].affected_nodes = ("mutated",)
+    result.errors[0].message = "mutated terminal error"
+
+    assert ledger.checks[0].detail == "plugin_enablement failed"
+    assert ledger.checks[-1].affected_nodes == ()
+    assert ledger._errors[0].message == "blocked"
 
 
 def test_duplicate_core_name_raises() -> None:
@@ -330,6 +402,18 @@ def test_finish_success_snapshots_all_mutable_inputs() -> None:
     assert result.readiness.blockers == []
     assert result.warnings[0].message == "Graph warning."
     assert result.semantic_contracts[0].outcome == "satisfied"
+
+
+def test_finish_success_result_mutation_does_not_flow_back_into_ledger() -> None:
+    ledger = ValidationLedger()
+    _record_all_core_passes(ledger)
+
+    result = ledger.finish_success(readiness=_ready_readiness())
+    result.checks[0].detail = "mutated terminal result"
+    result.checks[-1].affected_nodes = ("mutated",)
+
+    assert ledger.checks[0].detail == "plugin_enablement passed"
+    assert ledger.checks[-1].affected_nodes == ()
 
 
 @pytest.mark.parametrize(
