@@ -12,11 +12,13 @@ security). Companion to
 No Critical findings and a coherent net tightening of the security posture,
 but three Important cross-task interaction defects — each a composition of two
 individually-clean tasks — plus one confirmed P1 residual must land first. All
-are small and localized.
+are small and localized. (The fourth item, the runbook-contract failure, is
+already fixed — see below.)
 
 **Reconciliation suite:** 35,620 passed / 27 skipped / 1 xfailed / **1 failed**
-(12m12s, `-n 12`). The failure is the runbook-contract test tripped by T21's
-direct `aws logs delete-log-group`; fix in flight.
+(12m12s, `-n 12`). The failure was the runbook-contract test tripped by T21's
+direct `aws logs delete-log-group`; **fixed in `853dd2dfb`**, contract suite
+now 50/50.
 
 ## Fix wave — must land before soft launch
 
@@ -43,9 +45,14 @@ direct `aws logs delete-log-group`; fix in flight.
    case it discards a parsed-valid retain and mislabels it "unavailable" — a
    residual breach of R2-F15's (P1) own guarantee. Same pattern at
    chat_solver.py:213. One-liners; fix together.
-4. **Runbook-contract failure** — in flight, reframed to add the missing
-   "capture but tolerate one named expected error" capability rather than
-   contorting the code or weakening the contract.
+4. ~~**Runbook-contract failure**~~ — **DONE** (`853dd2dfb`). Resolved by
+   reusing an existing sanctioned idiom rather than new machinery: the
+   cleanup now follows `delete_ecr_tag`'s check-then-act pattern
+   (`aws_capture describe-log-groups` → exact-name count → capture-routed
+   delete only when present). Absence is a normal data condition; real
+   failures (AccessDenied, throttling) now propagate into `cleanup_failures`
+   and gate the run's exit code — which also closes the blanket-`|| true`
+   swallow-all-errors minor. Contract suite 50/50, package tests 61/61.
 
 ## Ships as tracked debt
 

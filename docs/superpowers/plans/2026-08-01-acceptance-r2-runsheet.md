@@ -56,10 +56,10 @@ implemented by a fresh subagent and reviewed (spec + quality) before the next.
 | Reconcile with 2 external chips — MERGED into composer branch (602243b8d); T2 coverage semantics verified reachable; local-only multi-query chip pushed to origin | ✅ |
 | Chip 3 in flight: persist composer readiness (from T8's discovery) — reconcile at merge; EPOCH HAZARD: may bump 40→41 colliding with T18's bump — resolve to coherent sequence | 🔵 running |
 | Single SESSION_SCHEMA_EPOCH bump 40→41 | ✅ verified: one bump, zero doc stragglers, drift test-pinned |
-| Full `pytest tests/ -n 12` + lints | 🟡 35620 passed / 1 failed (T21 runbook contract) — fix in flight |
+| Full `pytest tests/ -n 12` + lints | ✅ 35620 passed; sole failure fixed (853dd2dfb), contract suite 50/50 |
 | Final whole-branch review (most capable model) | ✅ **SHIP WITH FIXES** — [verdict](2026-08-01-acceptance-r2-final-review.md); 4-item fix wave |
 | ⏸️ **OPERATOR PAUSE POINT — REACHED, handed back** (2026-08-01 directive) | ✅ |
-| Fix wave (4 items from the final review) — awaiting operator go | ⬜ |
+| Fix wave — 3 remaining items (item 4 done in 853dd2dfb) — awaiting operator go | ⬜ |
 | Local staging e2e smoke (elspeth.foundryside.dev): rebuild, wipe DB, Playwright-verify composer fixes | ⬜ |
 | Rebuild images, redeploy stack (wipes sessions.db) | ⬜ |
 | Full 10-exercise live re-run incl. ex 6/7/9/10 | ⬜ |
