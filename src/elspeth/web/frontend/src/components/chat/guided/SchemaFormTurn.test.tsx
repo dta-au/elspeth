@@ -976,4 +976,107 @@ describe("SchemaFormTurn", () => {
       expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
     });
   });
+
+  // A blob uploaded AFTER this form was emitted (elspeth-c70909c13a): the turn
+  // payload is immutable replay authority, so the late upload can only land in
+  // the form's local draft — exactly the value the user would legally type.
+  // Mirrors the backend's upload-first prefill (_merge_inspection_into_prefill):
+  // path = blob:<id> plus on_validation_failure = discard.
+  describe("late-upload path prefill (sourceFormPathPrefill)", () => {
+    const BLOB_ID = "3e80ec24-392f-4862-ad22-ace24502c0bc";
+    const prefillBlob = { id: BLOB_ID, filename: "demo.csv", sizeBytes: 204 };
+
+    function pathFields(): KnobField[] {
+      return [
+        field({ name: "path", label: "Path", kind: "blob-ref", required: true }),
+        field({ name: "on_validation_failure", label: "On Validation Failure", kind: "text", required: true }),
+      ];
+    }
+
+    it("fills an empty path and validation routing from the uploaded blob", async () => {
+      const user = userEvent.setup();
+      const onSubmit = vi.fn();
+      render(
+        <SchemaFormTurn
+          payload={pluginPayload(pathFields())}
+          onSubmit={onSubmit}
+          sourceFormPathPrefill={prefillBlob}
+        />,
+      );
+
+      const continueButton = screen.getByRole("button", { name: "Continue" });
+      expect(continueButton).toBeEnabled();
+      await user.click(continueButton);
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          edited_values: {
+            plugin: "example",
+            options: { path: `blob:${BLOB_ID}`, on_validation_failure: "discard" },
+          },
+        }),
+      );
+    });
+
+    it("never overwrites a path the user (or server prefill) already set", async () => {
+      const user = userEvent.setup();
+      const onSubmit = vi.fn();
+      render(
+        <SchemaFormTurn
+          payload={pluginPayload(pathFields(), {
+            path: "blob:11111111-1111-4111-8111-111111111111",
+            on_validation_failure: "quarantine",
+          })}
+          onSubmit={onSubmit}
+          sourceFormPathPrefill={prefillBlob}
+        />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Continue" }));
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          edited_values: {
+            plugin: "example",
+            options: {
+              path: "blob:11111111-1111-4111-8111-111111111111",
+              on_validation_failure: "quarantine",
+            },
+          },
+        }),
+      );
+    });
+
+    it("leaves an already-answered validation routing alone when filling path", async () => {
+      const user = userEvent.setup();
+      const onSubmit = vi.fn();
+      render(
+        <SchemaFormTurn
+          payload={pluginPayload(pathFields(), { on_validation_failure: "quarantine" })}
+          onSubmit={onSubmit}
+          sourceFormPathPrefill={prefillBlob}
+        />,
+      );
+
+      await user.click(screen.getByRole("button", { name: "Continue" }));
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          edited_values: {
+            plugin: "example",
+            options: { path: `blob:${BLOB_ID}`, on_validation_failure: "quarantine" },
+          },
+        }),
+      );
+    });
+
+    it("ignores the prefill when the form has no path knob", () => {
+      render(
+        <SchemaFormTurn
+          payload={pluginPayload([field({ name: "delimiter", label: "Delimiter", kind: "text", required: true })])}
+          onSubmit={vi.fn()}
+          sourceFormPathPrefill={prefillBlob}
+        />,
+      );
+
+      expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+    });
+  });
 });

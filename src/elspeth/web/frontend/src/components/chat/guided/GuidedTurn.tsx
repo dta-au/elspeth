@@ -38,6 +38,10 @@ interface GuidedTurnProps {
   sourceBlobChoiceRequired?: boolean;
   /** Gates only Step-1 actions that can bind an in-flight source upload. */
   sourceUploadPending?: boolean;
+  /** Source blob uploaded after a Step-1 schema_form turn was emitted —
+   * forwarded to SchemaFormTurn's local-draft path prefill
+   * (elspeth-c70909c13a). Other turn types ignore it. */
+  sourceFormPathPrefill?: GuidedSourceBlobCandidate | null;
   disabled?: boolean;
   /** Tutorial mode — forwarded to leaf widgets that surface worked-example
    * teaching copy (e.g. SchemaFormTurn's on_validation_failure caveat). */
@@ -63,6 +67,7 @@ export function GuidedTurn({
   sourceBlobCandidates,
   sourceBlobChoiceRequired = false,
   sourceUploadPending = false,
+  sourceFormPathPrefill = null,
   disabled = false,
   isTutorial = false,
   wirePendingAcknowledgements,
@@ -119,6 +124,7 @@ export function GuidedTurn({
           onSubmit={guardedSubmit}
           disabled={disabled}
           isTutorial={isTutorial}
+          sourceFormPathPrefill={sourceFormPathPrefill}
         />
       );
     case "review_components":

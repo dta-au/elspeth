@@ -1,5 +1,5 @@
-import { useId, useState, type ReactNode } from "react";
-import type { GuidedRespondAction, KnobField, SchemaFormPayload } from "@/types/guided";
+import { useEffect, useId, useState, type ReactNode } from "react";
+import type { GuidedRespondAction, GuidedSourceBlobCandidate, KnobField, SchemaFormPayload } from "@/types/guided";
 import { TUTORIAL_VALIDATION_FAILURE_CAVEAT } from "@/components/tutorial/copy";
 import { CodeBlock } from "../CodeBlock";
 
@@ -13,16 +13,57 @@ interface SchemaFormTurnProps {
    * on_validation_failure="discard"). Off for the normal composer flow.
    */
   isTutorial?: boolean;
+  /**
+   * A source blob uploaded AFTER this form's turn was emitted
+   * (elspeth-c70909c13a). The persisted turn payload is immutable replay
+   * authority, so a late upload can only land in the local draft — the same
+   * ``blob:<id>`` sentinel the user would legally type into ``path``. Applied
+   * once, and only into an EMPTY path (a value the user or the server prefill
+   * already set is never overwritten). Mirrors the backend's upload-first
+   * prefill (emitters._merge_inspection_into_prefill): path plus
+   * on_validation_failure = "discard" when that knob is also unanswered.
+   */
+  sourceFormPathPrefill?: GuidedSourceBlobCandidate | null;
 }
 
 type FormValues = Record<string, unknown>;
 
-export function SchemaFormTurn({ payload, onSubmit, disabled = false, isTutorial = false }: SchemaFormTurnProps) {
+export function SchemaFormTurn({
+  payload,
+  onSubmit,
+  disabled = false,
+  isTutorial = false,
+  sourceFormPathPrefill = null,
+}: SchemaFormTurnProps) {
   const reactId = useId();
   const [view, setView] = useState<"summary" | "edit">("summary");
   const [values, setValues] = useState<FormValues>(() =>
     initialValues(payload.knobs.fields, payload.prefilled),
   );
+
+  const prefillBlobId = sourceFormPathPrefill?.id ?? null;
+  const hasPathKnob = payload.knobs.fields.some((field) => field.name === "path");
+  const hasValidationFailureKnob = payload.knobs.fields.some(
+    (field) => field.name === "on_validation_failure",
+  );
+  useEffect(() => {
+    if (prefillBlobId === null || !hasPathKnob) return;
+    setValues((prev) => {
+      const currentPath = prev["path"];
+      if (currentPath !== undefined && currentPath !== null && currentPath !== "") {
+        return prev;
+      }
+      const next: FormValues = { ...prev, path: `blob:${prefillBlobId}` };
+      const currentFailure = prev["on_validation_failure"];
+      if (
+        hasValidationFailureKnob &&
+        (currentFailure === undefined || currentFailure === null || currentFailure === "")
+      ) {
+        next["on_validation_failure"] = "discard";
+      }
+      return next;
+    });
+  }, [prefillBlobId, hasPathKnob, hasValidationFailureKnob]);
 
   function isVisible(field: KnobField, state: FormValues = values): boolean {
     if (!field.visible_when) return true;

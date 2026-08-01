@@ -573,6 +573,10 @@ interface GuidedUploadFence {
   step: GuidedStep | null;
   turnToken: string | null;
   isSourceSingleSelect: boolean;
+  /** Plugin of the live Step-1 source schema_form turn, else null — an upload
+   * completing against this fence prefills that form's local path draft
+   * (elspeth-c70909c13a) instead of injecting the chat message. */
+  sourceSchemaFormPlugin: string | null;
 }
 
 interface GuidedUploadContext {
@@ -581,6 +585,24 @@ interface GuidedUploadContext {
   step: GuidedStep | null;
   turnToken: string | null;
   isSourceSingleSelect: boolean;
+  sourceSchemaFormPlugin: string | null;
+}
+
+/** A late upload binds to a source form only when the filename plausibly
+ * matches the already-chosen plugin — the client-side mirror of the backend's
+ * `_inspection_matches_source_plugin` (which sniffs content; the client only
+ * has the name). A mismatch falls back to today's behavior untouched. */
+const SOURCE_PLUGIN_UPLOAD_EXTENSIONS: Record<string, readonly string[]> = {
+  csv: [".csv"],
+  json: [".json", ".jsonl"],
+  text: [".txt"],
+};
+
+function uploadMatchesSourcePlugin(plugin: string, filename: string): boolean {
+  const extensions = SOURCE_PLUGIN_UPLOAD_EXTENSIONS[plugin];
+  if (extensions === undefined) return false;
+  const lower = filename.toLowerCase();
+  return extensions.some((extension) => lower.endsWith(extension));
 }
 
 const CANONICAL_BLOB_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -831,6 +853,10 @@ export function ChatPanel({
   const [pendingGuidedUploads, setPendingGuidedUploads] = useState<
     ReadonlyMap<string, GuidedUploadFence>
   >(new Map());
+  const sourceSchemaFormPlugin =
+    guidedSession?.step === "step_1_source" && guidedNextTurn?.type === "schema_form"
+      ? guidedNextTurn.payload.plugin
+      : null;
   const guidedUploadContextRef = useRef<GuidedUploadContext>({
     activeSessionId,
     activationEpoch: blobActivationEpoch,
@@ -839,6 +865,7 @@ export function ChatPanel({
     isSourceSingleSelect:
       guidedSession?.step === "step_1_source" &&
       guidedNextTurn?.type === "single_select",
+    sourceSchemaFormPlugin,
   });
   guidedUploadContextRef.current = {
     activeSessionId,
@@ -848,6 +875,7 @@ export function ChatPanel({
     isSourceSingleSelect:
       guidedSession?.step === "step_1_source" &&
       guidedNextTurn?.type === "single_select",
+    sourceSchemaFormPlugin,
   };
   const activeComposerMessage = findActiveComposerMessage(messages);
   const proposalsByToolCallId = useMemo(
@@ -1003,6 +1031,7 @@ export function ChatPanel({
         step: context.step,
         turnToken: context.turnToken,
         isSourceSingleSelect: context.isSourceSingleSelect,
+        sourceSchemaFormPlugin: context.sourceSchemaFormPlugin,
       });
       setPendingGuidedUploads(new Map(pendingGuidedUploadsRef.current));
     },
@@ -1020,11 +1049,24 @@ export function ChatPanel({
         context.activationEpoch === fence.activationEpoch &&
         context.step === fence.step &&
         context.turnToken === fence.turnToken &&
-        context.isSourceSingleSelect === fence.isSourceSingleSelect
+        context.isSourceSingleSelect === fence.isSourceSingleSelect &&
+        context.sourceSchemaFormPlugin === fence.sourceSchemaFormPlugin
       );
     },
     [],
   );
+
+  // A source upload completing while the Step-1 schema_form turn is already
+  // live (elspeth-c70909c13a): the persisted turn is immutable replay
+  // authority, so the server cannot re-emit it prefilled — the blob lands in
+  // the form's LOCAL draft instead (the same blob:<id> sentinel the user would
+  // legally type). Keyed to the exact turn token so a later turn never
+  // inherits it; first compatible upload wins (no silent re-bind).
+  const [guidedSourceFormPathPrefill, setGuidedSourceFormPathPrefill] = useState<{
+    sessionId: string;
+    turnToken: string;
+    blob: GuidedSourceBlobCandidate;
+  } | null>(null);
 
   const handleGuidedBlobUploadCompleted = useCallback(
     (requestId: string, sessionId: string, blob: BlobMetadata): boolean => {
@@ -1038,6 +1080,35 @@ export function ChatPanel({
       }
       if (fence.isSourceSingleSelect) {
         handleGuidedBlobUploaded(blob);
+        return true;
+      }
+      if (
+        fence.sourceSchemaFormPlugin !== null &&
+        fence.turnToken !== null &&
+        blob.status === "ready" &&
+        CANONICAL_BLOB_UUID.test(blob.id) &&
+        uploadMatchesSourcePlugin(fence.sourceSchemaFormPlugin, blob.filename)
+      ) {
+        const turnToken = fence.turnToken;
+        setGuidedSourceFormPathPrefill((current) =>
+          current?.sessionId === sessionId && current.turnToken === turnToken
+            ? current
+            : {
+                sessionId,
+                turnToken,
+                blob: {
+                  id: blob.id,
+                  filename: blob.filename,
+                  sizeBytes: blob.size_bytes,
+                },
+              },
+        );
+        // Returning false suppresses ChatInput's "please use it as the
+        // pipeline input" injection: that message routes to the tool-less
+        // Phase-A advisory, which cannot bind the blob and answers with a
+        // dead-end "paste the contents" request. The form's path row filling
+        // in is the honest feedback for this gesture.
+        return false;
       }
       return true;
     },
@@ -2079,6 +2150,13 @@ export function ChatPanel({
                 sourceBlobCandidates={guidedSourceBlobCandidates}
                 sourceBlobChoiceRequired={guidedSourceBlobChoiceRequired}
                 sourceUploadPending={hasPendingGuidedSourceUpload}
+                sourceFormPathPrefill={
+                  guidedSourceFormPathPrefill !== null &&
+                  guidedSourceFormPathPrefill.sessionId === activeSessionId &&
+                  guidedSourceFormPathPrefill.turnToken === guidedNextTurn.turn_token
+                    ? guidedSourceFormPathPrefill.blob
+                    : null
+                }
                 // M-10: gate on guidedChatPending too — otherwise a chip/form
                 // widget stays clickable while a /guided/chat is in flight and
                 // can race an in-flight step-respond (mirrors "Explain this
