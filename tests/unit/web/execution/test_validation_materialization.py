@@ -180,6 +180,55 @@ def _blob_config() -> dict[str, object]:
     }
 
 
+def test_interpretation_state_detaches_authored_semantic_evidence_on_construction() -> None:
+    authored = _interpretation(_state(), contracts=(_contract(),)).authored
+
+    interpretation = InterpretationValidatedState(authored=authored, materialized_state=_state())
+    authored.semantic_contracts[0].outcome = "conflict"
+
+    assert interpretation.authored is not authored
+    assert interpretation.authored.policy is authored.policy
+    assert interpretation.authored.semantic_contracts[0].outcome == "satisfied"
+
+
+def test_materialization_detaches_interpretation_semantic_evidence() -> None:
+    interpretation = _interpretation(_state(), contracts=(_contract(),))
+
+    result = materialize_validation_yaml(
+        interpretation,
+        yaml_generator=_YamlGenerator("sources: {}\nsinks: {}\n"),
+        data_dir=Path("/tmp/test_data"),
+        session_id="test-session",
+        blob_get_metadata=None,
+        load_yaml=yaml.safe_load,
+    )
+    assert isinstance(result, PhaseReport)
+    interpretation.authored.semantic_contracts[0].outcome = "conflict"
+
+    assert result.artifact.authored is not interpretation.authored
+    assert result.artifact.authored.policy is interpretation.authored.policy
+    assert result.artifact.authored.semantic_contracts[0].outcome == "satisfied"
+
+
+def test_provider_pass_through_retains_detached_materialized_semantic_evidence() -> None:
+    interpretation = _interpretation(_state(), contracts=(_contract(),))
+    materialization = materialize_validation_yaml(
+        interpretation,
+        yaml_generator=_YamlGenerator("sources: {}\nsinks: {}\n"),
+        data_dir=Path("/tmp/test_data"),
+        session_id="test-session",
+        blob_get_metadata=None,
+        load_yaml=yaml.safe_load,
+    )
+    assert isinstance(materialization, PhaseReport)
+
+    provider_report = validate_managed_identity_policy(materialization.artifact)
+    assert isinstance(provider_report, PhaseReport)
+    interpretation.authored.semantic_contracts[0].outcome = "conflict"
+
+    assert provider_report.artifact.authored.semantic_contracts[0].outcome == "satisfied"
+
+
 def test_materialization_uses_only_interpretation_state_and_preserves_exact_yaml() -> None:
     policy_state = _state(nodes=(_node(plugin="llm", options={"base_url": "https://evil.example/v1"}),))
     materialized_state = _state()

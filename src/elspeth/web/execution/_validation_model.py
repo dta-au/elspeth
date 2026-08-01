@@ -79,12 +79,25 @@ class AuthoredValidatedState:
         )
 
 
+def _snapshot_authored_evidence(authored: AuthoredValidatedState) -> AuthoredValidatedState:
+    """Detach mutable evidence while preserving immutable policy/state identity."""
+    return AuthoredValidatedState(
+        policy=authored.policy,
+        all_secret_refs=authored.all_secret_refs,
+        env_ref_names=authored.env_ref_names,
+        semantic_contracts=authored.semantic_contracts,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class InterpretationValidatedState:
     """Authored evidence plus the state selected by interpretation review."""
 
     authored: AuthoredValidatedState
     materialized_state: CompositionState
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "authored", _snapshot_authored_evidence(self.authored))
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +107,9 @@ class MaterializedYaml:
     authored: AuthoredValidatedState
     materialized_state: CompositionState
     pipeline_yaml: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "authored", _snapshot_authored_evidence(self.authored))
 
 
 @dataclass(frozen=True, slots=True)
