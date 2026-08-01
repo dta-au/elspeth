@@ -85,6 +85,10 @@ from elspeth_lints.core.allowlist_io import (
     iter_yaml_documents,
     load_yaml_mapping_text,
     parse_allow_hits,
+    parse_per_file_rules,
+)
+from elspeth_lints.core.allowlist_io import (
+    PerFileRuleRecord as PerFileRuleCoverageEntry,
 )
 
 UNRECOGNIZED_ENTRY_SHAPE = "UNRECOGNIZED_ENTRY_SHAPE"
@@ -110,30 +114,6 @@ class JudgeCoverageViolation:
     entry_key: str
     source_file: str
     missing_fields: tuple[str, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class PerFileRuleCoverageEntry:
-    """One ``per_file_rules`` entry tracked by C1 coverage.
-
-    Per-file wildcard suppressions are valid allowlist records but they cannot
-    carry per-finding judge metadata. C1 therefore diffs them separately from
-    ``allow_hits``: baseline rules are grandfathered, while newly-added or
-    behavior-changing rules are reported with
-    :data:`PER_FILE_RULE_REQUIRES_JUDGE`.
-    """
-
-    source_file: str
-    index: int
-    pattern: str
-    rules: tuple[str, ...]
-    reason: str
-    expires: str | None
-    max_hits: int | None
-
-    @property
-    def label(self) -> str:
-        return _per_file_rule_label(self.index, self.pattern, self.rules)
 
 
 @dataclass(frozen=True, slots=True)
@@ -638,85 +618,7 @@ def _unrecognized_shape_violations(data: dict[str, Any], *, source_file: str) ->
 
 def _parse_per_file_rules_for_coverage(data: dict[str, Any], *, source_file: str) -> list[PerFileRuleCoverageEntry]:
     """Parse ``per_file_rules`` enough for judge-coverage diffing."""
-    raw_entries = data.get("per_file_rules", [])
-    if raw_entries is None:
-        return []
-    if not isinstance(raw_entries, list):
-        raise AllowlistIOError(f"{source_file}: per_file_rules must be a list if present")
-
-    entries: list[PerFileRuleCoverageEntry] = []
-    for index, raw_entry in enumerate(raw_entries):
-        context = f"per_file_rules[{index}]"
-        if not isinstance(raw_entry, dict):
-            raise AllowlistIOError(f"{source_file}: {context} must be a mapping")
-        pattern = _required_coverage_string(raw_entry, "pattern", context=context, source_file=source_file)
-        rules = tuple(_required_coverage_string_list(raw_entry, "rules", context=context, source_file=source_file))
-        reason = _required_coverage_string(raw_entry, "reason", context=context, source_file=source_file)
-        expires = _optional_coverage_date(raw_entry, "expires", context=context, source_file=source_file)
-        max_hits = _optional_coverage_int(raw_entry, "max_hits", context=context, source_file=source_file)
-        entries.append(
-            PerFileRuleCoverageEntry(
-                source_file=source_file,
-                index=index,
-                pattern=pattern,
-                rules=rules,
-                reason=reason,
-                expires=expires,
-                max_hits=max_hits,
-            )
-        )
-    return entries
-
-
-def _required_coverage_string(data: dict[str, Any], key: str, *, context: str, source_file: str) -> str:
-    if key not in data:
-        raise AllowlistIOError(f"{source_file}: {context} must include {key!r}")
-    value = data[key]
-    if not isinstance(value, str) or not value:
-        raise AllowlistIOError(f"{source_file}: {context}.{key} must be a non-empty string")
-    return value
-
-
-def _required_coverage_string_list(data: dict[str, Any], key: str, *, context: str, source_file: str) -> list[str]:
-    raw_values = data.get(key, [])
-    if not isinstance(raw_values, list):
-        raise AllowlistIOError(f"{source_file}: {context}.{key} must be a list")
-    values: list[str] = []
-    for index, raw_value in enumerate(raw_values):
-        if not isinstance(raw_value, str) or not raw_value:
-            raise AllowlistIOError(f"{source_file}: {context}.{key}[{index}] must be a non-empty string")
-        values.append(raw_value)
-    return values
-
-
-def _optional_coverage_date(data: dict[str, Any], key: str, *, context: str, source_file: str) -> str | None:
-    if key not in data or data[key] is None:
-        return None
-    value = data[key]
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, str) and value:
-        try:
-            date.fromisoformat(value)
-        except ValueError as exc:
-            raise AllowlistIOError(f"{source_file}: {context}.{key} must be YYYY-MM-DD, null, or absent") from exc
-        return value
-    raise AllowlistIOError(f"{source_file}: {context}.{key} must be YYYY-MM-DD, null, or absent")
-
-
-def _optional_coverage_int(data: dict[str, Any], key: str, *, context: str, source_file: str) -> int | None:
-    if key not in data or data[key] is None:
-        return None
-    value = data[key]
-    if isinstance(value, bool):
-        raise AllowlistIOError(f"{source_file}: {context}.{key} must be an integer, not a boolean")
-    if isinstance(value, int):
-        return value
-    raise AllowlistIOError(f"{source_file}: {context}.{key} must be an integer, null, or absent")
-
-
-def _per_file_rule_label(index: int, pattern: str, rules: tuple[str, ...]) -> str:
-    return f"per_file_rules[{index}]::pattern={pattern}::rules={','.join(rules)}"
+    return parse_per_file_rules(data, source_file=source_file)
 
 
 def _entry_shape_label(shape_key: str, index: int, raw_entry: Any) -> str:

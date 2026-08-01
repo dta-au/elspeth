@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,23 @@ class AllowlistYamlDocument:
 
     source_file: str
     data: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class PerFileRuleRecord:
+    """Rule-agnostic parsed representation shared by CI policy gates."""
+
+    source_file: str
+    index: int
+    pattern: str
+    rules: tuple[str, ...]
+    reason: str
+    expires: str | None
+    max_hits: int | None
+
+    @property
+    def label(self) -> str:
+        return f"per_file_rules[{self.index}]::pattern={self.pattern}::rules={','.join(self.rules)}"
 
 
 def load_yaml_mapping_text(text: str, *, source_label: str) -> dict[str, Any]:
@@ -67,6 +85,86 @@ def parse_allow_hits(
         return _parse_allow_hits(parse_data, source_file=source_file, source_root=None)
     except (ValueError, TypeError) as exc:
         raise AllowlistIOError(f"{source_file}: allow_hits entry shape violated loader invariants: {exc}") from exc
+
+
+def parse_per_file_rules(data: dict[str, Any], *, source_file: str) -> list[PerFileRuleRecord]:
+    """Parse ``per_file_rules`` without coupling to one rule vocabulary."""
+    raw_entries = data.get("per_file_rules", [])
+    if raw_entries is None:
+        return []
+    if not isinstance(raw_entries, list):
+        raise AllowlistIOError(f"{source_file}: per_file_rules must be a list if present")
+
+    entries: list[PerFileRuleRecord] = []
+    for index, raw_entry in enumerate(raw_entries):
+        context = f"per_file_rules[{index}]"
+        if not isinstance(raw_entry, dict):
+            raise AllowlistIOError(f"{source_file}: {context} must be a mapping")
+        pattern = _required_string(raw_entry, "pattern", context=context, source_file=source_file)
+        rules = tuple(_required_string_list(raw_entry, "rules", context=context, source_file=source_file))
+        if not rules:
+            raise AllowlistIOError(f"{source_file}: {context}.rules must be a non-empty list")
+        if len(set(rules)) != len(rules):
+            raise AllowlistIOError(f"{source_file}: {context}.rules must not contain duplicate rule ids")
+        entries.append(
+            PerFileRuleRecord(
+                source_file=source_file,
+                index=index,
+                pattern=pattern,
+                rules=rules,
+                reason=_required_string(raw_entry, "reason", context=context, source_file=source_file),
+                expires=_optional_date(raw_entry, "expires", context=context, source_file=source_file),
+                max_hits=_optional_int(raw_entry, "max_hits", context=context, source_file=source_file),
+            )
+        )
+    return entries
+
+
+def _required_string(data: dict[str, Any], key: str, *, context: str, source_file: str) -> str:
+    if key not in data:
+        raise AllowlistIOError(f"{source_file}: {context} must include {key!r}")
+    value = data[key]
+    if not isinstance(value, str) or not value:
+        raise AllowlistIOError(f"{source_file}: {context}.{key} must be a non-empty string")
+    return value
+
+
+def _required_string_list(data: dict[str, Any], key: str, *, context: str, source_file: str) -> list[str]:
+    raw_values = data.get(key)
+    if not isinstance(raw_values, list):
+        raise AllowlistIOError(f"{source_file}: {context}.{key} must be a list")
+    values: list[str] = []
+    for index, value in enumerate(raw_values):
+        if not isinstance(value, str) or not value:
+            raise AllowlistIOError(f"{source_file}: {context}.{key}[{index}] must be a non-empty string")
+        values.append(value)
+    return values
+
+
+def _optional_date(data: dict[str, Any], key: str, *, context: str, source_file: str) -> str | None:
+    if key not in data or data[key] is None:
+        return None
+    value = data[key]
+    if isinstance(value, datetime):
+        raise AllowlistIOError(f"{source_file}: {context}.{key} must be YYYY-MM-DD, null, or absent")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, str) and value:
+        try:
+            date.fromisoformat(value)
+        except ValueError as exc:
+            raise AllowlistIOError(f"{source_file}: {context}.{key} must be YYYY-MM-DD, null, or absent") from exc
+        return value
+    raise AllowlistIOError(f"{source_file}: {context}.{key} must be YYYY-MM-DD, null, or absent")
+
+
+def _optional_int(data: dict[str, Any], key: str, *, context: str, source_file: str) -> int | None:
+    if key not in data or data[key] is None:
+        return None
+    value = data[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise AllowlistIOError(f"{source_file}: {context}.{key} must be an integer, null, or absent")
+    return int(value)
 
 
 def _with_historical_baseline_safety(data: dict[str, Any]) -> dict[str, Any]:

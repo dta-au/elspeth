@@ -350,6 +350,12 @@ def test_stage_scan_builds_bundle(tmp_path: Path) -> None:
     payload = json.loads(outcome.text)
     assert payload["kind_counts"].get("drift_repair") == 1
     assert payload["kind_counts"].get("justify") == 1
+    assert payload["target_census"] == {
+        "raw_target_count": 2,
+        "exact_covered_count": 1,
+        "per_file_covered_count": 0,
+        "uncovered_count": 1,
+    }
     assert "sign-bundle" in payload["sign_bundle_command"]
 
     bundle = read_bundle(Path(payload["written_path"]))
@@ -364,6 +370,80 @@ def test_stage_scan_builds_bundle(tmp_path: Path) -> None:
     assert new[0].symbol == "Widget.lookup"
     # No rotation action -- the only judge-gated entry is filtered out of the scan.
     assert all(a.kind != "rotation" for a in bundle.actions)
+
+
+def test_stage_scan_records_absolute_scope_from_relative_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    root = Path("src_root")
+    root.mkdir()
+    allowlist_dir = Path("allowlist")
+    allowlist_dir.mkdir()
+    (allowlist_dir / "_defaults.yaml").write_text(
+        "version: 1\ndefaults:\n  fail_on_stale: false\n  fail_on_expired: false\n",
+        encoding="utf-8",
+    )
+    ctx = _context(root, allowlist_dir, Path("staged"))
+
+    bundle = _scan_and_read(ctx, "absolute-scope")
+
+    assert Path(bundle.root) == root.resolve()
+    assert Path(bundle.allowlist_dir) == allowlist_dir.resolve()
+    assert Path(bundle.root).is_absolute()
+    assert Path(bundle.allowlist_dir).is_absolute()
+
+
+def test_stage_scan_rejects_ambiguous_non_judge_target_group(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    target = root / "plugins" / "gadget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'anonymous')\n"
+        "        return payload.get('second', first)\n",
+        encoding="utf-8",
+    )
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(findings) == 2
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=_canonical_key(findings[0]))
+    ctx = _context(root, allowlist_dir, staged_dir)
+
+    outcome = judge_server._run_tool(ctx, "stage_scan", {"bundle_id": "ambiguous"})
+
+    assert outcome.is_error is True
+    assert "ambiguous non-judge target group" in outcome.text
+    assert not staged_dir.exists()
+
+
+def test_stage_scan_accepts_mixed_signed_and_prejudge_exact_same_prefix_group(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    target = root / "plugins" / "gadget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'anonymous')\n"
+        "        return payload.get('second', first)\n",
+        encoding="utf-8",
+    )
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(findings) == 2
+    _write_signed_v2_entry(allowlist_dir, "signed.yaml", finding=findings[0])
+    _write_pre_judge_entry(allowlist_dir, "prejudge.yaml", key=_canonical_key(findings[1]))
+    ctx = _context(root, allowlist_dir, staged_dir)
+
+    bundle = _scan_and_read(ctx, "mixed-exact")
+
+    assert bundle.actions == ()
 
 
 def test_stage_scan_does_not_stage_per_file_rule_covered_finding(tmp_path: Path) -> None:
