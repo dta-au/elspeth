@@ -1,0 +1,70 @@
+{
+  "enableAllProjectMcpServers": true,
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "jq -r '.tool_input.file_path // .tool_response.filePath // empty' | { read -r f; case \"$f\" in *.py) ruff format \"$f\" && ruff check --fix \"$f\";; esac; } 2>/dev/null || true",
+            "type": "command"
+          }
+        ],
+        "matcher": "Edit|Write"
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "filigree ensure-dashboard",
+            "timeout": 5000,
+            "type": "command"
+          }
+        ],
+        "matcher": "mcp__filigree__.*"
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "filigree session-context",
+            "timeout": 5000,
+            "type": "command"
+          },
+          {
+            "command": "filigree ensure-dashboard",
+            "timeout": 5000,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "loomweave hook session-start --path \"${CLAUDE_PROJECT_DIR:-$PWD}\"",
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "command": "warpline session-context --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"",
+            "timeout": 5000,
+            "type": "command"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "legis session-context",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -46,3 +46,5 @@ sinks:
         - 'category: str'
 landscape:
   url: sqlite:////app/pipeline/runs/audit.db
+payload_store:
+  base_path: /app/pipeline/runs/payloads

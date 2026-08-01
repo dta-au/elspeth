@@ -1,0 +1,25 @@
+<!-- @dsCard group="Colors" viewport="700x150" name="Component-type badges" subtitle="The six pipeline primitives — a fixed colour vocabulary" -->
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<link rel="stylesheet" href="../styles.css" />
+<style>
+  body { margin: 0; padding: 18px 16px; background: var(--color-bg); font-family: var(--font-sans); }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; }
+  .item { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+  .val { font-family: var(--font-mono); font-size: 10px; color: var(--color-text-muted); }
+</style>
+</head>
+<body>
+  <div class="row">
+    <div class="item"><span class="type-badge type-badge-source">Source</span><span class="val">#4db89a</span></div>
+    <div class="item"><span class="type-badge type-badge-transform">Transform</span><span class="val">#e8a030</span></div>
+    <div class="item"><span class="type-badge type-badge-gate">Gate</span><span class="val">#c390f9</span></div>
+    <div class="item"><span class="type-badge type-badge-sink">Sink</span><span class="val">#e07040</span></div>
+    <div class="item"><span class="type-badge type-badge-aggregation">Aggregation</span><span class="val">#61daff</span></div>
+    <div class="item"><span class="type-badge type-badge-coalesce">Coalesce</span><span class="val">#18c2c0</span></div>
+  </div>
+  <p style="margin:16px 0 0;font-size:12px;color:var(--color-text-secondary);line-height:1.5">Mono-typeface, uppercase, 4px radius. Each carries a pre-composited opaque background and a 30%-alpha border, reused on graph nodes.</p>
+</body>
+</html>

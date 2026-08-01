@@ -1,0 +1,50 @@
+<!-- @dsCard group="Components" viewport="700x420" name="Composer" subtitle="Wordmark · chat bubbles · plugin card" -->
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<link rel="stylesheet" href="../../styles.css" />
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="../../_ds_bundle.js"></script>
+<style>
+  body { margin: 0; padding: 0; background: var(--color-bg); font-family: var(--font-sans); }
+  .head { background: var(--color-surface-nav); padding: 10px 16px; border-bottom: 1px solid var(--color-border); display: flex; align-items: center; gap: 12px; }
+  .body { padding: 14px 8px; }
+  .lbl { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--color-text-muted); font-weight: 600; margin: 8px 16px 6px; }
+  .pcwrap { margin: 0 16px; border: 1px solid var(--color-border); border-radius: var(--radius-lg); overflow: hidden; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+  const { WordMark, ChatBubble, PluginCard } = window.ELSPETHDesignSystem_85edbb;
+  function Demo() {
+    return (
+      <div>
+        <div className="head">
+          <WordMark size={14} />
+          <span style={{ fontSize: 13, color: "var(--color-text-muted)" }}>Pipeline Composer</span>
+        </div>
+        <div className="body">
+          <ChatBubble role="user">Classify these tender submissions and flag abusive ones.</ChatBubble>
+          <ChatBubble role="assistant">Added a CSV <strong>source</strong>, an <strong>llm</strong> transform, and a safety gate routing flagged rows to a review queue. Validate when ready.</ChatBubble>
+          <ChatBubble role="system">Pipeline version 3 — graph validated.</ChatBubble>
+        </div>
+        <p className="lbl">Plugin catalog card</p>
+        <div className="pcwrap">
+          <PluginCard name="Azure Blob" type="source" kind="azure_blob"
+            description="Stream rows from an Azure Blob container. Parses CSV strictly; malformed rows are quarantined with an audit record."
+            audit={[{ label: "strict parsing", tone: "positive" }, { label: "quarantine on error", tone: "informational" }]} />
+          <PluginCard name="LLM query" type="transform" kind="llm"
+            description="Azure OpenAI / OpenRouter query transform with provider pooling and multi-query."
+            audit={[{ label: "fingerprinted secrets", tone: "positive" }, { label: "rate-limited", tone: "attention" }]} />
+        </div>
+      </div>
+    );
+  }
+  ReactDOM.createRoot(document.getElementById("root")).render(<Demo />);
+</script>
+</body>
+</html>

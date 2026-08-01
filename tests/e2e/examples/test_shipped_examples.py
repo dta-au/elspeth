@@ -512,6 +512,43 @@ class TestShippedExamples:
         assert "durable scheduler" in readme
         assert "5,000-10,000 rows/sec" not in readme
 
+    def test_openrouter_sentiment_readme_matches_configured_outputs(self, example_pipeline_dir: Path) -> None:
+        """OpenRouter output documentation stays aligned with both live settings."""
+        openrouter_dir = example_pipeline_dir / "openrouter_sentiment"
+        openrouter_readme = (openrouter_dir / "README.md").read_text()
+        for settings_name in ("settings.yaml", "settings_pooled.yaml"):
+            settings = yaml.safe_load((openrouter_dir / settings_name).read_text())
+            output_name = Path(settings["sinks"]["output"]["options"]["path"]).name
+            assert output_name in openrouter_readme
+        assert "results.csv" not in openrouter_readme
+        assert "results_pooled.csv" not in openrouter_readme
+
+    def test_screened_row_union_readmes_document_partial_exit(self, example_pipeline_dir: Path) -> None:
+        """Designed PARTIAL examples document the CLI's nonzero exit contract."""
+        root_readme = (example_pipeline_dir / "README.md").read_text()
+        row_union_readme = (example_pipeline_dir / "row_union_ab_experiment" / "README.md").read_text()
+        assert "`row_union_ab_experiment/settings_screened.yaml` | `PARTIAL`, exit 1" in root_readme
+        assert "This designed `PARTIAL` result returns process exit 1" in row_union_readme
+
+    def test_checkpoint_resume_readme_supplies_settings(self, example_pipeline_dir: Path) -> None:
+        """Every repo-root resume command supplies the pipeline settings path."""
+        checkpoint_readme = (example_pipeline_dir / "checkpoint_resume" / "README.md").read_text()
+        resume_commands = [line for line in checkpoint_readme.splitlines() if line.startswith("elspeth resume ")]
+        resume_settings = [
+            line for line in checkpoint_readme.splitlines() if line.startswith("  --settings examples/checkpoint_resume/settings.yaml")
+        ]
+        assert len(resume_commands) == 2
+        assert len(resume_settings) == 2
+
+    def test_container_example_preserves_host_ownership_and_payloads(self, example_pipeline_dir: Path) -> None:
+        """The bind-mount walkthrough keeps secure runtime artifacts host-readable."""
+        container_dir = example_pipeline_dir / "threshold_gate_container"
+        container_readme = (container_dir / "README.md").read_text()
+        settings = yaml.safe_load((container_dir / "settings.yaml").read_text())
+
+        assert '--user "$(id -u):$(id -g)"' in container_readme
+        assert settings["payload_store"]["base_path"] == "/app/pipeline/runs/payloads"
+
     def test_chaosllm_endurance_documents_smoke_row_override(self, example_pipeline_dir: Path) -> None:
         """chaosllm_endurance must expose a bounded dogfood mode."""
         run_sh = (example_pipeline_dir / "chaosllm_endurance" / "run.sh").read_text()

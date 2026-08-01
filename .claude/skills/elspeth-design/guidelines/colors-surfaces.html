@@ -1,0 +1,45 @@
+<!-- @dsCard group="Colors" viewport="700x200" name="Surfaces — three families" subtitle="Workspace teal · Navigation navy · Inspection warm-neutral" -->
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8" />
+<link rel="stylesheet" href="../styles.css" />
+<style>
+  body { margin: 0; padding: 16px; background: var(--color-bg); font-family: var(--font-sans); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .sw { flex: 1 1 0; min-width: 120px; border-radius: var(--radius-lg); border: 1px solid var(--color-border); overflow: hidden; }
+  .chip { height: 56px; }
+  .meta { padding: 8px 10px; background: var(--color-surface); }
+  .name { font-size: 12px; font-weight: 600; color: var(--color-text); }
+  .val { font-family: var(--font-mono); font-size: 10px; color: var(--color-text-muted); margin-top: 2px; }
+  .fam { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--color-text-muted); margin: 0 0 6px; font-weight: 600; }
+  .group { margin-bottom: 12px; }
+</style>
+</head>
+<body>
+  <div class="group">
+    <p class="fam">Workspace · Pacific teal</p>
+    <div class="row">
+      <div class="sw"><div class="chip" style="background:#0f2d35"></div><div class="meta"><div class="name">bg</div><div class="val">#0f2d35</div></div></div>
+      <div class="sw"><div class="chip" style="background:#122f37"></div><div class="meta"><div class="name">surface</div><div class="val">#122f37</div></div></div>
+      <div class="sw"><div class="chip" style="background:#1a3d47"></div><div class="meta"><div class="name">elevated</div><div class="val">#1a3d47</div></div></div>
+    </div>
+  </div>
+  <div class="row">
+    <div class="sw" style="flex:2 1 0">
+      <p class="fam" style="padding:8px 10px 0;margin:0">Navigation · Foundation navy</p>
+      <div class="row" style="padding:6px 10px 10px">
+        <div class="sw"><div class="chip" style="background:#0a1d2e"></div><div class="meta"><div class="name">nav</div><div class="val">#0a1d2e</div></div></div>
+        <div class="sw"><div class="chip" style="background:#13283a"></div><div class="meta"><div class="name">nav-raised</div><div class="val">#13283a</div></div></div>
+      </div>
+    </div>
+    <div class="sw" style="flex:2 1 0">
+      <p class="fam" style="padding:8px 10px 0;margin:0">Inspection · warm neutral</p>
+      <div class="row" style="padding:6px 10px 10px">
+        <div class="sw"><div class="chip" style="background:#2a2826"></div><div class="meta"><div class="name">inspector</div><div class="val">#2a2826</div></div></div>
+        <div class="sw"><div class="chip" style="background:#332f2c"></div><div class="meta"><div class="name">paper</div><div class="val">#332f2c</div></div></div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

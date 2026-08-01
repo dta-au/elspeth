@@ -83,7 +83,7 @@ alone to contribute a half-group observation. The run ends `PARTIAL`:
 ⚠ Run PARTIAL: 8 rows processed | ✓4 succeeded | ✗3 failed | →3 routed (screened_out:3)
 ```
 
-This designed `PARTIAL` result returns process exit 0; Landscape records the
+This designed `PARTIAL` result returns process exit 1; Landscape records the
 run as `completed_with_failures`, retaining the three branch-loss adjudications.
 
 3 of 8 tickets are screened out, so the comparison is computed over the 5

@@ -281,22 +281,6 @@ landscape.db-wal
 # pre-commit cache
 .pre-commit-cache/
 
-# Tool-specific local config and caches
-.codex/
-# Antigravity / Gemini AI-IDE local project state (was leaking a machine-specific
-# symlink into ~/.gemini; untracked + deleted from disk 2026-06-07).
-.antigravitycli/
-# Agent skill/config dirs — kept on disk, never tracked going forward.
-# .claude/ (Claude Code) and .agents/ (Codex) both hold local project config
-# + agent skills. .claude/ untracked 2026-06-07. .agents/ was the canonical
-# *tracked* skills home until 2026-06-28, when it too was untracked
-# (git rm --cached; history retained, files left on disk) so that neither
-# agent dir is committed from here on.
-.claude/
-.agents/
-
-
-
 # Deployment support artifacts are tracked. Only operator-local values and
 # generated backups remain private.
 deploy/**/*.env
@@ -312,6 +296,7 @@ deploy/Caddyfile
 
 # Temporary
 .codex
+.antigravitycli/
 
 # Build-artefact PDFs (regeneratable; exceed the pre-commit
 # large-file threshold). Narrow scope to PDF outputs only — the
