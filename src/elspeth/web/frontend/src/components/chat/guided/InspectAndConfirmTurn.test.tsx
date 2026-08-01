@@ -67,14 +67,16 @@ const PAYLOAD_SPARSE: InspectAndConfirmPayload = {
   },
 };
 
-// Empty samples: the production shape — the backend intentionally redacts row
-// content from inspection facts (see composer/guided/emitters.py,
-// _build_inspect_and_confirm_turn), so live payloads always arrive with
-// samples: []. The sample-rendering path above stays for wire-schema
-// compatibility, but the empty shape must not look like a broken table.
+// Empty samples: the production shape for EVERY guided flow, not just the
+// tutorial — the backend intentionally redacts row content from inspection
+// facts (see composer/guided/emitters.py, _build_inspect_and_confirm_turn),
+// so live payloads always arrive with samples: [] regardless of source. The
+// sample-rendering path above stays for wire-schema compatibility, but the
+// empty shape must not look like a broken table. Columns here are arbitrary
+// user-file headers; the component hardcodes none of them.
 const PAYLOAD_EMPTY_SAMPLES: InspectAndConfirmPayload = {
   observed: {
-    columns: ["url"],
+    columns: ["invoice_id", "amount", "due_date"],
     samples: [],
     warnings: [],
   },
@@ -148,7 +150,7 @@ describe("InspectAndConfirmTurn — empty samples", () => {
   it("still renders every column header when samples are empty", () => {
     render(<InspectAndConfirmTurn payload={PAYLOAD_EMPTY_SAMPLES} onSubmit={vi.fn()} />);
     const headers = screen.getAllByRole("columnheader");
-    expect(headers.map((h) => h.textContent)).toEqual(["url"]);
+    expect(headers.map((h) => h.textContent)).toEqual(["invoice_id", "amount", "due_date"]);
   });
 });
 
