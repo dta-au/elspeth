@@ -9,6 +9,9 @@ from uuid import uuid4
 import pytest
 
 from elspeth.contracts.hashing import stable_hash
+from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer import pipeline_planner
@@ -35,6 +38,18 @@ from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.sessions.protocol import GuidedOperationFence
+from tests.unit.web.composer.test_planner_authoring_aids import _guardrail_profile_view
+
+
+@pytest.fixture
+def llm_source_policy_manager(monkeypatch: pytest.MonkeyPatch) -> PluginManager:
+    """Keep Task 6 source recognition isolated from public discovery."""
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
+    monkeypatch.setattr("elspeth.web.plugin_policy.coverage.get_shared_plugin_manager", lambda: manager)
+    monkeypatch.setattr("elspeth.web.composer.required_controls.get_shared_plugin_manager", lambda: manager)
+    return manager
 
 
 def test_guided_full_is_an_explicit_composer_service_surface() -> None:
@@ -198,3 +213,46 @@ def test_all_planner_surfaces_share_canonical_core_schema_and_tool_identity() ->
     assert len({manifest.capability_core_hash for manifest in manifests}) == 1
     assert len({manifest.canonical_schema_hash for manifest in manifests}) == 1
     assert len({manifest.effective_tool_hash for manifest in manifests}) == 1
+
+
+def test_shared_candidate_finalizer_wires_named_llm_source_and_is_idempotent(
+    tmp_path: Path,
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    view, snapshot = _guardrail_profile_view(tmp_path)
+    finalize = service_module._required_controls_candidate_finalizer(
+        policy_catalog=view,
+        plugin_snapshot=snapshot,
+    )
+    candidate = {
+        "sources": {
+            "briefing": {
+                "plugin": "llm",
+                "on_success": "generated",
+                "options": {
+                    "profile": "sonnet",
+                    "prompt_template": "Write one concise audit briefing.",
+                    "response_field": "briefing",
+                    "schema": {"mode": "observed"},
+                },
+                "on_validation_failure": "discard",
+            }
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "generated",
+                "plugin": "json",
+                "options": {"path": "outputs/generated.json", "schema": {"mode": "observed"}},
+                "on_write_failure": "discard",
+            }
+        ],
+    }
+
+    wired = finalize(candidate)
+
+    assert wired["sources"]["briefing"]["on_success"] == "content_safety_auto_1_in"
+    assert wired["nodes"][0]["plugin"] == "aws_bedrock_content_safety"
+    assert wired["nodes"][0]["on_success"] == "generated"
+    assert finalize(wired) is wired

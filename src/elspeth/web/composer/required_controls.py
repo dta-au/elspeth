@@ -36,9 +36,11 @@ rejection.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Final
+from dataclasses import dataclass
+from typing import Any, Final, Literal, cast
 
 from elspeth.contracts.plugin_capabilities import ControlMode, ControlRole, PluginCapability
+from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 
 # The aids' exemplar machinery is the single source of truth for how a
@@ -52,7 +54,17 @@ from elspeth.web.composer.planner_authoring_aids import (
     _plugin_summaries,
     _selected_control_profile,
 )
-from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+from elspeth.web.composer.state import (
+    COMPOSER_NODE_TYPES,
+    CoalesceBranches,
+    CompositionState,
+    NodeSpec,
+    NodeType,
+    OutputSpec,
+    PipelineMetadata,
+    SourceSpec,
+    validate_composer_source_name,
+)
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
@@ -65,11 +77,13 @@ from elspeth.web.interpretation_state import (
 # diagnosis probe).
 from elspeth.web.plugin_policy.coverage import (
     _llm_output_fields,
+    _llm_source_output_fields,
     _stream_proves_output_control,
     build_output_stream_graph,
     control_coverage_findings,
     node_has_blocking_control,
     node_has_capability,
+    source_has_capability,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
@@ -79,13 +93,28 @@ _REQUIRED_CONTROL_CAPABILITIES: Final[tuple[PluginCapability, ...]] = (
 )
 
 _AUTO_WIRE_ACTIONABLE_REASONS: Final[frozenset[str]] = frozenset({"input_not_dominated", "output_not_post_dominated"})
+_MISSING: Final[object] = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateSource:
+    """One source block plus the authored container needed to rewrite it."""
+
+    container: Literal["source", "sources"]
+    name: str
+    block: Mapping[str, Any]
+
+    @property
+    def component_id(self) -> str:
+        return "source" if self.name == "source" else f"source:{self.name}"
 
 
 def _disclosure_draft(
     *,
     capability: PluginCapability,
     control_plugin: str,
-    llm_node_id: str,
+    llm_component_id: str,
+    llm_component_kind: Literal["node", "source"],
     role: ControlRole,
     protected_fields: tuple[str, ...] = (),
     scanned_fields: tuple[str, ...] = (),
@@ -94,7 +123,7 @@ def _disclosure_draft(
     edge = "input" if role is ControlRole.INPUT else "output"
     draft = (
         f"ELSPETH automatically inserted the deployment-required {capability.value} control "
-        f"'{control_plugin}' on the {edge} path of llm node '{llm_node_id}'. Deployment policy "
+        f"'{control_plugin}' on the {edge} path of llm {llm_component_kind} '{llm_component_id}'. Deployment policy "
         "makes this control mandatory on every such path; acknowledging records that you "
         "reviewed the inserted node. Removing it will block the pipeline at the required-control "
         f"gate unless an operator relaxes the {capability.value} control mode."
@@ -112,24 +141,96 @@ def _disclosure_draft(
     return draft
 
 
+def _candidate_sources(candidate: Mapping[str, Any]) -> tuple[_CandidateSource, ...] | None:
+    """Return authored sources without collapsing singular/plural provenance.
+
+    Both containers at once are ambiguous even if one is empty: choosing one
+    would silently reinterpret persisted proposal shape. Malformed source
+    containers similarly return ``None`` so the finalizer can preserve the
+    original candidate for downstream validation.
+    """
+    singular: object = candidate.get("source", _MISSING)
+    plural: object = candidate.get("sources", _MISSING)
+    if singular is not _MISSING and plural is not _MISSING:
+        return None
+    if singular is not _MISSING:
+        if not isinstance(singular, Mapping):
+            return None
+        return (_CandidateSource(container="source", name="source", block=singular),)
+    if plural is _MISSING:
+        return ()
+    if not isinstance(plural, Mapping):
+        return None
+    sources: list[_CandidateSource] = []
+    for name, block in plural.items():
+        if type(name) is not str or not isinstance(block, Mapping):
+            return None
+        sources.append(_CandidateSource(container="sources", name=name, block=block))
+    return tuple(sources)
+
+
 def _parse_node(raw: Mapping[str, Any]) -> NodeSpec:
     """Tolerant NodeSpec projection of one set_pipeline node dict."""
+    node_id = raw["id"]
+    node_type = raw["node_type"]
+    plugin = raw.get("plugin")
+    input_stream = raw.get("input", "")
+    on_success = raw.get("on_success")
+    on_error = raw.get("on_error")
     options = raw.get("options")
+    condition = raw.get("condition")
+    routes = raw.get("routes")
     fork_to = raw.get("fork_to")
+    branches = raw.get("branches")
+    policy = raw.get("policy")
+    merge = raw.get("merge")
+    if (
+        type(node_id) is not str
+        or not node_id
+        or type(node_type) is not str
+        or node_type not in COMPOSER_NODE_TYPES
+        or (plugin is not None and type(plugin) is not str)
+        or type(input_stream) is not str
+        or (on_success is not None and type(on_success) is not str)
+        or (on_error is not None and type(on_error) is not str)
+        or (options is not None and not isinstance(options, Mapping))
+        or (condition is not None and type(condition) is not str)
+        or (policy is not None and type(policy) is not str)
+        or (merge is not None and type(merge) is not str)
+    ):
+        raise TypeError("node fields have malformed types")
+    if routes is not None and (
+        not isinstance(routes, Mapping) or any(type(key) is not str or type(value) is not str for key, value in routes.items())
+    ):
+        raise TypeError("node routes must map exact strings")
+    if fork_to is not None and (
+        not isinstance(fork_to, Sequence) or isinstance(fork_to, (str, bytes)) or any(type(value) is not str for value in fork_to)
+    ):
+        raise TypeError("node fork_to must contain exact strings")
+    parsed_branches: CoalesceBranches | None = None
+    if branches is not None:
+        if isinstance(branches, Mapping):
+            if any(type(key) is not str or type(value) is not str for key, value in branches.items()):
+                raise TypeError("node branches must map exact strings")
+            parsed_branches = cast("Mapping[str, str]", branches)
+        elif not isinstance(branches, Sequence) or isinstance(branches, (str, bytes)) or any(type(value) is not str for value in branches):
+            raise TypeError("node branches must contain exact strings")
+        else:
+            parsed_branches = tuple(cast("Sequence[str]", branches))
     return NodeSpec(
-        id=raw["id"],
-        node_type=raw["node_type"],
-        plugin=raw.get("plugin"),
-        input=raw.get("input", ""),
-        on_success=raw.get("on_success"),
-        on_error=raw.get("on_error"),
+        id=node_id,
+        node_type=cast("NodeType", node_type),
+        plugin=plugin,
+        input=input_stream,
+        on_success=on_success,
+        on_error=on_error,
         options=options if isinstance(options, Mapping) else {},
-        condition=raw.get("condition"),
-        routes=raw.get("routes"),
+        condition=condition,
+        routes=routes,
         fork_to=tuple(fork_to) if isinstance(fork_to, Sequence) and not isinstance(fork_to, (str, bytes)) else None,
-        branches=raw.get("branches"),
-        policy=raw.get("policy"),
-        merge=raw.get("merge"),
+        branches=parsed_branches,
+        policy=policy,
+        merge=merge,
     )
 
 
@@ -143,16 +244,13 @@ def _parse_candidate_state(candidate: Mapping[str, Any]) -> CompositionState | N
     and never becomes session state.
     """
     try:
+        source_locations = _candidate_sources(candidate)
+        if source_locations is None:
+            return None
         sources: dict[str, SourceSpec] = {}
-        source_block = candidate.get("source")
-        if isinstance(source_block, Mapping):
-            sources["source"] = _parse_source(source_block)
-        named_sources = candidate.get("sources")
-        if isinstance(named_sources, Mapping):
-            for name, block in named_sources.items():
-                if not isinstance(name, str) or not isinstance(block, Mapping):
-                    return None
-                sources[name] = _parse_source(block)
+        for location in source_locations:
+            validate_composer_source_name(location.name)
+            sources[location.name] = _parse_source(location.block)
         raw_nodes = candidate.get("nodes")
         if not isinstance(raw_nodes, Sequence) or isinstance(raw_nodes, (str, bytes)):
             return None
@@ -168,13 +266,25 @@ def _parse_candidate_state(candidate: Mapping[str, Any]) -> CompositionState | N
         for raw in raw_outputs:
             if not isinstance(raw, Mapping):
                 return None
+            sink_name = raw["sink_name"]
+            plugin = raw["plugin"]
             options = raw.get("options")
+            on_write_failure = raw.get("on_write_failure") or "discard"
+            if (
+                type(sink_name) is not str
+                or not sink_name
+                or type(plugin) is not str
+                or not plugin
+                or (options is not None and not isinstance(options, Mapping))
+                or type(on_write_failure) is not str
+            ):
+                return None
             outputs.append(
                 OutputSpec(
-                    name=raw["sink_name"],
-                    plugin=raw["plugin"],
+                    name=sink_name,
+                    plugin=plugin,
                     options=options if isinstance(options, Mapping) else {},
-                    on_write_failure=raw.get("on_write_failure") or "discard",
+                    on_write_failure=on_write_failure,
                 )
             )
         if len({node.id for node in nodes}) != len(nodes):
@@ -195,11 +305,16 @@ def _parse_candidate_state(candidate: Mapping[str, Any]) -> CompositionState | N
 
 def _parse_source(block: Mapping[str, Any]) -> SourceSpec:
     options = block.get("options")
+    plugin = block["plugin"]
+    on_success = block.get("on_success", "")
+    on_validation_failure = block.get("on_validation_failure") or "discard"
+    if type(plugin) is not str or type(on_success) is not str or type(on_validation_failure) is not str or not isinstance(options, Mapping):
+        raise TypeError("source string fields must be exact strings")
     return SourceSpec(
-        plugin=block["plugin"],
-        on_success=block.get("on_success", ""),
-        options=options if isinstance(options, Mapping) else {},
-        on_validation_failure=block.get("on_validation_failure") or "discard",
+        plugin=plugin,
+        on_success=on_success,
+        options=options,
+        on_validation_failure=on_validation_failure,
     )
 
 
@@ -336,7 +451,8 @@ def _splice_input_control(
             disclosure_draft=_disclosure_draft(
                 capability=capability,
                 control_plugin=plugin_name,
-                llm_node_id=target_id,
+                llm_component_id=target_id,
+                llm_component_kind="node",
                 role=ControlRole.INPUT,
                 protected_fields=protected_fields,
                 scanned_fields=scanned_fields,
@@ -405,7 +521,8 @@ def _splice_output_control(
             disclosure_draft=_disclosure_draft(
                 capability=capability,
                 control_plugin=plugin_name,
-                llm_node_id=target.id,
+                llm_component_id=target.id,
+                llm_component_kind="node",
                 role=ControlRole.OUTPUT,
             ),
         ),
@@ -421,6 +538,88 @@ def _splice_output_control(
     rewired["on_success"] = in_stream
     nodes[index] = rewired
     nodes.insert(index + 1, control)
+    return True
+
+
+def _splice_source_output_control(
+    candidate: dict[str, object],
+    nodes: list[dict[str, object]],
+    *,
+    location: _CandidateSource,
+    source: SourceSpec,
+    state: CompositionState,
+    capability: PluginCapability,
+    plugin_name: str,
+    alias: str | None,
+    summaries: Mapping[str, Any],
+    reserved: set[str],
+) -> bool:
+    """Interpose content safety on one source's successful output route."""
+    validation_failure = location.block.get("on_validation_failure", _MISSING)
+    if type(validation_failure) is not str or validation_failure != "discard":
+        return False
+    downstream = source.on_success
+    if type(downstream) is not str or not downstream:
+        return False
+    protected_fields = _llm_source_output_fields(source)
+    if not protected_fields:
+        return False
+    graph = build_output_stream_graph(state.nodes)
+    sink_streams = frozenset(output.name for output in state.outputs)
+    if _stream_proves_output_control(
+        downstream,
+        graph,
+        sink_streams=sink_streams,
+        visited=frozenset(),
+        protected_fields=protected_fields,
+    ):
+        return False
+
+    new_id = _allocate_node_id(capability, reserved)
+    in_stream = f"{new_id}_in"
+    sorted_fields = tuple(sorted(protected_fields))
+    control: dict[str, object] = {
+        "id": new_id,
+        "node_type": "transform",
+        "plugin": plugin_name,
+        "input": in_stream,
+        "on_success": downstream,
+        "on_error": "discard",
+        "options": _control_options(
+            plugin_name=plugin_name,
+            alias=alias,
+            fields=sorted_fields,
+            summaries=summaries,
+            role=ControlRole.OUTPUT,
+            disclosure_draft=_disclosure_draft(
+                capability=capability,
+                control_plugin=plugin_name,
+                llm_component_id=location.component_id,
+                llm_component_kind="source",
+                role=ControlRole.OUTPUT,
+            ),
+        ),
+    }
+    if not _control_node_is_creditable(
+        control,
+        capability=capability,
+        role=ControlRole.OUTPUT,
+        protected_fields=sorted_fields,
+    ):
+        return False
+
+    rewired_source = dict(location.block)
+    rewired_source["on_success"] = in_stream
+    if location.container == "source":
+        candidate["source"] = rewired_source
+    else:
+        raw_sources = candidate.get("sources")
+        if not isinstance(raw_sources, Mapping):
+            return False
+        rewired_sources = dict(raw_sources)
+        rewired_sources[location.name] = rewired_source
+        candidate["sources"] = rewired_sources
+    nodes.append(control)
     return True
 
 
@@ -458,12 +657,34 @@ def wire_required_controls(
     # byte-exactness/authority hashing downstream trivially intact.
     if not selections:
         return candidate
+    source_locations = _candidate_sources(candidate)
+    if source_locations is None:
+        return candidate
     state = _parse_candidate_state(candidate)
     if state is None:
         return candidate
+    try:
+        source_manager = get_shared_plugin_manager()
+        for source in state.sources.values():
+            source_manager.get_source_by_name(source.plugin)
+    except PluginNotFoundError:
+        # Never repair one source while a sibling source is already known to
+        # be invalid. Downstream validation must see the original proposal.
+        return candidate
     llm_node_count = sum(1 for node in state.nodes if node_has_capability(node, PluginCapability.LLM))
-    if llm_node_count == 0:
-        # Coverage findings only exist for LLM nodes; skip the catalog sweep.
+    llm_source_locations = tuple(
+        location for location in source_locations if source_has_capability(state.sources[location.name], PluginCapability.LLM)
+    )
+    if not llm_source_locations and llm_node_count == 0:
+        # Coverage findings only exist for LLM components; skip the catalog sweep.
+        return candidate
+    if any(
+        type(location.block.get("on_validation_failure", _MISSING)) is not str or location.block.get("on_validation_failure") != "discard"
+        for location in llm_source_locations
+    ):
+        # A source validation-failure route cannot be interposed in the current
+        # graph model. Refuse the WHOLE candidate before any transform/source
+        # splice so this pass never partially certifies an unrepairable graph.
         return candidate
 
     summaries = _plugin_summaries(catalog)
@@ -481,12 +702,14 @@ def wire_required_controls(
     if not selections:
         return candidate
     working_nodes = [dict(node) for node in candidate["nodes"]]
+    working_candidate: dict[str, object] = dict(candidate)
+    working_candidate["nodes"] = working_nodes
     changed = False
-    # Each successful splice permanently covers at least one finding, so the
-    # fixpoint needs at most two insertions (input + output) per LLM node.
-    budget = 2 * llm_node_count
+    # Each successful splice permanently covers one source output or one of a
+    # transform's two protected edges. This is also the hard upper bound if a
+    # future coverage authority regresses and keeps reporting stale findings.
+    budget = len(llm_source_locations) + (2 * llm_node_count)
     for _ in range(budget):
-        working_candidate = {**candidate, "nodes": working_nodes}
         state = _parse_candidate_state(working_candidate)
         if state is None:
             # A splice produced an unparseable candidate — impossible by
@@ -494,30 +717,25 @@ def wire_required_controls(
             break
         reserved = _reserved_names(state)
         nodes_by_id = {node.id: node for node in state.nodes}
+        current_locations = _candidate_sources(working_candidate)
+        if current_locations is None:
+            break
+        sources_by_component = {location.component_id: (location, state.sources[location.name]) for location in current_locations}
         progressed = False
         for capability, (plugin_name, alias) in selections.items():
             for finding in control_coverage_findings(state, capability):
                 if finding.reason not in _AUTO_WIRE_ACTIONABLE_REASONS:
                     continue
-                target = nodes_by_id.get(finding.component_id)
-                if target is None:
-                    continue
-                if finding.role is ControlRole.INPUT:
-                    progressed = _splice_input_control(
+                if finding.component_type == "source":
+                    source_target = sources_by_component.get(finding.component_id)
+                    if source_target is None or finding.role is not ControlRole.OUTPUT:
+                        continue
+                    location, source = source_target
+                    progressed = _splice_source_output_control(
+                        working_candidate,
                         working_nodes,
-                        target_id=finding.component_id,
-                        protected_fields=finding.protected_fields,
-                        scanned_fields=finding.scanned_fields,
-                        capability=capability,
-                        plugin_name=plugin_name,
-                        alias=alias,
-                        summaries=summaries,
-                        reserved=reserved,
-                    )
-                else:
-                    progressed = _splice_output_control(
-                        working_nodes,
-                        target=target,
+                        location=location,
+                        source=source,
                         state=state,
                         capability=capability,
                         plugin_name=plugin_name,
@@ -525,6 +743,33 @@ def wire_required_controls(
                         summaries=summaries,
                         reserved=reserved,
                     )
+                else:
+                    target = nodes_by_id.get(finding.component_id)
+                    if target is None:
+                        continue
+                    if finding.role is ControlRole.INPUT:
+                        progressed = _splice_input_control(
+                            working_nodes,
+                            target_id=finding.component_id,
+                            protected_fields=finding.protected_fields,
+                            scanned_fields=finding.scanned_fields,
+                            capability=capability,
+                            plugin_name=plugin_name,
+                            alias=alias,
+                            summaries=summaries,
+                            reserved=reserved,
+                        )
+                    else:
+                        progressed = _splice_output_control(
+                            working_nodes,
+                            target=target,
+                            state=state,
+                            capability=capability,
+                            plugin_name=plugin_name,
+                            alias=alias,
+                            summaries=summaries,
+                            reserved=reserved,
+                        )
                 if progressed:
                     changed = True
                     break
@@ -534,9 +779,7 @@ def wire_required_controls(
             break
     if not changed:
         return candidate
-    result: dict[str, object] = dict(candidate)
-    result["nodes"] = working_nodes
-    return result
+    return working_candidate
 
 
 __all__ = ["wire_required_controls"]
