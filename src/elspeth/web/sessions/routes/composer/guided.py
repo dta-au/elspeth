@@ -1802,6 +1802,14 @@ async def post_guided_start(
                     exc_class=type(exc).__name__,
                     site="post_guided_start",
                     frames=_safe_frame_strings(exc),
+                    # R2-F16b: the response carries ``X-Request-ID`` but this
+                    # was the only server-side record of a guided 500, and it
+                    # named no id — so the header the user quoted back
+                    # correlated to nothing. Read leniently: an app assembled
+                    # without ``RequestIdMiddleware`` must log None rather than
+                    # raise an AttributeError out of this ``except`` block and
+                    # abandon the reserved fence unsettled.
+                    request_id=getattr(request.state, "request_id", None),
                 )
             try:
                 failed = await service.fail_guided_operation(
@@ -4634,6 +4642,10 @@ async def post_guided_respond(
                         exc_class=type(exc).__name__,
                         site="post_guided_respond",
                         frames=_safe_frame_strings(exc),
+                        # See the post_guided_start site (R2-F16b): correlates
+                        # this log line to the response's X-Request-ID; lenient
+                        # read so a missing middleware cannot break the error path.
+                        request_id=getattr(request.state, "request_id", None),
                     )
                 try:
                     failed = await service.fail_guided_operation_with_audit(
@@ -4965,6 +4977,10 @@ async def post_guided_convert(
                 exc_class=type(exc).__name__,
                 site="post_guided_convert",
                 frames=_safe_frame_strings(exc),
+                # See the post_guided_start site (R2-F16b): correlates this log
+                # line to the response's X-Request-ID; lenient read so a missing
+                # middleware cannot break the error path.
+                request_id=getattr(request.state, "request_id", None),
             )
         failed = await service.fail_guided_operation(
             reserved.fence,

@@ -85,6 +85,16 @@ locals {
   # var.* defaults to null, so leaving a variable unset reproduces exactly the
   # policy this module rendered when these values were hardcoded here.
   default_plugin_allowlist = [
+    # source:aws_s3 authorizes S3 reads for THIS deployment's own runtime
+    # (batch/CLI, local trained-operator sessions) only. The web authoring
+    # surface bans author-controlled S3 reads categorically
+    # (web_aws_s3_source_policy_error, src/elspeth/web/provider_config_policy.py)
+    # and declines this authorization rather than offering it
+    # (PluginUnavailableReason.WEB_SURFACE_PROHIBITED). Do not delete this
+    # entry to "fix" a web-surface exposure that the code already refuses —
+    # see the guard test
+    # test_scenario_allowlist_keeps_the_s3_source_authorization_the_web_surface_declines
+    # in tests/unit/deployment/test_aws_ecs_terraform_package.py.
     "source:aws_s3",
     "source:csv",
     "source:json",

@@ -1338,6 +1338,9 @@ class TestStepChatServerInvariants:
         event = invariant_events[0]
         assert event["exc_class"] == "InvariantError"
         assert isinstance(event["frames"], tuple) and len(event["frames"]) > 0
+        # R2-F16b: the correlation field is always emitted (None here — this
+        # app carries no RequestIdMiddleware).
+        assert "request_id" in event
         assert all(f.startswith("frame=") for f in event["frames"])
         assert _chat_turn_audit_bodies(composer_test_client, session_id) == []
 

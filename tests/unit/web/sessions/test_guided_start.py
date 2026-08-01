@@ -658,6 +658,52 @@ async def test_guided_start_integrity_failure_is_terminal_and_safe_to_replay(tmp
     assert event["exc_class"] == "AuditIntegrityError"
     assert event["site"] == "post_guided_start"
     assert "secret diagnostic" not in repr(event)
+    # The correlation field is always emitted. This app is assembled without
+    # ``RequestIdMiddleware`` (see ``_make_app``), so the honest value here is
+    # None — and the read must stay lenient: an ``AttributeError`` raised while
+    # gathering a LOG field would escape this ``except`` block and abandon the
+    # reserved fence instead of settling the operation as failed.
+    assert "request_id" in event
+    assert event["request_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_guided_start_terminal_failure_log_correlates_to_the_response_header(tmp_path) -> None:
+    """R2-F16b: the ``X-Request-ID`` an operator quotes must find the log line.
+
+    The guided routes settle their terminal exception in-route and re-raise a
+    closed ``HTTPException``, so before this the only server-side record of a
+    guided 500 — ``guided.operation_terminal_failure`` — carried no correlation
+    id at all. The header pointed at nothing.
+    """
+    from structlog.testing import capture_logs
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.middleware.request_id import RequestIdMiddleware
+
+    app, service = _make_app(tmp_path)
+    app.add_middleware(RequestIdMiddleware)
+    client = TestClient(app)
+    session = await service.create_session("alice", "T", "local")
+
+    with (
+        capture_logs() as logs,
+        patch.object(
+            service,
+            "seed_or_complete_guided_start_operation",
+            side_effect=AuditIntegrityError("diagnostic must not escape"),
+        ),
+    ):
+        response = client.post(
+            f"/api/sessions/{session.id}/guided/start",
+            json={"profile": "tutorial", "operation_id": str(uuid.uuid4())},
+            headers={"X-Request-ID": "trace-guided-start-1"},
+        )
+
+    assert response.status_code == 500
+    assert response.headers["X-Request-ID"] == "trace-guided-start-1"
+    event = next(entry for entry in logs if entry.get("event") == "guided.operation_terminal_failure")
+    assert event["request_id"] == "trace-guided-start-1"
 
 
 @pytest.mark.asyncio

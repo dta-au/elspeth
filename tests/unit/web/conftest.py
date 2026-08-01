@@ -119,12 +119,16 @@ def test_client(tmp_path: Path) -> TestClient:
     async def mock_user() -> UserIdentity:
         return identity
 
-    async def audit_access_log_write_error_handler(_request, _exc):
+    async def audit_access_log_write_error_handler(request, _exc):
+        # Mirrors ``create_app``'s handler, including the ``request_id``
+        # correlation field. This app has no ``RequestIdMiddleware``, so the
+        # honest value here is None — same lenient read as production.
         return JSONResponse(
             status_code=500,
             content={
                 "error_type": "audit_access_log_write_failed",
                 "detail": "Audit-grade transcript access could not be recorded; no audit-grade data returned.",
+                "request_id": getattr(getattr(request, "state", None), "request_id", None),
             },
         )
 

@@ -2,21 +2,32 @@
 
 from __future__ import annotations
 
+import errno
 import json
 from pathlib import Path
-from typing import cast
 
 import pytest
-from fastapi import Request
+from fastapi import HTTPException, Request
+from fastapi.exceptions import RequestValidationError, WebSocketRequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import OperationalError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from structlog.testing import capture_logs
 
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
+from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.app import create_app
 from elspeth.web.config import WebSettings
 from elspeth.web.preferences.service import CorruptPreferencesError
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
-from elspeth.web.sessions.protocol import AuditAccessLogWriteError, StaleComposeStateError
+from elspeth.web.sessions.protocol import (
+    AuditAccessLogWriteError,
+    GuidedOperationFailed,
+    RunAlreadyActiveError,
+    StaleComposeStateError,
+)
+from elspeth.web.sessions.routes.guided_operations import raise_guided_operation_failure
+from tests.unit.web._sync_asgi_client import SyncASGITestClient
 
 
 def _settings(tmp_path: Path) -> WebSettings:
@@ -162,11 +173,13 @@ async def test_stale_compose_state_error_handler_returns_409(tmp_path: Path) -> 
     app = create_app(_settings(tmp_path))
     handler = app.exception_handlers[StaleComposeStateError]
 
-    response = await handler(cast(Request, object()), StaleComposeStateError("stale"))
+    response = await handler(_audit_request("req-stale-1"), StaleComposeStateError("stale"))
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 409
-    assert json.loads(response.body)["error_type"] == "stale_compose_state"
+    body = json.loads(response.body)
+    assert body["error_type"] == "stale_compose_state"
+    assert body["request_id"] == "req-stale-1"
 
 
 @pytest.mark.asyncio
@@ -174,12 +187,13 @@ async def test_audit_access_log_write_error_handler_returns_static_500(tmp_path:
     app = create_app(_settings(tmp_path))
     handler = app.exception_handlers[AuditAccessLogWriteError]
 
-    response = await handler(cast(Request, object()), AuditAccessLogWriteError("hidden db path"))
+    response = await handler(_audit_request("req-aal-1"), AuditAccessLogWriteError("hidden db path"))
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 500
     body = json.loads(response.body)
     assert body["error_type"] == "audit_access_log_write_failed"
+    assert body["request_id"] == "req-aal-1"
     assert "hidden db path" not in response.body.decode()
 
 
@@ -205,7 +219,7 @@ async def test_corrupt_preferences_error_handler_returns_structured_500(tmp_path
     handler = app.exception_handlers[CorruptPreferencesError]
 
     response = await handler(
-        cast(Request, object()),
+        _audit_request("req-prefs-1"),
         CorruptPreferencesError("alice", "bogus_mode", field_name="default_composer_mode"),
     )
 
@@ -215,6 +229,7 @@ async def test_corrupt_preferences_error_handler_returns_structured_500(tmp_path
     assert body["error_type"] == "corrupt_preferences"
     assert body["field_name"] == "default_composer_mode"
     assert body["user_id"] == "alice"
+    assert body["request_id"] == "req-prefs-1"
     # bad_value deliberately not in body — could be arbitrary content
     assert "bogus_mode" not in response.body.decode()
 
@@ -238,7 +253,7 @@ async def test_audit_story_integrity_error_handler_returns_structured_500(tmp_pa
     handler = app.exception_handlers[AuditStoryIntegrityError]
 
     response = await handler(
-        cast(Request, object()),
+        _audit_request("req-story-int-1"),
         AuditStoryIntegrityError("Landscape run 'abc-123' has non-bool seeded_from_cache=None"),
     )
 
@@ -247,6 +262,7 @@ async def test_audit_story_integrity_error_handler_returns_structured_500(tmp_pa
     body = json.loads(response.body)
     assert body["error_type"] == "audit_story_integrity_error"
     assert body["detail"] == "Landscape run 'abc-123' has non-bool seeded_from_cache=None"
+    assert body["request_id"] == "req-story-int-1"
 
 
 @pytest.mark.asyncio
@@ -260,7 +276,7 @@ async def test_audit_story_not_recorded_error_handler_returns_structured_404(tmp
     handler = app.exception_handlers[AuditStoryNotRecordedError]
 
     response = await handler(
-        cast(Request, object()),
+        _audit_request("req-story-abs-1"),
         AuditStoryNotRecordedError("Landscape run 'abc-123' has NULL llm_call_count"),
     )
 
@@ -268,4 +284,238 @@ async def test_audit_story_not_recorded_error_handler_returns_structured_404(tmp
     assert response.status_code == 404
     body = json.loads(response.body)
     assert body["error_type"] == "audit_story_not_recorded"
+    assert body["request_id"] == "req-story-abs-1"
     assert "abc-123" not in response.body.decode()
+
+
+class TestHTTPExceptionRequestIdEnvelope:
+    """Every dict-shaped error envelope carries the response's correlation id.
+
+    R2-F16b: ``RequestIdMiddleware`` stamps ``X-Request-ID`` on every
+    response, and ``_audit_integrity_error_handler`` puts the same id in
+    its body — but the guided routes consume their terminal exception
+    in-route and re-raise a *closed* ``HTTPException``
+    (``raise_guided_operation_failure``). That envelope never passed
+    through an app-level handler, so the header correlated to nothing a
+    user could quote back.
+
+    The fix is ONE boundary rather than N routes: an app-level
+    ``HTTPException`` handler injects ``request.state.request_id`` into
+    any dict detail that does not already carry one, then delegates to
+    FastAPI's default rendering. String details are untouched — a bare
+    ``detail="..."`` is a plain-language message, not an envelope, and
+    wrapping it would change the client contract of ~200 raise sites.
+    """
+
+    def test_exactly_one_http_exception_handler_registered_on_the_starlette_class(self, tmp_path: Path) -> None:
+        """Compose with FastAPI's default handler; do not fork the boundary.
+
+        FastAPI's ``setup()`` registers its default renderer against
+        ``starlette.exceptions.HTTPException``. Registering ours against
+        ``fastapi.HTTPException`` instead would create a SECOND key:
+        MRO lookup would send route-raised ``fastapi.HTTPException``s to
+        ours and router-raised 404s to FastAPI's, so half the envelopes
+        would silently miss the id.
+        """
+        app = create_app(_settings(tmp_path))
+
+        http_exception_keys = [key for key in app.exception_handlers if key in (StarletteHTTPException, HTTPException)]
+        assert http_exception_keys == [StarletteHTTPException]
+
+    @pytest.mark.asyncio
+    async def test_dict_detail_gains_the_request_id(self, tmp_path: Path) -> None:
+        app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+
+        response = await handler(
+            _audit_request("req-dict-1"),
+            HTTPException(status_code=500, detail={"error_type": "guided_operation_terminal_failure"}),
+        )
+
+        assert response.status_code == 500
+        assert json.loads(response.body)["detail"] == {
+            "error_type": "guided_operation_terminal_failure",
+            "request_id": "req-dict-1",
+        }
+
+    @pytest.mark.asyncio
+    async def test_string_detail_is_left_exactly_as_raised(self, tmp_path: Path) -> None:
+        app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+
+        response = await handler(
+            _audit_request("req-str-1"),
+            HTTPException(status_code=400, detail="proposal_id must be a canonical UUID"),
+        )
+
+        assert response.status_code == 400
+        assert json.loads(response.body) == {"detail": "proposal_id must be a canonical UUID"}
+        assert "req-str-1" not in response.body.decode()
+
+    @pytest.mark.asyncio
+    async def test_an_envelope_that_already_carries_a_request_id_is_not_overwritten(self, tmp_path: Path) -> None:
+        """A route that sourced its own id keeps it — the boundary only fills gaps."""
+        app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+
+        response = await handler(
+            _audit_request("req-from-middleware"),
+            HTTPException(status_code=500, detail={"error_type": "x", "request_id": "req-from-route"}),
+        )
+
+        assert json.loads(response.body)["detail"]["request_id"] == "req-from-route"
+
+    @pytest.mark.asyncio
+    async def test_response_headers_survive_the_rewrap(self, tmp_path: Path) -> None:
+        """``HTTPException.headers`` is load-bearing for 401/429 — do not drop it."""
+        app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+
+        response = await handler(
+            _audit_request("req-hdr-1"),
+            HTTPException(
+                status_code=429,
+                detail={"error_type": "rate_limited"},
+                headers={"Retry-After": "30"},
+            ),
+        )
+
+        assert response.headers["Retry-After"] == "30"
+        assert json.loads(response.body)["detail"]["request_id"] == "req-hdr-1"
+
+    @pytest.mark.asyncio
+    async def test_the_guided_terminal_failure_envelope_is_covered_by_the_boundary(self, tmp_path: Path) -> None:
+        """The exact envelope ``raise_guided_operation_failure`` closes over.
+
+        The guided routes never reach an app-level handler for their own
+        exception class — they catch it, settle the operation, and raise
+        this. Pinning the composed result here is what makes the boundary
+        (rather than four route edits) the fix.
+        """
+        app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+
+        with pytest.raises(HTTPException) as caught:
+            raise_guided_operation_failure(GuidedOperationFailed(failure_code="integrity_error"))
+        response = await handler(_audit_request("req-guided-1"), caught.value)
+
+        assert response.status_code == 500
+        assert json.loads(response.body)["detail"] == {
+            "error_type": "guided_operation_terminal_failure",
+            "failure_code": "integrity_error",
+            "detail": "The operation failed an integrity check.",
+            "request_id": "req-guided-1",
+        }
+
+    def test_the_body_request_id_equals_the_response_header_end_to_end(self, tmp_path: Path) -> None:
+        """The finding, stated as a test: the header must correlate to something.
+
+        Handler-level tests never exercise registration, middleware
+        ordering, or dispatch. This one drives a real request through
+        ``create_app``'s full middleware stack so the id in the body is
+        provably the SAME id the operator reads off ``X-Request-ID``.
+        """
+        app = create_app(_settings(tmp_path))
+
+        @app.get("/api/_probe/guided-terminal-failure")
+        async def _probe_guided_terminal_failure() -> None:
+            raise_guided_operation_failure(GuidedOperationFailed(failure_code="integrity_error"))
+
+        @app.get("/api/_probe/string-detail")
+        async def _probe_string_detail() -> None:
+            raise HTTPException(status_code=409, detail="a plain-language message")
+
+        # ``create_app`` mounts the built SPA as a StaticFiles Mount at "",
+        # which matches EVERY path — so a route appended after it never runs
+        # and these probes would 404 instead of exercising the boundary. The
+        # mount is conditional on a built ``web/frontend/dist`` existing
+        # (app.py's ``if frontend_dist.is_dir():``), so whether it is there
+        # depends on whether the checkout has been built — which is exactly
+        # why this needs pinning rather than luck.
+        # Move the probes to the front of the table.
+        app.router.routes.insert(0, app.router.routes.pop())
+        app.router.routes.insert(0, app.router.routes.pop())
+
+        client = SyncASGITestClient(app)
+
+        response = client.get("/api/_probe/guided-terminal-failure")
+        assert response.status_code == 500
+        detail = response.json()["detail"]
+        assert detail["failure_code"] == "integrity_error"
+        assert detail["request_id"] == response.headers["X-Request-ID"]
+        assert detail["request_id"]
+
+        # An inbound id is honoured, so the correlation works for a caller
+        # that already owns a trace id.
+        supplied = client.get("/api/_probe/guided-terminal-failure", headers={"X-Request-ID": "trace-abc-123"})
+        assert supplied.json()["detail"]["request_id"] == "trace-abc-123"
+
+        # ... and the string-detail contract is unchanged end to end.
+        plain = client.get("/api/_probe/string-detail")
+        assert plain.status_code == 409
+        assert plain.json() == {"detail": "a plain-language message"}
+
+
+@pytest.mark.asyncio
+async def test_run_already_active_error_handler_returns_correlated_409(tmp_path: Path) -> None:
+    """Seam contract D: a flat 409 envelope, now correlated like its siblings.
+
+    This handler renders its ``JSONResponse`` directly rather than raising an
+    ``HTTPException``, so it never reaches the app-level ``HTTPException``
+    boundary that injects ``request_id`` — it has to source the id itself.
+    """
+    app = create_app(_settings(tmp_path))
+    handler = app.exception_handlers[RunAlreadyActiveError]
+
+    exc = RunAlreadyActiveError("session-1")
+    response = await handler(_audit_request("req-run-active-1"), exc)
+
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 409
+    body = json.loads(response.body)
+    assert body["error_type"] == "run_already_active"
+    assert body["detail"] == str(exc)
+    assert body["request_id"] == "req-run-active-1"
+
+
+@pytest.mark.asyncio
+async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path) -> None:
+    """R2-F16b, stated once as a whole-surface invariant.
+
+    The per-handler tests above each pin one envelope. This one pins the
+    *rule*: every app-level handler that renders a structured (``error_type``)
+    body must correlate to the ``X-Request-ID`` the same response carries.
+    A new handler added without ``request_id`` fails here even if nobody
+    remembers to write it a dedicated test.
+
+    The two validation handlers are excluded by construction, not by
+    oversight: their 422 bodies are lists of field errors with no
+    ``error_type`` discriminator, and neither is a composer envelope. The
+    ``HTTPException`` boundary is excluded because it is the injector.
+    """
+    app = create_app(_settings(tmp_path))
+    cases: list[tuple[type[Exception], Exception]] = [
+        (AuditIntegrityError, AuditIntegrityError("x")),
+        (CorruptPreferencesError, CorruptPreferencesError("alice", "bad", field_name="default_composer_mode")),
+        (AuditStoryIntegrityError, AuditStoryIntegrityError("x")),
+        (AuditStoryNotRecordedError, AuditStoryNotRecordedError("x")),
+        (StaleComposeStateError, StaleComposeStateError("x")),
+        (AuditAccessLogWriteError, AuditAccessLogWriteError("x")),
+        (RunAlreadyActiveError, RunAlreadyActiveError("x")),
+        (FingerprintKeyMissingError, FingerprintKeyMissingError("x")),
+        (SecretDecryptionError, SecretDecryptionError("x")),
+        (OperationalError, OperationalError("SELECT 1", {}, Exception("db down"))),
+        # Only a retryable errno becomes a 503 envelope; anything else is
+        # deliberately re-raised as a real 500.
+        (OSError, OSError(errno.ENOSPC, "no space left on device")),
+    ]
+    # Every registered handler that can render an ``error_type`` body is
+    # covered; if a new one is registered, this assertion names it.
+    excluded = (StarletteHTTPException, RequestValidationError, WebSocketRequestValidationError)
+    structured = {key for key in app.exception_handlers if isinstance(key, type) and issubclass(key, Exception) and key not in excluded}
+    assert structured == {case[0] for case in cases}
+
+    for exc_type, exc in cases:
+        response = await app.exception_handlers[exc_type](_audit_request("req-invariant-1"), exc)
+        body = json.loads(response.body)
+        assert body["request_id"] == "req-invariant-1", exc_type.__name__
