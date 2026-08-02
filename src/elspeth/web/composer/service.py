@@ -52,6 +52,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerP
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.core.canonical import canonical_json
@@ -6742,6 +6743,28 @@ _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS: Final[int] = 1000
 _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS: Final[frozenset[str]] = frozenset({"prompt_template", "template"})
 
 
+@observation_boundary(
+    tier=3,
+    source="web-authored plugin schema option (untrusted nested metadata and field declarations)",
+    source_param="raw_schema",
+    suppresses=("R1", "R5"),
+    invariant=(
+        "parses through ELSPETH-owned SchemaConfig and renders only its canonical mode, "
+        "field contracts, and sanctioned contract-field lists; unknown nested values are "
+        "discarded, malformed schemas yield a fixed marker, and output is bounded"
+    ),
+)
+def _render_schema_for_advisor(raw_schema: object) -> str:
+    """Render only ELSPETH-owned schema facts into advisor evidence."""
+    if not isinstance(raw_schema, Mapping):
+        return "<invalid schema>"
+    try:
+        schema = SchemaConfig.from_dict(raw_schema)
+    except ValueError:
+        return "<invalid schema>"
+    return _truncate_for_advisor(str(schema.to_dict()), _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS)
+
+
 def _summarize_pipeline_for_advisor(state: CompositionState) -> str:
     """Render a compact, redaction-safe description of the pipeline.
 
@@ -6849,8 +6872,10 @@ def _render_node_control_flow(node: NodeSpec) -> str:
 def _render_options_for_advisor(options: Mapping[str, Any]) -> str:
     """Render an options mapping as redaction-safe descriptive text.
 
-    Allowlisted intent-bearing keys (:data:`_ADVISOR_SUMMARY_VALUE_KEYS`) show
-    a truncated value; every other key shows its NAME only. Never raises.
+    The schema key is parsed into an ELSPETH-owned closed structural projection;
+    other allowlisted intent-bearing keys
+    (:data:`_ADVISOR_SUMMARY_VALUE_KEYS`) show a truncated value. Every other
+    key shows its NAME only. Never raises.
     """
     if not options:
         return "no options"
@@ -6858,13 +6883,14 @@ def _render_options_for_advisor(options: Mapping[str, Any]) -> str:
     name_only: list[str] = []
     for key in sorted(options.keys()):
         if key in _ADVISOR_SUMMARY_VALUE_KEYS:
-            if key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
+            if key == "schema":
+                rendered = _render_schema_for_advisor(options[key])
+            elif key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
                 limit = _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS
-            elif key == "schema":
-                limit = _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS
+                rendered = _truncate_for_advisor(str(options[key]), limit)
             else:
                 limit = _ADVISOR_SUMMARY_VALUE_MAX_CHARS
-            rendered = _truncate_for_advisor(str(options[key]), limit)
+                rendered = _truncate_for_advisor(str(options[key]), limit)
             if key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
                 value_parts.append(f"{key}_untrusted_json={json.dumps(rendered)}")
             else:
