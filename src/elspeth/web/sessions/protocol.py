@@ -2652,6 +2652,30 @@ class SessionOperationRunMutations(Protocol):
     ) -> tuple[RunEventRecord, ...]: ...
 
 
+class GlobalRunRecoveryAuthority(Protocol):
+    """Handle-free authority for cross-session run recovery writes.
+
+    Implementations own discovery, lock ordering, database-clock decisions,
+    and compare-and-swap mutations. Callers receive immutable run snapshots;
+    no database handle or connection-bearing callback crosses this boundary.
+    """
+
+    def cancel_orphaned_run_records(
+        self,
+        *,
+        max_age_seconds: int | None,
+        exclude_run_ids: frozenset[str],
+        reason: str | None,
+    ) -> tuple[RunRecord, ...]: ...
+
+    def mark_landscape_reconciliation_outcomes(
+        self,
+        *,
+        complete_run_ids: frozenset[UUID],
+        absent_run_ids: frozenset[UUID],
+    ) -> None: ...
+
+
 class SessionOperationBlobMutations(Protocol):
     """Blob/run-custody mutations available inside one exact operation fence."""
 

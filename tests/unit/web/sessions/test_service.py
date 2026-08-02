@@ -2327,6 +2327,24 @@ class TestCancelAllOrphanedRuns:
         assert updated.status == "cancelled"
 
     @pytest.mark.asyncio
+    async def test_does_not_cancel_run_covered_by_live_execute_fence(self, service, session_operation_contexts) -> None:
+        """A peer replica's live EXECUTE lease is durable liveness evidence."""
+        session = await service.create_session("alice", "Pipeline", "local")
+        state = await service.save_composition_state(
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+        )
+        execute_context = session_operation_contexts.acquire(service, session.id)
+        run = await service.create_run(session.id, state.id, session_operation_context=execute_context)
+        await service.update_run_status(run.id, "running", session_operation_context=execute_context)
+
+        cancelled = await service.cancel_all_orphaned_run_records(reason="periodic recovery")
+
+        assert cancelled == []
+        assert (await service.get_run(run.id)).status == "running"
+
+    @pytest.mark.asyncio
     async def test_record_returning_cleanup_preserves_landscape_run_id(self, service, session_operation_contexts) -> None:
         """Startup reconciliation needs cancelled run records to update Landscape."""
         session = await service.create_session("alice", "Pipeline", "local")
@@ -2521,6 +2539,86 @@ class TestLandscapeReconciliationMarkers:
         assert complete_row.error == f"human readable startup reason {LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX}"
         assert absent_row.error == f"human readable periodic reason {LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX}"
         assert await service.list_pending_landscape_reconciliations() == []
+
+    @pytest.mark.asyncio
+    async def test_replaying_same_outcome_is_idempotent(
+        self,
+        service,
+        session_operation_contexts,
+    ) -> None:
+        candidate = await self._cancelled_run(
+            service,
+            session_operation_contexts,
+            reason=f"startup reason {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
+            landscape_run_id="landscape-1",
+        )
+        complete_ids = frozenset({candidate.id})
+
+        await service.mark_landscape_reconciliation_outcomes(
+            complete_run_ids=complete_ids,
+            absent_run_ids=frozenset(),
+        )
+        await service.mark_landscape_reconciliation_outcomes(
+            complete_run_ids=complete_ids,
+            absent_run_ids=frozenset(),
+        )
+
+        updated = await service.get_run(candidate.id)
+        assert updated.error == f"startup reason {LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX}"
+
+    @pytest.mark.asyncio
+    async def test_opposite_replayed_outcome_is_rejected(
+        self,
+        service,
+        session_operation_contexts,
+    ) -> None:
+        candidate = await self._cancelled_run(
+            service,
+            session_operation_contexts,
+            reason=f"startup reason {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
+            landscape_run_id="landscape-1",
+        )
+        await service.mark_landscape_reconciliation_outcomes(
+            complete_run_ids=frozenset({candidate.id}),
+            absent_run_ids=frozenset(),
+        )
+
+        with pytest.raises(ValueError, match="exact pending"):
+            await service.mark_landscape_reconciliation_outcomes(
+                complete_run_ids=frozenset(),
+                absent_run_ids=frozenset({candidate.id}),
+            )
+
+        updated = await service.get_run(candidate.id)
+        assert updated.error == f"startup reason {LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX}"
+
+    @pytest.mark.asyncio
+    async def test_invalid_marker_rolls_back_the_entire_outcome_batch(
+        self,
+        service,
+        session_operation_contexts,
+    ) -> None:
+        candidate = await self._cancelled_run(
+            service,
+            session_operation_contexts,
+            reason=f"startup reason {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}",
+            landscape_run_id="landscape-1",
+        )
+        invalid = await self._cancelled_run(
+            service,
+            session_operation_contexts,
+            reason="ordinary cancellation",
+            landscape_run_id="landscape-2",
+        )
+
+        with pytest.raises(ValueError, match="exact pending"):
+            await service.mark_landscape_reconciliation_outcomes(
+                complete_run_ids=frozenset({candidate.id, invalid.id}),
+                absent_run_ids=frozenset(),
+            )
+
+        unchanged = await service.get_run(candidate.id)
+        assert unchanged.error == f"startup reason {LANDSCAPE_RECONCILIATION_PENDING_SUFFIX}"
 
     @pytest.mark.asyncio
     async def test_outcome_update_rejects_overlap_without_mutation(

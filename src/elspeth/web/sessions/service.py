@@ -79,6 +79,7 @@ from elspeth.web.coordination.repository import (
     SessionDerivedCustodyError,
     _ForkCreationTransaction,
 )
+from elspeth.web.coordination.run_recovery_authority import RepositoryGlobalRunRecoveryAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -168,6 +169,7 @@ from elspeth.web.sessions.protocol import (
     CompositionStateData,
     CompositionStateProvenance,
     CompositionStateRecord,
+    GlobalRunRecoveryAuthority,
     GuidedAuditEvidence,
     GuidedCompositionStateResult,
     GuidedDeclinedResult,
@@ -4537,6 +4539,7 @@ class SessionServiceImpl:
         operator_profile_registry: OperatorProfileRegistry | None = None,
         catalog: CatalogService | None = None,
         session_operation_authority: SessionOperationAuthority | None = None,
+        global_run_recovery_authority: GlobalRunRecoveryAuthority | None = None,
         audit_access_log_authority: AuditAccessLogAuthority | None = None,
         skill_markdown_history_authority: SkillMarkdownHistoryAuthority | None = None,
         owner_instance_id: str | None = None,
@@ -4569,6 +4572,7 @@ class SessionServiceImpl:
             else:
                 raise NotImplementedError(f"session operation authority not implemented for dialect {engine.dialect.name}")
         self._session_operation_authority = session_operation_authority
+        self._global_run_recovery_authority = global_run_recovery_authority or RepositoryGlobalRunRecoveryAuthority(engine)
         self._audit_access_log_authority = audit_access_log_authority or RepositoryAuditAccessLogAuthority(engine)
         self._skill_markdown_history_authority = skill_markdown_history_authority or RepositorySkillMarkdownHistoryAuthority(engine)
 
@@ -13107,31 +13111,13 @@ class SessionServiceImpl:
         Landscape audit rows. ``cancel_all_orphaned_runs`` keeps the older
         integer API by delegating here.
         """
-        now = self._now()
-
-        def _sync() -> list[RunRecord]:
-            with self._engine.begin() as conn:
-                conditions: list[ColumnElement[bool]] = [runs_table.c.status.in_(["pending", "running"])]
-                if max_age_seconds is not None:
-                    cutoff = now - timedelta(seconds=max_age_seconds)
-                    conditions.append(runs_table.c.started_at <= cutoff)
-                if exclude_run_ids:
-                    conditions.append(runs_table.c.id.not_in(exclude_run_ids))
-
-                stale_rows = conn.execute(select(runs_table.c.id).where(*conditions)).fetchall()
-
-                values: dict[str, Any] = {"status": "cancelled", "finished_at": now}
-                if reason is not None:
-                    values["error"] = reason
-
-                cancelled: list[RunRecord] = []
-                for row in stale_rows:
-                    conn.execute(update(runs_table).where(runs_table.c.id == row.id).values(**values))
-                    updated = conn.execute(select(runs_table).where(runs_table.c.id == row.id)).one()
-                    cancelled.append(self._row_to_run_record(updated))
-                return cancelled
-
-        return cast(list[RunRecord], await self._run_sync(_sync))
+        records = await self._run_sync(
+            self._global_run_recovery_authority.cancel_orphaned_run_records,
+            max_age_seconds=max_age_seconds,
+            exclude_run_ids=exclude_run_ids,
+            reason=reason,
+        )
+        return list(cast("tuple[RunRecord, ...]", records))
 
     async def list_pending_landscape_reconciliations(self) -> list[RunRecord]:
         """Return the durable, exact pending Landscape reconciliation set."""
@@ -13159,48 +13145,11 @@ class SessionServiceImpl:
         absent_run_ids: frozenset[UUID],
     ) -> None:
         """Atomically close exact pending markers without rewriting reasons."""
-        from elspeth.web.sessions.protocol import (
-            LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX,
-            LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX,
-            LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
+        await self._run_sync(
+            self._global_run_recovery_authority.mark_landscape_reconciliation_outcomes,
+            complete_run_ids=complete_run_ids,
+            absent_run_ids=absent_run_ids,
         )
-
-        overlap = complete_run_ids & absent_run_ids
-        if overlap:
-            raise ValueError("Landscape reconciliation outcome sets overlap")
-
-        def _sync() -> None:
-            with self._engine.begin() as conn:
-                outcomes = (
-                    (complete_run_ids, LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX),
-                    (absent_run_ids, LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX),
-                )
-                for run_ids, closed_suffix in outcomes:
-                    for run_id in sorted(run_ids, key=str):
-                        row = conn.execute(
-                            select(runs_table.c.status, runs_table.c.error).where(runs_table.c.id == str(run_id))
-                        ).one_or_none()
-                        if (
-                            row is None
-                            or row.status != "cancelled"
-                            or type(row.error) is not str
-                            or not row.error.endswith(LANDSCAPE_RECONCILIATION_PENDING_SUFFIX)
-                        ):
-                            raise ValueError("Run is not an exact pending Landscape reconciliation candidate")
-                        updated_error = row.error[: -len(LANDSCAPE_RECONCILIATION_PENDING_SUFFIX)] + closed_suffix
-                        result = conn.execute(
-                            update(runs_table)
-                            .where(
-                                runs_table.c.id == str(run_id),
-                                runs_table.c.status == "cancelled",
-                                runs_table.c.error == row.error,
-                            )
-                            .values(error=updated_error)
-                        )
-                        if result.rowcount != 1:
-                            raise RuntimeError("Landscape reconciliation marker update lost its compare-and-swap")
-
-        await self._run_sync(_sync)
 
     async def prune_state_versions(
         self,
