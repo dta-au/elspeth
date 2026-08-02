@@ -67,6 +67,7 @@ from elspeth.web.sessions.routes._helpers import _initial_composition_state_with
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 SOURCE_ID = "00000000-0000-4000-8000-000000000201"
@@ -210,7 +211,12 @@ async def _command(
             )
             deferred_intents.append(replace(deferred, originating_message_id=str(message.id)))
         guided = replace(guided, deferred_intents=tuple(deferred_intents))
-    predecessor = await service.save_composition_state(session.id, _state_data(guided), provenance="session_seed")
+    predecessor = await _save_composition_state_with_compose_authority(
+        service,
+        session.id,
+        _state_data(guided),
+        provenance="session_seed",
+    )
     predecessor_state = _state_from_record(predecessor)
     checkpoint_id = uuid4()
     proposal_id = uuid4()
@@ -273,7 +279,14 @@ async def _command(
     )
     assert isinstance(outcome, GuidedOperationClaimed)
     if drift:
-        await service.save_composition_state(session.id, _state_data(guided), provenance="convergence_persist")
+        assert isinstance(service, DualFencedSessionServiceHarness)
+        context = await service._guided_test_context(session.id, "guided")
+        await service.save_composition_state(
+            session.id,
+            _state_data(guided),
+            provenance="convergence_persist",
+            session_operation_context=context,
+        )
     redacted = redact_tool_call_arguments("set_pipeline", _pipeline(), telemetry=NoopRedactionTelemetry())
     return (
         GuidedPipelineProposalStageCommand(
@@ -485,9 +498,20 @@ def test_stage_writes_checkpoint_reference_private_row_event_and_operation_atomi
 def test_predecessor_drift_rolls_back_every_stage_row(service: SessionServiceImpl, tmp_path: Path) -> None:
     payload_store = FilesystemPayloadStore(tmp_path / "payloads")
     command, session_id = asyncio.run(_command(service, payload_store, drift=True))
+    assert isinstance(service, DualFencedSessionServiceHarness)
+    context = asyncio.run(service._guided_test_context(session_id, "guided"))
 
-    with pytest.raises(GuidedOperationSettlementConflictError):
-        asyncio.run(service.stage_guided_pipeline_proposal(command, payload_store=payload_store))
+    try:
+        with pytest.raises(GuidedOperationSettlementConflictError):
+            asyncio.run(
+                service.stage_guided_pipeline_proposal(
+                    command,
+                    payload_store=payload_store,
+                    session_operation_context=context,
+                )
+            )
+    finally:
+        asyncio.run(service._run_sync(service.session_operation_authority.release, context))
 
     with service._engine.connect() as conn:
         assert (
@@ -827,40 +851,53 @@ def test_dual_fenced_rejection_state_mismatch_changes_nothing_and_consumes_no_se
 ) -> None:
     payload_store = FilesystemPayloadStore(tmp_path / drift)
     command, session_id = asyncio.run(_staged_reject_command(service, payload_store))
-    if drift == "stale_command_current_db":
-        prior = asyncio.run(service.get_state(command.expected_current_state_id))
-        assert prior.derived_from_state_id is not None
-        command = replace(
-            command,
-            expected_current_state_id=prior.derived_from_state_id,
-            expected_current_state_version=command.expected_current_state_version - 1,
-        )
-    else:
-        current = asyncio.run(service.get_current_state(session_id))
-        assert current is not None
-        current_guided = _state_from_record(current).guided_session
-        assert current_guided is not None
-        asyncio.run(
-            service.save_composition_state(
-                session_id,
-                _state_data(current_guided),
-                provenance="convergence_persist",
+    assert isinstance(service, DualFencedSessionServiceHarness)
+    context = asyncio.run(service._guided_test_context(session_id, "guided"))
+    try:
+        if drift == "stale_command_current_db":
+            prior = asyncio.run(service.get_state(command.expected_current_state_id))
+            assert prior.derived_from_state_id is not None
+            command = replace(
+                command,
+                expected_current_state_id=prior.derived_from_state_id,
+                expected_current_state_version=command.expected_current_state_version - 1,
             )
-        )
+        else:
+            current = asyncio.run(service.get_current_state(session_id))
+            assert current is not None
+            current_guided = _state_from_record(current).guided_session
+            assert current_guided is not None
+            asyncio.run(
+                service.save_composition_state(
+                    session_id,
+                    _state_data(current_guided),
+                    provenance="convergence_persist",
+                    session_operation_context=context,
+                )
+            )
 
-    with service._engine.connect() as conn:
-        before_count = conn.scalar(
-            select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == str(session_id))
-        )
-        before_max_version = conn.scalar(
-            select(func.max(composition_states_table.c.version)).where(composition_states_table.c.session_id == str(session_id))
-        )
-        before_sequence = conn.scalar(
-            select(func.coalesce(func.max(chat_messages_table.c.sequence_no), 0)).where(chat_messages_table.c.session_id == str(session_id))
-        )
+        with service._engine.connect() as conn:
+            before_count = conn.scalar(
+                select(func.count()).select_from(composition_states_table).where(composition_states_table.c.session_id == str(session_id))
+            )
+            before_max_version = conn.scalar(
+                select(func.max(composition_states_table.c.version)).where(composition_states_table.c.session_id == str(session_id))
+            )
+            before_sequence = conn.scalar(
+                select(func.coalesce(func.max(chat_messages_table.c.sequence_no), 0)).where(
+                    chat_messages_table.c.session_id == str(session_id)
+                )
+            )
 
-    with pytest.raises((AuditIntegrityError, GuidedOperationSettlementConflictError)):
-        asyncio.run(service.reject_guided_pipeline_proposal(command))
+        with pytest.raises((AuditIntegrityError, GuidedOperationSettlementConflictError)):
+            asyncio.run(
+                service.reject_guided_pipeline_proposal(
+                    command,
+                    session_operation_context=context,
+                )
+            )
+    finally:
+        asyncio.run(service._run_sync(service.session_operation_authority.release, context))
 
     with service._engine.connect() as conn:
         assert (
@@ -1060,7 +1097,12 @@ async def _confirm_wiring_command(
     service = harness.service
     session = await service.create_session("alice", "Guided wire proposal", "local")
     base_guided = _guided()
-    predecessor = await service.save_composition_state(session.id, _state_data(base_guided), provenance="session_seed")
+    predecessor = await _save_composition_state_with_compose_authority(
+        service,
+        session.id,
+        _state_data(base_guided),
+        provenance="session_seed",
+    )
     predecessor_state = _state_from_record(predecessor)
     checkpoint_id = uuid4()
     proposal_id = uuid4()

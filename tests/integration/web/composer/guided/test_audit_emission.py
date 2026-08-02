@@ -6,6 +6,7 @@ import asyncio
 import json
 from uuid import UUID, uuid4
 
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 # ---------------------------------------------------------------------------
@@ -180,7 +181,14 @@ def test_get_guided_rejects_freeform_session_without_masking_http_error(composer
         validation_errors=None,
         composer_meta={},
     )
-    asyncio.run(service.save_composition_state(UUID(session_id), freeform_state, provenance="session_seed"))
+    asyncio.run(
+        _save_composition_state_with_compose_authority(
+            service,
+            UUID(session_id),
+            freeform_state,
+            provenance="session_seed",
+        )
+    )
 
     response = composer_test_client.get(f"/api/sessions/{session_id}/guided")
 

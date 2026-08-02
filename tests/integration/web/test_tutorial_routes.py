@@ -37,7 +37,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.integration.web.conftest import _make_session
+from tests.integration.web.conftest import _make_session, _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -106,7 +106,8 @@ def _seed_session_with_state(app: FastAPI) -> UUID:
     with app.state.session_engine.begin() as conn:
         _make_session(conn, session_id=str(session_id), user_id="alice")
     asyncio.run(
-        app.state.session_service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            app.state.session_service,
             session_id,
             CompositionStateData(),
             provenance="session_seed",
@@ -245,7 +246,8 @@ def test_post_cancel_with_active_run_cancels_via_run_cancel_machinery(tmp_path: 
     app = _app(tmp_path)
     session_id = _seed_session_with_state(app)
     state = asyncio.run(
-        app.state.session_service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            app.state.session_service,
             session_id,
             CompositionStateData(),
             provenance="session_seed",

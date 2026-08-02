@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 from uuid import UUID, uuid4
 
@@ -46,6 +47,7 @@ from elspeth.web.sessions.schemas import GuidedChatRequest
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep as _Step2Journey
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -232,7 +234,8 @@ def _persist_guided(client: TestClient, session_id: str, guided: GuidedSession) 
     state = replace(_initial_composition_state_with_guided_session(), guided_session=guided)
     state_dict = state.to_dict()
     asyncio.run(
-        client.app.state.session_service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            client.app.state.session_service,
             UUID(session_id),
             CompositionStateData(
                 sources=state_dict["sources"],
@@ -1029,11 +1032,21 @@ def test_provider_head_drift_fails_closed_without_settling_chat(
     initial_versions = asyncio.run(service.get_state_versions(UUID(session_id)))
     initial_messages = asyncio.run(service.get_messages(UUID(session_id), limit=None))
     marker = "chat-stale-head"
+    active_context: SessionOperationContext | None = None
+    real_reserve_guided_operation = service.reserve_guided_operation
+
+    async def capture_reserve_guided_operation(**kwargs: Any) -> Any:
+        nonlocal active_context
+        context = kwargs.get("session_operation_context")
+        assert type(context) is SessionOperationContext
+        active_context = context
+        return await real_reserve_guided_operation(**kwargs)
 
     async def drifting_provider(**kwargs: object) -> GuidedChatProviderOutcome:
         _record_test_llm_call(kwargs["recorder"], marker=marker)
         state = kwargs["state"]
         state_dict = state.to_dict()  # type: ignore[union-attr]
+        assert active_context is not None
         await service.save_composition_state(
             UUID(session_id),
             CompositionStateData(
@@ -1046,9 +1059,11 @@ def test_provider_head_drift_fails_closed_without_settling_chat(
                 composer_meta={"guided_session": state.guided_session.to_dict()},  # type: ignore[union-attr]
             ),
             provenance="session_seed",
+            session_operation_context=active_context,
         )
         return await _advisory_provider()
 
+    monkeypatch.setattr(service, "reserve_guided_operation", capture_reserve_guided_operation)
     monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", drifting_provider, raising=False)
     response = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=body)
     replay = composer_test_client.post(f"/api/sessions/{session_id}/guided/chat", json=body)

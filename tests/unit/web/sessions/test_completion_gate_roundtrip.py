@@ -21,6 +21,7 @@ import structlog
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.freeze import deep_freeze
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.state import (
     CompositionState,
     EdgeSpec,
@@ -119,7 +120,23 @@ async def _save_with_gate(service: SessionServiceImpl, state: CompositionState, 
             },
         },
     )
-    await service.save_composition_state(session_id=session.id, state=data, provenance="post_compose")
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        await service.save_composition_state(
+            session_id=session.id,
+            state=data,
+            provenance="post_compose",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
     record = await service.get_current_state(session.id)
     assert record is not None
     return record

@@ -39,6 +39,7 @@ from elspeth.web.sessions.routes.composer.guided_plan import (
 )
 from elspeth.web.sessions.schemas import CompositionProposalResponse
 from elspeth.web.sessions.service import _composition_state_data_content_hash
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 
 
 def _record_failed_llm_call(recorder, *, status: ComposerLLMCallStatus, secret: str) -> None:
@@ -337,7 +338,8 @@ def test_guided_full_preserves_an_existing_canonical_state_as_the_checkpoint_bas
     session = composer_test_client.post("/api/sessions", json={"title": "guided full existing"}).json()
     service = composer_test_client.app.state.session_service
     existing = asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             UUID(session["id"]),
             CompositionStateData(
                 sources={
@@ -409,7 +411,8 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
     session_id = UUID(session["id"])
     service = composer_test_client.app.state.session_service
     existing = asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             session_id,
             CompositionStateData(
                 sources={},

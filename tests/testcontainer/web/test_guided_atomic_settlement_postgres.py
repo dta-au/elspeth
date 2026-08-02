@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import structlog
@@ -21,6 +21,7 @@ from elspeth.contracts.composer_llm_audit import (
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
+from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, composition_states_table, guided_operations_table
@@ -110,16 +111,28 @@ def _command(
     )
 
 
-async def _seed_predecessor(service: SessionServiceImpl, session_id) -> CompositionStateRecord:
-    return await service.save_composition_state(
-        session_id,
-        CompositionStateData(
-            metadata_={"name": "PostgreSQL predecessor", "description": ""},
-            is_valid=False,
-            composer_meta={"guided_session": GuidedSession.initial().to_dict()},
-        ),
-        provenance="convergence_persist",
+async def _seed_predecessor(service: SessionServiceImpl, session_id: UUID) -> CompositionStateRecord:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
     )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            CompositionStateData(
+                metadata_={"name": "PostgreSQL predecessor", "description": ""},
+                is_valid=False,
+                composer_meta={"guided_session": GuidedSession.initial().to_dict()},
+            ),
+            provenance="convergence_persist",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 @pytest.mark.asyncio

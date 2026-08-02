@@ -17,6 +17,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
@@ -75,6 +76,26 @@ class _BlobServiceFake:
 
     async def get_blob(self, *args, **kwargs):
         return None
+
+
+async def _save_composition_state(service, session_id, state, *, provenance):  # type: ignore[no-untyped-def]
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 def _make_app(tmp_path, user_id="alice", database_url: str | None = None):
@@ -600,7 +621,8 @@ async def test_guided_start_rejects_existing_freeform_state_without_guided_sessi
             "on_validation_failure": "halt",
         }
     }
-    existing = await service.save_composition_state(
+    existing = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             sources=freeform_source,
@@ -804,18 +826,46 @@ async def test_guided_start_does_not_overwrite_head_changed_after_preflight(tmp_
         nonlocal raced_record
         outcome = await original_reserve(**kwargs)
         if raced_record is None:
-            raced_record = await service.save_composition_state(
-                session.id,
-                CompositionStateData(
-                    sources={},
-                    nodes={},
-                    edges={},
-                    outputs={},
-                    metadata_={"name": "Raced freeform", "description": ""},
-                    composer_meta=None,
-                ),
-                provenance="post_compose",
+            # This is a genuine competing freeform writer. Hand off from the
+            # route's incumbent lease, then let the successor acquire, write,
+            # and release its own exact COMPOSE authority.
+            await service._run_sync(
+                service.session_operation_authority.release,
+                kwargs["session_operation_context"],
             )
+            successor_context = await service._run_sync(
+                lambda: service.session_operation_authority.acquire(
+                    session_id=session.id,
+                    operation_kind=SessionOperationKind.COMPOSE,
+                    owner_instance_id=service.session_operation_owner_instance_id,
+                    lease_seconds=service.session_operation_lease_seconds,
+                )
+            )
+            try:
+                raced_record = await service.save_composition_state(
+                    session.id,
+                    CompositionStateData(
+                        sources={},
+                        nodes={},
+                        edges={},
+                        outputs={},
+                        metadata_={"name": "Raced freeform", "description": ""},
+                        composer_meta=None,
+                    ),
+                    provenance="post_compose",
+                    session_operation_context=successor_context,
+                )
+                await service.fail_guided_operation(
+                    outcome.fence,
+                    failure_code="stale_conflict",
+                    actor="composer_route",
+                    session_operation_context=successor_context,
+                )
+            finally:
+                await service._run_sync(
+                    service.session_operation_authority.release,
+                    successor_context,
+                )
         return outcome
 
     with patch.object(service, "reserve_guided_operation", side_effect=reserve_after_freeform_race):
@@ -850,7 +900,8 @@ async def test_guided_start_completed_retry_replays_after_later_freeform_head(tm
     payload = {"profile": "tutorial", "operation_id": operation_id}
     committed = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
     assert committed.status_code == 200
-    later_freeform = await service.save_composition_state(
+    later_freeform = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             sources={},
@@ -874,6 +925,12 @@ async def test_guided_start_completed_retry_replays_after_later_freeform_head(tm
 
 @pytest.mark.asyncio
 async def test_guided_start_empty_race_settles_exact_guided_winner(tmp_path) -> None:
+    """One guided-start operation may observe state written by its own substep.
+
+    The injected write deliberately reuses the route operation's exact COMPOSE
+    context: it models re-entrant work in the same logical operation, not a
+    second writer bypassing session serialization.
+    """
     from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
     from elspeth.web.sessions.protocol import CompositionStateData
     from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
@@ -888,6 +945,7 @@ async def test_guided_start_empty_race_settles_exact_guided_winner(tmp_path) -> 
         nonlocal winner_record
         outcome = await original_reserve(**kwargs)
         if winner_record is None:
+            live_compose_context = kwargs["session_operation_context"]
             winner = _materialize_first_turn(
                 _initial_composition_state_with_guided_session(profile=TUTORIAL_PROFILE),
                 app.state.catalog_service,
@@ -906,6 +964,7 @@ async def test_guided_start_empty_race_settles_exact_guided_winner(tmp_path) -> 
                     composer_meta={"guided_session": winner.guided_session.to_dict()},
                 ),
                 provenance="session_seed",
+                session_operation_context=live_compose_context,
             )
         return outcome
 
@@ -925,6 +984,7 @@ async def test_guided_start_empty_race_settles_exact_guided_winner(tmp_path) -> 
 
 @pytest.mark.asyncio
 async def test_guided_start_late_empty_race_converges_inside_atomic_seed(tmp_path) -> None:
+    """Atomic seed convergence rechecks a same-operation predecessor write."""
     from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
     from elspeth.web.sessions.protocol import CompositionStateData
     from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
@@ -944,6 +1004,8 @@ async def test_guided_start_late_empty_race_converges_inside_atomic_seed(tmp_pat
         )
         assert winner.guided_session is not None
         winner_data = winner.to_dict()
+        # The hook runs inside the original seed operation, so the forwarded
+        # exact context is the same operation's authority, not a competitor's.
         winner_record = await service.save_composition_state(
             session.id,
             CompositionStateData(
@@ -955,6 +1017,7 @@ async def test_guided_start_late_empty_race_converges_inside_atomic_seed(tmp_pat
                 composer_meta={"guided_session": winner.guided_session.to_dict()},
             ),
             provenance="session_seed",
+            session_operation_context=kwargs["session_operation_context"],
         )
         return await original_seed(*args, **kwargs)
 
@@ -990,7 +1053,8 @@ async def test_guided_start_replay_rejects_cross_session_result_locator(tmp_path
     client = TestClient(app)
     session = await service.create_session("alice", "T", "local")
     foreign = await service.create_session("alice", "Other", "local")
-    foreign_state = await service.save_composition_state(
+    foreign_state = await _save_composition_state(
+        service,
         foreign.id,
         CompositionStateData(
             sources={},

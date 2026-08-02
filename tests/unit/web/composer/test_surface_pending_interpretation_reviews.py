@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from uuid import UUID, uuid4
+from uuid import UUID
 
 import pytest
 import structlog
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import (
     CompositionState,
@@ -24,7 +25,7 @@ from elspeth.web.interpretation_state import (
     SOURCE_COMPONENT_ID,
 )
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -118,42 +119,41 @@ def _pt_node() -> NodeSpec:
     )
 
 
-async def _persist(sessions_service, state: CompositionState):
-    from datetime import UTC, datetime
-
-    from sqlalchemy import insert
-
-    from elspeth.web.sessions.models import sessions_table
-
-    session_id = uuid4()
-    with sessions_service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="u",
-                auth_provider_type="local",
-                title="surfacer test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+async def _persist(sessions_service: SessionServiceImpl, state: CompositionState) -> tuple[UUID, UUID]:
+    session = await sessions_service.create_session("u", "surfacer test", "local")
+    session_id = session.id
     record = await _save_state_for_session(sessions_service, session_id, state)
     return session_id, record.id
 
 
-async def _save_state_for_session(sessions_service, session_id: UUID, state: CompositionState):
+async def _save_state_for_session(
+    sessions_service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionState,
+) -> CompositionStateRecord:
     state_dict = state.to_dict()
-    record = await sessions_service.save_composition_state(
-        session_id,
-        CompositionStateData(
-            nodes=state_dict["nodes"],
-            sources=state_dict["sources"],
-            metadata_=state_dict["metadata"],
-            is_valid=True,
-        ),
-        provenance="tool_call",
+    context = await sessions_service._run_sync(
+        lambda: sessions_service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
     )
-    return record
+    try:
+        return await sessions_service.save_composition_state(
+            session_id,
+            CompositionStateData(
+                nodes=state_dict["nodes"],
+                sources=state_dict["sources"],
+                metadata_=state_dict["metadata"],
+                is_valid=True,
+            ),
+            provenance="tool_call",
+            session_operation_context=context,
+        )
+    finally:
+        await sessions_service._run_sync(sessions_service.session_operation_authority.release, context)
 
 
 @pytest.mark.asyncio

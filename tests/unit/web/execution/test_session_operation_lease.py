@@ -1607,11 +1607,16 @@ async def _seed_run_through_service(
 ) -> tuple[UUID, UUID]:
     """Seed only through reviewed SessionService writers, never direct table DML."""
     session = await service.create_session(_USER_ID, title, "local")
-    state = await service.save_composition_state(
-        session.id,
-        CompositionStateData(is_valid=True),
-        provenance="session_seed",
-    )
+    compose_context = _acquire(authority, session_id=session.id, kind=SessionOperationKind.COMPOSE)
+    try:
+        state = await service.save_composition_state(
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+            session_operation_context=compose_context,
+        )
+    finally:
+        authority.release(compose_context)
     context = _acquire(authority, session_id=session.id, kind=SessionOperationKind.EXECUTE)
     try:
         run = await service.create_run(

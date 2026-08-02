@@ -33,6 +33,7 @@ from elspeth.core.landscape.schema import schema_identity_table as landscape_sch
 from elspeth.core.schema_identity import SCHEMA_IDENTITY_APPLICATION_ID
 from elspeth.core.schema_shape import _text_builtin_identity_rows_on_connection
 from elspeth.web import schema_probe as schema_probe_module
+from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.preferences.models import UpdateComposerPreferencesRequest
 from elspeth.web.preferences.service import PreferencesService
 from elspeth.web.schema_probe import (
@@ -277,11 +278,23 @@ async def test_postgres_guided_operation_takeover_fences_late_worker(postgres_en
         log=structlog.get_logger("test.guided-operation-postgres-b"),
     )
     session_id = (await service_a.create_session("alice", "PostgreSQL guided operation", "local")).id
-    state = await service_a.save_composition_state(
-        session_id,
-        CompositionStateData(is_valid=False),
-        provenance="session_seed",
+    compose_context = await service_a._run_sync(
+        lambda: service_a.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service_a.session_operation_owner_instance_id,
+            lease_seconds=service_a.session_operation_lease_seconds,
+        )
     )
+    try:
+        state = await service_a.save_composition_state(
+            session_id,
+            CompositionStateData(is_valid=False),
+            provenance="session_seed",
+            session_operation_context=compose_context,
+        )
+    finally:
+        await service_a._run_sync(service_a.session_operation_authority.release, compose_context)
     state_id = state.id
 
     operation_id = "postgres-takeover"

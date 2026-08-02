@@ -27,10 +27,41 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
 )
 from elspeth.web.sessions.proposal_blob_effects import blob_row_snapshot_payload
-from elspeth.web.sessions.protocol import CompositionStateData, StaleComposeStateError
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionStateProvenance,
+    CompositionStateRecord,
+    StaleComposeStateError,
+)
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+
+
+async def _save_composition_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 @pytest.mark.asyncio
@@ -651,7 +682,8 @@ async def test_accept_ordinary_proposal_stale_predecessor_writes_nothing() -> No
     )
     session_id = (await service.create_session("alice", "Composer proposal stale predecessor", "local")).id
     proposal = await _create_ordinary_accept_proposal(service, session_id=session_id)
-    winner_state = await service.save_composition_state(
+    winner_state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(metadata_={"name": "winner"}, is_valid=True),
         provenance="tool_call",
@@ -712,7 +744,8 @@ async def test_accept_ordinary_proposal_requires_absent_base_to_match_locked_hea
     )
     session_id = (await service.create_session("alice", "Absent proposal base", "local")).id
     proposal = await _create_ordinary_accept_proposal(service, session_id=session_id)
-    winner_state = await service.save_composition_state(
+    winner_state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(metadata_={"name": "winner"}, is_valid=True),
         provenance="tool_call",
@@ -773,7 +806,8 @@ async def test_accept_ordinary_proposal_rejects_tool_state_shape_mismatch(case: 
         log=structlog.get_logger("test.composer-proposal-accept-state-shape"),
     )
     session_id = (await service.create_session("alice", "Proposal state shape", "local")).id
-    current = await service.save_composition_state(
+    current = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(metadata_={"name": "current"}, is_valid=True),
         provenance="tool_call",
@@ -839,7 +873,8 @@ async def test_accept_blob_only_proposal_binds_existing_or_inserts_initial_snaps
     session_id = (await service.create_session("alice", "Blob proposal state binding", "local")).id
     current = None
     if existing_head:
-        current = await service.save_composition_state(
+        current = await _save_composition_state(
+            service,
             session_id,
             CompositionStateData(metadata_={"name": "current"}, is_valid=True),
             provenance="tool_call",

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 import pytest
 import structlog
@@ -32,6 +33,7 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
@@ -39,7 +41,11 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import composer_completion_events_table
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionStateProvenance,
+    CompositionStateRecord,
+)
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -135,13 +141,39 @@ def _csv_state() -> CompositionStateData:
     )
 
 
+async def _save_composition_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
 @pytest.mark.asyncio
 async def test_export_yaml_authority_failure_returns_no_yaml_and_emits_no_counter(tmp_path: Path) -> None:
     app, service = _make_app_with_telemetry(tmp_path)
     telemetry = app.state.sessions_telemetry
     client = TestClient(app, raise_server_exceptions=False)
     session = await service.create_session("alice", "Pipeline", "local")
-    await service.save_composition_state(session.id, _csv_state(), provenance="session_seed")
+    await _save_composition_state(service, session.id, _csv_state(), provenance="session_seed")
 
     async def _pass_preflight(  # type: ignore[no-untyped-def]
         state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
@@ -169,7 +201,7 @@ async def test_export_yaml_taken_over_authority_returns_no_yaml_and_emits_no_cou
     telemetry = app.state.sessions_telemetry
     client = TestClient(app, raise_server_exceptions=False)
     session = await service.create_session("alice", "Pipeline", "local")
-    await service.save_composition_state(session.id, _csv_state(), provenance="session_seed")
+    await _save_composition_state(service, session.id, _csv_state(), provenance="session_seed")
 
     async def _pass_preflight(  # type: ignore[no-untyped-def]
         state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
@@ -208,25 +240,52 @@ async def test_export_yaml_taken_over_authority_returns_no_yaml_and_emits_no_cou
 
 
 @pytest.mark.asyncio
-async def test_export_yaml_records_the_authored_state_when_a_newer_state_appears_after_preflight(tmp_path: Path) -> None:
+async def test_export_yaml_records_authored_state_while_newer_state_waits_for_lease_release(tmp_path: Path) -> None:
     app, service = _make_app_with_telemetry(tmp_path)
     client = TestClient(app)
     session = await service.create_session("alice", "Pipeline", "local")
-    await service.save_composition_state(session.id, _csv_state(), provenance="session_seed")
+    await _save_composition_state(service, session.id, _csv_state(), provenance="session_seed")
     authored = await service.get_current_state(session.id)
     assert authored is not None
 
-    async def _supersede_after_preflight(  # type: ignore[no-untyped-def]
+    contender_queued = False
+    superseding_state = None
+
+    async def _queue_contender_after_preflight(  # type: ignore[no-untyped-def]
         state, *, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
     ):
+        nonlocal contender_queued
         del state, settings, secret_service, user_id, session_id, plugin_snapshot, profile_registry, catalog
-        await service.save_composition_state(session.id, _csv_state(), provenance="tool_call")
+        contender_queued = True
         return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness())
 
-    with patch("elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state", side_effect=_supersede_after_preflight):
+    original_close = SessionOperationLease.close
+
+    async def _release_then_run_contender(lease: SessionOperationLease) -> None:
+        nonlocal superseding_state
+        await original_close(lease)
+        if contender_queued:
+            superseding_state = await _save_composition_state(
+                service,
+                session.id,
+                _csv_state(),
+                provenance="tool_call",
+            )
+
+    with (
+        patch(
+            "elspeth.web.sessions.routes.composer.state._runtime_preflight_for_state",
+            side_effect=_queue_contender_after_preflight,
+        ),
+        patch.object(SessionOperationLease, "close", _release_then_run_contender),
+    ):
         response = client.get(f"/api/sessions/{session.id}/state/yaml")
 
     assert response.status_code == 200, response.text
+    assert superseding_state is not None
+    current = await service.get_current_state(session.id)
+    assert current is not None
+    assert current.id == superseding_state.id
     with app.state.session_engine.connect() as conn:
         rows = conn.execute(select(composer_completion_events_table)).all()
     assert len(rows) == 1
@@ -245,7 +304,8 @@ async def test_export_yaml_route_emits_completion_counter(tmp_path: Path) -> Non
     client = TestClient(app)
 
     session = await service.create_session("alice", "Pipeline", "local")
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session.id,
         _csv_state(),
         provenance="session_seed",
@@ -300,7 +360,8 @@ async def test_export_yaml_route_runtime_preflight_failure_does_not_emit(tmp_pat
     client = TestClient(app)
 
     session = await service.create_session("alice", "Pipeline", "local")
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session.id,
         _csv_state(),
         provenance="session_seed",

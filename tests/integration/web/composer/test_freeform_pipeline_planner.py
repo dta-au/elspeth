@@ -43,6 +43,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 
 
 @dataclass
@@ -163,7 +164,8 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
     )
     current_state = None
     if persisted_base:
-        current_state = await sessions.save_composition_state(
+        current_state = await _save_composition_state_with_compose_authority(
+            sessions,
             session.id,
             CompositionStateData(
                 sources={},

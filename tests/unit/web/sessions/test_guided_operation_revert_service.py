@@ -5,8 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import threading
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,6 +38,8 @@ from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, PresentBase, composition_content_hash
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
+from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
@@ -51,6 +52,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
+    CompositionStateProvenance,
     CompositionStateRecord,
     GuidedCompositionStateResult,
     GuidedOperationActive,
@@ -98,12 +100,12 @@ def file_engine(tmp_path: Path):
 
 @pytest.fixture(params=("sqlite", "postgres"))
 def durable_engine(request: pytest.FixtureRequest, tmp_path: Path):
-    """Production-shaped SQLite plus opt-in PostgreSQL real-lock races."""
+    """Production-shaped SQLite plus opt-in PostgreSQL authority handoffs."""
 
     if request.param == "postgres":
         url = os.environ.get("ELSPETH_TEST_POSTGRES_URL")
         if url is None:
-            pytest.skip("ELSPETH_TEST_POSTGRES_URL is required for the PostgreSQL accept/revert race")
+            pytest.skip("ELSPETH_TEST_POSTGRES_URL is required for the PostgreSQL accept/revert handoff")
         race_engine = create_session_engine(url)
     else:
         race_engine = create_session_engine(f"sqlite:///{tmp_path / 'revert-races.db'}")
@@ -114,12 +116,57 @@ def durable_engine(request: pytest.FixtureRequest, tmp_path: Path):
         race_engine.dispose()
 
 
-def _service_for(engine: Any) -> SessionServiceImpl:
-    return DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.revert-race"))
+def _service_for(engine: Any) -> DualFencedSessionServiceHarness:
+    return DualFencedSessionServiceHarness(engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.revert-handoff"))
+
+
+@contextlib.asynccontextmanager
+async def _session_operation_context(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    operation_kind: SessionOperationKind,
+) -> AsyncIterator[SessionOperationContext]:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=operation_kind,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        yield context
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
+@contextlib.asynccontextmanager
+async def _compose_context(
+    service: SessionServiceImpl,
+    session_id: UUID,
+) -> AsyncIterator[SessionOperationContext]:
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        yield context
+
+
+async def _save_composition_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    async with _compose_context(service, session_id) as context:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
 
 
 async def _revert_at_current(
-    service: SessionServiceImpl,
+    service: DualFencedSessionServiceHarness,
     fence: GuidedOperationFence,
     *,
     state_id: UUID,
@@ -139,71 +186,14 @@ async def _revert_at_current(
     )
 
 
-async def _service_lock_contention(
-    first_service: SessionServiceImpl,
-    second_service: SessionServiceImpl,
-    session_id: UUID,
-    first: Callable[[], Coroutine[Any, Any, Any]],
-    second: Callable[[], Coroutine[Any, Any, Any]],
-) -> tuple[Any, Any]:
-    """Pause the winner while it holds the production session lock."""
-
-    original_first_lock = first_service._session_write_lock
-    original_second_begin = second_service._session_process_locked_begin
-    original_second_lock = second_service._session_write_lock
-    held = threading.Barrier(2)
-    release = threading.Barrier(2)
-    contender_waiting = threading.Event()
-    contender_acquired = threading.Event()
-    paused = False
-
-    @contextlib.contextmanager
-    def controlled_first_lock(conn: Any, locked_session_id: str):
-        nonlocal paused
-        with original_first_lock(conn, locked_session_id):
-            if locked_session_id == str(session_id) and not paused:
-                paused = True
-                held.wait(timeout=5)
-                release.wait(timeout=5)
-            yield
-
-    @contextlib.contextmanager
-    def observed_second_begin(locked_session_id: str):
-        if locked_session_id == str(session_id):
-            contender_waiting.set()
-        with original_second_begin(locked_session_id) as conn:
-            yield conn
-
-    @contextlib.contextmanager
-    def observed_second_lock(conn: Any, locked_session_id: str):
-        with original_second_lock(conn, locked_session_id):
-            if locked_session_id == str(session_id):
-                contender_acquired.set()
-            yield
-
-    with (
-        patch.object(first_service, "_session_write_lock", new=controlled_first_lock),
-        patch.object(second_service, "_session_process_locked_begin", new=observed_second_begin),
-        patch.object(second_service, "_session_write_lock", new=observed_second_lock),
-    ):
-        first_task: asyncio.Task[Any] = asyncio.create_task(first())
-        await asyncio.to_thread(held.wait, 5)
-        second_task: asyncio.Task[Any] = asyncio.create_task(second())
-        assert await asyncio.to_thread(contender_waiting.wait, 5)
-        was_blocked = not contender_acquired.is_set()
-        await asyncio.to_thread(release.wait, 5)
-        results = tuple(await asyncio.gather(first_task, second_task, return_exceptions=True))
-        assert was_blocked
-        return results  # type: ignore[return-value]
-
-
 async def _claim(
-    service: SessionServiceImpl,
+    service: DualFencedSessionServiceHarness,
     session_id: UUID,
     operation_id="00000000-0000-4000-8000-000000000001",
     *,
     kind="state_revert",
     request_hash="a" * 64,
+    session_operation_context: SessionOperationContext | None = None,
 ) -> GuidedOperationFence:
     outcome = await service.reserve_guided_operation(
         session_id=session_id,
@@ -212,6 +202,7 @@ async def _claim(
         request_hash=request_hash,
         actor="route",
         lease_seconds=60,
+        session_operation_context=session_operation_context,
     )
     assert isinstance(outcome, GuidedOperationClaimed)
     return outcome.fence
@@ -249,22 +240,24 @@ async def _attach_pending_guided_pipeline_proposal(
         model_version="test-model-v1",
         provider="test",
     )
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=plan,
-        summary="Stage the guided topology.",
-        rationale="Exercise revert integrity.",
-        affects=("graph",),
-        arguments_redacted_json=redact_tool_call_arguments(
-            "set_pipeline",
-            deep_thaw(proposal.pipeline),
-            telemetry=NoopRedactionTelemetry(),
-        ),
-        actor="composer-web:user:alice",
-        composer_model_identifier="test-model",
-        composer_model_version="test-model-v1",
-        composer_provider="test",
-    )
+    async with _compose_context(service, session_id) as context:
+        row = await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=plan,
+            summary="Stage the guided topology.",
+            rationale="Exercise revert integrity.",
+            affects=("graph",),
+            arguments_redacted_json=redact_tool_call_arguments(
+                "set_pipeline",
+                deep_thaw(proposal.pipeline),
+                telemetry=NoopRedactionTelemetry(),
+            ),
+            actor="composer-web:user:alice",
+            composer_model_identifier="test-model",
+            composer_model_version="test-model-v1",
+            composer_provider="test",
+            session_operation_context=context,
+        )
     active = replace(
         guided,
         step=GuidedStep.STEP_3_TRANSFORMS,
@@ -371,7 +364,7 @@ async def _assert_revert_integrity_failure_is_atomic(
     assert operation.result_state_id is None
 
 
-def _race_state_content_hash(state: CompositionStateData) -> str:
+def _handoff_state_content_hash(state: CompositionStateData) -> str:
     return stable_hash(
         {
             "sources": state.sources,
@@ -383,12 +376,13 @@ def _race_state_content_hash(state: CompositionStateData) -> str:
     )
 
 
-async def _prepare_accept_revert_race(
-    accept_service: SessionServiceImpl,
-    revert_service: SessionServiceImpl,
+async def _prepare_accept_revert_handoff(
+    accept_service: DualFencedSessionServiceHarness,
+    revert_service: DualFencedSessionServiceHarness,
 ):
-    session = await accept_service.create_session("alice", "Accept/revert race", "local")
-    target = await accept_service.save_composition_state(
+    session = await accept_service.create_session("alice", "Accept/revert handoff", "local")
+    target = await _save_composition_state(
+        accept_service,
         session.id,
         CompositionStateData(
             sources={"target": {"type": "csv"}},
@@ -405,7 +399,8 @@ async def _prepare_accept_revert_race(
         metadata_={"name": "Accepted proposal", "description": ""},
         is_valid=True,
     )
-    current = await accept_service.save_composition_state(
+    current = await _save_composition_state(
+        accept_service,
         session.id,
         accepted_state,
         provenance="session_seed",
@@ -432,23 +427,25 @@ async def _prepare_accept_revert_race(
         model_version="test-model-v1",
         provider="test",
     )
-    proposal_row = await accept_service.create_pipeline_composition_proposal(
-        session_id=session.id,
-        plan=plan,
-        summary="Accept or revert.",
-        rationale="Exercise the shared lock.",
-        affects=("graph",),
-        arguments_redacted_json=redact_tool_call_arguments(
-            "set_pipeline",
-            pipeline,
-            telemetry=NoopRedactionTelemetry(),
-        ),
-        actor="composer-web:user:alice",
-        composer_model_identifier="test-model",
-        composer_model_version="test-model-v1",
-        composer_provider="test",
-    )
-    content_hash = _race_state_content_hash(accepted_state)
+    async with _compose_context(accept_service, session.id) as context:
+        proposal_row = await accept_service.create_pipeline_composition_proposal(
+            session_id=session.id,
+            plan=plan,
+            summary="Accept or revert.",
+            rationale="Exercise independent authority handoff.",
+            affects=("graph",),
+            arguments_redacted_json=redact_tool_call_arguments(
+                "set_pipeline",
+                pipeline,
+                telemetry=NoopRedactionTelemetry(),
+            ),
+            actor="composer-web:user:alice",
+            composer_model_identifier="test-model",
+            composer_model_version="test-model-v1",
+            composer_provider="test",
+            session_operation_context=context,
+        )
+    content_hash = _handoff_state_content_hash(accepted_state)
     invocation = finish_success(
         begin_dispatch(
             plan.tool_call_id,
@@ -483,14 +480,16 @@ async def _prepare_accept_revert_race(
     )
     assert len(bindings) == 1
     dispatch: PipelineDispatchAuditBinding = bindings[0]
-    fence = await _claim(
-        revert_service,
-        session.id,
-        operation_id=str(uuid4()),
-        request_hash="f" * 64,
-    )
+    async with _compose_context(revert_service, session.id) as revert_reservation_context:
+        fence = await _claim(
+            revert_service,
+            session.id,
+            operation_id=str(uuid4()),
+            request_hash="f" * 64,
+            session_operation_context=revert_reservation_context,
+        )
 
-    async def accept():
+    async def accept(operation_context: SessionOperationContext):
         return await accept_service.settle_pipeline_composition_proposal(
             session_id=session.id,
             proposal_id=proposal_row.id,
@@ -502,9 +501,10 @@ async def _prepare_accept_revert_race(
             final_composer_metadata=None,
             dispatch=dispatch,
             actor="user:alice",
+            session_operation_context=operation_context,
         )
 
-    async def revert():
+    async def revert(operation_context: SessionOperationContext):
         return await revert_service.revert_state_for_guided_operation(
             fence,
             state_id=target.id,
@@ -512,6 +512,7 @@ async def _prepare_accept_revert_race(
             expected_current_state_version=current.version,
             actor="composer_route",
             response_hash_factory=lambda state: stable_hash({"state_id": str(state.id), "version": state.version}),
+            session_operation_context=operation_context,
         )
 
     return session, target, proposal_row, fence, accept, revert
@@ -520,12 +521,14 @@ async def _prepare_accept_revert_race(
 @pytest.mark.asyncio
 async def test_revert_state_and_system_message_settle_in_fence_transaction(service) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    first = await service.save_composition_state(
+    first = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(sources={"source": {"type": "csv"}}, is_valid=True),
         provenance="session_seed",
     )
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(sources={"source": {"type": "api"}}, is_valid=True),
         provenance="session_seed",
@@ -558,7 +561,8 @@ async def test_revert_state_and_system_message_settle_in_fence_transaction(servi
 @pytest.mark.asyncio
 async def test_revert_older_guided_proposal_checkpoint_rejects_pending_and_scrubs_to_topology(service, engine) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS).to_dict()},
@@ -573,7 +577,8 @@ async def test_revert_older_guided_proposal_checkpoint_rejects_pending_and_scrub
         state=target,
         guided=GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS),
     )
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": None},
@@ -620,7 +625,8 @@ async def test_revert_older_guided_proposal_checkpoint_rejects_pending_and_scrub
 @pytest.mark.asyncio
 async def test_future_skewed_event_clock_cannot_clear_live_confirmation_or_reject_proposal(service, engine) -> None:
     session = await service.create_session("alice", "Clock-skewed revert", "local")
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS).to_dict()},
@@ -635,7 +641,8 @@ async def test_future_skewed_event_clock_cannot_clear_live_confirmation_or_rejec
         state=target,
         guided=GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS),
     )
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": None},
@@ -694,7 +701,8 @@ async def test_future_skewed_event_clock_cannot_clear_live_confirmation_or_rejec
 async def test_revert_terminal_target_reference_rolls_back_every_surface(service, engine) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
     guided = GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS)
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": guided.to_dict()},
@@ -711,16 +719,19 @@ async def test_revert_terminal_target_reference_rolls_back_every_surface(service
     )
     bound = state_from_record(target).guided_session
     assert bound is not None and bound.active_proposal is not None
-    await service.reject_pipeline_composition_proposal(
-        session_id=session.id,
-        proposal_id=proposal.id,
-        draft_hash=bound.active_proposal.draft_hash,
-        reviewed_facts=guided_private_reviewed_facts(bound),
-        reason="superseded",
-        dispatch=None,
-        actor="test",
-    )
-    await service.save_composition_state(
+    async with _compose_context(service, session.id) as context:
+        await service.reject_pipeline_composition_proposal(
+            session_id=session.id,
+            proposal_id=proposal.id,
+            draft_hash=bound.active_proposal.draft_hash,
+            reviewed_facts=guided_private_reviewed_facts(bound),
+            reason="superseded",
+            dispatch=None,
+            actor="test",
+            session_operation_context=context,
+        )
+    await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": None},
@@ -747,7 +758,8 @@ async def test_revert_terminal_target_reference_rolls_back_every_surface(service
 @pytest.mark.asyncio
 async def test_revert_freeform_target_rejects_current_guided_pending_proposal(service, engine) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={
@@ -759,7 +771,8 @@ async def test_revert_freeform_target_rejects_current_guided_pending_proposal(se
         ),
         provenance="session_seed",
     )
-    current = await service.save_composition_state(
+    current = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS).to_dict()},
@@ -808,7 +821,8 @@ async def test_revert_early_guided_checkpoint_preserves_stage_and_unanswered_tur
             ),
         ),
     )
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={
@@ -820,7 +834,8 @@ async def test_revert_early_guided_checkpoint_preserves_stage_and_unanswered_tur
         ),
         provenance="session_seed",
     )
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": None},
@@ -864,7 +879,8 @@ async def test_revert_completed_guided_checkpoint_preserves_terminal_step_and_st
         terminal=TerminalState(kind=TerminalKind.COMPLETED, reason=None, pipeline_yaml="pipeline: {}"),
         transition_consumed=True,
     )
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={
@@ -876,7 +892,8 @@ async def test_revert_completed_guided_checkpoint_preserves_terminal_step_and_st
         ),
         provenance="session_seed",
     )
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": None},
@@ -916,7 +933,8 @@ async def test_revert_step3_non_proposal_unanswered_turn_remains_valid(service) 
             ),
         ),
     )
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": guided.to_dict()},
@@ -944,7 +962,8 @@ async def test_revert_step3_non_proposal_unanswered_turn_remains_valid(service) 
 @pytest.mark.asyncio
 async def test_revert_rejects_distinct_current_and_target_pending_refs_once_each(service, engine) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS).to_dict()},
@@ -959,7 +978,8 @@ async def test_revert_rejects_distinct_current_and_target_pending_refs_once_each
         state=target,
         guided=GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS),
     )
-    current = await service.save_composition_state(
+    current = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS).to_dict()},
@@ -1004,7 +1024,8 @@ async def test_revert_rejects_distinct_current_and_target_pending_refs_once_each
 @pytest.mark.asyncio
 async def test_revert_reference_mismatch_rolls_back_proposals_state_message_and_operation(service, engine) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS).to_dict()},
@@ -1027,7 +1048,8 @@ async def test_revert_reference_mismatch_rolls_back_proposals_state_message_and_
             .where(composition_states_table.c.id == str(target.id))
             .values(composer_meta={"_version": 1, "data": tampered_meta})
         )
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": None},
@@ -1086,7 +1108,8 @@ async def test_revert_reference_mismatch_rolls_back_proposals_state_message_and_
 @pytest.mark.asyncio
 async def test_revert_guided_ref_wrong_checkpoint_base_rolls_back_every_surface(service, engine) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS).to_dict()},
@@ -1095,7 +1118,8 @@ async def test_revert_guided_ref_wrong_checkpoint_base_rolls_back_every_surface(
         ),
         provenance="session_seed",
     )
-    current = await service.save_composition_state(
+    current = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             sources={
@@ -1136,7 +1160,8 @@ async def test_revert_guided_ref_wrong_checkpoint_base_rolls_back_every_surface(
 @pytest.mark.asyncio
 async def test_revert_guided_ref_wrong_checkpoint_content_rolls_back_every_surface(service, engine) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS).to_dict()},
@@ -1174,7 +1199,8 @@ async def test_revert_guided_ref_wrong_checkpoint_content_rolls_back_every_surfa
 async def test_revert_guided_ref_wrong_surface_rolls_back_every_surface(service, engine) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
     guided = GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS)
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": guided.to_dict()},
@@ -1236,7 +1262,8 @@ async def test_revert_guided_ref_wrong_surface_rolls_back_every_surface(service,
 @pytest.mark.asyncio
 async def test_revert_guided_ref_without_trailing_proposal_turn_rolls_back_every_surface(service, engine) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS).to_dict()},
@@ -1287,7 +1314,8 @@ async def test_revert_guided_ref_with_multiple_unanswered_turns_rolls_back_every
             ),
         ),
     )
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": guided.to_dict()},
@@ -1338,7 +1366,8 @@ async def test_revert_trailing_proposal_turn_without_ref_rolls_back_every_surfac
             ),
         ),
     )
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": guided.to_dict()},
@@ -1367,7 +1396,8 @@ async def test_revert_trailing_proposal_turn_without_ref_rolls_back_every_surfac
 )
 async def test_revert_fault_rolls_back_every_settlement_surface(service, engine, fault_point: str) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    target = await service.save_composition_state(
+    target = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS).to_dict()},
@@ -1382,7 +1412,8 @@ async def test_revert_fault_rolls_back_every_settlement_surface(service, engine,
         state=target,
         guided=GuidedSession(step=GuidedStep.STEP_3_TRANSFORMS),
     )
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": None},
@@ -1466,33 +1497,55 @@ async def test_revert_fault_rolls_back_every_settlement_surface(service, engine,
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("winner", ("accept", "revert"))
-async def test_accept_vs_revert_serializes_on_real_session_lock(durable_engine, winner: str) -> None:
+async def test_accept_vs_revert_session_operation_handoff_yields_one_terminal_outcome(durable_engine, winner: str) -> None:
+    """Independent replicas conflict while one authority is live, then hand off safely."""
     accept_service = _service_for(durable_engine)
     revert_service = _service_for(durable_engine)
-    session, target, proposal, fence, accept, revert = await _prepare_accept_revert_race(accept_service, revert_service)
+    session, target, proposal, fence, accept, revert = await _prepare_accept_revert_handoff(
+        accept_service,
+        revert_service,
+    )
     try:
         if winner == "accept":
-            accept_result, revert_result = await _service_lock_contention(
+            async with _session_operation_context(
                 accept_service,
-                revert_service,
                 session.id,
-                accept,
-                revert,
-            )
-            assert not isinstance(accept_result, BaseException)
-            assert isinstance(revert_result, GuidedOperationSettlementConflictError)
+                SessionOperationKind.PROPOSAL,
+            ) as accept_context:
+                with pytest.raises(SessionOperationConflictError):
+                    await revert_service._run_sync(
+                        lambda: revert_service.session_operation_authority.acquire(
+                            session_id=session.id,
+                            operation_kind=SessionOperationKind.COMPOSE,
+                            owner_instance_id=revert_service.session_operation_owner_instance_id,
+                            lease_seconds=revert_service.session_operation_lease_seconds,
+                        )
+                    )
+                await accept(accept_context)
+            async with _compose_context(revert_service, session.id) as revert_context:
+                with pytest.raises(GuidedOperationSettlementConflictError):
+                    await revert(revert_context)
             expected_status = "committed"
             expected_versions = [1, 2, 3]
         else:
-            revert_result, accept_result = await _service_lock_contention(
-                revert_service,
+            async with _compose_context(revert_service, session.id) as revert_context:
+                with pytest.raises(SessionOperationConflictError):
+                    await accept_service._run_sync(
+                        lambda: accept_service.session_operation_authority.acquire(
+                            session_id=session.id,
+                            operation_kind=SessionOperationKind.PROPOSAL,
+                            owner_instance_id=accept_service.session_operation_owner_instance_id,
+                            lease_seconds=accept_service.session_operation_lease_seconds,
+                        )
+                    )
+                await revert(revert_context)
+            async with _session_operation_context(
                 accept_service,
                 session.id,
-                revert,
-                accept,
-            )
-            assert not isinstance(revert_result, BaseException)
-            assert isinstance(accept_result, ValueError)
+                SessionOperationKind.PROPOSAL,
+            ) as accept_context:
+                with pytest.raises(ValueError):
+                    await accept(accept_context)
             expected_status = "rejected"
             expected_versions = [1, 2, 3]
 
@@ -1534,7 +1587,7 @@ async def test_accept_vs_revert_serializes_on_real_session_lock(durable_engine, 
 @pytest.mark.asyncio
 async def test_stale_revert_fence_writes_nothing(service, engine) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    first = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+    first = await _save_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
     stale_fence = await _claim(service, session.id)
     with engine.begin() as conn:
         conn.execute(
@@ -1612,7 +1665,7 @@ async def test_guided_state_save_system_message_and_settlement_are_atomic(servic
 @pytest.mark.asyncio
 async def test_existing_guided_state_can_settle_without_new_state_version(service) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    existing = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+    existing = await _save_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
     fence = await _claim(service, session.id, kind="guided_start")
 
     settled = await service.complete_existing_state_guided_operation(
@@ -1662,7 +1715,8 @@ async def test_guided_start_atomic_seed_persists_and_settles_empty_session(servi
 @pytest.mark.asyncio
 async def test_guided_start_atomic_seed_converges_exact_existing_guided_head(service) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    existing = await service.save_composition_state(
+    existing = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(
             composer_meta={"guided_session": {"schema_version": 9}},
@@ -1692,7 +1746,8 @@ async def test_guided_start_atomic_seed_converges_exact_existing_guided_head(ser
 @pytest.mark.asyncio
 async def test_guided_start_atomic_seed_does_not_treat_generic_integrity_error_as_convergence(service) -> None:
     session = await service.create_session("alice", "Pipeline", "local")
-    freeform = await service.save_composition_state(
+    freeform = await _save_composition_state(
+        service,
         session.id,
         CompositionStateData(is_valid=True),
         provenance="post_compose",

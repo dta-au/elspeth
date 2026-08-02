@@ -87,7 +87,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
     skill_markdown_history_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateProvenance, CompositionStateRecord
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import InterpretationPlaceholderConsumedError, SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
@@ -522,20 +522,11 @@ async def _seed_session_and_state(
 
     Returns ``(session_id, composition_state_id)``.
     """
-    session_id = uuid4()
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id=user_id,
-                auth_provider_type="local",
-                title="Phase 5b Task 5 follow-on test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    session = await service.create_session(user_id, "Phase 5b Task 5 follow-on test", "local")
+    session_id = session.id
     state_dict = (state or _state_with_llm_node()).to_dict()
-    state_record = await service.save_composition_state(
+    state_record = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
@@ -546,6 +537,33 @@ async def _seed_session_and_state(
         provenance="tool_call",
     )
     return session_id, state_record.id
+
+
+async def _save_composition_state_with_compose_authority(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    """Persist test state under an authority-issued live COMPOSE context."""
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 @pytest.fixture(autouse=True)
@@ -610,18 +628,22 @@ async def _run_one_turn_with_compose_authority(
     # that retained authority row before acquiring the COMPOSE lease.
     created_at = datetime.now(UTC)
     with sessions_service._engine.begin() as conn:
-        conn.execute(
-            insert(session_operation_fences_table).values(
-                session_id=str(session_id),
-                operation_id=f"create-{session_id}",
-                lease_token=f"create-token-{session_id}",
-                operation_kind=SessionOperationKind.CREATE.value,
-                owner_instance_id="test-owner",
-                operation_epoch=1,
-                lease_expires_at=created_at,
-                released_at=created_at,
+        existing_fence = conn.execute(
+            select(session_operation_fences_table.c.session_id).where(session_operation_fences_table.c.session_id == str(session_id))
+        ).one_or_none()
+        if existing_fence is None:
+            conn.execute(
+                insert(session_operation_fences_table).values(
+                    session_id=str(session_id),
+                    operation_id=f"create-{session_id}",
+                    lease_token=f"create-token-{session_id}",
+                    operation_kind=SessionOperationKind.CREATE.value,
+                    owner_instance_id="test-owner",
+                    operation_epoch=1,
+                    lease_expires_at=created_at,
+                    released_at=created_at,
+                )
             )
-        )
     context = await sessions_service._run_sync(
         lambda: sessions_service.session_operation_authority.acquire(
             session_id=session_id,
@@ -770,9 +792,11 @@ async def test_compose_loop_dispatches_request_interpretation_review(
         ]
     )
 
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_state=state,
     )
@@ -834,9 +858,11 @@ async def test_request_interpretation_review_result_uses_profile_aware_validatio
         "elspeth.web.composer.service.normalize_tool_result_validation",
         wraps=normalize_tool_result_validation,
     ) as normalize:
-        result = await composer._run_one_turn_for_test(
+        result = await _run_one_turn_with_compose_authority(
+            composer,
+            sessions_service,
+            session_id,
             llm=llm,
-            session_id=str(session_id),
             current_state_id=str(state_id),
             initial_state=state,
         )
@@ -1056,9 +1082,11 @@ async def test_interpretation_review_handoff_requires_clean_terminal_review_suff
         ]
     )
 
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_state=state,
         message="update the pipeline and stage the interpretation review",
@@ -1619,7 +1647,8 @@ async def test_auto_surface_re_surfaces_after_prompt_edit_not_bricked(
         version=2,
     )
     state_dict_b = state_b.to_dict()
-    record_b = await sessions_service.save_composition_state(
+    record_b = await _save_composition_state_with_compose_authority(
+        sessions_service,
         session_id,
         CompositionStateData(
             nodes=state_dict_b["nodes"],
@@ -1715,7 +1744,8 @@ async def test_prompt_auto_surfacer_delegates_same_text_changed_skeleton_to_writ
         ]
     )
     state_b_dict = state_b.to_dict()
-    state_b_record = await sessions_service.save_composition_state(
+    state_b_record = await _save_composition_state_with_compose_authority(
+        sessions_service,
         session_id,
         CompositionStateData(
             nodes=state_b_dict["nodes"],
@@ -1808,7 +1838,8 @@ async def test_kind_general_auto_surfacer_delegates_same_text_changed_artifact_t
 
     state_b = _state("current reason")
     state_b_dict = state_b.to_dict()
-    state_b_record = await sessions_service.save_composition_state(
+    state_b_record = await _save_composition_state_with_compose_authority(
+        sessions_service,
         session_id,
         CompositionStateData(
             nodes=state_b_dict["nodes"],
@@ -2166,9 +2197,11 @@ async def test_request_interpretation_review_without_persisted_state_returns_arg
         ]
     )
 
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=None,
     )
 
@@ -2228,9 +2261,11 @@ async def test_stale_interpretation_review_conflict_returns_arg_error(
         ]
     )
 
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_state=state,
     )
@@ -2332,9 +2367,11 @@ async def test_f5c_skill_markdown_history_upsert_idempotent(
     # First compose() — assistant terminates immediately, exercising
     # only the F-5c upsert site at the top of _compose_loop.
     llm = _ScriptedLLM([_fake_text_response("Hello.")])
-    await composer._run_one_turn_for_test(
+    await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_state=state,
     )
@@ -2352,9 +2389,11 @@ async def test_f5c_skill_markdown_history_upsert_idempotent(
     # the row count stays at 1. Even if it weren't skipped, INSERT OR
     # IGNORE would prevent duplication.
     llm2 = _ScriptedLLM([_fake_text_response("Hello again.")])
-    await composer._run_one_turn_for_test(
+    await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm2,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_state=state,
     )
@@ -2381,9 +2420,11 @@ async def test_f5c_deployment_overlay_changes_skill_identity_and_exact_archive(
     exact_hash = hashlib.sha256(exact_prompt.encode("utf-8")).hexdigest()
 
     llm = _ScriptedLLM([_fake_text_response("Hello with deployment policy.")])
-    await composer._run_one_turn_for_test(
+    await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_state=_state_with_llm_node(),
     )
@@ -2492,9 +2533,11 @@ async def test_f6_rate_cap_branch_emits_telemetry_and_writes_audit_row(
                 _fake_text_response(f"Surfaced #{i}."),
             ]
         )
-        await composer._run_one_turn_for_test(
+        await _run_one_turn_with_compose_authority(
+            composer,
+            sessions_service,
+            session_id,
             llm=llm,
-            session_id=str(session_id),
             current_state_id=str(state_id),
             initial_state=state,
         )
@@ -2523,9 +2566,11 @@ async def test_f6_rate_cap_branch_emits_telemetry_and_writes_audit_row(
             _fake_text_response("Falling back to baked interpretation."),
         ]
     )
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_state=state,
     )
@@ -2612,9 +2657,11 @@ async def test_rate_capped_invalid_review_site_does_not_write_no_surfaces_row(
                 _fake_text_response(f"Surfaced #{i}."),
             ]
         )
-        await composer._run_one_turn_for_test(
+        await _run_one_turn_with_compose_authority(
+            composer,
+            sessions_service,
+            session_id,
             llm=llm,
-            session_id=str(session_id),
             current_state_id=str(state_id),
             initial_state=state,
         )
@@ -2635,9 +2682,11 @@ async def test_rate_capped_invalid_review_site_does_not_write_no_surfaces_row(
         ]
     )
 
-    result = await composer._run_one_turn_for_test(
+    result = await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_state=state,
     )
@@ -2832,9 +2881,11 @@ async def test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhau
         ]
     )
 
-    await composer._run_one_turn_for_test(
+    await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_state=state,
         message="give it a name",
@@ -3055,9 +3106,11 @@ async def test_p5_budget_exhaustion_advisor_blocked_return_surfaces_prompt_templ
         ]
     )
 
-    await composer._run_one_turn_for_test(
+    await _run_one_turn_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         llm=llm,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_state=state,
         message="give it a name",

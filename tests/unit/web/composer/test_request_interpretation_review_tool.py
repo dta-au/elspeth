@@ -43,6 +43,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import (
@@ -79,8 +80,8 @@ from elspeth.web.interpretation_state import (
     SOURCE_COMPONENT_ID,
 )
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import sessions_table
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.models import session_operation_fences_table, sessions_table
+from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import InterpretationPlaceholderConsumedError, SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -108,6 +109,64 @@ def service(engine) -> SessionServiceImpl:
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
     )
+
+
+def _insert_test_session_with_released_create_fence(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    *,
+    title: str,
+) -> None:
+    """Seed a fixed test UUID with the released CREATE fence production leaves."""
+    created_at = datetime.now(UTC)
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title=title,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+        )
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=str(session_id),
+                operation_id=f"create-{session_id}",
+                lease_token=f"create-token-{session_id}",
+                operation_kind=SessionOperationKind.CREATE.value,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                operation_epoch=1,
+                lease_expires_at=created_at,
+                released_at=created_at,
+            )
+        )
+
+
+async def _save_composition_state_with_compose_authority(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+) -> CompositionStateRecord:
+    """Persist test state under an authority-issued live COMPOSE context."""
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance="tool_call",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 def _llm_node(
@@ -384,73 +443,54 @@ async def _fake_create_pending_interpretation_event(**kwargs: Any) -> Interpreta
 
 async def _seed_session(service: SessionServiceImpl, session_id: UUID) -> UUID:
     """Seed a session row + a composition_states row; return the state id."""
-    from datetime import UTC, datetime
-
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Phase 5b Task 5 Test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Phase 5b Task 5 Test",
+    )
     # Persist a production-shaped composition_states row that the writer's
     # affected_node_id boundary check can read against.
     state_dict = _state_with(_llm_node()).to_dict()
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     return state.id
 
 
 async def _seed_node_session(service: SessionServiceImpl, session_id: UUID, *, node: NodeSpec) -> UUID:
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Phase 5b Task 5 Node Test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Phase 5b Task 5 Node Test",
+    )
     state_dict = _state_with(node).to_dict()
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     return state.id
 
 
 async def _seed_source_session(service: SessionServiceImpl, session_id: UUID, *, source: SourceSpec | None = None) -> UUID:
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Phase 5b Task 5 Source Test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Phase 5b Task 5 Source Test",
+    )
     state_dict = _state_with_source(source if source is not None else _llm_generated_source()).to_dict()
-    state = await service.save_composition_state(
+    state = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             sources=state_dict["sources"],
@@ -458,7 +498,6 @@ async def _seed_source_session(service: SessionServiceImpl, session_id: UUID, *,
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     return state.id
 
@@ -631,7 +670,8 @@ async def _save_event_liveness_state(
     state: CompositionState,
 ) -> UUID:
     state_dict = state.to_dict()
-    record = await service.save_composition_state(
+    record = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             sources=state_dict["sources"],
@@ -641,7 +681,6 @@ async def _save_event_liveness_state(
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     return record.id
 
@@ -651,17 +690,11 @@ async def _seed_event_liveness_session(
     session_id: UUID,
     state: CompositionState,
 ) -> UUID:
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Interpretation event liveness test",
-                created_at=_now(),
-                updated_at=_now(),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Interpretation event liveness test",
+    )
     return await _save_event_liveness_state(service, session_id, state)
 
 
@@ -2020,17 +2053,11 @@ async def test_08_per_term_rate_cap_after_three_surfacings(service: SessionServi
     # reads composition_states.nodes inside its locked transaction and validates
     # each affected_node_id; all four must be present from the outset because
     # ``composition_state_id`` is fixed across the iterations.
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Per-term rate cap test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Per-term rate cap test",
+    )
     multi_node_state = CompositionState(
         source=None,
         nodes=tuple(_llm_node(node_id=f"rate_node_{i}", term=sensitive_term) for i in range(4)),
@@ -2040,14 +2067,14 @@ async def test_08_per_term_rate_cap_after_three_surfacings(service: SessionServi
         version=1,
     )
     state_dict = multi_node_state.to_dict()
-    persisted = await service.save_composition_state(
+    persisted = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     state_id = persisted.id
 
@@ -2174,7 +2201,8 @@ async def test_15_per_session_day_rate_cap_resets_at_utc_midnight(service: Sessi
     for i in range(10):
         # Persist a composition_states row with an LLM node carrying the
         # iteration's placeholder so the writer's boundary check passes.
-        per_iter_state_record = await service.save_composition_state(
+        per_iter_state_record = await _save_composition_state_with_compose_authority(
+            service,
             session_id,
             CompositionStateData(
                 nodes=_state_with(
@@ -2185,7 +2213,6 @@ async def test_15_per_session_day_rate_cap_resets_at_utc_midnight(service: Sessi
                 ).to_dict()["nodes"],
                 is_valid=True,
             ),
-            provenance="tool_call",
         )
         await service.create_pending_interpretation_event(
             session_id=session_id,
@@ -2804,17 +2831,11 @@ async def test_16_rate_cap_breach_writes_no_audit_row(service: SessionServiceImp
     """
     session_id = uuid4()
 
-    with service._engine.begin() as conn:
-        conn.execute(
-            insert(sessions_table).values(
-                id=str(session_id),
-                user_id="alice",
-                auth_provider_type="local",
-                title="Rate-cap breach test",
-                created_at=datetime.now(UTC),
-                updated_at=datetime.now(UTC),
-            )
-        )
+    _insert_test_session_with_released_create_fence(
+        service,
+        session_id,
+        title="Rate-cap breach test",
+    )
     multi_node_state = CompositionState(
         source=None,
         nodes=tuple(_llm_node(node_id=f"rate_node_{i}") for i in range(4)),
@@ -2824,14 +2845,14 @@ async def test_16_rate_cap_breach_writes_no_audit_row(service: SessionServiceImp
         version=1,
     )
     state_dict = multi_node_state.to_dict()
-    persisted = await service.save_composition_state(
+    persisted = await _save_composition_state_with_compose_authority(
+        service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],
             metadata_=state_dict["metadata"],
             is_valid=True,
         ),
-        provenance="tool_call",
     )
     state_id = persisted.id
 

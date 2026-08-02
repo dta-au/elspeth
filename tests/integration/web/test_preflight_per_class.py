@@ -26,6 +26,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 
 
 def _settings(tmp_path: Path) -> WebSettings:
@@ -132,7 +133,8 @@ async def _seed_and_execute(
         auth_provider_type="local",
     )
     session_id = session.id
-    await session_service.save_composition_state(
+    await _save_composition_state_with_compose_authority(
+        session_service,
         session_id,
         state_data,
         provenance="session_seed",

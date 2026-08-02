@@ -38,6 +38,8 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
+    CompositionStateProvenance,
+    CompositionStateRecord,
     GuidedAuditEvidence,
     GuidedCompositionStateResult,
     GuidedOperationActive,
@@ -48,7 +50,6 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationFailureCommand,
     GuidedOperationFence,
     GuidedOperationFenceLostError,
-    GuidedOperationSettlementConflictError,
     GuidedOperationTakenOver,
     GuidedPipelineProposalResult,
     GuidedSessionResult,
@@ -168,6 +169,25 @@ async def _release_session_operation_context(
     context: SessionOperationContext,
 ) -> None:
     await service._run_sync(service.session_operation_authority.release, context)
+
+
+async def _save_composition_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    context = await _acquire_compose_context(service, session_id)
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await _release_session_operation_context(service, context)
 
 
 def _failed_llm_call(marker: str) -> ComposerLLMCall:
@@ -378,7 +398,8 @@ async def test_expired_guided_start_reconciliation_mints_current_attempt_before_
 
 
 async def _seed_state(engine, *, session_id: UUID) -> UUID:
-    state = await _service(engine).save_composition_state(
+    state = await _save_composition_state(
+        _service(engine),
         session_id,
         CompositionStateData(is_valid=False),
         provenance="session_seed",
@@ -1290,7 +1311,7 @@ async def test_expired_takeover_rotates_fence_and_old_worker_cannot_bind_or_sett
 
 
 @pytest.mark.asyncio
-async def test_guided_seed_rejects_cross_service_head_drift_before_writes(file_engine) -> None:
+async def test_guided_seed_rejects_session_takeover_before_writes(file_engine) -> None:
     service_a = _service(file_engine)
     service_b = _service(file_engine)
     session_id = await _create_session(service_a)
@@ -1304,13 +1325,16 @@ async def test_guided_seed_rejects_cross_service_head_drift_before_writes(file_e
     )
     assert isinstance(claim, GuidedOperationClaimed)
 
-    winning_state = await service_b.save_composition_state(
+    incumbent_context = await service_a._guided_test_context(session_id, "guided")
+    await _release_session_operation_context(service_a, incumbent_context)
+    winning_state = await _save_composition_state(
+        service_b,
         session_id,
         CompositionStateData(is_valid=True, composer_meta={}),
         provenance="session_seed",
     )
 
-    with pytest.raises(GuidedOperationSettlementConflictError):
+    with pytest.raises(GuidedOperationFenceLostError):
         await service_a.save_state_for_guided_operation(
             claim.fence,
             expected_current_state_id=None,
@@ -1329,11 +1353,12 @@ async def test_guided_seed_rejects_cross_service_head_drift_before_writes(file_e
 
 
 @pytest.mark.asyncio
-async def test_existing_guided_settlement_rejects_cross_service_head_drift(file_engine) -> None:
+async def test_existing_guided_settlement_rejects_session_takeover_after_head_drift(file_engine) -> None:
     service_a = _service(file_engine)
     service_b = _service(file_engine)
     session_id = await _create_session(service_a)
-    observed = await service_a.save_composition_state(
+    observed = await _save_composition_state(
+        service_a,
         session_id,
         CompositionStateData(is_valid=True),
         provenance="session_seed",
@@ -1347,13 +1372,16 @@ async def test_existing_guided_settlement_rejects_cross_service_head_drift(file_
         lease_seconds=30,
     )
     assert isinstance(claim, GuidedOperationClaimed)
-    winning_state = await service_b.save_composition_state(
+    incumbent_context = await service_a._guided_test_context(session_id, "guided")
+    await _release_session_operation_context(service_a, incumbent_context)
+    winning_state = await _save_composition_state(
+        service_b,
         session_id,
         CompositionStateData(is_valid=True),
         provenance="session_seed",
     )
 
-    with pytest.raises(GuidedOperationSettlementConflictError):
+    with pytest.raises(GuidedOperationFenceLostError):
         await service_a.complete_existing_state_guided_operation(
             claim.fence,
             state_id=observed.id,

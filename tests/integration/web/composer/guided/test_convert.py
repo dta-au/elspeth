@@ -40,6 +40,7 @@ from elspeth.web.sessions.guided_operations import guided_operation_request_hash
 from elspeth.web.sessions.guided_replay import load_guided_json_payload
 from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationCompleted, GuidedOperationSettlementConflictError
 from elspeth.web.sessions.schemas import ConvertGuidedRequest
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 # ---------------------------------------------------------------------------
@@ -128,7 +129,14 @@ def _seed_freeform_state_with_work(client: TestClient, session_id: str) -> None:
         validation_errors=None,
         composer_meta={},  # No guided_session key -> freeform.
     )
-    asyncio.run(service.save_composition_state(UUID(session_id), freeform_state, provenance="session_seed"))
+    asyncio.run(
+        _save_composition_state_with_compose_authority(
+            service,
+            UUID(session_id),
+            freeform_state,
+            provenance="session_seed",
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +323,8 @@ class TestConvertIdempotent:
         )
         state_data = state.to_dict()
         asyncio.run(
-            service.save_composition_state(
+            _save_composition_state_with_compose_authority(
+                service,
                 UUID(session_id),
                 CompositionStateData(
                     sources=state_data["sources"],

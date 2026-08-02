@@ -1250,7 +1250,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13814,
+        line=13818,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1260,7 +1260,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13825,
+        line=13829,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1270,7 +1270,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         2,
         "SessionForkAuthority",
-        line=13844,
+        line=13848,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1280,7 +1280,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13892,
+        line=13896,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1290,7 +1290,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13946,
+        line=13950,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",

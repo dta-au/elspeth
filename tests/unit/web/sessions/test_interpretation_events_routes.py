@@ -24,6 +24,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient, Response
+from sqlalchemy import insert
 
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
@@ -31,11 +32,61 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, SourceSpec
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY, SOURCE_COMPONENT_ID
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.models import session_operation_fences_table
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionStateProvenance,
+    CompositionStateRecord,
+)
 from elspeth.web.sessions.service import SessionServiceImpl
-from tests.unit.web.conftest import _make_session
+from tests.unit.web.conftest import _make_session as _make_session_row
+
+
+def _make_session(conn: Any, **kwargs: Any) -> None:
+    _make_session_row(conn, **kwargs)
+    session_id = kwargs["session_id"]
+    created_at = datetime.now(UTC)
+    conn.execute(
+        insert(session_operation_fences_table).values(
+            session_id=session_id,
+            operation_id=f"create-{session_id}",
+            lease_token=f"create-token-{session_id}",
+            operation_kind=SessionOperationKind.CREATE.value,
+            owner_instance_id="interpretation-routes-test-owner",
+            operation_epoch=1,
+            lease_expires_at=created_at,
+            released_at=created_at,
+        )
+    )
+
+
+async def _save_composition_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 async def _post(test_client: TestClient, url: str, *, json: dict[str, Any]) -> Response:
@@ -211,7 +262,8 @@ async def _seed_session_with_pending_event(
     service: SessionServiceImpl = test_client.app.state.session_service
     with test_client.app.state.phase3_engine.begin() as conn:
         _make_session(conn, session_id=str(sid), user_id=user_id)
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         sid,
         CompositionStateData(
             nodes=[node],
@@ -248,7 +300,8 @@ async def _seed_session_with_source_pending_event(test_client: TestClient) -> di
     service: SessionServiceImpl = test_client.app.state.session_service
     with test_client.app.state.phase3_engine.begin() as conn:
         _make_session(conn, session_id=str(sid), user_id="alice")
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         sid,
         CompositionStateData(
             source=_llm_generated_source(),
@@ -539,7 +592,8 @@ async def test_09_list_status_pending_returns_only_pending_events(
     # correctly returns the original event rather than creating a duplicate.
     service: SessionServiceImpl = test_client.app.state.session_service
     second_node = _llm_node(node_id="llm_transform_2", user_term="warm")
-    state_with_second_site = await service.save_composition_state(
+    state_with_second_site = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             sources=seeded["state"].sources,

@@ -98,6 +98,12 @@ def test_combined_message_transcript_write_requires_exact_compose_context(owner:
     assert context.annotation is SessionOperationContext or context.annotation == "SessionOperationContext"
 
 
+@pytest.mark.parametrize("owner", [SessionServiceProtocol, SessionServiceImpl])
+def test_composition_state_write_requires_exact_compose_context(owner: type[Any]) -> None:
+    context = _required_parameter(owner, "save_composition_state", "session_operation_context")
+    assert context.annotation is SessionOperationContext or context.annotation == "SessionOperationContext"
+
+
 def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
     route_source = textwrap.dedent(inspect.getsource(message_routes.register_message_routes))
     route_tree = ast.parse(route_source)

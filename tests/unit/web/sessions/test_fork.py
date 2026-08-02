@@ -9,6 +9,8 @@ import os
 import threading
 import traceback
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -38,7 +40,7 @@ from elspeth.web.blobs.service import (
     _ForkCopyWriteAuthority,
 )
 from elspeth.web.config import WebSettings
-from elspeth.web.coordination.contracts import SessionOperationKind
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.sessions import service as session_service_module
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
@@ -53,6 +55,8 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
+    CompositionStateProvenance,
+    CompositionStateRecord,
     GuidedForkSettlementCommand,
     GuidedOperationClaimed,
     GuidedOperationTakenOver,
@@ -167,6 +171,51 @@ async def _create_test_run(
         await session_service._run_sync(
             session_service.session_operation_authority.release,
             context,
+        )
+
+
+@asynccontextmanager
+async def _test_session_operation_context(
+    service: SessionServiceImpl,
+    session_id: uuid.UUID,
+    operation_kind: SessionOperationKind,
+) -> AsyncIterator[SessionOperationContext]:
+    """Hold one exact, short-lived session authority for a fixture writer."""
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=operation_kind,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        yield context
+    finally:
+        await service._run_sync(
+            service.session_operation_authority.release,
+            context,
+        )
+
+
+async def _save_test_composition_state(
+    session_service: SessionServiceImpl,
+    session_id: uuid.UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    """Save one fixture state under a short-lived, exact COMPOSE authority."""
+    async with _test_session_operation_context(
+        session_service,
+        session_id,
+        SessionOperationKind.COMPOSE,
+    ) as context:
+        return await session_service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
         )
 
 
@@ -320,22 +369,28 @@ async def _attach_pending_fork_proposal(
         model_version="test-model-v1",
         provider="test",
     )
-    row = await service.create_pipeline_composition_proposal(
-        session_id=session_id,
-        plan=plan,
-        summary="Stage fork proposal.",
-        rationale="Exercise fork proposal integrity.",
-        affects=("graph",),
-        arguments_redacted_json=redact_tool_call_arguments(
-            "set_pipeline",
-            deep_thaw(proposal.pipeline),
-            telemetry=NoopRedactionTelemetry(),
-        ),
-        actor="composer-web:user:alice",
-        composer_model_identifier="test-model",
-        composer_model_version="test-model-v1",
-        composer_provider="test",
-    )
+    async with _test_session_operation_context(
+        service,
+        session_id,
+        SessionOperationKind.COMPOSE,
+    ) as context:
+        row = await service.create_pipeline_composition_proposal(
+            session_id=session_id,
+            plan=plan,
+            summary="Stage fork proposal.",
+            rationale="Exercise fork proposal integrity.",
+            affects=("graph",),
+            arguments_redacted_json=redact_tool_call_arguments(
+                "set_pipeline",
+                deep_thaw(proposal.pipeline),
+                telemetry=NoopRedactionTelemetry(),
+            ),
+            actor="composer-web:user:alice",
+            composer_model_identifier="test-model",
+            composer_model_version="test-model-v1",
+            composer_provider="test",
+            session_operation_context=context,
+        )
     active = replace(
         guided,
         active_proposal=GuidedProposalRef(
@@ -561,7 +616,8 @@ async def _canonical_guided_fork_source(service: SessionServiceImpl):
         deferred_message_content=root.content,
         current_turn=TurnType.PROPOSE_PIPELINE.value,
     )
-    state = await service.save_composition_state(
+    state = await _save_test_composition_state(
+        service,
         session.id,
         CompositionStateData(
             sources={},
@@ -650,7 +706,8 @@ class TestForkSession:
         session = await service.create_session("alice", "Original", "local")
 
         # Save initial state
-        state_v1 = await service.save_composition_state(
+        state_v1 = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={"plugin": "csv", "options": {"path": "data.csv"}},
@@ -669,7 +726,8 @@ class TestForkSession:
         )
 
         # Assistant responds and mutates state to v2
-        state_v2 = await service.save_composition_state(
+        state_v2 = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={"plugin": "json", "options": {"path": "data.json"}},
@@ -713,7 +771,8 @@ class TestForkSession:
                 "options": {"path": "refunds.csv"},
             },
         }
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(sources=sources, is_valid=True),
             provenance="session_seed",
@@ -755,7 +814,8 @@ class TestForkSession:
         session_a = await service.create_session("alice", "Session A", "local")
         session_b = await service.create_session("alice", "Session B", "local")
 
-        state_in_a = await service.save_composition_state(
+        state_in_a = await _save_test_composition_state(
+            service,
             session_a.id,
             CompositionStateData(
                 source={"plugin": "csv", "options": {"path": "a.csv"}},
@@ -1236,7 +1296,8 @@ class TestForkSession:
             is_valid=True,
             composer_meta={"guided_session": source_guided.to_dict()},
         )
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             state_data,
             provenance="session_seed",
@@ -1328,7 +1389,8 @@ class TestForkSession:
             metadata_={"name": "Guided", "description": ""},
             composer_meta={"guided_session": guided.to_dict()},
         )
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             state_data,
             provenance="session_seed",
@@ -1388,7 +1450,8 @@ class TestForkSession:
             deferred_message_content=root.content,
             current_turn=TurnType.PROPOSE_PIPELINE.value,
         )
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 is_valid=True,
@@ -1433,7 +1496,8 @@ class TestForkSession:
             deferred_message_content=root.content,
             current_turn=TurnType.PROPOSE_PIPELINE.value,
         )
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 sources={},
@@ -1504,15 +1568,21 @@ class TestForkSession:
 
         session, proposal, _state, guided, fork_message = await _canonical_guided_fork_source(service)
         assert guided.active_proposal is not None
-        await service.reject_pipeline_composition_proposal(
-            session_id=session.id,
-            proposal_id=proposal.id,
-            draft_hash=guided.active_proposal.draft_hash,
-            reviewed_facts=guided_private_reviewed_facts(guided),
-            reason="superseded",
-            dispatch=None,
-            actor="test",
-        )
+        async with _test_session_operation_context(
+            service,
+            session.id,
+            SessionOperationKind.COMPOSE,
+        ) as context:
+            await service.reject_pipeline_composition_proposal(
+                session_id=session.id,
+                proposal_id=proposal.id,
+                draft_hash=guided.active_proposal.draft_hash,
+                reviewed_facts=guided_private_reviewed_facts(guided),
+                reason="superseded",
+                dispatch=None,
+                actor="test",
+                session_operation_context=context,
+            )
 
         await _assert_fork_integrity_failure_is_atomic(
             service,
@@ -1539,7 +1609,8 @@ class TestForkSession:
             deferred_message_content=root.content,
             current_turn=TurnType.PROPOSE_PIPELINE.value,
         )
-        target = await service.save_composition_state(
+        target = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 sources={},
@@ -1552,7 +1623,8 @@ class TestForkSession:
             ),
             provenance="session_seed",
         )
-        other = await service.save_composition_state(
+        other = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 sources={
@@ -1652,7 +1724,8 @@ class TestForkSession:
             is_valid=True,
             composer_meta={"guided_session": guided.to_dict()},
         )
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             state_data,
             provenance="session_seed",
@@ -1710,7 +1783,8 @@ class TestForkSession:
             is_valid=True,
             composer_meta={"guided_session": guided.to_dict()},
         )
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             state_data,
             provenance="session_seed",
@@ -1767,7 +1841,8 @@ class TestForkSession:
         )
         answered, unanswered = guided.history
         malformed_history = (unanswered, answered) if malformation == "non_trailing" else (unanswered, unanswered)
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(is_valid=True, composer_meta={"guided_session": guided.to_dict()}),
             provenance="session_seed",
@@ -1816,7 +1891,8 @@ class TestForkSession:
             deferred_message_content=fork_msg.content,
             current_turn=TurnType.PROPOSE_PIPELINE.value,
         )
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(is_valid=True, composer_meta={"guided_session": guided.to_dict()}),
             provenance="session_seed",
@@ -1858,7 +1934,8 @@ class TestForkSession:
             deferred_message_content=assistant.content,
             current_turn=TurnType.PROPOSE_PIPELINE.value,
         )
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(is_valid=True, composer_meta={"guided_session": guided.to_dict()}),
             provenance="session_seed",
@@ -1906,7 +1983,8 @@ class TestForkSession:
         )
         guided_meta = guided.to_dict()
         guided_meta["deferred_intents"][0]["message_content_hash"] = "0" * 64
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(is_valid=True, composer_meta={"guided_session": guided_meta}),
             provenance="session_seed",
@@ -1936,7 +2014,8 @@ class TestForkSession:
     async def test_fork_and_archive_parent_session_with_durable_history(self, service) -> None:
         """Archiving a fork parent with durable history soft-archives the parent."""
         session = await service.create_session("alice", "Original", "local")
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={"plugin": "csv", "options": {"path": "data.csv"}},
@@ -2013,7 +2092,8 @@ class TestForkSession:
 
         session = await service.create_session("alice", "Tutorial", "local")
         tutorial_guided = GuidedSession.initial(profile=TUTORIAL_PROFILE)
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 # Materialised canonical URL source (sessions.py:420-427): a real
@@ -2068,7 +2148,8 @@ class TestForkSession:
     async def test_fork_without_guided_session_passes_meta_through(self, service) -> None:
         """An ordinary (non-guided) fork is unaffected by the profile strip."""
         session = await service.create_session("alice", "Plain", "local")
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 sources={"s": {"plugin": "csv", "options": {"path": "x.csv"}}},
@@ -2977,7 +3058,8 @@ class TestForkEndpoint:
             is_valid=True,
             composer_meta={"guided_session": guided.to_dict()},
         )
-        state = await service.save_composition_state(
+        state = await _save_test_composition_state(
+            service,
             parent.id,
             state_data,
             provenance="session_seed",
@@ -3034,7 +3116,8 @@ class TestForkEndpoint:
         assert stable_id not in committed.pending_source_intents
         assert committed.reviewed_sources[stable_id].options["blob_ref"] == child_blob_id
         assert str(parent_blob.id) not in str(committed.to_dict())
-        committed_state = await service.save_composition_state(
+        committed_state = await _save_test_composition_state(
+            service,
             child_id,
             CompositionStateData(is_valid=True, composer_meta={"guided_session": committed.to_dict()}),
             provenance="post_compose",
@@ -3091,7 +3174,8 @@ class TestForkEndpoint:
             b"a,b\n1,2",
             "text/csv",
         )
-        source_state = await service.save_composition_state(
+        source_state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 sources={
@@ -3258,7 +3342,8 @@ class TestForkEndpoint:
             b"a,b,c\n1,2,3",
             "text/csv",
         )
-        source_state = await service.save_composition_state(
+        source_state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -3323,7 +3408,8 @@ class TestForkEndpoint:
             "sha256": original_blob.content_hash,
             "encoding": "utf-16",
         }
-        source_state = await service.save_composition_state(
+        source_state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -3396,7 +3482,8 @@ class TestForkEndpoint:
 
         session = await service.create_session("alice", "Original", "local")
         missing_blob_id = uuid.uuid4()
-        source_state = await service.save_composition_state(
+        source_state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 nodes=[
@@ -3607,7 +3694,8 @@ class TestForkEndpoint:
 
         # Tier 1 anomaly: persist a non-UUID blob_ref (simulates corrupt
         # or tampered source data).
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -3662,7 +3750,8 @@ class TestForkEndpoint:
 
         session = await service.create_session("alice", "Original", "local")
 
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -3770,7 +3859,8 @@ class TestForkEndpoint:
             b"a,b\n1,2",
             "text/csv",
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -3998,7 +4088,8 @@ class TestForkEndpoint:
         # for a blob that does NOT exist (simulating a deleted blob).
         # No actual blob is created → copy_blobs_for_fork returns {}.
         missing_blob_id = uuid.uuid4()
-        source_state = await service.save_composition_state(
+        source_state = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 sources={

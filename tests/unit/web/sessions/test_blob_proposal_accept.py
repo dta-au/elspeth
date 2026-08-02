@@ -31,7 +31,12 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import proposal_blob_effect_receipts_table
-from elspeth.web.sessions.protocol import CompositionProposalRecord, CompositionStateData
+from elspeth.web.sessions.protocol import (
+    CompositionProposalRecord,
+    CompositionStateData,
+    CompositionStateProvenance,
+    CompositionStateRecord,
+)
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -171,6 +176,32 @@ async def _create_test_proposal(
         await service._run_sync(service.session_operation_authority.release, context)
 
 
+async def _save_composition_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
 def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp_path: Path) -> None:
     app, service = _make_app(tmp_path)
     blob_service = BlobServiceImpl(
@@ -182,7 +213,8 @@ def test_accept_update_blob_proposal_commits_without_composition_state_delta(tmp
     session = asyncio.run(service.create_session("alice", "Blob approval", "local"))
     session_id = session.id
     state_record = asyncio.run(
-        service.save_composition_state(
+        _save_composition_state(
+            service,
             session_id,
             CompositionStateData(metadata_={"name": "Blob approval", "description": ""}, is_valid=True),
             provenance="session_seed",
@@ -251,7 +283,8 @@ def test_accept_update_blob_proposal_remains_blocked_by_second_pending_reference
     session = asyncio.run(service.create_session("alice", "Blob approval conflict", "local"))
     session_id = session.id
     state_record = asyncio.run(
-        service.save_composition_state(
+        _save_composition_state(
+            service,
             session_id,
             CompositionStateData(metadata_={"name": "Blob approval conflict", "description": ""}, is_valid=True),
             provenance="session_seed",
@@ -323,7 +356,8 @@ def test_accept_delete_blob_proposal_commits_without_composition_state_delta(tmp
     session = asyncio.run(service.create_session("alice", "Blob deletion approval", "local"))
     session_id = session.id
     state_record = asyncio.run(
-        service.save_composition_state(
+        _save_composition_state(
+            service,
             session_id,
             CompositionStateData(metadata_={"name": "Blob deletion approval", "description": ""}, is_valid=True),
             provenance="session_seed",
@@ -401,7 +435,8 @@ def test_retry_after_blob_effect_before_proposal_settlement_does_not_reexecute(
     session = asyncio.run(service.create_session("alice", "Blob approval recovery", "local"))
     session_id = session.id
     state_record = asyncio.run(
-        service.save_composition_state(
+        _save_composition_state(
+            service,
             session_id,
             CompositionStateData(metadata_={"name": "Blob approval recovery", "description": ""}, is_valid=True),
             provenance="session_seed",
@@ -516,7 +551,8 @@ def test_retry_after_blob_effect_before_proposal_settlement_does_not_reexecute(
     advanced_state = None
     if advance_state_head:
         advanced_state = asyncio.run(
-            service.save_composition_state(
+            _save_composition_state(
+                service,
                 session_id,
                 CompositionStateData(metadata_={"name": "independently advanced", "description": ""}, is_valid=True),
                 provenance="session_seed",
@@ -565,7 +601,8 @@ async def test_accept_update_blob_proposal_serializes_against_reject(
     )
     session = await service.create_session("alice", "Blob approval race", "local")
     session_id = session.id
-    state_record = await service.save_composition_state(
+    state_record = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(metadata_={"name": "Blob approval race", "description": ""}, is_valid=True),
         provenance="session_seed",
@@ -672,7 +709,8 @@ async def test_cancelled_accept_update_blob_proposal_still_terminalizes_before_r
     )
     session = await service.create_session("alice", "Blob approval cancellation", "local")
     session_id = session.id
-    state_record = await service.save_composition_state(
+    state_record = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(metadata_={"name": "Blob approval cancellation", "description": ""}, is_valid=True),
         provenance="session_seed",

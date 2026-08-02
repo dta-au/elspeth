@@ -48,7 +48,12 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
     sessions_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, StaleComposeStateError, TransitionAssistantDraft
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionStateRecord,
+    StaleComposeStateError,
+    TransitionAssistantDraft,
+)
 from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -113,6 +118,21 @@ async def _session_operation_context(
         yield context
     finally:
         await service._run_sync(service.session_operation_authority.release, context)
+
+
+async def _save_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+) -> CompositionStateRecord:
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        record = await service.save_composition_state(
+            session_id,
+            state,
+            provenance="session_seed",
+            session_operation_context=context,
+        )
+    return record
 
 
 async def _settle(service: SessionServiceImpl, **kwargs):
@@ -585,7 +605,7 @@ async def test_absent_base_conflicts_when_first_state_appears_before_settlement(
     plan = _plan()
     row = await _create(service, session_id, plan)
     binding = await _persist_dispatch(service, session_id)
-    await service.save_composition_state(session_id, _state_data(), provenance="session_seed")
+    await _save_state(service, session_id, _state_data())
 
     with pytest.raises(StaleComposeStateError):
         await _settle(
@@ -608,12 +628,12 @@ async def test_absent_base_conflicts_when_first_state_appears_before_settlement(
 async def test_present_base_conflicts_on_same_content_new_state_id(service: SessionServiceImpl) -> None:
     session_id = uuid4()
     _insert_session(service, session_id)
-    base_record = await service.save_composition_state(session_id, _state_data(), provenance="session_seed")
+    base_record = await _save_state(service, session_id, _state_data())
     base = PresentBase(state_id=base_record.id, composition_content_hash=_state_content_hash(_state_data()))
     plan = _plan(base)
     row = await _create(service, session_id, plan)
     binding = await _persist_dispatch(service, session_id)
-    await service.save_composition_state(session_id, _state_data(), provenance="session_seed")
+    await _save_state(service, session_id, _state_data())
 
     with pytest.raises(StaleComposeStateError):
         await _settle(

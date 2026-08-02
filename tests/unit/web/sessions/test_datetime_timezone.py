@@ -68,11 +68,21 @@ class TestDatetimeTimezoneRoundTrip:
     async def test_run_started_at_preserves_timezone(self, service) -> None:
         """started_at on a run record must be timezone-aware after retrieval."""
         session = await service.create_session("alice", "Run TZ Test", "local")
-        state = await service.save_composition_state(
+        compose_context = service.session_operation_authority.acquire(
             session_id=session.id,
-            state=CompositionStateData(source=None, nodes=[], edges=[], outputs=[], metadata_=None, is_valid=False),
-            provenance="session_seed",
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
         )
+        try:
+            state = await service.save_composition_state(
+                session_id=session.id,
+                state=CompositionStateData(source=None, nodes=[], edges=[], outputs=[], metadata_=None, is_valid=False),
+                provenance="session_seed",
+                session_operation_context=compose_context,
+            )
+        finally:
+            service.session_operation_authority.release(compose_context)
         execute_context = service.session_operation_authority.acquire(
             session_id=session.id,
             operation_kind=SessionOperationKind.EXECUTE,

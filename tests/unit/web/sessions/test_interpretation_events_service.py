@@ -41,6 +41,7 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.state import (
     CompositionState,
@@ -66,9 +67,14 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     interpretation_events_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, CompositionStateRecord
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    CompositionStateProvenance,
+    CompositionStateRecord,
+)
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import (
     InterpretationPlaceholderConsumedError,
@@ -104,16 +110,55 @@ def service(engine) -> SessionServiceImpl:
 
 
 def _insert_session(conn, session_id: str) -> None:
+    created_at = datetime.now(UTC)
     conn.execute(
         insert(sessions_table).values(
             id=session_id,
             user_id="alice",
             auth_provider_type="local",
             title="Phase 5b Task 4 Test",
-            created_at=datetime.now(UTC),
-            updated_at=datetime.now(UTC),
+            created_at=created_at,
+            updated_at=created_at,
         )
     )
+    conn.execute(
+        insert(session_operation_fences_table).values(
+            session_id=session_id,
+            operation_id=f"create-{session_id}",
+            lease_token=f"create-token-{session_id}",
+            operation_kind=SessionOperationKind.CREATE.value,
+            owner_instance_id="interpretation-events-test-owner",
+            operation_epoch=1,
+            lease_expires_at=created_at,
+            released_at=created_at,
+        )
+    )
+
+
+async def _save_composition_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 def _llm_node(
@@ -466,7 +511,8 @@ async def _seed_state_with_llm_node(
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
     node = node if node is not None else _llm_node()
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=[node],
@@ -487,7 +533,8 @@ async def _seed_state_with_source(
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
     source = source if source is not None else _llm_generated_source()
-    return await service.save_composition_state(
+    return await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=source,
@@ -854,7 +901,8 @@ async def test_resolve_interpretation_event_preserves_named_sources(service) -> 
     session_id = uuid4()
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             sources={
@@ -933,7 +981,8 @@ async def test_03b_resolve_recomputes_validation_for_patched_live_state(service)
         composer_skill_hash="a" * 64,
     )
     stale_error = "Invalid Jinja2 template: expected token 'end of print statement', got ':'"
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=[_llm_node()],
@@ -985,7 +1034,8 @@ async def test_resolve_interpretation_normalizes_validation_for_its_composer_sur
         provider="test-provider",
         composer_skill_hash="a" * 64,
     )
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=[_llm_node()],
@@ -1235,7 +1285,8 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
                 conn.execute(
                     update(sessions_table).where(sessions_table.c.id == str(session_id)).values(interpretation_review_disabled=True)
                 )
-        saved_state = await policy_service.save_composition_state(
+        saved_state = await _save_composition_state(
+            policy_service,
             session_id,
             CompositionStateData(
                 sources=state_dict["sources"],
@@ -1375,7 +1426,8 @@ async def test_named_invented_source_reviews_resolve_independently_and_survive_r
         _insert_session(conn, str(session_id))
     orders_hash = stable_hash({"orders": [1]})
     refunds_hash = stable_hash({"refunds": [2]})
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             sources={
@@ -1541,7 +1593,8 @@ async def test_06_resolve_raises_when_node_removed_since_surfacing(service) -> N
     )
 
     # Advance composition state — the affected node disappears.
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=[{"id": "different-node", "kind": "csv", "options": {}}],
@@ -1733,7 +1786,8 @@ async def test_resolve_prompt_template_review_still_rejects_genuine_skeleton_edi
         {"kind": "interpretation_ref", "requirement_id": "cool"},
         {"kind": "text", "text": " this is. EXTRA."},
     ]
-    await service.save_composition_state(
+    await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=[edited_node],
@@ -1787,7 +1841,8 @@ async def test_08_list_status_pending_filters_to_pending_only(service) -> None:
         node_id="llm_transform_2",
         user_term="warm",
     )
-    second_state = await service.save_composition_state(
+    second_state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=[_llm_node(), second_node],
@@ -1952,7 +2007,8 @@ async def test_create_pending_after_session_opt_out_writes_surface_specific_audi
     session_id = uuid4()
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=_llm_generated_source(),
@@ -2072,7 +2128,8 @@ async def test_create_pending_pipeline_decision_rejects_raw_html_mapping_preserv
         "content_fingerprint": "content_fingerprint",
         "primary_colours": "primary_colours",
     }
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=None,
@@ -2112,7 +2169,8 @@ async def test_create_pending_pipeline_decision_rejects_custom_raw_field_preserv
         "page_hash": "page_hash",
         "primary_colours": "primary_colours",
     }
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=None,
@@ -2157,7 +2215,8 @@ async def test_resolve_pipeline_decision_rejects_custom_raw_field_preservation(s
         "page_hash": "page_hash",
         "primary_colours": "primary_colours",
     }
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=None,
@@ -2217,7 +2276,8 @@ async def test_create_pending_interpretation_event_is_idempotent_for_same_pendin
     session_id = uuid4()
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=None,
@@ -2257,7 +2317,8 @@ async def test_create_pending_pipeline_decision_is_idempotent_across_state_versi
     session_id = uuid4()
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    first_state = await service.save_composition_state(
+    first_state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=None,
@@ -2267,7 +2328,8 @@ async def test_create_pending_pipeline_decision_is_idempotent_across_state_versi
         ),
         provenance="tool_call",
     )
-    second_state = await service.save_composition_state(
+    second_state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             source=None,
@@ -2899,7 +2961,8 @@ async def test_resolve_round_trips_through_state_from_record_and_yaml(service) -
     ]
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             nodes=nodes,

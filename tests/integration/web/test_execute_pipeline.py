@@ -24,6 +24,8 @@ from uuid import UUID
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 TEST_CSV = FIXTURES_DIR / "test_input.csv"
 
@@ -164,7 +166,12 @@ class TestEndToEndPipelineExecution:
                 validation_errors=None,
             )
             session_service = app.state.session_service
-            await session_service.save_composition_state(UUID(session_id), state_data, provenance="session_seed")
+            await _save_composition_state_with_compose_authority(
+                session_service,
+                UUID(session_id),
+                state_data,
+                provenance="session_seed",
+            )
 
             # 3. Execute via REST
             resp = await client.post(
@@ -386,7 +393,12 @@ class TestGateRoutedPipelineExecution:
                 validation_errors=None,
             )
             session_service = app.state.session_service
-            await session_service.save_composition_state(UUID(session_id), state_data, provenance="session_seed")
+            await _save_composition_state_with_compose_authority(
+                session_service,
+                UUID(session_id),
+                state_data,
+                provenance="session_seed",
+            )
 
             resp = await client.post(
                 f"/api/sessions/{session_id}/execute",
@@ -541,7 +553,8 @@ async def test_execute_fails_closed_for_uncovered_llm_source(
             version=1,
         )
         state_data = state.to_dict()
-        await app.state.session_service.save_composition_state(
+        await _save_composition_state_with_compose_authority(
+            app.state.session_service,
             UUID(session_id),
             CompositionStateData(
                 sources=state_data["sources"],
@@ -610,7 +623,8 @@ async def test_execute_fails_closed_for_uncovered_llm_source(
             version=1,
         )
         base_url_state_data = base_url_state.to_dict()
-        await app.state.session_service.save_composition_state(
+        await _save_composition_state_with_compose_authority(
+            app.state.session_service,
             UUID(base_url_session_id),
             CompositionStateData(
                 sources=base_url_state_data["sources"],
@@ -635,7 +649,8 @@ async def test_execute_fails_closed_for_uncovered_llm_source(
         )
         assert malformed_created.status_code == 201
         malformed_session_id = malformed_created.json()["id"]
-        await app.state.session_service.save_composition_state(
+        await _save_composition_state_with_compose_authority(
+            app.state.session_service,
             UUID(malformed_session_id),
             CompositionStateData(
                 sources={

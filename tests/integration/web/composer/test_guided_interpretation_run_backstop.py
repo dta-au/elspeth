@@ -35,6 +35,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 
 
 @pytest.fixture
@@ -260,7 +261,8 @@ async def _persist_state_with_unresolved_node(
     )
     state = state.with_edge(EdgeSpec(id="e1", from_node="source", to_node="rate_node", edge_type="on_success", label=None))
     state_dict = state.to_dict()
-    record = await sessions_service.save_composition_state(
+    record = await _save_composition_state_with_compose_authority(
+        sessions_service,
         session_id,
         CompositionStateData(
             nodes=state_dict["nodes"],

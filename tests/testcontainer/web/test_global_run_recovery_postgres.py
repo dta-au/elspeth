@@ -91,16 +91,30 @@ def _expire_instance(engine: Engine, instance_id: str) -> None:
 
 async def _create_running_run(service: SessionServiceImpl) -> tuple[RunRecord, SessionOperationContext]:
     session = await service.create_session(str(uuid4()), "Pipeline", "local")
-    state = await service.save_composition_state(
-        session.id,
-        CompositionStateData(is_valid=True),
-        provenance="session_seed",
+    compose_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
     )
-    context = service.session_operation_authority.acquire(
-        session_id=session.id,
-        operation_kind=SessionOperationKind.EXECUTE,
-        owner_instance_id=service.session_operation_owner_instance_id,
-        lease_seconds=service.session_operation_lease_seconds,
+    try:
+        state = await service.save_composition_state(
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+            session_operation_context=compose_context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, compose_context)
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
     )
     run = await service.create_run(session.id, state.id, session_operation_context=context)
     await service.update_run_status(run.id, "running", session_operation_context=context)

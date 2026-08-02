@@ -914,7 +914,25 @@ async def test_add_message_preserves_assert_state_in_session_guard(service):
         _make_session(conn, session_id=str(sid_a))
         _make_session(conn, session_id=str(sid_b))
 
-    state_a = await service.save_composition_state(sid_a, CompositionStateData(), provenance="session_seed")
+    for seeded_context in (_test_compose_context(str(sid_a)), _test_compose_context(str(sid_b))):
+        await service._run_sync(service.session_operation_authority.release, seeded_context)
+    compose_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=sid_a,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        state_a = await service.save_composition_state(
+            sid_a,
+            CompositionStateData(),
+            provenance="session_seed",
+            session_operation_context=compose_context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, compose_context)
 
     with pytest.raises(RuntimeError, match="cross-session reference"):
         await service.add_message(

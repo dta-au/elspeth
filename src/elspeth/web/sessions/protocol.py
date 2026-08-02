@@ -3683,9 +3683,12 @@ class SessionServiceProtocol(Protocol):
         state: CompositionStateData,
         *,
         provenance: CompositionStateProvenance,
-        session_operation_context: SessionOperationContext | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord:
         """Save a new immutable composition state snapshot.
+
+        A live, exact COMPOSE ``SessionOperationContext`` is required and
+        must be validated transactionally before any state write.
 
         ``provenance`` MUST be one of the values enumerated by the
         ``ck_composition_states_provenance`` CHECK constraint and the

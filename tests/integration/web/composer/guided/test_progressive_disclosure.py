@@ -56,6 +56,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 # ---------------------------------------------------------------------------
@@ -242,7 +243,14 @@ def _seed_terminal_guided_session(
         validation_errors=None,
         composer_meta=new_composer_meta,
     )
-    asyncio.run(service.save_composition_state(session_uuid, state_data, provenance="session_seed"))
+    asyncio.run(
+        _save_composition_state_with_compose_authority(
+            service,
+            session_uuid,
+            state_data,
+            provenance="session_seed",
+        )
+    )
 
 
 def _get_current_guided_session(client: TestClient, session_id: str) -> dict:

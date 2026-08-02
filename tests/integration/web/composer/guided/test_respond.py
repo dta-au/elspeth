@@ -57,6 +57,7 @@ from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.routes._helpers import _SessionComposeLockRegistry
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 # ---------------------------------------------------------------------------
@@ -214,7 +215,8 @@ def _remove_durable_current_turn(client: TestClient, session_id: str) -> None:
     composer_meta = dict(record.composer_meta or {})
     composer_meta["guided_session"] = prospective_guided.to_dict()
     asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             UUID(session_id),
             CompositionStateData(
                 sources=state_dict["sources"],
@@ -2486,7 +2488,8 @@ class TestStep2IntraStep:
         older_head = asyncio.run(service.get_current_state(session_uuid))
         assert older_head is not None
         later_head = asyncio.run(
-            service.save_composition_state(
+            _save_composition_state_with_compose_authority(
+                service,
                 session_uuid,
                 CompositionStateData(
                     sources=older_head.sources,

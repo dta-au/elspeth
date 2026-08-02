@@ -35,6 +35,8 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
+    CompositionStateProvenance,
+    CompositionStateRecord,
     GuidedForkSettlementCommand,
     GuidedOperationActive,
     GuidedOperationClaimed,
@@ -147,6 +149,32 @@ async def _delete_test_blob(
         )
     finally:
         await session_service._run_sync(session_service.session_operation_authority.release, context)
+
+
+async def _save_composition_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 async def _service_lock_contention(
@@ -740,7 +768,8 @@ async def test_takeover_fails_closed_when_bound_child_lineage_drifted(service, e
 @pytest.mark.asyncio
 async def test_settlement_rewrites_state_activates_child_and_completes_locator_atomically(service) -> None:
     parent = await service.create_session("alice", "Parent", "local")
-    original_state = await service.save_composition_state(
+    original_state = await _save_composition_state(
+        service,
         parent.id,
         CompositionStateData(
             sources={"orders": {"plugin": "csv", "options": {"blob_ref": str(uuid4())}}},
@@ -957,7 +986,8 @@ async def test_settlement_rejects_rewritten_state_with_parent_blob_custody(
         session_id=parent.id,
         storage_path=parent_storage_path,
     )
-    original_state = await service.save_composition_state(
+    original_state = await _save_composition_state(
+        service,
         parent.id,
         CompositionStateData(sources={"orders": {"plugin": "csv", "options": {"path": "old.csv"}}}),
         provenance="session_seed",
@@ -1012,7 +1042,8 @@ async def test_settlement_rejects_parent_blob_reference_excluded_from_ready_plan
         session_id=parent.id,
         status="pending",
     )
-    original_state = await service.save_composition_state(
+    original_state = await _save_composition_state(
+        service,
         parent.id,
         CompositionStateData(
             sources={
@@ -1066,7 +1097,8 @@ async def test_settlement_fault_rolls_back_every_surface_and_child_remains_takeo
     fault_point: str,
 ) -> None:
     parent = await service.create_session("alice", "Parent", "local")
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         parent.id,
         CompositionStateData(sources={"source": {"plugin": "csv", "options": {"path": "old.csv"}}}, is_valid=True),
         provenance="session_seed",
@@ -1551,7 +1583,8 @@ async def test_source_blob_delete_and_planned_copy_serialize_under_lock_contenti
         b"a,b\n1,2\n",
         "text/csv",
     )
-    state = await race_service.save_composition_state(
+    state = await _save_composition_state(
+        race_service,
         parent.id,
         CompositionStateData(
             sources={
@@ -1669,7 +1702,8 @@ async def test_fork_rebases_parent_session_sink_paths_into_child_namespace(
     parent_output = tmp_path / "outputs" / str(parent.id) / "result.jsonl"
     foreign_id = uuid4()
     foreign_output = tmp_path / "outputs" / str(foreign_id) / "foreign.jsonl"
-    state = await service.save_composition_state(
+    state = await _save_composition_state(
+        service,
         parent.id,
         CompositionStateData(
             sources={},

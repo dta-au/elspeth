@@ -26,6 +26,7 @@ from elspeth.web.composer.source_inspection import SourceInspectionFacts
 from elspeth.web.sessions.guided_replay import guided_turn_token, load_guided_json_payload
 from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationSettlementConflictError
 from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -69,7 +70,8 @@ def _seed_exited_guided_state(client: TestClient, session_id: str) -> str:
     state = replace(state, guided_session=guided)
     state_data_raw = state.to_dict()
     asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             UUID(session_id),
             CompositionStateData(
                 sources=state_data_raw["sources"],
@@ -257,7 +259,8 @@ def _seed_exited_checkpoint(client: TestClient, session_id: str, checkpoint: Gui
     state = replace(state, guided_session=exited)
     state_data_raw = state.to_dict()
     asyncio.run(
-        service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            service,
             UUID(session_id),
             CompositionStateData(
                 sources=state_data_raw["sources"],

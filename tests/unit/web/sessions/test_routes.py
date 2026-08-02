@@ -57,6 +57,7 @@ from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResu
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
@@ -89,6 +90,7 @@ from elspeth.web.sessions.protocol import (
     ChatMessageRole,
     CompositionProposalRecord,
     CompositionStateData,
+    CompositionStateProvenance,
     CompositionStateRecord,
     SessionRecord,
     TransitionResponseSettlement,
@@ -168,24 +170,35 @@ async def _execute_session_operation_context(
 
 @asynccontextmanager
 async def _compose_session_operation_context(
-    service: SessionServiceImpl,
+    service: SessionServiceImpl | _ProgressRouteSessionService,
     session_id: uuid.UUID,
 ) -> AsyncIterator[SessionOperationContext]:
     """Hold one real COMPOSE authority for direct proposal creation in tests."""
-    context = await service._run_sync(
-        lambda: service.session_operation_authority.acquire(
-            session_id=session_id,
-            operation_kind=SessionOperationKind.COMPOSE,
-            owner_instance_id=service.session_operation_owner_instance_id,
-            lease_seconds=service.session_operation_lease_seconds,
-        )
+    lease = await SessionOperationLease.acquire(
+        service.session_operation_authority,
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
     )
-    try:
-        yield context
-    finally:
-        await service._run_sync(
-            service.session_operation_authority.release,
-            context,
+    async with lease:
+        yield lease.context
+
+
+async def _save_test_composition_state(
+    service: SessionServiceImpl | _ProgressRouteSessionService,
+    session_id: uuid.UUID,
+    data: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    """Save one seeded state under a short-lived real COMPOSE authority."""
+    async with _compose_session_operation_context(service, session_id) as context:
+        return await service.save_composition_state(
+            session_id,
+            data,
+            provenance=provenance,
+            session_operation_context=context,
         )
 
 
@@ -609,10 +622,11 @@ class _ProgressRouteSessionService:
         session_id: uuid.UUID,
         data: CompositionStateData,
         *,
-        provenance: str,
-        session_operation_context: SessionOperationContext | None = None,
+        provenance: CompositionStateProvenance,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord:
-        del session_operation_context
+        assert session_operation_context.fence.session_id == str(session_id)
+        assert session_operation_context.operation_kind is SessionOperationKind.COMPOSE
         if session_id != self.session.id:
             raise ValueError("Session not found")
         version = 1 if self.current_state is None else self.current_state.version + 1
@@ -676,6 +690,7 @@ class _ProgressRouteSessionService:
             session_id,
             state,
             provenance="post_compose",
+            session_operation_context=session_operation_context,
         )
         message = await self.add_message(
             session_id,
@@ -2640,7 +2655,7 @@ class TestSessionCRUDRoutes:
         session_id = uuid.UUID(create_resp.json()["id"])
 
         # Create a pending run via the service layer
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             await service.create_run(
                 session_id,
@@ -2710,7 +2725,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Completed Run"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -2741,7 +2756,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Failed Run"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -2781,7 +2796,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Fanout Run"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -2835,7 +2850,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Missing Accounting"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -2887,7 +2902,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Open Accounting"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -2938,7 +2953,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Discarded Rows"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -3007,7 +3022,7 @@ class TestSessionCRUDRoutes:
         create_resp = client.post("/api/sessions", json={"title": "Running Run"})
         session_id = uuid.UUID(create_resp.json()["id"])
 
-        state = await service.save_composition_state(session_id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_test_composition_state(service, session_id, CompositionStateData(is_valid=True), provenance="session_seed")
         async with _execute_session_operation_context(service, session_id) as context:
             run = await service.create_run(
                 session_id,
@@ -3801,7 +3816,8 @@ class TestSendMessageStateIdValidation:
                 service.create_session("alice", "Alice Only", "local"),
             )
             alice_state = loop.run_until_complete(
-                service.save_composition_state(
+                _save_test_composition_state(
+                    service,
                     alice_session.id,
                     CompositionStateData(
                         metadata_={"name": "Alice", "description": ""},
@@ -3821,7 +3837,8 @@ class TestSendMessageStateIdValidation:
                 service.create_session("bob", "Bob's Own", "local"),
             )
             loop.run_until_complete(
-                service.save_composition_state(
+                _save_test_composition_state(
+                    service,
                     bob_session.id,
                     CompositionStateData(
                         metadata_={"name": "Bob", "description": ""},
@@ -3986,7 +4003,8 @@ class TestMessageRoutes:
         # route, so we seed one directly).
         loop = asyncio.new_event_loop()
         state_record = loop.run_until_complete(
-            service.save_composition_state(
+            _save_test_composition_state(
+                service,
                 uuid.UUID(session_id),
                 CompositionStateData(
                     metadata_={"name": "Test", "description": ""},
@@ -4059,7 +4077,8 @@ class TestMessageRoutes:
         loop = asyncio.new_event_loop()
         try:
             stale_record = loop.run_until_complete(
-                service.save_composition_state(
+                _save_test_composition_state(
+                    service,
                     uuid.UUID(session_id),
                     CompositionStateData(
                         metadata_={"name": "v1", "description": ""},
@@ -4069,7 +4088,8 @@ class TestMessageRoutes:
                 ),
             )
             head_record = loop.run_until_complete(
-                service.save_composition_state(
+                _save_test_composition_state(
+                    service,
                     uuid.UUID(session_id),
                     CompositionStateData(
                         metadata_={"name": "v2", "description": ""},
@@ -4470,7 +4490,8 @@ class TestMessageRoutes:
         loop = asyncio.new_event_loop()
         try:
             pre_state = loop.run_until_complete(
-                service.save_composition_state(
+                _save_test_composition_state(
+                    service,
                     session_id,
                     CompositionStateData(metadata_={"name": "Precompose", "description": ""}, is_valid=True),
                     provenance="session_seed",
@@ -6555,12 +6576,14 @@ class TestRevertEndpoint:
         registry = _SessionComposeLockRegistry()
         app.state.session_compose_lock_registry = registry
         session = await service.create_session("alice", "Pipeline", "local")
-        target = await service.save_composition_state(
+        target = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(is_valid=True),
             provenance="session_seed",
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(is_valid=True),
             provenance="session_seed",
@@ -6605,12 +6628,14 @@ class TestRevertEndpoint:
 
         app, service = _make_app(tmp_path)
         session = await service.create_session("alice", "Pipeline", "local")
-        target = await service.save_composition_state(
+        target = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(is_valid=True),
             provenance="session_seed",
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(is_valid=True),
             provenance="session_seed",
@@ -6665,12 +6690,14 @@ class TestRevertEndpoint:
 
         # Create session and two state versions via the service
         session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(
+        v1 = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(source={"plugin": "csv"}, is_valid=True),
             provenance="session_seed",
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(source={"plugin": "json"}, is_valid=True),
             provenance="session_seed",
@@ -6707,8 +6734,8 @@ class TestRevertEndpoint:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
-        await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        v1 = await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
 
         client.post(
             f"/api/sessions/{session.id}/state/revert",
@@ -6770,7 +6797,7 @@ class TestRevertEndpoint:
 
         # Alice creates a session with a state
         session = await service.create_session("alice", "Alice Only", "local")
-        v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        v1 = await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
 
         # Bob tries to revert -- should be 404
         resp = bob_client.post(
@@ -6787,7 +6814,7 @@ class TestRevertEndpoint:
 
         s1 = await service.create_session("alice", "Session 1", "local")
         s2 = await service.create_session("alice", "Session 2", "local")
-        v1_s2 = await service.save_composition_state(s2.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        v1_s2 = await _save_test_composition_state(service, s2.id, CompositionStateData(is_valid=True), provenance="session_seed")
 
         # Try to revert s1 using s2's state -- should fail
         resp = client.post(
@@ -6806,7 +6833,8 @@ class TestYamlEndpoint:
         _install_restricted_plugin_policy(app, PluginId("sink", "database"))
         client = TestClient(app)
         session = await service.create_session("alice", "Policy atomicity", "local")
-        before = await service.save_composition_state(
+        before = await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(is_valid=True),
             provenance="session_seed",
@@ -6843,7 +6871,8 @@ sinks:
         app.state.operator_profile_registry.lower_options.side_effect = AssertionError("export must not lower private bindings")
         client = TestClient(app)
         session = await service.create_session("alice", "Historical disabled plugin", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 sources={
@@ -6942,7 +6971,8 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Corrupt plugin projection", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 sources=sources,
@@ -7837,7 +7867,8 @@ sinks:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={"plugin": "csv", "on_success": "out", "options": {"path": "/data.csv"}, "on_validation_failure": "quarantine"},
@@ -7883,7 +7914,8 @@ sinks:
                 ),
             )
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -7963,7 +7995,8 @@ sinks:
                 )
             },
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8037,7 +8070,8 @@ sinks:
                 pipeline_yaml=None,
             ),
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8111,7 +8145,8 @@ sinks:
                 get_blob=get_blob,
             )
         blob_ref = "NOT-A-CANONICAL-UUID" if custody_failure == "noncanonical" else str(blob_id)
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8176,7 +8211,8 @@ sinks:
                 )
             },
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8257,7 +8293,8 @@ sinks:
                 )
             },
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8348,7 +8385,8 @@ sinks:
                 )
             },
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8414,7 +8452,8 @@ sinks:
                 )
             },
         )
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8458,7 +8497,8 @@ sinks:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8525,7 +8565,8 @@ sinks:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8607,7 +8648,8 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -8662,8 +8704,11 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
-            session.id, CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True), provenance="session_seed"
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
         leaked_value = "REDACTED-preflight-error-canary"
 
@@ -8695,8 +8740,11 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
-            session.id, CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True), provenance="session_seed"
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
         seen_session_ids: list[uuid.UUID] = []
 
@@ -8725,8 +8773,11 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
-            session.id, CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True), provenance="session_seed"
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
 
         async def pass_preflight(state, *, settings, secret_service, user_id, session_id, **_policy_context):
@@ -8752,8 +8803,11 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
-            session.id, CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True), provenance="session_seed"
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
 
         failure = ValidationResult(
@@ -8786,8 +8840,11 @@ sinks:
         app, service = _make_app(tmp_path)
         client = TestClient(app)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
-            session.id, CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True), provenance="session_seed"
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
 
         secret_canary = "this-text-must-not-appear-in-the-response-body"
@@ -8842,8 +8899,11 @@ sinks:
         # rather than re-raising the AttributeError into the test runner.
         client = TestClient(app, raise_server_exceptions=False)
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
-            session.id, CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True), provenance="session_seed"
+        await _save_test_composition_state(
+            service,
+            session.id,
+            CompositionStateData(metadata_={"name": "Snapshot", "description": ""}, is_valid=True),
+            provenance="session_seed",
         )
 
         async def programmer_bug(state, *, settings, secret_service, user_id, session_id, **_policy_context):
@@ -8881,7 +8941,8 @@ sinks:
 
         app.state.scoped_secret_resolver = FakeResolvedSecretService()
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(
                 source={
@@ -9060,7 +9121,7 @@ class TestRunAlreadyActiveError:
         app, service = _make_app(tmp_path)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        v1 = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        v1 = await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=True), provenance="session_seed")
         # Create a run to block the session
         async with _execute_session_operation_context(service, session.id) as context:
             await service.create_run(
@@ -9117,7 +9178,8 @@ class TestNewStateHasNoLineage:
         client = TestClient(app)
 
         session = await service.create_session("alice", "Pipeline", "local")
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(source={"plugin": "csv"}, is_valid=True),
             provenance="session_seed",
@@ -9147,7 +9209,8 @@ class TestNewStateHasNoLineage:
                 "options": {"path": "refunds.csv"},
             },
         }
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             session.id,
             CompositionStateData(sources=sources, is_valid=True),
             provenance="session_seed",
@@ -9273,7 +9336,8 @@ class TestComposerProgressRoutes:
             guided_session=guided,
         )
         initial_state_d = initial_state.to_dict()
-        await service.save_composition_state(
+        await _save_test_composition_state(
+            service,
             service.session.id,
             CompositionStateData(
                 sources=initial_state_d["sources"],
@@ -9824,7 +9888,7 @@ class TestPaginationRoutes:
 
         session = await service.create_session("alice", "Pipeline", "local")
         for _ in range(5):
-            await service.save_composition_state(session.id, CompositionStateData(is_valid=False), provenance="session_seed")
+            await _save_test_composition_state(service, session.id, CompositionStateData(is_valid=False), provenance="session_seed")
 
         resp = client.get(
             f"/api/sessions/{session.id}/state/versions?limit=2",
@@ -12597,7 +12661,8 @@ def test_send_message_state_advance_preserves_existing_composer_meta(tmp_path: P
     client = TestClient(app)
     session_id = client.post("/api/sessions", json={"title": "T"}).json()["id"]
     asyncio.run(
-        service.save_composition_state(
+        _save_test_composition_state(
+            service,
             uuid.UUID(session_id),
             CompositionStateData(
                 sources={},
@@ -12681,7 +12746,8 @@ def test_recompose_state_advance_preserves_existing_composer_meta(tmp_path: Path
     client = TestClient(app)
     session_id = client.post("/api/sessions", json={"title": "T"}).json()["id"]
     asyncio.run(
-        service.save_composition_state(
+        _save_test_composition_state(
+            service,
             uuid.UUID(session_id),
             CompositionStateData(
                 sources={},

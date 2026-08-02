@@ -9845,9 +9845,12 @@ class SessionServiceImpl:
         state: CompositionStateData,
         *,
         provenance: CompositionStateProvenance,
-        session_operation_context: SessionOperationContext | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord:
         """Save a new immutable composition state snapshot.
+
+        A live, exact COMPOSE ``SessionOperationContext`` is validated in the
+        same locked transaction before any state write.
 
         Version is max(existing versions for session) + 1, starting at 1.
 
@@ -9906,16 +9909,17 @@ class SessionServiceImpl:
             return version
 
         def _sync() -> int:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                if session_operation_context is None:
-                    return _write(conn)
-                with self._session_composer_mutation_transaction(
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
                     conn,
                     session_id=sid,
                     session_operation_context=session_operation_context,
                     expected_kind=SessionOperationKind.COMPOSE,
-                ):
-                    return _write(conn)
+                ),
+            ):
+                return _write(conn)
 
         version = await self._run_sync(_sync)
 

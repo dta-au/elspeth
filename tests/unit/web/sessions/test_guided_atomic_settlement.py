@@ -28,6 +28,7 @@ from elspeth.contracts.composer_llm_audit import (
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, stable_hash
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.audit import emit_intent_cancelled
@@ -59,6 +60,7 @@ from elspeth.web.sessions.models import (
 )
 from elspeth.web.sessions.protocol import (
     CompositionStateData,
+    CompositionStateProvenance,
     CompositionStateRecord,
     GuidedAuditEvidence,
     GuidedOperationClaimed,
@@ -79,6 +81,32 @@ from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl, _GuidedSessionMutations
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
+
+
+async def _save_composition_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    state: CompositionStateData,
+    *,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
 
 
 def _empty_composition_state() -> CompositionState:
@@ -1495,7 +1523,8 @@ def _empty_respond_command(fence: GuidedOperationFence, *, state_id=None) -> Gui
 
 
 async def _seed_present_guided_predecessor(service: SessionServiceImpl, session_id) -> CompositionStateRecord:
-    return await service.save_composition_state(
+    return await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             metadata_={"name": "Guided predecessor", "description": ""},
@@ -1511,7 +1540,8 @@ async def _seed_guided_predecessor_with_intents(
     session_id,
     intents: tuple[DeferredStageIntent, ...],
 ) -> CompositionStateRecord:
-    return await service.save_composition_state(
+    return await _save_composition_state(
+        service,
         session_id,
         CompositionStateData(
             metadata_={"name": "Guided predecessor", "description": ""},

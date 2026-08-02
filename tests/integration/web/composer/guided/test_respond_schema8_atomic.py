@@ -59,6 +59,7 @@ from elspeth.web.sessions.schemas import GuidedRespondRequest
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep as _Step2Journey
+from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
 
@@ -250,7 +251,8 @@ def _persist_guided(client: TestClient, session_id: str, guided: GuidedSession) 
     state = replace(_initial_composition_state_with_guided_session(), guided_session=guided)
     state_dict = state.to_dict()
     asyncio.run(
-        client.app.state.session_service.save_composition_state(
+        _save_composition_state_with_compose_authority(
+            client.app.state.session_service,
             UUID(session_id),
             CompositionStateData(
                 sources=state_dict["sources"],

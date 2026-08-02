@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar
 from unittest.mock import patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -56,8 +56,10 @@ from elspeth.web.sessions.protocol import (
     LANDSCAPE_RECONCILIATION_COMPLETE_SUFFIX,
     LANDSCAPE_RECONCILIATION_PENDING_SUFFIX,
     CompositionStateData,
+    CompositionStateRecord,
     RunRecord,
 )
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import _FakeCounter, build_sessions_telemetry, observed_value
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
@@ -98,6 +100,31 @@ def _settings(tmp_path: Path, **overrides) -> WebSettings:
     }
     defaults.update(overrides)
     return WebSettings(**defaults)  # type: ignore[arg-type]
+
+
+async def _save_session_seed_state(
+    service: SessionServiceImpl,
+    session_id: UUID,
+) -> CompositionStateRecord:
+    """Persist startup-test state under a real live COMPOSE authority."""
+    authority = service.session_operation_authority
+    context = await service._run_sync(
+        lambda: authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.save_composition_state(
+            session_id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(authority.release, context)
 
 
 def _aws_settings(tmp_path: Path, **overrides: object) -> WebSettings:
@@ -1413,7 +1440,7 @@ class TestLifespanShutdown:
         )
         session_service = app.state.session_service
         session = await session_service.create_session("alice", "Pipeline", "local")
-        state = await session_service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_session_seed_state(session_service, session.id)
         landscape_run_id = "lscp-startup-orphan"
         authority = session_service.session_operation_authority
         execute_context = authority.acquire(
@@ -1474,7 +1501,7 @@ class TestLifespanShutdown:
         )
         service = app.state.session_service
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_session_seed_state(service, session.id)
         authority = service.session_operation_authority
         execute_context = authority.acquire(
             session_id=session.id,
@@ -1527,7 +1554,7 @@ class TestLifespanShutdown:
         )
         service = app.state.session_service
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_session_seed_state(service, session.id)
         authority = service.session_operation_authority
         execute_context = authority.acquire(
             session_id=session.id,
@@ -1563,7 +1590,7 @@ class TestLifespanShutdown:
         app = create_app(_settings(tmp_path, composer_boot_probe_enabled=False))
         service = app.state.session_service
         session = await service.create_session("alice", "Pipeline", "local")
-        state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        state = await _save_session_seed_state(service, session.id)
         landscape_run_id = "landscape-marker-retry"
         authority = service.session_operation_authority
         execute_context = authority.acquire(

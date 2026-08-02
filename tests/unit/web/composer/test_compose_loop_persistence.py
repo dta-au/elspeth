@@ -42,7 +42,12 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
     sessions_table,
 )
-from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, CompositionStateData
+from elspeth.web.sessions.protocol import (
+    ComposerSessionPreferencesRecord,
+    CompositionStateData,
+    CompositionStateProvenance,
+    CompositionStateRecord,
+)
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
 
 
@@ -88,6 +93,32 @@ def _acquire_compose_authority(
         owner_instance_id=owner,
         lease_seconds=sessions_service.session_operation_lease_seconds,
     )
+
+
+async def _save_composition_state_with_compose_authority(
+    service: ComposerServiceImpl,
+    *,
+    session_id: str | UUID,
+    state: CompositionStateData,
+    provenance: CompositionStateProvenance,
+) -> CompositionStateRecord:
+    """Persist test state under the same exact COMPOSE authority as production."""
+    session_id_text = str(session_id)
+    sessions_service = service._require_sessions_service()  # type: ignore[attr-defined]
+    context = _acquire_compose_authority(
+        service,
+        session_id=session_id_text,
+        owner="composition-state-test",
+    )
+    try:
+        return await sessions_service.save_composition_state(
+            UUID(session_id_text),
+            state,
+            provenance=provenance,
+            session_operation_context=context,
+        )
+    finally:
+        sessions_service.session_operation_authority.release(context)
 
 
 def _expire_and_take_over_compose_authority(
@@ -1176,9 +1207,10 @@ async def test_tool_batch_rejects_id_owned_only_by_prior_interpretation_event(
 ) -> None:
     sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
     session_uuid = UUID(result_session_id)
-    state = await sessions_service.save_composition_state(
-        session_uuid,
-        CompositionStateData(
+    state = await _save_composition_state_with_compose_authority(
+        composer_service_with_real_sessions,
+        session_id=session_uuid,
+        state=CompositionStateData(
             nodes=[_interpretation_review_node()],
             metadata_={"name": "Interpretation ID ownership", "description": ""},
             is_valid=True,
@@ -1947,10 +1979,10 @@ async def test_step2_first_tool_turn_uses_existing_current_state_id(
 ) -> None:
     """First tool-call persistence must guard against the current state row."""
 
-    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
-    state_record = await sessions_service.save_composition_state(
-        result_session_id,
-        CompositionStateData(is_valid=False),
+    state_record = await _save_composition_state_with_compose_authority(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        state=CompositionStateData(is_valid=False),
         provenance="session_seed",
     )
 

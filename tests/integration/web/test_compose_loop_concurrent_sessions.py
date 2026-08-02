@@ -24,6 +24,7 @@ import structlog
 from sqlalchemy import text
 from testcontainers.postgres import PostgresContainer
 
+from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.sessions._persist_payload import RedactedToolRow, StatePayload
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import CompositionStateData
@@ -32,7 +33,10 @@ from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 # Integration-suite shared session-insert helper.
-from .conftest import _make_session
+from .conftest import (
+    _ensure_released_session_operation_fence,
+    _make_session,
+)
 
 pytestmark = [
     pytest.mark.testcontainer,
@@ -329,6 +333,13 @@ def test_cross_allocator_save_state_serialises_with_persist_turn(service):
     persist_count = 5
     save_count = 5
     starting_counter = observed_value(service._telemetry.tool_row_integrity_violation_total)
+    _ensure_released_session_operation_fence(service, session_uuid)
+    session_operation_context = service.session_operation_authority.acquire(
+        session_id=session_uuid,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    )
 
     def _persist_worker():
         # B2 (Phase 1 plan-review synthesis): pre-B2 this loop passed
@@ -359,6 +370,7 @@ def test_cross_allocator_save_state_serialises_with_persist_turn(service):
                     expected_current_state_id=expected_current_state_id,
                     writer_principal="compose_loop",
                     plugin_crash_pending=False,
+                    session_operation_context=session_operation_context,
                 )
         except StaleComposeStateError as e:
             stale_rejections.append(e)
@@ -378,6 +390,7 @@ def test_cross_allocator_save_state_serialises_with_persist_turn(service):
                         session_uuid,  # ``save_composition_state`` takes UUID
                         CompositionStateData(),
                         provenance="session_seed",
+                        session_operation_context=session_operation_context,
                     )
                 )
         except Exception as e:
@@ -390,10 +403,13 @@ def test_cross_allocator_save_state_serialises_with_persist_turn(service):
         threading.Thread(target=_persist_worker, name="persist"),
         threading.Thread(target=_save_worker, name="save"),
     ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join(timeout=30)
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+    finally:
+        service.session_operation_authority.release(session_operation_context)
 
     assert not errors, f"cross-allocator race not serialised; errors:\n{errors}\ntracebacks:\n" + "\n---\n".join(tracebacks)
     assert observed_value(service._telemetry.tool_row_integrity_violation_total) == starting_counter

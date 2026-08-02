@@ -33,7 +33,11 @@ from elspeth.web.sessions.models import composer_completion_events_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.shareable_reviews.signer import ShareTokenPayload
 
-from .conftest import _TEST_AUTHED_USER_ID, _passthrough_composition_state
+from .conftest import (
+    _TEST_AUTHED_USER_ID,
+    _passthrough_composition_state,
+    _save_composition_state_with_compose_authority,
+)
 
 # ── POST /mark-ready-for-review ─────────────────────────────────────────
 
@@ -118,7 +122,8 @@ def _seed_session_with_blob_subtree_sink(client: TestClient, *, user_id: str) ->
         (settings.data_dir / "blobs" / str(record.id)).mkdir(parents=True, exist_ok=True)
         state_d = _passthrough_composition_state(settings.data_dir, record.id).to_dict()
         state_d["outputs"][0]["options"]["path"] = str(settings.data_dir / "blobs" / str(record.id) / "review_out.csv")
-        await session_service.save_composition_state(
+        await _save_composition_state_with_compose_authority(
+            session_service,
             record.id,
             CompositionStateData(
                 sources=state_d["sources"],
