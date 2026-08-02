@@ -198,6 +198,104 @@ def _full_guided_session(body: dict) -> dict:
     return body["composition_state"]["composer_meta"]["guided_session"]
 
 
+def _llm_prompt_template_planner(prompt: str):
+    """Plan one llm node carrying a PENDING ``llm_prompt_template`` requirement.
+
+    Shared by the two wire-confirm surfacing tests so the first-attempt arm
+    and the replay arm are provably driven by the identical committed
+    pipeline; a drifted fixture would make that comparison meaningless.
+    """
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.core.canonical import stable_hash
+    from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
+    from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+    from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface
+
+    async def llm_planner(
+        *,
+        guided,
+        base,
+        supersedes_draft_hash,
+        recorder,
+        correction_target=None,
+        **_kwargs,
+    ):
+        del recorder, correction_target
+        source = guided.reviewed_sources[guided.source_order[0]]
+        output = guided.reviewed_outputs[guided.output_order[0]]
+        pipeline = {
+            "sources": {
+                source.name: {
+                    "plugin": source.plugin,
+                    "options": deep_thaw(source.options),
+                    "on_success": "llm_rows",
+                    "on_validation_failure": source.on_validation_failure,
+                }
+            },
+            "nodes": [
+                {
+                    "id": "summarize_rows",
+                    "node_type": "transform",
+                    "plugin": "llm",
+                    "input": "llm_rows",
+                    "on_success": output.name,
+                    "on_error": "discard",
+                    "options": {
+                        "schema": {"mode": "observed"},
+                        "profile": "task-role",
+                        "prompt_template": prompt,
+                        "response_field": "summary",
+                        "interpretation_requirements": [
+                            {
+                                "id": "llm_prompt_template:summarize_rows:summarize_rows",
+                                "kind": "llm_prompt_template",
+                                "user_term": "llm_prompt_template:summarize_rows",
+                                "status": "pending",
+                                "draft": prompt,
+                            }
+                        ],
+                    },
+                }
+            ],
+            "edges": [],
+            "outputs": [
+                {
+                    "sink_name": output.name,
+                    "plugin": output.plugin,
+                    "options": deep_thaw(output.options),
+                    "on_write_failure": output.on_write_failure,
+                }
+            ],
+        }
+        proposal = PipelineProposal.create(
+            pipeline=pipeline,
+            base=base,
+            reviewed_facts=guided_private_reviewed_facts(guided),
+            surface=PlannerSurface.GUIDED_STAGED,
+            repair_count=0,
+            skill_hash=stable_hash("llm-prompt-review-test-planner"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=supersedes_draft_hash,
+        )
+        return (
+            PipelinePlanResult(
+                proposal=proposal,
+                tool_call_id=f"guided-test-{proposal.draft_hash[:16]}",
+                custody_result="not_required",
+                model_identifier="llm-prompt-review-test-planner",
+                model_version="v1",
+                provider="test",
+            ),
+            {
+                "source": frozenset({source.plugin}),
+                "transform": frozenset({"llm"}),
+                "sink": frozenset({output.plugin}),
+            },
+        )
+
+    return llm_planner
+
+
 def _remove_durable_current_turn(client: TestClient, session_id: str) -> None:
     """Persist the same guided head without its unanswered turn occurrence."""
 
@@ -3706,101 +3804,13 @@ class TestStep2IntraStep:
         the accepted durable state (the writer boundary validates the node
         against that state's row).
         """
-        from elspeth.contracts.freeze import deep_thaw
-        from elspeth.core.canonical import stable_hash
-        from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
-        from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-        from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface
-
         session_id = _create_session(composer_test_client)
         prompt = "Summarise this row in one short sentence."
-
-        async def llm_planner(
-            *,
-            guided,
-            base,
-            supersedes_draft_hash,
-            recorder,
-            correction_target=None,
-            **_kwargs,
-        ):
-            del recorder, correction_target
-            source = guided.reviewed_sources[guided.source_order[0]]
-            output = guided.reviewed_outputs[guided.output_order[0]]
-            pipeline = {
-                "sources": {
-                    source.name: {
-                        "plugin": source.plugin,
-                        "options": deep_thaw(source.options),
-                        "on_success": "llm_rows",
-                        "on_validation_failure": source.on_validation_failure,
-                    }
-                },
-                "nodes": [
-                    {
-                        "id": "summarize_rows",
-                        "node_type": "transform",
-                        "plugin": "llm",
-                        "input": "llm_rows",
-                        "on_success": output.name,
-                        "on_error": "discard",
-                        "options": {
-                            "schema": {"mode": "observed"},
-                            "profile": "task-role",
-                            "prompt_template": prompt,
-                            "response_field": "summary",
-                            "interpretation_requirements": [
-                                {
-                                    "id": "llm_prompt_template:summarize_rows:summarize_rows",
-                                    "kind": "llm_prompt_template",
-                                    "user_term": "llm_prompt_template:summarize_rows",
-                                    "status": "pending",
-                                    "draft": prompt,
-                                }
-                            ],
-                        },
-                    }
-                ],
-                "edges": [],
-                "outputs": [
-                    {
-                        "sink_name": output.name,
-                        "plugin": output.plugin,
-                        "options": deep_thaw(output.options),
-                        "on_write_failure": output.on_write_failure,
-                    }
-                ],
-            }
-            proposal = PipelineProposal.create(
-                pipeline=pipeline,
-                base=base,
-                reviewed_facts=guided_private_reviewed_facts(guided),
-                surface=PlannerSurface.GUIDED_STAGED,
-                repair_count=0,
-                skill_hash=stable_hash("llm-prompt-review-test-planner"),
-                covered_deferred_intent_ids=(),
-                supersedes_draft_hash=supersedes_draft_hash,
-            )
-            return (
-                PipelinePlanResult(
-                    proposal=proposal,
-                    tool_call_id=f"guided-test-{proposal.draft_hash[:16]}",
-                    custody_result="not_required",
-                    model_identifier="llm-prompt-review-test-planner",
-                    model_version="v1",
-                    provider="test",
-                ),
-                {
-                    "source": frozenset({source.plugin}),
-                    "transform": frozenset({"llm"}),
-                    "sink": frozenset({output.plugin}),
-                },
-            )
 
         monkeypatch.setattr(
             composer_test_client.app.state.composer_service,
             "plan_guided_pipeline",
-            llm_planner,
+            _llm_prompt_template_planner(prompt),
         )
         staged = self._stage_proposal(composer_test_client, session_id, filename="llm_reviewed.jsonl")
         assert staged["next_turn"]["type"] == "propose_pipeline"
@@ -3821,6 +3831,93 @@ class TestStep2IntraStep:
         current = asyncio.run(session_service.get_current_state(UUID(session_id)))
         assert current is not None
         assert str(event.composition_state_id) == str(current.id)
+
+    def test_confirm_wiring_replay_surfaces_interpretation_events_the_crashed_attempt_owed(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A replayed wire-confirm must still surface what its first attempt owed.
+
+        ``accept_guided_pipeline_proposal`` durably settles the proposal AND
+        terminalizes the guided operation; the post-commit surfacing pass runs
+        after it, outside that transaction. An attempt that dies in between
+        leaves the operation terminal, so every retry carrying the same
+        ``operation_id`` joins the terminal result through the replay arm —
+        which only projects the stored state. Without this the committed state
+        keeps pending interpretation_requirements with no event row: no Accept
+        card renders and /execute fails closed with
+        ``UnresolvedInterpretationPlaceholderError`` with nothing the user can
+        resolve, and the retry can never repair it. Sibling of the freeform
+        exact-committed replay defect fixed in 41680eb60.
+
+        Provenance must name the planner that authored the draft under review
+        — the proposal row's identity, not the composer service's.
+        """
+        from elspeth.web.composer import service as composer_service_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_replayed.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+
+        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+
+        def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            _crash_between_settlement_and_surfacing,
+        )
+        with pytest.raises(_SurfacingWorkerCrash):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+
+        session_service = composer_test_client.app.state.session_service
+        # The window is real: settled durably, nothing surfaced.
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending")) == []
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            original_surface,
+        )
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json()["terminal"]["kind"] == "completed"
+
+        events = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+        prompt_events = [event for event in events if event.affected_node_id == "summarize_rows"]
+        assert len(prompt_events) == 1, [(event.affected_node_id, str(event.kind), event.user_term) for event in events]
+        event = prompt_events[0]
+        assert event.kind is not None and event.kind.value == "llm_prompt_template"
+        assert event.llm_draft == prompt
+        current = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert current is not None
+        assert str(event.composition_state_id) == str(current.id)
+        assert event.model_identifier == "llm-prompt-review-test-planner"
+        assert event.model_version == "v1"
+        assert event.provider == "test"
 
     def test_confirm_wiring_failure_after_dispatch_audit_insert_preserves_failure_evidence_only(
         self,

@@ -2605,10 +2605,51 @@ async def post_guided_respond(
             raise AuditIntegrityError("Guided RESPOND projection returned the wrong response type")
         return response
 
+    async def _resurface_replayed_interpretation_reviews(record: CompositionStateRecord) -> None:
+        """Run the post-commit surfacing pass this operation's settlement owed.
+
+        accept_guided_pipeline_proposal terminalizes the guided operation in
+        the same transaction that settles the proposal, but the surfacing pass
+        runs after it. An attempt that dies in between leaves the operation
+        terminal, so every retry lands here — and without this the committed
+        state keeps pending interpretation_requirements with NO event row: no
+        Accept card renders and /execute fails closed with
+        UnresolvedInterpretationPlaceholderError with nothing the user can
+        resolve, forever. Mirrors the freeform exact-committed replay arm
+        (pipeline_settlement.py). The pass is idempotent, so this is a no-op
+        whenever the settling attempt already completed it.
+
+        Provenance is re-derived from the proposal that published this state,
+        so a replayed surface names the same planner the settling attempt
+        would have named. A state no proposal published (every guided RESPOND
+        that settles no proposal) owes no surfacing.
+        """
+
+        proposal = await service.get_proposal_by_committed_state(
+            session_id=session_id,
+            committed_state_id=record.id,
+        )
+        if proposal is None:
+            return
+        from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
+
+        await surface_pending_interpretation_reviews_for_state(
+            _state_from_record(record),
+            sessions_service=service,
+            session_id=str(session_id),
+            current_state_id=str(record.id),
+            model_identifier=proposal.composer_model_identifier or "guided-planner",
+            model_version=proposal.composer_model_version or "guided-planner",
+            provider=proposal.composer_provider or "unknown",
+            composer_skill_hash=proposal.composer_skill_hash or "",
+        )
+
     async def _replay(result: object) -> GuidedRespondResponse:
         if type(result) is not GuidedCompositionStateResult:
             raise AuditIntegrityError("Guided RESPOND replay has a non-state result locator")
-        return _response_from_record(await service.get_state_in_session(result.state_id, session_id))
+        record = await service.get_state_in_session(result.state_id, session_id)
+        await _resurface_replayed_interpretation_reviews(record)
+        return _response_from_record(record)
 
     def _require_bound_revision_target(current_turn: Turn, *, public_error: bool) -> None:
         """Require the exact stable target advertised by the pending proposal."""
