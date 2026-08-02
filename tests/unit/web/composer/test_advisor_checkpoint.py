@@ -628,6 +628,134 @@ def test_summarize_renders_dynamic_field_contract_values() -> None:
     assert "select_only=True" in summary
 
 
+def _textract_advisor_state(
+    *,
+    schema_mode: str = "fixed",
+    schema_field_type: str = "str",
+    schema_field_required: bool = True,
+    schema_field_nullable: bool = False,
+    text_field: str = "document_text",
+    page_count_field: str = "document_pages",
+    region: str = "ap-southeast-2",
+    on_error: str = "textract_errors",
+) -> CompositionState:
+    source = SourceSpec(
+        plugin="inline_blob",
+        on_success="textract_input",
+        options={
+            "path": "/private/document-manifest.jsonl",
+            "blob_ref": "private-inline-blob-ref",
+            "schema": {
+                "mode": schema_mode,
+                "fields": [
+                    {
+                        "name": "doc",
+                        "type": schema_field_type,
+                        "required": schema_field_required,
+                        "nullable": schema_field_nullable,
+                    }
+                ],
+            },
+        },
+        on_validation_failure="invalid_documents",
+    )
+    textract = NodeSpec(
+        id="analyse_document",
+        node_type="transform",
+        plugin="aws_textract_document_analysis",
+        input="textract_input",
+        on_success="analysed_documents",
+        on_error=on_error,
+        options={
+            "region": region,
+            "bucket_field": "document_bucket",
+            "key_field": "document_key",
+            "feature_types": ["FORMS", "TABLES"],
+            "text_field": text_field,
+            "page_count_field": page_count_field,
+        },
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    output = OutputSpec(
+        name="analysed_documents",
+        plugin="json",
+        options={"path": "/private/analysed-documents.jsonl"},
+        on_write_failure="failed_writes",
+    )
+    return CompositionState(
+        source=source,
+        nodes=(textract,),
+        edges=(),
+        outputs=(output,),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def test_summarize_renders_complete_textract_contract_and_changes_with_committed_values() -> None:
+    from elspeth.web.composer.service import _summarize_pipeline_for_advisor
+
+    state = _textract_advisor_state()
+    summary = _summarize_pipeline_for_advisor(state)
+    source_line = next(line for line in summary.splitlines() if line.startswith("Source:"))
+    node_line = next(line for line in summary.splitlines() if "analyse_document" in line)
+    sink_line = next(line for line in summary.splitlines() if "analysed_documents: plugin=json" in line)
+
+    assert "schema=" in source_line
+    for schema_fact in ("'mode': 'fixed'", "'name': 'doc'", "'type': 'str'", "'required': True", "'nullable': False"):
+        assert schema_fact in source_line
+    assert "bucket_field=document_bucket" in node_line
+    assert "key_field=document_key" in node_line
+    assert "text_field=document_text" in node_line
+    assert "page_count_field=document_pages" in node_line
+    assert "feature_types=" in node_line
+    assert "FORMS" in node_line
+    assert "TABLES" in node_line
+    assert "region=ap-southeast-2" in node_line
+    assert "/private/document-manifest.jsonl" not in summary
+    assert "private-inline-blob-ref" not in summary
+    assert "path" in source_line
+    assert "blob_ref" in source_line
+    assert "path" in sink_line
+
+    changed = _textract_advisor_state(
+        schema_mode="flexible",
+        schema_field_type="int",
+        schema_field_required=False,
+        schema_field_nullable=True,
+        text_field="ocr_text",
+        page_count_field="page_total",
+        region="us-east-1",
+        on_error="stop",
+    )
+    changed_summary = _summarize_pipeline_for_advisor(changed)
+    changed_source_line = next(line for line in changed_summary.splitlines() if line.startswith("Source:"))
+    changed_node_line = next(line for line in changed_summary.splitlines() if "analyse_document" in line)
+
+    assert summary != changed_summary
+    for schema_fact in ("'mode': 'flexible'", "'type': 'int'", "'required': False", "'nullable': True"):
+        assert schema_fact in changed_source_line
+    assert "text_field=ocr_text" in changed_node_line
+    assert "page_count_field=page_total" in changed_node_line
+    assert "region=us-east-1" in changed_node_line
+    assert "on_error=stop" in changed_node_line
+
+
+def test_summarize_renders_source_node_and_sink_failure_routes() -> None:
+    from elspeth.web.composer.service import _summarize_pipeline_for_advisor
+
+    summary = _summarize_pipeline_for_advisor(_textract_advisor_state())
+
+    assert "on_validation_failure=invalid_documents" in summary
+    assert "on_error=textract_errors" in summary
+    assert "on_write_failure=failed_writes" in summary
+
+
 @pytest.mark.asyncio
 async def test_run_advisor_checkpoint_clean_verdict(make_service, simple_state):
     service = make_service()

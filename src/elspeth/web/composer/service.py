@@ -6700,6 +6700,7 @@ _ADVISOR_SUMMARY_VALUE_KEYS: Final[frozenset[str]] = frozenset(
         "field",
         "fields",
         "format",
+        "schema",
         "output_field",
         "expression",
         "operation",
@@ -6713,6 +6714,12 @@ _ADVISOR_SUMMARY_VALUE_KEYS: Final[frozenset[str]] = frozenset(
         "response_field",
         "mapping",
         "select_only",
+        "bucket_field",
+        "key_field",
+        "text_field",
+        "page_count_field",
+        "feature_types",
+        "region",
     }
 )
 _ADVISOR_SUMMARY_VALUE_MAX_CHARS: Final[int] = 120
@@ -6767,7 +6774,10 @@ def _summarize_pipeline_for_advisor(state: CompositionState) -> str:
         for source_name, source in state.sources.items():
             opt_text = _render_options_for_advisor(source.options)
             label = "Source" if source_name == "source" else f"Source '{source_name}'"
-            lines.append(f"{label}: plugin={source.plugin} -> '{source.on_success}' [{opt_text}]")
+            lines.append(
+                f"{label}: plugin={source.plugin} -> '{source.on_success}' "
+                f"on_validation_failure={source.on_validation_failure} [{opt_text}]"
+            )
 
     # Nodes (topology + control flow + per-node field contract).
     if not state.nodes:
@@ -6789,7 +6799,7 @@ def _summarize_pipeline_for_advisor(state: CompositionState) -> str:
             interp_suffix = f" [{_render_interpolated_row_fields(node)}]" if is_llm else ""
             lines.append(
                 f"  - {node.id}: type={node.node_type} plugin={plugin} "
-                f"reads '{node.input}' -> '{on_success}'{control_suffix} "
+                f"reads '{node.input}' -> '{on_success}' on_error={node.on_error or '-'}{control_suffix} "
                 f"[requires: {req_text}] [{opt_text}]{interp_suffix}"
             )
 
@@ -6800,7 +6810,7 @@ def _summarize_pipeline_for_advisor(state: CompositionState) -> str:
         lines.append("Sinks:")
         for output in state.outputs:
             opt_text = _render_options_for_advisor(output.options)
-            lines.append(f"  - {output.name}: plugin={output.plugin} [{opt_text}]")
+            lines.append(f"  - {output.name}: plugin={output.plugin} on_write_failure={output.on_write_failure} [{opt_text}]")
 
     return "\n".join(lines)
 
