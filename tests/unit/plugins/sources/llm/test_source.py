@@ -395,7 +395,7 @@ def test_pre_set_shutdown_remains_primary_when_cleanup_fails(
             tracer.flush_calls += 1
             raise RuntimeError("tracer cleanup failed")
 
-        tracer.flush = MagicMock(side_effect=fail_tracer_flush)  # type: ignore[method-assign]
+        tracer.flush = fail_tracer_flush  # type: ignore[method-assign]
     _install_provider(source, provider)
     source._tracer = tracer
     source._telemetry_emit = events.append
@@ -439,7 +439,11 @@ def test_shutdown_does_not_suppress_tier_one_resource_cleanup_failure(
     )
     tracer = RecordingTracer()
     if failing_resource == "tracer":
-        tracer.flush = MagicMock(side_effect=FrameworkBugError("tracer cleanup invariant failed"))  # type: ignore[method-assign]
+
+        def fail_tracer_flush() -> None:
+            raise FrameworkBugError("tracer cleanup invariant failed")
+
+        tracer.flush = fail_tracer_flush  # type: ignore[method-assign]
     _install_provider(source, provider)
     source._tracer = tracer
     shutdown_event = threading.Event()
@@ -461,7 +465,7 @@ def test_shutdown_does_not_suppress_tier_one_generator_close_failure(
     source: LLMSource,
     source_context: PluginContext,
 ) -> None:
-    rows = MagicMock()
+    rows = MagicMock(spec_set=Generator)
     rows.close.side_effect = FrameworkBugError("generator close invariant failed")
     shutdown_event = threading.Event()
     shutdown_event.set()
@@ -865,7 +869,7 @@ def test_metadata_and_catalogue_hooks_are_source_native(
     assert source.web_config_authority is WebConfigAuthority.OPERATOR_PROFILED
     assert source.policy_capabilities == frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     assert source.capability_tags == ("llm", "generation", "single-row")
-    assert not hasattr(source, "runtime_preflight")
+    assert "runtime_preflight" not in dir(source)
     assert source.get_agent_assistance(issue_code=None) is not None
     assert source.output_semantics().fields[0].field_name == "answer"
     discriminator, variants = source.discriminated_variants()
@@ -880,5 +884,5 @@ def test_source_does_not_inherit_or_delegate_to_transform(source: LLMSource) -> 
     from elspeth.plugins.transforms.llm.transform import LLMTransform
 
     assert LLMTransform not in type(source).__mro__
-    assert not hasattr(source, "_strategy")
-    assert not hasattr(source, "_query_executor")
+    assert "_strategy" not in dir(source)
+    assert "_query_executor" not in dir(source)

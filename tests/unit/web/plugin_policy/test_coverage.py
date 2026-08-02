@@ -27,10 +27,10 @@ from elspeth.web.plugin_policy.coverage import (
 
 @pytest.fixture
 def llm_source_policy_manager(monkeypatch: pytest.MonkeyPatch) -> PluginManager:
-    """Register the non-public LLM source without changing discovery."""
+    """Give coverage an isolated registry with the canonical LLM source."""
     manager = PluginManager()
     manager.register_builtin_plugins()
-    manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
+    assert manager.get_source_by_name("llm") is LLMSource
     monkeypatch.setattr(
         "elspeth.web.plugin_policy.coverage.get_shared_plugin_manager",
         lambda: manager,

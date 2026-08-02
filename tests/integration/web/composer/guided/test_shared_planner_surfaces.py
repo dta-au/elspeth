@@ -9,7 +9,6 @@ from uuid import uuid4
 import pytest
 
 from elspeth.contracts.hashing import stable_hash
-from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.web.auth.models import UserIdentity
@@ -43,10 +42,10 @@ from tests.unit.web.composer.test_planner_authoring_aids import _guardrail_profi
 
 @pytest.fixture
 def llm_source_policy_manager(monkeypatch: pytest.MonkeyPatch) -> PluginManager:
-    """Keep Task 6 source recognition isolated from public discovery."""
+    """Give policy checks an isolated canonical plugin registry."""
     manager = PluginManager()
     manager.register_builtin_plugins()
-    manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
+    assert manager.get_source_by_name("llm") is LLMSource
     monkeypatch.setattr("elspeth.web.plugin_policy.coverage.get_shared_plugin_manager", lambda: manager)
     monkeypatch.setattr("elspeth.web.composer.required_controls.get_shared_plugin_manager", lambda: manager)
     return manager

@@ -71,7 +71,7 @@ from elspeth.web.composer.tools._common import (
     _plugin_policy_failure,
     _post_mutation_invariant_error,
     _prevalidate_sink,
-    _prevalidate_source,
+    _prevalidate_source_for_context,
     _prevalidate_transform_for_context,
     _resolver_owned_interpretation_requirement_error,
     _row_union_node_contract_error,
@@ -442,7 +442,6 @@ def build_set_pipeline_candidate(
     :class:`SetSourceArgumentsModel` plugin-not-in-catalog handling.
     """
     args = dict(arguments)
-    catalog = context.catalog
     data_dir = context.data_dir
     session_engine = context.session_engine
     session_id = context.session_id
@@ -648,7 +647,13 @@ def build_set_pipeline_candidate(
             path_error = _validate_source_path(src_options, data_dir, session_id=session_id)
             if path_error is not None:
                 return _failure_result(state, f"Source '{source_name}': {path_error}")
-            src_prevalidation = _prevalidate_source(src_plugin, src_options, src_on_vf)
+            src_prevalidation = _prevalidate_source_for_context(
+                context,
+                src_plugin,
+                src_options,
+                src_on_vf,
+                source_name=source_name,
+            )
             if src_prevalidation is not None:
                 return _failure_result(state, f"Source '{source_name}': {src_prevalidation}", error_code="plugin_options_invalid")
             source_specs[source_name] = SourceSpec(
@@ -715,10 +720,11 @@ def build_set_pipeline_candidate(
                 caller_options=legacy_src_options,
                 on_validation_failure=src_on_vf,
                 state=state,
-                catalog=catalog,
+                context=context,
                 session_engine=session_engine,
                 session_id=session_id,
                 tool_name="set_pipeline",
+                source_name="source",
                 existing_options=state.sources["source"].options if "source" in state.sources else None,
             )
             if isinstance(resolved, ToolResult):
@@ -828,7 +834,13 @@ def build_set_pipeline_candidate(
         if path_error is not None:
             return _failure_result(state, path_error)
 
-        src_prevalidation = _prevalidate_source(src_plugin, legacy_src_options, src_on_vf)
+        src_prevalidation = _prevalidate_source_for_context(
+            context,
+            src_plugin,
+            legacy_src_options,
+            src_on_vf,
+            source_name="source",
+        )
         if src_prevalidation is not None:
             # Parity with the sources-map branch above: the identical
             # option-shape message was coded there and codeless here (pack

@@ -22,7 +22,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
-from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -49,10 +48,10 @@ _INLINE_CONTENT = "ticket_id,body\nT-1001,Cannot log in since the update\n"
 
 @pytest.fixture
 def llm_source_policy_manager(monkeypatch: pytest.MonkeyPatch) -> PluginManager:
-    """Make the not-yet-public source visible only to the coverage authority."""
+    """Give the coverage authority an isolated canonical plugin registry."""
     manager = PluginManager()
     manager.register_builtin_plugins()
-    manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
+    assert manager.get_source_by_name("llm") is LLMSource
     monkeypatch.setattr("elspeth.web.plugin_policy.coverage.get_shared_plugin_manager", lambda: manager)
     monkeypatch.setattr("elspeth.web.composer.required_controls.get_shared_plugin_manager", lambda: manager)
     return manager

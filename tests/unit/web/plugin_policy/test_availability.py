@@ -6,9 +6,11 @@ from typing import Literal
 import pytest
 
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
-from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.plugins.sources.llm import LLMSource
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.catalog.service import CatalogServiceImpl
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
@@ -61,6 +63,19 @@ def _settings(**overrides: object) -> WebSettings:
     return WebSettings.model_validate(values)
 
 
+class _CompilerLLMSource(LLMSource):
+    determinism = LLMSource.determinism
+    source_file_hash = "sha256:0123456789abcdef"
+
+
+def _isolated_manager_with_llm_source() -> PluginManager:
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    if all(source.name != "llm" for source in manager.get_sources()):
+        manager.register(create_dynamic_hookimpl([_CompilerLLMSource], "elspeth_get_source"))
+    return manager
+
+
 def _build_with_policy(
     settings: WebSettings,
     *,
@@ -68,12 +83,13 @@ def _build_with_policy(
     inventory: _Inventory | None = None,
 ) -> tuple[WebPluginPolicy, PluginAvailabilitySnapshot]:
     runtime = RuntimeWebPluginConfig.from_settings(settings)
-    manager = get_shared_plugin_manager()
+    manager = _isolated_manager_with_llm_source()
+    catalog = CatalogServiceImpl(manager)
     policy = compile_web_plugin_policy(registry=manager, settings=runtime)
     profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
     snapshot = build_plugin_snapshot(
         policy=policy,
-        catalog=create_catalog_service(),
+        catalog=catalog,
         profiles=profiles,
         principal_scope=principal,
         secret_inventory=inventory or _Inventory(),

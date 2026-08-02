@@ -121,18 +121,13 @@ from elspeth.contracts.enums import Determinism
 # ``_build_plugin_trust_row``). Transforms classify as boundary iff
 # their declared determinism is in ``_AUDIT_FLAGGED_DETERMINISMS``.
 #
-# The source-native ``llm`` plugin is deliberately absent from the exact
-# builtin map while public discovery remains off. Task 10 must add
-# ``"llm": Determinism.NON_DETERMINISTIC`` here in the same atomic change
-# that enables source discovery; adding it earlier would make this declared
-# catalog state disagree with the live builtin catalog.
-
 EXPECTED_SOURCE_DETERMINISMS: dict[str, Determinism] = {
     "aws_s3": Determinism.IO_READ,
     "azure_blob": Determinism.IO_READ,
     "csv": Determinism.IO_READ,
     "dataverse": Determinism.EXTERNAL_CALL,
     "json": Determinism.IO_READ,
+    "llm": Determinism.NON_DETERMINISTIC,
     "null": Determinism.DETERMINISTIC,
     "text": Determinism.IO_READ,
 }

@@ -10,11 +10,13 @@ from pydantic import ValidationError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.engine.orchestrator.preflight import check_config_value_sources
-from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.plugins.sources.llm import LLMSource
 from elspeth.plugins.transforms.llm.providers.azure import AzureOpenAIConfig
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig
 from elspeth.web.catalog.schemas import PluginSchemaInfo
+from elspeth.web.catalog.service import CatalogServiceImpl
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
@@ -32,6 +34,18 @@ def _settings(**overrides: object) -> WebSettings:
     }
     values.update(overrides)
     return WebSettings.model_validate(values)
+
+
+def _isolated_manager_with_llm_source() -> PluginManager:
+    class _CompilerLLMSource(LLMSource):
+        determinism = LLMSource.determinism
+        source_file_hash = "sha256:0123456789abcdef"
+
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    if all(source.name != "llm" for source in manager.get_sources()):
+        manager.register(create_dynamic_hookimpl([_CompilerLLMSource], "elspeth_get_source"))
+    return manager
 
 
 def test_openrouter_profile_requires_explicit_scoped_credential() -> None:
@@ -104,7 +118,7 @@ def test_llm_public_profile_schema_accepts_observed_schema_without_fields() -> N
         default_llm_profile="tutorial",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
     profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
     public_schema = profiles.public_schema(
         PluginId("transform", "llm"),
@@ -301,7 +315,7 @@ def test_bedrock_profile_resolver_exposes_only_alias_and_safe_options() -> None:
             ),
         )
     )
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
     registry = OperatorProfileRegistry(policy=policy, settings=runtime)
     plugin_id = PluginId("transform", "aws_bedrock_prompt_shield")
     full = PluginSchemaInfo(
@@ -360,7 +374,7 @@ def test_bedrock_profile_resolver_returns_only_an_authorized_exact_approved_bind
             ),
         )
     )
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
     registry = OperatorProfileRegistry(policy=policy, settings=runtime)
     plugin_id = PluginId("transform", "aws_bedrock_prompt_shield")
 
@@ -389,7 +403,7 @@ def test_bedrock_profile_resolver_preserves_referenced_public_schema_definitions
             ),
         )
     )
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
     registry = OperatorProfileRegistry(policy=policy, settings=runtime)
 
     public = registry.public_schema(
@@ -416,7 +430,7 @@ def test_bedrock_profile_resolver_rejects_private_or_mixed_options() -> None:
             ),
         )
     )
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
     registry = OperatorProfileRegistry(policy=policy, settings=runtime)
 
     with pytest.raises(ValueError, match="private_profile_option"):
@@ -455,7 +469,7 @@ def _profile_registry() -> OperatorProfileRegistry:
             default_llm_profile="tutorial",
         )
     )
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
     return OperatorProfileRegistry(policy=policy, settings=runtime)
 
 
@@ -472,6 +486,72 @@ def test_public_llm_schema_exposes_alias_not_private_provider_binding() -> None:
     assert '"tutorial"' in rendered
     for private_name in ("api_key", "base_url", "endpoint", "deployment_name", "region_name", '"provider"', '"model"'):
         assert private_name not in rendered
+
+
+def test_public_llm_source_schema_is_component_specific() -> None:
+    full = CatalogServiceImpl(_isolated_manager_with_llm_source()).get_schema("source", "llm")
+    public = _profile_registry().public_schema(
+        PluginId("source", "llm"),
+        full,
+        available_aliases=("tutorial",),
+    )
+
+    assert set(public.json_schema["properties"]) == {
+        "profile",
+        "schema",
+        "prompt_template",
+        "system_prompt",
+        "temperature",
+        "response_field",
+        "on_validation_failure",
+        "lookup",
+    }
+    assert set(public.json_schema["required"]) == {
+        "profile",
+        "schema",
+        "prompt_template",
+        "on_validation_failure",
+    }
+    assert public.json_schema["properties"]["profile"]["enum"] == ["tutorial"]
+    Draft202012Validator.check_schema(public.json_schema)
+    Draft202012Validator(public.json_schema).validate(
+        {
+            "profile": "tutorial",
+            "schema": {"mode": "observed"},
+            "prompt_template": "Write one briefing from {{ lookup.topic }}.",
+            "response_field": "briefing",
+            "on_validation_failure": "discard",
+            "lookup": {"topic": "the audit"},
+        }
+    )
+
+
+def test_public_llm_source_schema_excludes_transform_and_private_fields() -> None:
+    full = CatalogServiceImpl(_isolated_manager_with_llm_source()).get_schema("source", "llm")
+    public = _profile_registry().public_schema(
+        PluginId("source", "llm"),
+        full,
+        available_aliases=("tutorial",),
+    )
+    rendered = public.model_dump_json()
+
+    for excluded in (
+        "queries",
+        "required_input_fields",
+        "interpretation_requirements",
+        "provider",
+        "model",
+        "api_key",
+        "base_url",
+        "endpoint",
+        "deployment_name",
+        "region_name",
+        "timeout_seconds",
+        "prompt_template_source",
+        "lookup_source",
+        "resolved_prompt_template_hash",
+    ):
+        assert f'"{excluded}"' not in rendered
 
 
 def test_profile_lowering_splits_executable_and_audit_safe_options() -> None:
@@ -577,7 +657,7 @@ def test_llm_source_profile_availability_enumerates_only_configured_aliases(
         if alias is not None
         else OperatorProfileRegistry(
             policy=compile_web_plugin_policy(
-                registry=get_shared_plugin_manager(),
+                registry=_isolated_manager_with_llm_source(),
                 settings=RuntimeWebPluginConfig.from_settings(_settings()),
             ),
             settings=RuntimeWebPluginConfig.from_settings(_settings()),
@@ -659,7 +739,7 @@ def test_llm_source_profile_availability_enumerates_only_configured_aliases(
 )
 def test_each_profile_provider_lowers_into_source_config(alias: str, profile: dict[str, object]) -> None:
     runtime = RuntimeWebPluginConfig.from_settings(_settings(llm_profiles={alias: profile}, default_llm_profile=alias))
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
     registry = OperatorProfileRegistry(policy=policy, settings=runtime)
     lowered = registry.lower_options(
         PluginId("source", "llm"),
@@ -695,7 +775,7 @@ def test_azure_profile_lowering_honors_deployment_derived_model_contract() -> No
             default_llm_profile="azure-task",
         )
     )
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
     registry = OperatorProfileRegistry(policy=policy, settings=runtime)
 
     lowered = registry.lower_options(

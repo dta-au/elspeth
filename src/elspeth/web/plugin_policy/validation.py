@@ -62,6 +62,7 @@ class _Component:
     component_type: Literal["source", "transform", "sink"]
     plugin_id: PluginId | None
     options: Mapping[str, object]
+    source_on_validation_failure: str | None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "options")
@@ -313,6 +314,7 @@ def _components(state: CompositionState) -> tuple[_Component, ...]:
                 component_type="source",
                 plugin_id=_plugin_id("source", source.plugin),
                 options=(deep_thaw(source.options) if isinstance(source.options, Mapping) else {}),
+                source_on_validation_failure=source.on_validation_failure,
             )
         )
     for node in state.nodes:
@@ -324,6 +326,7 @@ def _components(state: CompositionState) -> tuple[_Component, ...]:
                 component_type="transform",
                 plugin_id=_plugin_id("transform", node.plugin),
                 options=deep_thaw(node.options),
+                source_on_validation_failure=None,
             )
         )
     for output in state.outputs:
@@ -333,6 +336,7 @@ def _components(state: CompositionState) -> tuple[_Component, ...]:
                 component_type="sink",
                 plugin_id=_plugin_id("sink", output.plugin),
                 options=deep_thaw(output.options),
+                source_on_validation_failure=None,
             )
         )
     return tuple(result)
@@ -362,12 +366,27 @@ def _lower_profiled_components(
         if profile_context is None:
             continue
         plugin_id, aliases, resolved_public_schema = profile_context
-        authored_options = {
-            name: deep_thaw(value) for name, value in component.options.items() if name not in _PROFILE_LOWERING_METADATA_OPTION_KEYS
-        }
-        authoring_metadata = {
-            name: deep_thaw(value) for name, value in component.options.items() if name in _PROFILE_LOWERING_METADATA_OPTION_KEYS
-        }
+        component_options = {name: deep_thaw(value) for name, value in component.options.items()}
+        if component.component_type == "source":
+            route = component.source_on_validation_failure
+            duplicate_route = component_options.get("on_validation_failure", route)
+            if type(route) is not str or type(duplicate_route) is not str or duplicate_route != route:
+                findings.append(
+                    PluginPolicyFinding(
+                        stage="operator_profile_options",
+                        component_id=component.component_id,
+                        component_type=component.component_type,
+                        error_code="profile_unavailable",
+                        message=(
+                            f"Plugin '{plugin_id}' source routing disagrees with its profile-bound "
+                            "on_validation_failure option. Keep one exact source routing value."
+                        ),
+                    )
+                )
+                continue
+            component_options["on_validation_failure"] = route
+        authored_options = {name: value for name, value in component_options.items() if name not in _PROFILE_LOWERING_METADATA_OPTION_KEYS}
+        authoring_metadata = {name: value for name, value in component_options.items() if name in _PROFILE_LOWERING_METADATA_OPTION_KEYS}
         alias = authored_options.pop("profile", None)
         if not isinstance(alias, str) or alias not in aliases:
             findings.append(_profile_unavailable_finding(component, plugin_id, available_aliases=tuple(aliases)))
@@ -437,8 +456,22 @@ def _lower_profiled_components(
                 )
             )
             continue
+        executable_options = deep_thaw(lowered.executable_options)
+        if component.component_type == "source":
+            lowered_route = executable_options.pop("on_validation_failure", None)
+            if type(lowered_route) is not str or lowered_route != component.source_on_validation_failure:
+                findings.append(
+                    PluginPolicyFinding(
+                        stage="operator_profile_options",
+                        component_id=component.component_id,
+                        component_type=component.component_type,
+                        error_code="profile_unavailable",
+                        message=f"Plugin '{plugin_id}' profile lowering changed source on_validation_failure routing.",
+                    )
+                )
+                continue
         lowered_options[(component.component_type, component.component_id)] = {
-            **deep_thaw(lowered.executable_options),
+            **executable_options,
             **authoring_metadata,
         }
 

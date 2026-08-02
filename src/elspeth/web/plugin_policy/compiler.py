@@ -22,6 +22,7 @@ REQUIRED_WEB_PLUGIN_IDS = frozenset(
     {
         PluginId("source", "csv"),
         PluginId("source", "json"),
+        PluginId("source", "llm"),
         PluginId("source", "text"),
         PluginId("sink", "csv"),
         PluginId("sink", "json"),

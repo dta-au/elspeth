@@ -137,17 +137,21 @@ class _ProfileRejectingCatalog(PolicyCatalogView):
     """Real catalog projection with one deterministic profile finding."""
 
     def validate_composition_state(self, state: CompositionState) -> ProfileAwareValidationResult:
-        finding = PluginPolicyFinding(
-            stage="operator_profile_options",
-            component_id="profile_prevalidation",
-            component_type="transform",
-            error_code="profile_unavailable",
-            message="The requested operator profile is unavailable.",
-        )
+        findings = ()
+        if state.nodes:
+            findings = (
+                PluginPolicyFinding(
+                    stage="operator_profile_options",
+                    component_id="profile_prevalidation",
+                    component_type="transform",
+                    error_code="profile_unavailable",
+                    message="The requested operator profile is unavailable.",
+                ),
+            )
         return ProfileAwareValidationResult(
             authored_state=state,
             executable_state=state,
-            policy_findings=(finding,),
+            policy_findings=findings,
             validation=state.validate(),
         )
 
@@ -1101,14 +1105,15 @@ def test_candidate_uses_final_request_scoped_profile_validation(tmp_path: Path) 
 
     assert candidate.result.success is True
     assert candidate.result.updated_state.validate().is_valid is True
-    assert (candidate.acceptable, len(catalog.validated_states)) == (False, 1)
-    assert catalog.validated_states[0] is candidate.result.updated_state
+    assert (candidate.acceptable, len(catalog.validated_states)) == (False, 2)
+    assert set(catalog.validated_states[0].sources) == {"source"}
+    assert catalog.validated_states[1] is candidate.result.updated_state
     assert candidate.result.validation.errors[0].error_code == "profile_complete_state_rejected"
 
     normalized_again = normalize_tool_result_validation(candidate.result, catalog)
 
     assert normalized_again is candidate.result
-    assert len(catalog.validated_states) == 1
+    assert len(catalog.validated_states) == 2
     assert "_validation_snapshot_hash" not in candidate.result.to_dict()
     assert "_validation_snapshot_hash" not in repr(candidate.result)
 
@@ -1126,9 +1131,10 @@ def test_candidate_uses_final_request_scoped_profile_validation(tmp_path: Path) 
     assert public_result.updated_state == candidate.result.updated_state
     assert public_result.validation == candidate.result.validation
     assert public_result.validation.is_valid is False
-    assert len(catalog.validated_states) == 2
+    assert len(catalog.validated_states) == 3
     assert catalog.validated_states[0] is state
-    assert catalog.validated_states[1] is public_result.updated_state
+    assert set(catalog.validated_states[1].sources) == {"source"}
+    assert catalog.validated_states[2] is public_result.updated_state
 
 
 @pytest.mark.parametrize("rejected", [False, True], ids=("success", "rejection"))
@@ -1157,9 +1163,13 @@ def test_public_set_pipeline_validates_current_and_candidate_exactly_once(
     )
 
     assert result.success is not rejected
-    assert len(catalog.validated_states) == 2
+    assert len(catalog.validated_states) == (2 if rejected else 3)
     assert catalog.validated_states[0] is state
-    assert catalog.validated_states[1] is result.updated_state
+    if rejected:
+        assert catalog.validated_states[1] is result.updated_state
+    else:
+        assert set(catalog.validated_states[1].sources) == {"source"}
+        assert catalog.validated_states[2] is result.updated_state
 
 
 def test_normalizer_revalidates_for_a_different_snapshot_and_preserves_rejection(tmp_path: Path) -> None:

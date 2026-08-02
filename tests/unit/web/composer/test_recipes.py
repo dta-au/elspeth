@@ -24,7 +24,10 @@ from jsonschema import Draft202012Validator
 
 import elspeth.web.composer.recipes as recipes_module
 from elspeth.core.expression_parser import ExpressionParser
-from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.plugins.sources.llm import LLMSource
+from elspeth.web.catalog.service import CatalogServiceImpl
 from elspeth.web.composer.recipes import (
     RecipeSpec,
     RecipeValidationError,
@@ -43,6 +46,19 @@ from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeW
 # --------------------------------------------------------------------------
 # Registry surface
 # --------------------------------------------------------------------------
+
+
+class _CompilerLLMSource(LLMSource):
+    determinism = LLMSource.determinism
+    source_file_hash = "sha256:0123456789abcdef"
+
+
+def _isolated_manager_with_llm_source() -> PluginManager:
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    if all(source.name != "llm" for source in manager.get_sources()):
+        manager.register(create_dynamic_hookimpl([_CompilerLLMSource], "elspeth_get_source"))
+    return manager
 
 
 def _snapshot_with_llm_profiles(*aliases: str) -> PluginAvailabilitySnapshot:
@@ -429,11 +445,13 @@ class TestClassifyRecipe:
             default_llm_profile="tutorial",
         )
         runtime = RuntimeWebPluginConfig.from_settings(settings)
-        policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+        manager = _isolated_manager_with_llm_source()
+        catalog = CatalogServiceImpl(manager)
+        policy = compile_web_plugin_policy(registry=manager, settings=runtime)
         profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
         public_schema = profiles.public_schema(
             PluginId("transform", "llm"),
-            create_catalog_service().get_schema("transform", "llm"),
+            catalog.get_schema("transform", "llm"),
             available_aliases=("tutorial",),
         ).json_schema
 
@@ -890,18 +908,25 @@ class TestRecipeIntegrationWithSetPipeline:
             )
         return engine, session_id, blob_id
 
-    def _catalog(self):
+    def _context(self):
         # Use the real PluginManager so set_pipeline's prevalidation can
         # see authentic schemas for csv/llm/type_coerce/json. Mocking
         # list_*/get_schema would force us to fabricate schemas — the
         # real catalog is cheap (builtin registration only) and avoids
         # masking schema mismatches.
         from elspeth.plugins.infrastructure.manager import PluginManager
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
         from elspeth.web.catalog.service import CatalogServiceImpl
+        from elspeth.web.composer.tools._common import ToolContext
 
         pm = PluginManager()
         pm.register_builtin_plugins()
-        return CatalogServiceImpl(pm)
+        catalog = CatalogServiceImpl(pm)
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+        return ToolContext(
+            catalog=PolicyCatalogView.for_trained_operator(catalog, snapshot),
+            plugin_snapshot=snapshot,
+        )
 
     def test_classify_recipe_blob_id_at_top_level(self) -> None:
         """Recipe places blob_id at source top-level so set_pipeline's
@@ -982,7 +1007,7 @@ class TestRecipeIntegrationWithSetPipeline:
             caller_options=src_args["options"],
             on_validation_failure=src_args["on_validation_failure"],
             state=empty,
-            catalog=self._catalog(),
+            context=self._context(),
             session_engine=engine,
             session_id=session_id,
         )
@@ -1080,16 +1105,13 @@ class TestApplyRecipeEndToEnd:
         # Real PluginManager so set_pipeline's prevalidation sees authentic
         # schemas for csv/llm/type_coerce/json. Mocking the catalog would
         # mask the schema-validity contract under test here.
-        from elspeth.plugins.infrastructure.manager import PluginManager
         from elspeth.web.catalog.policy_view import PolicyCatalogView
-        from elspeth.web.catalog.service import CatalogServiceImpl
         from elspeth.web.config import WebSettings
         from elspeth.web.plugin_policy.availability import build_plugin_snapshot
         from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
         from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 
-        pm = PluginManager()
-        pm.register_builtin_plugins()
+        pm = _isolated_manager_with_llm_source()
         catalog = CatalogServiceImpl(pm)
         settings = WebSettings(
             composer_max_composition_turns=4,

@@ -32,7 +32,7 @@ from typing import Any, Final, NotRequired, Required, TypedDict
 
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.catalog.schemas import PluginSummary
+from elspeth.web.catalog.schemas import PluginKind, PluginSummary
 
 # The registered shield-review constants and the untrusted-producer set are the
 # contract's single source of truth (interpretation_state); importing them —
@@ -175,6 +175,7 @@ class _PlannerAuthoringAids(TypedDict, total=False):
     fork_row_union: _ForkRowUnionAid
     model_custody: _RulesAid
     llm_output_contract: _RulesAid
+    llm_source_generation: _RulesAid
     review_registry: _ReviewRegistryAid
     prompt_shield: _RulesAid
     content_safety: _RulesAid
@@ -639,14 +640,14 @@ _REVIEW_REGISTRY_RULES: Final[tuple[str, ...]] = (
 )
 
 
-def _usable_llm_profile_alias(catalog: PolicyCatalogView) -> str | None:
+def _usable_llm_profile_alias(catalog: PolicyCatalogView, *, kind: PluginKind = "transform") -> str | None:
     """Return the selected (else first usable) llm operator-profile alias."""
     snapshot = catalog.snapshot
     llm_id = next(
         (
             plugin_id
             for plugin_id, aliases in snapshot.usable_profile_aliases
-            if plugin_id.kind == "transform" and plugin_id.name == "llm" and aliases
+            if plugin_id.kind == kind and plugin_id.name == "llm" and aliases
         ),
         None,
     )
@@ -807,32 +808,35 @@ def discovery_digest(
         "transforms": _digest_entries(summaries["transform"]),
         "sinks": _digest_entries(summaries["sink"]),
     }
-    # run-3 E4: the llm entry carries the LIVE profile-alias enum so
+
+    # run-3 E4: each llm component carries its LIVE profile-alias enum so
     # profile-first authoring never needs a discovery round to learn the
     # aliases (they are already policy-public via the knob schema's choices).
-    llm_aliases = sorted(
-        alias
-        for plugin_id, aliases in catalog.snapshot.usable_profile_aliases
-        if plugin_id.kind == "transform" and plugin_id.name == "llm"
-        for alias in aliases
-    )
-    if llm_aliases:
+    def project_llm_profile(kind: PluginKind, entries: list[_PluginDigestEntry]) -> None:
+        llm_aliases = sorted(
+            alias
+            for plugin_id, aliases in catalog.snapshot.usable_profile_aliases
+            if plugin_id.kind == kind and plugin_id.name == "llm"
+            for alias in aliases
+        )
+        if not llm_aliases:
+            return
         # run-5 P2 correction: required_options above came from the RAW
         # plugin schema (provider-form), never the operator profile's public
         # schema. On a profile-bound deployment that advertised provider/
-        # model/credential fields as required even though
-        # ``_LLMProfileResolver`` rejects them outright on a profile-bound
-        # node (profiles.py's ``_LLM_PRIVATE_OPTIONS``/``lower_options``) —
-        # steering the planner into a guaranteed profile_unavailable /
-        # plugin_unavailable rejection. Project required_options through the
-        # live public schema so the digest teaches the form the planner is
-        # actually pushed toward.
-        public_schema = catalog.get_schema("transform", "llm")
+        # model/credential fields as required even though the profile resolver
+        # rejects them outright — steering the planner into a guaranteed
+        # profile_unavailable / plugin_unavailable rejection. Project each
+        # component through its own live public schema.
+        public_schema = catalog.get_schema(kind, "llm")
         public_required = [field["name"] for field in public_schema.knob_schema.get("fields", ()) if field.get("required")]
-        for entry in digest["transforms"]:
+        for entry in entries:
             if entry["name"] == "llm":
                 entry["profile_aliases"] = llm_aliases
                 entry["required_options"] = public_required
+
+    project_llm_profile("source", digest["sources"])
+    project_llm_profile("transform", digest["transforms"])
     return digest
 
 
@@ -841,10 +845,50 @@ _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
     "build and is current for this deployment: you rarely need "
     "list_sources/list_transforms/list_sinks or get_plugin_schema calls — "
     "plan directly from it. Model identifiers still come only from "
-    "list_models, and blob/secret discovery is unchanged. Use "
+    "list_models. A list_models result is a session snapshot and can become "
+    "stale, so refresh it before binding a literal model; blob/secret "
+    "discovery is unchanged. Use "
     "get_plugin_assistance and explain_validation_error for structured "
     "repair when a proposal is rejected."
 )
+
+
+def _llm_source_generation_rules(*, profile_alias: str | None, output_control: str | None) -> list[str]:
+    """Source-native LLM guidance for pipelines that begin with generation."""
+    rules = [
+        "For a generation-first pipeline with no input rows, use source:llm. "
+        "Do not fabricate a seed/null row or add an upstream source plus a transform merely to trigger one model call.",
+        "One successful authored prompt emits exactly one source row. The text lands in options.response_field "
+        "(default llm_response), with <response_field>_usage and <response_field>_model appended automatically.",
+        "The prompt is static with respect to pipeline rows: no incoming row exists and {{ row... }} is invalid. "
+        "Use options.lookup for explicit authored values and reference them through {{ lookup... }}; Jinja globals are also available.",
+        "Prompt Shield is not applicable to this static author-authored source prompt. Content Safety still applies downstream "
+        "to the generated row when deployment policy requires it.",
+        "Model-catalog results from list_models are a session snapshot and can become stale; refresh before binding a literal "
+        "model on a trained-operator/provider-form surface. Never invent or recall a model identifier from training.",
+    ]
+    if profile_alias is not None:
+        rules.append(
+            f"This deployment serves source:llm through the operator profile alias '{profile_alias}'. Set options.profile to "
+            "that alias and omit provider/model/credential fields; operator policy owns those private bindings."
+        )
+    else:
+        rules.append(
+            "No source:llm operator profile is currently usable. On a trained-operator surface, bind a literal model only "
+            "from a fresh list_models result; on the web surface, ask the operator to provide a usable profile."
+        )
+    if output_control is not None:
+        rules.append(
+            f"This deployment REQUIRES the {output_control} Content Safety control for generated output. Set "
+            "options.on_validation_failure to 'discard': a non-discard source validation exit cannot be placed downstream "
+            "of the control and is rejected as an uncontrolled output path."
+        )
+    else:
+        rules.append(
+            "Set options.on_validation_failure explicitly. Use 'discard' for intentional dropping; a named sink retains "
+            "invalid generated rows only when deployment control policy permits that path."
+        )
+    return rules
 
 
 def source_custody_exemplar_args(
@@ -1423,6 +1467,13 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
             "rules": _model_custody_rules(_usable_llm_profile_alias(catalog)),
         }
         aids["llm_output_contract"] = {"rules": _llm_output_contract_rules(output_control=required_output_control)}
+    if "llm" in visible["source"]:
+        aids["llm_source_generation"] = {
+            "rules": _llm_source_generation_rules(
+                profile_alias=_usable_llm_profile_alias(catalog, kind="source"),
+                output_control=required_output_control,
+            )
+        }
     aids["review_registry"] = {
         # Imported from interpretation_state so the taught vocabulary can
         # never drift from the resolve-time registry (52322ebe1 discipline).

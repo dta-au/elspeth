@@ -145,20 +145,30 @@ class _LLMProfileResolver:
 
         safe_properties: dict[str, Any] = {}
         definitions = full_schema.json_schema.get("$defs", {})
-        if isinstance(definitions, dict):
-            from elspeth.plugins.transforms.llm.transform import LLMTransform
-
-            provider_definition_names = {config_cls.__name__ for config_cls in LLMTransform.discriminated_variants()[1].values()}
-            for definition_name in provider_definition_names:
-                definition = definitions.get(definition_name)
+        discriminator = full_schema.json_schema.get("discriminator", {})
+        mapping = discriminator.get("mapping", {}) if isinstance(discriminator, dict) else {}
+        provider_definitions: list[dict[str, Any]] = []
+        if isinstance(definitions, dict) and isinstance(mapping, dict):
+            for definition_ref in mapping.values():
+                if not isinstance(definition_ref, str) or not definition_ref.startswith("#/$defs/"):
+                    continue
+                definition = definitions.get(definition_ref.removeprefix("#/$defs/"))
                 if not isinstance(definition, dict):
                     continue
+                provider_definitions.append(definition)
                 properties = definition.get("properties", {})
                 if not isinstance(properties, dict):
                     continue
                 for name, property_schema in properties.items():
                     if name not in LLM_PROFILE_PRIVATE_FIELDS and isinstance(property_schema, dict):
                         safe_properties.setdefault(name, deepcopy(property_schema))
+        required_in_all_variants = (
+            set.intersection(
+                *({name for name in definition.get("required", ()) if isinstance(name, str)} for definition in provider_definitions)
+            )
+            if provider_definitions
+            else set()
+        )
         safe_properties = {
             "profile": {
                 "type": "string",
@@ -167,10 +177,20 @@ class _LLMProfileResolver:
             },
             **safe_properties,
         }
+        required_properties = [name for name in safe_properties if name in required_in_all_variants]
+        if full_schema.plugin_type == "transform":
+            # Preserve the established transform projection byte-for-byte;
+            # source variants add their own required routing field below the
+            # naturally ordered common properties.
+            established_order = ("prompt_template", "schema")
+            required_properties = [
+                *(name for name in established_order if name in required_properties),
+                *(name for name in required_properties if name not in established_order),
+            ]
         public_json_schema: dict[str, Any] = {
             "type": "object",
             "properties": safe_properties,
-            "required": ["profile", "prompt_template", "schema"],
+            "required": ["profile", *required_properties],
             "additionalProperties": False,
         }
         referenced_definitions: dict[str, Any] = {}
@@ -185,19 +205,49 @@ class _LLMProfileResolver:
                 pending.update(_schema_refs(definition))
         if referenced_definitions:
             public_json_schema["$defs"] = referenced_definitions
-        fields = [
-            {
-                "name": name,
-                "type": "string" if name == "profile" else str(schema.get("type", "object")),
-                "required": name in public_json_schema["required"],
-                # The composer-surface help text substitutes the CLI/YAML
-                # description on web knobs (mirrors
-                # web/catalog/knob_schema._composer_description).
-                "description": schema.get("composer_description") or schema.get("description"),
-                **({"choices": list(available_aliases)} if name == "profile" else {}),
-            }
-            for name, schema in safe_properties.items()
-        ]
+        if full_schema.plugin_type == "source":
+            raw_fields = full_schema.knob_schema.get("fields", ())
+            first_raw_field: dict[str, dict[str, Any]] = {}
+            for field in raw_fields:
+                if isinstance(field, dict) and isinstance(field.get("name"), str):
+                    first_raw_field.setdefault(field["name"], field)
+            fields: list[dict[str, Any]] = [
+                {
+                    "name": "profile",
+                    "label": "profile",
+                    "kind": "enum",
+                    "required": True,
+                    "nullable": False,
+                    "enum": list(available_aliases),
+                    "description": "Operator-approved LLM profile alias",
+                }
+            ]
+            for name in safe_properties:
+                if name == "profile":
+                    continue
+                try:
+                    field = deepcopy(first_raw_field[name])
+                except KeyError as exc:
+                    raise ValueError(f"source profile field {name!r} has no canonical knob projection") from exc
+                field.pop("visible_when", None)
+                fields.append(field)
+        else:
+            # Keep the established transform policy-view projection
+            # byte-compatible. Source forms use the current-schema knob wire
+            # contract because Guided Step 1 consumes them directly.
+            fields = [
+                {
+                    "name": name,
+                    "type": "string" if name == "profile" else str(schema.get("type", "object")),
+                    "required": name in public_json_schema["required"],
+                    # The composer-surface help text substitutes the CLI/YAML
+                    # description on web knobs (mirrors
+                    # web/catalog/knob_schema._composer_description).
+                    "description": schema.get("composer_description") or schema.get("description"),
+                    **({"choices": list(available_aliases)} if name == "profile" else {}),
+                }
+                for name, schema in safe_properties.items()
+            ]
         return PluginSchemaInfo(
             name=full_schema.name,
             plugin_type=full_schema.plugin_type,

@@ -444,7 +444,6 @@ async def test_execute_fails_closed_for_uncovered_llm_source(
     from asgi_lifespan import LifespanManager
 
     from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
-    from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
     from elspeth.plugins.infrastructure.manager import PluginManager
     from elspeth.plugins.sources.llm.source import LLMSource
     from elspeth.web.app import create_app
@@ -456,7 +455,6 @@ async def test_execute_fails_closed_for_uncovered_llm_source(
     manager = PluginManager()
     manager.register_builtin_plugins()
     monkeypatch.setattr(LLMSource, "source_file_hash", "sha256:0123456789abcdef")
-    manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
     monkeypatch.setattr("elspeth.plugins.infrastructure.manager._shared_instance", manager)
 
     settings = WebSettings(

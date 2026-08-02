@@ -20,7 +20,6 @@ from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.enums import CreationModality, is_llm_authored_creation_modality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
-from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import (
     PatchSourceOptionsArgumentsModel,
@@ -53,7 +52,7 @@ from elspeth.web.composer.tools._common import (
     _options_with_pending_requirement,
     _pending_interpretation_requirement,
     _plugin_policy_failure,
-    _prevalidate_source,
+    _prevalidate_source_for_context,
     _prohibited_section,
     _resolver_owned_interpretation_requirement_error,
     _source_review_requirement_id,
@@ -389,10 +388,11 @@ def _resolve_source_blob(
     caller_options: Mapping[str, Any],
     on_validation_failure: str,
     state: CompositionState,
-    catalog: CatalogService,
+    context: ToolContext,
     session_engine: Engine | None,
     session_id: str | None,
     tool_name: str = "set_source_from_blob",
+    source_name: str = "source",
     existing_options: Mapping[str, Any] | None = None,
 ) -> _ResolvedSourceBlob | ToolResult:
     """Resolve an existing ready blob into authoritative source options."""
@@ -462,10 +462,16 @@ def _resolve_source_blob(
             error_code="interpretation_requirements_invalid",
         )
     try:
-        catalog.get_schema("source", plugin)
+        context.catalog.get_schema("source", plugin)
     except (ValueError, KeyError) as exc:
         return _failure_result(state, f"Unknown source plugin '{plugin}': {exc}")
-    prevalidation_error = _prevalidate_source(plugin, merged_options, on_validation_failure)
+    prevalidation_error = _prevalidate_source_for_context(
+        context,
+        plugin,
+        merged_options,
+        on_validation_failure,
+        source_name=source_name,
+    )
     if prevalidation_error is not None:
         return _failure_result(state, prevalidation_error)
 
@@ -619,7 +625,13 @@ def _execute_set_source(
         return _failure_result(state, path_error)
 
     on_vf = validated.on_validation_failure
-    prevalidation_error = _prevalidate_source(plugin, options, on_vf)
+    prevalidation_error = _prevalidate_source_for_context(
+        context,
+        plugin,
+        options,
+        on_vf,
+        source_name=source_name,
+    )
     if prevalidation_error is not None:
         return _failure_result(state, prevalidation_error)
 
@@ -706,10 +718,11 @@ def _execute_set_source_from_blob(
         caller_options=caller_options,
         on_validation_failure=on_vf,
         state=state,
-        catalog=context.catalog,
+        context=context,
         session_engine=context.session_engine,
         session_id=context.session_id,
         tool_name="set_source_from_blob",
+        source_name=source_name,
         existing_options=state.sources[source_name].options if source_name in state.sources else None,
     )
     if isinstance(resolved, ToolResult):
@@ -1140,10 +1153,12 @@ def _execute_patch_source_options(
         return _failure_result(state, path_error)
 
     # Pre-validate patched options against config model
-    prevalidation_error = _prevalidate_source(
+    prevalidation_error = _prevalidate_source_for_context(
+        context,
         current_source.plugin,
         new_options,
         current_source.on_validation_failure,
+        source_name=source_name,
     )
     if prevalidation_error is not None:
         return _failure_result(state, prevalidation_error)

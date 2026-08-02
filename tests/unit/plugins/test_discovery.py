@@ -9,6 +9,7 @@ import pytest
 from elspeth.contracts import Determinism
 from elspeth.plugins.infrastructure.base import BaseSink, BaseSource, BaseTransform
 from elspeth.plugins.infrastructure.discovery import (
+    PLUGIN_SCAN_CONFIG,
     _canonical_module_name,
     discover_plugins_in_directory,
 )
@@ -196,6 +197,7 @@ class TestDiscoverAllPlugins:
         assert "json" in source_names
         assert "null" in source_names
         assert "aws_s3" in source_names
+        assert "llm" in source_names
         # Azure blob source lives in plugins/azure/
         assert "azure_blob" in source_names
         assert "web_source" not in source_names
@@ -253,7 +255,7 @@ class TestDiscoverAllPlugins:
         from elspeth.plugins.infrastructure.discovery import discover_all_plugins
 
         # Expected counts verified during migration from hookimpl files
-        EXPECTED_SOURCE_COUNT = 7  # csv, json, null, aws_s3, azure_blob, dataverse, text
+        EXPECTED_SOURCE_COUNT = 8  # Existing seven sources plus llm
         EXPECTED_TRANSFORM_COUNT = 32  # Existing 29 plus two AWS Bedrock Guardrails and Amazon Textract
         EXPECTED_SINK_COUNT = 8  # csv, json, text, database, aws_s3, azure_blob, dataverse, chroma_sink
 
@@ -271,6 +273,21 @@ class TestDiscoverAllPlugins:
             f"Sink count: expected {EXPECTED_SINK_COUNT}, got {len(discovered['sinks'])}. "
             f"Found: {[cls.name for cls in discovered['sinks']]}"  # type: ignore[attr-defined]
         )
+
+    def test_source_scan_includes_nested_llm_directory(self) -> None:
+        assert PLUGIN_SCAN_CONFIG["sources"] == ["sources", "sources/llm"]
+
+    def test_repeated_discovery_returns_canonical_llm_source_identity(self) -> None:
+        from elspeth.plugins.infrastructure.discovery import discover_all_plugins
+        from elspeth.plugins.sources.llm.source import LLMSource
+
+        first = next(plugin for plugin in discover_all_plugins()["sources"] if plugin.name == "llm")
+        second = next(plugin for plugin in discover_all_plugins()["sources"] if plugin.name == "llm")
+
+        assert first is LLMSource
+        assert second is LLMSource
+        assert first is second
+        assert first.__module__ == "elspeth.plugins.sources.llm.source"
 
     def test_all_plugins_have_config_model(self) -> None:
         """Every registered plugin must declare a config_model (via ClassVar or get_config_model).

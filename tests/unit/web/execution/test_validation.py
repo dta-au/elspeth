@@ -282,14 +282,11 @@ def test_required_content_safety_for_llm_source_fails_closed_with_source_attribu
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Execution rejects an unrepairable source failure route before construction."""
-    from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
     from elspeth.plugins.infrastructure.manager import PluginManager
-    from elspeth.plugins.sources.llm.source import LLMSource
     from elspeth.web.dependencies import create_catalog_service
 
     manager = PluginManager()
     manager.register_builtin_plugins()
-    manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
     monkeypatch.setattr(
         "elspeth.web.plugin_policy.coverage.get_shared_plugin_manager",
         lambda: manager,
@@ -374,15 +371,12 @@ def test_required_content_safety_for_llm_source_fails_closed_with_source_attribu
 
 
 def _isolated_llm_source_policy_context() -> tuple[PluginAvailabilitySnapshot, Any]:
-    """Return a snapshot/catalog with test-local LLM source registration."""
-    from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+    """Return a snapshot/catalog with the built-in LLM source."""
     from elspeth.plugins.infrastructure.manager import PluginManager
-    from elspeth.plugins.sources.llm.source import LLMSource
     from elspeth.web.catalog.service import CatalogServiceImpl
 
     manager = PluginManager()
     manager.register_builtin_plugins()
-    manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
     catalog = CatalogServiceImpl(manager)
     return PluginAvailabilitySnapshot.for_trained_operator(catalog), catalog
 

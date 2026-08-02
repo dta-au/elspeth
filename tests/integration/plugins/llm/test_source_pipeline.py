@@ -99,8 +99,8 @@ def isolated_manager() -> Iterator[PluginManager]:
         "sinks": tuple(shared.get_sinks()),
     }
     discovered_before = {kind: tuple(classes) for kind, classes in discover_all_plugins().items()}
-    assert LLMSource not in shared_before["sources"]
-    assert LLMSource not in discovered_before["sources"]
+    assert LLMSource in shared_before["sources"]
+    assert LLMSource in discovered_before["sources"]
 
     manager = _isolated_llm_manager()
     assert manager is not shared

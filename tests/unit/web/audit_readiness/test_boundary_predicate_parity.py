@@ -97,15 +97,12 @@ def test_every_source_classifies_as_boundary() -> None:
         )
 
 
-def test_llm_source_boundary_expectation_is_deferred_until_public_discovery() -> None:
-    """Pin Task 7/10 atomicity without weakening exact live-catalog parity."""
+def test_llm_source_boundary_expectation_is_live_and_canonical() -> None:
     manager = _make_manager()
 
-    assert "llm" not in {cls.name for cls in manager.get_sources()}, (
-        "LLM source discovery is now live; atomically add its NON_DETERMINISTIC "
-        "entry to EXPECTED_SOURCE_DETERMINISMS and replace this deferral test"
-    )
-    assert "llm" not in EXPECTED_SOURCE_DETERMINISMS
+    discovered = manager.get_source_by_name("llm")
+    assert discovered is LLMSource
+    assert EXPECTED_SOURCE_DETERMINISMS["llm"] is Determinism.NON_DETERMINISTIC
     assert LLMSource.determinism is Determinism.NON_DETERMINISTIC
     assert _predicate_says_boundary("source", LLMSource) is True
 

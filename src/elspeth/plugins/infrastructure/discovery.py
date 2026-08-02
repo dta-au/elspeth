@@ -285,7 +285,7 @@ def _get_base_classes() -> dict[str, type]:
 # gates are "config-driven system operations" handled by the engine, NOT plugins.
 # See "System Operations (NOT Plugins)" section in the plugin protocol.
 PLUGIN_SCAN_CONFIG: dict[str, list[str]] = {
-    "sources": ["sources"],
+    "sources": ["sources", "sources/llm"],
     "transforms": ["transforms", "transforms/aws", "transforms/azure", "transforms/llm", "transforms/rag"],
     "sinks": ["sinks"],
 }
