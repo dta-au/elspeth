@@ -59,6 +59,7 @@ from elspeth.web.composer.tools._common import (
     _validate_plugin_name,
     _validate_source_path,
     _vf_destination_note,
+    canonicalize_source_validation_failure,
 )
 from elspeth.web.composer.tools.blobs import (
     BlobToolRecord,
@@ -624,7 +625,11 @@ def _execute_set_source(
     if path_error is not None:
         return _failure_result(state, path_error)
 
-    on_vf = validated.on_validation_failure
+    # "" means no route and canonicalizes to 'discard' — one shared owner
+    # (elspeth-bcd7051143), so this seam agrees with set_pipeline and the
+    # auto-wire pass instead of deferring "" to the engine's plugin-config
+    # rejection.
+    on_vf = canonicalize_source_validation_failure(validated.on_validation_failure)
     prevalidation_error = _prevalidate_source_for_context(
         context,
         plugin,
@@ -673,9 +678,11 @@ def _execute_set_source_from_blob(
         ``arguments.get("options", {})``).
       * ``plugin`` and ``on_validation_failure`` remain ``str | None``
         so the handler can distinguish operator-omitted from
-        operator-specified.  ``on_validation_failure`` None falls back
-        to ``_DEFAULT_SOURCE_VALIDATION_FAILURE`` ("discard") at the
-        seam below, matching the prior ``arguments.get(...)`` default.
+        operator-specified.  ``on_validation_failure`` (both ``None``
+        and the unroutable ``""`` spelling) canonicalizes to "discard"
+        via ``canonicalize_source_validation_failure`` at the seam
+        below — the single owner shared by every source-authoring seam
+        (elspeth-bcd7051143).
     """
     try:
         validated = SetSourceFromBlobArgumentsModel.model_validate(arguments)
@@ -711,7 +718,10 @@ def _execute_set_source_from_blob(
     if endpoint_policy_error is not None:
         return _failure_result(state, endpoint_policy_error)
 
-    on_vf = validated.on_validation_failure if validated.on_validation_failure is not None else _DEFAULT_SOURCE_VALIDATION_FAILURE
+    # None and "" both mean 'discard' — one shared owner (elspeth-bcd7051143).
+    # The previous ``is not None`` seam preserved "" while set_pipeline
+    # coerced it, so the same authored value diverged by tool.
+    on_vf = canonicalize_source_validation_failure(validated.on_validation_failure)
     resolved = _resolve_source_blob(
         blob_id=validated.blob_id,
         explicit_plugin=validated.plugin,

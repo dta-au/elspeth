@@ -1296,6 +1296,35 @@ _SOURCE_VALIDATION_FAILURE_DESCRIPTION: Final[str] = (
 )
 
 
+def canonicalize_source_validation_failure(value: str | None) -> str:
+    """Fold unspecified spellings of ``on_validation_failure`` into 'discard'.
+
+    THE single owner of what an authored empty-string route means
+    (elspeth-bcd7051143). ``None`` (not specified) and ``""`` (specified but
+    naming no route — a sink name can never be the empty string, so "" carries
+    no distinct routing intent) both canonicalize to the 'discard' default.
+    Every composer seam that admits an authored ``on_validation_failure``
+    routes through here: ``set_source``, ``set_source_from_blob``, both
+    ``set_pipeline`` source branches, runtime-YAML import
+    (``yaml_importer._source_from_runtime_entry``), and the required-control
+    auto-wire projection (``required_controls._parse_source``). Before this
+    owner existed the seams disagreed — ``set_pipeline`` truthiness-coerced
+    "", ``set_source``/``set_source_from_blob`` passed it through to the
+    engine plugin-config rejection, and the auto-wire pass refused the whole
+    candidate as non-discard — an accepted-then-wedged repair defect. The
+    guided surface's hard reject of "" (``guided/resolved.py``
+    ``SourceResolved``) stays as an internal invariant, not a second owner:
+    with boundary canonicalization "" can no longer lawfully reach it. The
+    engine-side plugin-config validator
+    (``plugins/infrastructure/config_base.py``) still rejects "" for
+    non-composer-authored configs; composer-persisted state is always
+    canonical before it gets there.
+    """
+    if value is None or value == "":
+        return _DEFAULT_SOURCE_VALIDATION_FAILURE
+    return value
+
+
 def _credential_wiring_contract_failure(
     state: CompositionState,
     *,

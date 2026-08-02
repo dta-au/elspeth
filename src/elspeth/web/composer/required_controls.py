@@ -65,6 +65,12 @@ from elspeth.web.composer.state import (
     SourceSpec,
     validate_composer_source_name,
 )
+
+# The shared on_validation_failure canonicalizer is the single owner of the
+# "" -> 'discard' fold (elspeth-bcd7051143); deep-importing tools._common is
+# the established cross-package pattern (pipeline_planner, pipeline_commit,
+# guided.emitters do the same).
+from elspeth.web.composer.tools._common import canonicalize_source_validation_failure
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
@@ -309,9 +315,18 @@ def _parse_source(block: Mapping[str, Any]) -> SourceSpec:
     plugin = block["plugin"]
     on_success = block.get("on_success", "")
     authored_validation_failure = block.get("on_validation_failure")
-    on_validation_failure = "discard" if authored_validation_failure is None else authored_validation_failure
-    if type(plugin) is not str or type(on_success) is not str or type(on_validation_failure) is not str or not isinstance(options, Mapping):
+    if (
+        type(plugin) is not str
+        or type(on_success) is not str
+        or (authored_validation_failure is not None and type(authored_validation_failure) is not str)
+        or not isinstance(options, Mapping)
+    ):
         raise TypeError("source string fields must be exact strings")
+    # None and "" both mean 'discard' via the shared canonicalizer — the
+    # single owner of that fold (elspeth-bcd7051143) — so this coverage
+    # projection sees exactly what the set_pipeline persistence seam will
+    # store instead of refusing a candidate persistence would accept.
+    on_validation_failure = canonicalize_source_validation_failure(authored_validation_failure)
     return SourceSpec(
         plugin=plugin,
         on_success=on_success,
@@ -558,6 +573,15 @@ def _splice_source_output_control(
 ) -> bool:
     """Interpose content safety on one source's successful output route."""
     if source.on_validation_failure != "discard":
+        # Component-scoped refusal (elspeth-5b3d8d7b68): a validation-failure
+        # route naming a sink cannot be interposed in the current graph model
+        # (rows on that route would reach the sink unmoderated, so an
+        # on_success-only control is never credited by the coverage
+        # authority). Refuse THIS source's splice only — its own coverage
+        # finding survives untouched for the fail-closed execution gate —
+        # while the fixpoint continues repairing sibling discard-routed
+        # sources and transform edges. This pass never partially certifies
+        # the refused component: it inserts nothing on any of its edges.
         return False
     downstream = source.on_success
     if type(downstream) is not str or not downstream:
@@ -679,11 +703,14 @@ def wire_required_controls(
     if not llm_source_locations and llm_node_count == 0:
         # Coverage findings only exist for LLM components; skip the catalog sweep.
         return candidate
-    if any(state.sources[location.name].on_validation_failure != "discard" for location in llm_source_locations):
-        # A source validation-failure route cannot be interposed in the current
-        # graph model. Refuse the WHOLE candidate before any transform/source
-        # splice so this pass never partially certifies an unrepairable graph.
-        return candidate
+    # A non-discard-routed LLM source is refused COMPONENT-scoped, not
+    # candidate-scoped (elspeth-5b3d8d7b68): _splice_source_output_control
+    # skips that source's splice, its coverage finding survives untouched for
+    # the fail-closed execution gate, and sibling discard-routed sources and
+    # transform edges are still repaired. (The previous whole-candidate early
+    # return here let one unrepairable source suppress every unrelated
+    # repair.) A candidate whose ONLY repairs are refused makes no progress
+    # and falls through to the no-op identity return below.
 
     summaries = _plugin_summaries(catalog)
     # SECURITY: an alias-less selection whose required options would come from
