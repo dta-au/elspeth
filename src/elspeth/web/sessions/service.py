@@ -6328,7 +6328,6 @@ class SessionServiceImpl:
                     raise AuditIntegrityError("transition assistant requires guided_session.transition_consumed=true")
         sid = str(session_id)
         pid = str(proposal_id)
-        now = self._now()
         operation_kind = self._pipeline_settlement_operation_kind(session_operation_context)
 
         def _sync() -> tuple[PipelineProposalSettlementResult, bool]:
@@ -6342,6 +6341,14 @@ class SessionServiceImpl:
                     expected_kind=operation_kind,
                 ),
             ):
+                # Stamped under the lock, not at request entry: a settlement
+                # that waited on the session lock would otherwise record an
+                # application time from before the transaction it commits in.
+                # Stays on the Python clock like every sibling chat/session
+                # row (_now); reading the database clock here would make these
+                # rows incomparable with them and, on SQLite, truncate to
+                # whole seconds.
+                now = self._now()
                 row = conn.execute(
                     select(composition_proposals_table)
                     .where(composition_proposals_table.c.session_id == sid)
@@ -6496,7 +6503,7 @@ class SessionServiceImpl:
                         created_at=now,
                     )
                 )
-                conn.execute(
+                settled = conn.execute(
                     update(composition_proposals_table)
                     .where(composition_proposals_table.c.session_id == sid)
                     .where(composition_proposals_table.c.id == pid)
@@ -6508,6 +6515,13 @@ class SessionServiceImpl:
                         updated_at=now,
                     )
                 )
+                if settled.rowcount != 1:
+                    # The status guard above reads the authority snapshot; this
+                    # predicate is what actually closes the window. A zero-row
+                    # CAS means the proposal left ``pending`` under us, so the
+                    # accepted event and state must roll back with it rather
+                    # than reporting a terminalization that never happened.
+                    raise AuditIntegrityError("pipeline proposal left pending before settlement committed")
                 settled_row = conn.execute(
                     select(composition_proposals_table)
                     .where(composition_proposals_table.c.session_id == sid)
@@ -6584,7 +6598,6 @@ class SessionServiceImpl:
             raise TypeError("dispatch must be an exact PipelineDispatchAuditBinding or None")
         sid = str(session_id)
         pid = str(proposal_id)
-        now = self._now()
         operation_kind = self._pipeline_settlement_operation_kind(session_operation_context)
 
         def _sync() -> tuple[CompositionProposalRecord, bool]:
@@ -6598,6 +6611,10 @@ class SessionServiceImpl:
                     expected_kind=operation_kind,
                 ),
             ):
+                # Stamped under the lock for the same reason as the settling
+                # path above: a terminalization that waited on the session lock
+                # must not record a time from before its own transaction.
+                now = self._now()
                 row = conn.execute(
                     select(composition_proposals_table)
                     .where(composition_proposals_table.c.session_id == sid)
@@ -6661,13 +6678,18 @@ class SessionServiceImpl:
                         created_at=now,
                     )
                 )
-                conn.execute(
+                rejected = conn.execute(
                     update(composition_proposals_table)
                     .where(composition_proposals_table.c.session_id == sid)
                     .where(composition_proposals_table.c.id == pid)
                     .where(composition_proposals_table.c.status == "pending")
                     .values(status="rejected", audit_event_id=event_id, updated_at=now)
                 )
+                if rejected.rowcount != 1:
+                    # Same CAS contract as the settling path: a zero-row update
+                    # means another writer terminalized the proposal, so the
+                    # rejection event must roll back with it.
+                    raise AuditIntegrityError("pipeline proposal left pending before rejection committed")
                 updated_row = conn.execute(
                     select(composition_proposals_table)
                     .where(composition_proposals_table.c.session_id == sid)

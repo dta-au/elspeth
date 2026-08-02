@@ -1789,6 +1789,28 @@ def test_canonical_pipeline_accept_requires_and_echoes_draft_hash(tmp_path, monk
         message for message in asyncio.run(service.get_messages(session_id, limit=None)) if message.role == "audit" and message.tool_calls
     ]
     assert len(audit_rows_after_retry) == 1
+    # An exact-committed retry must still run the post-commit surfacing pass.
+    # It is documented idempotent, and the first attempt can die between the
+    # settling commit and the surfacing call; if the retry short-circuits
+    # before it, the committed state keeps pending interpretation
+    # requirements with no event row and /execute fails closed on
+    # interpretation_placeholder_unresolved with nothing for the user to
+    # resolve.
+    surfaced_state_ids = [
+        call.kwargs["current_state_id"] for call in app.state.composer_service.surface_pending_interpretation_reviews.call_args_list
+    ]
+    assert surfaced_state_ids == [str(committed_state.id), str(committed_state.id)], (
+        f"expected the accept and its exact-committed retry to each surface against the committed state, got {surfaced_state_ids!r}"
+    )
+    surfaced_contexts = [
+        call.kwargs.get("session_operation_context")
+        for call in app.state.composer_service.surface_pending_interpretation_reviews.call_args_list
+    ]
+    assert all(type(context) is SessionOperationContext for context in surfaced_contexts)
+    assert all(context.fence.session_id == str(session_id) for context in surfaced_contexts if type(context) is SessionOperationContext)
+    assert all(
+        context.operation_kind is SessionOperationKind.PROPOSAL for context in surfaced_contexts if type(context) is SessionOperationContext
+    )
 
 
 @pytest.mark.asyncio

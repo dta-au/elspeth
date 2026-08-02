@@ -166,6 +166,19 @@ async def settle_pipeline_proposal_under_compose_lock(
         if proposal.committed_state_id is None:
             raise RuntimeError("committed pipeline proposal has no committed state id")
         state = await service.get_state(proposal.committed_state_id)
+        # The exact-committed replay still owes the post-commit surfacing pass
+        # below. The first attempt can die between the settling commit and that
+        # pass, which leaves the committed state carrying pending
+        # interpretation requirements with no event row — /execute then fails
+        # closed on interpretation_placeholder_unresolved with nothing the user
+        # can resolve. The pass is idempotent, so re-running it here is a no-op
+        # when the first attempt already completed it.
+        await request.app.state.composer_service.surface_pending_interpretation_reviews(
+            _state_from_record(state),
+            session_id=str(proposal.session_id),
+            current_state_id=str(state.id),
+            session_operation_context=session_operation_context,
+        )
         return PipelineRouteSettlement(
             settlement=PipelineProposalSettlementResult(proposal=proposal, state=state),
             validation=None,
