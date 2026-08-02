@@ -1,0 +1,34 @@
+# Source-native LLM example: one authored prompt produces one generated row.
+
+sources:
+  generated_briefing:
+    plugin: llm
+    on_success: result
+    options:
+      provider: openrouter
+      api_key: fake-key-chaosllm-does-not-check
+      base_url: http://127.0.0.1:8199/v1
+      model: chaosllm/fake-gpt-4
+      timeout_seconds: 10
+      prompt_template: >-
+        Explain in one concise sentence why an auditable data pipeline matters.
+      temperature: 0.0
+      max_tokens: 80
+      response_field: briefing
+      schema:
+        mode: observed
+      on_validation_failure: discard
+
+sinks:
+  result:
+    plugin: json
+    on_write_failure: discard
+    options:
+      path: examples/llm_source/output/briefing.jsonl
+      format: jsonl
+      collision_policy: auto_increment
+      schema:
+        mode: observed
+
+landscape:
+  url: sqlite:///examples/llm_source/runs/audit.db
