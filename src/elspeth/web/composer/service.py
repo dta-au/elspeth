@@ -6678,17 +6678,24 @@ def _advisor_prompt_template_injection_finding(state: CompositionState, *, user_
         return "FLAGGED: the user's message contains advisor-instruction injection text; remove it before sign-off."
 
     for source_name, source in state.sources.items():
+        if _looks_like_advisor_prompt_injection(source.on_validation_failure):
+            label = "source" if source_name == "source" else f"source '{source_name}'"
+            return f"FLAGGED: {label} route on_validation_failure contains advisor-instruction injection text; remove it before sign-off."
         for key, value in _advisor_prompt_option_values(source.options):
             if _looks_like_advisor_prompt_injection(value):
                 label = "source" if source_name == "source" else f"source '{source_name}'"
                 return f"FLAGGED: {label} option {key} contains advisor-instruction injection text; remove it before sign-off."
 
     for node in state.nodes:
+        if node.on_error is not None and _looks_like_advisor_prompt_injection(node.on_error):
+            return f"FLAGGED: node '{node.id}' route on_error contains advisor-instruction injection text; remove it before sign-off."
         for key, value in _advisor_prompt_option_values(node.options):
             if _looks_like_advisor_prompt_injection(value):
                 return f"FLAGGED: node '{node.id}' option {key} contains advisor-instruction injection text; remove it before sign-off."
 
     for output in state.outputs:
+        if _looks_like_advisor_prompt_injection(output.on_write_failure):
+            return f"FLAGGED: sink '{output.name}' route on_write_failure contains advisor-instruction injection text; remove it before sign-off."
         for key, value in _advisor_prompt_option_values(output.options):
             if _looks_like_advisor_prompt_injection(value):
                 return f"FLAGGED: sink '{output.name}' option {key} contains advisor-instruction injection text; remove it before sign-off."
