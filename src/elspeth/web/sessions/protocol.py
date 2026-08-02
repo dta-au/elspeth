@@ -2649,6 +2649,31 @@ class SessionOperationCompositionMutations(Protocol):
     ) -> CompositionStateRecord: ...
 
 
+class SessionOperationInterpretationMutations(Protocol):
+    """Interpretation audit mutations under one exact COMPOSE operation fence."""
+
+    def record_session_opt_out(
+        self,
+        *,
+        event_id: UUID,
+        actor: str,
+        opted_out_at: datetime,
+    ) -> tuple[InterpretationEventRecord, bool]: ...
+
+    def record_auto_interpreted_no_surfaces_event(
+        self,
+        *,
+        event_id: UUID,
+        actor: str,
+        kind: InterpretationKind,
+        model_identifier: str,
+        model_version: str,
+        provider: str,
+        composer_skill_hash: str,
+        created_at: datetime,
+    ) -> InterpretationEventRecord: ...
+
+
 class SessionOperationRunMutations(Protocol):
     """Run mutations available inside one exact EXECUTE operation fence."""
 
@@ -2924,6 +2949,9 @@ class SessionOperationMutationTransaction(Protocol):
 
     @property
     def composition_states(self) -> SessionOperationCompositionMutations: ...
+
+    @property
+    def interpretations(self) -> SessionOperationInterpretationMutations: ...
 
     @property
     def runs(self) -> SessionOperationRunMutations: ...
@@ -3565,6 +3593,7 @@ class SessionServiceProtocol(Protocol):
         *,
         session_id: UUID,
         actor: str,
+        session_operation_context: SessionOperationContext,
         opted_out_at: datetime | None = None,
     ) -> InterpretationEventRecord:
         """Mark the session as 'don't surface interpretations any more'.
@@ -3608,9 +3637,8 @@ class SessionServiceProtocol(Protocol):
         model_version: str,
         provider: str,
         composer_skill_hash: str,
+        session_operation_context: SessionOperationContext,
         created_at: datetime | None = None,
-        session_operation_context: SessionOperationContext | None = None,
-        session_operation_kind: SessionOperationKind | None = None,
     ) -> InterpretationEventRecord:
         """Write an AUTO_INTERPRETED_NO_SURFACES row (Phase 5b Task 5, F-6).
 

@@ -25,16 +25,19 @@ Fixture model: shared ``test_client`` from ``tests/unit/web/conftest.py``.
 from __future__ import annotations
 
 import pathlib
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient, Response
-from sqlalchemy import select
+from sqlalchemy import insert, select
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.sessions.models import (
     interpretation_events_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.telemetry import observed_value
@@ -67,6 +70,19 @@ def _seed_session(test_client: TestClient, *, user_id: str = "alice") -> UUID:
     sid = uuid4()
     with test_client.app.state.phase3_engine.begin() as conn:
         _make_session(conn, session_id=str(sid), user_id=user_id)
+        created_at = datetime.now(UTC)
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=str(sid),
+                operation_id=f"create-{sid}",
+                lease_token=f"create-token-{sid}",
+                operation_kind=SessionOperationKind.CREATE.value,
+                owner_instance_id="interpretation-opt-out-route-test",
+                operation_epoch=1,
+                lease_expires_at=created_at,
+                released_at=created_at,
+            )
+        )
     return sid
 
 

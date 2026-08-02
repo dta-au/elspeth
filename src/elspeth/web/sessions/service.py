@@ -9047,6 +9047,7 @@ class SessionServiceImpl:
         *,
         session_id: UUID,
         actor: str,
+        session_operation_context: SessionOperationContext,
         opted_out_at: datetime | None = None,
     ) -> InterpretationEventRecord:
         """Mark the session as 'don't surface interpretations any more'.
@@ -9083,62 +9084,26 @@ class SessionServiceImpl:
         """
         now = self._ensure_utc(opted_out_at) if opted_out_at is not None else self._now()
         sid = str(session_id)
-
-        def _sync() -> tuple[InterpretationEventRecord, bool]:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                # F-29: idempotency. SELECT inside the lock so the
-                # SELECT-then-INSERT sequence is atomic against concurrent
-                # writers. If a prior opt-out exists, return it; do not
-                # insert a duplicate (the closed enum on choice plus the
-                # source-keyed nullability CHECK would not prevent
-                # duplicates, only structurally-bad rows).
-                existing = conn.execute(
-                    select(interpretation_events_table)
-                    .where(interpretation_events_table.c.session_id == sid)
-                    .where(interpretation_events_table.c.interpretation_source == InterpretationSource.AUTO_INTERPRETED_OPT_OUT.value)
-                    .order_by(interpretation_events_table.c.created_at)
-                    .limit(1)
-                ).one_or_none()
-                if existing is not None:
-                    return _interpretation_event_record_from_row(existing), False
-
-                event_id = str(uuid.uuid4())
-                conn.execute(
-                    insert(interpretation_events_table).values(
-                        id=event_id,
-                        session_id=sid,
-                        composition_state_id=None,
-                        affected_node_id=None,
-                        tool_call_id=None,
-                        user_term=None,
-                        kind=None,
-                        llm_draft=None,
-                        accepted_value=None,
-                        choice=InterpretationChoice.OPTED_OUT.value,
-                        created_at=now,
-                        resolved_at=now,
-                        actor=actor,
-                        model_identifier=None,
-                        model_version=None,
-                        provider=None,
-                        composer_skill_hash=None,
-                        arguments_hash=None,
-                        hash_domain_version=None,
-                        interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT.value,
-                        runtime_model_identifier_at_resolve=None,
-                        runtime_model_version_at_resolve=None,
-                        resolved_prompt_template_hash=None,
-                    )
-                )
-                conn.execute(
-                    update(sessions_table).where(sessions_table.c.id == sid).values(interpretation_review_disabled=True, updated_at=now)
-                )
-                row = conn.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == event_id)).one()
-                return _interpretation_event_record_from_row(row), True
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if (
+            session_operation_context.operation_kind is not SessionOperationKind.COMPOSE
+            or session_operation_context.fence.session_id != sid
+        ):
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+        event_id = uuid.uuid4()
 
         record, was_inserted = cast(
             "tuple[InterpretationEventRecord, bool]",
-            await self._run_sync(_sync),
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.interpretations.record_session_opt_out(
+                    event_id=event_id,
+                    actor=actor,
+                    opted_out_at=now,
+                ),
+            ),
         )
         # B3 cohort b1 — Phase 5b interpretation opt-out (Sub-task 7e).
         # Helper-based emit. The helper applies W5 wrapping so a broken
@@ -9203,6 +9168,7 @@ class SessionServiceImpl:
         model_version: str,
         provider: str,
         composer_skill_hash: str,
+        session_operation_context: SessionOperationContext,
         created_at: datetime | None = None,
     ) -> InterpretationEventRecord:
         """Write an AUTO_INTERPRETED_NO_SURFACES row (F-6).
@@ -9233,42 +9199,31 @@ class SessionServiceImpl:
             raise ValueError(f"kind must be InterpretationKind, got {type(kind).__name__}: {kind!r}")
         now = self._ensure_utc(created_at) if created_at is not None else self._now()
         sid = str(session_id)
-        kind_value = kind.value
-        event_id = str(uuid.uuid4())
-
-        def _sync() -> InterpretationEventRecord:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
-                conn.execute(
-                    insert(interpretation_events_table).values(
-                        id=event_id,
-                        session_id=sid,
-                        composition_state_id=None,
-                        affected_node_id=None,
-                        tool_call_id=None,
-                        user_term=None,
-                        kind=kind_value,
-                        llm_draft=None,
-                        accepted_value=None,
-                        choice=InterpretationChoice.OPTED_OUT.value,
-                        created_at=now,
-                        resolved_at=now,
-                        actor=actor,
-                        model_identifier=model_identifier,
-                        model_version=model_version,
-                        provider=provider,
-                        composer_skill_hash=composer_skill_hash,
-                        arguments_hash=None,
-                        hash_domain_version=None,
-                        interpretation_source=InterpretationSource.AUTO_INTERPRETED_NO_SURFACES.value,
-                        runtime_model_identifier_at_resolve=None,
-                        runtime_model_version_at_resolve=None,
-                        resolved_prompt_template_hash=None,
-                    )
-                )
-                row = conn.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == event_id)).one()
-                return _interpretation_event_record_from_row(row)
-
-        return cast(InterpretationEventRecord, await self._run_sync(_sync))
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if (
+            session_operation_context.operation_kind is not SessionOperationKind.COMPOSE
+            or session_operation_context.fence.session_id != sid
+        ):
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+        event_id = uuid.uuid4()
+        return cast(
+            InterpretationEventRecord,
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.interpretations.record_auto_interpreted_no_surfaces_event(
+                    event_id=event_id,
+                    actor=actor,
+                    kind=kind,
+                    model_identifier=model_identifier,
+                    model_version=model_version,
+                    provider=provider,
+                    composer_skill_hash=composer_skill_hash,
+                    created_at=now,
+                ),
+            ),
+        )
 
     async def add_message(
         self,

@@ -22,6 +22,8 @@ prompt-patch can land on real node JSON.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -41,7 +43,7 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.hashing import stable_hash
-from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.state import (
     CompositionState,
@@ -52,6 +54,7 @@ from elspeth.web.composer.state import (
     ValidationEntry,
     ValidationSummary,
 )
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
@@ -157,6 +160,22 @@ async def _save_composition_state(
             provenance=provenance,
             session_operation_context=context,
         )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
+@asynccontextmanager
+async def _compose_operation(service: SessionServiceImpl, session_id: UUID) -> AsyncIterator[SessionOperationContext]:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        yield context
     finally:
         await service._run_sync(service.session_operation_authority.release, context)
 
@@ -1946,10 +1965,12 @@ async def test_10_opt_out_writes_event_and_sets_session_boolean_no_proposal_even
         _insert_session(conn, str(session_id))
         before_count = conn.execute(select(proposal_events_table).where(proposal_events_table.c.session_id == str(session_id))).fetchall()
 
-    event = await service.record_session_interpretation_opt_out(
-        session_id=session_id,
-        actor="user:alice",
-    )
+    async with _compose_operation(service, session_id) as context:
+        event = await service.record_session_interpretation_opt_out(
+            session_id=session_id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
 
     assert event.choice is InterpretationChoice.OPTED_OUT
     assert event.interpretation_source is InterpretationSource.AUTO_INTERPRETED_OPT_OUT
@@ -1982,14 +2003,17 @@ async def test_10b_opt_out_is_idempotent(service) -> None:
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
 
-    first = await service.record_session_interpretation_opt_out(
-        session_id=session_id,
-        actor="user:alice",
-    )
-    second = await service.record_session_interpretation_opt_out(
-        session_id=session_id,
-        actor="user:alice",
-    )
+    async with _compose_operation(service, session_id) as context:
+        first = await service.record_session_interpretation_opt_out(
+            session_id=session_id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
+        second = await service.record_session_interpretation_opt_out(
+            session_id=session_id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
 
     assert first.id == second.id
     assert first.resolved_at == second.resolved_at
@@ -2022,10 +2046,12 @@ async def test_create_pending_after_session_opt_out_writes_surface_specific_audi
         ),
         provenance="tool_call",
     )
-    marker = await service.record_session_interpretation_opt_out(
-        session_id=session_id,
-        actor="user:alice",
-    )
+    async with _compose_operation(service, session_id) as context:
+        marker = await service.record_session_interpretation_opt_out(
+            session_id=session_id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
 
     requests = [
         (InterpretationKind.INVENTED_SOURCE, SOURCE_COMPONENT_ID, "inline_source_url_list", "https://example.gov.au"),
@@ -2378,15 +2404,17 @@ async def test_record_auto_interpreted_no_surfaces_carries_kind(service) -> None
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
 
-    event = await service.record_auto_interpreted_no_surfaces_event(
-        session_id=session_id,
-        actor="composer-llm",
-        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-        model_identifier="anthropic/claude-opus-4-7",
-        model_version="2026-05-01",
-        provider="anthropic",
-        composer_skill_hash="a" * 64,
-    )
+    async with _compose_operation(service, session_id) as context:
+        event = await service.record_auto_interpreted_no_surfaces_event(
+            session_id=session_id,
+            actor="composer-llm",
+            kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+            model_identifier="anthropic/claude-opus-4-7",
+            model_version="2026-05-01",
+            provider="anthropic",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
 
     assert event.choice is InterpretationChoice.OPTED_OUT
     assert event.interpretation_source is InterpretationSource.AUTO_INTERPRETED_NO_SURFACES
@@ -2402,18 +2430,135 @@ async def test_record_auto_interpreted_no_surfaces_requires_explicit_kind(servic
     with service._engine.begin() as conn:
         _insert_session(conn, str(session_id))
 
-    with pytest.raises(TypeError, match="kind"):
-        await service.record_auto_interpreted_no_surfaces_event(
-            session_id=session_id,
-            actor="composer-llm",
-            model_identifier="anthropic/claude-opus-4-7",
-            model_version="2026-05-01",
-            provider="anthropic",
-            composer_skill_hash="a" * 64,
-        )
+    async with _compose_operation(service, session_id) as context:
+        with pytest.raises(TypeError, match="kind"):
+            await service.record_auto_interpreted_no_surfaces_event(
+                session_id=session_id,
+                actor="composer-llm",
+                model_identifier="anthropic/claude-opus-4-7",
+                model_version="2026-05-01",
+                provider="anthropic",
+                composer_skill_hash="a" * 64,
+                session_operation_context=context,
+            )
 
     rows = await service.list_interpretation_events(session_id, status="all")
     assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_opt_out_rejects_wrong_kind_and_cross_session_contexts(service) -> None:
+    target_session_id = uuid4()
+    foreign_session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(target_session_id))
+        _insert_session(conn, str(foreign_session_id))
+
+    foreign_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=foreign_session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    wrong_kind_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=target_session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        for context in (foreign_context, wrong_kind_context):
+            with pytest.raises(SessionOperationFenceLost):
+                await service.record_session_interpretation_opt_out(
+                    session_id=target_session_id,
+                    actor="user:alice",
+                    session_operation_context=context,
+                )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, foreign_context)
+        await service._run_sync(service.session_operation_authority.release, wrong_kind_context)
+
+    with service._engine.connect() as conn:
+        assert (
+            conn.execute(
+                select(sessions_table.c.interpretation_review_disabled).where(sessions_table.c.id == str(target_session_id))
+            ).scalar_one()
+            is False
+        )
+        assert (
+            conn.execute(
+                select(interpretation_events_table.c.id).where(interpretation_events_table.c.session_id == str(target_session_id))
+            ).all()
+            == []
+        )
+
+
+@pytest.mark.asyncio
+async def test_no_surfaces_rejects_released_and_taken_over_contexts(service) -> None:
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        _insert_session(conn, str(session_id))
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+
+    kwargs = {
+        "session_id": session_id,
+        "actor": "composer-llm",
+        "kind": InterpretationKind.VAGUE_TERM,
+        "model_identifier": "anthropic/claude-opus-4-7",
+        "model_version": "2026-05-01",
+        "provider": "anthropic",
+        "composer_skill_hash": "a" * 64,
+    }
+    await service._run_sync(service.session_operation_authority.release, context)
+    with pytest.raises(SessionOperationFenceLost):
+        await service.record_auto_interpreted_no_surfaces_event(
+            **kwargs,
+            session_operation_context=context,
+        )
+
+    current = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    with service._engine.begin() as conn:
+        conn.execute(
+            update(session_operation_fences_table)
+            .where(session_operation_fences_table.c.session_id == str(session_id))
+            .values(lease_expires_at=datetime(2000, 1, 1, tzinfo=UTC))
+        )
+    replacement = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        with pytest.raises(SessionOperationFenceLost):
+            await service.record_auto_interpreted_no_surfaces_event(
+                **kwargs,
+                session_operation_context=current,
+            )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, replacement)
+
+    assert await service.list_interpretation_events(session_id, status="all") == []
 
 
 # --------------------------------------------------------------------------- #

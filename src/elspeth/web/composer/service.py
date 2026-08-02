@@ -5155,6 +5155,7 @@ class ComposerServiceImpl:
         audit: DispatchAudit,
         recorder: BufferingRecorder,
         session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         current_state_id: str | None,
         response: Any,
         llm_messages: list[dict[str, Any]],
@@ -5279,6 +5280,8 @@ class ComposerServiceImpl:
                 else None
             )
             if cap_type is not None:
+                if type(session_operation_context) is not SessionOperationContext:
+                    raise AuditIntegrityError("Rate-cap interpretation persistence requires exact COMPOSE authority") from exc
                 # F-15 telemetry FIRST (the spec is explicit: emit BEFORE
                 # the ARG_ERROR returns). Operational-only — no
                 # ``user_term`` attribute, PII risk.
@@ -5307,6 +5310,7 @@ class ComposerServiceImpl:
                     model_version=safe_response_model(response) or self._model,
                     provider=self._availability.provider or "unknown",
                     composer_skill_hash=self._composer_skill_hash,
+                    session_operation_context=session_operation_context,
                 )
 
             # Audit envelope: ARG_ERROR. Truthful — the handler returned

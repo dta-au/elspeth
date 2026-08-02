@@ -43,7 +43,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.enums import CreationModality
-from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import (
@@ -167,6 +167,17 @@ async def _save_composition_state_with_compose_authority(
         )
     finally:
         await service._run_sync(service.session_operation_authority.release, context)
+
+
+async def _acquire_compose_context(service: SessionServiceImpl, session_id: UUID) -> SessionOperationContext:
+    return await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
 
 
 def _llm_node(
@@ -1340,7 +1351,15 @@ async def test_02b_opted_out_session_does_not_return_pending_payload(service: Se
     """After session opt-out, the tool reports suppression and writes no PENDING row."""
     session_id = uuid4()
     state_id = await _seed_session(service, session_id)
-    await service.record_session_interpretation_opt_out(session_id=session_id, actor="user:alice")
+    context = await _acquire_compose_context(service, session_id)
+    try:
+        await service.record_session_interpretation_opt_out(
+            session_id=session_id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
     state = _state_with(_llm_node())
 
     result = await _handle_request_interpretation_review(
@@ -2915,12 +2934,17 @@ async def test_17_auto_interpreted_no_surfaces_writer(service: SessionServiceImp
     session_id = uuid4()
     await _seed_session(service, session_id)
 
-    event = await service.record_auto_interpreted_no_surfaces_event(
-        session_id=session_id,
-        actor="composer-llm",
-        kind=InterpretationKind.VAGUE_TERM,
-        **_provenance_kwargs(),
-    )
+    context = await _acquire_compose_context(service, session_id)
+    try:
+        event = await service.record_auto_interpreted_no_surfaces_event(
+            session_id=session_id,
+            actor="composer-llm",
+            kind=InterpretationKind.VAGUE_TERM,
+            session_operation_context=context,
+            **_provenance_kwargs(),
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
     assert event.interpretation_source is InterpretationSource.AUTO_INTERPRETED_NO_SURFACES
     assert event.choice is InterpretationChoice.OPTED_OUT
     # Surface fields NULL.

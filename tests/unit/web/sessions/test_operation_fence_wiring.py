@@ -29,7 +29,9 @@ from elspeth.contracts.blobs import (
     BlobRunLinkRecord,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
+from elspeth.web.composer import tool_batch
 from elspeth.web.composer.progress import ComposerProgressRegistry
+from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.coordination import repository as coordination_repository
 from elspeth.web.coordination.contracts import SessionOperationContext
 from elspeth.web.coordination.lifecycle import SessionOperationLease
@@ -37,6 +39,7 @@ from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import protocol as sessions_protocol
 from elspeth.web.sessions.protocol import RunEventRecord, SessionServiceProtocol
+from elspeth.web.sessions.routes import interpretation as interpretation_routes
 from elspeth.web.sessions.routes import messages as message_routes
 from elspeth.web.sessions.routes.guided_operations import reserve_or_replay_guided_operation
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -104,6 +107,45 @@ def test_composition_state_write_requires_exact_compose_context(owner: type[Any]
     assert context.annotation is SessionOperationContext or context.annotation == "SessionOperationContext"
 
 
+@pytest.mark.parametrize(
+    "method_name",
+    ("record_session_interpretation_opt_out", "record_auto_interpreted_no_surfaces_event"),
+)
+@pytest.mark.parametrize("owner", [SessionServiceProtocol, SessionServiceImpl])
+def test_simple_interpretation_writes_require_exact_compose_context(owner: type[Any], method_name: str) -> None:
+    context = _required_parameter(owner, method_name, "session_operation_context")
+    assert context.annotation is SessionOperationContext or context.annotation == "SessionOperationContext"
+
+
+def test_opt_out_route_owns_process_lock_and_compose_lease() -> None:
+    source = textwrap.dedent(inspect.getsource(interpretation_routes.register_interpretation_routes))
+    tree = ast.parse(source)
+    endpoint = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "opt_out_of_interpretations")
+    compose_scope = next(
+        node
+        for node in ast.walk(endpoint)
+        if isinstance(node, ast.AsyncWith) and any(ast.unparse(item.context_expr) == "compose_lock" for item in node.items)
+    )
+    lease = next(item for item in compose_scope.items if "SessionOperationLease.acquire" in ast.unparse(item.context_expr))
+    assert "SessionOperationKind.COMPOSE" in ast.unparse(lease.context_expr)
+    writer = next(
+        node
+        for node in ast.walk(compose_scope)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.record_session_interpretation_opt_out"
+    )
+    assert any(
+        keyword.arg == "session_operation_context" and ast.unparse(keyword.value) == "compose_operation_lease.context"
+        for keyword in writer.keywords
+    )
+
+
+def test_rate_cap_no_surfaces_write_reuses_compose_context() -> None:
+    batch_source = textwrap.dedent(inspect.getsource(tool_batch.run_tool_batch))
+    assert "session_operation_context=ctx.session_operation_context" in batch_source
+    dispatch_source = textwrap.dedent(inspect.getsource(ComposerServiceImpl._dispatch_session_aware_tool))
+    assert "session_operation_context=session_operation_context" in dispatch_source
+
+
 def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
     route_source = textwrap.dedent(inspect.getsource(message_routes.register_message_routes))
     route_tree = ast.parse(route_source)
@@ -160,12 +202,16 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
     """Every callback surface is an exact domain capability, never generic SQL."""
     archive_disposition = getattr(sessions_protocol, "SessionArchiveDisposition", None)
     session_protocol = getattr(sessions_protocol, "SessionOperationSessionMutations", None)
+    composition_protocol = getattr(sessions_protocol, "SessionOperationCompositionMutations", None)
+    interpretation_protocol = getattr(sessions_protocol, "SessionOperationInterpretationMutations", None)
     run_protocol = getattr(sessions_protocol, "SessionOperationRunMutations", None)
     blob_protocol = getattr(sessions_protocol, "SessionOperationBlobMutations", None)
     progress_protocol = getattr(sessions_protocol, "SessionOperationComposerProgressMutations", None)
     completion_protocol = getattr(sessions_protocol, "SessionOperationComposerCompletionMutations", None)
     assert archive_disposition is not None
     assert session_protocol is not None
+    assert composition_protocol is not None
+    assert interpretation_protocol is not None
     assert run_protocol is not None
     assert blob_protocol is not None
     assert progress_protocol is not None
@@ -177,12 +223,16 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
         getattr(coordination_repository, "_RepositoryRunMutations", None),
         getattr(coordination_repository, "_RepositoryBlobMutations", None),
         getattr(coordination_repository, "_RepositoryComposerCompletionMutations", None),
+        getattr(coordination_repository, "_RepositoryInterpretationMutations", None),
+        getattr(coordination_repository, "_RepositoryCompositionStateMutations", None),
     )
     assert all(owner is not None for owner in implementation_types)
 
     expected_outer = {
         "database_now": datetime,
         "session": session_protocol,
+        "composition_states": composition_protocol,
+        "interpretations": interpretation_protocol,
         "runs": run_protocol,
         "blobs": blob_protocol,
         "composer_progress": progress_protocol,
@@ -211,6 +261,15 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                 "decide_and_soft_archive": (
                     (("archived_at", inspect.Parameter.KEYWORD_ONLY, datetime),),
                     archive_disposition,
+                ),
+            },
+        ),
+        (
+            (composition_protocol, implementation_types[6]),
+            {
+                "append_state": (
+                    (("creation", inspect.Parameter.POSITIONAL_OR_KEYWORD, sessions_protocol.SessionCompositionStateCreation),),
+                    sessions_protocol.CompositionStateRecord,
                 ),
             },
         ),
@@ -447,6 +506,32 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                         ("resolved_at", inspect.Parameter.KEYWORD_ONLY, datetime),
                     ),
                     type(None),
+                ),
+            },
+        ),
+        (
+            (interpretation_protocol, implementation_types[5]),
+            {
+                "record_session_opt_out": (
+                    (
+                        ("event_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("actor", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("opted_out_at", inspect.Parameter.KEYWORD_ONLY, datetime),
+                    ),
+                    tuple[sessions_protocol.InterpretationEventRecord, bool],
+                ),
+                "record_auto_interpreted_no_surfaces_event": (
+                    (
+                        ("event_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("actor", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("kind", inspect.Parameter.KEYWORD_ONLY, sessions_protocol.InterpretationKind),
+                        ("model_identifier", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("model_version", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("provider", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("composer_skill_hash", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("created_at", inspect.Parameter.KEYWORD_ONLY, datetime),
+                    ),
+                    sessions_protocol.InterpretationEventRecord,
                 ),
             },
         ),

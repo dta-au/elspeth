@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy import delete, event, func, insert, select, text, update
 from sqlalchemy.engine import Connection, Engine, Transaction
 
+from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.coordination import repository as coordination_repository
 from elspeth.web.coordination.contracts import (
@@ -30,6 +31,7 @@ from elspeth.web.sessions.models import (
     chat_messages_table,
     composition_states_table,
     guided_operations_table,
+    interpretation_events_table,
     session_operation_fences_table,
     sessions_table,
 )
@@ -1008,6 +1010,57 @@ def test_fork_creation_transaction_refuses_protected_table_dml(engine) -> None:
             "SQLite local authority"
         )
         assert conn.execute(select(sessions_table.c.id).where(sessions_table.c.forked_from_session_id == str(parent.id))).first() is None
+
+
+def test_interpretation_facet_is_thread_confined_and_closes_after_callback(engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    created = _created(authority)
+    context = authority.acquire(
+        session_id=created.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+    captured: dict[str, object] = {}
+
+    def mutation(transaction) -> None:
+        facet = transaction.interpretations
+        captured["facet"] = facet
+        reachable = _callback_slot_graph((transaction, facet))
+        assert not any(isinstance(value, (Connection, Engine, Transaction)) for value in reachable)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                facet.record_auto_interpreted_no_surfaces_event,
+                event_id=uuid4(),
+                actor="composer-llm",
+                kind=InterpretationKind.VAGUE_TERM,
+                model_identifier="model",
+                model_version="version",
+                provider="provider",
+                composer_skill_hash="a" * 64,
+                created_at=datetime.now(UTC),
+            )
+            with pytest.raises(RuntimeError, match="owning callback thread"):
+                future.result()
+
+    authority.mutate(context, mutation)
+    facet = captured["facet"]
+    with pytest.raises(RuntimeError, match="closed"):
+        facet.record_auto_interpreted_no_surfaces_event(
+            event_id=uuid4(),
+            actor="composer-llm",
+            kind=InterpretationKind.VAGUE_TERM,
+            model_identifier="model",
+            model_version="version",
+            provider="provider",
+            composer_skill_hash="a" * 64,
+            created_at=datetime.now(UTC),
+        )
+    with engine.connect() as conn:
+        assert (
+            conn.execute(select(interpretation_events_table.c.id).where(interpretation_events_table.c.session_id == str(created.id))).all()
+            == []
+        )
 
 
 def test_fork_creation_callback_graph_has_no_database_handle_or_third_session_escape(engine) -> None:

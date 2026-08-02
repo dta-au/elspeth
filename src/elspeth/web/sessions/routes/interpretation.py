@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from typing import Literal
 
+from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.web.coordination.lifecycle import SessionOperationLease
+
 from ._helpers import (
     UUID,
     APIRouter,
@@ -25,6 +28,7 @@ from ._helpers import (
     SessionServiceProtocol,
     UserIdentity,
     _extract_runtime_model_snapshot,
+    _get_session_compose_lock_registry,
     _interpretation_event_response,
     _state_response,
     _verify_session_ownership,
@@ -238,10 +242,22 @@ def register_interpretation_routes(router: APIRouter) -> None:
         await _verify_session_ownership(session_id, user, raw_request)  # 404 on IDOR
         service: SessionServiceProtocol = raw_request.app.state.session_service
         actor = f"user:{user.user_id}"
-        record = await service.record_session_interpretation_opt_out(
-            session_id=session_id,
-            actor=actor,
-        )
+        compose_lock = await _get_session_compose_lock_registry(raw_request).get_lock(str(session_id))
+        async with (
+            compose_lock,
+            await SessionOperationLease.acquire(
+                service.session_operation_authority,
+                session_id=session_id,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            ) as compose_operation_lease,
+        ):
+            record = await service.record_session_interpretation_opt_out(
+                session_id=session_id,
+                actor=actor,
+                session_operation_context=compose_operation_lease.context,
+            )
         # The opt-out row's ``resolved_at`` carries the opt-out timestamp.
         # The service guarantees a non-NULL value on every opt-out row
         # (idempotent path returns the existing row; insertion path uses

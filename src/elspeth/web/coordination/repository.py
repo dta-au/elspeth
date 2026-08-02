@@ -39,6 +39,12 @@ from elspeth.contracts.blobs import (
     blob_record_snapshot_hash,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
+from elspeth.contracts.composer_interpretation import (
+    InterpretationChoice,
+    InterpretationEventRecord,
+    InterpretationKind,
+    InterpretationSource,
+)
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
@@ -72,6 +78,7 @@ from elspeth.web.sessions.models import (
     composition_proposals_table,
     composition_states_table,
     guided_operations_table,
+    interpretation_events_table,
     proposal_blob_effect_receipts_table,
     proposal_events_table,
     run_events_table,
@@ -111,6 +118,7 @@ from elspeth.web.sessions.protocol import (
     SessionOperationBlobMutations,
     SessionOperationComposerProgressMutations,
     SessionOperationCompositionMutations,
+    SessionOperationInterpretationMutations,
     SessionOperationMutationTransaction,
     SessionOperationRunMutations,
     SessionOperationSessionMutations,
@@ -683,6 +691,167 @@ class _RepositoryCompositionStateMutations:
             derived_from_state_id=derived_from_state_id,
             composer_meta=data.composer_meta,
         )
+
+
+@final
+class _RepositoryInterpretationMutations:
+    """Interpretation-event capability bound to one private COMPOSE transaction."""
+
+    __slots__ = ("__state",)
+
+    def __init__(self, state: _RepositoryMutationState) -> None:
+        self.__state = state
+
+    def _require_compose(self) -> None:
+        state = self.__state
+        state._require_active()
+        context = state._operation_context
+        if (
+            type(context) is not SessionOperationContext
+            or context.operation_kind is not SessionOperationKind.COMPOSE
+            or context.fence.session_id != state._session_id
+        ):
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+
+    @staticmethod
+    def _event_record(row: Row[Any]) -> InterpretationEventRecord:
+        return InterpretationEventRecord(
+            id=UUID(row.id),
+            session_id=UUID(row.session_id),
+            composition_state_id=(UUID(row.composition_state_id) if row.composition_state_id is not None else None),
+            affected_node_id=row.affected_node_id,
+            tool_call_id=row.tool_call_id,
+            user_term=row.user_term,
+            kind=InterpretationKind(row.kind) if row.kind is not None else None,
+            llm_draft=row.llm_draft,
+            accepted_value=row.accepted_value,
+            choice=InterpretationChoice(row.choice),
+            created_at=_ensure_utc(row.created_at),
+            resolved_at=_ensure_utc(row.resolved_at) if row.resolved_at is not None else None,
+            actor=row.actor,
+            model_identifier=row.model_identifier,
+            model_version=row.model_version,
+            provider=row.provider,
+            composer_skill_hash=row.composer_skill_hash,
+            arguments_hash=row.arguments_hash,
+            hash_domain_version=row.hash_domain_version,
+            interpretation_source=InterpretationSource(row.interpretation_source),
+            runtime_model_identifier_at_resolve=row.runtime_model_identifier_at_resolve,
+            runtime_model_version_at_resolve=row.runtime_model_version_at_resolve,
+            resolved_prompt_template_hash=row.resolved_prompt_template_hash,
+        )
+
+    def record_session_opt_out(
+        self,
+        *,
+        event_id: UUID,
+        actor: str,
+        opted_out_at: datetime,
+    ) -> tuple[InterpretationEventRecord, bool]:
+        self._require_compose()
+        state = self.__state
+        state._validate_uuid(event_id, field_name="event_id")
+        if type(opted_out_at) is not datetime:
+            raise TypeError("opted_out_at must be an exact datetime")
+        opted_out_at = _ensure_utc(opted_out_at)
+        connection = _resolve_mutation_connection(state._connection_token)
+        existing = connection.execute(
+            select(interpretation_events_table)
+            .where(interpretation_events_table.c.session_id == state._session_id)
+            .where(interpretation_events_table.c.interpretation_source == InterpretationSource.AUTO_INTERPRETED_OPT_OUT.value)
+            .order_by(interpretation_events_table.c.created_at, interpretation_events_table.c.id)
+            .limit(1)
+        ).one_or_none()
+        if existing is not None:
+            return self._event_record(existing), False
+
+        connection.execute(
+            insert(interpretation_events_table).values(
+                id=str(event_id),
+                session_id=state._session_id,
+                composition_state_id=None,
+                affected_node_id=None,
+                tool_call_id=None,
+                user_term=None,
+                kind=None,
+                llm_draft=None,
+                accepted_value=None,
+                choice=InterpretationChoice.OPTED_OUT.value,
+                created_at=opted_out_at,
+                resolved_at=opted_out_at,
+                actor=actor,
+                model_identifier=None,
+                model_version=None,
+                provider=None,
+                composer_skill_hash=None,
+                arguments_hash=None,
+                hash_domain_version=None,
+                interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT.value,
+                runtime_model_identifier_at_resolve=None,
+                runtime_model_version_at_resolve=None,
+                resolved_prompt_template_hash=None,
+            )
+        )
+        result = connection.execute(
+            update(sessions_table)
+            .where(sessions_table.c.id == state._session_id)
+            .values(interpretation_review_disabled=True, updated_at=opted_out_at)
+        )
+        if result.rowcount != 1:
+            raise SessionDerivedCustodyError
+        row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(event_id))).one()
+        return self._event_record(row), True
+
+    def record_auto_interpreted_no_surfaces_event(
+        self,
+        *,
+        event_id: UUID,
+        actor: str,
+        kind: InterpretationKind,
+        model_identifier: str,
+        model_version: str,
+        provider: str,
+        composer_skill_hash: str,
+        created_at: datetime,
+    ) -> InterpretationEventRecord:
+        self._require_compose()
+        state = self.__state
+        state._validate_uuid(event_id, field_name="event_id")
+        if type(kind) is not InterpretationKind:
+            raise TypeError("kind must be an exact InterpretationKind")
+        if type(created_at) is not datetime:
+            raise TypeError("created_at must be an exact datetime")
+        created_at = _ensure_utc(created_at)
+        connection = _resolve_mutation_connection(state._connection_token)
+        connection.execute(
+            insert(interpretation_events_table).values(
+                id=str(event_id),
+                session_id=state._session_id,
+                composition_state_id=None,
+                affected_node_id=None,
+                tool_call_id=None,
+                user_term=None,
+                kind=kind.value,
+                llm_draft=None,
+                accepted_value=None,
+                choice=InterpretationChoice.OPTED_OUT.value,
+                created_at=created_at,
+                resolved_at=created_at,
+                actor=actor,
+                model_identifier=model_identifier,
+                model_version=model_version,
+                provider=provider,
+                composer_skill_hash=composer_skill_hash,
+                arguments_hash=None,
+                hash_domain_version=None,
+                interpretation_source=InterpretationSource.AUTO_INTERPRETED_NO_SURFACES.value,
+                runtime_model_identifier_at_resolve=None,
+                runtime_model_version_at_resolve=None,
+                resolved_prompt_template_hash=None,
+            )
+        )
+        row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(event_id))).one()
+        return self._event_record(row)
 
 
 @final
@@ -2671,6 +2840,7 @@ class _RepositoryMutationTransaction:
         "__composer_completion",
         "__composer_progress",
         "__composition_states",
+        "__interpretations",
         "__runs",
         "__session",
         "__state",
@@ -2694,6 +2864,7 @@ class _RepositoryMutationTransaction:
             self.__state = state
             self.__session = _RepositorySessionMutations(state)
             self.__composition_states = _RepositoryCompositionStateMutations(state)
+            self.__interpretations = _RepositoryInterpretationMutations(state)
             self.__runs = _RepositoryRunMutations(state)
             self.__blobs = _RepositoryBlobMutations(state)
             self.__composer_progress = RepositoryComposerProgressMutations(state)
@@ -2716,6 +2887,11 @@ class _RepositoryMutationTransaction:
     def composition_states(self) -> SessionOperationCompositionMutations:
         self.__state._require_active()
         return self.__composition_states
+
+    @property
+    def interpretations(self) -> SessionOperationInterpretationMutations:
+        self.__state._require_active()
+        return self.__interpretations
 
     @property
     def runs(self) -> SessionOperationRunMutations:

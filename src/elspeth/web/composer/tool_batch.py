@@ -1468,6 +1468,7 @@ async def run_tool_batch(
                 audit=audit,
                 recorder=recorder,
                 session_id=session_id,
+                session_operation_context=ctx.session_operation_context,
                 current_state_id=current_state_id,
                 response=response,
                 llm_messages=llm_messages,
