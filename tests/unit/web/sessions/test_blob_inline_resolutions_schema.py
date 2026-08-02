@@ -45,10 +45,11 @@ def test_blob_inline_resolutions_table_exists_with_expected_columns(engine) -> N
     }
 
 
-def test_blob_inline_resolutions_schema_epoch_is_42(engine) -> None:
-    assert SESSION_SCHEMA_EPOCH == 42
+def test_blob_inline_resolutions_schema_epoch_is_43(engine) -> None:
+    # 43: chat_messages.writer_principal gains run_diagnostics (elspeth-0fcf68d50f).
+    assert SESSION_SCHEMA_EPOCH == 43
     with engine.connect() as conn:
-        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 42
+        assert conn.execute(text("PRAGMA user_version")).scalar_one() == 43
 
 
 def test_blob_inline_resolutions_blob_id_is_historical_without_live_blob_fk(engine) -> None:

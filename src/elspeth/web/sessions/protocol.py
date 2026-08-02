@@ -141,7 +141,7 @@ LANDSCAPE_RECONCILIATION_ABSENT_SUFFIX = "[landscape-reconciliation:absent]"
 # constraint in ``web/sessions/models.py``. The Python Literal and the SQL
 # CHECK are paired contracts: extending one without the other lets the
 # dataclass validator pass while the DB rejects the row (or vice versa).
-# The order here mirrors the CHECK declaration (models.py L116) for visual
+# The order here mirrors the CHECK declaration in ``models.py`` for visual
 # diff clarity. Adding a value is a governance action — see the
 # closed-list-of-permitted-writers comment block at the
 # ``audit_access_log_table`` definition for the same posture.
@@ -151,6 +151,11 @@ ChatMessageWriterPrincipal = Literal[
     "route_system_message",
     "admin_tool",
     "session_fork",
+    # LLM audit rows persisted by POST /api/runs/{run_id}/diagnostics/
+    # evaluate. A distinct principal (elspeth-0fcf68d50f): these writes
+    # originate outside any compose turn, so attributing them to
+    # ``compose_loop`` misrepresented the audit trail's writer custody.
+    "run_diagnostics",
 ]
 
 # Closed enum mirroring the ``ck_composition_states_provenance`` CHECK

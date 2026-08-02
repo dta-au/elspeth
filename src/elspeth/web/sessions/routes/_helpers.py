@@ -56,7 +56,6 @@ from elspeth.web.composer import yaml_generator
 from elspeth.web.composer.audit import (
     BufferingRecorder,
     audit_envelope,
-    chat_turn_audit_envelope,
     llm_call_audit_envelope,
     llm_call_audit_summary,
 )
@@ -156,6 +155,7 @@ from elspeth.web.sessions.protocol import (
     SESSION_TERMINAL_RUN_STATUS_VALUES,
     ChatMessageRecord,
     ChatMessageRole,
+    ChatMessageWriterPrincipal,
     ComposerSessionPreferencesRecord,
     CompositionProposalRecord,
     CompositionStateData,
@@ -1468,6 +1468,7 @@ async def _persist_llm_calls(
     composition_state_id: UUID | None,
     *,
     plugin_crash_pending: bool,
+    writer_principal: ChatMessageWriterPrincipal = "compose_loop",
 ) -> None:
     """Persist per-LLM-call audit records as audit-only ``role=audit`` rows.
 
@@ -1476,6 +1477,11 @@ async def _persist_llm_calls(
     for the full rationale. The shape is the same: success-path failure
     is a Tier-1 audit corruption that must crash; unwind-path failure
     is recorded via counter + slog so it cannot mask the primary error.
+
+    ``writer_principal`` defaults to ``compose_loop`` because every
+    compose-turn drain site writes as the compose loop; the run-
+    diagnostics route overrides it with ``run_diagnostics`` so its rows
+    are not misattributed to a compose turn (elspeth-0fcf68d50f).
     """
     for call in llm_calls:
         content = llm_call_audit_summary(call)
@@ -1486,7 +1492,7 @@ async def _persist_llm_calls(
                 content,
                 tool_calls=[llm_call_audit_envelope(call)],
                 composition_state_id=composition_state_id,
-                writer_principal="compose_loop",
+                writer_principal=writer_principal,
             )
         except SQLAlchemyError as save_err:
             if plugin_crash_pending:
@@ -1689,80 +1695,6 @@ async def _track_compose_inflight(
         yield
     finally:
         registry.end_request(sid)
-
-
-async def _persist_chat_turns(
-    service: SessionServiceProtocol,
-    session_id: UUID,
-    chat_turns: tuple[ComposerChatTurn, ...],
-    composition_state_id: UUID | None,
-    *,
-    request_unwinding: bool,
-) -> None:
-    """Persist per-chat-turn audit records as audit-only ``role=audit`` rows.
-
-    Sibling of :func:`_persist_llm_calls`.  Each ComposerChatTurn produces
-    one ``role=audit`` row tagged ``_kind=chat_turn_audit``; auditors query
-    by ``json_extract(content, '$._kind')='chat_turn_audit'`` and by
-    ``composition_state_id`` to scope to a particular composition snapshot.
-
-    SQLAlchemy failures propagate on the success path: otherwise the
-    guided-session ``chat_history`` state write can commit while the
-    corresponding audit-only row disappears.  During exception unwinds,
-    failures are logged instead so an audit cleanup problem does not mask
-    the primary HTTPException.
-    """
-    for turn in chat_turns:
-        content = json.dumps(
-            {
-                "_kind": "chat_turn_audit",
-                "status": turn.status.value,
-                "step": turn.step,
-                "initiator": turn.initiator.value,
-                "chat_turn_seq": turn.chat_turn_seq,
-                "model": turn.model,
-                "latency_ms": turn.latency_ms,
-                "error_class": turn.error_class,
-            }
-        )
-        try:
-            await service.add_message(
-                session_id,
-                "audit",
-                content,
-                tool_calls=[chat_turn_audit_envelope(turn)],
-                composition_state_id=composition_state_id,
-                writer_principal="compose_loop",
-            )
-        except SQLAlchemyError as save_err:
-            if request_unwinding:
-                slog.error(
-                    "composer_chat_turn_persist_failed_during_unwind",
-                    session_id=str(session_id),
-                    step=turn.step,
-                    status=turn.status.value,
-                    exc_class=type(save_err).__name__,
-                )
-                continue
-            _COMPOSER_TIER1_VIOLATION_COUNTER.add(
-                1,
-                {"helper": "chat_turns"},
-            )
-            raise AuditIntegrityError(
-                f"composer_chat_turn_persist_failed: audit insert failed for "
-                f"session_id={session_id!r} on success path — Tier-1 audit "
-                f"corruption (no recovery)"
-            ) from save_err
-        except Exception as save_err:
-            if not request_unwinding:
-                raise
-            slog.error(
-                "composer_chat_turn_persist_failed_during_unwind",
-                session_id=str(session_id),
-                step=turn.step,
-                status=turn.status.value,
-                exc_class=type(save_err).__name__,
-            )
 
 
 async def _state_data_from_composer_state(
@@ -2955,7 +2887,6 @@ __all__ = [
     "_llm_calls_from_exception",
     "_message_response",
     "_pending_proposal_responses",
-    "_persist_chat_turns",
     "_persist_llm_calls",
     "_persist_tool_invocations",
     "_proposal_event_response",
@@ -2990,7 +2921,6 @@ __all__ = [
     "build_step_2_single_select_turn",
     "build_step_4_wire_turn",
     "cast",
-    "chat_turn_audit_envelope",
     "client_cancelled_progress_event",
     "composer_completion_events_table",
     "contextlib",

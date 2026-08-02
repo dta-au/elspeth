@@ -11,8 +11,10 @@ from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH
 from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_schema
 
 
-def test_node_options_summary_contract_runs_inside_session_epoch_41() -> None:
-    assert SESSION_SCHEMA_EPOCH == 42
+def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
+    # Deliberate literal pin: an epoch bump must consciously update this test
+    # (and the release docs the docs tests check), not slide through.
+    assert SESSION_SCHEMA_EPOCH == 43
     assert SQLITE_SCHEMA_EPOCH == 30
 
 
@@ -24,7 +26,7 @@ def test_epoch_40_session_store_fails_before_schema_use(tmp_path: Path) -> None:
         connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 40 WHERE store_kind = 'session'"))
         connection.execute(text("PRAGMA user_version = 40"))
 
-    with pytest.raises(SessionSchemaError, match=r"SESSION_SCHEMA_EPOCH=42.*Delete the session DB file and restart"):
+    with pytest.raises(SessionSchemaError, match=r"SESSION_SCHEMA_EPOCH=43.*Delete the session DB file and restart"):
         initialize_session_schema(engine)
 
 
@@ -36,5 +38,5 @@ def test_epoch_35_session_store_fails_before_schema_use(tmp_path: Path) -> None:
         connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 35 WHERE store_kind = 'session'"))
         connection.execute(text("PRAGMA user_version = 35"))
 
-    with pytest.raises(SessionSchemaError, match=r"SESSION_SCHEMA_EPOCH=42.*Delete the session DB file and restart"):
+    with pytest.raises(SessionSchemaError, match=r"SESSION_SCHEMA_EPOCH=43.*Delete the session DB file and restart"):
         initialize_session_schema(engine)

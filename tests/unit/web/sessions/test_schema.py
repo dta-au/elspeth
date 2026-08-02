@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import QueuePool
 
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, metadata, sessions_table
+from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH, blobs_table, metadata, sessions_table
 from elspeth.web.sessions.schema import (
     SessionSchemaError,
     _stamp_schema_sentinels,
@@ -290,7 +290,7 @@ def test_initialize_session_schema_rejects_epoch_35_database() -> None:
     assert probe_current_schema(eng) is False
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH=42.*Delete the session DB file and restart",
+        match=rf"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*Delete the session DB file and restart",
     ):
         initialize_session_schema(eng)
 
@@ -339,7 +339,7 @@ def test_epoch_36_database_without_declined_result_contract_fails_at_sentinel(tm
 
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH=42.*"
+        match=rf"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*"
         r"Delete the session DB file and restart",
     ):
         initialize_session_schema(stale_engine)
@@ -380,7 +380,7 @@ def test_epoch_30_database_without_schema_9_operation_contract_fails_closed_with
 
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH=42.*"
+        match=rf"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*"
         r"Delete the session DB file and restart",
     ):
         initialize_session_schema(stale_engine)

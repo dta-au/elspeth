@@ -197,7 +197,14 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        to reproduce the original closed HTTP failure envelope exactly.
 #        Epoch 41 rows cannot represent that replay enrichment and are rejected
 #        outright; no migration or compatibility decoder exists.
-SESSION_SCHEMA_EPOCH = 42
+#   43 -> ``chat_messages.writer_principal`` closed enum gains the
+#        ``run_diagnostics`` value so run-diagnostics LLM audit rows are
+#        attributed to their real writer instead of being misattributed to
+#        ``compose_loop`` (elspeth-0fcf68d50f). SQLite cannot ALTER a CHECK
+#        constraint in place, so pre-release policy remains delete-and-
+#        recreate for stale session databases (sessions.db only — auth.db is
+#        never touched).
+SESSION_SCHEMA_EPOCH = 43
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -421,7 +428,7 @@ chat_messages_table = Table(
         name="ck_chat_messages_parent_role",
     ),
     CheckConstraint(
-        "writer_principal IN ('compose_loop', 'route_user_message', 'route_system_message', 'admin_tool', 'session_fork')",
+        "writer_principal IN ('compose_loop', 'route_user_message', 'route_system_message', 'admin_tool', 'session_fork', 'run_diagnostics')",
         name="ck_chat_messages_writer_principal",
     ),
     Index(
