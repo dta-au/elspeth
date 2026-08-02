@@ -4,17 +4,22 @@ Each run worker (currently only the N=1 leader) starts one
 :class:`RunHeartbeatThread` after the coordination seat is minted and joins
 it (via :meth:`RunHeartbeatThread.stop`) before every ``release_seat`` call.
 The thread shares ZERO Python state with the ``RowProcessor`` — it
-communicates through two :class:`threading.Event` flags:
+communicates through :class:`threading.Event` flags:
 
 - ``_stop_event``: set by the owner to signal the thread to exit; also used
   as the clock/sleep primitive via ``_stop_event.wait(interval)`` so that unit
   tests can inject a fast-forwarding ``wait_fn`` without real wall-clock sleeps.
+- ``_skip_final_beat_event``: set only for a known-terminal follower whose
+  membership row may already be departed, preventing shutdown from
+  misclassifying that clean departure as eviction.
 - ``_coordination_lost_event``: set by the thread when ``worker_heartbeat``
   returns ``worker_active=False`` (this worker's registry row left ``active``)
   OR when the snapshot's ``leader_worker_id`` differs from our own worker_id
   (deposed — another process took the seat). The drain loop raises
   :class:`~elspeth.contracts.errors.RunWorkerEvictedError` at the next
   boundary by polling :meth:`check_and_raise`.
+- ``_fatal_event``: set when a Tier-1 integrity failure must be re-raised by
+  the drain thread at its next boundary.
 
 Design invariants enforced here:
 
@@ -153,6 +158,7 @@ class RunHeartbeatThread:
         self._degraded_threshold = degraded_threshold
 
         self._stop_event = threading.Event()
+        self._skip_final_beat_event = threading.Event()
         # wait_fn defaults to _stop_event.wait after construction so that
         # injected wait_fn overrides are honoured while still allowing the
         # default binding to reference the instance's own Event.
@@ -183,13 +189,18 @@ class RunHeartbeatThread:
         """Start the background thread."""
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, *, final_beat: bool = True) -> None:
         """Signal the thread to stop and block until it exits.
 
         Must be called (in a ``finally`` block) before every ``release_seat``
         call so that the thread cannot beat the seat after the release vacates
-        it.  Idempotent — safe to call more than once.
+        it.  A follower that has already observed terminal run state may pass
+        ``final_beat=False``: finalization can atomically depart its membership
+        row before the follower stops, so another beat would misclassify that
+        clean departure as eviction.  Idempotent — safe to call more than once.
         """
+        if not final_beat:
+            self._skip_final_beat_event.set()
         self._stop_event.set()
         self._thread.join()
 
@@ -242,8 +253,10 @@ class RunHeartbeatThread:
             self._beat_once()
         # Final beat on exit: keeps the seat live until release_seat is called
         # (stop() is called in the finally block just before release_seat).
-        # Best-effort — never raises.
-        self._beat_once()
+        # A known-terminal follower skips it because finalize may already have
+        # departed the follower row. Best-effort — never raises.
+        if not self._skip_final_beat_event.is_set():
+            self._beat_once()
 
     def _beat_once(self) -> None:
         """Execute one heartbeat tick; NEVER raises.

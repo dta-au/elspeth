@@ -256,6 +256,7 @@ class FollowerProcessor:
             now_fn=self._now_fn,
         )
         heartbeat.start()
+        terminal_exit = False
         try:
             self._drain_loop(ctx, heartbeat)
         except RunWorkerEvictedError:
@@ -270,7 +271,7 @@ class FollowerProcessor:
                     self._token.worker_id,
                     self._token.run_id,
                 )
-                self._best_effort_depart()
+                terminal_exit = True
                 return
             # True eviction: leader's housekeeping sweep evicted us while the
             # run is still RUNNING (design case b). Propagate (CLI exit 3).
@@ -296,9 +297,15 @@ class FollowerProcessor:
             ) from None
         else:
             # Clean terminal exit.
-            self._best_effort_depart()
+            terminal_exit = True
         finally:
-            heartbeat.stop()
+            if terminal_exit:
+                try:
+                    heartbeat.stop(final_beat=False)
+                finally:
+                    self._best_effort_depart()
+            else:
+                heartbeat.stop()
 
     # ------------------------------------------------------------------
     # Internal

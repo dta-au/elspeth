@@ -20,7 +20,9 @@ elspeth run --settings examples/json_explode/settings.yaml --execute
 
 ## Output
 
-Results appear in `output/order_items.json` (JSONL format). Each line contains the original `order_id` plus:
+Results appear in `output/order_items.json` as one JSON array containing six
+expanded objects. Each object contains the original `order_id` plus:
+
 - `item` — The individual item object from the array
 - `item_index` — The position within the original array (0-based)
 
