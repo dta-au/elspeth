@@ -172,10 +172,13 @@ def build_llm_source_output_schema_config(
     """Add the fields guaranteed by a single-request LLM source.
 
     Explicit authored fields may repeat an LLM output field only with its
-    runtime type; fields and guarantees outside the three emitted values are
-    rejected because a source has no upstream row from which to preserve them.
-    The returned schema preserves the authored mode and contract metadata while
-    making all three emitted fields required and guaranteed.
+    runtime type; fields, guarantees, and audit_fields outside the three
+    emitted values are rejected because a source has no upstream row from
+    which to preserve them, and required_fields are rejected outright
+    because a source has no input row to require fields of
+    (elspeth-fb202d3793). The returned schema preserves the authored mode
+    and contract metadata while making all three emitted fields required
+    and guaranteed.
     """
     validate_field_name(response_field, "response_field")
     guaranteed_fields = get_llm_guaranteed_fields(response_field)
@@ -196,6 +199,15 @@ def build_llm_source_output_schema_config(
         raise ValueError(
             f"LLM source guaranteed field(s) {unsupported} are outside the emitted fields; "
             "an LLM source does not emit arbitrary authored fields"
+        )
+    if schema_config.required_fields is not None:
+        required = ", ".join(repr(field_name) for field_name in sorted(schema_config.required_fields))
+        raise ValueError(f"LLM source schema declares required_fields {required}; a source has no input row, so it cannot require fields")
+    unsupported_audit = sorted(set(schema_config.audit_fields or ()) - set(expected_types))
+    if unsupported_audit:
+        unsupported = ", ".join(repr(field_name) for field_name in unsupported_audit)
+        raise ValueError(
+            f"LLM source audit field(s) {unsupported} are outside the emitted fields; an LLM source does not emit arbitrary authored fields"
         )
     for field_name, expected_type in expected_types.items():
         if field_name not in authored_by_name:

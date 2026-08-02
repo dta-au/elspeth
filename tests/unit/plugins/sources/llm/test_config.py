@@ -343,3 +343,64 @@ def test_source_provider_schema_stays_in_parity_with_transform_single_request_fi
 
     assert set(source_model.model_fields) == (set(transform_model.model_fields) - TRANSFORM_ONLY_FIELDS) | {"on_validation_failure"}
     assert cast(Any, source_model).VALUE_SOURCES == cast(Any, transform_model).VALUE_SOURCES
+
+
+# --- Contract-claim hardening (elspeth-fb202d3793) ---
+# A source has no input row, so required_fields can never be satisfied, and
+# LLM audit provenance travels in success_reason metadata, never row fields.
+# Both would otherwise serialize false contract claims into the audit trail.
+
+
+def test_source_config_rejects_required_fields(
+    openrouter_config: Callable[..., dict[str, Any]],
+) -> None:
+    with pytest.raises(PluginConfigError, match=r"required_fields.*no input row"):
+        OpenRouterLLMSourceConfig.from_dict(
+            openrouter_config(
+                response_field="briefing",
+                schema={"mode": "observed", "required_fields": ["upstream_customer_id"]},
+            ),
+            plugin_name="llm",
+        )
+
+
+def test_source_config_rejects_audit_fields_it_cannot_emit(
+    openrouter_config: Callable[..., dict[str, Any]],
+) -> None:
+    with pytest.raises(PluginConfigError, match=r"briefing_template_hash.*does not emit"):
+        OpenRouterLLMSourceConfig.from_dict(
+            openrouter_config(
+                response_field="briefing",
+                schema={"mode": "observed", "audit_fields": ["briefing_template_hash"]},
+            ),
+            plugin_name="llm",
+        )
+
+
+def test_source_config_preserves_audit_fields_within_emitted_set(
+    openrouter_config: Callable[..., dict[str, Any]],
+) -> None:
+    cfg = OpenRouterLLMSourceConfig.from_dict(
+        openrouter_config(
+            response_field="briefing",
+            schema={"mode": "observed", "audit_fields": ["briefing_usage"]},
+        ),
+        plugin_name="llm",
+    )
+    assert cfg.schema_config.audit_fields == ("briefing_usage",)
+
+
+def test_public_source_schema_helper_rejects_required_fields() -> None:
+    with pytest.raises(ValueError, match=r"required_fields.*no input row"):
+        build_llm_source_output_schema_config(
+            SchemaConfig(mode="observed", required_fields=("upstream_customer_id",)),
+            "summary",
+        )
+
+
+def test_public_source_schema_helper_rejects_non_emitted_audit_fields() -> None:
+    with pytest.raises(ValueError, match=r"summary_template_hash.*does not emit"):
+        build_llm_source_output_schema_config(
+            SchemaConfig(mode="observed", audit_fields=("summary_template_hash",)),
+            "summary",
+        )
