@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from elspeth.plugins.infrastructure.telemetry import warn_telemetry_before_start
+import pytest
+
+from elspeth.contracts.errors import FrameworkBugError
+from elspeth.plugins.infrastructure.telemetry import emit_resource_cleanup_failed, warn_telemetry_before_start
 
 
 class _RecordingLogger:
@@ -26,3 +29,22 @@ def test_warn_telemetry_before_start_records_event_type() -> None:
             {"event_type": "object"},
         )
     ]
+
+
+@pytest.mark.parametrize("failure", [FrameworkBugError("telemetry invariant failed"), KeyboardInterrupt(), SystemExit(17)])
+def test_cleanup_telemetry_does_not_suppress_unsuppressible_failures(failure: BaseException) -> None:
+    def fail_emit(_event: object) -> None:
+        raise failure
+
+    with pytest.raises(type(failure)):
+        emit_resource_cleanup_failed(
+            fail_emit,
+            run_id="run-1",
+            component="component",
+            resource="provider",
+            error=RuntimeError("cleanup failed"),
+            suppressed=True,
+            state_id=None,
+            operation_id="operation-1",
+            token_id=None,
+        )
