@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import itertools
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -16,6 +17,22 @@ import yaml
 
 from elspeth.web._aws_ecs_acceptance import scenario_inventory, task_definition
 from elspeth.web.provider_config_policy import web_aws_s3_source_policy_error
+
+
+def _require_terraform(reason: str) -> None:
+    """Skip locally when terraform is absent; fail loudly in CI.
+
+    A silent CI skip proved nothing about the shipped package
+    (elspeth-af1efcb8d8). The workflow installs a checksum-pinned
+    terraform, so absence under GITHUB_ACTIONS is a broken gate, not an
+    environment quirk.
+    """
+    if shutil.which("terraform") is not None:
+        return
+    if os.environ.get("GITHUB_ACTIONS"):
+        pytest.fail(f"terraform binary is missing in CI: {reason}")
+    pytest.skip(f"terraform is not installed, so {reason}")
+
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PACKAGE = REPO_ROOT / "deploy" / "aws-ecs" / "terraform"
@@ -185,6 +202,11 @@ _ALB_INGRESS_CASES: tuple[tuple[str, bool], ...] = (
     # every IPv6 CIDR is rejected. Fail-closed, and the message says so.
     ('["::/0"]', False),
     ('["2001:db8::/32"]', False),
+    # A union of broader-than-/8 prefixes reopens the world without any
+    # single entry spelling /0: the guard enforces a /8 prefix floor.
+    ('["0.0.0.0/1", "128.0.0.0/1"]', False),
+    ('["64.0.0.0/2"]', False),
+    ('["10.0.0.0/7"]', False),
 )
 
 
@@ -219,8 +241,7 @@ def test_alb_ingress_guard_rejects_every_spelling_of_a_world_open_cidr(tmp_path:
         + "; every root must reject exactly what the module rejects"
     )
 
-    if shutil.which("terraform") is None:
-        pytest.skip("terraform is not installed, so the ingress guard cannot be exercised")
+    _require_terraform("the ingress guard cannot be exercised")
 
     (tmp_path / "main.tf").write_text(next(iter(blocks.values())), encoding="utf-8")
     init = subprocess.run(
@@ -923,8 +944,11 @@ def test_task_role_can_list_the_acceptance_bucket_so_head_object_can_report_miss
     assert "condition" not in list_bucket_statement
 
     # Same boundary-intersection requirement as the Bedrock grant: bucket-level (not
-    # object-level) ListBucket must also be allowed by the permissions boundary.
-    assert '"arn:aws:s3:::elspeth-*"' in bootstrap
+    # object-level) ListBucket must also be allowed by the permissions boundary —
+    # run-scoped to the derived scenario bucket names, never elspeth-* (which also
+    # matched every sibling run's bucket and the Terraform state bucket).
+    assert '[for bucket in local.scenario_buckets : "arn:aws:s3:::${bucket}"]' in bootstrap
+    assert '"arn:aws:s3:::elspeth-*"' not in bootstrap
     assert re.search(r'actions\s*=\s*\["s3:ListBucket"\]', bootstrap)
 
 
@@ -1622,8 +1646,7 @@ def initialized_scenario_a() -> Path:
     credentials.
     """
     directory = PACKAGE / "scenario-a"
-    if shutil.which("terraform") is None:
-        pytest.skip("terraform is not installed, so the native mock-plan contract cannot be exercised")
+    _require_terraform("the native mock-plan contract cannot be exercised")
     if not (directory / ".terraform").is_dir():
         result = subprocess.run(
             ["terraform", f"-chdir={directory}", "init", "-backend=false", "-input=false", "-no-color"],
@@ -1702,7 +1725,7 @@ def test_monitoring_resources_use_a_retained_digest_pinned_collector() -> None:
     assert '"untagged"' in bootstrap
     assert "cloudwatch_agent_repository_url" in bootstrap_outputs
     assert "@sha256:" in variables
-    assert re.search(r"Deploy the\s+CloudWatch agent by digest", readme)
+    assert re.search(r"Deploy both\s+images\s+by\s+digest", readme)
     ecs = _text("modules/scenario/ecs.tf")
     observability = _text("modules/scenario/iam_observability.tf")
     assert re.search(
@@ -1801,7 +1824,14 @@ def test_acceptance_verifier_containers_use_the_live_published_identity() -> Non
         assert re.search(rf'\buser\s*=\s*"{re.escape(published_user)}"', container)
 
 
-def test_scenario_b_inventory_has_a_validated_nonempty_cognito_subject() -> None:
+def test_scenario_b_cognito_subject_binds_after_pool_creation_not_before() -> None:
+    """The subject cannot exist before the apply that creates the pool.
+
+    Requiring a nonempty subject on the fresh apply was a bootstrap
+    deadlock: Terraform demanded a Cognito `sub` from a pool it had not
+    created yet. Empty is the documented pre-bind state; the acceptance
+    inventory check refuses to run while the pool has no bound subject.
+    """
     module_variables = _text("modules/scenario/variables.tf")
     outputs = _text("modules/scenario/outputs.tf")
     scenario_a_variables = _text("scenario-a/variables.tf")
@@ -1810,18 +1840,25 @@ def test_scenario_b_inventory_has_a_validated_nonempty_cognito_subject() -> None
 
     assert 'variable "cognito_subject_sub"' in module_variables
     assert 'var.scenario_id == "A" ? var.cognito_subject_sub == ""' in module_variables
+    assert 'var.cognito_subject_sub == "" || can(regex(' in module_variables
     assert 'cognito_subject_sub             = var.scenario_id == "B" ? var.cognito_subject_sub : ""' in outputs
     assert re.search(r'variable "cognito_subject_sub".*?default\s*=\s*""', scenario_a_variables, re.DOTALL)
     assert re.search(
-        r'variable "cognito_subject_sub".*?condition\s*=\s*\(\s*'
-        r"length\(trimspace\(var\.cognito_subject_sub\)\)\s*>\s*0",
+        r'variable "cognito_subject_sub".*?default\s*=\s*""',
         scenario_b_variables,
         re.DOTALL,
     )
     assert re.search(
-        r'cognito_subject_sub\s*=\s*"REPLACE_WITH_SCENARIO_B_COGNITO_SUBJECT"',
+        r'variable "cognito_subject_sub".*?condition\s*=\s*\(\s*'
+        r'var\.cognito_subject_sub\s*==\s*""',
+        scenario_b_variables,
+        re.DOTALL,
+    )
+    assert re.search(
+        r'cognito_subject_sub\s*=\s*""',
         scenario_b_example,
     )
+    assert "re-apply" in scenario_b_example
 
 
 def test_scenario_b_reuses_the_single_bootstrap_run_identity() -> None:
@@ -1857,7 +1894,8 @@ def test_explicit_aws_profile_is_bound_across_provider_backend_and_local_cli() -
         assert re.search(r"\baws_profile\s+=\s+var\.aws_profile\b", _text(f"{scenario}/main.tf"))
 
     assert re.search(r"\bAWS_PROFILE\s*=\s*var\.aws_profile\b", database_bootstrap)
-    assert database_bootstrap.count('--profile "$AWS_PROFILE"') == 3
+    # run-task, wait, describe-tasks, and the wait-failure stop-task arm.
+    assert database_bootstrap.count('--profile "$AWS_PROFILE"') == 4
     assert 'aws --profile "$AWS_PROFILE" --region "$AWS_REGION"' in readme
     assert "--profile ${jsonencode(var.aws_profile)}" in module_outputs
     assert "--region ${jsonencode(var.aws_region)}" in module_outputs

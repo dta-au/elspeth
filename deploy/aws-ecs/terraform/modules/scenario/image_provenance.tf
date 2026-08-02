@@ -1,3 +1,14 @@
+# ADMISSION TRUST MODEL (elspeth-9f7d336e1c residual): these checks prove
+# that the image the operator named is the image ECR serves (every
+# reference is a digest, and the pull is by that digest) and that its
+# self-declared org.opencontainers.image.revision label matches the SHA
+# the operator claims. They do NOT prove producer identity — the label is
+# writable by any builder, and CI's cosign signature is not verified on
+# the GHCR-to-ECR handoff — and they do NOT prove settings-contract
+# compatibility: a truthfully-labelled older image passes admission and
+# then fails every task at settings load. The supported pairing remains a
+# package and image cut from the same commit by the operator who supplies
+# both values; see README "Minimum image revision".
 resource "terraform_data" "candidate_image_provenance" {
   input = var.candidate_image
 

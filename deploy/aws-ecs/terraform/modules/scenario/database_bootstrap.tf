@@ -20,6 +20,18 @@ locals {
         os.environ["ELSPETH_DB_LANDSCAPE_DATABASE"],
     ]
 
+    # Fail closed before any DDL: the loop below unconditionally rewrites
+    # ownership of every named database, so a name colliding with the
+    # cluster's administrative databases (or the admin connection's own
+    # database) would hijack them rather than error.
+    reserved_databases = {"postgres", "template0", "template1", "rdsadmin"}
+    admin_database = urlsplit(admin_url).path.lstrip("/").lower() or "postgres"
+    for database in databases:
+        if database.lower() in reserved_databases or database.lower() == admin_database:
+            raise SystemExit(f"database_bootstrap_reserved_database_name:{database}")
+    if len({database.lower() for database in databases}) != len(databases):
+        raise SystemExit("database_bootstrap_duplicate_database_names")
+
     def database_url(database: str) -> str:
         parsed = urlsplit(admin_url)
         return urlunsplit((parsed.scheme, parsed.netloc, f"/{database}", parsed.query, ""))
@@ -186,6 +198,15 @@ resource "terraform_data" "database_bootstrap" {
         --region "$AWS_REGION" \
         --cluster "$ECS_CLUSTER" \
         --tasks "$task_arn" >"$work/wait.out" 2>"$work/wait.err"; then
+        # The launched task may still be running (wait timeout/API error);
+        # a failed apply must not leave a live Fargate task holding the
+        # admin credentials.
+        aws ecs stop-task \
+          --profile "$AWS_PROFILE" \
+          --region "$AWS_REGION" \
+          --cluster "$ECS_CLUSTER" \
+          --task "$task_arn" \
+          --reason database_bootstrap_wait_failed >/dev/null 2>&1 || true
         printf '%s\n' database_bootstrap_wait_failed >&2
         exit 1
       fi

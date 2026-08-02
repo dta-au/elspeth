@@ -41,11 +41,32 @@
       }
     },
     {
+      "Sid": "TagElbResourcesOnRunScopedCreate",
+      "Effect": "Allow",
+      "Action": [
+        "elasticloadbalancing:AddTags"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/ACCEPTANCE_RUN_ID": "${run_id}",
+          "aws:RequestedRegion": "${aws_region}",
+          "elasticloadbalancing:CreateAction": [
+            "CreateLoadBalancer",
+            "CreateTargetGroup",
+            "CreateListener",
+            "CreateRule"
+          ]
+        }
+      }
+    },
+    {
       "Sid": "MutateRunTaggedRegionalResources",
       "Effect": "Allow",
       "Action": [
         "acm:AddTagsToCertificate",
         "acm:DeleteCertificate",
+        "acm:ImportCertificate",
         "acm:RemoveTagsFromCertificate",
         "bedrock:CreateGuardrailVersion",
         "bedrock:DeleteGuardrail",

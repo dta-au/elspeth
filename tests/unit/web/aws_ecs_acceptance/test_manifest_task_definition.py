@@ -797,6 +797,54 @@ def test_task_definition_policy_binding_requires_explicit_nonroot_one_shot_entry
         )
 
 
+def test_task_definition_policy_binding_accepts_terraform_pathed_role_arns(tmp_path: Path) -> None:
+    manifest_path, container_name, inventory, payload = _task_definition_policy_payload(tmp_path)
+    run_id = inventory["acceptance_run_id"]
+    task_role_name, execution_role_name = inventory["orphan_sweep"]["iam_role_names"][:2]
+    task = payload["taskDefinition"]
+    task["taskRoleArn"] = f"arn:aws:iam::123456789012:role/elspeth/{run_id}/{task_role_name}"
+    task["executionRoleArn"] = f"arn:aws:iam::123456789012:role/elspeth/{run_id}/{execution_role_name}"
+
+    assert (
+        acceptance.validate_task_definition_policy_binding(
+            payload,
+            manifest_path=manifest_path,
+            scenario_id="A",
+            container_name=container_name,
+        )
+        == task["taskDefinitionArn"]
+    )
+
+
+@pytest.mark.parametrize(
+    "role_resource_template",
+    [
+        pytest.param("role/elspeth//{name}", id="empty-path-segment"),
+        pytest.param("user/elspeth/{run_id}/{name}", id="wrong-resource-type"),
+        pytest.param("role/elspeth/{run_id}/", id="missing-role-name"),
+        pytest.param("role//elspeth/{run_id}/{name}", id="leading-empty-path-segment"),
+        pytest.param("role/elspeth/bad segment/{name}", id="invalid-path-character"),
+    ],
+)
+def test_task_definition_policy_binding_rejects_malformed_pathed_role_arns(
+    tmp_path: Path,
+    role_resource_template: str,
+) -> None:
+    manifest_path, container_name, inventory, payload = _task_definition_policy_payload(tmp_path)
+    run_id = inventory["acceptance_run_id"]
+    task_role_name = inventory["orphan_sweep"]["iam_role_names"][0]
+    resource = role_resource_template.format(run_id=run_id, name=task_role_name)
+    payload["taskDefinition"]["taskRoleArn"] = f"arn:aws:iam::123456789012:{resource}"
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="task_definition_policy_binding"):
+        acceptance.validate_task_definition_policy_binding(
+            payload,
+            manifest_path=manifest_path,
+            scenario_id="A",
+            container_name=container_name,
+        )
+
+
 def test_task_definition_policy_binding_requires_manifest_pinned_image(tmp_path: Path) -> None:
     manifest_path, container_name, _inventory, payload = _task_definition_policy_payload(tmp_path)
     container = payload["taskDefinition"]["containerDefinitions"][0]

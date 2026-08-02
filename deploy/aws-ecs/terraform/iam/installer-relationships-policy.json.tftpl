@@ -52,6 +52,7 @@
         "ec2:DeleteRoute",
         "ec2:DetachInternetGateway",
         "ec2:DisassociateRouteTable",
+        "ec2:ModifySubnetAttribute",
         "ec2:ModifyVpcAttribute",
         "ec2:RevokeSecurityGroupEgress",
         "ec2:RevokeSecurityGroupIngress"
@@ -110,7 +111,16 @@
       "Condition": {
         "StringEquals": {
           "aws:RequestTag/ACCEPTANCE_RUN_ID": "${run_id}",
-          "aws:RequestedRegion": "${aws_region}"
+          "aws:RequestedRegion": "${aws_region}",
+          "ec2:CreateAction": [
+            "AuthorizeSecurityGroupEgress",
+            "AuthorizeSecurityGroupIngress",
+            "CreateInternetGateway",
+            "CreateRouteTable",
+            "CreateSecurityGroup",
+            "CreateSubnet",
+            "CreateVpc"
+          ]
         }
       }
     },
@@ -118,6 +128,8 @@
       "Sid": "ManageRunCognitoChildren",
       "Effect": "Allow",
       "Action": [
+        "cognito-idp:AdminCreateUser",
+        "cognito-idp:AdminGetUser",
         "cognito-idp:CreateUserPoolClient",
         "cognito-idp:CreateUserPoolDomain",
         "cognito-idp:DeleteUserPoolClient",

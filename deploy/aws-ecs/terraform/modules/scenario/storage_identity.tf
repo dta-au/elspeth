@@ -219,8 +219,16 @@ resource "aws_bedrock_guardrail" "prompt" {
 
 resource "aws_bedrock_guardrail_version" "prompt" {
   guardrail_arn = aws_bedrock_guardrail.prompt.guardrail_arn
-  description   = "Immutable disposable ELSPETH prompt acceptance version"
-  skip_destroy  = false
+  # The content digest in the description forces a NEW immutable version
+  # whenever the effective guardrail policy changes. With a constant
+  # description the parent updated in place, no new version was cut, and
+  # task definitions kept injecting the superseded safety policy.
+  description  = "Disposable ELSPETH prompt acceptance version ${substr(sha256(jsonencode(local.effective_prompt_guardrail)), 0, 12)}"
+  skip_destroy = false
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_bedrock_guardrail" "content" {
@@ -246,8 +254,14 @@ resource "aws_bedrock_guardrail" "content" {
 
 resource "aws_bedrock_guardrail_version" "content" {
   guardrail_arn = aws_bedrock_guardrail.content.guardrail_arn
-  description   = "Immutable disposable ELSPETH content acceptance version"
-  skip_destroy  = false
+  # Content digest forces a new version on policy change — see the
+  # prompt version resource above for the full rationale.
+  description  = "Disposable ELSPETH content acceptance version ${substr(sha256(jsonencode(local.effective_content_guardrail)), 0, 12)}"
+  skip_destroy = false
+
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
 resource "aws_cognito_user_pool" "web" {

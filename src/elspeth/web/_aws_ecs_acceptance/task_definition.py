@@ -311,10 +311,10 @@ def validate_task_definition_policy_binding(
         raise AcceptanceCheckError("task_definition_policy_binding")
     for field, expected_name in expected_roles.items():
         role_arn = task.get(field)
-        if type(role_arn) is not str:
+        if type(role_arn) is not str or len(role_arn) > 2048:
             raise AcceptanceCheckError("task_definition_policy_binding")
         match = re.fullmatch(
-            r"arn:aws(?:-us-gov|-cn)?:iam::([0-9]{12}):role/([A-Za-z0-9+=,.@_-]{1,64})",
+            r"arn:aws(?:-us-gov|-cn)?:iam::([0-9]{12}):role/(?:[A-Za-z0-9+=,.@_-]+/)*([A-Za-z0-9+=,.@_-]{1,64})",
             role_arn,
         )
         if match is None or match.group(1) != account_id or match.group(2) != expected_name or expected_name not in role_names:
