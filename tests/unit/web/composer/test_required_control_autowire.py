@@ -397,7 +397,7 @@ class TestLLMSourceAutoWireSplicing:
 
         assert wire_required_controls(candidate, snapshot, view) is candidate
 
-    @pytest.mark.parametrize("failure_route", ["quarantine", "", None, 17])
+    @pytest.mark.parametrize("failure_route", ["quarantine", "", 17])
     def test_non_discard_or_malformed_validation_failure_refuses_the_entire_candidate(
         self,
         tmp_path: Path,
@@ -408,6 +408,27 @@ class TestLLMSourceAutoWireSplicing:
         candidate = _bare_llm_source_candidate(on_validation_failure=failure_route)
 
         assert wire_required_controls(candidate, snapshot, view) is candidate
+
+    @pytest.mark.parametrize("container", ["source", "sources"])
+    @pytest.mark.parametrize("default_spelling", ["omitted", "null"])
+    def test_defaulted_discard_validation_failure_is_auto_wired(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+        container: str,
+        default_spelling: str,
+    ) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_source_candidate(container=container, source_name="briefing")
+        source = candidate["source"] if container == "source" else candidate["sources"]["briefing"]
+        if default_spelling == "omitted":
+            source.pop("on_validation_failure")
+        else:
+            source["on_validation_failure"] = None
+
+        wired = wire_required_controls(candidate, snapshot, view)
+
+        assert _nodes_by_id(dict(wired))["content_safety_auto_1"]["plugin"] == "aws_bedrock_content_safety"
 
     def test_validation_failure_requires_an_exact_builtin_discard_string(
         self,

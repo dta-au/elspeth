@@ -253,73 +253,57 @@ def test_nullable_authored_output_fields_are_rejected(
         )
 
 
-def test_source_config_augments_fixed_schema_and_preserves_mode(
+def test_source_config_rejects_fixed_schema_fields_it_cannot_emit(
     openrouter_config: Callable[..., dict[str, Any]],
 ) -> None:
-    cfg = OpenRouterLLMSourceConfig.from_dict(
-        openrouter_config(
-            response_field="answer",
-            schema={
-                "mode": "fixed",
-                "fields": ["request_id: str"],
-                "guaranteed_fields": ["request_id"],
-            },
-        ),
-        plugin_name="llm",
-    )
-
-    assert cfg.schema_config.mode == "fixed"
-    assert cfg.schema_config.fields is not None
-    fields = {field.name: field for field in cfg.schema_config.fields}
-    assert fields == {
-        "request_id": FieldDefinition(name="request_id", field_type="str"),
-        "answer": FieldDefinition(name="answer", field_type="str"),
-        "answer_usage": FieldDefinition(name="answer_usage", field_type="any"),
-        "answer_model": FieldDefinition(name="answer_model", field_type="str"),
-    }
-    assert set(cfg.schema_config.guaranteed_fields or ()) == {
-        "request_id",
-        "answer",
-        "answer_usage",
-        "answer_model",
-    }
+    with pytest.raises(PluginConfigError, match=r"request_id.*does not emit"):
+        OpenRouterLLMSourceConfig.from_dict(
+            openrouter_config(
+                response_field="answer",
+                schema={
+                    "mode": "fixed",
+                    "fields": ["request_id: str"],
+                    "guaranteed_fields": ["request_id"],
+                },
+            ),
+            plugin_name="llm",
+        )
 
 
-def test_source_config_augments_observed_schema_guarantees(
+def test_source_config_rejects_observed_guarantees_it_cannot_emit(
     openrouter_config: Callable[..., dict[str, Any]],
 ) -> None:
-    cfg = OpenRouterLLMSourceConfig.from_dict(
-        openrouter_config(
-            response_field="answer",
-            schema={"mode": "observed", "guaranteed_fields": ["request_id"]},
-        ),
-        plugin_name="llm",
-    )
-
-    assert cfg.schema_config.mode == "observed"
-    assert cfg.schema_config.fields is None
-    assert set(cfg.schema_config.guaranteed_fields or ()) == {
-        "request_id",
-        "answer",
-        "answer_usage",
-        "answer_model",
-    }
+    with pytest.raises(PluginConfigError, match=r"request_id.*does not emit"):
+        OpenRouterLLMSourceConfig.from_dict(
+            openrouter_config(
+                response_field="answer",
+                schema={"mode": "observed", "guaranteed_fields": ["request_id"]},
+            ),
+            plugin_name="llm",
+        )
 
 
 def test_public_source_schema_helper_uses_configurable_output_base() -> None:
+    authored_fields = (
+        FieldDefinition(name="summary", field_type="str"),
+        FieldDefinition(name="summary_usage", field_type="any"),
+        FieldDefinition(name="summary_model", field_type="str"),
+    )
     result = build_llm_source_output_schema_config(
-        SchemaConfig(mode="flexible", fields=(FieldDefinition(name="request_id", field_type="str"),)),
+        SchemaConfig(mode="flexible", fields=authored_fields),
         "summary",
     )
 
     assert result.mode == "flexible"
-    assert result.fields is not None
-    assert {field.name: field.field_type for field in result.fields} == {
-        "request_id": "str",
-        "summary": "str",
-        "summary_usage": "any",
-        "summary_model": "str",
-    }
+    assert result.fields == authored_fields
+
+
+def test_public_source_schema_helper_rejects_non_emitted_fields() -> None:
+    with pytest.raises(ValueError, match=r"request_id.*does not emit"):
+        build_llm_source_output_schema_config(
+            SchemaConfig(mode="flexible", fields=(FieldDefinition(name="request_id", field_type="str"),)),
+            "summary",
+        )
 
 
 def test_public_source_schema_helper_rejects_keyword_output_base() -> None:

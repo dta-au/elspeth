@@ -172,8 +172,10 @@ def build_llm_source_output_schema_config(
     """Add the fields guaranteed by a single-request LLM source.
 
     Explicit authored fields may repeat an LLM output field only with its
-    runtime type. The returned schema preserves the authored mode and contract
-    metadata while making all three emitted fields required and guaranteed.
+    runtime type; fields and guarantees outside the three emitted values are
+    rejected because a source has no upstream row from which to preserve them.
+    The returned schema preserves the authored mode and contract metadata while
+    making all three emitted fields required and guaranteed.
     """
     validate_field_name(response_field, "response_field")
     guaranteed_fields = get_llm_guaranteed_fields(response_field)
@@ -181,6 +183,20 @@ def build_llm_source_output_schema_config(
 
     authored_fields = schema_config.fields or ()
     authored_by_name = {field.name: field for field in authored_fields}
+    unsupported_fields = sorted(set(authored_by_name) - set(expected_types))
+    if unsupported_fields:
+        unsupported = ", ".join(repr(field_name) for field_name in unsupported_fields)
+        raise ValueError(
+            f"LLM source schema field(s) {unsupported} are outside the emitted fields; "
+            "an LLM source does not emit arbitrary authored fields"
+        )
+    unsupported_guarantees = sorted(set(schema_config.guaranteed_fields or ()) - set(expected_types))
+    if unsupported_guarantees:
+        unsupported = ", ".join(repr(field_name) for field_name in unsupported_guarantees)
+        raise ValueError(
+            f"LLM source guaranteed field(s) {unsupported} are outside the emitted fields; "
+            "an LLM source does not emit arbitrary authored fields"
+        )
     for field_name, expected_type in expected_types.items():
         if field_name not in authored_by_name:
             continue

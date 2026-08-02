@@ -53,19 +53,30 @@ def validate_azure_endpoint(value: str) -> str:
 
 
 def derive_azure_model(data: Any) -> Any:
-    """Fill an omitted Azure model from its deployment name."""
-    if isinstance(data, dict) and not data.get("model"):
-        deployment = data.get("deployment_name")
-        if deployment:
-            data["model"] = deployment
+    """Fill an omitted, null, or empty Azure model from its deployment name."""
+    if isinstance(data, dict) and ("model" not in data or data["model"] is None or data["model"] == "") and "deployment_name" in data:
+        deployment = data["deployment_name"]
+        data["model"] = deployment
     return data
 
 
 def normalize_openrouter_base_url(value: str) -> str:
     """Normalize base URL spellings that runtime HTTP joining treats as identical."""
     parsed = urlsplit(value)
+    hostname = parsed.hostname
+    if hostname is None:
+        raise ValueError("base_url must include a hostname")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(f"base_url must have a valid port: {exc}") from exc
+    normalized_host = hostname.lower()
+    if ":" in normalized_host:
+        normalized_host = f"[{normalized_host}]"
+    default_port = 443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else None
+    netloc = normalized_host if port is None or port == default_port else f"{normalized_host}:{port}"
     path = parsed.path.rstrip("/")
-    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+    return urlunsplit((parsed.scheme, netloc, path, parsed.query, parsed.fragment))
 
 
 def validate_openrouter_base_url(value: str) -> str:

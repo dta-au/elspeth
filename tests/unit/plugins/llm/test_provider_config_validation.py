@@ -7,11 +7,13 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
 
 from elspeth.contracts.value_source import CatalogValueSource
+from elspeth.engine.orchestrator.preflight import check_config_value_sources
 from elspeth.plugins.llm.config_validation import (
     AZURE_MODEL_VALUE_SOURCES,
     BEDROCK_VALUE_SOURCES,
@@ -125,6 +127,26 @@ def test_azure_deployment_fallback_matches(config_model: type[Any], options: dic
 
 
 @pytest.mark.parametrize("config_model,common", [(AzureOpenAILLMSourceConfig, _SOURCE_COMMON), (AzureOpenAIConfig, _TRANSFORM_COMMON)])
+@pytest.mark.parametrize("malformed_model", [0, False])
+def test_azure_rejects_falsey_non_string_model_values(
+    config_model: type[Any],
+    common: dict[str, Any],
+    malformed_model: object,
+) -> None:
+    with pytest.raises(ValidationError, match="model"):
+        config_model.model_validate(
+            {
+                **common,
+                "provider": "azure",
+                "model": malformed_model,
+                "deployment_name": "gpt-4o-mini",
+                "endpoint": "https://example.openai.azure.com",
+                "api_key": "test-api-key",
+            }
+        )
+
+
+@pytest.mark.parametrize("config_model,common", [(AzureOpenAILLMSourceConfig, _SOURCE_COMMON), (AzureOpenAIConfig, _TRANSFORM_COMMON)])
 def test_azure_rejects_remote_http_endpoint(config_model: type[Any], common: dict[str, Any]) -> None:
     with pytest.raises(ValidationError, match="endpoint"):
         config_model.model_validate(
@@ -164,6 +186,37 @@ def test_openrouter_normalizes_url_and_rejects_remote_http(config_model: type[An
                 "base_url": "http://example.com/v1",
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("config_model", "common"),
+    [(OpenRouterLLMSourceConfig, _SOURCE_COMMON), (OpenRouterConfig, _TRANSFORM_COMMON)],
+)
+@pytest.mark.parametrize("equivalent_url", ["https://OPENROUTER.AI/api/v1", "https://openrouter.ai:443/api/v1"])
+def test_openrouter_provider_equivalent_urls_keep_catalog_enforcement(
+    config_model: type[Any],
+    common: dict[str, Any],
+    equivalent_url: str,
+) -> None:
+    config = config_model.model_validate(
+        {
+            **common,
+            "provider": "openrouter",
+            "model": "not/in-catalog",
+            "api_key": "test-api-key",
+            "base_url": equivalent_url,
+        }
+    )
+
+    with patch(
+        "elspeth.engine.orchestrator.preflight.get_catalog_values",
+        return_value=frozenset({"known/model"}),
+    ):
+        findings = check_config_value_sources(config, component_id="llm")
+
+    assert config.base_url == OPENROUTER_BASE_URL
+    assert len(findings) == 1
+    assert findings[0].field_name == "model"
 
 
 @pytest.mark.parametrize(
