@@ -606,6 +606,115 @@ async def test_settlement_rolls_back_state_event_and_status_when_interrupted_aft
 
 
 @pytest.mark.asyncio
+async def test_settlement_stamps_application_time_under_the_lock_not_at_request_entry(
+    service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The applied timestamp must describe the committing transaction.
+
+    A settlement that waits on the session lock must not record a time from
+    before the transaction it commits in. The clock is advanced exactly when
+    the lock is taken, so a pre-lock capture is distinguishable from a
+    post-lock one without depending on wall-clock timing.
+    """
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+
+    before_lock = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
+    after_lock = datetime(2026, 8, 2, 12, 0, 30, tzinfo=UTC)
+    clock = {"now": before_lock}
+    monkeypatch.setattr(service, "_now", lambda: clock["now"])
+    original_lock = service._session_write_lock
+
+    def advance_clock_on_lock(conn, session_id_arg):
+        clock["now"] = after_lock
+        return original_lock(conn, session_id_arg)
+
+    monkeypatch.setattr(service, "_session_write_lock", advance_clock_on_lock)
+
+    settled = await service.settle_pipeline_composition_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        draft_hash=plan.proposal.draft_hash,
+        reviewed_facts={},
+        state=_state_data(),
+        candidate_content_hash=_state_content_hash(_state_data()),
+        executor_content_hash=_state_content_hash(_state_data()),
+        final_composer_metadata=None,
+        dispatch=binding,
+        actor="user:alice",
+    )
+
+    assert settled.proposal.status == "committed"
+    with service._engine.begin() as conn:
+        accepted_at = conn.execute(
+            select(proposal_events_table.c.created_at).where(proposal_events_table.c.event_type == "proposal.accepted")
+        ).scalar_one()
+        state_at = conn.execute(select(composition_states_table.c.created_at)).scalar_one()
+    # SQLite hands back naive datetimes; compare on the same footing.
+    expected = after_lock.replace(tzinfo=None)
+    assert accepted_at.replace(tzinfo=None) == expected, "the accepted event was stamped before the settling transaction acquired the lock"
+    assert state_at.replace(tzinfo=None) == expected, "the committed state was stamped before the settling transaction acquired the lock"
+
+
+@pytest.mark.asyncio
+async def test_settlement_fails_closed_when_the_pending_cas_matches_no_row(
+    service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A zero-row pending CAS must abort, not report a terminalization that never happened.
+
+    The status guard on the authority row reads a snapshot taken earlier in
+    the transaction; the ``WHERE status == 'pending'`` predicate on the
+    settling UPDATE is what actually closes that window. If its rowcount is
+    ignored, a proposal that left ``pending`` under the caller is reported
+    settled while the row still carries the other writer's terminal status.
+    """
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _plan()
+    row = await _create(service, session_id, plan)
+    binding = await _persist_dispatch(service, session_id)
+    original = service._insert_composition_state
+
+    def terminalize_before_cas(conn, /, **kwargs):
+        state_id = original(conn, **kwargs)
+        # Same connection, so this lands inside the settling transaction and
+        # is exactly what the CAS predicate exists to detect.
+        conn.execute(update(composition_proposals_table).where(composition_proposals_table.c.id == str(row.id)).values(status="rejected"))
+        return state_id
+
+    monkeypatch.setattr(service, "_insert_composition_state", terminalize_before_cas)
+
+    with pytest.raises(AuditIntegrityError, match="pending"):
+        await service.settle_pipeline_composition_proposal(
+            session_id=session_id,
+            proposal_id=row.id,
+            draft_hash=plan.proposal.draft_hash,
+            reviewed_facts={},
+            state=_state_data(),
+            candidate_content_hash=_state_content_hash(_state_data()),
+            executor_content_hash=_state_content_hash(_state_data()),
+            final_composer_metadata=None,
+            dispatch=binding,
+            actor="user:alice",
+        )
+
+    with service._engine.begin() as conn:
+        assert conn.execute(select(func.count()).select_from(composition_states_table)).scalar_one() == 0
+        assert (
+            conn.execute(
+                select(func.count()).select_from(proposal_events_table).where(proposal_events_table.c.event_type == "proposal.accepted")
+            ).scalar_one()
+            == 0
+        )
+        assert conn.execute(select(composition_proposals_table.c.status)).scalar_one() == "pending"
+
+
+@pytest.mark.asyncio
 async def test_settlement_rejects_missing_or_tampered_durable_dispatch_audit(service: SessionServiceImpl) -> None:
     session_id = uuid4()
     _insert_session(service, session_id)
