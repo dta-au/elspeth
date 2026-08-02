@@ -219,7 +219,7 @@ def validate_runtime_plugins(
         errors = tuple(
             ValidationError(
                 component_id=finding.component_id,
-                component_type="transform",
+                component_type=finding.component_type,
                 message=finding.format(),
                 suggestion=(
                     "Use the list_models composer tool to pick a known model identifier; "
@@ -552,14 +552,9 @@ def build_static_llm_prompt_advisory_checks(
     """Build non-blocking static-prompt llm advisories after validation.
 
     Same happy-path-only contract as the identity and gate fan-out advisories.
-    Operator direction (elspeth-6bdb7e7736): a static-prompt llm transform is
-    essentially a *source* shape (generating rows) mis-declared as a
-    transform — so this never escalates to a rejection, now or later. Wording
-    deliberately asks rather than asserts ("did you mean...?") because an LLM
-    source plugin is in development elsewhere but does not exist yet: naming a
-    specific plugin id here would promise a capability that may not be
-    installed or allowlisted on a given deployment even once it lands. Revisit
-    this string once that plugin ships and its id is verifiable.
+    A static-prompt llm transform is essentially a source shape (generating
+    rows) mis-declared as a transform. The live source:llm capability is the
+    value-safe repair guidance; this never escalates to a rejection.
     """
     policy_state = graphed.instantiated.loaded.materialized.authored.policy.state
     checks: list[ValidationCheck] = []
@@ -571,9 +566,10 @@ def build_static_llm_prompt_advisory_checks(
                 detail=(
                     f"Node '{finding.node_id}' has a prompt_template that interpolates no row "
                     "data, so every row receives an identical prompt to the model — one call would do the "
-                    "same work as looping over every row. If per-row transformation was intended, add a "
-                    "'row.*' reference so each row's prompt reflects its own data. If the intent is "
-                    "generation rather than transformation, did you mean to use an LLM source instead?"
+                    "same work as looping over every row. If the intent is transformation, add a 'row.*' "
+                    "reference so each row's prompt reflects its own data. If the intent is generation "
+                    "(producing one row from one fixed prompt, not transforming existing rows), use the "
+                    "'llm' source (source:llm); it accepts no input rows and emits one response row."
                 ),
                 affected_nodes=(finding.node_id,),
             )

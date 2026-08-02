@@ -21,7 +21,7 @@ from elspeth.contracts.results import TransformResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.transforms.llm.multi_query import QuerySpec
-from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult
+from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent, LLMProvider, LLMQueryResult
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 from elspeth.plugins.transforms.llm.transform import MultiQueryStrategy, SingleQueryStrategy
 from elspeth.testing import make_pipeline_row
@@ -45,10 +45,33 @@ class _TransformContextDouble:
 
 
 class _TracerDouble:
-    def record_success(self, **_kwargs: Any) -> None:
+    def record_success(
+        self,
+        *,
+        parent: LLMAuditParent,
+        query_name: str,
+        prompt: str,
+        response_content: str,
+        model: str | None,
+        usage: TokenUsage | None,
+        latency_ms: float | None,
+        extra_metadata: dict[str, Any] | None,
+        system_prompt: str | None,
+    ) -> None:
         return None
 
-    def record_error(self, **_kwargs: Any) -> None:
+    def record_error(
+        self,
+        *,
+        parent: LLMAuditParent,
+        query_name: str,
+        prompt: str,
+        error_message: str,
+        model: str,
+        latency_ms: float | None,
+        extra_metadata: dict[str, Any] | None,
+        system_prompt: str | None,
+    ) -> None:
         return None
 
 
@@ -90,8 +113,7 @@ def _make_mock_provider(responses: list[dict[str, Any]] | None = None) -> Mock:
         model: str,
         temperature: float,
         max_tokens: int | None,
-        state_id: str,
-        token_id: str,
+        audit_parent: LLMAuditParent,
         response_format: dict[str, Any] | None = None,
     ) -> LLMQueryResult:
         return LLMQueryResult(

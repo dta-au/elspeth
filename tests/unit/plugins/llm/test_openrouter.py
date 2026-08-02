@@ -1992,11 +1992,11 @@ class TestOpenRouterRefcount:
             telemetry_emit=_ignore_telemetry,
         )
 
-    def test_release_unknown_state_id_raises(self) -> None:
-        """Releasing an unacquired state_id is a refcount underflow — must crash."""
+    def test_release_unknown_cache_key_raises(self) -> None:
+        """Releasing an unacquired parent cache key is a refcount underflow."""
         provider = self._make_provider()
 
-        with pytest.raises(RuntimeError, match="unknown state_id"):
+        with pytest.raises(RuntimeError, match="unknown cache_key"):
             provider._release_http_client("never-acquired")
 
 

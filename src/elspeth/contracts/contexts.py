@@ -97,6 +97,9 @@ class SourceContext(Protocol):
     @property
     def telemetry_emit(self) -> Callable[[Any], None]: ...
 
+    @property
+    def shutdown_event(self) -> threading.Event | None: ...
+
     def record_validation_error(
         self,
         row: Any,

@@ -46,6 +46,13 @@ class TestBuiltinSourceMetadata:
         assert isinstance(NullSource.plugin_version, str)
         assert NullSource.plugin_version != "0.0.0", "NullSource has placeholder version"
 
+    def test_llm_source_has_pinned_metadata(self) -> None:
+        from elspeth.plugins.sources.llm.source import LLMSource
+
+        assert LLMSource.plugin_version == "1.0.0"
+        assert isinstance(LLMSource.source_file_hash, str)
+        assert LLMSource.source_file_hash.startswith("sha256:")
+
 
 class TestBuiltinSinkMetadata:
     """Verify all built-in sink plugins have audit-required metadata."""

@@ -2249,6 +2249,7 @@ def _schema8_schema_authority(
     plugin: str,
     options: Mapping[str, Any],
     source: bool,
+    catalog: PolicyCatalogView,
 ) -> SchemaFormAuthority:
     payload = turn["payload"]
     knobs = payload.get("knobs")
@@ -2258,7 +2259,31 @@ def _schema8_schema_authority(
     server_options = _schema8_server_options(prefilled)
     merged = dict(deep_thaw(options))
     merged.update(server_options)
-    config_model = get_source_config_model(plugin) if source else get_sink_config_model(plugin)
+    authored_model_validated: dict[str, object] | None = None
+    validation_options = merged
+    if source and "profile" in merged:
+        from elspeth.web.plugin_policy.models import PluginId
+
+        alias = merged["profile"]
+        if type(alias) is not str:
+            raise ValueError("source operator profile alias must be an exact string")
+        lowered = catalog.lower_operator_profile_options(
+            PluginId("source", plugin),
+            alias=alias,
+            safe_options={name: value for name, value in merged.items() if name != "profile"},
+        )
+        audit_safe = dict(deep_thaw(lowered.audit_safe_options))
+        if audit_safe != merged:
+            raise InvariantError("source operator profile lowering changed authored options")
+        authored_model_validated = audit_safe
+        # Local import: this module's top-level statement positions anchor
+        # signed judge metadata. Profile lowering can inject unresolved secret
+        # references, so validate a detached placeholder projection without
+        # exposing or persisting the private executable binding.
+        from elspeth.web.composer._validation_probe import prepare_validation_probe_options
+
+        validation_options = prepare_validation_probe_options(lowered.executable_options)
+    config_model = get_source_config_model(plugin, validation_options) if source else get_sink_config_model(plugin)
     model_validated = merged
     if config_model is not None:
         # Node failure policies are server-owned structural fields rather than
@@ -2266,9 +2291,13 @@ def _schema8_schema_authority(
         # them into strict plugin models that correctly reject extra keys.
         # Source config models own ``on_validation_failure`` directly. Sink
         # ``on_write_failure`` belongs to the node wrapper, not the plugin.
-        plugin_options = merged if source else {name: value for name, value in merged.items() if name != "on_write_failure"}
+        plugin_options = (
+            validation_options if source else {name: value for name, value in validation_options.items() if name != "on_write_failure"}
+        )
         config = config_model.from_dict(plugin_options, plugin_name=plugin)
-        model_validated = config.model_dump(mode="json", by_alias=True)
+        model_validated = (
+            authored_model_validated if authored_model_validated is not None else config.model_dump(mode="json", by_alias=True)
+        )
         # Pydantic expands nested semantic values (notably
         # ``schema: {mode: observed}``) with nullable defaults.  The pure
         # transition requires every submitted value to survive validation
@@ -2334,6 +2363,7 @@ def _schema8_transition(
     turn: Turn,
     body: GuidedRespondRequest,
     *,
+    catalog: PolicyCatalogView,
     new_stable_id: UUID,
     source_inspection_facts: SourceInspectionFacts | None = None,
     sink_prefill_options: Mapping[str, Any] | None = None,
@@ -2441,7 +2471,13 @@ def _schema8_transition(
                 target_id=target,
                 turn=answered,
                 response=form_response,
-                authority=_schema8_schema_authority(turn=turn, plugin=held_plugin, options=options, source=True),
+                authority=_schema8_schema_authority(
+                    turn=turn,
+                    plugin=held_plugin,
+                    options=options,
+                    source=True,
+                    catalog=catalog,
+                ),
                 edit_inspection_facts=source_inspection_facts if is_edit else None,
             )
         elif guided.step is GuidedStep.STEP_2_SINK:
@@ -2453,7 +2489,13 @@ def _schema8_transition(
                 target_id=target,
                 turn=answered,
                 response=form_response,
-                authority=_schema8_schema_authority(turn=turn, plugin=held_plugin, options=options, source=False),
+                authority=_schema8_schema_authority(
+                    turn=turn,
+                    plugin=held_plugin,
+                    options=options,
+                    source=False,
+                    catalog=catalog,
+                ),
             )
         else:
             raise _schema8_unsupported_stage(guided.step)
@@ -2532,6 +2574,7 @@ def _schema8_answer_and_project_next(
             guided,
             current_turn,
             body,
+            catalog=catalog,
             new_stable_id=new_stable_id,
             source_inspection_facts=source_inspection_facts,
             sink_prefill_options=sink_prefill_options,

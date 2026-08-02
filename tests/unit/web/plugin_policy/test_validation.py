@@ -20,6 +20,60 @@ def test_profile_unavailable_finding_enumerates_available_aliases() -> None:
     assert "sonnet" not in unconfigured.message
 
 
+def test_plugin_policy_returns_typed_finding_for_malformed_rehydrated_source() -> None:
+    from typing import Any, cast
+
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+    from elspeth.web.plugin_policy.validation import validate_plugin_policy
+
+    malformed = SourceSpec(
+        plugin=[],  # type: ignore[arg-type]
+        on_success=[],  # type: ignore[arg-type]
+        options=[],  # type: ignore[arg-type]
+        on_validation_failure=[],  # type: ignore[arg-type]
+    )
+    state = CompositionState(
+        sources={
+            "rows": SourceSpec(
+                plugin=[],  # type: ignore[arg-type]
+                on_success="unused",
+                options={},
+                on_validation_failure="discard",
+            ),
+            7: malformed,  # type: ignore[dict-item]
+        },
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="malformed-source-policy",
+        principal_scope="local:test",
+        available=frozenset(),
+        unavailable=(),
+        selected=(),
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        binding_generation_fingerprint="malformed-source-generation",
+    )
+
+    result = validate_plugin_policy(
+        state,
+        snapshot=snapshot,
+        profile_registry=None,
+        catalog=cast(CatalogService, cast(Any, object())),
+    )
+
+    assert [(finding.component_id, finding.component_type, finding.stage) for finding in result.findings] == [
+        ("source:rows", "source", "plugin_enablement"),
+        ("source:<invalid>", "source", "plugin_enablement"),
+    ]
+
+
 # ── required_control_coverage messages ───────────────────────────────────────
 
 
@@ -31,6 +85,7 @@ def _coverage_message(reason: str, *, uncovered_stream: str | None, input_role: 
     finding = _control_coverage_finding(
         ControlCoverageFinding(
             component_id="judge",
+            component_type="transform",
             capability=PluginCapability.PROMPT_SHIELD if input_role else PluginCapability.CONTENT_SAFETY,
             role=ControlRole.INPUT if input_role else ControlRole.OUTPUT,
             reason=reason,  # type: ignore[arg-type]
@@ -40,6 +95,7 @@ def _coverage_message(reason: str, *, uncovered_stream: str | None, input_role: 
     assert finding.stage == "required_control_coverage"
     assert finding.error_code == "required_control_coverage"
     assert finding.component_id == "judge"
+    assert finding.component_type == "transform"
     return finding.message
 
 
@@ -98,6 +154,7 @@ def test_unprovable_input_without_dominating_control_does_not_claim_wiring_is_co
     finding = _control_coverage_finding(
         ControlCoverageFinding(
             component_id="judge",
+            component_type="transform",
             capability=PluginCapability.PROMPT_SHIELD,
             role=ControlRole.INPUT,
             reason="input_fields_unprovable",
@@ -126,6 +183,31 @@ def test_error_route_coverage_message_routes_retention_to_the_operator() -> None
     assert "content hash" in message
 
 
+def test_source_validation_failure_coverage_preserves_source_identity_and_repair() -> None:
+    from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
+    from elspeth.web.plugin_policy.coverage import ControlCoverageFinding
+    from elspeth.web.plugin_policy.validation import _control_coverage_finding
+
+    finding = _control_coverage_finding(
+        ControlCoverageFinding(
+            component_id="source:briefing",
+            component_type="source",
+            capability=PluginCapability.CONTENT_SAFETY,
+            role=ControlRole.OUTPUT,
+            reason="output_validation_failure_route_not_post_dominated",
+            uncovered_stream="quarantine",
+        )
+    )
+
+    assert finding.component_id == "source:briefing"
+    assert finding.component_type == "source"
+    assert "on_validation_failure" in finding.message
+    assert "quarantine" in finding.message
+    assert finding.suggestion is not None
+    assert "'discard'" in finding.suggestion
+    assert "on_error" not in finding.suggestion
+
+
 # ── required_control_coverage suggestions (keyed on reason, not stage) ───────
 
 
@@ -137,6 +219,7 @@ def _coverage_suggestion(reason: str, *, uncovered_stream: str | None = None, in
     finding = _control_coverage_finding(
         ControlCoverageFinding(
             component_id="judge",
+            component_type="transform",
             capability=PluginCapability.PROMPT_SHIELD if input_role else PluginCapability.CONTENT_SAFETY,
             role=ControlRole.INPUT if input_role else ControlRole.OUTPUT,
             reason=reason,  # type: ignore[arg-type]
@@ -213,6 +296,7 @@ def test_scope_mismatch_suggestion_repairs_the_control_scope_not_the_wiring() ->
     finding = _control_coverage_finding(
         ControlCoverageFinding(
             component_id="judge",
+            component_type="transform",
             capability=PluginCapability.PROMPT_SHIELD,
             role=ControlRole.INPUT,
             reason="input_not_dominated",

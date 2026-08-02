@@ -28,6 +28,7 @@ from typing import Any
 import httpx
 import pytest
 
+from elspeth.plugins.llm import model_catalog as neutral_model_catalog
 from elspeth.plugins.transforms.llm import model_catalog
 
 
@@ -57,6 +58,24 @@ def _make_response(payload: Any, *, status_code: int = 200) -> httpx.Response:
         json=payload,
         request=httpx.Request("GET", "https://openrouter.ai/api/v1/models"),
     )
+
+
+def test_transform_model_catalog_preserves_public_api_as_identity_reexports() -> None:
+    """The historical transform path remains an exact compatibility surface."""
+    expected_public_api = {
+        "MODEL_CATALOG_OPENROUTER",
+        "OPENROUTER_LITELLM_PREFIX",
+        "OPENROUTER_MODELS_URL",
+        "prime_openrouter_catalog_from_live",
+        "read_litellm_model_list",
+        "read_openrouter_catalog_snapshot_id",
+        "reset_live_openrouter_catalog",
+    }
+
+    assert set(model_catalog.__all__) == expected_public_api
+    assert set(neutral_model_catalog.__all__) == expected_public_api
+    for name in expected_public_api:
+        assert getattr(model_catalog, name) is getattr(neutral_model_catalog, name)
 
 
 async def _prime_live_catalog(ids: list[str]) -> None:

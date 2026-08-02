@@ -125,6 +125,7 @@ shown in the individual READMEs.
 
 | Example | What It Demonstrates |
 |---------|---------------------|
+| [`llm_source`](llm_source/) | One authored prompt becomes one generated row through the source-native `llm` plugin |
 | [`chaosllm_sentiment`](chaosllm_sentiment/) | Sentiment analysis against ChaosLLM (mirrors `openrouter_sentiment`) |
 | [`chaosllm_endurance`](chaosllm_endurance/) | Multi-query endurance test with fault injection |
 | [`rate_limited_llm`](rate_limited_llm/) | LLM pipeline with rate limiting (30 req/min cap) |
@@ -173,6 +174,7 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Statistical batch QA** | [`statistical_batch_plugins`](statistical_batch_plugins/) — prompt/model score comparisons, classifier metrics, drift, outlier annotation, data quality, top-k, thresholds, and effect sizes |
 | **Deaggregation (1 to N)** | [`deaggregation`](deaggregation/), [`json_explode`](json_explode/), or [`blob_transforms`](blob_transforms/) |
 | **Type normalization and derived fields** | [`transform_pipeline`](transform_pipeline/) — coerce CSV strings to typed values, then compute dependent fields |
+| **LLM as a source (no input rows)** | [`llm_source`](llm_source/) — one static authored prompt produces one generated row |
 | **LLM integration (quick start)** | [`openrouter_sentiment`](openrouter_sentiment/) — simplest real LLM pipeline |
 | **LLM without API keys** | [`chaosllm_sentiment`](chaosllm_sentiment/) — same pipeline, local ChaosLLM server |
 | **Multi-query LLM matrices** | [`openrouter_multi_query_assessment`](openrouter_multi_query_assessment/) — case studies x criteria |

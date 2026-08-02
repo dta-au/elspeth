@@ -55,6 +55,29 @@ def _trained_view() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
     return PolicyCatalogView.for_trained_operator(catalog, snapshot), snapshot
 
 
+def _compiler_manager_with_llm_source() -> Any:
+    """Required-policy registry while production source discovery stays off."""
+    from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+    from elspeth.plugins.infrastructure.manager import PluginManager
+    from elspeth.plugins.sources.llm import LLMSource
+
+    class _CompilerLLMSource(LLMSource):
+        determinism = LLMSource.determinism
+        source_file_hash = "sha256:0123456789abcdef"
+
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    if all(source.name != "llm" for source in manager.get_sources()):
+        manager.register(create_dynamic_hookimpl([_CompilerLLMSource], "elspeth_get_source"))
+    return manager
+
+
+def _catalog_with_llm_source() -> Any:
+    from elspeth.web.catalog.service import CatalogServiceImpl
+
+    return CatalogServiceImpl(_compiler_manager_with_llm_source())
+
+
 def test_authoring_aids_memo_access_is_locked(monkeypatch: pytest.MonkeyPatch) -> None:
     """Lookup, eviction, and insertion are locked while cold builds remain off-lock."""
 
@@ -134,7 +157,6 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
     the posture every failing planner surface (tutorial, guided, freeform web)
     actually runs under, where llm nodes are authored via a profile alias.
     """
-    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.availability import build_plugin_snapshot
     from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
@@ -159,8 +181,9 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
         default_llm_profile="sonnet",
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_compiler_manager_with_llm_source(), settings=runtime)
     profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    catalog = _catalog_with_llm_source()
 
     class _ServerKeyInventory:
         def has_server_ref(self, name: str) -> bool:
@@ -180,13 +203,98 @@ def _profile_view(tmp_path: Path) -> tuple[PolicyCatalogView, PluginAvailability
 
     snapshot = build_plugin_snapshot(
         policy=policy,
-        catalog=create_catalog_service(),
+        catalog=catalog,
         profiles=profiles,
         principal_scope="local:authoring-aids-profile",
         secret_inventory=_ServerKeyInventory(),
         generation_key=b"authoring-aids-key",
     )
-    return PolicyCatalogView(create_catalog_service(), snapshot, profiles), snapshot
+    return PolicyCatalogView(catalog, snapshot, profiles), snapshot
+
+
+def _source_only_profile_view(
+    tmp_path: Path,
+    *,
+    content_safety_required: bool = False,
+) -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    """Pre-discovery source profile posture with transform:llm hidden."""
+    from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+    from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+    from elspeth.plugins.infrastructure.manager import PluginManager
+    from elspeth.plugins.sources.llm import LLMSource
+    from elspeth.web.catalog.service import CatalogServiceImpl
+    from elspeth.web.config import WebSettings
+    from elspeth.web.plugin_policy.models import PluginId, WebPluginPolicy
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    if all(source.name != "llm" for source in manager.get_sources()):
+        manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
+    catalog = CatalogServiceImpl(manager)
+    settings = WebSettings(
+        data_dir=tmp_path,
+        composer_model="test/planner",
+        composer_max_composition_turns=3,
+        composer_max_discovery_turns=2,
+        composer_timeout_seconds=20.0,
+        composer_rate_limit_per_minute=10,
+        shareable_link_signing_key=b"\x00" * 32,
+        llm_profiles={
+            "sonnet": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "credential_scope": "server",
+                "credential_ref": "OPENROUTER_API_KEY",
+            }
+        },
+        default_llm_profile="sonnet",
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = WebPluginPolicy.create(
+        required=frozenset(),
+        configured_optional=frozenset(),
+        preferences=(),
+        control_modes=(),
+        plugin_code_identities=(),
+    )
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    transform_llm = PluginId("transform", "llm")
+    available = frozenset(
+        {
+            *(PluginId("source", item.name) for item in catalog.list_sources()),
+            *(PluginId("transform", item.name) for item in catalog.list_transforms()),
+            *(PluginId("sink", item.name) for item in catalog.list_sinks()),
+        }
+        - {transform_llm}
+    )
+    source_llm = PluginId("source", "llm")
+    selected = tuple(
+        (
+            capability,
+            (
+                PluginId("transform", "aws_bedrock_content_safety")
+                if capability is PluginCapability.CONTENT_SAFETY and content_safety_required
+                else source_llm
+                if capability is PluginCapability.LLM
+                else None
+            ),
+        )
+        for capability in PluginCapability
+    )
+    control_modes = ((PluginCapability.CONTENT_SAFETY, ControlMode.REQUIRED),) if content_safety_required else ()
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="source-only-policy",
+        principal_scope="local:source-only",
+        available=available,
+        unavailable=(),
+        selected=selected,
+        usable_profile_aliases=((source_llm, ("sonnet",)),),
+        selected_profile_aliases=((source_llm, "sonnet"),),
+        binding_generation_fingerprint="source-only-bindings",
+        control_modes=control_modes,
+    )
+    return PolicyCatalogView(catalog, snapshot, profiles), snapshot
 
 
 def _guardrail_profile_view(
@@ -201,7 +309,6 @@ def _guardrail_profile_view(
     Guardrail behind an opaque alias.
     """
     from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
-    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
     from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.availability import build_plugin_snapshot
@@ -256,8 +363,9 @@ def _guardrail_profile_view(
         },
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_compiler_manager_with_llm_source(), settings=runtime)
     profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    catalog = _catalog_with_llm_source()
 
     class _ServerKeyInventory:
         def has_server_ref(self, name: str) -> bool:
@@ -277,13 +385,13 @@ def _guardrail_profile_view(
 
     snapshot = build_plugin_snapshot(
         policy=policy,
-        catalog=create_catalog_service(),
+        catalog=catalog,
         profiles=profiles,
         principal_scope="local:authoring-aids-guardrail",
         secret_inventory=_ServerKeyInventory(),
         generation_key=b"authoring-aids-key",
     )
-    return PolicyCatalogView(create_catalog_service(), snapshot, profiles), snapshot
+    return PolicyCatalogView(catalog, snapshot, profiles), snapshot
 
 
 def _direct_control_view(
@@ -298,7 +406,6 @@ def _direct_control_view(
     operator profile aliases — the direct-configuration deployment shape.
     """
     from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
-    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.availability import build_plugin_snapshot
     from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
@@ -332,8 +439,9 @@ def _direct_control_view(
         },
     )
     runtime = RuntimeWebPluginConfig.from_settings(settings)
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_compiler_manager_with_llm_source(), settings=runtime)
     profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    catalog = _catalog_with_llm_source()
 
     class _ServerKeyInventory:
         _names = frozenset({"OPENROUTER_API_KEY", "AZURE_CONTENT_SAFETY_KEY"})
@@ -355,13 +463,13 @@ def _direct_control_view(
 
     snapshot = build_plugin_snapshot(
         policy=policy,
-        catalog=create_catalog_service(),
+        catalog=catalog,
         profiles=profiles,
         principal_scope="local:authoring-aids-direct-control",
         secret_inventory=_ServerKeyInventory(),
         generation_key=b"authoring-aids-key",
     )
-    return PolicyCatalogView(create_catalog_service(), snapshot, profiles), snapshot
+    return PolicyCatalogView(catalog, snapshot, profiles), snapshot
 
 
 def _session_with_user_message(content: str) -> tuple[Any, str, str, str]:
@@ -1328,6 +1436,81 @@ class TestModelCustody:
         assert "llm_response" in rules
         assert "multi_query" in rules
         assert "does NOT create row fields" in rules
+
+
+class TestLlmSourceGenerationAid:
+    def test_source_only_generation_uses_llm_source_without_transform_advice(self, tmp_path: Path) -> None:
+        view, _snapshot = _source_only_profile_view(tmp_path)
+
+        aids = build_planner_authoring_aids(view)
+        rendered = " ".join(aids["llm_source_generation"]["rules"])
+
+        assert "source:llm" in rendered
+        assert "generation-first" in rendered
+        assert "transform:llm" not in rendered
+        assert "seed" in rendered
+        assert "exactly one" in rendered
+        assert "incoming row" in rendered
+
+    def test_source_generation_names_output_and_value_source_contract(self, tmp_path: Path) -> None:
+        view, _snapshot = _source_only_profile_view(tmp_path)
+
+        rendered = " ".join(build_planner_authoring_aids(view)["llm_source_generation"]["rules"])
+
+        assert "response_field" in rendered
+        assert "_usage" in rendered
+        assert "_model" in rendered
+        assert "lookup" in rendered
+        assert "{{ row" in rendered
+        assert "sonnet" in rendered
+        assert "provider/model/credential" in rendered
+
+    def test_source_generation_marks_model_catalog_as_refreshable_session_snapshot(self, tmp_path: Path) -> None:
+        view, _snapshot = _source_only_profile_view(tmp_path)
+
+        aids = build_planner_authoring_aids(view)
+        rendered = " ".join(aids["llm_source_generation"]["rules"])
+        guidance = aids["discovery_digest"]["guidance"]
+
+        assert "list_models" in rendered
+        assert "session snapshot" in rendered
+        assert "stale" in rendered
+        assert "list_models" in guidance
+        assert "session snapshot" in guidance
+        assert "stale" in guidance
+        assert "anthropic/claude-sonnet-4.6" not in json.dumps(aids)
+
+    def test_source_generation_requires_discard_when_content_safety_is_required(self, tmp_path: Path) -> None:
+        view, _snapshot = _source_only_profile_view(tmp_path, content_safety_required=True)
+
+        rendered = " ".join(build_planner_authoring_aids(view)["llm_source_generation"]["rules"])
+
+        assert "on_validation_failure" in rendered
+        assert "discard" in rendered
+        assert "REQUIRES" in rendered
+        assert "Prompt Shield" in rendered
+        assert "not applicable" in rendered
+
+    def test_source_digest_has_source_profile_alias_and_public_required_options(self, tmp_path: Path) -> None:
+        view, _snapshot = _source_only_profile_view(tmp_path)
+
+        digest = discovery_digest(view)
+        source = next(entry for entry in digest["sources"] if entry["name"] == "llm")
+
+        assert source["profile_aliases"] == ["sonnet"]
+        assert set(source["required_options"]) == {
+            "profile",
+            "schema",
+            "prompt_template",
+            "on_validation_failure",
+        }
+        assert not set(source["required_options"]) & {
+            "provider",
+            "model",
+            "api_key",
+            "queries",
+            "required_input_fields",
+        }
 
 
 class TestReviewRegistry:

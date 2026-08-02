@@ -631,6 +631,7 @@ def _prepare_step_1_uploaded_source_bind(
             plugin=held_plugin,
             options=form_options,
             source=True,
+            catalog=catalog,
         ),
     )
     updated, form_response = _answered_bind_turn(

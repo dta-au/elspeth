@@ -237,6 +237,45 @@ class TelemetryEvent:
         return result
 
 
+_CLEANUP_FIELD_MAX_CHARS = 64
+
+
+def _validate_cleanup_field(value: object, field_name: str) -> None:
+    if type(value) is not str or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty owned string")
+    if len(value) > _CLEANUP_FIELD_MAX_CHARS:
+        raise ValueError(f"{field_name} must be at most {_CLEANUP_FIELD_MAX_CHARS} characters")
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceCleanupFailed(TelemetryEvent):
+    """Telemetry-only system-health signal for plugin resource cleanup."""
+
+    component: str
+    resource: str
+    error_type: str
+    suppressed: bool
+    state_id: str | None = None
+    operation_id: str | None = None
+    token_id: str | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("component", "resource", "error_type"):
+            _validate_cleanup_field(getattr(self, field_name), field_name)
+        if type(self.suppressed) is not bool:
+            raise TypeError("suppressed must be bool")
+        for field_name in ("state_id", "operation_id", "token_id"):
+            value = getattr(self, field_name)
+            if value is not None and (type(value) is not str or not value.strip()):
+                raise ValueError(f"{field_name} must be a non-empty exact string when present")
+        row_parent = self.state_id is not None or self.token_id is not None
+        operation_parent = self.operation_id is not None
+        if row_parent == operation_parent:
+            raise ValueError("ResourceCleanupFailed requires exactly one row or operation parent")
+        if row_parent and (self.state_id is None or self.token_id is None):
+            raise ValueError("ResourceCleanupFailed row parent requires state_id and token_id")
+
+
 def _event_field_to_serializable(obj: Any) -> Any:
     """Recursively convert a value to a plain-dict tree.
 

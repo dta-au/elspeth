@@ -1,0 +1,238 @@
+"""Parity tests for provider-neutral LLM configuration validation."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+from pydantic import ValidationError
+
+from elspeth.contracts.value_source import CatalogValueSource
+from elspeth.plugins.llm.config_validation import (
+    AZURE_MODEL_VALUE_SOURCES,
+    BEDROCK_VALUE_SOURCES,
+    GATEWAY_VALUE_SOURCES,
+    OPENROUTER_BASE_URL,
+    OPENROUTER_BASE_URL_APPLIES_WHEN,
+    OPENROUTER_MODEL_VALUE_SOURCES,
+)
+from elspeth.plugins.sources.llm.config import (
+    AzureOpenAILLMSourceConfig,
+    BedrockLLMSourceConfig,
+    GatewayLLMSourceConfig,
+    OpenRouterLLMSourceConfig,
+)
+from elspeth.plugins.transforms.llm.providers.azure import AzureOpenAIConfig
+from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig
+from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig
+from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterConfig
+
+_SOURCE_COMMON: dict[str, Any] = {
+    "prompt_template": "Summarise the audit topic.",
+    "schema": {"mode": "observed"},
+    "on_validation_failure": "discard",
+}
+_TRANSFORM_COMMON: dict[str, Any] = {
+    "prompt_template": "Summarise the audit topic.",
+    "schema": {"mode": "observed"},
+}
+
+
+def _run_isolated(code: str) -> subprocess.CompletedProcess[str]:
+    repo_root = Path(__file__).parents[4]
+    env = dict(os.environ)
+    existing_pythonpath = env.get("PYTHONPATH")
+    source_path = str(repo_root / "src")
+    env["PYTHONPATH"] = source_path if existing_pythonpath is None else f"{source_path}{os.pathsep}{existing_pythonpath}"
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_transform_openrouter_import_registers_declared_catalogue() -> None:
+    result = _run_isolated(
+        "\n".join(
+            (
+                "from elspeth.contracts.value_source import CatalogValueSource, get_catalog_values",
+                "from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterConfig",
+                "declaration = OpenRouterConfig.VALUE_SOURCES[0]",
+                "assert isinstance(declaration, CatalogValueSource)",
+                "assert isinstance(get_catalog_values(declaration.catalog_id), frozenset)",
+            )
+        )
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_source_openrouter_import_registers_declared_catalogue() -> None:
+    result = _run_isolated(
+        "\n".join(
+            (
+                "from elspeth.contracts.value_source import CatalogValueSource, get_catalog_values",
+                "from elspeth.plugins.sources.llm.config import OpenRouterLLMSourceConfig",
+                "declaration = OpenRouterLLMSourceConfig.VALUE_SOURCES[0]",
+                "assert isinstance(declaration, CatalogValueSource)",
+                "assert isinstance(get_catalog_values(declaration.catalog_id), frozenset)",
+            )
+        )
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def _source_options(**provider_options: Any) -> dict[str, Any]:
+    return {**_SOURCE_COMMON, **provider_options}
+
+
+def _transform_options(**provider_options: Any) -> dict[str, Any]:
+    return {**_TRANSFORM_COMMON, **provider_options}
+
+
+@pytest.mark.parametrize(
+    ("config_model", "options"),
+    [
+        (
+            AzureOpenAILLMSourceConfig,
+            _source_options(
+                provider="azure",
+                deployment_name="gpt-4o-mini",
+                endpoint="https://example.openai.azure.com",
+                api_key="test-api-key",
+            ),
+        ),
+        (
+            AzureOpenAIConfig,
+            _transform_options(
+                provider="azure",
+                deployment_name="gpt-4o-mini",
+                endpoint="https://example.openai.azure.com",
+                api_key="test-api-key",
+            ),
+        ),
+    ],
+)
+def test_azure_deployment_fallback_matches(config_model: type[Any], options: dict[str, Any]) -> None:
+    cfg = config_model.model_validate(options)
+    assert cfg.model == "gpt-4o-mini"
+
+
+@pytest.mark.parametrize("config_model,common", [(AzureOpenAILLMSourceConfig, _SOURCE_COMMON), (AzureOpenAIConfig, _TRANSFORM_COMMON)])
+def test_azure_rejects_remote_http_endpoint(config_model: type[Any], common: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError, match="endpoint"):
+        config_model.model_validate(
+            {
+                **common,
+                "provider": "azure",
+                "deployment_name": "gpt-4o-mini",
+                "endpoint": "http://example.com",
+                "api_key": "test-api-key",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("config_model", "common"),
+    [(OpenRouterLLMSourceConfig, _SOURCE_COMMON), (OpenRouterConfig, _TRANSFORM_COMMON)],
+)
+def test_openrouter_normalizes_url_and_rejects_remote_http(config_model: type[Any], common: dict[str, Any]) -> None:
+    valid = config_model.model_validate(
+        {
+            **common,
+            "provider": "openrouter",
+            "model": "openai/gpt-4o-mini",
+            "api_key": "test-api-key",
+            "base_url": f"{OPENROUTER_BASE_URL}/",
+        }
+    )
+    assert valid.base_url == OPENROUTER_BASE_URL
+
+    with pytest.raises(ValidationError, match="base_url"):
+        config_model.model_validate(
+            {
+                **common,
+                "provider": "openrouter",
+                "model": "openai/gpt-4o-mini",
+                "api_key": "test-api-key",
+                "base_url": "http://example.com/v1",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("config_model", "common"),
+    [(BedrockLLMSourceConfig, _SOURCE_COMMON), (BedrockConfig, _TRANSFORM_COMMON)],
+)
+def test_bedrock_model_and_region_validation_match(config_model: type[Any], common: dict[str, Any]) -> None:
+    valid = config_model.model_validate(
+        {
+            **common,
+            "provider": "bedrock",
+            "model": "bedrock/anthropic.claude-3-haiku",
+            "region_name": "ap-southeast-2",
+        }
+    )
+    assert valid.region_name == "ap-southeast-2"
+
+    with pytest.raises(ValidationError, match="Bedrock model"):
+        config_model.model_validate({**common, "provider": "bedrock", "model": "anthropic.claude-3-haiku"})
+    with pytest.raises(ValidationError, match="region_name"):
+        config_model.model_validate(
+            {
+                **common,
+                "provider": "bedrock",
+                "model": "bedrock/anthropic.claude-3-haiku",
+                "region_name": "Australia East",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("config_model", "common"),
+    [(GatewayLLMSourceConfig, _SOURCE_COMMON), (GatewayConfig, _TRANSFORM_COMMON)],
+)
+def test_gateway_validation_and_bounds_match(config_model: type[Any], common: dict[str, Any]) -> None:
+    base = {
+        **common,
+        "provider": "gateway",
+        "model": "summariser",
+        "endpoint": "https://gateway.example/v1",
+        "api_key": "test-api-key",
+    }
+    valid = config_model.model_validate({**base, "required_capabilities": ["text", "usage"], "max_tokens": 131072})
+    assert valid.contract_major == 1
+    assert valid.required_capabilities == ("text", "usage")
+    assert valid.max_tokens == 131072
+
+    invalid_options = (
+        ({"endpoint": "https://gateway.example/v2"}, "endpoint"),
+        ({"required_capabilities": ["unknown"]}, "capability"),
+        ({"required_capabilities": ["text", "text"]}, "duplicate"),
+        ({"contract_major": 2}, "contract_major"),
+        ({"max_tokens": 0}, "max_tokens"),
+        ({"max_tokens": 131073}, "max_tokens"),
+    )
+    for overrides, match in invalid_options:
+        with pytest.raises(ValidationError, match=match):
+            config_model.model_validate({**base, **overrides})
+
+
+def test_provider_value_sources_use_shared_declarations() -> None:
+    assert AzureOpenAILLMSourceConfig.VALUE_SOURCES is AZURE_MODEL_VALUE_SOURCES
+    assert AzureOpenAIConfig.VALUE_SOURCES is AZURE_MODEL_VALUE_SOURCES
+    assert OpenRouterLLMSourceConfig.VALUE_SOURCES is OPENROUTER_MODEL_VALUE_SOURCES
+    assert OpenRouterConfig.VALUE_SOURCES is OPENROUTER_MODEL_VALUE_SOURCES
+    openrouter_model_source = OpenRouterLLMSourceConfig.VALUE_SOURCES[0]
+    assert isinstance(openrouter_model_source, CatalogValueSource)
+    assert openrouter_model_source.applies_when == OPENROUTER_BASE_URL_APPLIES_WHEN
+    assert BedrockLLMSourceConfig.VALUE_SOURCES is BEDROCK_VALUE_SOURCES
+    assert BedrockConfig.VALUE_SOURCES is BEDROCK_VALUE_SOURCES
+    assert GatewayLLMSourceConfig.VALUE_SOURCES is GATEWAY_VALUE_SOURCES
+    assert GatewayConfig.VALUE_SOURCES is GATEWAY_VALUE_SOURCES

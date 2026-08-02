@@ -568,6 +568,7 @@ class SourceIterationDriver:
                 idle_pump.start()
             try:
                 source_exhausted = False
+                interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
                 pending_source_item: SourceRow | None = None
                 try:
                     if use_idle_polling:
@@ -583,7 +584,8 @@ class SourceIterationDriver:
                     else:
                         pending_source_item = next(source_iterator)
                 except StopIteration:
-                    source_exhausted = True
+                    interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
+                    source_exhausted = not interrupted_by_shutdown
 
                 # Deferred recording flags — field resolution after first iteration,
                 # schema contract after first VALID row. Always start false so
@@ -605,10 +607,11 @@ class SourceIterationDriver:
                     )
                 )
 
-                interrupted_by_shutdown = False
                 try:
                     source_row_index = 0
                     while True:
+                        if interrupted_by_shutdown:
+                            break
                         if pending_source_item is not None:
                             source_item = pending_source_item
                             pending_source_item = None
@@ -627,7 +630,8 @@ class SourceIterationDriver:
                                 else:
                                     source_item = next(source_iterator)
                             except StopIteration:
-                                source_exhausted = True
+                                interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
+                                source_exhausted = not interrupted_by_shutdown
                                 break
 
                         current_source_row_index = source_row_index

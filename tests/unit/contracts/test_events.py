@@ -5,6 +5,52 @@ from datetime import UTC, datetime
 import pytest
 
 
+def test_resource_cleanup_failed_serializes_only_bounded_operational_fields() -> None:
+    from elspeth.contracts.events import ResourceCleanupFailed
+
+    event = ResourceCleanupFailed(
+        timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+        run_id="run-1",
+        component="openrouter_provider",
+        resource="audited_http_client",
+        error_type="RuntimeError",
+        suppressed=True,
+        operation_id="operation-1",
+    )
+
+    assert event.to_dict() == {
+        "timestamp": datetime(2026, 8, 2, tzinfo=UTC),
+        "run_id": "run-1",
+        "component": "openrouter_provider",
+        "resource": "audited_http_client",
+        "error_type": "RuntimeError",
+        "suppressed": True,
+        "state_id": None,
+        "operation_id": "operation-1",
+        "token_id": None,
+    }
+
+
+@pytest.mark.parametrize("field_name", ["component", "resource", "error_type"])
+def test_resource_cleanup_failed_rejects_unbounded_or_non_owned_field(field_name: str) -> None:
+    from elspeth.contracts.events import ResourceCleanupFailed
+
+    kwargs = {
+        "component": "llm_source",
+        "resource": "provider",
+        "error_type": "RuntimeError",
+    }
+    kwargs[field_name] = "x" * 65
+
+    with pytest.raises(ValueError, match=field_name):
+        ResourceCleanupFailed(
+            timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+            run_id="run-1",
+            suppressed=False,
+            **kwargs,
+        )
+
+
 class TestTokenCompletedTwoAxis:
     """ADR-019 Phase 1: TokenCompleted telemetry event carries (outcome, path)."""
 

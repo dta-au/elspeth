@@ -75,6 +75,19 @@ elspeth run --settings examples/rate_limited_llm/settings.yaml --execute
 elspeth run --settings examples/chaosllm_endurance/settings.yaml --execute  # 10K rows, slow
 ```
 
+The bounded source-native example uses the zero-error `silent` preset so its
+only provider request has a stable happy-path contract. Start a separate server
+as documented in its README, then run:
+
+```bash
+# Terminal 1
+chaosllm serve --port 8199 --preset=silent --workers=1
+
+# Terminal 2
+source examples/chaosllm_env.sh
+elspeth run --settings examples/llm_source/settings.yaml --execute
+```
+
 Do not gate dogfood completion on the full `chaosllm_endurance` workload. It
 expands 10,000 rows into 100,000 mock LLM calls before retries. For ordinary
 examples dogfood, use a bounded smoke input such as:
@@ -91,6 +104,7 @@ category.
 
 | Example | Rows | Notes |
 |---------|------|-------|
+| `llm_source` | 1 | One static authored prompt emitted as one generated row; uses the `silent` preset |
 | `chaosllm_sentiment` | 10 | Basic sentiment with fault injection |
 | `rate_limited_llm` | 8 | Rate limiter with ChaosLLM |
 | `chaosllm_endurance` | 10,000 | Long-running endurance test |

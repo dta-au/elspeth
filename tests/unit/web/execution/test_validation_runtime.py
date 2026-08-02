@@ -615,7 +615,8 @@ def test_static_llm_prompt_advisory_checks_use_policy_state_and_preserve_exact_p
     assert checks[0].name == "static_llm_prompt_advisory"
     assert checks[0].affected_nodes == ("classify",)
     assert "has a prompt_template that interpolates no row" in checks[0].detail
-    assert "did you mean to use an LLM source instead?" in checks[0].detail
+    assert "use the 'llm' source (source:llm)" in checks[0].detail
+    assert "emits one response row" in checks[0].detail
 
 
 def test_runtime_carriers_snapshot_envelopes_but_preserve_executable_identities() -> None:

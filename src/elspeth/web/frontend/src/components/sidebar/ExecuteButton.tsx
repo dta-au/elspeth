@@ -6,7 +6,12 @@ import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { sortedSourceEntries, sourceComponentId } from "@/utils/compositionState";
-import type { CompositionState, NodeSpec, PluginSummary } from "@/types/index";
+import type {
+  CompositionState,
+  NodeSpec,
+  PluginSummary,
+  SourceSpec,
+} from "@/types/index";
 import type { ReadinessRowId } from "@/types/api";
 
 /**
@@ -80,12 +85,63 @@ function isLlmNode(node: NodeSpec): boolean {
   );
 }
 
+const SAFE_LLM_PROFILE_ALIAS = /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$/;
+const SAFE_LLM_MODEL_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,511}$/;
+
+function hasOwnOption(options: Record<string, unknown>, name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(options, name);
+}
+
+/** Return only a safe, author-visible LLM binding label.
+ *
+ * Web profile lowering deliberately keeps the opaque authored `profile`
+ * alias in composition state while provider, model, endpoint, and credential
+ * bindings stay operator-private. If profile provenance is present but
+ * malformed, fail closed to the generic label instead of falling through to
+ * a possibly resolved private model. `profile_alias` and `resolved_model`
+ * are executable/audit provenance, never consent-dialog display values.
+ */
+function llmSourceBindingLabel(source: SourceSpec): string {
+  const { options } = source;
+  if (hasOwnOption(options, "profile")) {
+    const profile = options.profile;
+    if (typeof profile === "string" && SAFE_LLM_PROFILE_ALIAS.test(profile)) {
+      return `profile ${profile}`;
+    }
+    return "configured LLM";
+  }
+  if (
+    hasOwnOption(options, "profile_alias") ||
+    hasOwnOption(options, "resolved_model")
+  ) {
+    return "configured LLM";
+  }
+  const model = options.model;
+  if (typeof model === "string" && SAFE_LLM_MODEL_IDENTIFIER.test(model)) {
+    return `model ${model}`;
+  }
+  return "configured LLM";
+}
+
+function catalogFlagsLlmSource(
+  source: SourceSpec,
+  catalogSources: readonly PluginSummary[] | null,
+  catalogCurrent: boolean,
+): boolean {
+  if (source.plugin === "llm") return true;
+  if (!catalogCurrent || catalogSources === null) return false;
+  return catalogSources.some(
+    (summary) =>
+      summary.plugin_type === "source" &&
+      summary.name === source.plugin &&
+      summary.capability_tags.includes("llm"),
+  );
+}
+
 /**
  * Derive the pre-run egress disclosure lines from the actual composition
- * (elspeth-c18ad229cc). Nothing here is hardcoded pipeline content: each
- * line names the configured components (sources, LLM nodes and their model
- * option, network-fetching transforms, output sinks) from the live
- * CompositionState.
+ * (elspeth-c18ad229cc). Each line names configured components from the live
+ * CompositionState; catalog metadata classifies their external effects.
  *
  * `catalogTransforms` is the plugin catalog's transform list
  * (`usePluginCatalogStore((s) => s.transforms)`), the same source of truth
@@ -108,22 +164,50 @@ function isLlmNode(node: NodeSpec): boolean {
  *     it is named in an explicit uncertainty line rather than silently
  *     assumed safe — the exact under-disclosure R2-F7 fixed must not
  *     reappear whenever a catalog fetch errors.
+ *
+ * `catalogSources` classifies source plugins carrying the catalog's `llm`
+ * capability tag. Only a settled catalog is authoritative. The exact built-in
+ * `llm` identity remains a bounded fallback while the catalog is loading,
+ * failed, stale, or missing that entry, so its authored prompt is never
+ * silently omitted from consent.
  * Exported for tests.
  */
 export function buildRunEgressSummary(
   compositionState: CompositionState | null,
   catalogTransforms: readonly PluginSummary[] | null = null,
   catalogLoadFailed = false,
+  catalogSources: readonly PluginSummary[] | null = null,
+  catalogIsLoading = false,
 ): string[] {
   if (!compositionState) return [];
   const lines: string[] = [];
 
-  const sources = sortedSourceEntries(compositionState).map(
-    ([sourceName, source]) =>
-      `${sourceComponentId(sourceName)} (${source.plugin})`,
+  const sourceEntries = sortedSourceEntries(compositionState);
+  const catalogCurrent =
+    catalogSources !== null && !catalogLoadFailed && !catalogIsLoading;
+  const llmSourceEntries = sourceEntries.filter(([, source]) =>
+    catalogFlagsLlmSource(source, catalogSources, catalogCurrent),
   );
-  if (sources.length > 0) {
-    lines.push(`Reads source data: ${sources.join(", ")}.`);
+  const ordinarySources = sourceEntries
+    .filter(([, source]) =>
+      !catalogFlagsLlmSource(source, catalogSources, catalogCurrent),
+    )
+    .map(
+      ([sourceName, source]) =>
+        `${sourceComponentId(sourceName)} (${source.plugin})`,
+    );
+  if (ordinarySources.length > 0) {
+    lines.push(`Reads source data: ${ordinarySources.join(", ")}.`);
+  }
+
+  const llmSources = llmSourceEntries.map(
+    ([sourceName, source]) =>
+      `${sourceComponentId(sourceName)} (${llmSourceBindingLabel(source)})`,
+  );
+  if (llmSources.length > 0) {
+    lines.push(
+      `Sends one authored prompt to the configured LLM: ${llmSources.join(", ")}.`,
+    );
   }
 
   // `?.` on options: display-only derivation that must tolerate partially
@@ -364,6 +448,8 @@ export function ExecuteButton(): JSX.Element | null {
   // permanently fell back to the same under-disclosing hardcoded set R2-F7
   // exists to fix (finding elspeth-27bc704359 follow-up).
   const catalogTransforms = usePluginCatalogStore((s) => s.transforms);
+  const catalogSources = usePluginCatalogStore((s) => s.sources);
+  const catalogIsLoading = usePluginCatalogStore((s) => s.isLoading);
   const catalogLoadFailed = usePluginCatalogStore((s) => s.error !== null);
 
   const reactId = useId();
@@ -425,6 +511,8 @@ export function ExecuteButton(): JSX.Element | null {
     compositionState,
     catalogTransforms,
     catalogLoadFailed,
+    catalogSources,
+    catalogIsLoading,
   );
 
   return (

@@ -109,7 +109,7 @@ from elspeth.plugins.infrastructure.clients.llm import (  # noqa: E402
     LLMClientError,
     ServerError,
 )
-from elspeth.plugins.transforms.llm.provider import FinishReason  # noqa: E402
+from elspeth.plugins.transforms.llm.provider import FinishReason, LLMAuditParent  # noqa: E402
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayLLMProvider  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -416,8 +416,10 @@ class TestCriterion4Shapes:
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
-            state_id="state-text",
-            token_id="token-text",
+            audit_parent=LLMAuditParent.for_row(
+                state_id="state-text",
+                token_id="token-text",
+            ),
         )
         assert result.content == "MOCK:hello gateway"
         assert result.model == _MODEL_ALIAS
@@ -443,8 +445,10 @@ class TestCriterion4Shapes:
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
-            state_id="state-schema",
-            token_id="token-schema",
+            audit_parent=LLMAuditParent.for_row(
+                state_id="state-schema",
+                token_id="token-schema",
+            ),
             response_format=response_format,
         )
         assert json.loads(result.content) == {"answer": "structured please"}
@@ -457,8 +461,10 @@ class TestCriterion4Shapes:
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
-            state_id="state-object",
-            token_id="token-object",
+            audit_parent=LLMAuditParent.for_row(
+                state_id="state-object",
+                token_id="token-object",
+            ),
             response_format=response_format,
         )
         assert json.loads(result.content) == {"echo": "object please"}
@@ -478,8 +484,10 @@ class TestCriterion5UsageAndFinishReason:
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
-            state_id="state-halt-truncated",
-            token_id="token-halt-truncated",
+            audit_parent=LLMAuditParent.for_row(
+                state_id="state-halt-truncated",
+                token_id="token-halt-truncated",
+            ),
         )
         assert result.content == "MOCK:truncated"
         assert result.finish_reason is FinishReason.LENGTH
@@ -495,8 +503,10 @@ class TestCriterion5UsageAndFinishReason:
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
-            state_id="state-halt-complete",
-            token_id="token-halt-complete",
+            audit_parent=LLMAuditParent.for_row(
+                state_id="state-halt-complete",
+                token_id="token-halt-complete",
+            ),
         )
         assert result.content == "MOCK:complete"
         assert result.finish_reason is FinishReason.STOP
@@ -513,8 +523,10 @@ class TestCriterion5UsageAndFinishReason:
                 model=_MODEL_ALIAS,
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-halt-screened",
-                token_id="token-halt-screened",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-halt-screened",
+                    token_id="token-halt-screened",
+                ),
             )
 
     def test_unavailable_usage_recorded_as_unknown_never_zeros(self, no_usage_provider: GatewayLLMProvider) -> None:
@@ -523,8 +535,10 @@ class TestCriterion5UsageAndFinishReason:
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
-            state_id="state-no-usage",
-            token_id="token-no-usage",
+            audit_parent=LLMAuditParent.for_row(
+                state_id="state-no-usage",
+                token_id="token-no-usage",
+            ),
         )
         assert result.content == "MOCK:no usage please"
         assert result.usage.prompt_tokens is None
@@ -549,8 +563,10 @@ class TestCriterion6RetriesStayOutside:
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
-            state_id="state-count-once",
-            token_id="token-count-once",
+            audit_parent=LLMAuditParent.for_row(
+                state_id="state-count-once",
+                token_id="token-count-once",
+            ),
         )
         assert upstream_transport.call_count - before == 1
 
@@ -564,8 +580,10 @@ class TestCriterion6RetriesStayOutside:
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
-            state_id="state-401-replay",
-            token_id="token-401-replay",
+            audit_parent=LLMAuditParent.for_row(
+                state_id="state-401-replay",
+                token_id="token-401-replay",
+            ),
         )
 
         # ELSPETH sees exactly one successful call -- the gateway's own
@@ -598,8 +616,10 @@ class TestCriterion9ErrorMapping:
                 model=_MODEL_ALIAS,
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-fault-overloaded",
-                token_id="token-fault-overloaded",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-fault-overloaded",
+                    token_id="token-fault-overloaded",
+                ),
             )
         assert exc_info.value.retryable is True
         assert str(exc_info.value) == "Gateway LLM request failed"
@@ -611,8 +631,10 @@ class TestCriterion9ErrorMapping:
                 model=_MODEL_ALIAS,
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-fault-screening",
-                token_id="token-fault-screening",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-fault-screening",
+                    token_id="token-fault-screening",
+                ),
             )
         assert exc_info.value.retryable is False
         assert str(exc_info.value) == "Gateway LLM request failed"
@@ -624,8 +646,10 @@ class TestCriterion9ErrorMapping:
                 model=_MODEL_ALIAS,
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-fault-too-long",
-                token_id="token-fault-too-long",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-fault-too-long",
+                    token_id="token-fault-too-long",
+                ),
             )
         assert exc_info.value.retryable is False
         assert str(exc_info.value) == "Gateway LLM request failed"
@@ -637,8 +661,10 @@ class TestCriterion9ErrorMapping:
                 model="not-a-published-alias",
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-unmapped-model",
-                token_id="token-unmapped-model",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-unmapped-model",
+                    token_id="token-unmapped-model",
+                ),
             )
         assert type(exc_info.value) is LLMClientError
         assert exc_info.value.retryable is False
@@ -655,8 +681,10 @@ class TestCriterion9ErrorMapping:
                 model=_MODEL_ALIAS,
                 temperature=0.0,
                 max_tokens=100,
-                state_id="state-contract-mismatch",
-                token_id="token-contract-mismatch",
+                audit_parent=LLMAuditParent.for_row(
+                    state_id="state-contract-mismatch",
+                    token_id="token-contract-mismatch",
+                ),
             )
         assert type(exc_info.value) is LLMClientError
         assert exc_info.value.retryable is False
@@ -703,8 +731,10 @@ def test_success_records_two_audit_rows_end_to_end(main_stack: tuple[str, _Recor
             model=_MODEL_ALIAS,
             temperature=0.0,
             max_tokens=100,
-            state_id="state-audit",
-            token_id="token-audit",
+            audit_parent=LLMAuditParent.for_row(
+                state_id="state-audit",
+                token_id="token-audit",
+            ),
         )
     finally:
         provider.close()

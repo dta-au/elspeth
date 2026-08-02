@@ -120,13 +120,14 @@ from elspeth.contracts.enums import Determinism
 # derivable from kind + the predicate in
 # ``_build_plugin_trust_row``). Transforms classify as boundary iff
 # their declared determinism is in ``_AUDIT_FLAGGED_DETERMINISMS``.
-
+#
 EXPECTED_SOURCE_DETERMINISMS: dict[str, Determinism] = {
     "aws_s3": Determinism.IO_READ,
     "azure_blob": Determinism.IO_READ,
     "csv": Determinism.IO_READ,
     "dataverse": Determinism.EXTERNAL_CALL,
     "json": Determinism.IO_READ,
+    "llm": Determinism.NON_DETERMINISTIC,
     "null": Determinism.DETERMINISTIC,
     "text": Determinism.IO_READ,
 }

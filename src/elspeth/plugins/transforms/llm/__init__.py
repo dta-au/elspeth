@@ -39,7 +39,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Literal
 
-from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.identifiers import validate_field_name
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.token_usage import TokenUsage
 
 if TYPE_CHECKING:
@@ -161,6 +162,53 @@ def _build_llm_output_schema_config(
         fields=schema_config.fields,
         guaranteed_fields=guaranteed_fields_result,
         required_fields=schema_config.required_fields,
+    )
+
+
+def build_llm_source_output_schema_config(
+    schema_config: SchemaConfig,
+    response_field: str,
+) -> SchemaConfig:
+    """Add the fields guaranteed by a single-request LLM source.
+
+    Explicit authored fields may repeat an LLM output field only with its
+    runtime type. The returned schema preserves the authored mode and contract
+    metadata while making all three emitted fields required and guaranteed.
+    """
+    validate_field_name(response_field, "response_field")
+    guaranteed_fields = get_llm_guaranteed_fields(response_field)
+    expected_types = {f"{response_field}{suffix}": _SUFFIX_SCHEMA_TYPES[suffix] for suffix in LLM_GUARANTEED_SUFFIXES}
+
+    authored_fields = schema_config.fields or ()
+    authored_by_name = {field.name: field for field in authored_fields}
+    for field_name, expected_type in expected_types.items():
+        if field_name not in authored_by_name:
+            continue
+        authored_field = authored_by_name[field_name]
+        if authored_field.field_type != expected_type:
+            actual_type = authored_field.field_type
+            raise ValueError(f"LLM source schema field {field_name!r} must have type {expected_type!r}, got {actual_type!r}")
+        if not authored_field.required:
+            raise ValueError(f"LLM source schema field {field_name!r} must be required")
+        if authored_field.nullable:
+            raise ValueError(f"LLM source schema field {field_name!r} must be non-nullable")
+
+    if schema_config.fields is None:
+        output_fields = None
+    else:
+        output_fields = authored_fields + tuple(
+            FieldDefinition(name=field_name, field_type=field_type)
+            for field_name, field_type in expected_types.items()
+            if field_name not in authored_by_name
+        )
+
+    output_guarantees = tuple(sorted(set(schema_config.guaranteed_fields or ()) | set(guaranteed_fields)))
+    return SchemaConfig(
+        mode=schema_config.mode,
+        fields=output_fields,
+        guaranteed_fields=output_guarantees,
+        required_fields=schema_config.required_fields,
+        audit_fields=schema_config.audit_fields,
     )
 
 

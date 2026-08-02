@@ -14,6 +14,7 @@ executor tests in tests/unit/engine/test_row_union_executor.py.
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
@@ -24,6 +25,7 @@ from elspeth.contracts.plugin_protocols import SinkProtocol, SourceProtocol
 from elspeth.contracts.types import NodeID
 from elspeth.core.events import EventBusProtocol
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.schema import RunSourceLifecycleState
 from elspeth.engine.orchestrator import PipelineConfig
 from elspeth.engine.orchestrator.ceremony import RunCeremony
 from elspeth.engine.orchestrator.quarantine_router import QuarantineRouter
@@ -110,3 +112,64 @@ def test_quarantined_row_boundaries_sweep_row_union_timeouts() -> None:
     # quarantine branch continued the loop without sweeping (count == 1).
     assert row_union_executor.check_timeouts.call_count == 3
     row_union_executor.check_timeouts.assert_called_with("variant_union")
+
+
+def test_shutdown_set_during_empty_first_fetch_records_interrupted_without_eof_flush() -> None:
+    driver = SourceIterationDriver(
+        events=MagicMock(spec=EventBusProtocol),
+        span_factory=MagicMock(spec=SpanFactory),
+        ceremony=MagicMock(spec=RunCeremony),
+    )
+    lifecycle = MagicMock(spec=SourceLifecycleRecorder)
+    lifecycle.record_field_resolution.return_value = ({}, None)
+    driver._lifecycle_recorder = lifecycle
+
+    processor = MagicMock(spec=RowProcessor)
+    processor.row_union_executor = None
+    source = MagicMock(spec=SourceProtocol)
+    source.name = "llm"
+    source.on_success = "default"
+    sink = MagicMock(spec=SinkProtocol)
+    sink.name = "default"
+    loop_ctx = LoopContext(
+        counters=ExecutionCounters(),
+        pending_tokens={"default": []},
+        processor=processor,
+        ctx=MagicMock(spec=PluginContext),
+        config=PipelineConfig(sources={"llm": source}, transforms=(), sinks={"default": sink}),
+        agg_transform_lookup={},
+        coalesce_executor=None,
+        coalesce_node_map={},
+    )
+    shutdown_event = threading.Event()
+
+    def interrupt_during_first_fetch() -> Any:
+        shutdown_event.set()
+        return
+        yield
+
+    driver.load_source_with_events = lambda run_id, ctx, active_source: interrupt_during_first_fetch()  # type: ignore[method-assign]
+
+    with (
+        patch("elspeth.engine.orchestrator.source_iteration.track_operation", _null_track_operation),
+        patch("elspeth.engine.orchestrator.source_iteration.record_schema_contract", return_value=True),
+        patch("elspeth.engine.orchestrator.source_iteration.run_end_of_input_barrier_flush") as end_of_input_flush,
+    ):
+        result = driver.run_main_processing_loop(
+            loop_ctx,
+            factory=MagicMock(spec=RecorderFactory),
+            run_id="run-pre-egress-shutdown",
+            source_id=NodeID("src"),
+            edge_map={},
+            active_source_name="llm",
+            active_source=source,
+            shutdown_event=shutdown_event,
+            flush_end_of_input=True,
+        )
+
+    assert result.interrupted is True
+    states = [call.args[-1] for call in lifecycle.record_run_source_lifecycle.call_args_list]
+    assert states == [RunSourceLifecycleState.LOADING, RunSourceLifecycleState.INTERRUPTED]
+    assert RunSourceLifecycleState.EXHAUSTED not in states
+    processor.process_row.assert_not_called()
+    end_of_input_flush.assert_not_called()

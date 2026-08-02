@@ -1,0 +1,849 @@
+{
+  "knob_schema": {
+    "fields": [
+      {
+        "enum": [
+          "azure",
+          "openrouter",
+          "bedrock",
+          "gateway"
+        ],
+        "kind": "enum",
+        "label": "provider",
+        "name": "provider",
+        "nullable": false,
+        "required": true
+      },
+      {
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
+        "kind": "json-value",
+        "label": "Schema",
+        "name": "schema",
+        "nullable": false,
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": "",
+        "description": "Model identifier (defaults to deployment_name)",
+        "kind": "text",
+        "label": "Model",
+        "name": "model",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Static Jinja2 prompt template",
+        "kind": "text",
+        "label": "Prompt Template",
+        "name": "prompt_template",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional system prompt",
+        "kind": "text",
+        "label": "System Prompt",
+        "name": "system_prompt",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 0.0,
+        "description": "Sampling temperature",
+        "kind": "number-float",
+        "label": "Temperature",
+        "name": "temperature",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Maximum tokens in response",
+        "kind": "number-int",
+        "label": "Max Tokens",
+        "name": "max_tokens",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": "llm_response",
+        "description": "Field name for LLM response in output",
+        "kind": "text",
+        "label": "Response Field",
+        "name": "response_field",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Sink name for non-conformant output, or 'discard' for explicit drop",
+        "kind": "text",
+        "label": "On Validation Failure",
+        "name": "on_validation_failure",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Lookup data loaded from YAML file",
+        "kind": "json-object",
+        "label": "Lookup",
+        "name": "lookup",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Prompt template file path for audit",
+        "kind": "text",
+        "label": "Prompt Template Source",
+        "name": "prompt_template_source",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Lookup file path for audit",
+        "kind": "text",
+        "label": "Lookup Source",
+        "name": "lookup_source",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "System prompt file path for audit",
+        "kind": "text",
+        "label": "System Prompt Source",
+        "name": "system_prompt_source",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Azure deployment name",
+        "kind": "text",
+        "label": "Deployment Name",
+        "name": "deployment_name",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Azure OpenAI endpoint URL",
+        "kind": "text",
+        "label": "Endpoint",
+        "name": "endpoint",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Azure OpenAI API key",
+        "kind": "text",
+        "label": "API Key",
+        "name": "api_key",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": "2024-10-21",
+        "description": "Azure API version",
+        "kind": "text",
+        "label": "API Version",
+        "name": "api_version",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Tier 2 tracing configuration",
+        "kind": "json-object",
+        "label": "Tracing",
+        "name": "tracing",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "azure",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
+        "kind": "json-value",
+        "label": "Schema",
+        "name": "schema",
+        "nullable": false,
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Model identifier",
+        "kind": "text",
+        "label": "Model",
+        "name": "model",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Static Jinja2 prompt template",
+        "kind": "text",
+        "label": "Prompt Template",
+        "name": "prompt_template",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional system prompt",
+        "kind": "text",
+        "label": "System Prompt",
+        "name": "system_prompt",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 0.0,
+        "description": "Sampling temperature",
+        "kind": "number-float",
+        "label": "Temperature",
+        "name": "temperature",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Maximum tokens in response",
+        "kind": "number-int",
+        "label": "Max Tokens",
+        "name": "max_tokens",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": "llm_response",
+        "description": "Field name for LLM response in output",
+        "kind": "text",
+        "label": "Response Field",
+        "name": "response_field",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Sink name for non-conformant output, or 'discard' for explicit drop",
+        "kind": "text",
+        "label": "On Validation Failure",
+        "name": "on_validation_failure",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Lookup data loaded from YAML file",
+        "kind": "json-object",
+        "label": "Lookup",
+        "name": "lookup",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Prompt template file path for audit",
+        "kind": "text",
+        "label": "Prompt Template Source",
+        "name": "prompt_template_source",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Lookup file path for audit",
+        "kind": "text",
+        "label": "Lookup Source",
+        "name": "lookup_source",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "System prompt file path for audit",
+        "kind": "text",
+        "label": "System Prompt Source",
+        "name": "system_prompt_source",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "OpenRouter API key",
+        "kind": "text",
+        "label": "API Key",
+        "name": "api_key",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": "https://openrouter.ai/api/v1",
+        "description": "OpenRouter API base URL",
+        "kind": "text",
+        "label": "Base URL",
+        "name": "base_url",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 60.0,
+        "description": "Request timeout",
+        "kind": "number-float",
+        "label": "Timeout Seconds",
+        "name": "timeout_seconds",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Tier 2 tracing configuration",
+        "kind": "json-object",
+        "label": "Tracing",
+        "name": "tracing",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "openrouter",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
+        "kind": "json-value",
+        "label": "Schema",
+        "name": "schema",
+        "nullable": false,
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "LiteLLM Bedrock model id in bedrock/<id> form",
+        "kind": "text",
+        "label": "Model",
+        "name": "model",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Static Jinja2 prompt template",
+        "kind": "text",
+        "label": "Prompt Template",
+        "name": "prompt_template",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional system prompt",
+        "kind": "text",
+        "label": "System Prompt",
+        "name": "system_prompt",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 0.0,
+        "description": "Sampling temperature",
+        "kind": "number-float",
+        "label": "Temperature",
+        "name": "temperature",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Maximum tokens in response",
+        "kind": "number-int",
+        "label": "Max Tokens",
+        "name": "max_tokens",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": "llm_response",
+        "description": "Field name for LLM response in output",
+        "kind": "text",
+        "label": "Response Field",
+        "name": "response_field",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Sink name for non-conformant output, or 'discard' for explicit drop",
+        "kind": "text",
+        "label": "On Validation Failure",
+        "name": "on_validation_failure",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Lookup data loaded from YAML file",
+        "kind": "json-object",
+        "label": "Lookup",
+        "name": "lookup",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Prompt template file path for audit",
+        "kind": "text",
+        "label": "Prompt Template Source",
+        "name": "prompt_template_source",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Lookup file path for audit",
+        "kind": "text",
+        "label": "Lookup Source",
+        "name": "lookup_source",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "System prompt file path for audit",
+        "kind": "text",
+        "label": "System Prompt Source",
+        "name": "system_prompt_source",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "AWS region override; default AWS region resolution otherwise",
+        "kind": "text",
+        "label": "Region Name",
+        "name": "region_name",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Tier 2 tracing configuration",
+        "kind": "json-object",
+        "label": "Tracing",
+        "name": "tracing",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "bedrock",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Enter one JSON object. Worked example: {\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"page_count: int\", \"note: str?\"]}. Every entry in \"fields\" is the string \"name: type\", where type is one of str, int, float, bool, any, and a trailing \"?\" marks the field optional (\"note: str?\" is an optional string). Field names must be valid Python identifiers \u2014 write \"doc_id\", not \"doc-id\" or \"doc.id\". Modes: \"fixed\" accepts exactly these fields, \"flexible\" accepts these plus any extras the data carries, and \"observed\" infers every field from the data \u2014 with \"observed\" leave \"fields\" out entirely ({\"mode\": \"observed\"}).",
+        "kind": "json-value",
+        "label": "Schema",
+        "name": "schema",
+        "nullable": false,
+        "placeholder": "{\"mode\": \"fixed\", \"fields\": [\"doc_id: str\", \"note: str?\"]}",
+        "required": true,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Logical model alias",
+        "kind": "text",
+        "label": "Model",
+        "name": "model",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Static Jinja2 prompt template",
+        "kind": "text",
+        "label": "Prompt Template",
+        "name": "prompt_template",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Optional system prompt",
+        "kind": "text",
+        "label": "System Prompt",
+        "name": "system_prompt",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 0.0,
+        "description": "Sampling temperature",
+        "kind": "number-float",
+        "label": "Temperature",
+        "name": "temperature",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Maximum tokens in response",
+        "kind": "number-int",
+        "label": "Max Tokens",
+        "name": "max_tokens",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": "llm_response",
+        "description": "Field name for LLM response in output",
+        "kind": "text",
+        "label": "Response Field",
+        "name": "response_field",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Sink name for non-conformant output, or 'discard' for explicit drop",
+        "kind": "text",
+        "label": "On Validation Failure",
+        "name": "on_validation_failure",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Lookup data loaded from YAML file",
+        "kind": "json-object",
+        "label": "Lookup",
+        "name": "lookup",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Prompt template file path for audit",
+        "kind": "text",
+        "label": "Prompt Template Source",
+        "name": "prompt_template_source",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Lookup file path for audit",
+        "kind": "text",
+        "label": "Lookup Source",
+        "name": "lookup_source",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "System prompt file path for audit",
+        "kind": "text",
+        "label": "System Prompt Source",
+        "name": "system_prompt_source",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Gateway base URL ending in '/v1'",
+        "kind": "text",
+        "label": "Endpoint",
+        "name": "endpoint",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "description": "Resolved gateway bearer credential",
+        "kind": "text",
+        "label": "API Key",
+        "name": "api_key",
+        "nullable": false,
+        "required": true,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 1,
+        "description": "Gateway contract major version",
+        "kind": "number-int",
+        "label": "Contract Major",
+        "name": "contract_major",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": [],
+        "description": "Required gateway capabilities",
+        "kind": "json-value",
+        "label": "Required Capabilities",
+        "name": "required_capabilities",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": 60.0,
+        "description": "Request timeout",
+        "kind": "number-float",
+        "label": "Timeout Seconds",
+        "name": "timeout_seconds",
+        "nullable": false,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      },
+      {
+        "default": null,
+        "description": "Tier 2 tracing configuration",
+        "kind": "json-object",
+        "label": "Tracing",
+        "name": "tracing",
+        "nullable": true,
+        "required": false,
+        "visible_when": {
+          "equals": "gateway",
+          "field": "provider"
+        }
+      }
+    ]
+  },
+  "plugin_kind": "source",
+  "plugin_name": "llm"
+}

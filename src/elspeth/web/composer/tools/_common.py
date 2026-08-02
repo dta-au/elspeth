@@ -1704,7 +1704,7 @@ def _prevalidate_plugin_options(
 
     try:
         if plugin_type == "source":
-            config_cls = get_source_config_model(plugin_name)
+            config_cls = get_source_config_model(plugin_name, options)
         elif plugin_type == "transform":
             config_cls = get_transform_config_model(plugin_name, options)
         elif plugin_type == "sink":
@@ -2401,6 +2401,65 @@ def _prevalidate_source(
         filtered,
         injected_fields={"on_validation_failure": on_validation_failure},
     )
+
+
+def _prevalidate_source_for_context(
+    context: ToolContext,
+    plugin_name: str,
+    options: Mapping[str, Any],
+    on_validation_failure: str = _DEFAULT_SOURCE_VALIDATION_FAILURE,
+    *,
+    source_name: str = "source",
+) -> str | None:
+    """Validate one candidate source through the shared profile adapter.
+
+    Profile lowering is an in-memory validation projection only.  The caller
+    persists its original authored ``options``; this helper validates the
+    corresponding executable provider binding without returning or exposing
+    that private projection.
+    """
+    if "on_validation_failure" in options and options["on_validation_failure"] != on_validation_failure:
+        return (
+            f"Invalid options for source '{plugin_name}': options.on_validation_failure conflicts with "
+            "the source routing field on_validation_failure"
+        )
+    profile_options = {
+        **deep_thaw(options),
+        "on_validation_failure": on_validation_failure,
+    }
+    candidate = CompositionState(
+        sources={
+            source_name: SourceSpec(
+                plugin=plugin_name,
+                on_success="discard",
+                options=profile_options,
+                on_validation_failure=on_validation_failure,
+            )
+        },
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    try:
+        profile_validation = context.catalog.validate_composition_state(candidate)
+    except ValueError as exc:
+        return f"Invalid options for source '{plugin_name}': {exc}"
+    blocking = tuple(
+        finding for finding in profile_validation.policy_findings if finding.stage in {"plugin_enablement", "operator_profile_options"}
+    )
+    if blocking:
+        return f"Invalid options for source '{plugin_name}': {blocking[0].error_code} — {blocking[0].message}"
+    executable_source = profile_validation.executable_state.sources[source_name]
+    if type(executable_source.on_validation_failure) is not str or executable_source.on_validation_failure != on_validation_failure:
+        return f"Invalid options for source '{plugin_name}': profile lowering changed on_validation_failure"
+    executable_options = deep_thaw(executable_source.options)
+    if "on_validation_failure" in executable_options:
+        executable_on_validation_failure = executable_options.pop("on_validation_failure")
+        if type(executable_on_validation_failure) is not str or executable_on_validation_failure != on_validation_failure:
+            return f"Invalid options for source '{plugin_name}': profile lowering changed on_validation_failure"
+    return _prevalidate_source(plugin_name, executable_options, on_validation_failure)
 
 
 def _prevalidate_transform(plugin_name: str, options: Mapping[str, Any]) -> str | None:

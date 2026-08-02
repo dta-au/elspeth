@@ -38,6 +38,7 @@ from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginC
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.value_source import register_value_source_plugin
+from elspeth.core.llm_profiles import require_lowered_llm_profile_alias
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
 from elspeth.plugins.infrastructure.clients.llm import ContextLengthError, LLMClientError
@@ -60,10 +61,12 @@ from elspeth.plugins.transforms.llm.langfuse import LangfuseTracer, create_langf
 from elspeth.plugins.transforms.llm.multi_query import QuerySpec, ResponseFormat, resolve_queries
 from elspeth.plugins.transforms.llm.provider import (
     FinishReason,
+    LLMAuditParent,
     LLMProvider,
     LLMQueryResult,
     ParsedFinishReason,
     UnrecognizedFinishReason,
+    classify_finish_reason_failure,
 )
 from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider, AzureOpenAIConfig, _configure_azure_monitor
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockConfig, BedrockLLMProvider
@@ -81,11 +84,6 @@ if TYPE_CHECKING:
 
 _warn_telemetry_before_start = make_warn_telemetry_before_start(logger)
 
-
-_FINISH_REASON_ERRORS: dict[FinishReason, tuple[str, str]] = {
-    FinishReason.LENGTH: ("response_truncated", "Response truncated (finish_reason=length)"),
-    FinishReason.CONTENT_FILTER: ("content_filtered", "Response blocked by provider content filter"),
-}
 
 # Bounded local retry constants for sequential multi-query transient errors.
 # Mirrors transforms/azure/base.py _CAPACITY_RETRY_* constants.
@@ -189,55 +187,18 @@ def _finish_reason_error(
             reason["content_length"] = content_length
         return reason
 
-    # Allowlist: explicit STOP is a known-good completion.
-    if finish_reason == FinishReason.STOP:
+    failure = classify_finish_reason_failure(finish_reason)
+    if failure is None:
         return None
-
-    # Absent finish_reason (None) is a valid response shape for some providers
-    # (e.g. Azure SDK omits raw_response or choices in certain configurations).
-    # This is provider-normal behavior, not a defect. The provider already
-    # validated content is non-empty via LLMQueryResult, and logged a warning
-    # about "truncation undetectable".
-    #
-    # Callers record finish_reason in success_reason.metadata so the audit
-    # trail distinguishes None (absent) from STOP (confirmed completion).
-    # This is queryable via MCP diagnose() for operational visibility.
-    if finish_reason is None:
-        return None
-
-    # Known-bad reasons with specific error messages.
-    if isinstance(finish_reason, FinishReason):
-        entry = _FINISH_REASON_ERRORS.get(finish_reason)
-        if entry is not None:
-            reason_key, error_message = entry
-            return _FinishReasonError(
-                result=TransformResult.error(
-                    cast(
-                        TransformErrorReason,
-                        _build_reason(reason=reason_key, finish_reason=finish_reason.value),
-                    ),
-                    retryable=False,
-                ),
-                error_message=error_message,
-            )
-        # entry is None: this FinishReason is not in the error dict but is also
-        # not STOP — fall through to the catch-all so it is rejected.
-
-    # Catch-all: any finish reason not explicitly allowlisted (including
-    # known enum members not in STOP or error dict, and unrecognized values)
-    # is an error. Uses _serialize_finish_reason as the single source of truth
-    # for string conversion. None was handled above; raw_value is always str.
-    raw_value = _serialize_finish_reason(finish_reason)
-    assert raw_value is not None, "finish_reason=None was handled above — unreachable"
     return _FinishReasonError(
         result=TransformResult.error(
             cast(
                 TransformErrorReason,
-                _build_reason(reason="unexpected_finish_reason", finish_reason=raw_value),
+                _build_reason(reason=failure.reason, finish_reason=failure.finish_reason),
             ),
             retryable=False,
         ),
-        error_message=f"Unexpected finish reason: {raw_value}",
+        error_message=failure.error_message,
     )
 
 
@@ -331,6 +292,7 @@ class SingleQueryStrategy:
             return _shutdown_requested_result()
 
         # 3. Call provider (EXTERNAL — errors classified by provider)
+        trace_parent = LLMAuditParent.for_row(state_id=state_id, token_id=token_id)
         start_time = time.monotonic()
         try:
             result = provider.execute_query(
@@ -338,18 +300,19 @@ class SingleQueryStrategy:
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
-                state_id=state_id,
-                token_id=token_id,
+                audit_parent=trace_parent,
             )
         except ContextLengthError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name="single",
                 prompt=rendered.prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=None,
+                system_prompt=self.system_prompt,
             )
             return TransformResult.error(
                 {"reason": "context_length_exceeded", "error": str(e)},
@@ -358,12 +321,14 @@ class SingleQueryStrategy:
         except LLMClientError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name="single",
                 prompt=rendered.prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=None,
+                system_prompt=self.system_prompt,
             )
             if e.retryable:
                 raise
@@ -381,12 +346,14 @@ class SingleQueryStrategy:
         )
         if finish_reason_error is not None:
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name="single",
                 prompt=rendered.prompt,
                 error_message=finish_reason_error.error_message,
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=None,
+                system_prompt=self.system_prompt,
             )
             return finish_reason_error.result
 
@@ -395,13 +362,15 @@ class SingleQueryStrategy:
 
         # Record success in tracer
         tracer.record_success(
-            token_id=token_id,
+            parent=trace_parent,
             query_name="single",
             prompt=rendered.prompt,
             response_content=content,
-            model=self.model,
+            model=result.model,
             usage=result.usage,
             latency_ms=latency_ms,
+            extra_metadata=None,
+            system_prompt=self.system_prompt,
         )
 
         # 6. Build output row — operational fields only
@@ -630,6 +599,7 @@ class MultiQueryStrategy:
             else:
                 response_format = {"type": "json_object"}
 
+        trace_parent = LLMAuditParent.for_row(state_id=state_id, token_id=token_id)
         start_time = time.monotonic()
         try:
             result = provider.execute_query(
@@ -637,19 +607,20 @@ class MultiQueryStrategy:
                 model=self.model,
                 temperature=self.temperature,
                 max_tokens=query_max_tokens,
-                state_id=state_id,
-                token_id=token_id,
+                audit_parent=trace_parent,
                 response_format=response_format,
             )
         except ContextLengthError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name=spec.name,
                 prompt=rendered.prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=None,
+                system_prompt=self.system_prompt,
             )
             return TransformResult.error(
                 {
@@ -663,12 +634,14 @@ class MultiQueryStrategy:
         except LLMClientError as e:
             latency_ms = (time.monotonic() - start_time) * 1000
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name=spec.name,
                 prompt=rendered.prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=None,
+                system_prompt=self.system_prompt,
             )
             if e.retryable:
                 raise  # Pool catches with AIMD; sequential catches and returns error
@@ -692,12 +665,14 @@ class MultiQueryStrategy:
         )
         if finish_reason_error is not None:
             tracer.record_error(
-                token_id=token_id,
+                parent=trace_parent,
                 query_name=spec.name,
                 prompt=rendered.prompt,
                 error_message=finish_reason_error.error_message,
                 model=self.model,
                 latency_ms=latency_ms,
+                extra_metadata=None,
+                system_prompt=self.system_prompt,
             )
             return finish_reason_error.result
 
@@ -705,13 +680,15 @@ class MultiQueryStrategy:
         content = strip_markdown_fences(result.content)
 
         tracer.record_success(
-            token_id=token_id,
+            parent=trace_parent,
             query_name=spec.name,
             prompt=rendered.prompt,
             response_content=content,
-            model=self.model,
+            model=result.model,
             usage=result.usage,
             latency_ms=latency_ms,
+            extra_metadata=None,
+            system_prompt=self.system_prompt,
         )
 
         # Build partial output for this query
@@ -1155,7 +1132,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:acc31f06c294a33c"
+    source_file_hash: str | None = "sha256:2162a412737490ac"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1310,11 +1287,10 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 model: str,
                 temperature: float,
                 max_tokens: int | None,
-                state_id: str,
-                token_id: str,
+                audit_parent: LLMAuditParent,
                 response_format: object | None = None,
             ) -> LLMQueryResult:
-                del messages, model, temperature, max_tokens, state_id, token_id, response_format
+                del messages, model, temperature, max_tokens, audit_parent, response_format
                 return LLMQueryResult(
                     content="probe response",
                     usage=TokenUsage.known(1, 1),
@@ -1338,11 +1314,19 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
             probe_provider.close()
 
     def __init__(self, config: dict[str, Any]) -> None:
-        super().__init__(config)
+        profile_alias = require_lowered_llm_profile_alias(config)
+        if profile_alias is None:
+            base_config = config
+        else:
+            # Consume the nominal admission proof at the plugin boundary and
+            # retain only the opaque plain-string alias in audit config.
+            base_config = dict(config)
+            base_config["profile_alias"] = profile_alias
+        super().__init__(base_config)
 
         # Provider dispatch from single registry.
         # config is user YAML (Tier 3 boundary) — distinguish missing key from unknown value.
-        provider_name = config.get("provider")
+        provider_name = base_config.get("provider")
         if provider_name is None:
             raise ValueError(f"LLM config missing required 'provider' key. Valid providers: {sorted(_PROVIDERS)}")
         if provider_name not in _PROVIDERS:
@@ -1351,19 +1335,21 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
 
         # `profile_alias` is a provenance-only marker the batch/CLI operator
         # profile catalog lowering pass (core.config._lower_llm_profile_nodes)
-        # leaves in `self.config` (set by BaseTransform.__init__ above, from
-        # the SAME `config` dict) purely so the DAG's per-node audit config
-        # and the run's settings_json snapshot can answer "which llm_profiles
-        # alias did this node use" — no provider config model declares this
-        # field, and every provider config class forbids extra fields, so it
-        # must be excluded before validation rather than declared on
-        # LLMConfig itself. Named distinctly from the authored `profile`
-        # selector key on purpose: keying the retained alias as `profile`
-        # here would put a lowered node right back into the exact shape
+        # leaves in `self.config` (converted from its nominal admission marker
+        # to an ordinary string before BaseTransform.__init__ above) purely so
+        # the DAG's per-node audit config and the run's settings_json snapshot
+        # can answer "which llm_profiles alias did this node use" — no provider
+        # config model declares this field, and every provider config class
+        # forbids extra fields, so it must be excluded before validation rather
+        # than declared on LLMConfig itself. Named distinctly from the authored
+        # `profile` selector key on purpose: keying the retained alias as
+        # `profile` here would put a lowered node right back into the exact shape
         # _lower_llm_profile_nodes's own ambiguity check rejects (`profile`
         # + `provider` both present), making that pass unsafe to run twice
         # over its own output.
-        provider_config = {key: value for key, value in config.items() if key != "profile_alias"} if "profile_alias" in config else config
+        provider_config = (
+            {key: value for key, value in base_config.items() if key != "profile_alias"} if "profile_alias" in base_config else base_config
+        )
 
         # Parse config with provider-specific model.
         # config_cls is one of the registered provider config classes at runtime;
@@ -1626,11 +1612,6 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
         # Must happen after provider creation — the OpenAI SDK must be available.
         if isinstance(self._tracing_config, AzureAITracingConfig):
             _configure_azure_monitor(self._tracing_config)
-            logger.info(
-                "Azure AI tracing initialized",
-                provider="azure_ai",
-                content_recording=self._tracing_config.enable_content_recording,
-            )
 
     def runtime_preflight(self, ctx: LifecycleContext) -> None:
         """Fail fast if the configured LLM provider/model cannot be reached."""

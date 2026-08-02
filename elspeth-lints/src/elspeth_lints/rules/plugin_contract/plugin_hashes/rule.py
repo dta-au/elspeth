@@ -22,6 +22,7 @@ from elspeth_lints.rules.plugin_contract.plugin_hashes.metadata import (
 
 PLUGIN_DIRS = (
     "plugins/sources",
+    "plugins/sources/llm",
     "plugins/sinks",
     "plugins/transforms",
     "plugins/transforms/azure",
@@ -42,7 +43,7 @@ EXCLUDED_FILES = frozenset(
         "provider.py",
     }
 )
-EXPECTED_PLUGIN_COUNT = 37
+EXPECTED_PLUGIN_COUNT = 45
 _HASH_LINE_PATTERN = re.compile(rb'(\s*source_file_hash\s*(?::[^=]+=\s*|=\s*))"sha256:[^"]+"')
 _NORMALIZED_HASH_VALUE = b'"sha256:0000000000000000"'
 _PLUGIN_BASE_CLASS_NAMES = frozenset(

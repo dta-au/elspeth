@@ -31,3 +31,13 @@ def test_every_example_directory_is_indexed() -> None:
     ]
 
     assert not missing, f"Add these example directories to examples/README.md or explicitly exempt them in {Path(__file__).name}: {missing}"
+
+
+def test_llm_source_index_describes_the_source_native_cardinality() -> None:
+    index_lines = EXAMPLES_README.read_text(encoding="utf-8").splitlines()
+    table_rows = [line for line in index_lines if line.startswith("| [`llm_source`](llm_source/) |")]
+
+    assert len(table_rows) == 1
+    row = table_rows[0].lower()
+    assert "one authored prompt" in row
+    assert "one generated row" in row

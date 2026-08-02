@@ -111,7 +111,7 @@ def _source_entries(source: SourceSpec) -> list[ImplicitDecisionEntry]:
         _entry(
             f"source.{field_path}",
             value,
-            category="source",
+            category=_category_for_source_option(source, field_path),
             provenance=_provenance_for_path(f"source.{field_path}", value),
         )
         for field_path, value in _flatten_options(
@@ -316,6 +316,12 @@ def _category_for_node_option(node: NodeSpec, field_path: str) -> DecisionCatego
     if node.plugin == "llm" and field_path in {"provider", "model", "temperature", "pool_size"}:
         return "model"
     return "plugin_option"
+
+
+def _category_for_source_option(source: SourceSpec, field_path: str) -> DecisionCategory:
+    if source.plugin == "llm" and field_path in {"provider", "model", "temperature", "pool_size"}:
+        return "model"
+    return "source"
 
 
 def _provenance_for_path(path: str, value: object) -> DecisionProvenance:

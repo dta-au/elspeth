@@ -11,7 +11,9 @@ syntactically legal, but every row gets an identical prompt, which is
 almost always an authoring mistake. It mirrors identity_node_advisory's
 contract exactly: registered in VALIDATION_CHECK_NAMES, present in the
 advisory list, absent from VALIDATION_BLOCKING_CHECK_NAMES and _ALL_CHECKS,
-``passed=True`` always, emitted only on the happy path.
+``passed=True`` always, emitted only on the happy path. Generation guidance
+must point at the live ``source:llm`` capability without echoing authored
+prompt content.
 """
 
 from __future__ import annotations
@@ -352,9 +354,10 @@ def test_validate_pipeline_emits_advisory_and_does_not_block(
     mock_build_graph.return_value = _runtime_graph_double()
     mock_assemble.return_value = object()
 
+    prompt_sentinel = "STATIC_PROMPT_MUST_NOT_REACH_THE_ADVISORY"
     state = _make_state_with(
         source=_allowlisted_source(),
-        nodes=(_make_llm_node(prompt_template="Static prompt with no interpolation at all."),),
+        nodes=(_make_llm_node(prompt_template=prompt_sentinel),),
         outputs=(_allowlisted_observed_sink(),),
     )
     # allow_pending_interpretation_placeholders masks the llm node's pending
@@ -372,28 +375,16 @@ def test_validate_pipeline_emits_advisory_and_does_not_block(
     advisory = advisories[0]
     assert advisory.passed is True, "Advisory entries are passed=True (informational)"
     assert advisory.affected_nodes == ("classify",)
+    assert (
+        "If the intent is generation (producing one row from one fixed prompt, not transforming existing rows), "
+        "use the 'llm' source (source:llm); it accepts no input rows and emits one response row."
+    ) in advisory.detail
+    assert "cannot express today" not in advisory.detail
+    assert prompt_sentinel not in advisory.detail
 
-    detail = advisory.detail
-    # 1. Observation: names the node, states the consequence (unchanged by
-    # the wording revision).
-    assert "'classify'" in detail
-    assert "identical prompt" in detail
-    # 2. Redirect question, not an availability assertion — an LLM source
-    # plugin is in development elsewhere (as of this wording) but does not
-    # exist yet, so the advisory must ask rather than promise. Exact phrasing
-    # from operator direction (2026-08-01 follow-up on elspeth-6bdb7e7736).
-    assert "did you mean to use an LLM source instead?" in detail
-    assert detail.rstrip().endswith("?"), "must end as a question, not an assertion of availability"
-    # No specific plugin id is verifiable yet (no ticket, no branch, no
-    # registration) — the advisory must not promise one. Guards against a
-    # future edit re-introducing an unverified id like 'source:llm'.
-    assert "source:llm" not in detail
-    assert "llm_source" not in detail
-    # Old assertion-style wording ("cannot express today") must be gone.
-    assert "cannot express" not in detail
-    # 3. Concrete remedy retained for the transform case.
-    assert "row.*" in detail
-    assert "per-row transformation" in detail
+    assert "'classify'" in advisory.detail
+    assert "identical prompt" in advisory.detail
+    assert "row.*" in advisory.detail
 
 
 @patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config")

@@ -1041,6 +1041,91 @@ describe("AuditReadinessPanel", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("renders the backend interpretation narrative for a source-only LLM composition", async () => {
+    useSessionStore.setState({
+      activeSessionId: SESSION_ID,
+      compositionState: makeComposition(1, {
+        sources: {
+          generated: {
+            plugin: "llm",
+            options: { api_key: "do-not-render-private-key" },
+          },
+        },
+        nodes: [],
+      }),
+    });
+    vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
+      (_sid, signal) =>
+        makeAbortablePromise(
+          snapshotWithLlmRow(1, {
+            status: "not_applicable",
+            summary: "LLM source prompts do not use interpretation review",
+            detail:
+              "The rowless LLM source issues one authored prompt without incoming row data, so it creates no row interpretation events.",
+          }),
+          { signal },
+        ),
+    );
+
+    const user = userEvent.setup();
+    render(<AuditReadinessPanel />);
+    await user.click(await screen.findByRole("button", { name: /Audit ready/i }));
+
+    const row = screen.getByTestId(
+      "audit-readiness-row-llm-interpretations",
+    );
+    expect(row).toHaveTextContent(
+      "LLM source prompts do not use interpretation review",
+    );
+    expect(row).toHaveTextContent("Not applicable");
+    expect(
+      screen.queryByText(/do-not-render-private-key/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the session opt-out override authoritative for a source-only LLM composition", async () => {
+    useSessionStore.setState({
+      activeSessionId: SESSION_ID,
+      compositionState: makeComposition(1, {
+        sources: {
+          generated: { plugin: "llm", options: {} },
+        },
+        nodes: [],
+      }),
+    });
+    useInterpretationEventsStore.setState({
+      pendingBySession: { [SESSION_ID]: {} },
+      resolvedCountBySession: {
+        [SESSION_ID]: { accepted_as_drafted: 0, amended: 0, opted_out: 2 },
+      },
+      optedOutBySession: { [SESSION_ID]: true },
+    });
+    vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
+      (_sid, signal) =>
+        makeAbortablePromise(
+          snapshotWithLlmRow(1, {
+            status: "not_applicable",
+            summary: "LLM source prompts do not use interpretation review",
+          }),
+          { signal },
+        ),
+    );
+
+    const user = userEvent.setup();
+    render(<AuditReadinessPanel />);
+    await user.click(await screen.findByRole("button", { name: /Audit ready/i }));
+
+    const row = screen.getByTestId(
+      "audit-readiness-row-llm-interpretations",
+    );
+    expect(row).toHaveTextContent(
+      "Opted out for this session (2 drafted, not reviewed)",
+    );
+    expect(row).not.toHaveTextContent(
+      "LLM source prompts do not use interpretation review",
+    );
+  });
+
   it("renders 'all N resolved' when status=ok and only resolved events exist (Phase 5b.18b.7 §2)", async () => {
     useSessionStore.setState({
       activeSessionId: SESSION_ID,

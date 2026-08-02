@@ -72,6 +72,45 @@ def test_calls_out_llm_recording_details():
     assert "response" in text.lower() or "model" in text.lower()
 
 
+def test_calls_out_source_native_llm_recording_details_without_values():
+    state = _state(source_plugin="llm", transforms=())
+    source = state.sources["source"]
+    state = CompositionState(
+        sources={
+            "source": SourceSpec(
+                plugin=source.plugin,
+                on_success=source.on_success,
+                options={
+                    "prompt_template": "PROMPT_CANARY_DO_NOT_RENDER",
+                    "profile": "PROFILE_CANARY_DO_NOT_RENDER",
+                    "model": "MODEL_CANARY_DO_NOT_RENDER",
+                    "api_key": "SECRET_CANARY_DO_NOT_RENDER",
+                },
+                on_validation_failure=source.on_validation_failure,
+            )
+        },
+        nodes=state.nodes,
+        edges=state.edges,
+        outputs=state.outputs,
+        metadata=state.metadata,
+        version=state.version,
+    )
+
+    text = build_narrative(state, retention_days=90)
+
+    assert "one authored prompt" in text
+    assert "one generated row" in text
+    assert "served model" in text
+    assert "provider-reported usage" in text
+    assert "timestamp" in text
+    assert "source_load operation" in text
+    assert "prompt and response evidence" in text
+    assert "for each row" not in text
+    assert "LLM transform" not in text
+    for canary in ("PROMPT_CANARY", "PROFILE_CANARY", "MODEL_CANARY", "SECRET_CANARY"):
+        assert canary not in text
+
+
 def test_includes_each_sink():
     text = build_narrative(
         _state(sinks=(("primary", "csv"), ("backup", "json"))),

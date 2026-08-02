@@ -407,6 +407,42 @@ class TestStep1IntraStep:
         assert body["next_turn"]["step_index"] == 0  # STEP_1_SOURCE is index 0
         assert body["guided_session"]["step"] == "step_1_source"
 
+    def test_llm_source_profile_form_persists_only_authored_options(self, composer_test_client: TestClient) -> None:
+        """The guided source form validates through its request-scoped profile authority."""
+        session_id = _create_session(composer_test_client)
+        initial = _get_guided(composer_test_client, session_id)
+        assert "llm" in {option["id"] for option in initial["next_turn"]["payload"]["options"]}
+
+        selected = _respond(composer_test_client, session_id, chosen=["llm"])
+        assert selected["next_turn"]["type"] == "schema_form"
+        assert selected["next_turn"]["payload"]["plugin"] == "llm"
+
+        reviewed = _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "llm",
+                "options": {
+                    "profile": "task-role",
+                    "prompt_template": "Write one concise audit briefing.",
+                    "response_field": "briefing",
+                    "schema": {"mode": "observed"},
+                    "on_validation_failure": "discard",
+                },
+            },
+        )
+
+        assert reviewed["next_turn"]["type"] == "review_components"
+        source = next(iter(_full_guided_session(reviewed)["reviewed_sources"].values()))
+        assert source["on_validation_failure"] == "discard"
+        assert source["options"] == {
+            "profile": "task-role",
+            "prompt_template": "Write one concise audit briefing.",
+            "response_field": "briefing",
+            "schema": {"mode": "observed"},
+        }
+        assert not ({"provider", "model", "api_key", "region_name"} & set(source["options"]))
+
     def test_uploaded_csv_prefills_blob_path_and_commits_observed_schema(self, composer_test_client: TestClient) -> None:
         """A Step-1 CSV pick after upload is deterministic without asking chat to infer the file."""
         session_id = _create_session(composer_test_client)

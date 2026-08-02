@@ -11,6 +11,7 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
+import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { resetStore } from "@/test/store-helpers";
 import type { CompositionState, PluginSummary } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
@@ -96,6 +97,7 @@ describe("ExecuteButton", () => {
     } as never);
     resetStore(useInterpretationEventsStore);
     resetStore(useAuditReadinessStore);
+    resetStore(usePluginCatalogStore);
   });
 
   it("renders nothing when there is no active session", () => {
@@ -231,6 +233,53 @@ describe("ExecuteButton", () => {
       within(dialog).getByRole("button", { name: /^run pipeline$/i }),
     );
     expect(execute).toHaveBeenCalledWith("sess-1");
+  });
+
+  it("uses the live source catalog when building the disclosure", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+      } as never,
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({
+      activeSessionId: "sess-1",
+      compositionState: makeComposition({
+        sources: {
+          generated: {
+            plugin: "catalogued_generator",
+            options: { profile: "approved-generation" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+    } as never);
+    usePluginCatalogStore.setState({
+      sources: [
+        makePluginSummary({
+          name: "catalogued_generator",
+          plugin_type: "source",
+          capability_tags: ["llm"],
+        }),
+      ],
+      transforms: [],
+      isLoading: false,
+      error: null,
+    });
+
+    render(<ExecuteButton />);
+    fireEvent.click(screen.getByRole("button", { name: /run pipeline/i }));
+
+    const dialog = screen.getByRole("alertdialog", { name: /run pipeline\?/i });
+    expect(dialog).toHaveTextContent(
+      "Sends one authored prompt to the configured LLM: source:generated (profile approved-generation).",
+    );
+    expect(dialog).not.toHaveTextContent("Reads source data");
   });
 
   it("does not execute when the disclosure is cancelled", () => {
@@ -740,6 +789,231 @@ describe("primaryRunBlockReason", () => {
 describe("buildRunEgressSummary", () => {
   it("returns no lines for a null composition", () => {
     expect(buildRunEgressSummary(null)).toEqual([]);
+  });
+
+  const llmSourceCatalog = [
+    makePluginSummary({
+      name: "llm",
+      plugin_type: "source",
+      capability_tags: ["llm", "generation", "single-row"],
+    }),
+  ];
+
+  it.each([
+    {
+      catalogState: "current",
+      sources: llmSourceCatalog,
+      loadFailed: false,
+      isLoading: false,
+    },
+    {
+      catalogState: "failed",
+      sources: null,
+      loadFailed: true,
+      isLoading: false,
+    },
+    {
+      catalogState: "stale",
+      sources: llmSourceCatalog,
+      loadFailed: false,
+      isLoading: true,
+    },
+    {
+      catalogState: "not yet loaded",
+      sources: null,
+      loadFailed: false,
+      isLoading: false,
+    },
+    {
+      catalogState: "unknown",
+      sources: [makePluginSummary({ name: "csv", plugin_type: "source" })],
+      loadFailed: false,
+      isLoading: false,
+    },
+  ])(
+    "discloses one authored prompt exactly once when the source catalog is $catalogState",
+    ({ sources, loadFailed, isLoading }) => {
+      const lines = buildRunEgressSummary(
+        makeComposition({
+          sources: {
+            source: {
+              plugin: "llm",
+              options: {
+                profile: "approved-generation",
+                prompt_template: "private authored prompt sentinel",
+              },
+              on_success: "results",
+              on_validation_failure: "discard",
+            },
+          },
+        }),
+        [],
+        loadFailed,
+        sources,
+        isLoading,
+      );
+
+      expect(lines).toEqual([
+        "Sends one authored prompt to the configured LLM: source (profile approved-generation).",
+      ]);
+      expect(lines.join(" ")).not.toContain("Reads source data");
+      expect(lines.join(" ")).not.toContain("private authored prompt sentinel");
+    },
+  );
+
+  it("uses a current source catalog to classify a capability-tagged LLM source", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          generated: {
+            plugin: "catalogued_generator",
+            options: { profile: "approved-generation" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      false,
+      [
+        makePluginSummary({
+          name: "catalogued_generator",
+          plugin_type: "source",
+          capability_tags: ["llm"],
+        }),
+      ],
+      false,
+    );
+
+    expect(lines).toEqual([
+      "Sends one authored prompt to the configured LLM: source:generated (profile approved-generation).",
+    ]);
+  });
+
+  it("keeps ordinary-source and LLM-transform wording unchanged beside an LLM source", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          generated: {
+            plugin: "llm",
+            options: { profile: "approved-generation" },
+            on_success: "rows",
+            on_validation_failure: "discard",
+          },
+          source: { plugin: "csv", options: {}, on_success: "rows" },
+        },
+        nodes: [
+          {
+            id: "classify",
+            node_type: "transform",
+            plugin: "llm",
+            input: "rows",
+            on_success: "results",
+            on_error: null,
+            options: { model: "openrouter/anthropic/claude-sonnet-4.6" },
+          },
+        ],
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+    );
+
+    expect(lines).toEqual([
+      "Reads source data: source (csv).",
+      "Sends one authored prompt to the configured LLM: source:generated (profile approved-generation).",
+      "Sends rows to the configured LLM: classify (model openrouter/anthropic/claude-sonnet-4.6).",
+    ]);
+  });
+
+  it("uses a safe authored model only when no profile provenance is present", () => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          source: {
+            plugin: "llm",
+            options: { model: "bedrock/anthropic.claude-3-haiku-20240307-v1:0" },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+    );
+
+    expect(lines).toEqual([
+      "Sends one authored prompt to the configured LLM: source (model bedrock/anthropic.claude-3-haiku-20240307-v1:0).",
+    ]);
+  });
+
+  it("shows only the authored profile alias and never private resolved values", () => {
+    const privateSentinels = [
+      "private-resolved-model-sentinel",
+      "https://private-endpoint.invalid/v1",
+      "private-api-key-sentinel",
+      "PRIVATE_CREDENTIAL_REF_SENTINEL",
+      "private-profile-alias-sentinel",
+    ];
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          source: {
+            plugin: "llm",
+            options: {
+              profile: "approved-generation",
+              model: privateSentinels[0],
+              endpoint: privateSentinels[1],
+              api_key: privateSentinels[2],
+              credential_ref: privateSentinels[3],
+              profile_alias: privateSentinels[4],
+            },
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+    );
+
+    expect(lines).toEqual([
+      "Sends one authored prompt to the configured LLM: source (profile approved-generation).",
+    ]);
+    for (const sentinel of privateSentinels) {
+      expect(lines.join(" ")).not.toContain(sentinel);
+    }
+  });
+
+  it.each([
+    { label: "unsafe profile provenance", options: { profile: { secret_ref: "PRIVATE_PROFILE" }, model: "private-resolved-model" } },
+    { label: "private profile alias", options: { profile_alias: "operator-resolved", model: "private-resolved-model" } },
+    { label: "secret-reference model", options: { model: "${PRIVATE_MODEL}" } },
+    { label: "non-string model", options: { model: { secret_ref: "PRIVATE_MODEL" } } },
+  ])("falls back to configured LLM for $label", ({ options }) => {
+    const lines = buildRunEgressSummary(
+      makeComposition({
+        sources: {
+          source: {
+            plugin: "llm",
+            options,
+            on_success: "results",
+            on_validation_failure: "discard",
+          },
+        },
+      }),
+      [],
+      false,
+      llmSourceCatalog,
+    );
+
+    expect(lines).toEqual([
+      "Sends one authored prompt to the configured LLM: source (configured LLM).",
+    ]);
+    expect(lines.join(" ")).not.toContain("PRIVATE_MODEL");
+    expect(lines.join(" ")).not.toContain("private-resolved-model");
   });
 
   it("derives sources, LLM/model nodes, network fetches, and sinks from the composition", () => {

@@ -13,7 +13,8 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlRole, PluginCapability
 from elspeth.core.templates import extract_jinja2_field_usage
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
-from elspeth.web.composer.state import CompositionState, NodeSpec, _coalesce_branch_connections
+from elspeth.web.composer._producer_resolver import source_producer_id
+from elspeth.web.composer.state import CompositionState, NodeSpec, SourceSpec, _coalesce_branch_connections
 
 _NON_PRODUCED_ROUTE_TARGETS = frozenset({"discard", "fork", "stop"})
 
@@ -57,9 +58,14 @@ class ControlCoverageFinding:
     rejection with the same severity. ``output_error_route_not_post_dominated``
     is the narrow, fully-diagnosable output case: the node's own ``on_error``
     edge is the single uncovered stream, so the message can name the one
-    authorable repair instead of a generic "not covered". ``uncovered_stream``
-    is populated only for that case and carries the offending ``on_error``
-    target.
+    authorable repair instead of a generic "not covered". The source-side
+    ``output_validation_failure_route_not_post_dominated`` is the equivalent
+    diagnosis for an unrepairable ``on_validation_failure`` route.
+    ``uncovered_stream`` carries the offending target for either diagnosis.
+
+    ``component_type`` keeps the stable component id nominal across every
+    policy and execution validation boundary. ``source`` ids use the composer
+    convention (``source`` or ``source:<name>``); transform ids are node ids.
 
     ``input_fields_unprovable`` is the second fully-diagnosable case: the
     node's protected field set is not statically complete, so a control scoped
@@ -73,6 +79,7 @@ class ControlCoverageFinding:
     """
 
     component_id: str
+    component_type: Literal["source", "transform"]
     capability: PluginCapability
     role: ControlRole
     reason: Literal[
@@ -80,6 +87,7 @@ class ControlCoverageFinding:
         "input_fields_unprovable",
         "output_not_post_dominated",
         "output_error_route_not_post_dominated",
+        "output_validation_failure_route_not_post_dominated",
     ]
     uncovered_stream: str | None = None
     protected_fields: tuple[str, ...] = ()
@@ -232,10 +240,15 @@ def _template_input_fields(template: object) -> _ProtectedFields:
 
 def _llm_output_fields(node: NodeSpec) -> frozenset[str]:
     """Return the raw model-response fields emitted by this LLM config."""
-    response_field = node.options.get("response_field", "llm_response")
+    return _llm_output_fields_from_options(node.options)
+
+
+def _llm_output_fields_from_options(options: Mapping[str, object]) -> frozenset[str]:
+    """Return only raw model-response fields, excluding operational diagnostics."""
+    response_field = options.get("response_field", "llm_response")
     if not isinstance(response_field, str) or not response_field.strip():
         return frozenset()
-    queries = node.options.get("queries")
+    queries = options.get("queries")
     if queries is None:
         return frozenset({response_field})
 
@@ -257,6 +270,17 @@ def _llm_output_fields(node: NodeSpec) -> frozenset[str]:
     return frozenset(f"{name}_{response_field}" for name in query_names)
 
 
+def _llm_source_output_fields(source: SourceSpec) -> frozenset[str] | None:
+    """Return the one generated field, or ``None`` when options are malformed."""
+    options: object = source.options
+    if not isinstance(options, Mapping):
+        return None
+    response_field = options.get("response_field", "llm_response")
+    if type(response_field) is not str or not response_field.strip():
+        return None
+    return frozenset({response_field})
+
+
 def node_has_capability(node: NodeSpec, capability: PluginCapability) -> bool:
     if node.plugin is None:
         return False
@@ -267,6 +291,40 @@ def node_has_capability(node: NodeSpec, capability: PluginCapability) -> bool:
     return any(declaration.capability is capability for declaration in plugin_cls.policy_capabilities)
 
 
+def source_has_capability(source: SourceSpec, capability: PluginCapability) -> bool:
+    """Resolve source capabilities through the nominal source registry."""
+    if type(source.plugin) is not str:
+        return False
+    try:
+        plugin_cls = get_shared_plugin_manager().get_source_by_name(source.plugin)
+    except PluginNotFoundError:
+        return False
+    return any(declaration.capability is capability for declaration in plugin_cls.policy_capabilities)
+
+
+def _source_component_id(source_name: object) -> str:
+    """Return a value-safe stable id for a possibly malformed source name."""
+    if type(source_name) is not str:
+        return "source:<invalid>"
+    return source_producer_id(source_name)
+
+
+def _stable_source_items(state: CompositionState) -> tuple[tuple[object, SourceSpec], ...]:
+    """Order valid source names lexically and malformed names stably last."""
+    sources = cast("Mapping[object, SourceSpec]", state.sources)
+    return tuple(
+        sorted(
+            sources.items(),
+            key=lambda item: (0, item[0]) if type(item[0]) is str else (1, ""),
+        )
+    )
+
+
+def _valid_source_stream(value: object) -> str | None:
+    """Return an exact non-empty authored stream name, else fail closed."""
+    return value if type(value) is str and bool(value.strip()) else None
+
+
 def control_coverage_findings(
     state: CompositionState,
     capability: PluginCapability,
@@ -275,9 +333,46 @@ def control_coverage_findings(
     if capability not in (PluginCapability.PROMPT_SHIELD, PluginCapability.CONTENT_SAFETY):
         return ()
     graph = build_output_stream_graph(state.nodes)
-    source_streams = frozenset(source.on_success for source in state.sources.values())
+    source_items = _stable_source_items(state)
+    source_streams = frozenset(
+        stream for _source_name, source in source_items if (stream := _valid_source_stream(source.on_success)) is not None
+    )
     sink_streams = frozenset(output.name for output in state.outputs)
     findings: list[ControlCoverageFinding] = []
+    if capability is PluginCapability.CONTENT_SAFETY:
+        for source_name, source in source_items:
+            if not source_has_capability(source, PluginCapability.LLM):
+                continue
+            protected_fields = _llm_source_output_fields(source)
+            success_stream = _valid_source_stream(source.on_success)
+            success_covered = (
+                protected_fields is not None
+                and success_stream is not None
+                and _stream_proves_output_control(
+                    success_stream,
+                    graph,
+                    sink_streams=sink_streams,
+                    visited=frozenset(),
+                    protected_fields=protected_fields,
+                )
+            )
+            validation_failure_destination = source.on_validation_failure if type(source.on_validation_failure) is str else None
+            validation_failure_covered = validation_failure_destination == "discard"
+            if success_covered and validation_failure_covered:
+                continue
+            validation_failure_only = success_covered and not validation_failure_covered
+            findings.append(
+                ControlCoverageFinding(
+                    component_id=_source_component_id(source_name),
+                    component_type="source",
+                    capability=capability,
+                    role=ControlRole.OUTPUT,
+                    reason=(
+                        "output_validation_failure_route_not_post_dominated" if validation_failure_only else "output_not_post_dominated"
+                    ),
+                    uncovered_stream=validation_failure_destination if validation_failure_only else None,
+                )
+            )
     for node in state.nodes:
         if not node_has_capability(node, PluginCapability.LLM):
             continue
@@ -314,6 +409,7 @@ def control_coverage_findings(
                 findings.append(
                     ControlCoverageFinding(
                         component_id=node.id,
+                        component_type="transform",
                         capability=capability,
                         role=ControlRole.INPUT,
                         reason=(
@@ -359,6 +455,7 @@ def control_coverage_findings(
                 findings.append(
                     ControlCoverageFinding(
                         component_id=node.id,
+                        component_type="transform",
                         capability=capability,
                         role=ControlRole.OUTPUT,
                         reason=("output_error_route_not_post_dominated" if names_error_route else "output_not_post_dominated"),

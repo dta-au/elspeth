@@ -44,8 +44,11 @@ from elspeth.core.dependency_config import CollectionProbeConfig, CommencementGa
 from elspeth.core.llm_profiles import (
     LLM_PROFILE_PRIVATE_FIELDS,
     LLMProfileSettings,
+    LoweredLLMProfileAlias,
     RuntimeLLMProfile,
     lower_llm_profile_options,
+    make_lowered_llm_profile_alias,
+    require_lowered_llm_profile_alias,
     validate_profile_alias,
 )
 from elspeth.core.secrets import is_secret_field
@@ -2194,6 +2197,10 @@ def _expand_env_vars(config: dict[str, Any]) -> dict[str, Any]:
 
     def _expand_value(value: Any) -> Any:
         """Expand env vars in a single value."""
+        if type(value) is LoweredLLMProfileAlias:
+            # Preserve only the exact nominal proof produced by the trusted
+            # profile-lowering pass immediately before environment expansion.
+            return value
         if isinstance(value, str):
             return _expand_string(value)
         elif isinstance(value, dict):
@@ -2212,7 +2219,7 @@ def _lower_llm_profile_node_options(
     options: Mapping[str, object],
 ) -> tuple[dict[str, object], dict[str, object]]:
     """Return ``(executable_options, audit_safe_options)`` for one ``llm``
-    node's profile selection, BEFORE batch's credential-materialization
+    component's profile selection, BEFORE batch's credential-materialization
     rewrite (the ``api_key`` value is still the ``{"secret_ref": ...}``
     marker, exactly as :meth:`_LLMProfileResolver.lower_options` (web)
     returns it for the same profile+options — both call
@@ -2233,10 +2240,10 @@ def _lower_llm_profile_node_options(
 
 
 def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -> dict[str, Any]:
-    """Rewrite ``llm`` transform nodes that select an operator profile.
+    """Rewrite ``llm`` source and transform components that select an operator profile.
 
     Mirrors the web plugin-policy resolver's ``lower_options`` lowering seam
-    so a batch/CLI ``llm`` node written as ``options: {"profile": "alias",
+    so a batch/CLI ``llm`` component written as ``options: {"profile": "alias",
     ...}`` (no ``provider`` key) resolves to the SAME private executable
     options a web author's identical profile selection would produce — both
     call :func:`elspeth.core.llm_profiles.lower_llm_profile_options` via
@@ -2244,24 +2251,24 @@ def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -
 
     Runs on the raw config dict, before :func:`_expand_env_vars`, mirroring
     that function's own placement (a pre-pydantic rewrite of the raw dict,
-    not a ``model_validator`` — ``TransformSettings.options`` is an untyped
-    ``dict[str, Any]`` and ``ElspethSettings`` is frozen, so there is nowhere
-    to write a lowered value back onto validated settings).
+    not a ``model_validator`` — source and transform ``options`` are untyped
+    ``dict[str, Any]`` values and ``ElspethSettings`` is frozen, so there is
+    nowhere to write a lowered value back onto validated settings).
 
     Structural checks (unknown alias; ``profile`` supplied together with
     ``provider``; a non-``server`` ``credential_scope``) run whenever a
-    profile-selecting node is found and require no secret material — but the
+    profile-selecting component is found and require no secret material — but the
     ENTIRE lowering, not just the credential step, is gated on
     ``materialize``: when it is ``False`` these checks still run (an unknown
-    alias or ambiguous node is rejected immediately regardless), but a node
+    alias or ambiguous component is rejected immediately regardless), but a component
     naming a VALID alias is left completely un-lowered — ``options`` still
     has ``"profile"`` and no ``"provider"``. That is not itself an error at
     this layer; both real callers (below) only ever pass ``materialize=True``
     for a caller trusted to expand host environment variables, so the
     un-lowered state is unreachable in production. It is not silently
-    swallowed either: an un-lowered node still fails closed later, at
-    ``LLMTransform.__init__``'s "missing required 'provider' key" check, when
-    the pipeline is actually built.
+    swallowed either: an un-lowered component still fails closed later, at
+    its plugin constructor's "missing required 'provider' key" check, when the
+    pipeline is actually built.
 
     When ``materialize`` IS set, the rewrite injects a secret REFERENCE
     marker for the profile's credential, then converts it to a ``${VAR}``
@@ -2291,35 +2298,38 @@ def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -
     if default_alias is not None and default_alias not in profiles:
         raise ValueError(f"default_llm_profile {default_alias!r} does not name a configured llm_profiles entry")
 
-    transforms = raw_config.get("transforms")
-    if not isinstance(transforms, list):
-        return raw_config
-    for index, node in enumerate(transforms):
-        if not isinstance(node, dict) or node.get("plugin") != "llm":
-            continue
-        options = node.get("options")
-        if not isinstance(options, dict) or "profile" not in options:
-            continue
+    def lower_component(component: object, *, location: str) -> None:
+        if not isinstance(component, dict) or component.get("plugin") != "llm":
+            return
+        options = component.get("options")
+        if not isinstance(options, dict):
+            return
+        # Exact nominal validation makes a second in-memory pass idempotent,
+        # while raw YAML/JSON/dict replay cannot forge audit attribution with
+        # an ordinary string under this reserved key.
+        require_lowered_llm_profile_alias(options)
+        if "profile" not in options:
+            return
         alias = options["profile"]
         if not isinstance(alias, str):
-            raise ValueError(f"transforms[{index}] llm node 'profile' option must be a string alias")
+            raise ValueError(f"{location} llm component 'profile' option must be a string alias")
         if "provider" in options:
             raise ValueError(
-                f"transforms[{index}] llm node specifies both 'profile' and 'provider' — "
+                f"{location} llm component specifies both 'profile' and 'provider' — "
                 "choose exactly one: an operator profile alias, or explicit provider config"
             )
         try:
             profile_settings = profiles[alias]
         except KeyError:
-            raise ValueError(f"transforms[{index}] llm node references unknown llm profile {alias!r}") from None
+            raise ValueError(f"{location} llm component references unknown llm profile {alias!r}") from None
         if profile_settings.credential_scope not in (None, "server"):
             raise ValueError(
-                f"transforms[{index}] llm node references profile {alias!r} with "
+                f"{location} llm component references profile {alias!r} with "
                 f"credential_scope {profile_settings.credential_scope!r}; batch/CLI runs have no per-user "
                 "secret store and can only use credential_scope 'server' (or scope-less, e.g. Bedrock) profiles"
             )
         if not materialize:
-            continue
+            return
         executable, _audit_safe = _lower_llm_profile_node_options(alias, profile_settings, options)
         api_key = executable.get("api_key")
         if isinstance(api_key, dict) and "secret_ref" in api_key:
@@ -2334,28 +2344,38 @@ def _lower_llm_profile_nodes(raw_config: dict[str, Any], *, materialize: bool) -
         # resolve_config()'s settings_json snapshot (core/config.py) and the
         # DAG's per-node audit config (core/landscape/data_flow/graph.py's
         # sanitize_node_config_for_audit) derive from exactly this dict via
-        # BaseTransform.config. Web's parallel answer to "which profile did
-        # this node use" lives in run_web_plugin_policy.selected_profile_aliases_json
+        # BaseSource.config / BaseTransform.config. Web's parallel answer to
+        # "which profile did this component use" lives in
+        # run_web_plugin_policy.selected_profile_aliases_json
         # (a web-only Landscape table); batch has no such table, so the
         # alias must travel inside the node's own options.
         #
         # Deliberately NOT keyed as "profile" (the authored selector key):
-        # this same dict is what a second pass through this function would
-        # see if a lowered run's settings were ever re-loaded (persisted-run
-        # replay, run cloning — no such caller exists today, but nothing
-        # prevents one being added later). If the alias rode under "profile"
-        # ALONGSIDE the now-also-present "provider" key, that re-load would
-        # look identical to a genuinely ambiguous authored node and trip the
-        # "specifies both 'profile' and 'provider'" rejection above — an
-        # accidental self-collision, not a real conflict. "profile_alias" is
-        # a distinct key the ambiguity check never inspects and no provider
-        # config model or authoring surface uses, so this pass is safe to
-        # run twice over its own output (round-trip safe by construction, not
-        # by relying on the two checks never being fed the same dict twice).
-        # `LLMTransform.__init__` strips this key before provider
-        # construction — no provider config model declares it.
-        executable["profile_alias"] = alias
-        node["options"] = executable
+        # A second pass over this same owned in-memory dict must be inert. If
+        # the alias rode under "profile" ALONGSIDE the now-also-present
+        # "provider" key, that pass would look identical to a genuinely
+        # ambiguous authored node and trip the "specifies both 'profile' and
+        # 'provider'" rejection above — an accidental self-collision, not a
+        # real conflict. "profile_alias" is a distinct key the ambiguity check
+        # never inspects and no provider config model or authoring surface
+        # uses, so this pass is safe to run twice over its own owned output.
+        # Serialization intentionally erases the nominal ownership proof;
+        # loading persisted YAML/JSON with a plain ``profile_alias`` is rejected
+        # rather than re-trusted. Both LLM plugin constructors consume this key
+        # before strict provider config validation — no provider model declares
+        # it — and retain only the plain opaque alias in Base*.config for audit.
+        executable["profile_alias"] = make_lowered_llm_profile_alias(alias)
+        component["options"] = executable
+
+    sources = raw_config.get("sources")
+    if isinstance(sources, dict):
+        for source_name, source in sources.items():
+            lower_component(source, location=f"sources[{source_name!r}]")
+
+    transforms = raw_config.get("transforms")
+    if isinstance(transforms, list):
+        for index, node in enumerate(transforms):
+            lower_component(node, location=f"transforms[{index}]")
     return raw_config
 
 
