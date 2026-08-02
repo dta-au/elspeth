@@ -14,15 +14,6 @@ per_file_rules:
   max_hits: 7
 - pattern: plugins/transforms/llm/*
   rules:
-  - R1
-  - R2
-  - R4
-  - R6
-  - R9
-  reason: LLM API responses are external data (Tier 3) - all defensive patterns legitimate
-  expires: null
-- pattern: plugins/transforms/llm/*
-  rules:
   - R5
   reason: Type discrimination for LLM response validation and provider dispatch (includes
     Pydantic model_validator(mode="before") isinstance(data, dict) Tier-3 input checks

@@ -193,17 +193,11 @@ the resume point — trust it over this prompt if they disagree.
   tree (`git archive HEAD` — mind tar --strip-components: config/cicd/enforce_tier_model
   needs 3, not 2). Zero new findings = reconciled. Session-5 reference: 423 findings
   on both sides, diagnostics byte-identical.
-- **Commit with `--no-verify` by DEFAULT** (operator directive 2026-07-04, you and
-  any subagents you spawn): skip the pre-commit chain routinely — reconciliation
-  is batched ONCE at session end (full unscoped pytest, ruff+format+mypy over the
-  session diff, shadow-lint reconciliation, `git diff --stat config/cicd/`), not
-  per commit or per ticket. Per-commit hook runs were costing more than the work
-  itself. Context on why hooks block anyway: tier-model gate CRASHES on commits
-  touching config/cicd/enforce_tier_model/ or the trust_tier rule source
-  (pre-existing judge-scope drift, operator-held); Check Contracts fails on 8
-  pre-existing dict[str,Any] violations near contract-adjacent files (task
-  elspeth-a16b05298a). --no-verify does NOT authorize signing or blessing
-  trust-tier/baseline HMAC state — that stays the operator's.
+- **Commit normally with repository hooks enabled.** Run focused checks per
+  ticket and the full unscoped pytest/ruff/format/mypy reconciliation once at
+  session end. A failing hook is evidence to investigate, not a reason to bypass
+  the repository guardrails. Signing or blessing trust-tier/baseline HMAC state
+  remains operator-only.
 - **Token/walltime economy** (operator directive 2026-07-04 — trim ceremony, never
   evidence): never re-Read processor.py (~4,100 lines) or other large files whole —
   narrow offset/limit Reads or Loomweave (entity_at/entity_source_get/
@@ -212,8 +206,8 @@ the resume point — trust it over this prompt if they disagree.
   model:'sonnet'). Per ticket: scoped test file / -k selection only; full unscoped
   pytest exactly ONCE at session end. Calibrate rigor to ticket size — parity-net
   ceremony is for god-class extractions, not the P2 pool (small ticket = triage
-  comment → verify vs tree → one focused test → fix → scoped checks → commit
-  --no-verify → close). Judge bundle staged ONCE at session end.
+  comment → verify vs tree → one focused test → fix → scoped checks → normal
+  commit → close). Judge bundle staged ONCE at session end.
 - Any allowlist re-key STALES the staged judge bundle — re-stage at session end.
 - **Ruff PostToolUse hook strips imports** whose use-site doesn't exist yet at hook
   time. It bit session 4 once and session 5 TWICE (a stripped `import bisect` caused

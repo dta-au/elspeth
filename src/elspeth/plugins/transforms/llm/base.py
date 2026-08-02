@@ -11,13 +11,12 @@ import json
 from typing import Any, Literal
 
 from jinja2 import TemplateSyntaxError
-from jinja2.meta import find_undeclared_variables
 from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts.hashing import stable_hash
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.pooling import PoolConfig
-from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment
+from elspeth.plugins.infrastructure.templates import TemplateError, create_sandboxed_environment, find_runtime_unbound_variables
 from elspeth.plugins.transforms.llm.multi_query import QueryDefinition, resolve_queries
 from elspeth.plugins.transforms.llm.templates import PromptTemplate
 
@@ -231,15 +230,10 @@ class LLMConfig(TransformDataConfig):
     def _field_extraction_templates(self) -> tuple[tuple[str, str], ...]:
         """Return (label, template) for every LLM Jinja2 template that can interpolate row data."""
         templates = [("prompt_template", self.prompt_template)]
-        if isinstance(self.queries, dict):
-            for name, defn in self.queries.items():
-                if defn.template:
-                    templates.append((f"query {name!r} template", defn.template))
-        elif isinstance(self.queries, list):
-            for index, item in enumerate(self.queries):
-                if item.template:
-                    label = item.name if item.name is not None else index
-                    templates.append((f"query {label!r} template", item.template))
+        if self.queries is not None:
+            for spec in resolve_queries(self.queries):
+                if spec.template:
+                    templates.append((f"query {spec.name!r} template", spec.template))
         return tuple(templates)
 
     @model_validator(mode="after")
@@ -272,7 +266,7 @@ class LLMConfig(TransformDataConfig):
             "map(attribute)": "map(attribute=expr)",
             "row-api": "row API",
         }
-        access_examples = ", ".join(access_examples_by_kind.get(kind, kind) for kind in access_kinds)
+        access_examples = ", ".join(access_examples_by_kind[kind] for kind in access_kinds)
         raise ValueError(
             "LLM prompt_template uses dynamic row field access "
             f"({', '.join(access_kinds)} via {access_examples}). "
@@ -312,15 +306,10 @@ class LLMConfig(TransformDataConfig):
                 # any row.* references in the top-level and per-query templates.
                 extracted: set[str] = set()
                 # Collect row column names from input_fields mappings
-                query_defs: list[QueryDefinition]
-                if isinstance(self.queries, dict):
-                    query_defs = list(self.queries.values())
-                else:
-                    query_defs = list(self.queries)
-                for defn in query_defs:
-                    extracted.update(defn.input_fields.values())
-                    if defn.template:
-                        extracted.update(extract_jinja2_fields(defn.template))
+                for spec in resolve_queries(self.queries):
+                    extracted.update(spec.input_fields.values())
+                    if spec.template:
+                        extracted.update(extract_jinja2_fields(spec.template))
                 # Also check the top-level template for row references
                 extracted.update(extract_jinja2_fields(self.prompt_template))
             else:
@@ -396,7 +385,7 @@ class LLMConfig(TransformDataConfig):
 
     @model_validator(mode="after")
     def _validate_template_variable_bindings(self) -> LLMConfig:
-        """Reject templates whose interpolations can never bind at render.
+        """Reject templates whose names may be unbound on a render path.
 
         ``PromptTemplate.render`` supplies exactly ``{row, lookup}`` under
         StrictUndefined in BOTH modes — multi-query rendering wraps the
@@ -404,9 +393,9 @@ class LLMConfig(TransformDataConfig):
         ``source_row``) under ``row`` (``_execute_one_query`` →
         ``render_with_metadata``). Two config-time-provable defects:
 
-        * a top-level name outside ``{row, lookup}`` + environment globals
-          never binds in any mode (covers the legacy positional
-          ``{{ input_N }}`` idiom, which is such a bare name);
+        * a top-level name outside ``{row, lookup}`` + environment globals that
+          is not definitely assigned locally before every load (covers the
+          legacy positional ``{{ input_N }}`` idiom, which is a bare name);
         * in multi-query mode, a ``row.<name>`` reference outside that
           query's ``input_fields`` keys + ``{source_row}`` raises
           ``Undefined variable`` when that query renders.
@@ -432,7 +421,7 @@ class LLMConfig(TransformDataConfig):
         def unbound_top_level(template: str) -> list[str]:
             # Field validators already compile-checked both template slots,
             # so parse cannot fail here; no TemplateSyntaxError handling.
-            names = find_undeclared_variables(env.parse(template))
+            names = find_runtime_unbound_variables(env.parse(template))
             return sorted(names - _PROMPT_CONTEXT_NAMES - _PROMPT_GLOBAL_NAMES)
 
         if self.queries is None:

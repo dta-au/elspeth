@@ -1449,6 +1449,88 @@ async def test_step_2_pair_with_non_string_assistant_message_returns_retain_alon
 
 
 @pytest.mark.asyncio
+async def test_step_1_pair_with_scaffold_assistant_message_returns_retain_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scaffold-leaking source reply must not discard its valid retain."""
+
+    async def scaffold_pair(**_kwargs: Any) -> _FakeLLMResponse:
+        tool_calls = [
+            SimpleNamespace(
+                id="c_source",
+                function=SimpleNamespace(
+                    name="resolve_source",
+                    arguments=json.dumps(
+                        {
+                            **_PAIR_SOURCE_ARGUMENTS,
+                            "assistant_message": "<tool_call>internal transcript</tool_call>",
+                        }
+                    ),
+                ),
+            ),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", scaffold_pair)
+    outcome = await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="Use these JSON rows, and later add the passthrough transform.",
+        plugin_hint="json",
+        current_source=None,
+        available_source_plugins=("csv", "json"),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
+
+
+@pytest.mark.asyncio
+async def test_step_2_pair_with_scaffold_assistant_message_returns_retain_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A scaffold-leaking sink reply must not discard its valid retain."""
+
+    async def scaffold_pair(**_kwargs: Any) -> _FakeLLMResponse:
+        tool_calls = [
+            SimpleNamespace(
+                id="c_sink",
+                function=SimpleNamespace(
+                    name="resolve_sink",
+                    arguments=json.dumps(
+                        {
+                            **_PAIR_SINK_ARGUMENTS,
+                            "assistant_message": "<tool_call>internal transcript</tool_call>",
+                        }
+                    ),
+                ),
+            ),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", scaffold_pair)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save results as jsonl, and later add the passthrough transform.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
+
+
+@pytest.mark.asyncio
 async def test_step_2_pair_wrapper_threads_deferred_action(monkeypatch: pytest.MonkeyPatch) -> None:
     async def pair_acompletion(**_kwargs: Any) -> _FakeLLMResponse:
         calls = [

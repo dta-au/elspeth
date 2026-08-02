@@ -119,13 +119,18 @@ Do not inherit another worktree's virtual environment:
 
 ```bash
 unset VIRTUAL_ENV
-uv sync --frozen --all-extras
+REPO_ROOT=$(git rev-parse --show-toplevel)
+export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/elspeth-lints/src${PYTHONPATH:+:$PYTHONPATH}"
 ```
+
+ELSPETH worktrees symlink `.venv` to the main checkout. Never run `uv sync`,
+`uv pip install`, or a syncing `uv run` from a worktree; use the already-managed
+environment directly and stop if it lacks a required locked dependency.
 
 AWS ECS and startup contracts:
 
 ```bash
-uv run --frozen pytest -q \
+.venv/bin/pytest -q \
   tests/unit/web/test_aws_ecs_runbook_contract.py \
   tests/unit/web/test_aws_ecs_acceptance.py \
   tests/unit/web/test_aws_ecs_startup.py \
@@ -136,7 +141,7 @@ uv run --frozen pytest -q \
 Focused real-PostgreSQL lane:
 
 ```bash
-uv run --frozen pytest -n auto -q -m testcontainer \
+.venv/bin/pytest -n auto -q -m testcontainer \
   tests/testcontainer/web/test_schema_probe_postgres.py \
   tests/testcontainer/web/test_doctor_aws_ecs_postgres.py \
   tests/testcontainer/web/test_aws_ecs_validate_only_startup.py \

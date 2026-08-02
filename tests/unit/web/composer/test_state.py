@@ -2861,6 +2861,20 @@ class TestPromptTemplateUnboundVariables:
         state = self._state_with_llm(template)
         assert not self._unbound_errors(state), f"False positive for {template!r}"
 
+    def test_accepts_local_assigned_in_every_if_branch(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% else %}{% set verdict = "NO" %}{% endif %}{{ verdict }}'
+
+        assert not self._unbound_errors(self._state_with_llm(template))
+
+    def test_rejects_local_assigned_in_only_one_if_branch(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% endif %}{{ verdict }}'
+
+        errors = self._unbound_errors(self._state_with_llm(template))
+
+        assert len(errors) == 1
+        assert errors[0].component == "node:classify"
+        assert "'verdict'" in errors[0].message
+
     def test_masked_interpretation_placeholder_does_not_hide_unbound_names(self) -> None:
         """Placeholders are masked before parsing, but bare names elsewhere in
         the same template must still be caught."""
@@ -3055,6 +3069,47 @@ class TestMultiQueryTemplateVariableBindings:
             ],
         )
         assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_accepts_query_local_assigned_in_every_if_branch(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% else %}{% set verdict = "NO" %}{% endif %}{{ verdict }}'
+        state = self._state(
+            "Unused node template",
+            [{"name": "q1", "input_fields": {"flag": "source_flag"}, "template": template}],
+        )
+
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_rejects_query_local_assigned_in_only_one_if_branch(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% endif %}{{ verdict }}'
+        state = self._state(
+            "Unused node template",
+            [{"name": "q1", "input_fields": {"flag": "source_flag"}, "template": template}],
+        )
+
+        errors = self._errors(state, "prompt_template_unbound_variables")
+
+        assert len(errors) == 1
+        assert "'q1'" in errors[0].message
+        assert "'verdict'" in errors[0].message
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_accepts_shared_node_template_local_assigned_in_every_if_branch(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% else %}{% set verdict = "NO" %}{% endif %}{{ verdict }}'
+        state = self._state(template, {"q1": {"input_fields": {"flag": "source_flag"}}})
+
+        assert not self._errors(state, "prompt_template_unbound_variables")
+        assert not self._errors(state, "query_template_unbound_row_fields")
+
+    def test_rejects_shared_node_template_local_assigned_in_only_one_if_branch(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% endif %}{{ verdict }}'
+        state = self._state(template, {"q1": {"input_fields": {"flag": "source_flag"}}})
+
+        errors = self._errors(state, "prompt_template_unbound_variables")
+
+        assert len(errors) == 1
+        assert "'verdict'" in errors[0].message
         assert not self._errors(state, "query_template_unbound_row_fields")
 
     def test_shared_node_template_checked_against_each_querys_bindings(self) -> None:

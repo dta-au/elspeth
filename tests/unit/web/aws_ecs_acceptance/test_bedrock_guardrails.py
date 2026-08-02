@@ -631,6 +631,7 @@ def test_plugin_policy_acceptance_binds_effective_bedrock_policy_tutorial_and_sa
             "transform:aws_bedrock_content_safety",
         ],
         plugin_preferences={
+            "llm": ["transform:llm", "source:llm"],
             "prompt_shield": ["transform:aws_bedrock_prompt_shield"],
             "content_safety": ["transform:aws_bedrock_content_safety"],
         },

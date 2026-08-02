@@ -802,6 +802,46 @@ def test_plugin_trust_row_ok_summary_when_boundary_plugins_present():
     assert row.component_ids != ()
 
 
+def test_llm_source_is_a_nondeterministic_external_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from elspeth.plugins.sources.llm.source import LLMSource
+    from elspeth.web.audit_readiness import service as service_module
+
+    catalog = service_module._plugin_catalog_snapshot()
+    isolated_catalog = {kind: dict(plugins) for kind, plugins in catalog.items()}
+    isolated_catalog["source"]["llm"] = LLMSource
+    monkeypatch.setattr(service_module, "_plugin_catalog_snapshot", lambda: isolated_catalog)
+    state = CompositionState(
+        sources={
+            "briefing": SourceSpec(
+                plugin="llm",
+                on_success="out",
+                options={},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(),
+        edges=(),
+        outputs=(make_output_spec("out", "csv"),),
+        metadata=PipelineMetadata(name="t", description=""),
+        version=1,
+    )
+
+    snap = asyncio.run(
+        _make_service(state, _OK).compute_snapshot(
+            session_id=UUID("11111111-1111-1111-1111-111111111111"),
+            user_id="alice",
+        )
+    )
+
+    row = _row(snap, "plugin_trust")
+    assert LLMSource.determinism.value == "non_deterministic"
+    assert row.status == "ok"
+    assert "[source] source:briefing (llm)" in (row.detail or "")
+    assert row.component_ids == ("source:briefing", "out")
+
+
 def test_plugin_trust_row_ok_summary_when_no_boundary_plugins():
     # Source=None and sinks=() means no source-or-sink kind in the
     # composition. With only an internal transform (passthrough,
@@ -996,6 +1036,29 @@ def test_llm_interpretations_not_applicable_when_no_llm_transforms():
     sess_svc.list_interpretation_events.assert_not_called()
 
 
+def test_llm_interpretations_are_source_specific_and_not_applicable_for_source_only() -> None:
+    """A rowless LLM source has no row/model interpretation-event lifecycle."""
+    svc = _make_service(_state(source_plugin="llm", transforms=()), _OK)
+    snap = asyncio.run(
+        svc.compute_snapshot(
+            session_id=UUID("11111111-1111-1111-1111-111111111111"),
+            user_id="alice",
+        )
+    )
+
+    row = _row(snap, "llm_interpretations")
+    assert row.status == "not_applicable"
+    assert row.summary == "LLM source prompts do not use interpretation review"
+    assert row.detail is not None
+    assert "one authored prompt" in row.detail
+    assert "row interpretation events" in row.detail
+    assert "transform" not in row.summary.lower()
+    assert "transform" not in row.detail.lower()
+    assert row.component_ids == ()
+    session_service = svc._session_service  # type: ignore[attr-defined]
+    session_service.list_interpretation_events.assert_not_called()
+
+
 def test_llm_interpretations_not_applicable_when_llm_present_but_no_events():
     """LLM transforms present, no interpretation events yet → not_applicable.
 
@@ -1015,6 +1078,22 @@ def test_llm_interpretations_not_applicable_when_llm_present_but_no_events():
     assert row.status == "not_applicable"
     assert row.summary == "No interpretation events yet for this composition"
     assert row.component_ids == ()
+
+
+def test_llm_source_does_not_override_transform_interpretation_semantics() -> None:
+    svc = _make_service(_state(source_plugin="llm", transforms=(("j", "llm"),)), _OK)
+    snap = asyncio.run(
+        svc.compute_snapshot(
+            session_id=UUID("11111111-1111-1111-1111-111111111111"),
+            user_id="alice",
+        )
+    )
+
+    row = _row(snap, "llm_interpretations")
+    assert row.status == "not_applicable"
+    assert row.summary == "No interpretation events yet for this composition"
+    session_service = svc._session_service  # type: ignore[attr-defined]
+    assert len(session_service.list_interpretation_events.calls) == 2
 
 
 def test_llm_interpretations_warning_when_pending_events_present():

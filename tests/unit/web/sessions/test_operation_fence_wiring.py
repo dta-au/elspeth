@@ -99,17 +99,20 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
     run_protocol = getattr(sessions_protocol, "SessionOperationRunMutations", None)
     blob_protocol = getattr(sessions_protocol, "SessionOperationBlobMutations", None)
     progress_protocol = getattr(sessions_protocol, "SessionOperationComposerProgressMutations", None)
+    completion_protocol = getattr(sessions_protocol, "SessionOperationComposerCompletionMutations", None)
     assert archive_disposition is not None
     assert session_protocol is not None
     assert run_protocol is not None
     assert blob_protocol is not None
     assert progress_protocol is not None
+    assert completion_protocol is not None
 
     implementation_types = (
         coordination_repository._RepositoryMutationTransaction,
         getattr(coordination_repository, "_RepositorySessionMutations", None),
         getattr(coordination_repository, "_RepositoryRunMutations", None),
         getattr(coordination_repository, "_RepositoryBlobMutations", None),
+        getattr(coordination_repository, "_RepositoryComposerCompletionMutations", None),
     )
     assert all(owner is not None for owner in implementation_types)
 
@@ -119,21 +122,28 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
         "runs": run_protocol,
         "blobs": blob_protocol,
         "composer_progress": progress_protocol,
+        "composer_completion": completion_protocol,
     }
-    for owner in (sessions_protocol.SessionOperationMutationTransaction, implementation_types[0]):
-        public = {name for name in dir(owner) if not name.startswith("_")}
+    for outer_owner in (sessions_protocol.SessionOperationMutationTransaction, implementation_types[0]):
+        public = {name for name in dir(outer_owner) if not name.startswith("_")}
         assert public == set(expected_outer)
         for name, return_type in expected_outer.items():
-            descriptor = inspect.getattr_static(owner, name)
+            descriptor = inspect.getattr_static(outer_owner, name)
             assert isinstance(descriptor, property)
             assert descriptor.fget is not None
+            if outer_owner is implementation_types[0] and name == "composer_completion":
+                return_type = implementation_types[4]
             assert _resolved_signature(descriptor.fget) == ((), return_type)
-            _assert_no_authority_escape(owner=owner, member_name=name, member=descriptor.fget)
+            _assert_no_authority_escape(owner=outer_owner, member_name=name, member=descriptor.fget)
 
     expected_capabilities = (
         (
             (session_protocol, implementation_types[1]),
             {
+                "record_plugin_crash_breadcrumb": (
+                    (),
+                    type(None),
+                ),
                 "decide_and_soft_archive": (
                     (("archived_at", inspect.Parameter.KEYWORD_ONLY, datetime),),
                     archive_disposition,
@@ -376,9 +386,33 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                 ),
             },
         ),
+        (
+            (completion_protocol, implementation_types[4]),
+            {
+                "mark_ready_for_review": (
+                    (
+                        ("composition_state_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("actor", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("created_at", inspect.Parameter.KEYWORD_ONLY, datetime),
+                        ("payload_digest", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("expires_at", inspect.Parameter.KEYWORD_ONLY, datetime),
+                    ),
+                    type(None),
+                ),
+                "record_yaml_export": (
+                    (
+                        ("composition_state_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("actor", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("created_at", inspect.Parameter.KEYWORD_ONLY, datetime),
+                    ),
+                    type(None),
+                ),
+            },
+        ),
     )
     for owners, expected in expected_capabilities:
         for owner in owners:
+            assert owner is not None
             public = {name for name in dir(owner) if not name.startswith("_")}
             assert public == set(expected)
             for name, signature in expected.items():
@@ -390,15 +424,20 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
 def test_execute_transfers_one_renewable_lease_to_background_completion() -> None:
     lease = _required_parameter(ExecutionServiceImpl, "execute", "session_operation_lease")
     assert lease.annotation is SessionOperationLease or lease.annotation == "SessionOperationLease"
-    worker_context = _required_parameter(ExecutionServiceImpl, "_run_pipeline", "session_operation_context")
-    assert worker_context.annotation is SessionOperationContext or worker_context.annotation == "SessionOperationContext"
+    worker_lease = _required_parameter(ExecutionServiceImpl, "_run_pipeline", "session_operation_lease")
+    assert worker_lease.annotation is SessionOperationLease or worker_lease.annotation == "SessionOperationLease"
+    assert "session_operation_context" not in inspect.signature(ExecutionServiceImpl._run_pipeline).parameters
     completion_lease = _required_parameter(ExecutionServiceImpl, "_on_pipeline_done", "session_operation_lease")
     assert completion_lease.annotation is SessionOperationLease or completion_lease.annotation == "SessionOperationLease"
 
     execute_source = textwrap.dedent(inspect.getsource(ExecutionServiceImpl.execute))
-    assert "session_operation_lease.context" in execute_source
+    assert "session_operation_context = session_operation_lease.context" in execute_source
+    assert "session_operation_lease=session_operation_lease" in execute_source
     assert "_executor.submit" in execute_source
     assert "future.add_done_callback" in execute_source
+    worker_source = textwrap.dedent(inspect.getsource(ExecutionServiceImpl._run_pipeline))
+    assert "session_operation_context = session_operation_lease.context" in worker_source
+    assert "session_operation_lease.guard_external_effect" in worker_source
     completion_source = textwrap.dedent(inspect.getsource(ExecutionServiceImpl._on_pipeline_done))
     assert "session_operation_lease" in completion_source
     assert ".close" in completion_source

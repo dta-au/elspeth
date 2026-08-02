@@ -6137,11 +6137,8 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
                 raise OSError("backup-unlink-fault")
             real_unlink(path_self, missing_ok=missing_ok)
 
-        with (
-            patch.object(Path, "unlink", _fail_backup_unlink),
-            pytest.raises(OSError, match="backup-unlink-fault"),
-        ):
-            execute_tool(
+        with patch.object(Path, "unlink", _fail_backup_unlink):
+            result = execute_tool(
                 "update_blob",
                 {"blob_id": self.blob_id, "content": "new"},
                 _empty_state(),
@@ -6151,6 +6148,7 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
                 **_verbatim_blob_context(self.engine, self.session_id, "new"),
             )
 
+        assert result.success is True
         assert self.storage_path.read_bytes() == b"new"
         with self.engine.connect() as conn:
             replacement = conn.execute(

@@ -553,6 +553,11 @@ class TierModelVisitor(ast.NodeVisitor):
         self.function_stack: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
         self.path_stack: list[str] = []
         self.node_stack: list[ast.AST] = []
+        # Definition nodes stay on ``node_stack`` while their decorators,
+        # defaults, annotations, bases, and type parameters are evaluated.
+        # Those expressions execute in the enclosing scope, so scope binding
+        # must temporarily ignore the not-yet-entered definition node.
+        self._definition_header_stack: list[ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda] = []
         self._decorator_lines: set[int] = set()  # Track lines that are decorators
         self._import_alias_stack: list[tuple[str, dict[str, str]]] = [("module", {})]
         self._import_alias_mutation_stack: list[tuple[dict[str, str], set[str]]] = []
@@ -648,7 +653,9 @@ class TierModelVisitor(ast.NodeVisitor):
         enclosing def/class the module root (``node_stack[0]``) is the
         fallback target.
         """
-        ancestors = list(reversed(self.node_stack))
+        ancestors = [
+            node for node in reversed(self.node_stack) if not any(node is definition for definition in self._definition_header_stack)
+        ]
         scope = enclosing_scope_node(ancestors)
         if scope is not None:
             return compute_scope_fingerprint(scope)
@@ -671,7 +678,9 @@ class TierModelVisitor(ast.NodeVisitor):
         for them: any module-body edit (e.g. adding an import) changes the
         module's scope_fingerprint, so the scope-fingerprint-equality check fails.
         """
-        scope = enclosing_scope_node(list(reversed(self.node_stack)))
+        scope = enclosing_scope_node(
+            [node for node in reversed(self.node_stack) if not any(node is definition for definition in self._definition_header_stack)]
+        )
         if scope is None:
             return 0
         for index, node in enumerate(self.node_stack):
@@ -863,28 +872,31 @@ class TierModelVisitor(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         """Track class context."""
+        self._visit_definition_header(node)
         outer_state = self._current_derived_state()
-        if outer_state is not None:
-            outer_state.assign_target_names((node.name,), is_derived=False)
         self.symbol_stack.append(node.name)
         self.class_stack.append(node)
         self._boundary_stack.append(None)
         self._push_import_scope("class")
         try:
-            self.generic_visit(node)
+            for index, statement in enumerate(node.body):
+                self._visit_ast_list_item("body", index, statement)
         finally:
             self._pop_import_scope()
             self._boundary_stack.pop()
             self.class_stack.pop()
             self.symbol_stack.pop()
+        if outer_state is not None:
+            outer_state.assign_target_names((node.name,), is_derived=False)
         self._invalidate_import_aliases((node.name,))
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
         """Visit lambda bodies without inheriting enclosing boundary suppression."""
+        self._visit_definition_header(node)
         self._boundary_stack.append(None)
         self._push_import_scope("function", local_bindings=argument_names(node.args))
         try:
-            self.generic_visit(node)
+            self._visit_ast_child("body", node.body)
         finally:
             self._pop_import_scope()
             self._boundary_stack.pop()
@@ -894,20 +906,22 @@ class TierModelVisitor(ast.NodeVisitor):
         # Collect decorator lines — .get() calls here are not dict access
         for decorator in node.decorator_list:
             self._decorator_lines.add(decorator.lineno)
+        self._visit_definition_header(node)
         outer_state = self._current_derived_state()
-        if outer_state is not None:
-            outer_state.assign_target_names((node.name,), is_derived=False)
         self.symbol_stack.append(node.name)
         self.function_stack.append(node)
         self._enter_boundary_context(node)
         self._push_import_scope("function", local_bindings=function_local_binding_names(node))
         try:
-            self.generic_visit(node)
+            for index, statement in enumerate(node.body):
+                self._visit_ast_list_item("body", index, statement)
         finally:
             self._pop_import_scope()
             self._boundary_stack.pop()
             self.function_stack.pop()
             self.symbol_stack.pop()
+        if outer_state is not None:
+            outer_state.assign_target_names((node.name,), is_derived=False)
         self._invalidate_import_aliases((node.name,))
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
@@ -915,21 +929,50 @@ class TierModelVisitor(ast.NodeVisitor):
         # Collect decorator lines — .get() calls here are not dict access
         for decorator in node.decorator_list:
             self._decorator_lines.add(decorator.lineno)
+        self._visit_definition_header(node)
         outer_state = self._current_derived_state()
-        if outer_state is not None:
-            outer_state.assign_target_names((node.name,), is_derived=False)
         self.symbol_stack.append(node.name)
         self.function_stack.append(node)
         self._enter_boundary_context(node)
         self._push_import_scope("function", local_bindings=function_local_binding_names(node))
         try:
-            self.generic_visit(node)
+            for index, statement in enumerate(node.body):
+                self._visit_ast_list_item("body", index, statement)
         finally:
             self._pop_import_scope()
             self._boundary_stack.pop()
             self.function_stack.pop()
             self.symbol_stack.pop()
+        if outer_state is not None:
+            outer_state.assign_target_names((node.name,), is_derived=False)
         self._invalidate_import_aliases((node.name,))
+
+    def _visit_definition_header(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef | ast.Lambda,
+    ) -> None:
+        """Visit definition-time expressions in their enclosing scope."""
+        self._definition_header_stack.append(node)
+        try:
+            if isinstance(node, ast.ClassDef):
+                for index, decorator in enumerate(node.decorator_list):
+                    self._visit_ast_list_item("decorator_list", index, decorator)
+                for index, base in enumerate(node.bases):
+                    self._visit_ast_list_item("bases", index, base)
+                for index, keyword in enumerate(node.keywords):
+                    self._visit_ast_list_item("keywords", index, keyword)
+            else:
+                if not isinstance(node, ast.Lambda):
+                    for index, decorator in enumerate(node.decorator_list):
+                        self._visit_ast_list_item("decorator_list", index, decorator)
+                self._visit_ast_child("args", node.args)
+                if not isinstance(node, ast.Lambda):
+                    self._visit_ast_child("returns", node.returns)
+            for index, type_param in enumerate(getattr(node, "type_params", ())):
+                self._visit_ast_list_item("type_params", index, type_param)
+        finally:
+            popped = self._definition_header_stack.pop()
+            assert popped is node
 
     def _enter_boundary_context(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         """Parse ``@trust_boundary`` (if present) and push the suppression context.

@@ -59,6 +59,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           path: ${{ env.CI_CHECKOUT_PATH }}
+          # Branch-creation pushes have no event.before. Full history is needed
+          # to resolve their complete delta from the default-branch merge base.
+          fetch-depth: 0
 
       - name: Check GitHub workflows (actionlint)
         working-directory: ${{ env.CI_CHECKOUT_PATH }}

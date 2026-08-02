@@ -24,7 +24,11 @@ from elspeth.plugins.transforms.llm.langfuse import (
     NoOpLangfuseTracer,
     create_langfuse_tracer,
 )
+from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig, LangfuseTracingConfig
+
+_ROW_PARENT = LLMAuditParent.for_row(state_id="state-1", token_id="tok-1")
+_OPERATION_PARENT = LLMAuditParent.for_operation(operation_id="operation-1")
 
 
 @dataclass
@@ -120,12 +124,14 @@ class TestCreateLangfuseTracer:
             secret_key="sk-test",
             host="https://test.langfuse.com",
         )
-        tracer = patched_create(
-            transform_name="test_transform",
-            tracing_config=config,
-        )
+        with patch("elspeth.plugins.transforms.llm.langfuse.logger") as mock_logger:
+            tracer = patched_create(
+                transform_name="test_transform",
+                tracing_config=config,
+            )
         assert isinstance(tracer, PatchedActiveTracer)
         assert tracer.transform_name == "test_transform"
+        mock_logger.info.assert_not_called()
 
     def test_create_langfuse_not_installed_raises_runtime_error(self) -> None:
         import builtins
@@ -163,7 +169,7 @@ class TestNoOpLangfuseTracer:
         tracer = NoOpLangfuseTracer()
         # Should not raise
         tracer.record_success(
-            token_id="tok-1",
+            parent=_ROW_PARENT,
             query_name="test",
             prompt="hello",
             response_content="world",
@@ -175,7 +181,7 @@ class TestNoOpLangfuseTracer:
         tracer = NoOpLangfuseTracer()
         # Should not raise
         tracer.record_error(
-            token_id="tok-1",
+            parent=_ROW_PARENT,
             query_name="test",
             prompt="hello",
             error_message="something failed",
@@ -224,7 +230,7 @@ class TestActiveLangfuseTracer:
         tracer, client = self._make_tracer()
 
         tracer.record_success(
-            token_id="tok-1",
+            parent=_ROW_PARENT,
             query_name="classify",
             prompt="Classify this",
             response_content="positive",
@@ -240,7 +246,7 @@ class TestActiveLangfuseTracer:
         tracer, client = self._make_tracer()
 
         tracer.record_success(
-            token_id="tok-1",
+            parent=_ROW_PARENT,
             query_name="classify",
             prompt="Classify this",
             response_content="positive",
@@ -255,7 +261,7 @@ class TestActiveLangfuseTracer:
         tracer, client = self._make_tracer()
 
         tracer.record_success(
-            token_id="tok-1",
+            parent=_ROW_PARENT,
             query_name="classify",
             prompt="Classify this",
             response_content="positive",
@@ -270,7 +276,7 @@ class TestActiveLangfuseTracer:
         tracer, client = self._make_tracer()
 
         tracer.record_success(
-            token_id="tok-1",
+            parent=_ROW_PARENT,
             query_name="classify",
             prompt="Classify this",
             response_content="positive",
@@ -287,7 +293,7 @@ class TestActiveLangfuseTracer:
         tracer = ActiveLangfuseTracer(transform_name="test_transform", client=client)
 
         tracer.record_success(
-            token_id="tok-1",
+            parent=_ROW_PARENT,
             query_name="classify",
             prompt="test",
             response_content="result",
@@ -299,12 +305,29 @@ class TestActiveLangfuseTracer:
         span_call_kwargs = client.observation_calls[0]
         assert span_call_kwargs["metadata"]["deployment"] == "prod-east"
         assert span_call_kwargs["metadata"]["token_id"] == "tok-1"
+        assert span_call_kwargs["metadata"]["state_id"] == "state-1"
+
+    def test_operation_parent_uses_operation_metadata_without_fake_token(self) -> None:
+        tracer, client = self._make_tracer()
+
+        tracer.record_success(
+            parent=_OPERATION_PARENT,
+            query_name="source",
+            prompt="Generate one row",
+            response_content="result",
+            model="served-model",
+        )
+
+        metadata = client.observation_calls[0]["metadata"]
+        assert metadata["operation_id"] == "operation-1"
+        assert "state_id" not in metadata
+        assert "token_id" not in metadata
 
     def test_record_error_sets_error_level(self) -> None:
         tracer, client = self._make_tracer()
 
         tracer.record_error(
-            token_id="tok-1",
+            parent=_ROW_PARENT,
             query_name="classify",
             prompt="Classify this",
             error_message="rate limited",
@@ -319,7 +342,7 @@ class TestActiveLangfuseTracer:
         tracer, client = self._make_tracer()
 
         tracer.record_error(
-            token_id="tok-1",
+            parent=_ROW_PARENT,
             query_name="classify",
             prompt="Classify this",
             error_message="timeout",
@@ -338,7 +361,7 @@ class TestActiveLangfuseTracer:
 
         with patch("elspeth.plugins.transforms.llm.langfuse._handle_trace_failure", autospec=True) as mock_handler:
             tracer.record_success(
-                token_id="tok-1",
+                parent=_ROW_PARENT,
                 query_name="classify",
                 prompt="test",
                 response_content="result",

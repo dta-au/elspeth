@@ -489,6 +489,38 @@ def test_stage_scan_stages_unsigned_second_same_prefix_finding(tmp_path: Path) -
     assert [action.key for action in bundle.actions if action.kind == "justify"] == [_canonical_key(findings[1])]
 
 
+def test_stage_scan_rotation_replacement_is_not_also_a_new_judgment(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    stale_key = identity_prefix(_canonical_key(finding)) + ":fp=deadbeefdeadbeef"
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+
+    bundle = _scan_and_read(_context(root, allowlist_dir, staged_dir), "rotation-only")
+
+    assert [(action.kind, action.key) for action in bundle.actions] == [("rotation", stale_key)]
+
+
+def test_stage_scan_fails_before_writing_bundle_when_source_is_unscannable(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    (root / "plugins" / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+
+    outcome = judge_server._run_tool(
+        _context(root, allowlist_dir, staged_dir),
+        "stage_scan",
+        {"bundle_id": "unscannable"},
+    )
+
+    assert outcome.is_error is True
+    assert "tier-model scan failed" in outcome.text
+    assert "plugins/broken.py" in outcome.text
+    assert not (staged_dir / "unscannable.json").exists()
+
+
 def test_stage_scan_does_not_stage_per_file_rule_covered_finding(tmp_path: Path) -> None:
     """Production-covered findings must not become redundant judgments."""
     root = _build_root(tmp_path)

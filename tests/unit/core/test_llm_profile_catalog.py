@@ -35,11 +35,10 @@ projections — both surfaces call the single shared
   and that the alias value is never the profile's endpoint or credential_ref
   (retained under the distinct `profile_alias` key, never the authored
   `profile` selector key itself); and
-- lowering is round-trip safe BY CONSTRUCTION: feeding an already-lowered
-  node back through the same pass never raises (it has no `profile` key
-  left to act on), while a genuinely ambiguous AUTHORED node (`profile` and
-  `provider` both written by hand) still fails closed — proving the
-  ambiguity check is intact, not merely disarmed for lowered output.
+- lowering is idempotent over the same owned in-memory output, while YAML/JSON
+  replay loses that ownership proof and fails closed; a genuinely ambiguous
+  AUTHORED node (`profile` and `provider` both written by hand) also still
+  fails closed.
 """
 
 from __future__ import annotations
@@ -47,10 +46,19 @@ from __future__ import annotations
 from typing import Any, ClassVar
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
-from elspeth.core.config import ElspethSettings, _lower_llm_profile_node_options, load_settings_from_config_dict, resolve_config
-from elspeth.core.llm_profiles import LLMProfileSettings, RuntimeLLMProfile
+from elspeth.core.config import (
+    ElspethSettings,
+    _lower_llm_profile_node_options,
+    _lower_llm_profile_nodes,
+    load_settings_from_config_dict,
+    load_settings_from_yaml_string,
+    resolve_config,
+)
+from elspeth.core.llm_profiles import LLMProfileSettings, LoweredLLMProfileAlias, RuntimeLLMProfile
+from elspeth.plugins.sources.llm import LLMSource
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.web.plugin_policy.profiles import _LLMProfileResolver
 
@@ -195,6 +203,7 @@ class TestBatchProfileNodeLowering:
         # TestLoweringIsRoundTripSafe). LLMTransform.__init__ excludes
         # `profile_alias` before provider construction.
         assert options["profile_alias"] == "gw-primary"
+        assert type(options["profile_alias"]) is LoweredLLMProfileAlias
         assert "profile" not in options
         assert options["prompt_template"] == "{{ row }}"
 
@@ -465,27 +474,46 @@ class TestBatchRunAuditRecordsAlias:
         transform = LLMTransform(dict(settings.transforms[0].options))
 
         assert transform.config["profile_alias"] == "gw-primary"
+        assert type(transform.config["profile_alias"]) is str
         assert transform._config.provider == "gateway"
         assert transform._config.model == "standard"
 
+    def test_transform_rejects_plain_forged_profile_alias(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-test-value")
+        settings = load_settings_from_config_dict(
+            _config(
+                transforms=[
+                    _llm_node(
+                        {
+                            "profile": "gw-primary",
+                            "prompt_template": "{{ row }}",
+                            "schema": {"mode": "observed"},
+                        }
+                    )
+                ],
+                llm_profiles={"gw-primary": _GATEWAY_PROFILE},
+            ),
+            expand_env_vars=True,
+        )
+        forged = dict(settings.transforms[0].options)
+        forged["profile_alias"] = str(forged["profile_alias"])
+
+        with pytest.raises(ValueError, match="reserved for trusted LLM profile lowering"):
+            LLMTransform(forged)
+
 
 # ---------------------------------------------------------------------------
-# Fix round 2: the alias retention key must not collide with the ambiguity
-# check — defused BY CONSTRUCTION (a distinct key), not by call-ordering.
+# Fix round 2: in-memory idempotence must retain provenance, while serialized
+# replay must not be silently re-trusted.
 # ---------------------------------------------------------------------------
 
 
 class TestLoweringIsRoundTripSafe:
-    """`_lower_llm_profile_nodes` is safe to run twice over its own output.
+    """The lowering pass trusts only its own still-owned in-memory output.
 
-    Nothing re-feeds a lowered dict back through this pass today, so this
-    was never observable in production — but the protection must be
-    structural, not an accident of the one call site that happens to exist.
-    Proven in both directions: a lowered node fed back through the pass must
-    NOT raise (round-trip safe), and a genuinely ambiguous AUTHORED node
-    (both `profile` and `provider` written by hand) must STILL raise — the
-    ambiguity check is intact and precise, not merely disarmed for
-    already-lowered output.
+    A second pass over the same nominally marked object is identity-equivalent.
+    YAML/JSON serialization erases the marker and must fail closed on re-entry,
+    as must a genuinely ambiguous authored node with both selector forms.
     """
 
     def test_lowered_output_round_trips_without_raising(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -501,19 +529,42 @@ class TestLoweringIsRoundTripSafe:
         # `profile`.
         assert "provider" in lowered_options
         assert "profile_alias" in lowered_options
+        assert type(lowered_options["profile_alias"]) is LoweredLLMProfileAlias
         assert "profile" not in lowered_options
 
-        # Feed the lowered output back through the SAME pass, exactly as a
-        # persisted-run reload or run-clone caller would if one existed.
-        # Must NOT raise.
-        round_tripped_cfg = _config(
+        # Feed the still-owned in-memory output back through the same pass.
+        # This must not raise or erase its nominal provenance marker.
+        in_memory_cfg = _config(
             transforms=[_llm_node(dict(lowered_options))],
             llm_profiles={"gw-primary": _GATEWAY_PROFILE},
         )
-        again = load_settings_from_config_dict(round_tripped_cfg, expand_env_vars=True)
+        again = load_settings_from_config_dict(in_memory_cfg, expand_env_vars=True)
         # No `profile` key means this pass has nothing to lower — the node
         # is inert to it, exactly like any other explicit-provider node.
         assert dict(again.transforms[0].options) == lowered_options
+        assert type(again.transforms[0].options["profile_alias"]) is LoweredLLMProfileAlias
+
+    def test_serialized_lowered_transform_is_not_retrusted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-test-value")
+        settings = load_settings_from_config_dict(
+            _config(
+                transforms=[
+                    _llm_node(
+                        {
+                            "profile": "gw-primary",
+                            "prompt_template": "{{ row }}",
+                            "schema": {"mode": "observed"},
+                        }
+                    )
+                ],
+                llm_profiles={"gw-primary": _GATEWAY_PROFILE},
+            ),
+            expand_env_vars=True,
+        )
+        serialized = settings.model_dump(mode="json")
+
+        with pytest.raises(ValueError, match="reserved for trusted LLM profile lowering"):
+            load_settings_from_config_dict(serialized, expand_env_vars=True)
 
     def test_genuinely_ambiguous_authored_node_still_raises(self) -> None:
         """The ambiguity check remains intact — not just inert for lowered output."""
@@ -532,3 +583,173 @@ class TestLoweringIsRoundTripSafe:
         )
         with pytest.raises(ValueError, match="both 'profile' and 'provider'"):
             load_settings_from_config_dict(cfg, expand_env_vars=True)
+
+
+class TestBatchProfileSourceLowering:
+    """The plural runtime source map gets the same profile lowering as transforms."""
+
+    @staticmethod
+    def _source_config(
+        *,
+        source_name: str = "source",
+        options: dict[str, object] | None = None,
+        transforms: object = None,
+        profile: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        config: dict[str, object] = {
+            "sources": {
+                source_name: {
+                    "plugin": "llm",
+                    "on_success": "output",
+                    "options": options
+                    or {
+                        "profile": "gw-primary",
+                        "prompt_template": "Write one audit briefing.",
+                        "response_field": "briefing",
+                        "schema": {"mode": "observed"},
+                        "on_validation_failure": "discard",
+                    },
+                }
+            },
+            "sinks": {
+                "output": {
+                    "plugin": "csv",
+                    "on_write_failure": "discard",
+                    "options": {"path": "out.csv"},
+                }
+            },
+            "llm_profiles": {"gw-primary": profile or _GATEWAY_PROFILE},
+        }
+        if transforms is not None:
+            config["transforms"] = transforms
+        return config
+
+    @pytest.mark.parametrize("source_name", ["source", "generated_brief"])
+    def test_plural_source_lowers_without_a_transform_list(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        source_name: str,
+    ) -> None:
+        monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-source-test")
+        raw = self._source_config(source_name=source_name, transforms={})
+        lowered = _lower_llm_profile_nodes(raw, materialize=True)
+        del lowered["transforms"]
+        settings = load_settings_from_config_dict(lowered, expand_env_vars=True)
+
+        source_settings = settings.sources[source_name]
+        assert source_settings.on_success == "output"
+        assert source_settings.options["on_validation_failure"] == "discard"
+        assert source_settings.options["provider"] == "gateway"
+        assert source_settings.options["api_key"] == "sk-source-test"
+        assert source_settings.options["profile_alias"] == "gw-primary"
+        assert type(source_settings.options["profile_alias"]) is LoweredLLMProfileAlias
+        assert "profile" not in source_settings.options
+
+    def test_lowered_source_retains_audit_alias_and_constructs_strict_provider_config(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-source-test")
+        settings = load_settings_from_config_dict(self._source_config(), expand_env_vars=True)
+
+        source = LLMSource(dict(settings.sources["source"].options))
+        resolved = resolve_config(settings)
+
+        assert source.config["profile_alias"] == "gw-primary"
+        assert type(source.config["profile_alias"]) is str
+        assert source.provider_config.provider == "gateway"
+        assert source.provider_config.model == "standard"
+        assert resolved["sources"]["source"]["options"]["profile_alias"] == "gw-primary"
+        assert "LLM_GATEWAY_BEARER_TOKEN" not in resolved["sources"]["source"]["options"]["profile_alias"]
+
+    def test_source_rejects_plain_forged_profile_alias(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-source-test")
+        settings = load_settings_from_config_dict(self._source_config(), expand_env_vars=True)
+        forged = dict(settings.sources["source"].options)
+        forged["profile_alias"] = str(forged["profile_alias"])
+
+        with pytest.raises(ValueError, match="reserved for trusted LLM profile lowering"):
+            LLMSource(forged)
+
+    def test_source_unknown_alias_and_profile_provider_ambiguity_fail_closed(self) -> None:
+        unknown = self._source_config(
+            options={
+                "profile": "missing",
+                "prompt_template": "Write one audit briefing.",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            }
+        )
+        with pytest.raises(ValueError, match=r"sources\['source'\].*unknown llm profile"):
+            load_settings_from_config_dict(unknown, expand_env_vars=True)
+
+        ambiguous = self._source_config(
+            options={
+                "profile": "gw-primary",
+                "provider": "gateway",
+                "prompt_template": "Write one audit briefing.",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            }
+        )
+        with pytest.raises(ValueError, match=r"sources\['source'\].*both 'profile' and 'provider'"):
+            load_settings_from_config_dict(ambiguous, expand_env_vars=True)
+
+    def test_source_rejects_user_scope_but_accepts_scopeless_bedrock(self) -> None:
+        user_profile: dict[str, object] = {
+            "provider": "openrouter",
+            "model": "openai/gpt-5-mini",
+            "credential_scope": "user",
+            "credential_ref": "OPENROUTER_API_KEY",
+        }
+        with pytest.raises(ValueError, match=r"sources\['source'\].*credential_scope"):
+            load_settings_from_config_dict(
+                self._source_config(profile=user_profile),
+                expand_env_vars=True,
+            )
+
+        bedrock_profile: dict[str, object] = {
+            "provider": "bedrock",
+            "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+            "region_name": "ap-southeast-2",
+        }
+        settings = load_settings_from_config_dict(
+            self._source_config(profile=bedrock_profile),
+            expand_env_vars=True,
+        )
+        assert settings.sources["source"].options["provider"] == "bedrock"
+        assert "api_key" not in settings.sources["source"].options
+
+    def test_source_lowering_is_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-source-test")
+        raw = self._source_config()
+        once = _lower_llm_profile_nodes(raw, materialize=True)
+        first_options = dict(once["sources"]["source"]["options"])
+        assert first_options["provider"] == "gateway"
+        assert first_options["profile_alias"] == "gw-primary"
+        marker = first_options["profile_alias"]
+        assert type(marker) is LoweredLLMProfileAlias
+
+        twice = _lower_llm_profile_nodes(once, materialize=True)
+
+        assert twice is once
+        assert twice["sources"]["source"]["options"] == first_options
+        assert twice["sources"]["source"]["options"]["profile_alias"] is marker
+
+    def test_serialized_lowered_source_is_not_retrusted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LLM_GATEWAY_BEARER_TOKEN", "sk-source-test")
+        settings = load_settings_from_config_dict(self._source_config(), expand_env_vars=True)
+        serialized = settings.model_dump(mode="json")
+
+        with pytest.raises(ValueError, match="reserved for trusted LLM profile lowering"):
+            load_settings_from_config_dict(serialized, expand_env_vars=True)
+        with pytest.raises(ValueError, match="reserved for trusted LLM profile lowering"):
+            load_settings_from_yaml_string(yaml.safe_dump(serialized), expand_env_vars=True)
+
+    def test_top_level_singular_source_is_not_a_runtime_contract(self) -> None:
+        config = self._source_config()
+        source = config.pop("sources")["source"]  # type: ignore[index]
+        config["source"] = source
+
+        with pytest.raises(ValueError, match=r"Unknown configuration keys: \['source'\].*'sources'"):
+            load_settings_from_config_dict(config, expand_env_vars=True)

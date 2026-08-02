@@ -410,6 +410,42 @@ class TestStep1IntraStep:
         assert body["next_turn"]["step_index"] == 0  # STEP_1_SOURCE is index 0
         assert body["guided_session"]["step"] == "step_1_source"
 
+    def test_llm_source_profile_form_persists_only_authored_options(self, composer_test_client: TestClient) -> None:
+        """The guided source form validates through its request-scoped profile authority."""
+        session_id = _create_session(composer_test_client)
+        initial = _get_guided(composer_test_client, session_id)
+        assert "llm" in {option["id"] for option in initial["next_turn"]["payload"]["options"]}
+
+        selected = _respond(composer_test_client, session_id, chosen=["llm"])
+        assert selected["next_turn"]["type"] == "schema_form"
+        assert selected["next_turn"]["payload"]["plugin"] == "llm"
+
+        reviewed = _respond(
+            composer_test_client,
+            session_id,
+            edited_values={
+                "plugin": "llm",
+                "options": {
+                    "profile": "task-role",
+                    "prompt_template": "Write one concise audit briefing.",
+                    "response_field": "briefing",
+                    "schema": {"mode": "observed"},
+                    "on_validation_failure": "discard",
+                },
+            },
+        )
+
+        assert reviewed["next_turn"]["type"] == "review_components"
+        source = next(iter(_full_guided_session(reviewed)["reviewed_sources"].values()))
+        assert source["on_validation_failure"] == "discard"
+        assert source["options"] == {
+            "profile": "task-role",
+            "prompt_template": "Write one concise audit briefing.",
+            "response_field": "briefing",
+            "schema": {"mode": "observed"},
+        }
+        assert not ({"provider", "model", "api_key", "region_name"} & set(source["options"]))
+
     def test_uploaded_csv_prefills_blob_path_and_commits_observed_schema(self, composer_test_client: TestClient) -> None:
         """A Step-1 CSV pick after upload is deterministic without asking chat to infer the file."""
         session_id = _create_session(composer_test_client)
@@ -892,10 +928,12 @@ class TestStep2IntraStep:
 
         from structlog.testing import capture_logs
 
+        operation_id = str(uuid4())
         with capture_logs() as planner_logs:
             settled = _post_current_response(
                 composer_test_client,
                 session_id,
+                operation_id=operation_id,
                 component_action={"action": "finish", "component_kind": "output"},
             )
 
@@ -913,6 +951,14 @@ class TestStep2IntraStep:
             assert failure_detail["failure_code"] == "invalid_provider_response"
             assert failure_detail["unproducible_output_fields"] == ["amount_aud", "client"]
             assert "amount_aud" in failure_detail["detail"] and "client" in failure_detail["detail"]
+            replayed = _post_current_response(
+                composer_test_client,
+                session_id,
+                operation_id=operation_id,
+                component_action={"action": "finish", "component_kind": "output"},
+            )
+            assert replayed.status_code == 502, replayed.json()
+            assert replayed.json() == settled.json()
             # The guided surface records its planner disposition as a
             # structured log rather than a durable audit row
             # (``_log_guided_planner_failure``), so that is where the closed

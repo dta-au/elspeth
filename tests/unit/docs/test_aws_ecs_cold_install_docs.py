@@ -150,3 +150,39 @@ def test_cold_install_teardown_is_scenario_then_bootstrap_with_orphan_check() ->
     assert 'test -z "$(terraform -chdir=scenario-a state list)"' in teardown
     assert 'test -z "$(terraform -chdir=bootstrap state list)"' in teardown
     assert "no active ECS tasks, Aurora instances, ALBs, NAT gateways, EFS" in teardown
+
+
+def test_cold_install_container_insights_cleanup_is_bounded_and_fails_closed() -> None:
+    text = _read(RUNBOOK)
+    cleanup = text[text.index("### Container Insights log-group orphan") : text.index("Finally, query the run tag:")]
+
+    for marker in (
+        "ELSPETH_CONTAINER_INSIGHTS_MAX_WAIT_SECONDS",
+        "ELSPETH_CONTAINER_INSIGHTS_POLL_INTERVAL_SECONDS",
+        "ELSPETH_CONTAINER_INSIGHTS_QUIET_SECONDS",
+        "describe-log-groups",
+        "delete-log-group",
+        "container_insights_log_group_stable",
+        "container_insights_log_group_not_stabilized",
+    ):
+        assert marker in cleanup
+    assert "|| true" not in cleanup
+    assert cleanup.index("describe-log-groups") < cleanup.index("delete-log-group")
+    assert "full quiet window" in cleanup
+
+
+def test_cold_install_replans_to_enable_log_group_adoption_before_saved_plan_apply() -> None:
+    text = _read(RUNBOOK)
+    cleanup = text[text.index("### Container Insights log-group orphan") : text.index("Finally, query the run tag:")]
+    normalized = " ".join(cleanup.split())
+
+    plan = "terraform -chdir=scenario-a plan"
+    variable = "-var='adopt_container_insights_log_group=true'"
+    plan_file = "-out=.terraform/scenario-a-adopt.tfplan"
+    apply = "terraform -chdir=scenario-a apply .terraform/scenario-a-adopt.tfplan"
+    for marker in (plan, variable, plan_file, apply):
+        assert marker in cleanup
+    assert "Do not reuse the failed saved plan" in normalized
+    assert cleanup.index(plan) < cleanup.index(variable) < cleanup.index(plan_file) < cleanup.index(apply)
+    assert not re.search(r"terraform\s+-chdir=scenario-a\s+apply[^\n]*-var", cleanup)
+    assert "on that apply" not in cleanup

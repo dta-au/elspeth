@@ -241,3 +241,21 @@ def test_postgres_unlock_failure_surfaces_without_primary() -> None:
         locking.postgres_session_advisory_lock(conn, "shared-session"),  # type: ignore[arg-type]
     ):
         pass
+
+
+def test_postgres_unlock_failure_surfaces_after_unrelated_caught_exception() -> None:
+    conn = _PostgresUnlockFailureConnection()
+    outer: LookupError | None = None
+
+    try:
+        raise LookupError("already handled")
+    except LookupError as exc:
+        outer = exc
+        with (
+            pytest.raises(OSError, match="advisory unlock failed"),
+            locking.postgres_session_advisory_lock(conn, "shared-session"),  # type: ignore[arg-type]
+        ):
+            pass
+
+    assert outer is not None
+    assert getattr(outer, "__notes__", ()) == ()

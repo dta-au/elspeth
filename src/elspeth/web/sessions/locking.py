@@ -7,7 +7,6 @@ import hashlib
 import importlib.util
 import os
 import stat
-import sys
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack
@@ -42,9 +41,13 @@ class _SQLiteFlockLeaseState(threading.local):
 _SQLITE_FLOCK_LEASE_STATE = _SQLiteFlockLeaseState()
 
 
-def _run_lock_cleanup(action: Callable[[], None], *, label: str) -> None:
+def _run_lock_cleanup(
+    action: Callable[[], None],
+    *,
+    label: str,
+    primary_exc: BaseException | None,
+) -> None:
     """Run one lock cleanup without replacing an active primary failure."""
-    primary_exc = sys.exception()
     try:
         action()
     except BaseException as cleanup_exc:
@@ -99,6 +102,7 @@ def filesystem_session_lock(root: Path, session_id: str) -> Iterator[None]:
         lock_path = lock_dir / f"{session_digest}.lock"
         flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
         descriptor = os.open(lock_path, flags, 0o600)
+        descriptor_primary_exc: BaseException | None = None
         try:
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                 raise AuditIntegrityError("Filesystem session lock sidecar is not a regular file")
@@ -107,18 +111,27 @@ def filesystem_session_lock(root: Path, session_id: str) -> Iterator[None]:
             except OSError as exc:
                 raise AuditIntegrityError("Unable to acquire filesystem session lock") from exc
             leases[lease_key] = (descriptor, 1)
+            lease_primary_exc: BaseException | None = None
             try:
                 yield
+            except BaseException as exc:
+                lease_primary_exc = exc
+                raise
             finally:
                 del leases[lease_key]
                 _run_lock_cleanup(
                     lambda: _fcntl.flock(descriptor, _fcntl.LOCK_UN),
                     label="Filesystem session lock release",
+                    primary_exc=lease_primary_exc,
                 )
+        except BaseException as exc:
+            descriptor_primary_exc = exc
+            raise
         finally:
             _run_lock_cleanup(
                 lambda: os.close(descriptor),
                 label="Filesystem session lock descriptor close",
+                primary_exc=descriptor_primary_exc,
             )
 
 
@@ -191,6 +204,7 @@ def sqlite_process_session_lock(engine: Engine, session_id: str) -> Iterator[Non
             return
         flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
         descriptor = os.open(lock_path, flags, 0o600)
+        descriptor_primary_exc: BaseException | None = None
         try:
             if not stat.S_ISREG(os.fstat(descriptor).st_mode):
                 raise AuditIntegrityError("SQLite session lock sidecar is not a regular file")
@@ -199,18 +213,27 @@ def sqlite_process_session_lock(engine: Engine, session_id: str) -> Iterator[Non
             except OSError as exc:
                 raise AuditIntegrityError("Unable to acquire SQLite process-shared session lock") from exc
             leases[lease_key] = (descriptor, 1)
+            lease_primary_exc: BaseException | None = None
             try:
                 yield
+            except BaseException as exc:
+                lease_primary_exc = exc
+                raise
             finally:
                 del leases[lease_key]
                 _run_lock_cleanup(
                     lambda: _fcntl.flock(descriptor, _fcntl.LOCK_UN),
                     label="SQLite session lock release",
+                    primary_exc=lease_primary_exc,
                 )
+        except BaseException as exc:
+            descriptor_primary_exc = exc
+            raise
         finally:
             _run_lock_cleanup(
                 lambda: os.close(descriptor),
                 label="SQLite session lock descriptor close",
+                primary_exc=descriptor_primary_exc,
             )
 
 
@@ -266,19 +289,28 @@ def sqlite_transaction_session_lock(conn: Connection, engine: Engine, session_id
     lock_stack = ExitStack()
     lock_stack.enter_context(sqlite_process_session_lock(engine, session_id))
     release_state = {"released": False}
+    release_primary_exc: BaseException | None = None
 
     def _release(_conn: Connection) -> None:
         if release_state["released"]:
             return
         release_state["released"] = True
-        _run_lock_cleanup(lock_stack.close, label="SQLite transaction session lock release")
+        _run_lock_cleanup(
+            lock_stack.close,
+            label="SQLite transaction session lock release",
+            primary_exc=release_primary_exc,
+        )
 
     def _remove_listener(identifier: Literal["commit", "rollback"], fn: Any) -> None:
         def _discard_listener() -> None:
             if event.contains(conn, identifier, fn):
                 event.remove(conn, identifier, fn)
 
-        _run_lock_cleanup(_discard_listener, label=f"SQLite transaction {identifier} listener cleanup")
+        _run_lock_cleanup(
+            _discard_listener,
+            label=f"SQLite transaction {identifier} listener cleanup",
+            primary_exc=release_primary_exc,
+        )
 
     def _release_on_commit(_conn: Connection) -> None:
         _release(_conn)
@@ -293,6 +325,9 @@ def sqlite_transaction_session_lock(conn: Connection, engine: Engine, session_id
         event.listen(conn, "rollback", _release_on_rollback, once=True)
     try:
         yield
+    except BaseException as exc:
+        release_primary_exc = exc
+        raise
     finally:
         if not conn.in_transaction():
             _release(conn)
@@ -318,7 +353,15 @@ def postgres_session_advisory_lock(conn: Connection, session_id: str) -> Iterato
         if unlocked is not True:
             raise AuditIntegrityError("PostgreSQL session advisory lock was not held during release")
 
+    primary_exc: BaseException | None = None
     try:
         yield
+    except BaseException as exc:
+        primary_exc = exc
+        raise
     finally:
-        _run_lock_cleanup(_release, label="PostgreSQL session advisory lock release")
+        _run_lock_cleanup(
+            _release,
+            label="PostgreSQL session advisory lock release",
+            primary_exc=primary_exc,
+        )

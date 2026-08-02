@@ -593,10 +593,10 @@ def _is_matching_lock_assertion(statement: ast.stmt, writer: ast.Call) -> bool:
     )
 
 
-def _call_has_dominating_matching_lock_assertion(call: ast.Call) -> bool:
-    """Accept only a prior, guaranteed assertion over this call's conn/session."""
+def _node_has_dominating_matching_lock_assertion(node: ast.AST, writer: ast.Call) -> bool:
+    """Accept only a prior, guaranteed assertion over ``writer``'s conn/session."""
 
-    child: ast.AST = call
+    child = node
     parent = getattr(child, "parent", None)
     while parent is not None:
         for field in ("body", "orelse", "finalbody"):
@@ -604,13 +604,19 @@ def _call_has_dominating_matching_lock_assertion(call: ast.Call) -> bool:
             if not isinstance(statements, list) or child not in statements:
                 continue
             index = statements.index(child)
-            if any(_is_matching_lock_assertion(statement, call) for statement in statements[:index]):
+            if any(_is_matching_lock_assertion(statement, writer) for statement in statements[:index]):
                 return True
         if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
             return False
         child = parent
         parent = getattr(parent, "parent", None)
     return False
+
+
+def _call_has_dominating_matching_lock_assertion(call: ast.Call) -> bool:
+    """Accept only a prior, guaranteed assertion over this call's conn/session."""
+
+    return _node_has_dominating_matching_lock_assertion(call, call)
 
 
 def check_lock_discipline(
@@ -767,6 +773,104 @@ _INLINE_VERSION_PATTERN = re.compile(
 )
 
 
+def _is_composition_states_column(expression: ast.expr, column: str) -> bool:
+    """Return whether ``expression`` is exactly ``composition_states_table.c.<column>``."""
+
+    return (
+        isinstance(expression, ast.Attribute)
+        and expression.attr == column
+        and isinstance(expression.value, ast.Attribute)
+        and expression.value.attr == "c"
+        and isinstance(expression.value.value, ast.Name)
+        and expression.value.value.id == "composition_states_table"
+    )
+
+
+def _is_sqlalchemy_inline_version_max(node: ast.AST) -> bool:
+    """Recognize the production ``func.max(composition_states_table.c.version)`` form."""
+
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "max"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "func"
+        and len(node.args) == 1
+        and _is_composition_states_column(node.args[0], "version")
+    )
+
+
+def _enclosing_database_execute(node: ast.AST) -> ast.Call | None:
+    """Return the enclosing connection execute call for one allocator expression."""
+
+    cursor: ast.AST | None = getattr(node, "parent", None)
+    while cursor is not None and not isinstance(cursor, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+        if (
+            isinstance(cursor, ast.Call)
+            and isinstance(cursor.func, ast.Attribute)
+            and cursor.func.attr in {"execute", "exec_driver_sql"}
+            and cursor.args
+        ):
+            return cursor
+        cursor = getattr(cursor, "parent", None)
+    return None
+
+
+def _sqlalchemy_allocator_session_expression(execute_call: ast.Call) -> ast.expr | None:
+    """Extract the session expression from an exact composition-state WHERE predicate."""
+
+    for candidate in ast.walk(execute_call.args[0]):
+        if not isinstance(candidate, ast.Compare) or len(candidate.ops) != 1 or not isinstance(candidate.ops[0], ast.Eq):
+            continue
+        if len(candidate.comparators) != 1:
+            continue
+        right = candidate.comparators[0]
+        if _is_composition_states_column(candidate.left, "session_id"):
+            return right
+        if _is_composition_states_column(right, "session_id"):
+            return candidate.left
+    return None
+
+
+def _raw_allocator_session_expression(execute_call: ast.Call) -> ast.expr | None:
+    """Extract ``sid``/``session_id`` from a raw SQL parameter mapping."""
+
+    parameters: ast.expr | None = execute_call.args[1] if len(execute_call.args) > 1 else None
+    if parameters is None:
+        parameters = next(
+            (keyword.value for keyword in execute_call.keywords if keyword.arg in {"parameters", "params"}),
+            None,
+        )
+    if not isinstance(parameters, ast.Dict):
+        return None
+    for key_name in ("sid", "session_id"):
+        for key, value in zip(parameters.keys, parameters.values, strict=True):
+            if isinstance(key, ast.Constant) and key.value == key_name:
+                return value
+    return None
+
+
+def _inline_allocator_contract(node: ast.AST) -> tuple[ast.Call, ast.Call] | None:
+    """Return the location and exact ``(connection, session)`` lock contract."""
+
+    execute_call = _enclosing_database_execute(node)
+    if execute_call is None or not isinstance(execute_call.func, ast.Attribute):
+        return None
+    connection = execute_call.func.value
+    if isinstance(node, ast.Constant):
+        session_id = _raw_allocator_session_expression(execute_call)
+    else:
+        session_id = _sqlalchemy_allocator_session_expression(execute_call)
+    if session_id is None:
+        return None
+    writer = ast.Call(
+        func=ast.Name(id="_inline_composition_state_version_allocator", ctx=ast.Load()),
+        args=[connection, session_id],
+        keywords=[],
+    )
+    return execute_call, writer
+
+
 def check_inline_state_version_allocation(
     roots: Sequence[Path],
     *,
@@ -804,15 +908,25 @@ def check_inline_state_version_allocation(
         source_lines = source.splitlines()
 
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
-                continue
-            if _INLINE_VERSION_PATTERN.search(node.value) is None:
+            is_raw_allocator = (
+                isinstance(node, ast.Constant) and isinstance(node.value, str) and _INLINE_VERSION_PATTERN.search(node.value) is not None
+            )
+            if not is_raw_allocator and not _is_sqlalchemy_inline_version_max(node):
                 continue
             symbol = _qualified_symbol(node)
-            simple_name = symbol.rsplit(".", 1)[-1]
-            if simple_name not in {"save_composition_state", "set_active_state"}:
+            symbol_parts = symbol.split(".")
+            if not {"save_composition_state", "set_active_state"}.intersection(symbol_parts):
                 continue
-            inside_lock = any(_with_block_establishes_session_write_lock(w) for w in _enclosing_with_blocks(node))
+            contract = _inline_allocator_contract(node)
+            if contract is None:
+                inside_lock = False
+            else:
+                location, writer = contract
+                inside_lock = any(
+                    _with_block_establishes_session_write_lock(with_block, writer) for with_block in _enclosing_with_blocks(node)
+                )
+                if not inside_lock:
+                    inside_lock = _node_has_dominating_matching_lock_assertion(location, writer)
             if inside_lock:
                 continue
             line = getattr(node, "lineno", 0)
@@ -843,7 +957,7 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
     # handover pitfall §5).
     ReviewedWriter(
         path="src/elspeth/web/sessions/service.py",
-        enclosing_symbol="SessionServiceImpl.save_composition_state._sync",
+        enclosing_symbol="SessionServiceImpl.save_composition_state._write",
         table="composition_states",
         operation="sqlalchemy_insert_call",
         purpose=(
@@ -851,7 +965,8 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "in place (NOT helper-routed) per plan §2128-2133 — uniform "
             "helper-routing would either lose the per-site retry semantics "
             "(race risk) or grow per-site escape hatches. The SELECT-MAX + "
-            "INSERT region is wrapped in ``_session_write_lock`` so the "
+            "INSERT region locally asserts and is wrapped in "
+            "``_session_write_lock`` so the "
             "inline allocation runs under the same per-session write "
             "discipline as ``_insert_composition_state``. The B3 "
             "belt-and-suspenders retry loop was deleted: under CLAUDE.md "
@@ -1347,14 +1462,14 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "the production tool handlers."
         ),
     ),
-    # ------ test_schema.py — epoch-42 coordination schema fixture ------
+    # ------ test_schema.py — epoch-43 coordination schema fixture ------
     ReviewedWriter(
         path="tests/unit/web/sessions/test_schema.py",
         enclosing_symbol="_seed_session_state",
         table="composition_states",
         operation="sqlalchemy_insert_call",
         purpose=(
-            "epoch-42 coordination schema fixture: seeds the parent "
+            "epoch-43 coordination schema fixture: seeds the parent "
             "composition_states row required by runs_table's composite FK so "
             "direct negative inserts can isolate the new coordination CHECK "
             "constraints. The test owns the in-memory SQLite engine and is "
@@ -1706,6 +1821,34 @@ _EXPLICIT_FIXTURE_WRITERS: tuple[ReviewedWriter, ...] = tuple(
             "chat_messages",
             "sqlalchemy_insert_call",
             "B3 fork-creation custody negative presents an otherwise allowed insert bound to a third session",
+        ),
+        (
+            "tests/unit/web/coordination/test_session_operation_fence.py",
+            "test_composer_completion_mutations_write_fixed_shapes_under_exact_blob_read",
+            "composition_states",
+            "sqlalchemy_insert_call",
+            "Composer-completion authority fixture seeds the exact state parent whose fixed-shape BLOB_READ writes are under test",
+        ),
+        (
+            "tests/unit/web/coordination/test_session_operation_fence.py",
+            "test_composer_completion_mutations_enforce_kind_session_and_latest_state",
+            "composition_states",
+            "sqlalchemy_insert_call",
+            "Composer-completion authority fixture seeds owned old/current and foreign state parents to exercise exact kind, session, and latest-state checks",
+        ),
+        (
+            "tests/unit/web/coordination/test_session_operation_fence.py",
+            "test_composer_completion_released_authority_writes_zero_and_successor_writes_once",
+            "composition_states",
+            "sqlalchemy_insert_call",
+            "Composer-completion authority fixture seeds the state parent used to prove released authority writes nothing and its successor writes once",
+        ),
+        (
+            "tests/unit/web/shareable_reviews/test_service.py",
+            "test_mark_ready_for_review_rejects_state_superseded_after_readiness_without_side_effects.supersede_after_readiness",
+            "composition_states",
+            "sqlalchemy_table_insert",
+            "Readiness race fixture advances the session head between readiness and settlement to prove stale output is rejected before audit, blob, token, or telemetry effects",
         ),
     )
 )
@@ -2223,6 +2366,93 @@ def test_lock_discipline_allowlist_key_match_is_exact(tmp_path: Path) -> None:
     findings = check_lock_discipline([synthetic_src, synthetic_tests], path_anchor=tmp_path, allowlist=mismatched_helper)
     matching = [v for v in findings if v.enclosing_symbol == "test_reserve_sequence_range_requires_session_write_lock"]
     assert matching, f"allowlist with mismatched helper_name must NOT suppress; findings={findings}"
+
+
+def test_inline_version_guard_handles_raw_sql_and_requires_exact_lock_identity(tmp_path: Path) -> None:
+    """Raw SQL allocation is classified without crashing and binds to the exact lock."""
+
+    synthetic_root = tmp_path / "src"
+    synthetic_root.mkdir()
+    (synthetic_root / "raw_allocators.py").write_text(
+        textwrap.dedent("""\
+        from contextlib import contextmanager
+
+
+        @contextmanager
+        def _session_write_lock(conn, session_id):
+            yield
+
+
+        def save_composition_state(conn, session_id):
+            with _session_write_lock(conn, session_id):
+                conn.exec_driver_sql(
+                    "SELECT MAX(composition_states.version) FROM composition_states WHERE session_id = :sid",
+                    {"sid": session_id},
+                )
+
+
+        def set_active_state(conn, session_id, other_session_id):
+            with _session_write_lock(conn, other_session_id):
+                conn.exec_driver_sql(
+                    "SELECT MAX(composition_states.version) FROM composition_states WHERE session_id = :sid",
+                    {"sid": session_id},
+                )
+        """)
+    )
+
+    findings = check_inline_state_version_allocation([synthetic_root], path_anchor=tmp_path)
+    symbols = {finding.enclosing_symbol for finding in findings}
+    assert "save_composition_state" not in symbols
+    assert "set_active_state" in symbols
+
+
+def test_inline_version_guard_detects_sqlalchemy_allocator_and_nested_assertion(tmp_path: Path) -> None:
+    """The live SQLAlchemy allocator form cannot bypass exact lock proof through nesting."""
+
+    synthetic_root = tmp_path / "src"
+    synthetic_root.mkdir()
+    (synthetic_root / "sqlalchemy_allocators.py").write_text(
+        textwrap.dedent("""\
+        from contextlib import contextmanager
+        from sqlalchemy import func, select
+
+
+        @contextmanager
+        def _session_write_lock(conn, session_id):
+            yield
+
+
+        def _assert_session_write_lock_held(conn, session_id, *, caller):
+            pass
+
+
+        class Service:
+            def save_composition_state(self, conn, session_id):
+                def _write(conn):
+                    self._assert_session_write_lock_held(conn, session_id, caller="save")
+                    return conn.execute(
+                        select(func.max(composition_states_table.c.version)).where(
+                            composition_states_table.c.session_id == session_id
+                        )
+                    ).scalar()
+
+                with self._session_write_lock(conn, session_id):
+                    return _write(conn)
+
+            def set_active_state(self, conn, session_id, other_session_id):
+                with self._session_write_lock(conn, other_session_id):
+                    return conn.execute(
+                        select(func.max(composition_states_table.c.version)).where(
+                            composition_states_table.c.session_id == session_id
+                        )
+                    ).scalar()
+        """)
+    )
+
+    findings = check_inline_state_version_allocation([synthetic_root], path_anchor=tmp_path)
+    symbols = {finding.enclosing_symbol for finding in findings}
+    assert "Service.save_composition_state._write" not in symbols
+    assert "Service.set_active_state" in symbols
 
 
 # ---------------------------------------------------------------------------

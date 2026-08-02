@@ -8,7 +8,9 @@ import pytest
 from structlog.testing import capture_logs
 
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlRole, PluginCapability
-from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.plugins.sources.llm import LLMSource
 from elspeth.plugins.transforms.aws.guardrail_profiles import (
     BedrockGuardrailProfileSettings,
     BedrockLocalRequirementResult,
@@ -31,15 +33,45 @@ def _settings(**overrides: object) -> WebSettings:
     return WebSettings.model_validate(values)
 
 
+class _CompilerLLMSource(LLMSource):
+    determinism = LLMSource.determinism
+    source_file_hash = "sha256:0123456789abcdef"
+
+
+def _isolated_manager_with_llm_source() -> PluginManager:
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    if all(source.name != "llm" for source in manager.get_sources()):
+        manager.register(create_dynamic_hookimpl([_CompilerLLMSource], "elspeth_get_source"))
+    return manager
+
+
 def test_default_policy_authorizes_exact_required_core() -> None:
     policy = compile_web_plugin_policy(
-        registry=get_shared_plugin_manager(),
+        registry=_isolated_manager_with_llm_source(),
         settings=RuntimeWebPluginConfig.from_settings(_settings()),
     )
 
     assert policy.required == REQUIRED_WEB_PLUGIN_IDS
     assert policy.authorized == REQUIRED_WEB_PLUGIN_IDS
     assert PluginId("sink", "database") not in policy.authorized
+
+
+def test_default_policy_requires_llm_source_and_transform() -> None:
+    assert PluginId("source", "llm") in REQUIRED_WEB_PLUGIN_IDS
+    assert PluginId("transform", "llm") in REQUIRED_WEB_PLUGIN_IDS
+
+
+def test_required_llm_source_compiles_with_isolated_registration() -> None:
+    manager = _isolated_manager_with_llm_source()
+
+    policy = compile_web_plugin_policy(
+        registry=manager,
+        settings=RuntimeWebPluginConfig.from_settings(_settings()),
+    )
+
+    assert PluginId("source", "llm") in policy.required
+    assert PluginId("source", "llm") in policy.authorized
 
 
 def test_compiling_a_categorically_prohibited_allowlist_entry_warns_at_boot() -> None:
@@ -52,7 +84,7 @@ def test_compiling_a_categorically_prohibited_allowlist_entry_warns_at_boot() ->
     """
     with capture_logs() as logs:
         policy = compile_web_plugin_policy(
-            registry=get_shared_plugin_manager(),
+            registry=_isolated_manager_with_llm_source(),
             settings=RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=("source:aws_s3",))),
         )
 
@@ -66,7 +98,7 @@ def test_compiling_a_categorically_prohibited_allowlist_entry_warns_at_boot() ->
 def test_compiling_without_a_categorically_prohibited_entry_does_not_warn() -> None:
     with capture_logs() as logs:
         compile_web_plugin_policy(
-            registry=get_shared_plugin_manager(),
+            registry=_isolated_manager_with_llm_source(),
             settings=RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=("sink:database",))),
         )
 
@@ -75,9 +107,9 @@ def test_compiling_without_a_categorically_prohibited_entry_does_not_warn() -> N
 
 def test_allowlist_is_set_like_for_hashing() -> None:
     runtime = RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=("sink:database", "transform:azure_prompt_shield")))
-    first = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    first = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
     second = compile_web_plugin_policy(
-        registry=get_shared_plugin_manager(),
+        registry=_isolated_manager_with_llm_source(),
         settings=replace(runtime, plugin_allowlist=tuple(reversed(runtime.plugin_allowlist))),
     )
 
@@ -89,7 +121,7 @@ def test_duplicate_allowlist_entry_is_rejected_without_echoing_value() -> None:
     runtime = RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=(marker, marker)))
 
     with pytest.raises(ValueError) as exc_info:
-        compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+        compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
 
     assert "duplicate_plugin_id" in str(exc_info.value)
     assert marker not in str(exc_info.value)
@@ -99,14 +131,14 @@ def test_uninstalled_allowlist_entry_is_rejected_by_closed_reason() -> None:
     runtime = RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=("sink:not_installed",)))
 
     with pytest.raises(ValueError) as exc_info:
-        compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+        compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
 
     assert str(exc_info.value) == "web plugin policy invalid: plugin_not_installed"
 
 
 def test_every_authorized_plugin_has_canonical_code_identity() -> None:
     policy = compile_web_plugin_policy(
-        registry=get_shared_plugin_manager(),
+        registry=_isolated_manager_with_llm_source(),
         settings=RuntimeWebPluginConfig.from_settings(_settings()),
     )
 
@@ -117,7 +149,7 @@ def test_every_authorized_plugin_has_canonical_code_identity() -> None:
 
 class _FakeRegistry:
     def __init__(self, *, transforms: list[type]) -> None:
-        manager = get_shared_plugin_manager()
+        manager = _isolated_manager_with_llm_source()
         self._sources = manager.get_sources()
         self._transforms = [cls for cls in manager.get_transforms() if cls.name not in {item.name for item in transforms}] + transforms
         self._sinks = manager.get_sinks()
@@ -198,7 +230,7 @@ def test_allowlisted_bedrock_shield_without_profile_requires_optional_sdk(
     runtime = RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=(f"transform:{plugin}",)))
 
     with pytest.raises(ValueError) as exc_info:
-        compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+        compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
 
     assert str(exc_info.value) == "web plugin policy invalid: plugin_unavailable"
     assert marker not in str(exc_info.value)
@@ -226,7 +258,7 @@ def test_allowlisted_bedrock_shield_without_profile_rejects_old_optional_sdk(
     runtime = RuntimeWebPluginConfig.from_settings(_settings(plugin_allowlist=("transform:aws_bedrock_prompt_shield",)))
 
     with pytest.raises(ValueError, match=r"^web plugin policy invalid: plugin_unavailable$"):
-        compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+        compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
 
 
 def test_unallowlisted_bedrock_shields_do_not_import_optional_sdk(
@@ -244,7 +276,7 @@ def test_unallowlisted_bedrock_shields_do_not_import_optional_sdk(
     monkeypatch.setattr(importlib, "import_module", track_sdk_imports)
 
     policy = compile_web_plugin_policy(
-        registry=get_shared_plugin_manager(),
+        registry=_isolated_manager_with_llm_source(),
         settings=RuntimeWebPluginConfig.from_settings(_settings()),
     )
 
@@ -279,7 +311,7 @@ def test_authorized_operator_profile_preflights_local_requirements_without_detai
     )
 
     with pytest.raises(ValueError) as exc_info:
-        compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+        compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
 
     rendered = str(exc_info.value)
     assert rendered == "web plugin policy invalid: plugin_unavailable"
@@ -299,7 +331,7 @@ def test_unallowlisted_operator_profile_does_not_preflight_optional_sdk(
     monkeypatch.setattr(BedrockGuardrailProfileSettings, "check_local_requirements", unavailable)
     runtime = RuntimeWebPluginConfig.from_settings(_settings(bedrock_guardrail_profiles=(_bedrock_profile(),)))
 
-    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
 
     assert PluginId("transform", "aws_bedrock_prompt_shield") not in policy.authorized
     assert calls == []

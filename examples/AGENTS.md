@@ -130,6 +130,7 @@ timeout 20 elspeth run --settings examples/openrouter_sentiment/settings.yaml --
 
 | Example | Rows | Typical time | Notes |
 |---------|------|-------------|-------|
+| `llm_source` | 1 | one request | One static authored prompt emitted as one generated row |
 | `openrouter_sentiment` | 5 | ~6s | GPT-4o-mini sentiment |
 | `template_lookups` | 5 | ~8s | Claude Haiku with templates |
 | `openrouter_multi_query_assessment` | 3 | ~18s | Claude Sonnet multi-query |

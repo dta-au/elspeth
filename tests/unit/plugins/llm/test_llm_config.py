@@ -1966,6 +1966,19 @@ class TestTemplateVariableBindings:
     def test_single_prompt_bound_or_static_accepted(self, template: str) -> None:
         assert self._single(template).prompt_template == template
 
+    def test_single_prompt_local_assigned_in_every_if_branch_is_accepted(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% else %}{% set verdict = "NO" %}{% endif %}{{ verdict }}'
+
+        assert self._single(template).prompt_template == template
+
+    def test_single_prompt_local_assigned_in_only_one_if_branch_is_rejected(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% endif %}{{ verdict }}'
+
+        with pytest.raises(ValidationError, match="prompt render context does not define") as exc_info:
+            self._single(template)
+
+        assert "'verdict'" in str(exc_info.value)
+
     def test_dynamic_access_error_keeps_primacy(self) -> None:
         """``{{ row.get(k) }}`` is both dynamic AND has an unbound ``k`` — the
         dynamic-access validator is defined first and must keep firing, or its
@@ -2009,12 +2022,44 @@ class TestTemplateVariableBindings:
         )
         assert config.queries is not None
 
+    def test_query_override_local_assigned_in_every_if_branch_is_accepted(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% else %}{% set verdict = "NO" %}{% endif %}{{ verdict }}'
+
+        config = self._multi({"q1": {"input_fields": {"flag": "source_flag"}, "template": template}})
+
+        assert config.queries is not None
+
+    def test_query_override_local_assigned_in_only_one_if_branch_is_rejected(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% endif %}{{ verdict }}'
+
+        with pytest.raises(ValidationError, match="multi-query render context does not define") as exc_info:
+            self._multi({"q1": {"input_fields": {"flag": "source_flag"}, "template": template}})
+
+        message = str(exc_info.value)
+        assert "'q1'" in message
+        assert "'verdict'" in message
+
     def test_node_template_bare_name_used_by_query_rejected(self) -> None:
         """The legacy positional idiom ``{{ input_1 }}`` never binds — the
         render context wraps input_fields variables under ``row``."""
         with pytest.raises(ValidationError, match="multi-query render context does not define") as exc_info:
             self._multi({"q1": {"input_fields": {"input_1": "col_a"}}}, template="Assess: {{ input_1 }}")
         assert "'input_1'" in str(exc_info.value)
+
+    def test_shared_node_template_local_assigned_in_every_if_branch_is_accepted(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% else %}{% set verdict = "NO" %}{% endif %}{{ verdict }}'
+
+        config = self._multi({"q1": {"input_fields": {"flag": "source_flag"}}}, template=template)
+
+        assert config.queries is not None
+
+    def test_shared_node_template_local_assigned_in_only_one_if_branch_is_rejected(self) -> None:
+        template = '{% if row.flag %}{% set verdict = "YES" %}{% endif %}{{ verdict }}'
+
+        with pytest.raises(ValidationError, match="multi-query render context does not define") as exc_info:
+            self._multi({"q1": {"input_fields": {"flag": "source_flag"}}}, template=template)
+
+        assert "'verdict'" in str(exc_info.value)
 
     def test_node_template_used_by_no_query_is_not_checked(self) -> None:
         """Every query overrides the template, so the node-level slot never

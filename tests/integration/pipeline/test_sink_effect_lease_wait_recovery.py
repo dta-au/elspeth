@@ -17,7 +17,7 @@ from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import CheckpointSettings, SourceSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.execution import sink_effect_lifecycle
+from elspeth.core.landscape.execution import sink_effect_finalization, sink_effect_lifecycle
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import runs_table, token_work_items_table
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -110,6 +110,7 @@ def test_fresh_database_reopen_public_resume_waits_for_effect_lease_and_preserve
         original_fault(self, seam)
 
     monkeypatch.setattr(sink_effect_lifecycle, "now", clock.now_utc)
+    monkeypatch.setattr(sink_effect_finalization, "now", clock.now_utc)
     monkeypatch.setattr(SinkEffectCoordinator, "__init__", initialize_with_deterministic_lease)
     monkeypatch.setattr(SinkEffectCoordinator, "_fault", lose_first_publication_response)
 

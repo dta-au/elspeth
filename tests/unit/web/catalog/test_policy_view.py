@@ -73,7 +73,7 @@ def view() -> PolicyCatalogView:
 
 
 def test_lists_only_snapshot_available_plugins(view: PolicyCatalogView) -> None:
-    assert {item.name for item in view.list_sources()} == {"csv", "json", "text"}
+    assert {item.name for item in view.list_sources()} == {"csv", "json", "llm", "text"}
     assert {item.name for item in view.list_sinks()} == {"csv", "json", "text"}
     assert {item.name for item in view.list_transforms()} == {"field_mapper", "llm", "web_scrape"}
 

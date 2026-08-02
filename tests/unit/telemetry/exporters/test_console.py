@@ -129,6 +129,37 @@ class TestConsoleExporterExportBehavior:
         assert parsed["output_hash"] == "hash-out"
         assert parsed["timestamp"] == "2026-01-15T10:30:00+00:00"  # ISO 8601
 
+    def test_resource_cleanup_failure_exports_bounded_system_health_fields(self) -> None:
+        from elspeth.contracts.events import ResourceCleanupFailed
+
+        exporter = ConsoleExporter()
+        exporter.configure({"format": "json", "output": "stdout"})
+        captured = StringIO()
+        exporter._stream = captured
+        event = ResourceCleanupFailed(
+            timestamp=datetime(2026, 8, 2, tzinfo=UTC),
+            run_id="run-1",
+            component="gateway_provider",
+            resource="audited_http_client",
+            error_type="RuntimeError",
+            suppressed=True,
+            operation_id="source-load-op-1",
+        )
+
+        exporter.export(event)
+
+        parsed = json.loads(captured.getvalue())
+        assert parsed["event_type"] == "ResourceCleanupFailed"
+        assert parsed["run_id"] == "run-1"
+        assert parsed["component"] == "gateway_provider"
+        assert parsed["resource"] == "audited_http_client"
+        assert parsed["error_type"] == "RuntimeError"
+        assert parsed["suppressed"] is True
+        assert parsed["operation_id"] == "source-load-op-1"
+        assert parsed["state_id"] is None
+        assert parsed["token_id"] is None
+        assert "error_message" not in parsed
+
     def test_json_format_with_gate_event(self) -> None:
         """JSON format handles GateEvaluated events with routing mode enum."""
         exporter = ConsoleExporter()

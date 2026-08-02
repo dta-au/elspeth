@@ -10,7 +10,9 @@ from elspeth.contracts.plugin_capabilities import (
     PluginCapability,
     WebConfigAuthority,
 )
+from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
 from elspeth.plugins.infrastructure.manager import PluginManager, get_shared_plugin_manager
+from elspeth.plugins.sources.llm import LLMSource
 from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSecretRequirement, PluginSummary
@@ -30,6 +32,15 @@ def catalog(plugin_manager: PluginManager) -> CatalogServiceImpl:
     return CatalogServiceImpl(plugin_manager)
 
 
+@pytest.fixture(scope="module")
+def llm_source_catalog() -> CatalogServiceImpl:
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    if all(source.name != "llm" for source in manager.get_sources()):
+        manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
+    return CatalogServiceImpl(manager)
+
+
 class TestCatalogService:
     """CatalogServiceImpl satisfies the CatalogService protocol."""
 
@@ -46,7 +57,7 @@ class TestCatalogService:
             ("transform", catalog.list_transforms(), plugin_manager.get_transforms()),
             ("sink", catalog.list_sinks(), plugin_manager.get_sinks()),
         )
-        assert sum(len(summaries) for _, summaries, _ in groups) == 47
+        assert sum(len(summaries) for _, summaries, _ in groups) == 48
 
         for kind, summaries, plugin_classes in groups:
             classes_by_name = {plugin_cls.name: plugin_cls for plugin_cls in plugin_classes}
@@ -75,6 +86,17 @@ class TestListSources:
         sources = catalog.list_sources()
         names = [s.name for s in sources]
         assert "text" in names
+
+    def test_llm_source_summary_is_source_native(self, llm_source_catalog: CatalogServiceImpl) -> None:
+        source = next(item for item in llm_source_catalog.list_sources() if item.name == "llm")
+
+        assert source.plugin_type == "source"
+        assert source.web_config_authority is WebConfigAuthority.OPERATOR_PROFILED
+        assert source.policy_capabilities == (CapabilityDeclaration(PluginCapability.LLM),)
+        assert source.usage_when_to_use is not None and "one generated row" in source.usage_when_to_use
+        assert source.usage_when_not_to_use is not None and "incoming rows" in source.usage_when_not_to_use
+        assert source.example_use is not None and "profile: approved-generation" in source.example_use
+        assert source.composer_hints
 
     def test_all_entries_are_plugin_summaries(self, catalog: CatalogServiceImpl) -> None:
         sources = catalog.list_sources()
@@ -363,6 +385,26 @@ class TestGetSchema:
         assert set(defs["GatewayConfig"]["required"]) >= {"model", "endpoint", "api_key", "prompt_template"}
         assert "region_name" in defs["BedrockConfig"]["properties"]
         assert "api_key" not in defs["BedrockConfig"]["properties"]
+
+    def test_llm_source_emits_source_discriminated_schema(self, llm_source_catalog: CatalogServiceImpl) -> None:
+        info = llm_source_catalog.get_schema("source", "llm")
+        schema = info.json_schema
+
+        assert schema["discriminator"]["propertyName"] == "provider"
+        assert set(schema["discriminator"]["mapping"]) == {"azure", "openrouter", "bedrock", "gateway"}
+        assert set(schema["$defs"]) >= {
+            "AzureOpenAILLMSourceConfig",
+            "OpenRouterLLMSourceConfig",
+            "BedrockLLMSourceConfig",
+            "GatewayLLMSourceConfig",
+        }
+        for definition_name in schema["discriminator"]["mapping"].values():
+            definition = schema["$defs"][definition_name.removeprefix("#/$defs/")]
+            assert {"provider", "schema", "prompt_template", "on_validation_failure"} <= set(definition["required"])
+
+        knobs = {field["name"] for field in info.knob_schema["fields"]}
+        assert {"prompt_template", "response_field", "on_validation_failure", "lookup"} <= knobs
+        assert not knobs & {"queries", "required_input_fields", "interpretation_requirements"}
 
     def test_llm_transform_schema_defs_expose_typed_query_structure(self, catalog: CatalogServiceImpl) -> None:
         """Ruling B(1): json_schema $defs advertise the typed structured-query contract.

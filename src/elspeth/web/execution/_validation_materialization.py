@@ -6,9 +6,10 @@ owner of check ordering and ledger mutation.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Any, Literal, cast
 from uuid import UUID
 
 import yaml
@@ -21,6 +22,7 @@ from elspeth.core.blobs_inline import (
     _substitute_blob_content_refs_for_validation,
     _validate_blob_content_refs_sync,
 )
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution._validation_model import (
     InterpretationValidatedState,
     MaterializedYaml,
@@ -51,6 +53,54 @@ from elspeth.web.provider_config_policy import (
     web_llm_tracing_policy_error,
     web_rag_provider_config_policy_error,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _LLMPolicyComponent:
+    """One source or transform subject to component-neutral LLM policy."""
+
+    component_id: str
+    component_type: Literal["source", "transform"]
+    label: str
+    plugin: str | None
+    options: Mapping[str, Any]
+
+
+def _source_policy_component_id(source_name: object) -> str:
+    """Return a stable, value-safe id for one possibly malformed source key."""
+    if type(source_name) is not str:
+        return "source:<invalid>"
+    return "source" if source_name == "source" else f"source:{source_name}"
+
+
+def _llm_policy_components(state: CompositionState) -> tuple[_LLMPolicyComponent, ...]:
+    """Return source-first, stable components for shared LLM egress gates."""
+    source_items = sorted(
+        cast("Mapping[object, Any]", state.sources).items(),
+        key=lambda item: (0, item[0]) if type(item[0]) is str else (1, ""),
+    )
+    components = [
+        _LLMPolicyComponent(
+            component_id=_source_policy_component_id(source_name),
+            component_type="source",
+            label="Source",
+            plugin=source.plugin,
+            options=source.options,
+        )
+        for source_name, source in source_items
+    ]
+    components.extend(
+        _LLMPolicyComponent(
+            component_id=node.id,
+            component_type="transform",
+            label="Transform",
+            plugin=node.plugin,
+            options=node.options,
+        )
+        for node in state.nodes
+        if node.node_type == "transform"
+    )
+    return tuple(components)
 
 
 def _blob_inline_component_id(field_path: str) -> str | None:
@@ -255,35 +305,34 @@ def validate_llm_retry_budget_policy(materialized: MaterializedYaml) -> PhaseRep
 
 def validate_llm_base_url_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
     """Reject web-authored OpenRouter base URL overrides."""
-    for node in materialized.authored.policy.state.nodes:
-        if node.node_type != "transform":
-            continue
-        policy_error = web_llm_base_url_policy_error(node.plugin, node.options)
+    for component in _llm_policy_components(materialized.authored.policy.state):
+        policy_error = web_llm_base_url_policy_error(component.plugin, component.options)
         if policy_error is None:
             continue
+        policy_message = policy_error if component.component_type == "transform" else policy_error.replace("LLM nodes", "LLM sources")
         return PhaseFailure(
             passed_checks=(),
             failed_check=ValidationCheck(
                 name=CHECK_LLM_BASE_URL_POLICY,
                 passed=False,
-                detail=f"Transform '{node.id}' overrides OpenRouter base_url in a web-authored pipeline",
-                affected_nodes=(node.id,),
+                detail=f"{component.label} '{component.component_id}' overrides OpenRouter base_url in a web-authored pipeline",
+                affected_nodes=(component.component_id,),
                 outcome_code=None,
             ),
             errors=(
                 ValidationError(
-                    component_id=node.id,
-                    component_type="transform",
-                    message=policy_error,
+                    component_id=component.component_id,
+                    component_type=component.component_type,
+                    message=policy_message,
                     suggestion="Remove the base_url option to use the canonical OpenRouter endpoint.",
                     error_code="llm_base_url_not_allowed",
                 ),
             ),
             readiness=_blocked_readiness(
                 code=CHECK_LLM_BASE_URL_POLICY,
-                detail=f"transform {node.id} overrides OpenRouter base_url in a web-authored pipeline",
-                component_id=node.id,
-                component_type="transform",
+                detail=f"{component.component_type} {component.component_id} overrides OpenRouter base_url in a web-authored pipeline",
+                component_id=component.component_id,
+                component_type=component.component_type,
             ),
             semantic_contracts=materialized.authored.semantic_contracts,
         )
@@ -303,35 +352,34 @@ def validate_llm_base_url_policy(materialized: MaterializedYaml) -> PhaseReport[
 
 def validate_llm_tracing_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
     """Reject author-controlled LLM tracing configuration."""
-    for node in materialized.authored.policy.state.nodes:
-        if node.node_type != "transform":
-            continue
-        policy_error = web_llm_tracing_policy_error(node.plugin, node.options)
+    for component in _llm_policy_components(materialized.authored.policy.state):
+        policy_error = web_llm_tracing_policy_error(component.plugin, component.options)
         if policy_error is None:
             continue
+        policy_message = policy_error if component.component_type == "transform" else policy_error.replace("LLM nodes", "LLM sources")
         return PhaseFailure(
             passed_checks=(),
             failed_check=ValidationCheck(
                 name=CHECK_LLM_TRACING_POLICY,
                 passed=False,
-                detail=f"Transform '{node.id}' configures tracing in a web-authored pipeline",
-                affected_nodes=(node.id,),
+                detail=f"{component.label} '{component.component_id}' configures tracing in a web-authored pipeline",
+                affected_nodes=(component.component_id,),
                 outcome_code=None,
             ),
             errors=(
                 ValidationError(
-                    component_id=node.id,
-                    component_type="transform",
-                    message=policy_error,
+                    component_id=component.component_id,
+                    component_type=component.component_type,
+                    message=policy_message,
                     suggestion="Remove tracing; tracing destinations and credentials are operator-controlled.",
                     error_code="llm_tracing_not_allowed",
                 ),
             ),
             readiness=_blocked_readiness(
                 code=CHECK_LLM_TRACING_POLICY,
-                detail=f"transform {node.id} configures tracing in a web-authored pipeline",
-                component_id=node.id,
-                component_type="transform",
+                detail=f"{component.component_type} {component.component_id} configures tracing in a web-authored pipeline",
+                component_id=component.component_id,
+                component_type=component.component_type,
             ),
             semantic_contracts=materialized.authored.semantic_contracts,
         )

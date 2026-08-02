@@ -16,10 +16,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
+from pydantic import SecretBytes
 
 from elspeth.contracts.value_source import register_value_source_plugin
 from elspeth.engine.orchestrator.preflight import validate_value_source_compliance
@@ -27,6 +28,7 @@ from elspeth.engine.orchestrator.value_source_validation import (
     ValueSourceFinding,
     ValueSourceValidationError,
 )
+from elspeth.plugins.sources.llm import LLMSource
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -75,7 +77,7 @@ class TestWalkerL2Direct:
         # A WiredTransform whose plugin has no `config` attribute and no
         # VALUE_SOURCES is silently skipped.
         wired = _FakeWiredTransform(plugin=_PluginWithoutValueSources(), settings=SimpleNamespace(name="settings_obj"))
-        validate_value_source_compliance([wired])
+        validate_value_source_compliance(cast(Any, [wired]))
 
     def test_catalog_membership_pass(self) -> None:
         _plugin, wired = _build_wired_with_config(
@@ -263,6 +265,82 @@ class TestWalkerL2Direct:
         assert "wrong-deploy" in finding.reason
         assert "right-deploy" in finding.reason
 
+    def test_source_catalog_failure_uses_source_identity_and_component_type(self) -> None:
+        plugin = LLMSource(
+            {
+                "provider": "openrouter",
+                "model": "unknown/model",
+                "api_key": "resolved-secret",
+                "prompt_template": "Write one audit briefing.",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            }
+        )
+
+        with (
+            patch(
+                "elspeth.engine.orchestrator.preflight.get_catalog_values",
+                return_value=frozenset({"openai/gpt-5-mini"}),
+            ),
+            pytest.raises(ValueSourceValidationError) as exc_info,
+        ):
+            validate_value_source_compliance([], sources={"generated_brief": plugin})
+
+        finding = exc_info.value.findings[0]
+        assert finding.component_id == "source:generated_brief"
+        assert finding.component_type == "source"
+        assert finding.field_name == "model"
+
+    def test_conventional_source_name_uses_unqualified_source_identity(self) -> None:
+        plugin = LLMSource(
+            {
+                "provider": "azure",
+                "model": "wrong",
+                "deployment_name": "right",
+                "endpoint": "https://example.openai.azure.com",
+                "api_key": "resolved-secret",
+                "prompt_template": "Write one audit briefing.",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            }
+        )
+
+        with pytest.raises(ValueSourceValidationError) as exc_info:
+            validate_value_source_compliance([], sources={"source": plugin})
+
+        finding = exc_info.value.findings[0]
+        assert finding.component_id == "source"
+        assert finding.component_type == "source"
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {
+                "provider": "bedrock",
+                "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+                "prompt_template": "Write one audit briefing.",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            },
+            {
+                "provider": "gateway",
+                "model": "standard",
+                "endpoint": "https://gateway.example.com/v1",
+                "api_key": "resolved-secret",
+                "prompt_template": "Write one audit briefing.",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            },
+        ],
+    )
+    def test_source_without_declared_value_sources_does_not_fabricate_checks(self, config: dict[str, object]) -> None:
+        plugin = LLMSource(config)
+
+        with patch("elspeth.engine.orchestrator.preflight.get_catalog_values") as catalog_values:
+            validate_value_source_compliance([], sources={"source": plugin})
+
+        catalog_values.assert_not_called()
+
 
 class TestWalkerInValidatePipeline:
     """End-to-end through ``validate_pipeline_for_trained_operator`` — the composer entry path.
@@ -350,6 +428,37 @@ class TestWalkerInValidatePipeline:
         check_by_name = {c.name: c for c in result.checks}
         assert check_by_name[_CHECK_PLUGINS].passed is True
         assert check_by_name[_CHECK_VALUE_SOURCE_COMPLIANCE].passed is True
+
+    def test_source_value_source_failure_keeps_source_attribution(self) -> None:
+        yaml_gen = _StaticYamlGenerator()
+        finding = ValueSourceFinding(
+            component_id="source:generated_brief",
+            component_type="source",
+            field_name="model",
+            reason="value 'unknown/model' is not in catalog 'openrouter'",
+        )
+        injected_error = ValueSourceValidationError(
+            f"1 field(s) violated value-source declarations: {finding.format()}",
+            findings=(finding,),
+        )
+
+        def raise_value_source_error(_settings: object, *, plugin_snapshot: PluginAvailabilitySnapshot) -> None:
+            raise injected_error
+
+        with (
+            patch("elspeth.web.execution.validation.load_settings_from_yaml_string", new=_load_settings_from_yaml_string),
+            patch("elspeth.web.execution.validation.instantiate_runtime_plugins", new=raise_value_source_error),
+        ):
+            result = validate_pipeline_for_trained_operator(
+                _make_state(),
+                _make_settings(),
+                yaml_gen,
+                plugin_snapshot=_value_source_test_snapshot(),
+            )
+
+        source_errors = [error for error in result.errors if error.component_id == "source:generated_brief"]
+        assert len(source_errors) == 1
+        assert source_errors[0].component_type == "source"
 
 
 # ── test fixtures ────────────────────────────────────────────────────
@@ -590,5 +699,5 @@ def _make_settings() -> WebSettings:
         composer_max_discovery_turns=5,
         composer_timeout_seconds=30.0,
         composer_rate_limit_per_minute=60,
-        shareable_link_signing_key=b"\x00" * 32,
+        shareable_link_signing_key=SecretBytes(b"\x00" * 32),
     )

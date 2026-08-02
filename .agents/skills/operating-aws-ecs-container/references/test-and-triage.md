@@ -36,7 +36,7 @@ They complement, but do not replace, in-task role checks.
 : "${ELSPETH_TEST_S3_BUCKET:?set a disposable acceptance bucket}"
 AWS_PROFILE="$AWS_PROFILE" AWS_REGION="$AWS_REGION" \
 ELSPETH_TEST_S3_BUCKET="$ELSPETH_TEST_S3_BUCKET" \
-uv run --frozen pytest -q -m 'slow or integration' \
+.venv/bin/pytest -q -m 'slow or integration' \
   tests/integration/plugins/sources/test_aws_s3_source_live.py \
   tests/integration/plugins/sinks/test_aws_s3_sink_live.py
 ```
@@ -50,7 +50,7 @@ The tests create UUID-scoped keys and delete them in `finally` blocks.
 AWS_PROFILE="$AWS_PROFILE" AWS_REGION="$AWS_REGION" \
 ELSPETH_RUN_BEDROCK_LIVE=1 \
 ELSPETH_BEDROCK_LIVE_TEST_MODEL="$ELSPETH_BEDROCK_LIVE_TEST_MODEL" \
-uv run --frozen pytest -q -m 'slow and integration' \
+.venv/bin/pytest -q -m 'slow and integration' \
   tests/integration/web/composer/test_bedrock_live_smoke.py
 ```
 
@@ -65,7 +65,7 @@ safe/blocked cases, and expected immutable versions:
 ```bash
 ELSPETH_RUN_LIVE_BEDROCK_GUARDRAILS=1 \
 AWS_PROFILE="$AWS_PROFILE" AWS_REGION="$AWS_REGION" \
-uv run --frozen pytest -q -m live_aws \
+.venv/bin/pytest -q -m live_aws \
   tests/integration/plugins/transforms/aws/test_bedrock_guardrails_live.py
 ```
 
@@ -101,8 +101,10 @@ Checks:
 - run the local container import/SPA smoke; and
 - inspect the image revision label and `Os/Architecture`.
 
-If `psycopg` is missing locally, sync the worktree with all extras. If it is
-missing in the image, the build extras or lockfile are wrong.
+If `psycopg` is missing locally, do not repair the worktree's symlinked shared
+environment. Stop and have the environment repaired from its owning main
+checkout, or use a genuinely separate environment. If it is missing in the
+image, the build extras or lockfile are wrong.
 
 ### 3. Image pull
 

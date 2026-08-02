@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from elspeth_lints.core.allowlist import Allowlist, PerFileRule
+from elspeth_lints.core.ast_walker import PythonFileReadError, PythonSyntaxError, parse_python_file
 
 if TYPE_CHECKING:
     from elspeth_lints.rules.trust_tier.tier_model.rotate import AmbiguousGroup, RotationPlan
@@ -73,6 +74,7 @@ def scan_single_file_findings(*, target_file: Path, root: Path) -> list[Any]:
         scan_layer_imports_file,
     )
 
+    _require_scannable_python_file(target_file=target_file, root=root)
     findings: list[Any] = list(scan_file(target_file, root))
     layer_violations, layer_tc = scan_layer_imports_file(target_file, root)
     findings.extend(layer_violations)
@@ -154,6 +156,45 @@ def census_tree_targets(
         ),
         findings=findings,
         uncovered_findings=tuple(uncovered),
+    )
+
+
+def diagnosis_deferred_prefixes(diagnosis_items: tuple[Any, ...]) -> frozenset[str]:
+    """Return identity groups reserved for an outstanding diagnosis action.
+
+    Exact allowlist matching remains fingerprint-specific. This separate
+    routing set prevents a drift repair or stale-delete cycle from also
+    creating a fresh judgment for the same identity in one bundle.
+    """
+    from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
+
+    deferred: set[str] = set()
+    for item in diagnosis_items:
+        if not item.requires_action:
+            continue
+        try:
+            deferred.add(identity_prefix(item.key))
+        except ValueError:
+            continue
+    return frozenset(deferred)
+
+
+def routable_new_judgment_findings(
+    *,
+    uncovered_findings: tuple[Any, ...],
+    diagnosis_items: tuple[Any, ...],
+    rotation_plan: RotationPlan,
+) -> tuple[Any, ...]:
+    """Select uncovered findings not reserved for another authority lane."""
+    from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
+
+    deferred_prefixes = diagnosis_deferred_prefixes(diagnosis_items)
+    rotation_keys = {rotation.new_key for rotation in rotation_plan.rotations}
+    return tuple(
+        finding
+        for finding in uncovered_findings
+        if _finding_canonical_key(finding) not in rotation_keys
+        and identity_prefix(_finding_canonical_key(finding)) not in deferred_prefixes
     )
 
 
@@ -255,3 +296,16 @@ def _finding_canonical_key(finding: Any) -> str:
     if not isinstance(key, str):
         raise ValueError(f"finding.canonical_key must be str; got {type(key).__name__}")
     return key
+
+
+def _require_scannable_python_file(*, target_file: Path, root: Path) -> None:
+    """Fail closed when an authority-bearing scan cannot parse one target."""
+    parsed = parse_python_file(target_file)
+    try:
+        display_path = target_file.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        display_path = str(target_file)
+    if isinstance(parsed, PythonSyntaxError):
+        raise ValueError(f"tier-model scan failed for {display_path}: syntax error at {parsed.line}:{parsed.column}: {parsed.message}")
+    if isinstance(parsed, PythonFileReadError):
+        raise ValueError(f"tier-model scan failed for {display_path}: read error ({parsed.error_type}): {parsed.message}")

@@ -100,6 +100,7 @@ export OPENROUTER_API_KEY="your-key-from-openrouter.ai"
 
 | Example | What It Demonstrates |
 |---------|---------------------|
+| [`llm_source`](llm_source/) | One authored prompt becomes one generated row through the source-native `llm` plugin |
 | [`openrouter_sentiment`](openrouter_sentiment/) | Single-query sentiment analysis (sequential and pooled modes) |
 | [`openrouter_multi_query_assessment`](openrouter_multi_query_assessment/) | Multi-query matrix (case studies x criteria) with stress/overflow variants |
 | [`schema_contracts_llm_assessment`](schema_contracts_llm_assessment/) | LLM pipeline with DAG-time schema contract validation |
@@ -173,6 +174,7 @@ A fresh checkout has no such artifacts and needs no reset.
 | **Statistical batch QA** | [`statistical_batch_plugins`](statistical_batch_plugins/) — prompt/model score comparisons, classifier metrics, drift, outlier annotation, data quality, top-k, thresholds, and effect sizes |
 | **Deaggregation (1 to N)** | [`deaggregation`](deaggregation/), [`json_explode`](json_explode/), or [`blob_transforms`](blob_transforms/) |
 | **Type normalization and derived fields** | [`transform_pipeline`](transform_pipeline/) — coerce CSV strings to typed values, then compute dependent fields |
+| **LLM as a source (no input rows)** | [`llm_source`](llm_source/) — one static authored prompt produces one generated row |
 | **LLM integration (quick start)** | [`openrouter_sentiment`](openrouter_sentiment/) — simplest real LLM pipeline |
 | **LLM without API keys** | [`chaosllm_sentiment`](chaosllm_sentiment/) — same pipeline, local ChaosLLM server |
 | **Multi-query LLM matrices** | [`openrouter_multi_query_assessment`](openrouter_multi_query_assessment/) — case studies x criteria |

@@ -7,6 +7,9 @@ from dataclasses import replace
 import pytest
 
 from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,
@@ -20,6 +23,19 @@ from elspeth.web.plugin_policy.coverage import (
     build_output_stream_graph,
     control_coverage_findings,
 )
+
+
+@pytest.fixture
+def llm_source_policy_manager(monkeypatch: pytest.MonkeyPatch) -> PluginManager:
+    """Give coverage an isolated registry with the canonical LLM source."""
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    assert manager.get_source_by_name("llm") is LLMSource
+    monkeypatch.setattr(
+        "elspeth.web.plugin_policy.coverage.get_shared_plugin_manager",
+        lambda: manager,
+    )
+    return manager
 
 
 def _node(
@@ -73,6 +89,44 @@ def _state(*nodes: NodeSpec, source_target: str = "llm_in", sinks: tuple[str, ..
             options={"path": "rows.csv", "schema": {"mode": "observed"}},
             on_validation_failure="discard",
         ),
+        nodes=nodes,
+        edges=(),
+        outputs=tuple(
+            OutputSpec(
+                name=name,
+                plugin="json",
+                options={"path": f"{name}.jsonl", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            )
+            for name in sinks
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def _llm_source_state(
+    *nodes: NodeSpec,
+    source_name: str = "source",
+    on_success: str = "main",
+    on_validation_failure: str = "discard",
+    response_field: str = "llm_response",
+    other_sources: dict[str, SourceSpec] | None = None,
+    sinks: tuple[str, ...] = ("main",),
+) -> CompositionState:
+    sources = dict(other_sources or {})
+    sources[source_name] = SourceSpec(
+        plugin="llm",
+        on_success=on_success,
+        options={
+            "prompt_template": "Write one concise audit briefing.",
+            "lookup": {"audience": "operators"},
+            "response_field": response_field,
+        },
+        on_validation_failure=on_validation_failure,
+    )
+    return CompositionState(
+        sources=sources,
         nodes=nodes,
         edges=(),
         outputs=tuple(
@@ -189,6 +243,25 @@ def _mapper(
 )
 def test_prompt_shield_input_coverage(state: CompositionState, covered: bool) -> None:
     assert (control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()) is covered
+
+
+def test_prompt_shield_coverage_ignores_malformed_source_success_stream_without_raising() -> None:
+    state = _state(_llm())
+    state = replace(
+        state,
+        sources={
+            "source": replace(
+                state.sources["source"],
+                on_success=[],  # type: ignore[arg-type]
+            )
+        },
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("judge", "transform"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -657,6 +730,310 @@ def test_content_safety_output_coverage_requires_llm_field_scope(
     assert (control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()) is covered
 
 
+def test_llm_source_content_safety_finding_has_stable_component_identity(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state()
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type, finding.reason) for finding in findings] == [
+        ("source", "source", "output_not_post_dominated")
+    ]
+
+
+def test_named_llm_source_finding_uses_qualified_component_id(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(source_name="briefing")
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source:briefing", "source"),
+    ]
+
+
+def test_llm_source_capability_uses_nominal_source_registry(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    class SourceOnlyLLM(LLMSource):
+        name = "source_only_llm"
+        determinism = LLMSource.determinism
+
+    llm_source_policy_manager.register(create_dynamic_hookimpl([SourceOnlyLLM], "elspeth_get_source"))
+    state = _llm_source_state()
+    state = replace(
+        state,
+        sources={"source": replace(state.sources["source"], plugin="source_only_llm")},
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source", "source"),
+    ]
+
+
+def test_malformed_source_plugin_defers_to_plugin_enablement_without_raising(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state()
+    state = replace(
+        state,
+        sources={"source": replace(state.sources["source"], plugin=[])},  # type: ignore[arg-type]
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
+
+
+def test_llm_source_prompt_is_not_subject_to_prompt_shield(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state()
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+@pytest.mark.parametrize(
+    ("safety_fields", "covered"),
+    [
+        (("briefing",), True),
+        (("llm_response",), False),
+        (("briefing_usage", "briefing_model"), False),
+    ],
+)
+def test_llm_source_content_safety_covers_only_configured_response_field(
+    llm_source_policy_manager: PluginManager,
+    safety_fields: tuple[str, ...],
+    covered: bool,
+) -> None:
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main", fields=safety_fields),
+        on_success="safe_in",
+        response_field="briefing",
+    )
+
+    assert (control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()) is covered
+
+
+def test_llm_source_ignores_transform_only_query_shapes_when_selecting_protected_field(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main", fields=("ignored_briefing",)),
+        on_success="safe_in",
+        response_field="briefing",
+    )
+    source = state.sources["source"]
+    state = replace(
+        state,
+        sources={
+            "source": replace(
+                source,
+                options={
+                    **source.options,
+                    "queries": {"ignored": {"input_fields": {}}},
+                },
+            )
+        },
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+
+def test_llm_source_malformed_options_are_unprovable_and_fail_closed(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    safety = replace(
+        _safety("safety", "safe_in", "main"),
+        options={"detect_only": False, "fields": "all"},
+    )
+    state = _llm_source_state(safety, on_success="safe_in")
+    state = replace(
+        state,
+        sources={"source": replace(state.sources["source"], options=[])},  # type: ignore[arg-type]
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source", "source"),
+    ]
+
+
+def test_llm_source_content_safety_must_post_dominate_every_success_path(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(
+        _node(
+            "fanout",
+            None,
+            "generated",
+            None,
+            node_type="gate",
+            routes={"all": "fork"},
+            fork_to=("safe_in", "unsafe_in"),
+        ),
+        _safety("safety", "safe_in", "safe"),
+        _node("unsafe", "passthrough", "unsafe_in", "unsafe"),
+        on_success="generated",
+        sinks=("safe", "unsafe"),
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source", "source"),
+    ]
+
+
+@pytest.mark.parametrize("invalid_stream", [[], None, 7])
+def test_llm_source_malformed_success_stream_fails_closed_without_raising(
+    llm_source_policy_manager: PluginManager,
+    invalid_stream: object,
+) -> None:
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main"),
+        on_success="safe_in",
+    )
+    state = replace(
+        state,
+        sources={
+            "source": replace(
+                state.sources["source"],
+                on_success=invalid_stream,  # type: ignore[arg-type]
+            )
+        },
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source", "source"),
+    ]
+
+
+def test_llm_source_non_exact_success_stream_fails_closed(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    class StreamAlias(str):
+        pass
+
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main"),
+        on_success=StreamAlias("safe_in"),
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+
+def test_llm_source_direct_sink_success_is_uncovered(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(on_success="main")
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+
+def test_llm_source_validation_failure_sink_is_unrepairable_even_when_success_is_covered(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main"),
+        on_success="safe_in",
+        on_validation_failure="quarantine",
+        sinks=("main", "quarantine"),
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type, finding.reason, finding.uncovered_stream) for finding in findings] == [
+        (
+            "source",
+            "source",
+            "output_validation_failure_route_not_post_dominated",
+            "quarantine",
+        )
+    ]
+
+
+def test_llm_source_validation_failure_discard_is_accepted_when_success_is_covered(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main"),
+        on_success="safe_in",
+        on_validation_failure="discard",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
+
+
+def test_llm_source_validation_failure_requires_exact_discard_literal(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    class DiscardAlias(str):
+        pass
+
+    state = _llm_source_state(
+        _safety("safety", "safe_in", "main"),
+        on_success="safe_in",
+        on_validation_failure=DiscardAlias("discard"),
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("source", "output_validation_failure_route_not_post_dominated"),
+    ]
+
+
+def test_llm_source_and_transform_findings_have_stable_mixed_order(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(
+        _llm(input_stream="rows", on_success="main"),
+        source_name="zeta",
+        on_success="main",
+        other_sources={
+            "rows": SourceSpec("csv", "rows", {}, "discard"),
+            "alpha": SourceSpec(
+                "llm",
+                "main",
+                {"prompt_template": "Alpha", "response_field": "alpha_response"},
+                "discard",
+            ),
+        },
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source:alpha", "source"),
+        ("source:zeta", "source"),
+        ("judge", "transform"),
+    ]
+
+
+def test_malformed_source_name_has_stable_typed_finding_without_sort_failure(
+    llm_source_policy_manager: PluginManager,
+) -> None:
+    state = _llm_source_state(source_name="valid")
+    malformed = state.sources["valid"]
+    sources: dict[object, SourceSpec] = {
+        "rows": SourceSpec("csv", "unused", {}, "discard"),
+        7: malformed,
+    }
+    state = replace(state, sources=sources)  # type: ignore[arg-type]
+
+    findings = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+
+    assert [(finding.component_id, finding.component_type) for finding in findings] == [
+        ("source:<invalid>", "source"),
+    ]
+
+
 def test_content_safety_output_coverage_follows_field_mapper_rename_downstream() -> None:
     state = _state(
         _llm(on_success="mapped_in"),
@@ -1085,6 +1462,45 @@ def test_all_fields_shield_is_credited_when_prompt_fields_are_unprovable() -> No
     assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
 
 
+def test_all_fields_shield_does_not_cover_dynamic_prompt_after_downstream_rewrite() -> None:
+    state = _state(
+        _all_fields_shield("shield", "raw", "rewrite_in"),
+        _value_transform(
+            "rewrite",
+            "rewrite_in",
+            "llm_in",
+            [{"target": "prompt", "expression": "row['untrusted']"}],
+        ),
+        _llm_with_template("Classify: {{ row[lookup.field_name] }}"),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_fields_unprovable"),
+    ]
+    assert findings[0].scanned_fields == ()
+
+
+def test_all_fields_shield_covers_dynamic_prompt_after_downstream_field_mapping() -> None:
+    """A mapper only relocates values already scanned by an all-field shield."""
+    state = _state(
+        _all_fields_shield("shield", "raw", "mapping_in"),
+        _node(
+            "rename",
+            "field_mapper",
+            "mapping_in",
+            "llm_in",
+            options={"mapping": {"untrusted": "prompt"}, "select_only": False},
+        ),
+        _llm_with_template("Classify: {{ row[lookup.field_name] }}"),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
 def test_unprovable_prompt_fields_are_a_distinct_diagnosis_naming_both_field_sets() -> None:
     """A field-scoped shield still fails closed — but says why, not "not covered".
 
@@ -1114,14 +1530,124 @@ def test_unprovable_prompt_fields_are_a_distinct_diagnosis_naming_both_field_set
     assert findings[0].scanned_fields == ("prompt",)
 
 
-def test_missing_shield_keeps_the_domination_diagnosis_when_prompt_fields_are_unprovable() -> None:
-    """No upstream control at all is a topology failure, not a scope failure."""
+def test_missing_shield_preserves_the_unprovable_prompt_field_diagnosis() -> None:
+    """Unprovable scope must block unsafe field-scoped auto-wiring."""
     state = _state(_llm_with_template("Classify: {{ row[lookup.field_name] }}"))
 
     findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
 
     assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_fields_unprovable"),
+    ]
+
+
+def _multi_query_llm(
+    *,
+    prompt_template: str,
+    queries: dict[str, object],
+    input_stream: str = "llm_in",
+    on_success: str = "main",
+) -> NodeSpec:
+    """A multi-query LLM whose shared template may be dead (all queries override)."""
+    return _node(
+        "judge",
+        "llm",
+        input_stream,
+        on_success,
+        options={
+            "prompt_template": prompt_template,
+            "required_input_fields": [],
+            "response_field": "llm_response",
+            "queries": queries,
+        },
+    )
+
+
+def test_dead_shared_template_does_not_poison_prompt_field_provability() -> None:
+    """A node template every query overrides never renders, so it must not decide provability.
+
+    ``queries.*.template`` is a per-query override (``None`` = fall back to the
+    node-level ``prompt_template`` — multi_query.py), and config validation
+    deliberately skips a shared template no query falls back to
+    (``LLMConfig._validate_template_variable_bindings``). Coverage must apply
+    the same liveness rule: with every override static, the protected set is
+    provably {prompt} and a shield scanning exactly that field is credited.
+    """
+    state = _state(
+        _shield("shield", "raw", "llm_in", fields=("prompt",)),
+        _multi_query_llm(
+            prompt_template="Classify: {{ row[lookup.field_name] }}",
+            queries={"q.a": {"input_fields": {"prompt": "prompt"}, "template": "Classify: {{ row.prompt }}"}},
+        ),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+def test_dead_shared_template_missing_shield_is_an_auto_wirable_topology_failure() -> None:
+    """With the dead template ignored, a missing shield is the wirable diagnosis.
+
+    Required-control auto-wiring acts only on ``input_not_dominated``
+    (required_controls._AUTO_WIRE_ACTIONABLE_REASONS); reporting the dead
+    template's dynamic access as ``input_fields_unprovable`` left the required
+    shield unwired and failed the gate later.
+    """
+    state = _state(
+        _multi_query_llm(
+            prompt_template="Classify: {{ row[lookup.field_name] }}",
+            queries={"q.a": {"input_fields": {"prompt": "prompt"}, "template": "Classify: {{ row.prompt }}"}},
+        )
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
         ("judge", "input_not_dominated"),
+    ]
+    assert findings[0].protected_fields == ("prompt",)
+
+
+def test_query_fallback_keeps_node_template_in_provability() -> None:
+    """A query WITHOUT an override still pulls the shared template into the set."""
+    llm = _multi_query_llm(
+        prompt_template="{{ row.shared_context }}",
+        queries={
+            "q.a": {"input_fields": {"prompt": "prompt"}},
+            "q.b": {"input_fields": {"prompt": "prompt"}, "template": "Classify: {{ row.prompt }}"},
+        },
+    )
+
+    partial = _state(_shield("shield", "raw", "llm_in", fields=("prompt",)), llm, source_target="raw")
+    findings = control_coverage_findings(partial, PluginCapability.PROMPT_SHIELD)
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_not_dominated"),
+    ]
+    assert findings[0].protected_fields == ("prompt", "shared_context")
+
+    covered = _state(
+        _shield("shield", "raw", "llm_in", fields=("prompt", "shared_context")),
+        llm,
+        source_target="raw",
+    )
+    assert control_coverage_findings(covered, PluginCapability.PROMPT_SHIELD) == ()
+
+
+def test_dynamic_shared_template_with_a_falling_back_query_stays_unprovable() -> None:
+    """Liveness is per-query: one fallback keeps the dynamic template authoritative."""
+    state = _state(
+        _shield("shield", "raw", "llm_in", fields=("prompt",)),
+        _multi_query_llm(
+            prompt_template="Classify: {{ row[lookup.field_name] }}",
+            queries={"q.a": {"input_fields": {"prompt": "prompt"}}},
+        ),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_fields_unprovable"),
     ]
 
 
@@ -1152,14 +1678,13 @@ def test_all_fields_control_is_credited_for_output_coverage_too() -> None:
     assert control_coverage_findings(state, PluginCapability.CONTENT_SAFETY) == ()
 
 
-def test_external_call_below_the_shield_is_not_reported_as_a_scope_failure() -> None:
-    """The scope diagnosis must not claim a broken topology is already right.
+def test_external_call_below_the_shield_preserves_unprovable_field_diagnosis() -> None:
+    """Unprovable scope remains authoritative over the topology diagnosis.
 
     A ``web_scrape`` between the shield and the LLM reintroduces unscanned
-    content, so no shield scope — not even ``all`` — can cover this node. The
-    diagnosis must stay ``input_not_dominated``: telling the author "the wiring
-    is already right, widen the control's fields" would send them round a
-    repair that cannot land.
+    content, so no upstream shield scope can cover this node. The diagnostic
+    renderer uses the empty scanned-field set to avoid claiming the wiring is
+    correct, while the unprovable reason prevents unsafe partial auto-wiring.
     """
     state = _state(
         _shield("shield", "raw", "fetch_in"),
@@ -1171,7 +1696,7 @@ def test_external_call_below_the_shield_is_not_reported_as_a_scope_failure() -> 
     findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
 
     assert [(finding.component_id, finding.reason) for finding in findings] == [
-        ("judge", "input_not_dominated"),
+        ("judge", "input_fields_unprovable"),
     ]
     # No field sets are asserted for a topology failure — naming a control
     # that does not dominate would be a second false statement.

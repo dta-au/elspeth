@@ -522,6 +522,9 @@ def test_static_analysis_ratchets_permanent_multi_rule_blankets_repo_wide_on_prs
     assert env.get("GH_TOKEN") == "${{ github.event_name != 'pull_request' && github.token || '' }}"
     assert env.get("CURRENT_RUN_ID") == "${{ github.run_id }}"
 
+    checkout = _step(static_analysis, "Checkout code")
+    assert checkout["with"]["fetch-depth"] == 0
+
     run = _step_run(static_analysis, step_name)
     assert 'BASELINE_REF="$PR_BASELINE_REF"' in run, "PRs must preserve the event's exact base SHA"
     assert "github.event.before" not in str(step), "a cancelled push predecessor is not policy authority"

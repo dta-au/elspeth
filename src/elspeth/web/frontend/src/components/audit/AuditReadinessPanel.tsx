@@ -89,8 +89,9 @@ function isActionable(status: ReadinessStatus): boolean {
  *
  *   | Backend status   | Frontend summary text                                     |
  *   |------------------|-----------------------------------------------------------|
- *   | `not_applicable` | (row hidden) OR "not yet surfaced" when LLM transform     |
- *   |                  | exists but no events yet (frontend-derived F-14 state)    |
+ *   | `not_applicable` | (row hidden), the backend source-only narrative, OR       |
+ *   |                  | "not yet surfaced" when an LLM transform exists but no   |
+ *   |                  | events yet (frontend-derived F-14 state)                  |
  *   | `warning`        | "{P} pending review ({R} resolved)"                       |
  *   | `ok`             | "all {N} resolved"                                        |
  *
@@ -108,8 +109,8 @@ function isActionable(status: ReadinessStatus): boolean {
  * CLOSED switch over `ReadinessStatus`; the `never` arm prevents silent
  * fallthrough if a future backend extension adds a new status value.
  *
- * @returns null when the row should be HIDDEN (not_applicable with no
- *   LLM-context to surface). The caller must skip rendering the row
+ * @returns null when the row should be HIDDEN (not_applicable with no LLM
+ *   transform or source to surface). The caller must skip rendering the row
  *   entirely on null.
  */
 interface LlmInterpretationsRenderInputs {
@@ -118,6 +119,8 @@ interface LlmInterpretationsRenderInputs {
   resolvedCount: number;
   optedOut: boolean;
   hasLlmTransform: boolean;
+  hasLlmSource: boolean;
+  backendSummaryText: string;
 }
 
 interface LlmInterpretationsRenderOutput {
@@ -132,8 +135,15 @@ interface LlmInterpretationsRenderOutput {
 function formatLlmInterpretationsRow(
   inputs: LlmInterpretationsRenderInputs,
 ): LlmInterpretationsRenderOutput | null {
-  const { status, pendingCount, resolvedCount, optedOut, hasLlmTransform } =
-    inputs;
+  const {
+    status,
+    pendingCount,
+    resolvedCount,
+    optedOut,
+    hasLlmTransform,
+    hasLlmSource,
+    backendSummaryText,
+  } = inputs;
   const total = pendingCount + resolvedCount;
 
   // Opt-out override is unconditional — it suppresses the status mapping
@@ -148,6 +158,20 @@ function formatLlmInterpretationsRow(
       summaryText: `Opted out for this session (${total} drafted, not reviewed)`,
       glyph: "◎", // ◎ — neutral "circled dot" per spec table row
       ariaStatusLabel: "Opted out",
+    };
+  }
+
+  // A source-native LLM issues an authored prompt without consuming rows, so
+  // it has no interpretation-event lifecycle. Keep the backend's narrative
+  // authoritative: unlike transform event counts, there is nothing for the
+  // frontend to derive or re-word here. Source options are deliberately never
+  // inspected by this presentation path. The unconditional session opt-out
+  // override above remains authoritative when both contexts are present.
+  if (status === "not_applicable" && hasLlmSource && !hasLlmTransform) {
+    return {
+      summaryText: backendSummaryText,
+      glyph: "—",
+      ariaStatusLabel: "Not applicable",
     };
   }
 
@@ -177,8 +201,8 @@ function formatLlmInterpretationsRow(
           ariaStatusLabel: "Not yet surfaced",
         };
       }
-      // No LLM transform AND no events: hide the row entirely (return
-      // null). The caller skips rendering.
+      // No LLM transform or source AND no events: hide the row entirely
+      // (return null). The caller skips rendering.
       return null;
     case "error":
       // The backend never emits `error` for this row today. Render with a
@@ -204,6 +228,12 @@ function compositionHasLlmTransform(state: CompositionState | null): boolean {
   return state.nodes.some(
     (n) => n.node_type === "transform" && n.plugin === "llm",
   );
+}
+
+/** True when the composition contains at least one source-native `llm`. */
+function compositionHasLlmSource(state: CompositionState | null): boolean {
+  if (state === null) return false;
+  return Object.values(state.sources).some((source) => source.plugin === "llm");
 }
 
 function validationResultFromSnapshot(snapshot: AuditReadinessSnapshot): ValidationResult {
@@ -519,10 +549,10 @@ export function AuditReadinessPanel() {
             // frontend-stylised renderer driven by interpretationEventsStore
             // counts (pending / resolved) and the opt-out flag. The
             // formatter returns null when the row should be HIDDEN (no LLM
-            // transform + no events); we skip rendering entirely in that
-            // case so the row is removed from the list (parallel to the
-            // backend's "not_applicable" semantics but with the
-            // frontend-derived F-14 "not yet surfaced" override layered on).
+            // transform or source + no events); we skip rendering entirely in
+            // that case so the row is removed from the list (parallel to the
+            // backend's "not_applicable" semantics but with source parity and
+            // the frontend-derived F-14 "not yet surfaced" override layered on).
             if (row.id === "llm_interpretations") {
               const pendingCount = activeSessionId
                 ? Object.keys(
@@ -544,10 +574,12 @@ export function AuditReadinessPanel() {
                 resolvedCount,
                 optedOut,
                 hasLlmTransform: compositionHasLlmTransform(compositionState),
+                hasLlmSource: compositionHasLlmSource(compositionState),
+                backendSummaryText: row.summary,
               });
               if (formatted === null) {
-                // Row hidden — no LLM transform AND no events AND not
-                // opted out. Skip rendering so the row does not appear.
+                // Row hidden — no LLM transform or source AND no events AND
+                // not opted out. Skip rendering so the row does not appear.
                 return null;
               }
               const heading = row.label || rowHeading(row.id);

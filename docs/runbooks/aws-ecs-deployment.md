@@ -275,6 +275,9 @@ export ELSPETH_AWS_CALL_CEILING_SECONDS=60
 export ELSPETH_AWS_WAITER_CEILING_SECONDS=900
 export ELSPETH_AWS_EXEC_CEILING_SECONDS=420
 export ELSPETH_ORPHAN_SWEEP_CEILING_SECONDS=900
+export ELSPETH_CONTAINER_INSIGHTS_MAX_WAIT_SECONDS=1200
+export ELSPETH_CONTAINER_INSIGHTS_POLL_INTERVAL_SECONDS=10
+export ELSPETH_CONTAINER_INSIGHTS_QUIET_SECONDS=600
 # Aurora create/delete can legitimately consume the provider's two-hour
 # timeout. This outer ceiling adds ten minutes for provider bookkeeping.
 export ELSPETH_TERRAFORM_CALL_CEILING_SECONDS=7800
@@ -1507,9 +1510,9 @@ countersigns it. Set `SCENARIO_A_COMPATIBILITY_RECORD_FILE` and
   "rollback_doctor_task_definition": "exact-rollback-doctor-task-definition-arn",
   "previous_package_version": "0.7.1",
   "schema_facts": {
-    "candidate": {"session_epoch": 42, "landscape_epoch": 30, "run_web_plugin_policy_present": true},
+    "candidate": {"session_epoch": 43, "landscape_epoch": 30, "run_web_plugin_policy_present": true},
     "previous": {"session_epoch": 35, "landscape_epoch": 29, "run_web_plugin_policy_present": true},
-    "structural_changes": "session_epoch_35_to_42_landscape_epoch_29_to_30_blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema",
+    "structural_changes": "session_epoch_35_to_43_landscape_epoch_29_to_30_blob_cleanup_guided_decline_row_union_barrier_failed_guided_output_replay_and_coordination_schema",
     "semantics_only_changes": "guided_coalesce_timeout_seconds_and_node_options_summary_required",
     "archive_export_decision": "required_before_forward_migration",
     "destructive_reset_required": false
@@ -1535,12 +1538,12 @@ Scenario A uses the same field set with `scenario_id: "A"`; empty strings for
 
 The controller binds the record to the manifest, image digest, exact task
 and doctor definitions, candidate and previous package/image identities,
-session epoch 42, Landscape epoch 30 and `run_web_plugin_policy` presence,
+session epoch 43, Landscape epoch 30 and `run_web_plugin_policy` presence,
 change/reset facts, decision, two distinct approvals, and expiry. It
 stores only a sanitized receipt and document hash. Reopen and revalidate the
 raw record before init-capable doctor, ordinary doctor, candidate deploy, and
 any later deployment action. The 0.7.1 image understands session epoch 35,
-not epoch 42. Pre-1.0 candidates do not migrate predecessor schemas: the old
+not epoch 43. Pre-1.0 candidates do not migrate predecessor schemas: the old
 deployment is stopped and uninstalled, required evidence is archived/exported,
 and the databases are recreated before the candidate is installed. The previous
 image cannot reopen the recreated current database, so Scenario B rollback is
@@ -3233,7 +3236,7 @@ fi
 
 The compatibility receipt plus `candidate-after-rollback-refusal` evidence is
 the refusal/forward-recovery record. If the candidate is unhealthy, keep traffic
-drained and repair forward with epoch-42 session/epoch-30 Landscape code.
+drained and repair forward with epoch-43 session/epoch-30 Landscape code.
 Predecessor database restoration and code downgrade are not supported repair
 paths. Never roll old code over the recreated schema.
 
@@ -3357,9 +3360,11 @@ case "$SCENARIO_B_COGNITO_POOL_OWNED" in true|false) ;; *) exit 1 ;; esac
 # cannot see it. `cleanup_container_insights_log_group` below (called from
 # the disposable-cleanup sequence, after both scenario destroys and the
 # ECR/identity/bootstrap steps have bought the flush enough wall-clock time)
-# is the corresponding cleanup; a same-namespace redeploy retry that still
-# hits `ResourceAlreadyExistsException` on `CreateLogGroup` should re-run it
-# or set `-var=adopt_container_insights_log_group=true`.
+# is the corresponding cleanup. A same-namespace redeploy retry that still
+# hits `ResourceAlreadyExistsException` on `CreateLogGroup` must generate a
+# replacement plan with `-var=adopt_container_insights_log_group=true`, pass
+# that replacement through the ordinary sanitized review, obtain a new signed
+# approval, and apply only those newly approved plan bytes.
 destroy_scenario() {
   local scenario_id="$1" directory="$2" vars="$3" binding="$4"
   local binding_file="$5" approval_file="$6" surface="$7"
@@ -3572,39 +3577,82 @@ fi
 # performance log group if ECS's service-linked role has already re-created
 # it. That role re-creates the group, untagged, minutes after the cluster
 # goes INACTIVE (a final metrics flush) — outside every Terraform state and
-# invisible to the tagged orphan-sweep below. This follows the same
-# check-then-act idiom as delete_ecr_tag() above: describe first, and treat
-# "not found" as a normal, successful no-op (the flush may not have landed
-# by the time this runs, or a prior cleanup already deleted it) rather than
-# tolerating a delete-time failure. Every AWS call routes through
-# aws_capture, so a real failure — AccessDenied, throttling, a malformed
-# region — surfaces as a genuine, non-swallowed error instead of being
-# caught by a blanket `|| true`. This does not call checkpoint_cleanup (no
+# invisible to the tagged orphan-sweep below. Unlike delete_ecr_tag(),
+# point-in-time absence is not terminal here: the known service-linked-role
+# writer can still run later. Poll for the delayed recreation, delete every
+# exact-name appearance, and require one fully elapsed quiet window whether
+# the group was already absent or was deleted here. A deletion restarts that
+# window. The separate maximum bounds the procedure and fails cleanup if a
+# late recreation leaves too little time to demonstrate quiescence. Every
+# AWS call routes through aws_capture, so a real failure — AccessDenied,
+# throttling, a malformed region — also surfaces as a genuine, non-swallowed
+# error. This does not call checkpoint_cleanup (no
 # new cleanup-manifest surface; `_CLEANUP_SURFACES` in
 # aws_ecs_acceptance/manifest_schema.py is a closed, set-equality-validated
 # enum and adding to it is a separate change), but a real failure still
 # fails the overall cleanup run via cleanup_failures, exactly like
 # ecr_baseline/ecr_candidate above. If a later same-namespace redeploy still
-# hits `ResourceAlreadyExistsException` on `CreateLogGroup` (the flush
-# landed after this step ran), delete it manually or set
-# `-var=adopt_container_insights_log_group=true` on that apply.
+# hits `ResourceAlreadyExistsException` on `CreateLogGroup`, do not reuse the
+# failed saved plan: generate a replacement plan with the adoption variable,
+# sanitize and review it, obtain a new signed approval, and then apply exactly
+# that replacement plan without adding planning options to `terraform apply`.
 cleanup_container_insights_log_group() {
   local inventory="$1"
   if (
     set -Eeuo pipefail
+    max_wait="${ELSPETH_CONTAINER_INSIGHTS_MAX_WAIT_SECONDS:?set Container Insights maximum wait}"
+    poll_interval="${ELSPETH_CONTAINER_INSIGHTS_POLL_INTERVAL_SECONDS:?set Container Insights poll interval}"
+    quiet_seconds="${ELSPETH_CONTAINER_INSIGHTS_QUIET_SECONDS:?set Container Insights quiet duration}"
+    test "$max_wait" -gt 0 || exit 1
+    test "$poll_interval" -gt 0 || exit 1
+    test "$quiet_seconds" -gt 0 || exit 1
+    test "$quiet_seconds" -le "$max_wait" || exit 1
     test -f "$inventory" || exit 0
     cluster=$(jq -er '.values.ECS_CLUSTER // empty' "$inventory") || exit 0
     test -n "$cluster" || exit 0
     log_group="/aws/ecs/containerinsights/${cluster}/performance"
-    listing="$(aws_capture aws logs describe-log-groups --region "$AWS_REGION" \
-      --log-group-name-prefix "$log_group" --output json)"
-    count="$(jq --arg name "$log_group" '[.logGroups[]? | select(.logGroupName == $name)] | length' <<<"$listing")"
-    test "$count" = 0 || test "$count" = 1
-    if test "$count" = 0; then
-      exit 0
-    fi
-    aws_capture aws logs delete-log-group --region "$AWS_REGION" \
-      --log-group-name "$log_group" >/dev/null
+    started_at=$SECONDS
+    quiet_started_at=-1
+    samples=0
+    deletions=0
+    while true; do
+      listing="$(aws_capture aws logs describe-log-groups --region "$AWS_REGION" \
+        --log-group-name-prefix "$log_group" --output json)" || exit $?
+      count="$(jq --arg name "$log_group" '[.logGroups[]? | select(.logGroupName == $name)] | length' <<<"$listing")" \
+        || exit $?
+      test "$count" = 0 || test "$count" = 1 || exit 1
+      samples=$((samples + 1))
+      if test "$count" = 1; then
+        aws_capture aws logs delete-log-group --region "$AWS_REGION" \
+          --log-group-name "$log_group" >/dev/null || exit $?
+        deletions=$((deletions + 1))
+        quiet_started_at=$SECONDS
+      else
+        if test "$quiet_started_at" -lt 0; then
+          quiet_started_at=$SECONDS
+        fi
+        elapsed=$((SECONDS - started_at))
+        quiet_elapsed=$((SECONDS - quiet_started_at))
+        if test "$quiet_elapsed" -ge "$quiet_seconds"; then
+          printf 'container_insights_log_group_stable elapsed_seconds=%s quiet_seconds=%s samples=%s deletions=%s\n' \
+            "$elapsed" "$quiet_elapsed" "$samples" "$deletions"
+          exit 0
+        fi
+      fi
+
+      elapsed=$((SECONDS - started_at))
+      if test "$elapsed" -ge "$max_wait"; then
+        printf 'container_insights_log_group_not_stabilized elapsed_seconds=%s samples=%s deletions=%s\n' \
+          "$elapsed" "$samples" "$deletions" >&2
+        exit 1
+      fi
+      remaining=$((max_wait - elapsed))
+      sleep_seconds=$poll_interval
+      if test "$sleep_seconds" -gt "$remaining"; then
+        sleep_seconds=$remaining
+      fi
+      sleep "$sleep_seconds" || exit $?
+    done
   ); then
     return 0
   else

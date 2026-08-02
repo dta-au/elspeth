@@ -170,6 +170,8 @@ def lower_plugin_policy(
     catalog: CatalogService,
 ) -> PhaseReport[PolicyLoweredState] | PhaseFailure:
     """Run the four plugin-policy stages and return the executable state."""
+    # Deliberately transform-only: rowless LLM sources do not mint row prompt
+    # or model-choice interpretation reviews.
     operator_resolved_model_node_ids = frozenset(
         node.id for node in state.nodes if node.plugin == "llm" and isinstance(node.options.get("profile"), str)
     )

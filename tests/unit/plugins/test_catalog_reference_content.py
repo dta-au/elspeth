@@ -38,6 +38,7 @@ EXPECTED_BUILTIN_IDENTITIES = frozenset(
         "source:csv",
         "source:dataverse",
         "source:json",
+        "source:llm",
         "source:null",
         "source:text",
         "transform:aws_bedrock_content_safety",
@@ -90,6 +91,7 @@ EXPECTED_BUILTIN_IDENTITIES = frozenset(
 DOCUMENTED_HIDDEN_IDENTITIES = frozenset({"source:null"})
 OPERATOR_PROFILED_IDENTITIES = frozenset(
     {
+        "source:llm",
         "transform:llm",
         "transform:aws_bedrock_prompt_shield",
         "transform:aws_bedrock_content_safety",
@@ -116,10 +118,17 @@ def _normalize_reference_text(value: str) -> str:
 
 def _profiled_authored_options(reference: BuiltinReference) -> dict[str, Any]:
     parsed = load_bounded_pipeline_yaml(reference.plugin_cls.example_use)
-    assert set(parsed) == {"transform"}
-    node = cast(Mapping[str, Any], parsed["transform"])
+    if reference.kind == "source":
+        assert set(parsed) == {"sources"}
+        sources = cast(Mapping[str, Any], parsed["sources"])
+        assert len(sources) == 1
+        node = cast(Mapping[str, Any], next(iter(sources.values())))
+    else:
+        assert set(parsed) == {"transform"}
+        node = cast(Mapping[str, Any], parsed["transform"])
     assert node["plugin"] == reference.plugin_cls.name
-    assert set(node) <= {"plugin", "options"}
+    allowed_node_fields = {"plugin", "options", "on_success"} if reference.kind == "source" else {"plugin", "options"}
+    assert set(node) <= allowed_node_fields
     options = cast(Mapping[str, Any], node["options"])
 
     credential_fields = allowed_secret_ref_fields(reference.kind, reference.plugin_cls.name)
@@ -153,12 +162,16 @@ def _operator_profile_registry() -> OperatorProfileRegistry:
                 "transform:aws_bedrock_content_safety",
             ),
             "llm_profiles": {
+                "approved-generation": {
+                    "provider": "bedrock",
+                    "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+                },
                 "approved-structured-generation": {
                     "provider": "openrouter",
                     "model": "openai/gpt-4o",
                     "credential_scope": "server",
                     "credential_ref": "OPENROUTER_API_KEY",
-                }
+                },
             },
             "default_llm_profile": "approved-structured-generation",
             "bedrock_guardrail_profiles": (
@@ -185,9 +198,9 @@ def _operator_profile_registry() -> OperatorProfileRegistry:
 
 
 def test_registry_contains_the_exact_accepted_builtin_inventory() -> None:
-    assert len(REFERENCES) == 47
+    assert len(REFERENCES) == 48
     assert Counter(reference.kind for reference in REFERENCES) == {
-        "source": 7,
+        "source": 8,
         "transform": 32,
         "sink": 8,
     }
@@ -207,13 +220,19 @@ DIRECT_CONFIG_REFERENCES = tuple(reference for reference in REFERENCES if _ident
 def test_operator_profiled_exception_set_is_fixed_and_exhaustive() -> None:
     profiled_examples: set[str] = set()
     for reference in REFERENCES:
-        if reference.kind != "transform":
+        if reference.kind == "sink":
             continue
         parsed = load_bounded_pipeline_yaml(reference.plugin_cls.example_use)
-        assert set(parsed) == {"aggregations" if reference.plugin_cls.is_batch_aware else "transform"}
-        if reference.plugin_cls.is_batch_aware:
-            continue
-        node = cast(Mapping[str, Any], parsed["transform"])
+        if reference.kind == "source":
+            assert set(parsed) == {"sources"}
+            sources = cast(Mapping[str, Any], parsed["sources"])
+            assert len(sources) == 1
+            node = cast(Mapping[str, Any], next(iter(sources.values())))
+        else:
+            assert set(parsed) == {"aggregations" if reference.plugin_cls.is_batch_aware else "transform"}
+            if reference.plugin_cls.is_batch_aware:
+                continue
+            node = cast(Mapping[str, Any], parsed["transform"])
         options = cast(Mapping[str, Any], node.get("options", {}))
         if "profile" in options:
             profiled_examples.add(_identity(reference))

@@ -29,7 +29,7 @@ import threading
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, NoReturn, cast, final
+from typing import TYPE_CHECKING, Literal, NoReturn, cast, final
 
 from elspeth.contracts.errors import SinkEffectCapabilityError
 from elspeth.contracts.hashing import stable_hash
@@ -632,11 +632,15 @@ def assemble_and_validate_pipeline_config(
     return pipeline_config
 
 
-def validate_value_source_compliance(transforms: Sequence[WiredTransform]) -> None:
+def validate_value_source_compliance(
+    transforms: Sequence[WiredTransform],
+    *,
+    sources: Mapping[str, object] | None = None,
+) -> None:
     """Reject pipelines whose plugin configs violate VALUE_SOURCES declarations.
 
-    Walks each transform's typed config (via the plugin's public ``config``
-    accessor when present) and dispatches each
+    Walks each source and transform typed config (via the plugin's registered
+    public config accessor) and dispatches each
     :class:`elspeth.contracts.value_source.ValueSource` declaration:
 
     * :class:`CatalogValueSource` — ``getattr(config, field_name)`` must
@@ -665,42 +669,66 @@ def validate_value_source_compliance(transforms: Sequence[WiredTransform]) -> No
             reader); callers should let it propagate to a 500.
     """
     findings: list[ValueSourceFinding] = []
+    if sources is not None:
+        for source_name, source in sources.items():
+            component_id = "source" if source_name == "source" else f"source:{source_name}"
+            findings.extend(
+                _plugin_value_source_findings(
+                    source,
+                    component_id=component_id,
+                    component_type="source",
+                )
+            )
     for wired in transforms:
-        # The L0 registry returns the typed config for plugins that have
-        # explicitly opted into value-source compliance via
-        # ``register_value_source_plugin``; ``None`` for everything else.
-        # Explicit opt-in instead of duck-typing avoids defensive
-        # getattr/hasattr/isinstance patterns and makes the contract
-        # discoverable at plugin-pack import time.
-        config = find_value_source_config(wired.plugin)
-        if config is None:
-            continue
-        config_cls = type(config)
-        # The discriminated-union declarations live on the config class
-        # as a ``VALUE_SOURCES`` ClassVar. A registered plugin whose
-        # config class has no declarations is a plugin-pack contract
-        # bug — let AttributeError surface rather than silently passing.
-        # mypy narrows ``type(config)`` to ``type[object]`` and cannot
-        # see the ClassVar declared by L3 plugin packs; ``# type: ignore``
-        # documents the intentional contract break.
-        declarations: tuple[ValueSource, ...] = config_cls.VALUE_SOURCES  # type: ignore[attr-defined]
-        if not declarations:
-            continue
         # ``settings.name`` is the operator-facing transform identifier
         # (e.g. ``"openrouter_llm_node_1"``) — pinned into each finding
         # so the composer can attribute errors to a specific component
         # without re-walking the bundle.
-        component_id = wired.settings.name
-        for declaration in declarations:
-            finding = _check_value_source(declaration, config, component_id)
-            if finding is not None:
-                findings.append(finding)
+        findings.extend(
+            _plugin_value_source_findings(
+                wired.plugin,
+                component_id=wired.settings.name,
+                component_type="transform",
+            )
+        )
     if findings:
         message = f"{len(findings)} field(s) violated value-source declarations: " + "; ".join(f.format() for f in findings)
         raise ValueSourceValidationError(message, findings=tuple(findings))
 
 
-def check_config_value_sources(config: object, *, component_id: str) -> tuple[ValueSourceFinding, ...]:
+def _plugin_value_source_findings(
+    plugin: object,
+    *,
+    component_id: str,
+    component_type: Literal["source", "transform"],
+) -> tuple[ValueSourceFinding, ...]:
+    """Return findings for one plugin that explicitly registered a typed config."""
+    config = find_value_source_config(plugin)
+    if config is None:
+        return ()
+    config_cls = type(config)
+    declarations: tuple[ValueSource, ...] = config_cls.VALUE_SOURCES  # type: ignore[attr-defined]
+    return tuple(
+        finding
+        for declaration in declarations
+        if (
+            finding := _check_value_source(
+                declaration,
+                config,
+                component_id,
+                component_type=component_type,
+            )
+        )
+        is not None
+    )
+
+
+def check_config_value_sources(
+    config: object,
+    *,
+    component_id: str,
+    component_type: Literal["source", "transform"] = "transform",
+) -> tuple[ValueSourceFinding, ...]:
     """Run one already-constructed config's ``VALUE_SOURCES`` declarations.
 
     Per-config counterpart to :func:`validate_value_source_compliance` (which
@@ -714,7 +742,15 @@ def check_config_value_sources(config: object, *, component_id: str) -> tuple[Va
     return tuple(
         finding
         for declaration in _declared_value_sources(type(config))
-        if (finding := _check_value_source(declaration, config, component_id)) is not None
+        if (
+            finding := _check_value_source(
+                declaration,
+                config,
+                component_id,
+                component_type=component_type,
+            )
+        )
+        is not None
     )
 
 
@@ -738,6 +774,8 @@ def _check_value_source(
     declaration: ValueSource,
     config: object,
     component_id: str,
+    *,
+    component_type: Literal["source", "transform"],
 ) -> ValueSourceFinding | None:
     """Run a single declaration against ``config``; return None on pass.
 
@@ -749,9 +787,9 @@ def _check_value_source(
     """
     match declaration:
         case CatalogValueSource():
-            return _check_catalog_membership(declaration, config, component_id)
+            return _check_catalog_membership(declaration, config, component_id, component_type=component_type)
         case DerivedFromSiblingValueSource():
-            return _check_derived_from_sibling(declaration, config, component_id)
+            return _check_derived_from_sibling(declaration, config, component_id, component_type=component_type)
         case _:
             raise TypeError(f"Unknown ValueSource variant {type(declaration).__name__} on {component_id!r}: {declaration!r}")
 
@@ -760,6 +798,8 @@ def _check_catalog_membership(
     declaration: CatalogValueSource,
     config: object,
     component_id: str,
+    *,
+    component_type: Literal["source", "transform"],
 ) -> ValueSourceFinding | None:
     # ``applies_when`` predicate: catalog membership is conditional on
     # sibling field values. If any predicate pair doesn't match, the
@@ -787,6 +827,7 @@ def _check_catalog_membership(
             component_id=component_id,
             field_name=declaration.field_name,
             reason=(f"catalog '{declaration.catalog_id}' is empty or unavailable; cannot verify field value ({remediation})"),
+            component_type=component_type,
         )
     # ``value`` is a string for the LLM ``model`` field today; for non-string
     # values we structurally reject (type mismatch is a Pydantic-level fault
@@ -803,6 +844,7 @@ def _check_catalog_membership(
                     f"(catalog has {len(catalog)} entries; pick a valid value via the "
                     "list_models composer tool)"
                 ),
+                component_type=component_type,
             )
 
 
@@ -810,6 +852,8 @@ def _check_derived_from_sibling(
     declaration: DerivedFromSiblingValueSource,
     config: object,
     component_id: str,
+    *,
+    component_type: Literal["source", "transform"],
 ) -> ValueSourceFinding | None:
     field_value = _read_field(config, declaration.field_name)
     sibling_value = _read_field(config, declaration.sibling_field)
@@ -825,6 +869,7 @@ def _check_derived_from_sibling(
             f"'{declaration.sibling_field}' (currently {sibling_value!r})"
             + ("; leave the field empty to inherit the sibling value" if declaration.allow_empty_default else "")
         ),
+        component_type=component_type,
     )
 
 

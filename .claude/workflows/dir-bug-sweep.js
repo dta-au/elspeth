@@ -1,7 +1,7 @@
 // dir-bug-sweep — read-only multi-agent bug sweep of a directory.
 //
 // Invoke (from the main loop, after deciding scope):
-//   Workflow({ name: 'dir-bug-sweep', args: {
+//   Workflow({ scriptPath: '/abs/path/to/.claude/workflows/dir-bug-sweep.js', args: {
 //     path: 'src/elspeth/contracts',     // dir (or file) to sweep — required in practice
 //     tag: '2806bugsweep',               // Filigree label applied to every lodged issue — required
 //     glob: '*.py',                      // optional, default '*.py'
@@ -50,17 +50,59 @@ let A = args
 if (typeof A === 'string') { try { A = JSON.parse(A) } catch (e) { A = {} } }
 if (A == null || typeof A !== 'object') A = {}
 
-const path = A.path || '.'
+function normalizeScoutPath(value) {
+  const raw = String(value).replace(/\\/g, '/')
+  const absolute = raw.startsWith('/')
+  const parts = []
+  for (const part of raw.split('/')) {
+    if (part === '' || part === '.') continue
+    if (part === '..') {
+      if (parts.length && parts[parts.length - 1] !== '..') parts.pop()
+      else if (!absolute) parts.push(part)
+    } else {
+      parts.push(part)
+    }
+  }
+  let normalized = `${absolute ? '/' : ''}${parts.join('/')}`
+  if (!normalized) normalized = absolute ? '/' : '.'
+  // Shell quoting prevents shell metacharacter expansion, but GNU find still parses a quoted
+  // leading-dash starting point as one of its own options/actions. Make relative paths
+  // unambiguously positional before interpolating the command.
+  if (!absolute && normalized.startsWith('-')) normalized = `./${normalized}`
+  return normalized
+}
+
+const path = normalizeScoutPath(A.path || '.')
 const TAG = A.tag || 'bugsweep'
 const GLOB = A.glob || '*.py'
 const LINE_CAP = A.lineCap || 1000
-const MAX_PARALLEL = A.maxParallel || 6
+const MAX_PARALLEL = Object.prototype.hasOwnProperty.call(A, 'maxParallel') ? A.maxParallel : 6
 const EXTRA = A.extraGuidance || ''
-const EXPLICIT_FILES = A.files || null
+const HAS_EXPLICIT_FILES = Object.prototype.hasOwnProperty.call(A, 'files')
+const EXPLICIT_FILES = HAS_EXPLICIT_FILES ? A.files : null
+const IS_WHOLE_REPO_SCOPE = path === '.' || path === '/'
+const ESCAPES_REPO_SCOPE = path === '..' || path.startsWith('../')
+const IS_ABSOLUTE_SCOPE = path.startsWith('/')
 
 // Self-diagnostic: echo the resolved scope FIRST so a mis-delivered args is visible on line 1, not agent 97.
-log(`Resolved scope: path='${path}' tag='${TAG}' glob='${GLOB}' lineCap=${LINE_CAP} maxParallel=${MAX_PARALLEL} explicitFiles=${EXPLICIT_FILES ? EXPLICIT_FILES.length : 0} extraGuidance=${EXTRA ? EXTRA.length + 'chars' : 'none'}`)
-if (path === '.' && !EXPLICIT_FILES) {
+log(`Resolved scope: path='${path}' tag='${TAG}' glob='${GLOB}' lineCap=${LINE_CAP} maxParallel=${MAX_PARALLEL} explicitFiles=${Array.isArray(EXPLICIT_FILES) ? EXPLICIT_FILES.length : 0} extraGuidance=${EXTRA ? EXTRA.length + 'chars' : 'none'}`)
+if (!Number.isInteger(MAX_PARALLEL) || MAX_PARALLEL <= 0) {
+  log(`REFUSING invalid maxParallel=${JSON.stringify(MAX_PARALLEL)} — expected a positive integer.`)
+  return { error: 'invalid_max_parallel', maxParallel: MAX_PARALLEL }
+}
+if (HAS_EXPLICIT_FILES && !Array.isArray(EXPLICIT_FILES)) {
+  log(`REFUSING invalid files inventory — expected an array, got typeof=${typeof EXPLICIT_FILES}.`)
+  return { error: 'invalid_files_inventory', filesType: typeof EXPLICIT_FILES }
+}
+if (IS_ABSOLUTE_SCOPE && !HAS_EXPLICIT_FILES) {
+  log(`REFUSING absolute scout path '${path}'. Scout scopes must be repository-relative; pass an explicit files inventory for a targeted run. Aborting.`)
+  return { error: 'absolute_scout_path_refused', resolvedPath: path }
+}
+if (ESCAPES_REPO_SCOPE && !HAS_EXPLICIT_FILES) {
+  log(`REFUSING scout path '${path}' because it escapes the repository scope. Pass a scoped path or an explicit files inventory. Aborting.`)
+  return { error: 'out_of_repo_sweep_refused', resolvedPath: path }
+}
+if (IS_WHOLE_REPO_SCOPE && !HAS_EXPLICIT_FILES) {
   log(`REFUSING to sweep the whole repo from '.' with no explicit files — args likely did not arrive (got typeof=${typeof args}). Pass {path, tag} (and ideally files). Aborting.`)
   return { error: 'unscoped_sweep_refused', argsType: typeof args, resolvedPath: path }
 }
@@ -82,7 +124,7 @@ const FILE_SCHEMA = {
 
 // ---------- scout ----------
 let inventory
-if (EXPLICIT_FILES && EXPLICIT_FILES.length) {
+if (HAS_EXPLICIT_FILES) {
   inventory = EXPLICIT_FILES
   log(`Using ${inventory.length} explicitly-provided files (scout skipped — targeted re-run)`)
 } else {
@@ -90,7 +132,7 @@ if (EXPLICIT_FILES && EXPLICIT_FILES.length) {
   const scout = await agent(
     `READ-ONLY scout for a code sweep. Run EXACTLY ONE shell command and emit its result — nothing else.\n` +
     `Run this VERBATIM; do NOT broaden it, do NOT run any other find, do NOT enumerate any directory:\n` +
-    `  find ${path} -type f -name '${GLOB}' -not -path '*/__pycache__/*' -print0 | xargs -0 wc -l\n` +
+    `  find ${shellQuote(path)} -type f -name ${shellQuote(GLOB)} -not -path '*/__pycache__/*' -print0 | xargs -0 wc -l\n` +
     `Scope is STRICTLY \`${path}\`. NEVER walk parent dirs, .venv, .uv-cache, node_modules, build caches, or the repo root — ` +
     `if you find yourself looking at thousands of files you have widened the scope and MUST stop and re-run the exact command above. ` +
     `Return EVERY matching file as {path, lines}, path exactly as printed, EXCLUDING the wc 'total' row. ` +
@@ -158,6 +200,10 @@ const ISSUE_SCHEMA = {
   required: ['files_reviewed', 'issues', 'notes'],
 }
 
+function shellQuote(value) {
+  return "'" + String(value).replace(/'/g, "'\"'\"'") + "'"
+}
+
 function buildPrompt(bin) {
   const fileList = bin.files.map(f => `  - ${f}`).join('\n')
   return `You are a meticulous READ-ONLY code reviewer running a bug sweep.\n\n` +
@@ -165,7 +211,7 @@ function buildPrompt(bin) {
 `WHAT TO HUNT FOR: correctness bugs (None/Optional mishandling, mutable defaults, wrong comparisons, broken (de)serialisation, implicit fabrication via dict.get-with-default where a missing required value should raise); contract-invariant violations (validation theatre — a validator that returns success without validating; fields that permit contradictory states; lifecycle/telemetry invariants only partially enforced); architectural defects (leaky/duplicated boundaries, fail-open / silent-failure, trust-boundary gaps); security (secret/PII egress, unredacted error text, unsafe URL/host handling, weak signing); and concrete enhancement opportunities ONLY where there is a real, named deficiency.\n\n` +
 `THIS IS A READ-ONLY RUN. Do NOT modify any file. Do NOT use Edit/Write/NotebookEdit. Do NOT run any mutating tool (no analyze, no fix, no git writes). The ONLY writes permitted are creating + labelling Filigree issues (below).\n\n` +
 `METHOD: (1) Read each owned file fully. (2) VERIFY each candidate before lodging — roam into callers, referenced classes/functions, and tests and confirm it actually manifests (use Loomweave MCP tools entity_find/entity_callers_list/entity_at/entity_source_get and Grep/Read). A candidate you cannot substantiate does NOT get lodged. (3) Evidence bar per issue: exact file:line, what is wrong, WHY (the invariant/caller expectation it breaks), expected behaviour, and the verification you did. No style nitpicks. A clean file is a valid outcome — report it clean, do NOT force-lodge.\n\n` +
-`LODGING IN FILIGREE (the only permitted writes): (1) FIRST load the deferred tools — ToolSearch query "select:mcp__filigree__issue_create,mcp__filigree__label_add". (2) Create each finding with mcp__filigree__issue_create: type "bug" for defects/architecture/security, "task" for a pure enhancement; title prefixed with the file; priority P0..P3 by real blast radius; description = file:line + evidence + why + expected + your verification; if it has an actor/assignee field set it to "bug-sweep". (3) IMMEDIATELY apply the EXACT label \`${TAG}\` (verbatim) via mcp__filigree__label_add — the post-run reconciliation queries on this label, so an unlabelled issue is invisible. (4) Capture the REAL id returned by issue_create; never invent or narrate one.\n\n` +
+`LODGING IN FILIGREE (the only permitted writes): (1) FIRST load the deferred tool — ToolSearch query "select:mcp__filigree__issue_create". (2) Create each finding with mcp__filigree__issue_create: type "bug" for defects/architecture/security, "task" for a pure enhancement; title prefixed with the file; priority P0..P3 by real blast radius; description = file:line + evidence + why + expected + your verification; labels: ["${TAG}"] in this same creation call; if it has an actor/assignee field set it to "bug-sweep". The post-run reconciliation queries on this exact label, so it must be committed atomically with the issue. (3) Capture the REAL id returned by issue_create; never invent or narrate one.\n\n` +
 `RETURN (structured): files_reviewed = every owned file; issues = one entry per lodged issue with the REAL id; notes = clean files, cross-file patterns, anything deferred. Empty issues array is fine.` +
 (EXTRA ? `\n\nADDITIONAL GUIDANCE FOR THIS SWEEP:\n${EXTRA}` : ``)
 }
@@ -184,15 +230,20 @@ for (let i = 0; i < ordered.length; i += MAX_PARALLEL) {
     if (bin.effort) opts.effort = bin.effort
     return agent(buildPrompt(bin), opts)
   }))
-  const ok = res.filter(Boolean)
+  const ok = res.map((result, index) => result ? { bin: wave[index], result } : null).filter(Boolean)
   allResults.push(...ok)
-  const lodged = ok.reduce((n, r) => n + (r.issues ? r.issues.length : 0), 0)
+  const lodged = ok.reduce((n, item) => n + (item.result.issues ? item.result.issues.length : 0), 0)
   const failed = wave.length - ok.length
   log(`${phaseTitle} done: ${ok.length}/${wave.length} returned${failed ? ` (${failed} FAILED — re-run those files via args.files, NOT resume)` : ''}, ${lodged} issues lodged`)
 }
 
-const lodged = allResults.flatMap(r => r.issues || [])
-const reviewed = allResults.flatMap(r => r.files_reviewed || [])
+const lodged = allResults.flatMap(item => item.result.issues || [])
+const reviewed = allResults.flatMap(item => {
+  const claimed = new Set(item.result.files_reviewed || [])
+  const unexpected = [...claimed].filter(path => !item.bin.files.includes(path))
+  if (unexpected.length) log(`IGNORING files_reviewed outside assigned bin: ${unexpected.join(', ')}`)
+  return item.bin.files.filter(path => claimed.has(path))
+})
 // Which owned files never came back (failed agents) — feed these to a targeted re-run.
 const reviewedSet = new Set(reviewed)
 const missing = inventory.map(f => f.path).filter(p => !reviewedSet.has(p))
@@ -207,5 +258,9 @@ return {
   filesReviewed: reviewed.length,
   unreviewedFiles: missing,
   selfReportedIssues: lodged,
-  perAgent: allResults.map(r => ({ files: r.files_reviewed, issueCount: (r.issues || []).length, notes: r.notes, issues: r.issues || [] })),
+  perAgent: allResults.map(item => {
+    const claimed = new Set(item.result.files_reviewed || [])
+    const files = item.bin.files.filter(path => claimed.has(path))
+    return { files, issueCount: (item.result.issues || []).length, notes: item.result.notes, issues: item.result.issues || [] }
+  }),
 }

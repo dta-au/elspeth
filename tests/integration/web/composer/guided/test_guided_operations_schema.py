@@ -362,7 +362,16 @@ def test_request_cancelled_is_closed_terminal_failure(engine) -> None:
         {"status": "in_progress", "lease_token": None},
         {"status": "in_progress", "lease_expires_at": None},
         {"status": "in_progress", "settled_at": NOW},
+        {"status": "in_progress", "unproducible_output_fields": ["client"]},
         {"status": "completed", "lease_token": "stale", "lease_expires_at": NOW},
+        {
+            "status": "completed",
+            "settled_at": NOW,
+            "result_kind": "composition_state",
+            "result_state_id": STATE_ID,
+            "response_hash": RESPONSE_HASH,
+            "unproducible_output_fields": ["client"],
+        },
         {
             "status": "completed",
             "settled_at": NOW,
@@ -392,6 +401,22 @@ def test_request_cancelled_is_closed_terminal_failure(engine) -> None:
             "failure_code": "raw provider error: secret",
             "lease_token": None,
             "lease_expires_at": None,
+        },
+        {
+            "status": "failed",
+            "settled_at": NOW,
+            "failure_code": "provider_timeout",
+            "lease_token": None,
+            "lease_expires_at": None,
+            "unproducible_output_fields": [],
+        },
+        {
+            "status": "failed",
+            "settled_at": NOW,
+            "failure_code": "provider_timeout",
+            "lease_token": None,
+            "lease_expires_at": None,
+            "unproducible_output_fields": {"field": "client"},
         },
     ],
 )
@@ -426,6 +451,7 @@ def test_completed_and_failed_terminal_bundles_are_accepted(engine) -> None:
                     lease_token=None,
                     lease_expires_at=None,
                     failure_code="provider_unavailable",
+                    unproducible_output_fields=["amount_aud", "client"],
                     settled_at=NOW,
                 )
             )

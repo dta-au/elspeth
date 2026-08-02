@@ -57,8 +57,8 @@ does not (that's *why* it delegates). One deterministic command yields the exact
 
 ```bash
 find <path> -type f -name '<glob>' -not -path '*/__pycache__/*' -print0 \
-  | xargs -0 wc -l | grep -v ' total$' \
-  | python3 -c "import sys,json; print(json.dumps([{'path':p,'lines':int(n)} for n,p in (l.split(None,1) for l in sys.stdin if l.strip())]))"
+  | xargs -r -0 wc -l \
+  | python3 -c "import sys,json; rows=[parts for line in sys.stdin if len(parts := line.split(None,1)) == 2]; print(json.dumps([{'path':p.rstrip('\n'),'lines':int(n)} for n,p in rows if p.rstrip('\n') != 'total']))"
 ```
 
 Pass that array as `args.files`; the workflow skips the scout and goes straight
@@ -99,7 +99,7 @@ at the *first* failure, so every downstream agent re-runs and re-lodges
 duplicates (this is exactly how a clean sweep grows a pile of dupes). Instead:
 
 ```
-Workflow({ name: 'dir-bug-sweep', args: {
+Workflow({ scriptPath: '/abs/path/to/.claude/workflows/dir-bug-sweep.js', args: {
   tag: '2806bugsweep',                              // SAME tag
   files: [{ path: '.../data.py', lines: 392 }, ...] // the unreviewedFiles, scout skipped
 }})
@@ -179,4 +179,5 @@ re-run of the failed slice is the recovery, not a panic.
 ## Files
 
 - Workflow: `.claude/workflows/dir-bug-sweep.js` (scout → FFD bin-pack → waves).
-  Edit it to change the review prompt, schema, or packing; re-invoke by name.
+  Edit it to change the review prompt, schema, or packing; re-invoke via its
+  absolute `scriptPath` so the runtime reads the live file.

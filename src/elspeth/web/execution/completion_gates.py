@@ -209,12 +209,13 @@ def parse_completion_gates(
     a malformed shape means corruption or writer drift — raise, never skip
     the gate.
 
-    Tier-model adjudication note (R1 ``.get()`` / R5 ``isinstance()`` below):
-    this function is the ADR-032 parse point for a JSON-round-tripped
-    envelope read back off our own ``composition_states`` row. The ``.get()``
-    calls are sentinel probes for keys whose ABSENCE is a legal, meaningful
-    state (`no envelope written` / `no gate withheld`) — never a silent
-    default: every present-but-malformed shape raises, and the two
+    Tier-model adjudication note (R1 membership / ``.get()`` / R5
+    ``isinstance()`` below): this function is the ADR-032 parse point for a
+    JSON-round-tripped envelope read back off our own ``composition_states``
+    row. The membership checks are sentinel probes for keys whose ABSENCE is
+    a legal, meaningful state (`no envelope written` / `no gate withheld`) —
+    never a silent default. The remaining ``.get()`` calls are required-field
+    reads: every present-but-malformed shape raises, and the two
     ``isinstance(..., Mapping)`` checks are shape validation that constructs
     the owned ``CompletionGateFacts`` type, not defensive masking of a code
     bug. If this function ever stops raising on malformed present values, or
@@ -226,9 +227,9 @@ def parse_completion_gates(
         return None
     # Sentinel probe: rows written before this envelope existed (and
     # fork/revert paths) legitimately lack the key.
-    raw = composer_meta.get(COMPLETION_GATES_META_KEY)
-    if raw is None:
+    if COMPLETION_GATES_META_KEY not in composer_meta:
         return None
+    raw = composer_meta[COMPLETION_GATES_META_KEY]
     if not isinstance(raw, Mapping):
         raise ValueError(f"Tier 1: composer_meta.completion_gates is {type(raw).__name__}, expected a mapping")
     unknown = set(raw) - {_ADVISOR_SIGNOFF_GATE_KEY}
@@ -236,9 +237,9 @@ def parse_completion_gates(
         raise ValueError(f"Tier 1: composer_meta.completion_gates has unknown gate keys {sorted(unknown)!r}")
     # Sentinel probe: the writer persists {} on every clean compose turn, so
     # a missing gate key means "not withheld", not corruption.
-    raw_signoff = raw.get(_ADVISOR_SIGNOFF_GATE_KEY)
-    if raw_signoff is None:
+    if _ADVISOR_SIGNOFF_GATE_KEY not in raw:
         return CompletionGateFacts(advisor_signoff=None)
+    raw_signoff = raw[_ADVISOR_SIGNOFF_GATE_KEY]
     if not isinstance(raw_signoff, Mapping):
         raise ValueError(f"Tier 1: completion_gates.advisor_signoff is {type(raw_signoff).__name__}, expected a mapping")
     # From here every probe is get-then-assert: a missing or malformed field

@@ -43,9 +43,9 @@ or *debt* (defensive code that should be fixed). The judge's verdict, rationale,
 the source binding (AST path + a fingerprint), and an HMAC signature are
 written into the entry. The forward binding primitive is the v2
 `scope_fingerprint` (the enclosing-scope AST fingerprint, signature prefix
-`hmac-sha256:v2:`) minted by `justify`; the legacy v1 `file_fingerprint`
-(whole-file hash, prefix `hmac-sha256:v1:`) is still live for already-signed
-entries and is being migrated away via `migrate-judge-scope`.
+`hmac-sha256:v2:`) minted by the staged signing workflow; the legacy v1
+`file_fingerprint` (whole-file hash, prefix `hmac-sha256:v1:`) is still live for
+already-signed entries and is migrated through a staged repair.
 
 This reframes what the audit audits:
 
@@ -55,26 +55,22 @@ This reframes what the audit audits:
   as the underlying code changes out from under it. The audit's job for these is
   decay detection (`reaudit`), not re-justification.
 
-All judge tooling is `elspeth-lints` subcommands. Run from the repo root with:
-
-```bash
-env PYTHONPATH=elspeth-lints/src .venv/bin/python -m elspeth_lints.core.cli <cmd> ...
-```
-
-`<cmd> --help` is the authoritative flag/verdict reference; the tables below are
-orientation, not a substitute (verdict enums and flags evolve).
+Agents use the key-free `mcp__elspeth-judge__*` staging tools. Operators use
+the `elspeth-lints` CLI in a key-bearing shell. The judge-signature workflow is
+the authoritative command and recovery reference; the table below is only an
+orientation to the current seam.
 
 ### Subcommands
 
 | Subcommand | Role | Writes to allowlist? |
 | ---------- | ---- | -------------------- |
-| `rotate` | Mechanical fingerprint reconciliation after an AST refactor. **No judge.** | Yes — entry fingerprints |
-| `justify` | Propose a new entry; the judge (Opus) returns `ACCEPTED`/`BLOCKED`; signs accepted entries. Accepts `--judge-transport {openrouter,agent}` (default `openrouter`). | Yes — new entry |
-| `diagnose-judge-signatures` | Read-only stale-signature triage for signed allowlist entries. Use before asking an operator to sign or before committing allowlist churn. | No |
-| `sign-judge-signatures` | Operator-only bulk repair for signable signed-entry drift. Refuses entries that cannot safely be signed, such as `NO_MATCHING_FINDING`. | Yes — re-signed entries |
+| `stage_scan` (MCP) | Key-free survey into `drift_repair`, `rotation`, `stale_delete`, and `new_judgment` actions. | No — staged bundle only |
+| `verify_signatures` (MCP) | Read-only shape diagnosis without the HMAC key. | No |
+| `stage_preview` / `stage_status` (MCP) | Optional non-authoritative preview and paste-ready operator handoff. | No |
+| `sign-bundle` (CLI) | Operator-only transactional firing after re-verifying the live tree. | Yes — only after complete success |
 | `audit-verdict` | Human post-review of a judge-**ACCEPTED** entry — confirm or reverse the judge. | Yes — review block |
-| `reaudit` | Re-run the judge across existing entries to detect decay. **Read-only on YAML**; emits a triage report. Accepts `--judge-transport {openrouter,agent}` (default `openrouter`). | No |
-| `migrate-judge-scope` | **Operator-only** (signs; needs the HMAC key). Re-signs v1 (`file_fingerprint`) entries whose signature verifies and whose node still matches a live finding as v2 (`scope_fingerprint`) **without re-running the judge** — it deliberately skips the file_fingerprint byte-freshness gate, so byte-drifted-but-scope-stable entries are the target set, not "CI-green" ones. Gated on integrity (existing v1 signature must verify) + relevance (key still matches a live finding). | Yes — re-signed entries |
+| `reaudit` | Re-run the judge across existing entries to detect decay. **Read-only on YAML**; use the normal `codex-cli` + `readonly` policy. | No |
+| `stage_rekey` (MCP) / `rekey` (CLI) | Key-free rekey worklist followed by an operator-only signature-key rotation. | MCP: no; CLI: signatures only |
 | `check-judge-coverage` (C1) | CI gate: every new entry must carry signed judge metadata (pre-judge entries grandfathered, rotation-stable). | No |
 | `check-override-rate` (C3) | CI gate: rolling-30d operator-override rate must stay under `--max-rate` (workflow-pinned 0.10). | No |
 | `check-judge-quality` (VAL) | CI gate, trusted contexts only: judge accuracy on a labelled corpus ≥ 0.90 (regression tripwire, not a guarantee). | No |
@@ -85,92 +81,65 @@ orientation, not a substitute (verdict enums and flags evolve).
 The signature uses a **symmetric** key (`ELSPETH_JUDGE_METADATA_HMAC_KEY`). Any
 key holder can forge a valid `ACCEPTED` verdict, so the gate's whole security is
 custody: **the key is operator-only and MUST NOT be in any agent environment.**
-An agent may *propose* a `justify` invocation; only an operator-held environment
-runs it and signs. Full rationale: CLAUDE.md § "CICD Judge Gate: HMAC Key
-Custody". During an audit you therefore *recommend* `justify`/`audit-verdict`
-commands for the operator to run — you do not run the signing path yourself.
+Agents inspect and stage key-free work through `mcp__elspeth-judge__*`; only an
+operator-held environment fires the bundle. Never request, read, or pass the
+key, and never hand-edit signed YAML.
 
 ### Signed-entry repair workflow
 
-Before committing allowlist churn, run read-only diagnosis with fork-compatible
-signature verification:
+Before any allowlist churn, call `mcp__elspeth-judge__verify_signatures`, then
+call `mcp__elspeth-judge__stage_scan`. The staged bundle classifies changes into
+`drift_repair`, `rotation`, `stale_delete`, and `new_judgment` lanes. Optionally
+call `mcp__elspeth-judge__stage_preview`, then call
+`mcp__elspeth-judge__stage_status` for the paste-ready operator handoff.
 
 ```bash
-ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
-  uv run elspeth-lints diagnose-judge-signatures \
-  --root src/elspeth \
-  --allowlist-dir config/cicd/enforce_tier_model \
-  --format text
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+PYTHONPATH="$REPO_ROOT/elspeth-lints/src" \
+  .venv/bin/python -m elspeth_lints.core.cli \
+  sign-bundle <bundle.json> --owner <operator-id> \
+  --judge-transport codex-cli --judge-tools readonly --dry-run
 ```
 
-Classify the output before touching YAML:
+The command is for the operator's key-bearing shell, not the agent. It
+re-derives every binding from the live tree and aborts before any write on
+staleness. Agents stop at the staged bundle.
 
-- `NO_MATCHING_FINDING`: the signed row has no live finding. The signer will
-  refuse this. Inspect the code; if the finding is gone, remove that stale row
-  from the allowlist. If the finding still matters under a new key, propose a
-  fresh `justify` command for the operator.
+Classify staged actions without touching YAML:
+
+- `NO_MATCHING_FINDING`: after confirming the finding is gone, keep the
+  corresponding `stale_delete` action in the staged bundle. Never delete the
+  signed row manually.
 - `SCOPE_BINDING_DRIFT`: the same finding key still exists, but the enclosing
-  scope changed. Do not hand-edit metadata. Propose the emitted `justify`
-  command; the operator runs it with the HMAC key.
+  scope changed. Keep the emitted `drift_repair` action; do not hand-edit
+  metadata.
 - `AST_PATH_BINDING_DRIFT` with `repair_key`: the live finding moved to a new
-  fingerprint. If an operator-signed replacement row for the `repair_key`
-  already exists and diagnosis reports it `OK_SHAPE_ONLY`/valid, remove the old
-  stale row. If no replacement exists, propose the emitted `justify` command and
-  wait for the operator.
+  fingerprint. Preserve the staged repair and any paired stale deletion; the
+  operator transaction applies them coherently.
 
-After operator signing, re-run `diagnose-judge-signatures`; only continue when
-no drift/no-match rows remain. Then run the actual trust-tier gate:
+After operator signing, re-run `mcp__elspeth-judge__verify_signatures`; only
+continue when no drift/no-match rows remain. Then run the actual trust-tier gate:
 
 ```bash
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
 ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
-  uv run elspeth-lints check --rules trust_tier.tier_model --root src/elspeth
+  PYTHONPATH="$REPO_ROOT/elspeth-lints/src" \
+  .venv/bin/python -m elspeth_lints.core.cli \
+  check --rules trust_tier.tier_model --root src/elspeth
 ```
 
 Do not commit backup files created during operator repair, such as temporary
 `*.bak-*` copies, unless the user explicitly asks for them.
 
-### `--judge-transport` — which LLM serves the verdict
+### Judging transport and staged entry creation
 
-`justify` and `reaudit` both accept `--judge-transport {openrouter,agent}`
-(default `openrouter`; no behaviour change unless opted in). This selects the
-judging LLM and is a *separate axis* from HMAC custody — it governs which model
-produces the verdict, not who signs it.
-
-- **`openrouter`** (default) — OpenAI-compatible SDK pointed at OpenRouter,
-  `temperature=0`, reproducible. Persisted/signed `judge_transport`: `"openrouter"`.
-  Use this for any deterministic re-check (and it is the only transport an agent
-  can drive, since it runs on the agent's own OpenRouter key).
-- **`agent`** — Claude Agent SDK (`claude_code` system-prompt preset, no tools).
-  Needs the `[judge-agent]` extra and Claude Code auth (CLI login /
-  `ANTHROPIC_API_KEY` / Bedrock-Vertex-Azure) — operator-held credentials an
-  agent's environment does not carry. Persisted/signed `judge_transport`:
-  `"claude_agent_sdk"`. The "cheaper" assumption holds only on the
-  subscription/credit path; `ANTHROPIC_API_KEY` is per-token and may not beat
-  OpenRouter. The SDK cannot pin `temperature`, so agent-written verdicts are
-  less reproducible than the `openrouter` path.
-
-`judge_transport` is part of the **signed v2 payload** ("how the verdict was
-produced" — verdict metadata, tamper-evident with the verdict; a forged or edited
-transport label fails the load-time HMAC recompute). Consequence for the audit: a
-re-`justify` of the same entry under a different transport surfaces as a
-metadata-diff (the `judge_transport` value, and the verdict/rationale it
-produced, change). For decay-detection re-checks, keep `reaudit` on
-`--judge-transport openrouter` so re-runs stay deterministic regardless of the
-transport that originally wrote each entry.
-
-### `justify` — propose a new entry (agent proposes, operator signs)
-
-Re-runs the rule on `--file-path`, asks the judge to rule on the `--rationale`,
-and on `ACCEPTED` writes the signed entry. The two model verdicts are `ACCEPTED`
-(the suppression lands) and `BLOCKED` (fix the code instead — the judge holds a
-conservative prior toward `BLOCKED`); `OVERRIDDEN_BY_OPERATOR` is a third verdict
-set only by `--operator-override`, never by the model. Required: `--file-path`, `--symbol`
-(qualified name; literal `_module_` for module scope), `--rationale`, `--owner`.
-Useful: `--fingerprint` (disambiguate when `--symbol` matches several findings),
-`--dry-run` (show the verdict without writing), `--rule` (default
-`trust_tier.tier_model`). `--operator-override` writes
-`verdict=OVERRIDDEN_BY_OPERATOR` (the judge is still called for the record) and
-requires the override-token env vars — every override feeds the C3 rate gate.
+The normal transport is the Codex CLI harness with path-confined read-only
+tools: `--judge-transport codex-cli --judge-tools readonly`. The judge never
+receives the HMAC key, override tokens, provider keys, or cloud credentials.
+New findings enter the `new_judgment` lane through `stage_scan`; agents do not
+invoke a direct signing command or add a row to `allow_hits`.
 
 ### `reaudit` — decay sweeps (the audit's main judge-era tool)
 
@@ -180,7 +149,9 @@ flags: `--limit N` / `--max-calls N` (the ~700-entry corpus must NOT be
 re-judged in one pass — `--max-calls` is a spend guard that leaves the sweep
 resumable), `--since` (skip entries judged recently), `--include-pre-judge` (off
 by default; the pre-judge set is large), `--format markdown --output <path>`
-(most triage-readable). Crash recovery: a fresh run prints a `run_id`; resume a
+(most triage-readable), and
+`--judge-transport codex-cli --judge-tools readonly`. Crash recovery: a fresh
+run prints a `run_id`; resume a
 killed sweep with `--resume <run_id>`, or render its partial report with
 `--render-incomplete <run_id>` (sidecar at
 `<allowlist-dir>/.reaudit-state/<run_id>.jsonl`). Feed decayed verdicts into
@@ -202,8 +173,8 @@ must pass; VAL may be `skipped` on fork PRs, which cannot read the OpenRouter
 secret). On fork PRs the HMAC key is also withheld, so signature verification
 falls back to `shape-only-when-key-missing` mode
 (`ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE`). A C3 failure is an audit
-trigger (see "When to run"); a C1 failure means someone hand-wrote an entry
-without going through `justify`.
+trigger (see "When to run"); a C1 failure means an entry bypassed the staged
+signing workflow.
 
 ## Method (5 stages)
 
@@ -213,33 +184,13 @@ All 14 gates must currently pass locally; otherwise the audit is meaningless
 (you can't separate load-bearing from fixable if some are actively failing).
 
 ```bash
-cd /home/john/elspeth
-.venv/bin/python scripts/cicd/enforce_tier_model.py check --root src/elspeth \
-  --allowlist config/cicd/enforce_tier_model --exclude "**/__pycache__/*" --format text
-.venv/bin/python scripts/cicd/enforce_freeze_guards.py check --root src/elspeth \
-  --allowlist config/cicd/enforce_freeze_guards
-.venv/bin/python scripts/cicd/enforce_audit_evidence_nominal.py check --root src/elspeth \
-  --allowlist config/cicd/enforce_audit_evidence_nominal
-.venv/bin/python scripts/cicd/enforce_tier_1_decoration.py check \
-  --file src/elspeth/contracts/errors.py --allowlist config/cicd/enforce_tier_1_decoration
-.venv/bin/python scripts/cicd/enforce_composer_exception_channel.py check \
-  --root src/elspeth --allowlist config/cicd/enforce_composer_exception_channel
-.venv/bin/python scripts/cicd/enforce_composer_catch_order.py check --root src/elspeth \
-  --allowlist config/cicd/enforce_composer_catch_order
-.venv/bin/python scripts/cicd/enforce_contract_manifest.py check \
-  --allowlist config/cicd/enforce_contract_manifest
-.venv/bin/python scripts/cicd/enforce_frozen_annotations.py check --root src/elspeth \
-  --allowlist config/cicd/enforce_frozen_annotations
-.venv/bin/python -m scripts.cicd.enforce_plugin_hashes check --root src/elspeth
-.venv/bin/python scripts/cicd/enforce_options_metadata.py
-.venv/bin/python scripts/cicd/enforce_component_type.py check --root src/elspeth \
-  --allowlist config/cicd/enforce_component_type
-.venv/bin/python scripts/cicd/enforce_guard_symmetry.py check --root src/elspeth \
-  --allowlist config/cicd/enforce_guard_symmetry
-.venv/bin/python scripts/cicd/enforce_gve_attribution.py check --root src/elspeth \
-  --allowlist config/cicd/enforce_gve_attribution
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+PYTHONPATH="$REPO_ROOT/elspeth-lints/src" \
+  .venv/bin/python -m elspeth_lints.core.cli check
 .venv/bin/python -m scripts.check_contracts
 .venv/bin/python scripts/cicd/check_slot_type_cross_language.py
+.venv/bin/pytest tests/
 .venv/bin/python -m mypy src/elspeth
 .venv/bin/python -m ruff check src/ tests/ scripts/ examples/
 .venv/bin/python -m ruff format --check src/ tests/ scripts/ examples/
@@ -380,10 +331,11 @@ For each entry below:
 
 [List entries with key, owner, reason, file, function.]
 
-DELIVERABLE: write to /home/john/elspeth/docs/audit/findings/<agent-role>.md
+DELIVERABLE: write to <repo-root>/docs/audit/findings/<agent-role>.md
 with per-entry verdict + aggregate signal + recommendation.
 
-CWD: /home/john/elspeth. Use .venv/bin/python.
+CWD: the current selected checkout/worktree root from `git rev-parse --show-toplevel`.
+Use .venv/bin/python without syncing or installing into a symlinked worktree venv.
 ```
 
 Always **write findings to a durable file under `docs/audit/findings/`** so the
@@ -450,9 +402,9 @@ The audit produces exactly these artifacts:
 
 - `tier-model-deep-dive` skill — for the trust-tier decision test the SME
   agents apply.
-- `CLAUDE.md` — for the "offensive programming encouraged, defensive forbidden"
-  policy, the fabrication decision test, the `rotate`/`justify`/`reaudit`
-  command examples, and § "CICD Judge Gate: HMAC Key Custody".
+- `AGENTS.md` — for the trust-tier posture and the operator-key custody rule;
+  `judge-signature-workflow` for the current stage/fire commands and recovery
+  semantics.
 - The cicd-judge gate (write path) — see "The cicd-judge gate" section above;
   CLI in `elspeth-lints/src/elspeth_lints/core/cli.py`; CI in
   `.github/workflows/enforce-allowlist-judge-gates.yaml`; design notes in

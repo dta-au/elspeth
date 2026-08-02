@@ -4,17 +4,145 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from enum import StrEnum
 
 import pytest
 
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.transforms.llm.provider import (
     FinishReason,
+    FinishReasonFailure,
+    LLMAuditParent,
     LLMProvider,
     LLMQueryResult,
     UnrecognizedFinishReason,
+    classify_finish_reason_failure,
     parse_finish_reason,
 )
+
+
+class _IdentifierEnum(StrEnum):
+    VALUE = "identifier-value"
+
+
+class _FormattingString(str):
+    def __str__(self) -> str:
+        return "formatted-differently"
+
+
+def test_llm_audit_parent_accepts_row_and_operation_forms() -> None:
+    row = LLMAuditParent.for_row(state_id="state-1", token_id="token-1")
+    operation = LLMAuditParent.for_operation(operation_id="operation-1")
+
+    assert row.client_kwargs() == {
+        "state_id": "state-1",
+        "token_id": "token-1",
+        "operation_id": None,
+    }
+    assert operation.client_kwargs() == {
+        "state_id": None,
+        "token_id": None,
+        "operation_id": "operation-1",
+    }
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"state_id": "state-1"},
+        {"token_id": "token-1"},
+        {"operation_id": "operation-1", "state_id": "state-1", "token_id": "token-1"},
+        {"operation_id": " "},
+    ],
+)
+def test_llm_audit_parent_rejects_invalid_parentage(kwargs: dict[str, str]) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        LLMAuditParent(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "field_name"),
+    [
+        ({"state_id": 1, "token_id": "token-1"}, "state_id"),
+        ({"state_id": "state-1", "token_id": 1}, "token_id"),
+        ({"operation_id": 1}, "operation_id"),
+    ],
+)
+def test_llm_audit_parent_rejects_non_string_ids_with_type_error(
+    kwargs: dict[str, object],
+    field_name: str,
+) -> None:
+    with pytest.raises(TypeError, match=rf"{field_name} must be a string"):
+        LLMAuditParent(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [_IdentifierEnum.VALUE, _FormattingString("identifier-value")])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"state_id": "state-1", "token_id": "token-1"},
+        {"operation_id": "operation-1"},
+    ],
+)
+def test_llm_audit_parent_rejects_string_subclasses_before_identity_use(
+    value: str,
+    kwargs: dict[str, str],
+) -> None:
+    field_name = "operation_id" if "operation_id" in kwargs else "state_id"
+    kwargs[field_name] = value
+
+    with pytest.raises(TypeError, match=rf"{field_name} must be a string"):
+        LLMAuditParent(**kwargs)
+
+
+@pytest.mark.parametrize("finish_reason", [FinishReason.STOP, None])
+def test_finish_reason_classifier_accepts_success_forms(finish_reason: FinishReason | None) -> None:
+    assert classify_finish_reason_failure(finish_reason) is None
+
+
+@pytest.mark.parametrize(
+    ("finish_reason", "expected"),
+    [
+        (
+            FinishReason.LENGTH,
+            FinishReasonFailure(
+                reason="response_truncated",
+                finish_reason="length",
+                error_message="Response truncated (finish_reason=length)",
+            ),
+        ),
+        (
+            FinishReason.CONTENT_FILTER,
+            FinishReasonFailure(
+                reason="content_filtered",
+                finish_reason="content_filter",
+                error_message="Response blocked by provider content filter",
+            ),
+        ),
+        (
+            FinishReason.TOOL_CALLS,
+            FinishReasonFailure(
+                reason="unexpected_finish_reason",
+                finish_reason="tool_calls",
+                error_message="Unexpected finish reason: tool_calls",
+            ),
+        ),
+        (
+            UnrecognizedFinishReason("safety_filter"),
+            FinishReasonFailure(
+                reason="unexpected_finish_reason",
+                finish_reason="safety_filter",
+                error_message="Unexpected finish reason: safety_filter",
+            ),
+        ),
+    ],
+)
+def test_finish_reason_classifier_returns_provider_neutral_failure(
+    finish_reason: FinishReason | UnrecognizedFinishReason,
+    expected: FinishReasonFailure,
+) -> None:
+    assert classify_finish_reason_failure(finish_reason) == expected
 
 
 class TestLLMQueryResult:
@@ -182,9 +310,9 @@ class TestLLMProviderProtocol:
                 model: str,
                 temperature: float,
                 max_tokens: int | None,
-                state_id: str,
-                token_id: str,
+                audit_parent: LLMAuditParent,
             ) -> LLMQueryResult:
+                del audit_parent
                 return LLMQueryResult(
                     content="test",
                     usage=TokenUsage.unknown(),

@@ -43,9 +43,10 @@ Frozen-at-mark-time discipline (load-bearing):
       never arises at resolve time.
 
 Mark-time gate: ``mark_ready_for_review`` raises
-``CompositionNotRunnableError`` if validation fails OR if any readiness row
-has ``status == "error"``. ``status == "warning"`` (e.g. pending LLM
-interpretations) is permitted; the reviewer sees the warning.
+``CompositionNotRunnableError`` if validation fails, completion readiness is
+withheld, OR any readiness row has ``status == "error"``. ``status ==
+"warning"`` (e.g. pending LLM interpretations) is permitted; the reviewer
+sees the warning.
 
 Layer: L3 (web application).
 """
@@ -120,6 +121,8 @@ class CompositionNotRunnableError(Exception):
 
     * ``"validation_failed"`` — ``ExecutionService.validate`` returned
       ``is_valid=False``.
+    * ``"completion_not_ready"`` — validation succeeded, but a completion
+      gate (such as advisor sign-off) withheld ``completion_ready``.
     * ``"readiness_error_row"`` — ``ReadinessService.compute_snapshot``
       returned a row with ``status == "error"``. Sharing a known-broken
       readiness state is share-theatre; the gate refuses.
@@ -371,8 +374,8 @@ class ShareableReviewService:
 
         Sequence (audit-first ordering):
 
-        1. Validate the composition (raises ``CompositionNotRunnableError``
-           on failure).
+        1. Validate the composition and completion gates (raises
+           ``CompositionNotRunnableError`` on failure).
         2. Compute the readiness snapshot using the OWNER's user_id and
            apply the mark-time gate (no row with status='error').
         3. Build the canonical-JSON snapshot bytes; compute payload_digest.
@@ -408,6 +411,11 @@ class ShareableReviewService:
             raise CompositionNotRunnableError(
                 reason="validation_failed",
                 detail="composition validation failed; fix errors before sharing",
+            )
+        if not validation.readiness.completion_ready:
+            raise CompositionNotRunnableError(
+                reason="completion_not_ready",
+                detail="composition completion gates have not passed; resolve blockers before sharing",
             )
 
         audit_readiness = await self._readiness_service.compute_snapshot(

@@ -444,6 +444,51 @@ describe("ChatPanel", () => {
     ).toBeInTheDocument();
   });
 
+  it("keeps a historical aborted agent turn visible while hiding the current incomplete turn", () => {
+    const session: Session = {
+      id: "session-aborted-turn",
+      title: "Aborted turn session",
+      created_at: "2026-08-02T00:00:00Z",
+      updated_at: "2026-08-02T00:00:00Z",
+    };
+    const mkMsg = (
+      overrides: Partial<ChatMessage> & {
+        id: string;
+        role: ChatMessage["role"];
+      },
+    ): ChatMessage =>
+      ({
+        session_id: session.id,
+        content: "",
+        tool_calls: null,
+        created_at: "2026-08-02T00:00:00Z",
+        ...overrides,
+      }) as ChatMessage;
+    const tc = (name: string) => ({
+      id: name,
+      type: "function",
+      function: { name, arguments: "{}" },
+    });
+
+    useSessionStore.setState({
+      activeSessionId: session.id,
+      sessions: [session],
+      messages: [
+        mkMsg({ id: "u1", role: "user", content: "First request" }),
+        mkMsg({ id: "a1", role: "assistant", tool_calls: [tc("first_tool")] }),
+        mkMsg({ id: "u2", role: "user", content: "Second request" }),
+        mkMsg({ id: "a2", role: "assistant", tool_calls: [tc("second_tool")] }),
+      ],
+    });
+
+    render(<ChatPanel />);
+
+    // The first incomplete agent turn is historical because a later user turn
+    // exists, so it remains in the timeline. Only the current tail turn stays
+    // behind the atomic-reveal gate while composition is in flight.
+    expect(screen.getAllByTestId("message-bubble")).toHaveLength(3);
+  });
+
   it("passes matching and stale proposal state to message bubbles", () => {
     const session: Session = {
       id: "session-1",

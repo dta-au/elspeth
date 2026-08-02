@@ -11,6 +11,7 @@ from elspeth.web.plugin_policy.models import PluginId
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 
 _GOLDEN = Path("tests/golden/web/catalog/policy_view/transform__llm.json")
+_SOURCE_GOLDEN = Path("tests/golden/web/catalog/policy_view/source__llm.json")
 
 
 def test_profiled_llm_policy_schema_matches_golden() -> None:
@@ -41,6 +42,13 @@ def test_profiled_llm_policy_schema_matches_golden() -> None:
     )
 
     assert public.model_dump(mode="json") == json.loads(_GOLDEN.read_text())
+
+    source_public = profiles.public_schema(
+        PluginId("source", "llm"),
+        create_catalog_service().get_schema("source", "llm"),
+        available_aliases=("tutorial",),
+    )
+    assert source_public.model_dump(mode="json") == json.loads(_SOURCE_GOLDEN.read_text())
 
 
 def _bedrock_public_schema(plugin_name: str, alias: str) -> dict[str, object]:

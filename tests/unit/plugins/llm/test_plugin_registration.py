@@ -9,10 +9,24 @@ Verifies that:
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 
 from elspeth.contracts import Determinism
-from elspeth.plugins.infrastructure.validation import get_transform_config_model
+from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
+from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.plugins.infrastructure.validation import get_source_config_model, get_transform_config_model
+from elspeth.plugins.sources.llm import LLMSource
+from elspeth.plugins.sources.llm.config import (
+    AzureOpenAILLMSourceConfig,
+    BedrockLLMSourceConfig,
+    GatewayLLMSourceConfig,
+    OpenRouterLLMSourceConfig,
+)
 
 
 class TestLLMPluginConfigDispatch:
@@ -44,6 +58,90 @@ class TestLLMPluginConfigDispatch:
 
         config_model = get_transform_config_model("llm", {})
         assert config_model is LLMConfig
+
+
+class TestLLMSourcePluginConfigDispatch:
+    """Source validation and construction dispatch on the authored provider."""
+
+    @pytest.fixture
+    def manager(self, monkeypatch: pytest.MonkeyPatch) -> PluginManager:
+        manager = PluginManager()
+        manager.register(create_dynamic_hookimpl([LLMSource], "elspeth_get_source"))
+        monkeypatch.setattr(
+            "elspeth.plugins.infrastructure.manager.get_shared_plugin_manager",
+            lambda: manager,
+        )
+        return manager
+
+    @pytest.mark.parametrize(
+        ("provider_config", "expected_config_model"),
+        [
+            (
+                {
+                    "provider": "azure",
+                    "deployment_name": "deployment",
+                    "endpoint": "https://example.openai.azure.com",
+                    "api_key": "resolved-key",
+                },
+                AzureOpenAILLMSourceConfig,
+            ),
+            (
+                {
+                    "provider": "openrouter",
+                    "model": "openai/gpt-5-mini",
+                    "api_key": "resolved-key",
+                },
+                OpenRouterLLMSourceConfig,
+            ),
+            (
+                {
+                    "provider": "bedrock",
+                    "model": "bedrock/anthropic.claude-3-haiku-20240307-v1:0",
+                    "region_name": "ap-southeast-2",
+                },
+                BedrockLLMSourceConfig,
+            ),
+            (
+                {
+                    "provider": "gateway",
+                    "model": "standard",
+                    "endpoint": "https://gateway.example.com/v1",
+                    "api_key": "resolved-key",
+                },
+                GatewayLLMSourceConfig,
+            ),
+        ],
+        ids=("azure", "openrouter", "bedrock", "gateway"),
+    )
+    def test_source_dispatch_and_manager_creation_use_provider_specific_model(
+        self,
+        manager: PluginManager,
+        provider_config: dict[str, object],
+        expected_config_model: type,
+    ) -> None:
+        config = {
+            **provider_config,
+            "prompt_template": "Write one audit briefing.",
+            "schema": {"mode": "observed"},
+            "on_validation_failure": "discard",
+        }
+
+        assert get_source_config_model("llm", config) is expected_config_model
+        source = manager.create_source("llm", config)
+
+        assert isinstance(source, LLMSource)
+        assert isinstance(source.provider_config, expected_config_model)
+
+    def test_source_dispatch_rejects_unknown_provider_before_construction(self, manager: PluginManager) -> None:
+        config = {
+            "provider": "forged",
+            "prompt_template": "Write one audit briefing.",
+            "schema": {"mode": "observed"},
+            "on_validation_failure": "discard",
+        }
+
+        with pytest.raises(ValueError, match="Unknown LLM provider 'forged'"):
+            manager.create_source("llm", config)
 
     def test_llm_plugin_unknown_provider_raises(self) -> None:
         """verify unknown provider raises ValueError with valid providers listed."""
@@ -85,3 +183,34 @@ class TestLLMPluginDiscovery:
         from elspeth.plugins.transforms.llm.transform import LLMTransform
 
         assert LLMTransform.determinism == Determinism.NON_DETERMINISTIC
+
+    def test_llm_source_is_discovered_by_shared_manager_with_canonical_identity(self) -> None:
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        assert get_shared_plugin_manager().get_source_by_name("llm") is LLMSource
+
+    def test_fresh_process_resolves_canonical_llm_source_identity(self) -> None:
+        repository_root = Path(__file__).resolve().parents[4]
+        environment = {
+            **os.environ,
+            "PYTHONPATH": os.pathsep.join((str(repository_root / "src"), str(repository_root / "elspeth-lints" / "src"))),
+        }
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager; "
+                    "from elspeth.plugins.sources.llm.source import LLMSource; "
+                    "assert get_shared_plugin_manager().get_source_by_name('llm') is LLMSource; "
+                    "assert LLMSource.__module__ == 'elspeth.plugins.sources.llm.source'"
+                ),
+            ],
+            cwd=repository_root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0, f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"

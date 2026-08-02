@@ -1,23 +1,12 @@
 {
   "enableAllProjectMcpServers": true,
   "hooks": {
-    "PostToolUse": [
-      {
-        "hooks": [
-          {
-            "command": "jq -r '.tool_input.file_path // .tool_response.filePath // empty' | { read -r f; case \"$f\" in *.py) ruff format \"$f\" && ruff check --fix \"$f\";; esac; } 2>/dev/null || true",
-            "type": "command"
-          }
-        ],
-        "matcher": "Edit|Write"
-      }
-    ],
     "PreToolUse": [
       {
         "hooks": [
           {
-            "command": "filigree ensure-dashboard",
-            "timeout": 5000,
+            "command": "/home/john/.local/bin/filigree ensure-dashboard",
+            "timeout": 5,
             "type": "command"
           }
         ],
@@ -28,13 +17,13 @@
       {
         "hooks": [
           {
-            "command": "filigree session-context",
-            "timeout": 5000,
+            "command": "/home/john/.local/bin/filigree session-context",
+            "timeout": 5,
             "type": "command"
           },
           {
-            "command": "filigree ensure-dashboard",
-            "timeout": 5000,
+            "command": "/home/john/.local/bin/filigree ensure-dashboard",
+            "timeout": 5,
             "type": "command"
           }
         ]
@@ -50,8 +39,8 @@
       {
         "hooks": [
           {
-            "command": "warpline session-context --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"",
-            "timeout": 5000,
+            "command": "/home/john/.local/bin/warpline session-context --repo \"${CLAUDE_PROJECT_DIR:-$PWD}\"",
+            "timeout": 5,
             "type": "command"
           }
         ]
@@ -60,8 +49,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "legis session-context",
-            "timeout": 5000
+            "command": "/home/john/.local/bin/legis session-context",
+            "timeout": 5
           }
         ]
       }

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ProgressView } from "./ProgressView";
 import { useWebSocket } from "@/hooks/useWebSocket";
@@ -311,6 +311,21 @@ describe("ProgressView", () => {
     ).toBeInTheDocument();
   });
 
+  it("labels the progressbar as queued before execution starts", () => {
+    (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: false,
+      progress: progressFixture({ status: "pending" }),
+    });
+
+    render(<ProgressView />);
+
+    expect(
+      screen.getByRole("progressbar", { name: "Pipeline execution queued" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Pipeline execution in progress")).not.toBeInTheDocument();
+  });
+
   // Mid-run counters need an "in progress" affordance so the numbers don't
   // read as a settled final tally while the run is still going.
   it("shows a running affordance near the counters while the run is in progress", () => {
@@ -323,6 +338,34 @@ describe("ProgressView", () => {
     render(<ProgressView />);
 
     expect(screen.getByText("Running — counts so far")).toBeInTheDocument();
+  });
+
+  it("labels pending counters as queued rather than running", () => {
+    (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: false,
+      progress: progressFixture({ status: "pending" }),
+    });
+
+    render(<ProgressView />);
+
+    expect(screen.getByText("Queued — waiting to start")).toBeInTheDocument();
+    expect(screen.queryByText("Running — counts so far")).not.toBeInTheDocument();
+  });
+
+  it("describes cancellation of a pending run as queued", () => {
+    (useWebSocket as ReturnType<typeof vi.fn>).mockReturnValue({
+      activeRunId: "run-1",
+      wsDisconnected: false,
+      progress: progressFixture({ status: "pending" }),
+    });
+
+    render(<ProgressView />);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel pipeline execution" }));
+
+    expect(
+      screen.getByText("Cancel the queued pipeline? This cannot be undone."),
+    ).toBeInTheDocument();
   });
 
   it("hides the running affordance once the run is terminal", () => {

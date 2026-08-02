@@ -346,6 +346,18 @@ def test_container_insights_performance_log_group_is_terraform_owned() -> None:
     assert "describe-log-groups" in teardown_body
 
 
+def test_container_insights_adoption_guidance_requires_a_replacement_plan() -> None:
+    cold_install = (REPO_ROOT / "docs" / "runbooks" / "aws-ecs-cold-install.md").read_text(encoding="utf-8")
+    deployment = (REPO_ROOT / "docs" / "runbooks" / "aws-ecs-deployment.md").read_text(encoding="utf-8")
+    readme = _text("README.md")
+
+    for text in (cold_install, deployment, readme, _text("scenario-a/main.tf"), _text("scenario-b/main.tf")):
+        normalized = " ".join(text.split())
+        assert "replacement plan" in normalized
+        assert "on that apply" not in normalized
+    assert "obtain a new signed approval" in deployment
+
+
 def test_installer_secret_reads_are_bound_to_the_two_exact_run_namespaces() -> None:
     template = _installer_policy_template_text()
     secret_resources = re.search(r'"Sid": "ReadScenarioSecretValues"(?P<body>.*?)\n    \}', template, re.DOTALL)

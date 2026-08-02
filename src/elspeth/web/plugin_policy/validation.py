@@ -14,7 +14,12 @@ from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, SourceSpec, ValidationEntry, ValidationSummary
 from elspeth.web.interpretation_state import AUTHORING_METADATA_OPTION_KEYS
-from elspeth.web.plugin_policy.coverage import ControlCoverageFinding, control_coverage_findings
+from elspeth.web.plugin_policy.coverage import (
+    ControlCoverageFinding,
+    _source_component_id,
+    _stable_source_items,
+    control_coverage_findings,
+)
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry
 
@@ -57,6 +62,7 @@ class _Component:
     component_type: Literal["source", "transform", "sink"]
     plugin_id: PluginId | None
     options: Mapping[str, object]
+    source_on_validation_failure: str | None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "options")
@@ -137,8 +143,8 @@ def validate_plugin_policy(
 
 
 # Per-diagnosis remediation for coverage findings, keyed on the finding's
-# ``reason`` — never on the stage. The three diagnoses have three different
-# repairs, and a stage-level string cannot be right for all of them: telling
+# ``reason`` — never on the stage. The diagnoses have distinct repairs, and a
+# stage-level string cannot be right for all of them: telling
 # an input-domination (prompt_shield) author to "set on_error to 'discard'"
 # names a repair that cannot address the finding, while the error-route
 # conflict has exactly that one authorable repair. Total over
@@ -153,11 +159,10 @@ _CONTROL_COVERAGE_SUGGESTIONS: dict[str, str] = {
         "the control mode to 'recommend' — it is not an authoring change."
     ),
     "input_fields_unprovable": (
-        "The wiring is already right — do not move the control. Set the control's "
-        "'fields' to 'all' so it scans every string field, or rewrite the node's "
-        "prompt template so every row access is static ('{{ row.field }}', never "
-        "'{{ row[key] }}') and list those exact fields in the control's 'fields'. "
-        "Then validate again."
+        "Do not auto-wire a field-scoped control from the known field subset. Place a "
+        "blocking control after any downstream rewrites and set fields: 'all', or rewrite "
+        "the node's prompt template so every row access is static ('{{ row.field }}', "
+        "never '{{ row[key] }}') and then protect those exact fields. Validate again."
     ),
     "output_not_post_dominated": (
         "Wire the required control transform so it sits on every path that carries the "
@@ -172,6 +177,13 @@ _CONTROL_COVERAGE_SUGGESTIONS: dict[str, str] = {
         "sink, ask the operator to relax the control mode to 'recommend' — it is not an "
         "authoring change."
     ),
+    "output_validation_failure_route_not_post_dominated": (
+        "Set the named source's on_validation_failure to 'discard'. The current graph "
+        "cannot interpose a required output control on a source validation-failure "
+        "route. Then validate again. If failed rows must be kept in a quarantine sink, "
+        "ask the operator to relax the control mode to 'recommend' — it is not an "
+        "authoring change."
+    ),
 }
 
 
@@ -181,7 +193,7 @@ def _field_set(fields: tuple[str, ...]) -> str:
 
 
 def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyFinding:
-    """Name the on_error conflict and its one authorable repair.
+    """Name unrepairable alternate routes and their one authorable repair.
 
     The bare "not covered" message told authors nothing about WHY an
     otherwise-correct pipeline was rejected, and the on_error case is the one
@@ -200,11 +212,13 @@ def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyF
     surface, ``No producer for connection`` when built), so a planner that
     followed the advice would ping-pong between two rejections.
 
-    Preserving the failed rows is a real need with a real answer, but it lives
-    with the operator, not the author: ``on_error: <quarantine sink>`` builds
-    and runs fine, and only the *required* control mode rejects it. Naming that
-    escape hatch keeps the author from concluding the requirement is a bug. See
-    ``docs/reference/configuration.md`` — "Required controls and error routing".
+    The source-side ``on_validation_failure`` route has the same topology
+    constraint: it may write directly to a sink, but the current graph cannot
+    interpose a control on that route. Preserving failed rows is a real need
+    with an operator-owned answer; the only authoring repair under REQUIRED is
+    ``discard``. Naming that escape hatch keeps the author from concluding the
+    requirement is a bug. See ``docs/reference/configuration.md`` — "Required
+    controls and error routing".
     """
     if coverage.reason == "output_error_route_not_post_dominated" and coverage.uncovered_stream is not None:
         message = (
@@ -220,20 +234,42 @@ def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyF
             f"'{coverage.capability.value}' control mode relaxed to 'recommend', or the pipeline "
             "run under the CLI/batch runtime where web plugin policy does not apply."
         )
-    elif coverage.reason == "input_fields_unprovable":
+    elif coverage.reason == "output_validation_failure_route_not_post_dominated" and coverage.uncovered_stream is not None:
         message = (
-            f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
-            f"{coverage.role.value} control upstream, but its own protected field set could not "
-            "be proven from its prompt template, so a control scoped to specific fields cannot be "
-            f"credited: protected fields {_field_set(coverage.protected_fields)}, control scans "
-            f"{_field_set(coverage.scanned_fields)}. An empty protected set is not proof that no "
-            "field needs protecting — a dynamic access such as row[key] extracts nothing either — "
-            "so only a control with fields: 'all' covers it. The wiring itself is correct; this is "
-            "a control-scope repair, not a layout repair."
+            f"Source '{coverage.component_id}' routes rows that fail schema validation to the "
+            f"'{coverage.uncovered_stream}' sink through on_validation_failure. The current "
+            "graph cannot interpose a required output control on that independent write path, "
+            f"so the source is not covered by the required '{coverage.capability.value}' "
+            "output control. Set on_validation_failure to 'discard'. That drops the failed "
+            "row's content while the audit trail still records its terminal outcome and "
+            "content hash. Preserving failed rows in a quarantine sink is an operator "
+            "decision: it requires the control mode relaxed to 'recommend', or the pipeline "
+            "run under the CLI/batch runtime where web plugin policy does not apply."
         )
+    elif coverage.reason == "input_fields_unprovable":
+        if coverage.scanned_fields:
+            message = (
+                f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
+                f"{coverage.role.value} control upstream, but its own protected field set could not "
+                "be proven from its prompt template, so a control scoped to specific fields cannot be "
+                f"credited: protected fields {_field_set(coverage.protected_fields)}, control scans "
+                f"{_field_set(coverage.scanned_fields)}. A dynamic access such as row[key] can read "
+                "outside the statically known set, so only fields: 'all' covers it."
+            )
+        else:
+            message = (
+                f"Node '{coverage.component_id}' has a required '{coverage.capability.value}' "
+                f"{coverage.role.value} control, but its complete protected field set could not be "
+                f"proven from its prompt template (known fields: {_field_set(coverage.protected_fields)}). "
+                "A dynamic access such as row[key] can read outside that set, so Composer cannot safely "
+                "auto-wire a field-scoped control. Place a blocking control after any downstream rewrites "
+                "with fields: 'all', or rewrite the prompt to use only static row fields."
+            )
     else:
+        component_label = "Source" if coverage.component_type == "source" else "Node"
         message = (
-            f"Node '{coverage.component_id}' is not covered by the required '{coverage.capability.value}' {coverage.role.value} control."
+            f"{component_label} '{coverage.component_id}' is not covered by the required "
+            f"'{coverage.capability.value}' {coverage.role.value} control."
         )
         if coverage.protected_fields and coverage.scanned_fields:
             message += (
@@ -259,14 +295,16 @@ def _control_coverage_finding(coverage: ControlCoverageFinding) -> PluginPolicyF
     return PluginPolicyFinding(
         stage="required_control_coverage",
         component_id=coverage.component_id,
-        component_type="transform",
+        component_type=coverage.component_type,
         error_code="required_control_coverage",
         message=message,
         suggestion=suggestion,
     )
 
 
-def _plugin_id(kind: Literal["source", "transform", "sink"], name: str) -> PluginId | None:
+def _plugin_id(kind: Literal["source", "transform", "sink"], name: object) -> PluginId | None:
+    if type(name) is not str:
+        return None
     try:
         return PluginId(kind, name)
     except ValueError:
@@ -275,14 +313,15 @@ def _plugin_id(kind: Literal["source", "transform", "sink"], name: str) -> Plugi
 
 def _components(state: CompositionState) -> tuple[_Component, ...]:
     result: list[_Component] = []
-    for source_name, source in sorted(state.sources.items()):
-        component_id = "source" if source_name == "source" else f"source:{source_name}"
+    for source_name, source in _stable_source_items(state):
+        component_id = _source_component_id(source_name)
         result.append(
             _Component(
                 component_id=component_id,
                 component_type="source",
                 plugin_id=_plugin_id("source", source.plugin),
-                options=deep_thaw(source.options),
+                options=(deep_thaw(source.options) if isinstance(source.options, Mapping) else {}),
+                source_on_validation_failure=source.on_validation_failure,
             )
         )
     for node in state.nodes:
@@ -294,6 +333,7 @@ def _components(state: CompositionState) -> tuple[_Component, ...]:
                 component_type="transform",
                 plugin_id=_plugin_id("transform", node.plugin),
                 options=deep_thaw(node.options),
+                source_on_validation_failure=None,
             )
         )
     for output in state.outputs:
@@ -303,6 +343,7 @@ def _components(state: CompositionState) -> tuple[_Component, ...]:
                 component_type="sink",
                 plugin_id=_plugin_id("sink", output.plugin),
                 options=deep_thaw(output.options),
+                source_on_validation_failure=None,
             )
         )
     return tuple(result)
@@ -332,12 +373,27 @@ def _lower_profiled_components(
         if profile_context is None:
             continue
         plugin_id, aliases, resolved_public_schema = profile_context
-        authored_options = {
-            name: deep_thaw(value) for name, value in component.options.items() if name not in _PROFILE_LOWERING_METADATA_OPTION_KEYS
-        }
-        authoring_metadata = {
-            name: deep_thaw(value) for name, value in component.options.items() if name in _PROFILE_LOWERING_METADATA_OPTION_KEYS
-        }
+        component_options = {name: deep_thaw(value) for name, value in component.options.items()}
+        if component.component_type == "source":
+            route = component.source_on_validation_failure
+            duplicate_route = component_options.get("on_validation_failure", route)
+            if type(route) is not str or type(duplicate_route) is not str or duplicate_route != route:
+                findings.append(
+                    PluginPolicyFinding(
+                        stage="operator_profile_options",
+                        component_id=component.component_id,
+                        component_type=component.component_type,
+                        error_code="profile_unavailable",
+                        message=(
+                            f"Plugin '{plugin_id}' source routing disagrees with its profile-bound "
+                            "on_validation_failure option. Keep one exact source routing value."
+                        ),
+                    )
+                )
+                continue
+            component_options["on_validation_failure"] = route
+        authored_options = {name: value for name, value in component_options.items() if name not in _PROFILE_LOWERING_METADATA_OPTION_KEYS}
+        authoring_metadata = {name: value for name, value in component_options.items() if name in _PROFILE_LOWERING_METADATA_OPTION_KEYS}
         alias = authored_options.pop("profile", None)
         if not isinstance(alias, str) or alias not in aliases:
             findings.append(_profile_unavailable_finding(component, plugin_id, available_aliases=tuple(aliases)))
@@ -407,8 +463,22 @@ def _lower_profiled_components(
                 )
             )
             continue
+        executable_options = deep_thaw(lowered.executable_options)
+        if component.component_type == "source":
+            lowered_route = executable_options.pop("on_validation_failure", None)
+            if type(lowered_route) is not str or lowered_route != component.source_on_validation_failure:
+                findings.append(
+                    PluginPolicyFinding(
+                        stage="operator_profile_options",
+                        component_id=component.component_id,
+                        component_type=component.component_type,
+                        error_code="profile_unavailable",
+                        message=f"Plugin '{plugin_id}' profile lowering changed source on_validation_failure routing.",
+                    )
+                )
+                continue
         lowered_options[(component.component_type, component.component_id)] = {
-            **deep_thaw(lowered.executable_options),
+            **executable_options,
             **authoring_metadata,
         }
 

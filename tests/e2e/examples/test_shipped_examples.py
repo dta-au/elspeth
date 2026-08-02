@@ -43,6 +43,7 @@ _EXAMPLES_WITH_ENV_VARS: frozenset[str] = frozenset(
         "azure_keyvault_secrets",
         "azure_openai_sentiment",
         "chroma_rag_qa",
+        "llm_source",
         "multi_query_assessment",
         "openrouter_multi_query_assessment",
         "openrouter_sentiment",
@@ -319,6 +320,62 @@ class TestShippedExamples:
                 assert source.plugin, f"{name}/{path.name}: source '{source_name}' plugin is empty"
             # Verify at least one sink exists
             assert len(loaded.sinks) > 0, f"{name}/{path.name}: no sinks defined"
+
+    def test_llm_source_example_is_one_static_prompt_to_one_json_sink(self, example_pipeline_dir: Path) -> None:
+        """The bounded LLM example is source-native and emits the configured field shape."""
+        settings_path = example_pipeline_dir / "llm_source" / "settings.yaml"
+        data: dict[str, Any] = yaml.safe_load(settings_path.read_text(encoding="utf-8"))
+
+        assert list(data["sources"]) == ["generated_briefing"]
+        source = data["sources"]["generated_briefing"]
+        assert source["plugin"] == "llm"
+        assert source["on_success"] == "result"
+
+        options = source["options"]
+        assert options["provider"] == "openrouter"
+        assert options["api_key"] == "${OPENROUTER_API_KEY}"
+        assert options["model"] == "openai/gpt-4.1-mini"
+        assert "base_url" not in options
+        assert isinstance(options["prompt_template"], str) and options["prompt_template"].strip()
+        assert "{{" not in options["prompt_template"]
+        assert "{%" not in options["prompt_template"]
+        assert options["response_field"] == "briefing"
+        assert options["schema"] == {"mode": "observed"}
+        assert options["on_validation_failure"] == "discard"
+
+        assert data.get("transforms", []) == []
+        assert list(data["sinks"]) == ["result"]
+        sink = data["sinks"]["result"]
+        assert sink["plugin"] == "json"
+        assert sink["on_write_failure"] == "discard"
+        assert sink["options"]["format"] == "jsonl"
+        assert sink["options"]["collision_policy"] == "auto_increment"
+        assert sink["options"]["schema"] == {"mode": "observed"}
+
+    def test_llm_source_example_cli_validation_makes_no_provider_request(
+        self,
+        example_pipeline_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Static CLI validation neither preflights nor executes the configured provider."""
+        from elspeth.plugins.transforms.llm.providers.openrouter import OpenRouterLLMProvider
+
+        def reject_provider_call(*_args: object, **_kwargs: object) -> None:
+            pytest.fail("elspeth validate crossed the LLM provider boundary")
+
+        monkeypatch.setattr(OpenRouterLLMProvider, "runtime_preflight", reject_provider_call)
+        monkeypatch.setattr(OpenRouterLLMProvider, "execute_query", reject_provider_call)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "provider-token-placeholder")
+        monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
+        monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
+
+        result = CliRunner().invoke(
+            app,
+            ["validate", "--settings", str(example_pipeline_dir / "llm_source" / "settings.yaml")],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Pipeline configuration valid" in result.output
 
     def test_multi_flow_example_executes_end_to_end(
         self,

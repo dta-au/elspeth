@@ -83,6 +83,11 @@ export function YamlView() {
   const hasPipelineContent = hasCompositionContent(compositionState);
 
   useEffect(() => {
+    // The sidecar is valid only for the exact YAML returned by the most recent
+    // successful export. Any new export inputs invalidate the prior pair
+    // immediately, including while the replacement request is in flight.
+    setExportedYamlBlobBinding(null);
+
     if (!activeSessionId || version === null || !hasPipelineContent) {
       setYaml(null);
       setYamlError(null);
@@ -122,6 +127,7 @@ export function YamlView() {
           setYaml(null);
           setYamlError(describeYamlFetchError(error));
           setIsLoading(false);
+          setExportedYamlBlobBinding(null);
         }
       });
 

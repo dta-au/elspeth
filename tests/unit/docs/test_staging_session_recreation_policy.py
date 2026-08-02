@@ -10,7 +10,7 @@ def test_current_cutover_requires_live_epoch_contract_and_forbids_downgrade_repa
     current_cutover = runbook.split("## Current Cutover:", maxsplit=1)[1].split("## Historical Cutover:", maxsplit=1)[0]
     normalized = " ".join(runbook.split())
 
-    assert "0.7.2 blob cleanup, guided decline, coordination, and row_union barrier" in current_cutover
+    assert "0.7.2 blob cleanup, guided decline and replay, coordination, and row_union barrier" in current_cutover
     assert f"session epoch {SESSION_SCHEMA_EPOCH}" in current_cutover
     assert "Landscape epoch 30" in current_cutover
     assert f"0.7.2 advances `SESSION_SCHEMA_EPOCH` from 35 to {SESSION_SCHEMA_EPOCH}" in current_cutover

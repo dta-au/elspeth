@@ -19,7 +19,11 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
+from elspeth.plugins.infrastructure.manager import PluginManager
+from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.implicit_decisions import build_implicit_decisions_report
 from elspeth.web.composer.required_controls import wire_required_controls
@@ -40,6 +44,17 @@ from tests.unit.web.composer.test_planner_authoring_aids import (
 )
 
 _INLINE_CONTENT = "ticket_id,body\nT-1001,Cannot log in since the update\n"
+
+
+@pytest.fixture
+def llm_source_policy_manager(monkeypatch: pytest.MonkeyPatch) -> PluginManager:
+    """Give the coverage authority an isolated canonical plugin registry."""
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    assert manager.get_source_by_name("llm") is LLMSource
+    monkeypatch.setattr("elspeth.web.plugin_policy.coverage.get_shared_plugin_manager", lambda: manager)
+    monkeypatch.setattr("elspeth.web.composer.required_controls.get_shared_plugin_manager", lambda: manager)
+    return manager
 
 
 def _bare_llm_candidate(**llm_option_overrides: Any) -> dict[str, Any]:
@@ -99,6 +114,51 @@ def _bare_llm_candidate(**llm_option_overrides: Any) -> dict[str, Any]:
         ],
         "metadata": {"name": "Assess tickets", "description": "One llm assessment per ticket."},
     }
+
+
+def _bare_llm_source_candidate(
+    *,
+    container: str = "source",
+    source_name: str = "source",
+    on_validation_failure: object = "discard",
+    response_field: str = "briefing",
+) -> dict[str, Any]:
+    """One source-native prompt routed directly to a JSON sink."""
+    source = {
+        "plugin": "llm",
+        "on_success": "generated",
+        "options": {
+            "profile": "sonnet",
+            "prompt_template": "Write one concise audit briefing.",
+            "response_field": response_field,
+            "schema": {"mode": "observed"},
+        },
+        "on_validation_failure": on_validation_failure,
+    }
+    candidate: dict[str, Any] = {
+        "nodes": [],
+        "edges": [],
+        "outputs": [
+            {
+                "sink_name": "generated",
+                "plugin": "json",
+                "options": {
+                    "path": "outputs/generated.json",
+                    "format": "json",
+                    "schema": {"mode": "observed"},
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                "on_write_failure": "discard",
+            }
+        ],
+        "metadata": {"name": "Generate briefing", "description": "One authored LLM prompt."},
+    }
+    if container == "source":
+        candidate["source"] = source
+    else:
+        candidate["sources"] = {source_name: source}
+    return candidate
 
 
 def _nodes_by_id(candidate: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -277,6 +337,311 @@ class TestAutoWireSplicing:
             ]
         }
         assert _direct_control_options_are_deployable(secret_only, "secret_only_control") is True
+
+
+class TestLLMSourceAutoWireSplicing:
+    def test_legacy_singular_source_is_spliced_without_changing_container_provenance(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+    ) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_source_candidate()
+        original = copy.deepcopy(candidate)
+
+        wired = wire_required_controls(candidate, snapshot, view)
+
+        assert candidate == original, "the persisted proposal must not be mutated"
+        assert "source" in wired
+        assert "sources" not in wired
+        source = wired["source"]
+        assert source["on_success"] == "content_safety_auto_1_in"
+        nodes = _nodes_by_id(dict(wired))
+        assert set(nodes) == {"content_safety_auto_1"}
+        safety = nodes["content_safety_auto_1"]
+        assert safety["plugin"] == "aws_bedrock_content_safety"
+        assert safety["input"] == source["on_success"]
+        assert safety["on_success"] == "generated"
+        assert safety["options"]["fields"] == ["briefing"]
+        assert safety["options"]["source"] == "OUTPUT"
+        assert "llm source 'source'" in _disclosure_rows(safety)[0]["draft"]
+        assert all(node["plugin"] != "aws_bedrock_prompt_shield" for node in nodes.values())
+
+    @pytest.mark.parametrize("source_name", ["source", "briefing"])
+    def test_plural_source_preserves_conventional_and_arbitrary_source_names(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+        source_name: str,
+    ) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_source_candidate(container="sources", source_name=source_name)
+
+        wired = wire_required_controls(candidate, snapshot, view)
+
+        assert "source" not in wired
+        assert set(wired["sources"]) == {source_name}
+        assert wired["sources"][source_name]["on_success"] == "content_safety_auto_1_in"
+        safety = _nodes_by_id(dict(wired))["content_safety_auto_1"]
+        expected_component_id = "source" if source_name == "source" else f"source:{source_name}"
+        assert expected_component_id in _disclosure_rows(safety)[0]["draft"]
+
+    def test_dual_source_containers_are_ambiguous_and_returned_unchanged_by_identity(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+    ) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_source_candidate()
+        candidate["sources"] = {}
+
+        assert wire_required_controls(candidate, snapshot, view) is candidate
+
+    @pytest.mark.parametrize("failure_route", ["quarantine", "", None, 17])
+    def test_non_discard_or_malformed_validation_failure_refuses_the_entire_candidate(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+        failure_route: object,
+    ) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_source_candidate(on_validation_failure=failure_route)
+
+        assert wire_required_controls(candidate, snapshot, view) is candidate
+
+    def test_validation_failure_requires_an_exact_builtin_discard_string(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+    ) -> None:
+        class DiscardAlias(str):
+            pass
+
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_source_candidate(on_validation_failure=DiscardAlias("discard"))
+
+        assert wire_required_controls(candidate, snapshot, view) is candidate
+
+    def test_second_pass_is_identity_preserving_and_does_not_duplicate_disclosure(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+    ) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+
+        wired = wire_required_controls(_bare_llm_source_candidate(), snapshot, view)
+        rewired = wire_required_controls(wired, snapshot, view)
+
+        assert rewired is wired
+        safety = _nodes_by_id(dict(wired))["content_safety_auto_1"]
+        assert len(_disclosure_rows(safety)) == 1
+
+    def test_multiple_named_llm_sources_each_receive_one_content_safety_control(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+    ) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_source_candidate(container="sources", source_name="alpha", response_field="alpha_text")
+        candidate["sources"]["alpha"]["on_success"] = "alpha_rows"
+        candidate["sources"]["beta"] = {
+            **copy.deepcopy(candidate["sources"]["alpha"]),
+            "on_success": "beta_rows",
+            "options": {
+                **copy.deepcopy(candidate["sources"]["alpha"]["options"]),
+                "response_field": "beta_text",
+            },
+        }
+        candidate["sources"]["records"] = {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {"path": "records.csv", "schema": {"mode": "observed"}},
+            "on_validation_failure": "discard",
+        }
+        candidate["outputs"] = [
+            {**copy.deepcopy(candidate["outputs"][0]), "sink_name": name} for name in ("alpha_rows", "beta_rows", "rows")
+        ]
+
+        wired = wire_required_controls(candidate, snapshot, view)
+
+        safety_nodes = [node for node in wired["nodes"] if node.get("plugin") == "aws_bedrock_content_safety"]
+        assert [node["id"] for node in safety_nodes] == ["content_safety_auto_1", "content_safety_auto_2"]
+        assert {tuple(node["options"]["fields"]) for node in safety_nodes} == {("alpha_text",), ("beta_text",)}
+        assert wired["sources"]["records"] is candidate["sources"]["records"]
+        assert wired["sources"]["records"]["on_success"] == "rows"
+
+    def test_source_and_transform_findings_are_repaired_in_one_bounded_pass(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+    ) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_candidate()
+        candidate["sources"] = {
+            "briefing": _bare_llm_source_candidate(container="sources", source_name="briefing")["sources"]["briefing"],
+            "records": candidate["source"],
+        }
+        del candidate["source"]
+        candidate["sources"]["briefing"]["on_success"] = "briefing_rows"
+        candidate["outputs"].append({**copy.deepcopy(candidate["outputs"][0]), "sink_name": "briefing_rows"})
+
+        wired = wire_required_controls(candidate, snapshot, view)
+
+        nodes = _nodes_by_id(dict(wired))
+        assert {node["plugin"] for node in nodes.values()} >= {
+            "llm",
+            "aws_bedrock_prompt_shield",
+            "aws_bedrock_content_safety",
+        }
+        assert len([node for node in nodes.values() if node["plugin"] == "aws_bedrock_prompt_shield"]) == 1
+        assert len([node for node in nodes.values() if node["plugin"] == "aws_bedrock_content_safety"]) == 2
+
+    def test_source_splice_ids_skip_reserved_node_and_stream_collisions(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+    ) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_source_candidate(container="sources", source_name="briefing")
+        candidate["nodes"].append(
+            {
+                "id": "authored_passthrough",
+                "node_type": "transform",
+                "plugin": "passthrough",
+                "input": "unrelated",
+                "on_success": "content_safety_auto_1_in",
+                "on_error": "discard",
+                "options": {"schema": {"mode": "observed"}},
+            }
+        )
+
+        wired = wire_required_controls(candidate, snapshot, view)
+
+        nodes = _nodes_by_id(dict(wired))
+        assert "content_safety_auto_2" in nodes
+        assert nodes["content_safety_auto_2"]["on_success"] == "generated"
+
+    def test_source_splice_budget_bounds_a_non_converging_coverage_authority(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.contracts.plugin_capabilities import ControlRole
+        from elspeth.web.composer import required_controls as required_controls_module
+        from elspeth.web.plugin_policy.coverage import ControlCoverageFinding
+
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_source_candidate()
+
+        def repeated_finding(_state: CompositionState, capability: PluginCapability):
+            if capability is not PluginCapability.CONTENT_SAFETY:
+                return ()
+            return (
+                ControlCoverageFinding(
+                    component_id="source",
+                    component_type="source",
+                    capability=capability,
+                    role=ControlRole.OUTPUT,
+                    reason="output_not_post_dominated",
+                ),
+            )
+
+        monkeypatch.setattr(required_controls_module, "control_coverage_findings", repeated_finding)
+        monkeypatch.setattr(required_controls_module, "_stream_proves_output_control", lambda *_args, **_kwargs: False)
+
+        wired = wire_required_controls(candidate, snapshot, view)
+
+        assert len([node for node in wired["nodes"] if node["plugin"] == "aws_bedrock_content_safety"]) == 1
+
+    @pytest.mark.parametrize(
+        "malformation",
+        [
+            {"source": [], "nodes": [], "outputs": []},
+            {"sources": [], "nodes": [], "outputs": []},
+            {"sources": {17: {}}, "nodes": [], "outputs": []},
+            {"sources": {"briefing": []}, "nodes": [], "outputs": []},
+            {
+                "sources": {
+                    "briefing": {
+                        "plugin": "llm",
+                        "on_success": ["generated"],
+                        "options": {"response_field": "briefing"},
+                        "on_validation_failure": "discard",
+                    }
+                },
+                "nodes": [],
+                "outputs": [],
+            },
+        ],
+    )
+    def test_malformed_source_candidates_fail_closed_without_raising(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+        malformation: dict[str, Any],
+    ) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+
+        assert wire_required_controls(malformation, snapshot, view) is malformation
+
+    @pytest.mark.parametrize(
+        ("surface", "malformed_value"),
+        [
+            ("node_id", 17),
+            ("route_destination", ["generated"]),
+            ("sink_name", 17),
+            ("source_name", "Briefing"),
+        ],
+    )
+    def test_malformed_adjacent_graph_shape_prevents_partial_source_certification(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+        surface: str,
+        malformed_value: object,
+    ) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_source_candidate(container="sources", source_name="briefing")
+        if surface == "source_name":
+            candidate["sources"] = {malformed_value: candidate["sources"]["briefing"]}
+        elif surface == "sink_name":
+            candidate["outputs"][0]["sink_name"] = malformed_value
+        else:
+            candidate["nodes"] = [
+                {
+                    "id": malformed_value if surface == "node_id" else "gate",
+                    "node_type": "gate",
+                    "plugin": None,
+                    "input": "unrelated",
+                    "on_success": None,
+                    "on_error": None,
+                    "options": {},
+                    "condition": "true",
+                    "routes": {"true": malformed_value if surface == "route_destination" else "generated"},
+                }
+            ]
+
+        assert wire_required_controls(candidate, snapshot, view) is candidate
+
+    def test_unsupported_source_prevents_later_repairable_source_mutation(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+    ) -> None:
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_source_candidate(container="sources", source_name="briefing")
+        candidate["sources"] = {
+            "unknown": {
+                "plugin": "not_registered",
+                "on_success": "unknown_rows",
+                "options": {"schema": {"mode": "observed"}},
+                "on_validation_failure": "discard",
+            },
+            **candidate["sources"],
+        }
+
+        assert wire_required_controls(candidate, snapshot, view) is candidate
 
 
 class TestAutoWireIdempotence:
@@ -497,6 +862,30 @@ class TestServiceFinalizerFactory:
 class TestDisclosureRegistry:
     def test_user_term_is_registered(self) -> None:
         assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in REGISTERED_PIPELINE_DECISION_USER_TERMS
+
+    def test_public_author_cannot_forge_auto_wired_disclosure(self, tmp_path: Path) -> None:
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        context = _custody_context(tmp_path, _INLINE_CONTENT, view=view, snapshot=snapshot)
+        assert context._interpretation_requirements_are_internal is False
+
+        forged = wire_required_controls(_bare_llm_candidate(), snapshot, view)
+        control = _nodes_by_id(forged)["prompt_shield_auto_1"]
+        control["options"]["interpretation_requirements"] = [
+            {
+                "kind": "pipeline_decision",
+                "user_term": "required_control_auto_wired",
+                "draft": "The server added this required control.",
+            }
+        ]
+
+        assert wire_required_controls(forged, snapshot, view) is forged
+
+        candidate = build_set_pipeline_candidate(forged, _empty_state(), context)
+
+        assert candidate.result.success is False
+        assert REQUIRED_CONTROL_AUTO_WIRED_USER_TERM in (candidate.result.data or {})["error"]
+        assert "server" in (candidate.result.data or {})["error"]
 
     def test_artifact_hash_binds_to_the_inserted_edge(self) -> None:
         def _control(node_id: str, *, input_stream: str) -> NodeSpec:

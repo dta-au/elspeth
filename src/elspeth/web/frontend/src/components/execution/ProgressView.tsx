@@ -111,8 +111,10 @@ export function ProgressView() {
     progress.status === "cancelled" ||
     progress.status === "failed";
   const cancelRequested = progress.cancel_requested === true && !isTerminal;
+  const isPending = progress.status === "pending";
   const statusAnnouncement = buildStatusAnnouncement(progress, cancelRequested);
   const displayStatus = cancelRequested ? ("cancelling" as const) : progress.status;
+  const progressBarLabel = isPending ? "Pipeline execution queued" : "Pipeline execution in progress";
 
   return (
     <div className="progress-container">
@@ -159,7 +161,11 @@ export function ProgressView() {
       {showCancelConfirm && (
         <ConfirmDialog
           title="Cancel pipeline"
-          message="Cancel the running pipeline? This cannot be undone."
+          message={
+            isPending
+              ? "Cancel the queued pipeline? This cannot be undone."
+              : "Cancel the running pipeline? This cannot be undone."
+          }
           confirmLabel="Cancel pipeline"
           variant="danger"
           onConfirm={() => {
@@ -181,7 +187,7 @@ export function ProgressView() {
       <div
         className="progress-bar progress-bar-outer"
         role={isTerminal ? undefined : "progressbar"}
-        aria-label={isTerminal ? undefined : "Pipeline execution in progress"}
+        aria-label={isTerminal ? undefined : progressBarLabel}
       >
         <div
           className={isTerminal ? "progress-bar-complete" : "progress-bar-stripe"}
@@ -214,7 +220,9 @@ export function ProgressView() {
           in-progress affordance — this caption makes clear the numbers
           below are a running total, not a finished result. */}
       {!isTerminal && (
-        <div className="progress-counters-caption">Running — counts so far</div>
+        <div className="progress-counters-caption">
+          {isPending ? "Queued — waiting to start" : "Running — counts so far"}
+        </div>
       )}
 
       {/* Source/token counters -- large and prominent */}

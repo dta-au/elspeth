@@ -1996,6 +1996,7 @@ def test_route_adapter_dispatches_all_six_schema8_stage_transitions(
         guided,
         turn,
         request_model,
+        catalog=object(),  # Authority is replaced above; no catalog access occurs.
         new_stable_id=server_stable_id,
     )
 
@@ -2097,6 +2098,7 @@ def test_route_adapter_dispatches_closed_component_review_actions(
         guided,
         turn,
         request,
+        catalog=object(),  # Component actions do not consult the catalog.
         new_stable_id=UUID("33333333-3333-4333-8333-333333333333"),
     )
 

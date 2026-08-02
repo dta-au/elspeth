@@ -27,7 +27,13 @@ from elspeth.plugins.infrastructure.clients.llm import (
     RateLimitError,
     ServerError,
 )
-from elspeth.plugins.transforms.llm.provider import FinishReason, LLMProvider, LLMQueryResult, UnrecognizedFinishReason
+from elspeth.plugins.transforms.llm.provider import (
+    FinishReason,
+    LLMAuditParent,
+    LLMProvider,
+    LLMQueryResult,
+    UnrecognizedFinishReason,
+)
 from elspeth.testing import make_pipeline_row
 
 # ---------------------------------------------------------------------------
@@ -573,7 +579,7 @@ class TestTruncationDetection:
 
         call_count = [0]
 
-        def mock_execute_query(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute_query(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 2:
                 return LLMQueryResult(
@@ -787,7 +793,7 @@ class TestMultiQueryPartialFailure:
         # Mock provider: queries 1,2 succeed, query 3 fails, query 4 would succeed
         call_count = [0]
 
-        def mock_execute_query(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute_query(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 3:
                 raise LLMClientError("Bad response for query 3", retryable=False)
@@ -831,7 +837,7 @@ class TestMultiQueryPartialFailure:
 
         call_count = [0]
 
-        def mock_execute_query(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute_query(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 2:
                 return LLMQueryResult(
@@ -1109,7 +1115,7 @@ class TestMultiQueryContextLength:
         transform = LLMTransform(config)
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 2:
                 raise ContextLengthError("Context too long for q2")
@@ -1898,7 +1904,7 @@ class TestMultiQueryFieldTypeValidation:
         mock_provider = Mock(spec=LLMProvider)
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 return LLMQueryResult(
@@ -2008,7 +2014,7 @@ class TestMultiQuerySequentialRetryBehavior:
         # Record (query order) of calls: q1 then q2 then q2-retry.
         q2_attempts = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             # Fail q2's first attempt only (call #2); its retry (call #3) succeeds.
             if call_count[0] == 2:
@@ -2095,7 +2101,7 @@ class TestMultiQuerySequentialReasonImmutability:
 
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 return LLMQueryResult(
@@ -2200,7 +2206,7 @@ class TestMultiQueryParallelExecution:
         transform = LLMTransform(config)
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 2:
                 raise ContentPolicyError("Content blocked for q2")
@@ -2249,7 +2255,7 @@ class TestMultiQueryParallelExecution:
         transform = LLMTransform(config)
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             if call_count[0] == 1:
                 return LLMQueryResult(
@@ -2297,7 +2303,7 @@ class TestMultiQueryParallelExecution:
         transform = LLMTransform(config)
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             # q2 (2nd call) fails non-retryable; q1 and q3 succeed
             if call_count[0] == 2:
@@ -2347,7 +2353,7 @@ class TestMultiQueryParallelExecution:
         transform = LLMTransform(config)
         call_count = [0]
 
-        def mock_execute(messages, *, model, temperature, max_tokens, state_id, token_id, response_format=None):
+        def mock_execute(messages, *, model, temperature, max_tokens, audit_parent: LLMAuditParent, response_format=None):
             call_count[0] += 1
             # q1 succeeds, q2 and q3 both fail
             if call_count[0] == 1:
@@ -2609,11 +2615,7 @@ class TestAzureAITracingOnStart:
     """Tests for _configure_azure_monitor() wiring in on_start()."""
 
     def test_on_start_calls_configure_azure_monitor(self) -> None:
-        """on_start() calls _configure_azure_monitor for AzureAITracingConfig.
-
-        Also verifies success-path logging: logger.info is called with
-        "Azure AI tracing initialized" and the content_recording value.
-        """
+        """on_start configures Azure tracing without duplicate lifecycle logging."""
         from elspeth.plugins.transforms.llm.tracing import AzureAITracingConfig
         from elspeth.plugins.transforms.llm.transform import LLMTransform
 
@@ -2642,12 +2644,7 @@ class TestAzureAITracingOnStart:
             assert isinstance(call_arg, AzureAITracingConfig)
             assert call_arg.connection_string == "InstrumentationKey=test"
 
-            # Verify success-path logging includes content_recording value
-            mock_logger.info.assert_any_call(
-                "Azure AI tracing initialized",
-                provider="azure_ai",
-                content_recording=True,
-            )
+            mock_logger.info.assert_not_called()
 
     def test_on_start_propagates_import_error_from_configure(self) -> None:
         """on_start() lets ImportError propagate when _configure_azure_monitor fails."""

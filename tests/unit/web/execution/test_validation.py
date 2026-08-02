@@ -10,7 +10,7 @@ W18 fix: Only typed exceptions are caught — no bare except Exception.
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -288,6 +288,347 @@ def test_required_prompt_shield_coverage_fails_before_constructor() -> None:
     assert result.errors[0].component_id == "test_node"
     assert result.errors[0].error_code == "required_control_coverage"
     constructor.assert_not_called()
+
+
+def test_required_content_safety_for_llm_source_fails_closed_with_source_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Execution rejects an unrepairable source failure route before construction."""
+    from elspeth.plugins.infrastructure.manager import PluginManager
+    from elspeth.web.dependencies import create_catalog_service
+
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    monkeypatch.setattr(
+        "elspeth.web.plugin_policy.coverage.get_shared_plugin_manager",
+        lambda: manager,
+    )
+
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+    llm_source_id = PluginId("source", "llm")
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="required-source-control-policy",
+        principal_scope="local:alice",
+        available=unrestricted.available | {llm_source_id},
+        unavailable=(),
+        selected=unrestricted.selected,
+        usable_profile_aliases=(),
+        selected_profile_aliases=(),
+        control_modes=((PluginCapability.CONTENT_SAFETY, ControlMode.REQUIRED),),
+        binding_generation_fingerprint="required-source-control-generation",
+    )
+    state = CompositionState(
+        source=SourceSpec(
+            plugin="llm",
+            on_success="transform_in",
+            options={
+                "prompt_template": "Write one audit briefing.",
+                "response_field": "briefing",
+            },
+            on_validation_failure="quarantine",
+        ),
+        nodes=(
+            replace(
+                _make_node(
+                    plugin="azure_content_safety",
+                    options={"detect_only": False, "fields": ["briefing"]},
+                ),
+                on_success="primary",
+            ),
+        ),
+        edges=(),
+        outputs=(_make_output(), _make_output(name="quarantine")),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+    with patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as constructor:
+        result = validate_pipeline_for_trained_operator(
+            state,
+            _make_settings(),
+            _FakeYamlGenerator(),
+            plugin_snapshot=snapshot,
+        )
+        malformed_result = validate_pipeline_for_trained_operator(
+            CompositionState(
+                source=SourceSpec(
+                    plugin="llm",
+                    on_success=[],  # type: ignore[arg-type]
+                    options=[],  # type: ignore[arg-type]
+                    on_validation_failure=[],  # type: ignore[arg-type]
+                ),
+                nodes=(),
+                edges=(),
+                outputs=(_make_output(),),
+                metadata=PipelineMetadata(),
+                version=1,
+            ),
+            _make_settings(),
+            _FakeYamlGenerator(),
+            plugin_snapshot=snapshot,
+        )
+
+    assert result.is_valid is False
+    assert result.errors[0].error_code == "required_control_coverage"
+    assert result.errors[0].component_id == "source"
+    assert result.errors[0].component_type == "source"
+    assert "on_validation_failure" in result.errors[0].message
+    assert result.readiness.blockers[0].component_id == "source"
+    assert result.readiness.blockers[0].component_type == "source"
+    assert malformed_result.is_valid is False
+    assert malformed_result.errors[0].error_code == "required_control_coverage"
+    assert malformed_result.errors[0].component_id == "source"
+    assert malformed_result.errors[0].component_type == "source"
+    constructor.assert_not_called()
+
+
+def _isolated_llm_source_policy_context() -> tuple[PluginAvailabilitySnapshot, Any]:
+    """Return a snapshot/catalog with the built-in LLM source."""
+    from elspeth.plugins.infrastructure.manager import PluginManager
+    from elspeth.web.catalog.service import CatalogServiceImpl
+
+    manager = PluginManager()
+    manager.register_builtin_plugins()
+    catalog = CatalogServiceImpl(manager)
+    return PluginAvailabilitySnapshot.for_trained_operator(catalog), catalog
+
+
+def _llm_source_state(*, source_name: str = "source", options: dict[str, Any]) -> CompositionState:
+    return CompositionState(
+        sources={
+            source_name: SourceSpec(
+                plugin="llm",
+                on_success="primary",
+                options=options,
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(),
+        edges=(),
+        outputs=(_make_output(),),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+class TestValidatePipelineLlmSourcePolicy:
+    """The source-native LLM receives web policy without transform semantics."""
+
+    def test_named_source_base_url_is_rejected_with_source_attribution(self) -> None:
+        snapshot, catalog = _isolated_llm_source_policy_context()
+        state = _llm_source_state(
+            source_name="briefing",
+            options={"base_url": "https://credential-canary.attacker.invalid/private"},
+        )
+        yaml_generator = MagicMock(spec=YamlGenerator)
+        yaml_generator.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
+
+        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as settings_loader:
+            settings_loader.side_effect = ValueError("settings stop")
+            result = validate_pipeline_for_trained_operator(
+                state,
+                _make_settings(),
+                yaml_generator,
+                plugin_snapshot=snapshot,
+                catalog=catalog,
+            )
+
+        assert result.is_valid is False
+        assert _check(result, "llm_base_url_policy").passed is False
+        assert result.errors[0].error_code == "llm_base_url_not_allowed"
+        assert result.errors[0].component_id == "source:briefing"
+        assert result.errors[0].component_type == "source"
+        assert "LLM sources" in result.errors[0].message
+        assert "LLM nodes" not in result.errors[0].message
+        assert "credential-canary" not in result.errors[0].message
+        assert result.readiness.blockers[0].component_id == "source:briefing"
+        assert result.readiness.blockers[0].component_type == "source"
+        yaml_generator.generate_yaml.assert_called_once_with(state)
+        settings_loader.assert_not_called()
+
+    def test_source_tracing_is_rejected_without_leaking_destination_or_secret(self) -> None:
+        snapshot, catalog = _isolated_llm_source_policy_context()
+        state = _llm_source_state(
+            options={
+                "tracing": {
+                    "provider": "langfuse",
+                    "host": "https://credential-canary.attacker.invalid",
+                    "secret_key": {"secret_ref": "LANGFUSE_SECRET_CANARY"},
+                }
+            },
+        )
+        yaml_generator = MagicMock(spec=YamlGenerator)
+        yaml_generator.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
+
+        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as settings_loader:
+            settings_loader.side_effect = ValueError("settings stop")
+            result = validate_pipeline_for_trained_operator(
+                state,
+                _make_settings(),
+                yaml_generator,
+                plugin_snapshot=snapshot,
+                catalog=catalog,
+            )
+
+        assert result.is_valid is False
+        assert _check(result, "llm_tracing_policy").passed is False
+        assert result.errors[0].error_code == "llm_tracing_not_allowed"
+        assert result.errors[0].component_id == "source"
+        assert result.errors[0].component_type == "source"
+        assert "LLM sources" in result.errors[0].message
+        assert "LLM nodes" not in result.errors[0].message
+        assert "credential-canary" not in result.errors[0].message
+        assert "LANGFUSE_SECRET_CANARY" not in result.errors[0].message
+        yaml_generator.generate_yaml.assert_called_once_with(state)
+        settings_loader.assert_not_called()
+
+    def test_malformed_source_base_url_fails_closed_without_reflecting_value(self) -> None:
+        snapshot, catalog = _isolated_llm_source_policy_context()
+        malformed_canary = "https://[BASE_URL_CANARY"
+        state = _llm_source_state(options={"base_url": malformed_canary})
+        yaml_generator = MagicMock(spec=YamlGenerator)
+        yaml_generator.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
+
+        result = validate_pipeline_for_trained_operator(
+            state,
+            _make_settings(),
+            yaml_generator,
+            plugin_snapshot=snapshot,
+            catalog=catalog,
+        )
+
+        assert result.is_valid is False
+        assert result.errors[0].error_code == "llm_base_url_not_allowed"
+        assert result.errors[0].component_id == "source"
+        assert result.errors[0].component_type == "source"
+        assert "BASE_URL_CANARY" not in result.errors[0].message
+
+    def test_multiple_source_policy_failures_are_source_first_and_lexical(self) -> None:
+        snapshot, catalog = _isolated_llm_source_policy_context()
+        state = CompositionState(
+            sources={
+                name: SourceSpec(
+                    plugin="llm",
+                    on_success=f"{name}_stream",
+                    options={"base_url": f"https://{name}.attacker.invalid/v1"},
+                    on_validation_failure="discard",
+                )
+                for name in ("zeta", "alpha")
+            },
+            nodes=(),
+            edges=(),
+            outputs=(_make_output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        yaml_generator = MagicMock(spec=YamlGenerator)
+        yaml_generator.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
+
+        result = validate_pipeline_for_trained_operator(
+            state,
+            _make_settings(),
+            yaml_generator,
+            plugin_snapshot=snapshot,
+            catalog=catalog,
+        )
+
+        assert result.is_valid is False
+        assert result.errors[0].component_id == "source:alpha"
+        assert result.errors[0].component_type == "source"
+
+    def test_source_queries_do_not_enter_transform_multi_query_retry_policy(self) -> None:
+        snapshot, catalog = _isolated_llm_source_policy_context()
+        state = _llm_source_state(options={"queries": [{"name": "not-a-source-feature"}]})
+        yaml_generator = MagicMock(spec=YamlGenerator)
+        yaml_generator.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
+
+        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as settings_loader:
+            settings_loader.side_effect = ValueError("settings stop")
+            result = validate_pipeline_for_trained_operator(
+                state,
+                _make_settings(),
+                yaml_generator,
+                plugin_snapshot=snapshot,
+                catalog=catalog,
+            )
+
+        assert _check(result, "llm_retry_budget_policy").passed is True
+        assert all(error.error_code != "llm_retry_budget_policy" for error in result.errors)
+        yaml_generator.generate_yaml.assert_called_once_with(state)
+
+    def test_source_profile_failure_keeps_named_source_identity(self) -> None:
+        trained_snapshot, catalog = _isolated_llm_source_policy_context()
+        source_id = PluginId("source", "llm")
+        snapshot = PluginAvailabilitySnapshot.create(
+            policy_hash="llm-source-profile-attribution",
+            principal_scope="local:alice",
+            available=trained_snapshot.available,
+            unavailable=(),
+            selected=trained_snapshot.selected,
+            usable_profile_aliases=((source_id, ()),),
+            selected_profile_aliases=((source_id, None),),
+            binding_generation_fingerprint="llm-source-profile-attribution-generation",
+        )
+        state = _llm_source_state(
+            source_name="briefing",
+            options={
+                "profile": "missing-profile",
+                "prompt_template": "Write one briefing.",
+                "schema": {"mode": "observed"},
+            },
+        )
+        yaml_generator = MagicMock(spec=YamlGenerator)
+
+        result = _validate_pipeline(
+            state,
+            _make_settings(),
+            yaml_generator,
+            plugin_snapshot=snapshot,
+            profile_registry=None,
+            catalog=catalog,
+            session_id="test-session",
+        )
+
+        assert result.is_valid is False
+        assert result.errors[0].error_code == "profile_unavailable"
+        assert result.errors[0].component_id == "source:briefing"
+        assert result.errors[0].component_type == "source"
+        assert result.readiness.blockers[0].component_id == "source:briefing"
+        assert result.readiness.blockers[0].component_type == "source"
+        yaml_generator.generate_yaml.assert_not_called()
+
+    def test_source_prompt_model_and_profile_do_not_enter_interpretation_review(self) -> None:
+        snapshot, catalog = _isolated_llm_source_policy_context()
+        state = _llm_source_state(
+            options={
+                "profile": "operator-owned-profile",
+                "model": "operator/model",
+                "prompt_template": "Write one briefing.",
+            }
+        )
+        yaml_generator = MagicMock(spec=YamlGenerator)
+        yaml_generator.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
+
+        with patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as settings_loader:
+            settings_loader.side_effect = ValueError("settings stop")
+            result = validate_pipeline_for_trained_operator(
+                state,
+                _make_settings(),
+                yaml_generator,
+                plugin_snapshot=snapshot,
+                catalog=catalog,
+            )
+
+        assert _check(result, "interpretation_review").passed is True
+        assert all(error.error_code != "interpretation_review_pending" for error in result.errors)
+        yaml_generator.generate_yaml.assert_called_once_with(state)
+
+    def test_static_prompt_advisory_remains_transform_only(self) -> None:
+        from elspeth.web.execution.validation import _find_static_llm_prompt_advisories
+
+        state = _llm_source_state(options={"prompt_template": "Write one briefing."})
+
+        assert _find_static_llm_prompt_advisories(state) == []
 
 
 def test_operator_profile_lowering_preserves_authored_state() -> None:
@@ -5405,7 +5746,7 @@ class TestPluginPolicySuggestions:
             binding_generation_fingerprint="required-control-generation",
         )
         state = _make_state(
-            nodes=(_make_node(plugin="llm"),),
+            nodes=(_make_node(plugin="llm", options={"prompt_template": "Assess {{ row.ticket_id }}"}),),
             outputs=(_make_output(),),
         )
 

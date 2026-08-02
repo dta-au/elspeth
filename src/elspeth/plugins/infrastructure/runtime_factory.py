@@ -180,7 +180,10 @@ def instantiate_plugins_from_config(
     # YAML with hallucinated values is rejected at construction time.
     from elspeth.engine.orchestrator.preflight import validate_value_source_compliance
 
-    validate_value_source_compliance(_value_source_wired_transforms(bundle))
+    validate_value_source_compliance(
+        _value_source_wired_transforms(bundle),
+        sources=bundle.sources,
+    )
     return bundle
 
 
