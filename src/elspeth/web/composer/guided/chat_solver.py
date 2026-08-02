@@ -627,7 +627,9 @@ _DEFERRED_INTENT_TOOL: dict[str, Any] = {
         "name": "retain_deferred_intent",
         "description": (
             "Use only when the user gives a concrete instruction whose responsible guided stage is later than the current stage. "
-            "Emit structural facts only; never copy raw user prose into redacted_summary."
+            "Emit structural facts only; never copy raw user prose into redacted_summary. "
+            "Gate, coalesce, row_union, and queue are structural node types, never transform plugins. "
+            "If this schema cannot faithfully encode the instruction, ask for clarification instead of fabricating a catalog identity."
         ),
         "parameters": {
             "type": "object",

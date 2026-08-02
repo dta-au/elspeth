@@ -1367,6 +1367,107 @@ def _last_chat_turn_audit(client: TestClient, session_id: str) -> dict:
     return dict(envelopes[-1]["turn"])
 
 
+def test_model_authored_transform_identity_for_structural_gate_retains_unverified_clarification(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = composer_test_client
+    session_id = _create_session(client)
+    user_message = (
+        "This is an orders CSV. Later on I want a gate that routes rows with amount greater than 500 to a high_value JSON sink, "
+        "and everything else to a standard JSON sink. Every row must land in exactly one of them."
+    )
+    catalog, snapshot = _policy_context(
+        (("transform", "passthrough"),),
+        available=frozenset({PluginId("transform", "passthrough")}),
+    )
+    monkeypatch.setattr(guided_chat_atomic, "_request_plugin_policy_context", lambda _request, _user: (catalog, snapshot))
+    monkeypatch.setattr(guided_route, "_request_plugin_policy_context", lambda _request, _user: (catalog, snapshot))
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _provider(_action(catalog_name="numeric_route")))
+    turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+
+    response = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=turn["turn_token"],
+        message=user_message,
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assistant_message = body["assistant_message"]
+    assert "not installed" not in assistant_message.lower()
+    assert "gate" in assistant_message.lower()
+    assert "structure was not verified" in assistant_message.lower()
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    audit_turn = _last_chat_turn_audit(client, session_id)
+    assert audit_turn["status"] == ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE.value
+    assert audit_turn["error_class"] == "DeferredIntentModelCatalogIdentity"
+    guided = _guided(client, session_id)
+    (intent,) = guided.deferred_intents
+    assert intent.constraints == ()
+    assert intent.catalog_kind is None
+    assert intent.catalog_name is None
+    assert intent.message_content_hash == stable_hash(user_message)
+    ((originating_message_id, persisted_message),) = _non_root_user_rows(client, session_id)
+    assert persisted_message == user_message
+    assert intent.originating_message_id == originating_message_id
+
+
+@pytest.mark.parametrize(
+    ("installed_requested", "expected_reason"),
+    [
+        pytest.param(False, "is not installed", id="not-installed"),
+        pytest.param(True, "is not enabled by the current policy", id="policy-denied"),
+    ],
+)
+def test_user_named_unavailable_transform_reports_bounded_policy_visible_alternatives(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    installed_requested: bool,
+    expected_reason: str,
+) -> None:
+    client = composer_test_client
+    session_id = _create_session(client)
+    user_message = "Later use the numeric_route transform during topology authoring."
+    visible_names = ("alpha", "beta", "delta", "epsilon", "gamma", "zeta")
+    installed = (
+        tuple(("transform", name) for name in visible_names)
+        + ((("transform", "numeric_route"),) if installed_requested else ())
+        + (("transform", "secret_transform"),)
+    )
+    available = frozenset(PluginId("transform", name) for name in visible_names)
+    catalog, snapshot = _policy_context(installed, available=available)
+    monkeypatch.setattr(guided_chat_atomic, "_request_plugin_policy_context", lambda _request, _user: (catalog, snapshot))
+    monkeypatch.setattr(guided_route, "_request_plugin_policy_context", lambda _request, _user: (catalog, snapshot))
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _provider(_action(catalog_name="numeric_route")))
+    turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+
+    response = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=turn["turn_token"],
+        message=user_message,
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert expected_reason in body["assistant_message"]
+    assert "Policy-visible transform alternatives: alpha, beta, delta, epsilon, gamma." in body["assistant_message"]
+    assert "secret_transform" not in body["assistant_message"]
+    assert "zeta" not in body["assistant_message"]
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    audit_turn = _last_chat_turn_audit(client, session_id)
+    assert audit_turn["status"] == ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE.value
+    assert audit_turn["error_class"] == "DeferredIntentUnsupported"
+    assert _guided(client, session_id).deferred_intents == ()
+
+
 _PAIR_RETAIN_ARGUMENTS: dict[str, object] = {
     "target_stage": "topology",
     "catalog_kind": "transform",
@@ -1963,7 +2064,7 @@ def test_exact_policy_denial_wins_over_same_name_visible_in_another_kind_at_each
     if stage == "sink":
         TestStepChatCrossStep._seed_csv_blob(client, session_id)
         TestStepChatCrossStep._configure_csv_source(client, session_id)
-    private_message = "Privately remember the unavailable transform for topology."
+    private_message = "Privately remember the unavailable llm transform for topology."
     catalog, snapshot = _policy_context(
         (("source", "llm"), ("transform", "llm")),
         available=frozenset({PluginId("source", "llm")}),
@@ -1982,7 +2083,12 @@ def test_exact_policy_denial_wins_over_same_name_visible_in_another_kind_at_each
     )
 
     assert response.status_code == 200, response.json()
-    assert response.json()["assistant_message"] == "The transform plugin 'llm' is not enabled by the current policy."
+    body = response.json()
+    assert body["assistant_message"] == (
+        "The transform plugin 'llm' is not enabled by the current policy. No policy-visible transform alternatives are available."
+    )
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
     assert private_message not in _text_outside_chat_history(response.json())
     guided = _guided(client, session_id)
     assert guided.deferred_intents == ()
@@ -2274,7 +2380,7 @@ def test_absence_policy_denial_and_current_target_clarify_without_mutation(
         session_id,
         operation_id=str(uuid4()),
         turn_token=turn["turn_token"],
-        message="private wrong-stage detail",
+        message=f"private wrong-stage detail naming {action.catalog_name}",
     )
 
     assert response.status_code == 200, response.json()

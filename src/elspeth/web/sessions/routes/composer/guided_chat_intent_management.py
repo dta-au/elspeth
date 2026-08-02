@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, cast
@@ -11,6 +12,7 @@ from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentAccepted,
     DeferredIntentAction,
@@ -189,13 +191,18 @@ def _guided_stage_name(step: GuidedStep) -> StageName:
 def _deferred_disposition_chat(
     disposition: DeferredIntentAccepted | DeferredIntentClarification | DeferredIntentUnsupported | DeferredIntentRejected,
     *,
+    catalog: PolicyCatalogView,
     latency_ms: int,
 ) -> StepChatResult:
     if type(disposition) is DeferredIntentAccepted:
         message = f"I saved that instruction for the {disposition.action.target_stage.replace('_', ' ')} stage."
+        status = ComposerChatTurnStatus.SUCCESS
+        error_class = None
     elif type(disposition) is DeferredIntentClarification:
         kinds = ", ".join(disposition.plugin_kinds)
         message = f"I found {disposition.plugin_name!r} in more than one plugin category ({kinds}). Which category did you mean?"
+        status = ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+        error_class = "DeferredIntentClarification"
     elif type(disposition) is DeferredIntentUnsupported:
         if disposition.reason.value == "plugin_not_enabled":
             message = f"The {disposition.plugin_kind} plugin {disposition.plugin_name!r} is not enabled by the current policy."
@@ -203,13 +210,77 @@ def _deferred_disposition_chat(
             message = f"The {disposition.plugin_kind} plugin {disposition.plugin_name!r} is not installed."
         else:
             message = f"The {disposition.plugin_kind} plugin {disposition.plugin_name!r} is currently unavailable."
+        alternatives = _policy_visible_alternatives(
+            catalog,
+            plugin_kind=disposition.plugin_kind,
+            excluded_name=disposition.plugin_name,
+        )
+        if alternatives:
+            message = f"{message} Policy-visible {disposition.plugin_kind} alternatives: {', '.join(alternatives)}."
+        else:
+            message = f"{message} No policy-visible {disposition.plugin_kind} alternatives are available."
+        status = ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+        error_class = "DeferredIntentUnsupported"
     else:
         message = "I couldn't safely retain that as a future-stage instruction. Please clarify the target stage and structural requirement."
+        status = ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
+        error_class = "DeferredIntentRejected"
     return StepChatResult(
         assistant_message=message,
-        status=ComposerChatTurnStatus.SUCCESS,
+        status=status,
         latency_ms=latency_ms,
-        error_class=None,
+        error_class=error_class,
+    )
+
+
+_MAX_POLICY_VISIBLE_ALTERNATIVES = 5
+_STRUCTURAL_NODE_TYPES = ("gate", "coalesce", "row_union", "queue")
+
+
+def _message_names_identifier(message: str, identifier: str) -> bool:
+    """Match one canonical catalog identifier without alias normalization."""
+
+    return re.search(rf"(?<![a-z0-9_]){re.escape(identifier)}(?![a-z0-9_])", message.casefold()) is not None
+
+
+def _policy_visible_alternatives(
+    catalog: PolicyCatalogView,
+    *,
+    plugin_kind: PluginKind,
+    excluded_name: str,
+) -> tuple[str, ...]:
+    if plugin_kind == "source":
+        plugins = catalog.list_sources()
+    elif plugin_kind == "transform":
+        plugins = catalog.list_transforms()
+    else:
+        plugins = catalog.list_sinks()
+    names = sorted(plugin.name for plugin in plugins if plugin.name != excluded_name)
+    return tuple(names[:_MAX_POLICY_VISIBLE_ALTERNATIVES])
+
+
+def _model_catalog_identity_chat(*, user_message: str, latency_ms: int) -> StepChatResult:
+    structural_node = next(
+        (node_type for node_type in _STRUCTURAL_NODE_TYPES if _message_names_identifier(user_message, node_type)),
+        None,
+    )
+    if structural_node is None:
+        message = (
+            "I kept that future-stage instruction, but its structure was not verified. "
+            "The proposed transform identity was not present in your request, so I did not treat it as a deployment problem. "
+            "Clarify the concrete topology structure and I'll firm it up."
+        )
+    else:
+        message = (
+            f"I kept your {structural_node} request, but its structure was not verified. "
+            f"A {structural_node} is a built-in topology node, not a transform plugin. "
+            "Clarify the concrete topology structure and I'll firm it up."
+        )
+    return StepChatResult(
+        assistant_message=message,
+        status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+        latency_ms=latency_ms,
+        error_class="DeferredIntentModelCatalogIdentity",
     )
 
 
@@ -285,6 +356,7 @@ def _apply_deferred_management(
             DeferredIntentAccepted | DeferredIntentClarification | DeferredIntentUnsupported | DeferredIntentRejected,
             management,
         ),
+        catalog=catalog,
         latency_ms=chat.latency_ms,
     )
     return DeferredRequestUnchanged(guided=guided, chat=rejected_chat)
@@ -304,7 +376,18 @@ def apply_deferred_request(
             catalog=authority.catalog,
             guided=authority.guided,
         )
-        resolved_chat = _deferred_disposition_chat(disposition, latency_ms=chat.latency_ms)
+        if type(disposition) is DeferredIntentUnsupported and not _message_names_identifier(
+            authority.originating_message.content,
+            disposition.plugin_name,
+        ):
+            return apply_deferred_clarification(
+                authority=authority,
+                chat=_model_catalog_identity_chat(
+                    user_message=authority.originating_message.content,
+                    latency_ms=chat.latency_ms,
+                ),
+            )
+        resolved_chat = _deferred_disposition_chat(disposition, catalog=authority.catalog, latency_ms=chat.latency_ms)
         if type(disposition) is not DeferredIntentAccepted:
             return DeferredRequestUnchanged(guided=authority.guided, chat=resolved_chat)
         retained = create_deferred_stage_intent(

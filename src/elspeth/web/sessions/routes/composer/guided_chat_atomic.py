@@ -1413,6 +1413,10 @@ async def post_guided_chat_schema8(
                                 "DeferredIntentUnknown",
                                 "DeferredIntentBindingMismatch",
                                 "DeferredIntentAmbiguous",
+                                "DeferredIntentClarification",
+                                "DeferredIntentUnsupported",
+                                "DeferredIntentRejected",
+                                "DeferredIntentModelCatalogIdentity",
                                 # The model's sink config failed plugin
                                 # validation and was deliberately not staged —
                                 # a rejected application, not provider weather
