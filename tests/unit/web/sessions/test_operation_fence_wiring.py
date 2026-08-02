@@ -7,6 +7,7 @@ exact renewable authority that owns the complete logical operation.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import textwrap
 import types
@@ -33,8 +34,10 @@ from elspeth.web.coordination import repository as coordination_repository
 from elspeth.web.coordination.contracts import SessionOperationContext
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.service import ExecutionServiceImpl
+from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import protocol as sessions_protocol
 from elspeth.web.sessions.protocol import RunEventRecord, SessionServiceProtocol
+from elspeth.web.sessions.routes import messages as message_routes
 from elspeth.web.sessions.routes.guided_operations import reserve_or_replay_guided_operation
 from elspeth.web.sessions.service import SessionServiceImpl
 
@@ -59,6 +62,61 @@ def test_route_guided_reservation_adapter_cannot_omit_parent_authority() -> None
     assert "SessionOperationKind.COMPOSE" in source
     assert "SessionOperationKind.SESSION_FORK" in source
     assert "session_operation_context=session_lease.context" in source
+
+
+def test_send_message_acquires_compose_authority_before_state_or_message_access() -> None:
+    source = textwrap.dedent(inspect.getsource(message_routes.register_message_routes))
+    tree = ast.parse(source)
+    send_message = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef) and node.name == "send_message")
+    compose_scope = next(
+        node
+        for node in ast.walk(send_message)
+        if isinstance(node, ast.AsyncWith) and any(ast.unparse(item.context_expr) == "compose_lock" for item in node.items)
+    )
+    lease_item = next(item for item in compose_scope.items if "SessionOperationLease.acquire" in ast.unparse(item.context_expr))
+    assert isinstance(lease_item.optional_vars, ast.Name)
+    assert lease_item.optional_vars.id == "compose_operation_lease"
+
+    state_read = next(
+        node for node in ast.walk(compose_scope) if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.get_current_state"
+    )
+    transcript_write = next(
+        node
+        for node in ast.walk(compose_scope)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) == "service.add_message_with_transcript"
+    )
+    assert lease_item.context_expr.lineno < state_read.lineno < transcript_write.lineno
+    assert any(
+        keyword.arg == "session_operation_context" and ast.unparse(keyword.value) == "compose_operation_lease.context"
+        for keyword in transcript_write.keywords
+    )
+
+
+@pytest.mark.parametrize("owner", [SessionServiceProtocol, SessionServiceImpl])
+def test_combined_message_transcript_write_requires_exact_compose_context(owner: type[Any]) -> None:
+    context = _required_parameter(owner, "add_message_with_transcript", "session_operation_context")
+    assert context.annotation is SessionOperationContext or context.annotation == "SessionOperationContext"
+
+
+def test_auto_title_is_owned_by_and_reuses_the_compose_lease() -> None:
+    route_source = textwrap.dedent(inspect.getsource(message_routes.register_message_routes))
+    route_tree = ast.parse(route_source)
+    auto_title_call = next(
+        node for node in ast.walk(route_tree) if isinstance(node, ast.Call) and ast.unparse(node.func) == "maybe_auto_title_session"
+    )
+    assert any(
+        keyword.arg == "session_operation_context" and ast.unparse(keyword.value) == "compose_operation_lease.context"
+        for keyword in auto_title_call.keywords
+    )
+    parent = next(
+        node
+        for node in ast.walk(route_tree)
+        if isinstance(node, ast.Call) and auto_title_call in ast.walk(node) and node is not auto_title_call
+    )
+    assert ast.unparse(parent.func) == "compose_operation_lease.create_task"
+
+    title_source = textwrap.dedent(inspect.getsource(_auto_title.maybe_auto_title_session))
+    assert "session_operation_context=session_operation_context" in title_source
 
 
 def _resolved_signature(member: Any) -> tuple[tuple[tuple[str, inspect._ParameterKind, Any], ...], Any]:

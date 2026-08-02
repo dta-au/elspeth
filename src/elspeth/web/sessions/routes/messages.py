@@ -121,7 +121,16 @@ def register_message_routes(router: APIRouter) -> None:
         service: SessionServiceProtocol = request.app.state.session_service
         settings = request.app.state.settings
         compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
-        async with compose_lock:
+        async with (
+            compose_lock,
+            await SessionOperationLease.acquire(
+                service.session_operation_authority,
+                session_id=session.id,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            ) as compose_operation_lease,
+        ):
             # 1. Load or create CompositionState — needed before user message
             #    for pre-send provenance (AD-7: user msg records what user saw).
             state_record = await service.get_current_state(session.id)
@@ -207,13 +216,7 @@ def register_message_routes(router: APIRouter) -> None:
                 body.content,
                 composition_state_id=pre_send_state_id,
                 writer_principal="route_user_message",
-            )
-            compose_operation_lease = await SessionOperationLease.acquire(
-                service.session_operation_authority,
-                session_id=session.id,
-                operation_kind=SessionOperationKind.COMPOSE,
-                owner_instance_id=service.session_operation_owner_instance_id,
-                lease_seconds=service.session_operation_lease_seconds,
+                session_operation_context=compose_operation_lease.context,
             )
             terminal_status: _ComposerRequestTerminalStatus = "failed"
             # Initialized here so the finally block can reference it even
@@ -293,7 +296,7 @@ def register_message_routes(router: APIRouter) -> None:
                 # gets re-titled. Tighten to a separate auto_titled_at
                 # column if this becomes annoying.
                 if len(records) == 1 and is_default_session_title(session.title):
-                    auto_title_task = asyncio.create_task(
+                    auto_title_task = compose_operation_lease.create_task(
                         maybe_auto_title_session(
                             service=service,
                             session_id=session.id,
@@ -301,6 +304,7 @@ def register_message_routes(router: APIRouter) -> None:
                             model=settings.composer_model,
                             temperature=settings.composer_temperature,
                             seed=settings.composer_seed,
+                            session_operation_context=compose_operation_lease.context,
                             # Auto-title uses the PRIMARY composer role only
                             # (Phase 3 Task 2 endpoint affordance) — never
                             # the advisor's endpoint.
@@ -1076,18 +1080,16 @@ def register_message_routes(router: APIRouter) -> None:
                         else:
                             auto_title_task.cancel()
                 finally:
-                    try:
-                        if progress_started:
-                            await _join_progress_write(
-                                progress_registry.finish_request(
-                                    session_operation_context=compose_operation_lease.context,
-                                    request_id=str(user_msg.id),
-                                    user_id=str(user.user_id),
-                                    terminal_event=None,
-                                )
+                    if progress_started:
+                        await _join_progress_write(
+                            progress_registry.finish_request(
+                                session_operation_context=compose_operation_lease.context,
+                                request_id=str(user_msg.id),
+                                user_id=str(user.user_id),
+                                terminal_event=None,
                             )
-                    finally:
-                        await compose_operation_lease.close()
+                        )
+        raise AuditIntegrityError("Tier 1 invariant: send_message operation scope exited without a response")
 
     @router.get(
         "/{session_id}/messages",

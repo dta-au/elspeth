@@ -3268,7 +3268,13 @@ class SessionServiceProtocol(Protocol):
         session_operation_context: SessionOperationContext,
     ) -> CompositionStateRecord: ...
 
-    async def update_session_title(self, session_id: UUID, title: str) -> SessionRecord: ...
+    async def update_session_title(
+        self,
+        session_id: UUID,
+        title: str,
+        *,
+        session_operation_context: SessionOperationContext | None = None,
+    ) -> SessionRecord: ...
 
     async def list_sessions(
         self,
@@ -3623,6 +3629,7 @@ class SessionServiceProtocol(Protocol):
         raw_content: str | None = None,
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
         """Insert one message and return ``(record, full transcript)``.
 

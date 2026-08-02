@@ -19,6 +19,7 @@ import structlog
 from sqlalchemy import Engine, func, select
 from testcontainers.postgres import PostgresContainer
 
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -68,6 +69,12 @@ async def test_postgres_combined_read_sees_its_own_write_despite_repeatable_read
         ).scalar_one()
 
     stale_reader = postgres_engine.connect().execution_options(isolation_level="REPEATABLE READ")
+    context = postgres_service.session_operation_authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=postgres_service.session_operation_owner_instance_id,
+        lease_seconds=postgres_service.session_operation_lease_seconds,
+    )
     try:
         # First read begins the transaction and pins the snapshot at one
         # seed row — the pooled-stale-reader condition from production.
@@ -78,6 +85,7 @@ async def test_postgres_combined_read_sees_its_own_write_despite_repeatable_read
             "user",
             "hello",
             writer_principal="route_user_message",
+            session_operation_context=context,
         )
 
         # The REPEATABLE READ snapshot still cannot see the committed
@@ -92,6 +100,7 @@ async def test_postgres_combined_read_sees_its_own_write_despite_repeatable_read
     finally:
         stale_reader.rollback()
         stale_reader.close()
+        postgres_service.session_operation_authority.release(context)
 
     # After the pinned transaction ends, a fresh read converges.
     assert [message.content for message in await postgres_service.get_messages(session.id, limit=None)] == ["seed", "hello"]

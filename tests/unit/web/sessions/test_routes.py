@@ -18,6 +18,7 @@ import pytest
 import structlog
 import yaml
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
@@ -56,6 +57,7 @@ from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerResu
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
 from elspeth.web.composer.state import CompositionState, OutputSpec, PipelineMetadata, SourceSpec, ValidationSummary
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.repository import SessionOperationConflictError
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import (
@@ -570,6 +572,7 @@ class _ProgressRouteSessionService:
         raw_content: str | None = None,
         tool_call_id: str | None = None,
         parent_assistant_id: uuid.UUID | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
         # In-memory double: append + snapshot are trivially one atomic
         # step, mirroring the production single-transaction contract
@@ -584,6 +587,7 @@ class _ProgressRouteSessionService:
             raw_content=raw_content,
             tool_call_id=tool_call_id,
             parent_assistant_id=parent_assistant_id,
+            session_operation_context=session_operation_context,
         )
         return record, list(self.messages)
 
@@ -12751,6 +12755,34 @@ class TestSendMessageTranscriptSnapshot:
     write-locked transaction) and never re-calls ``get_messages`` on
     that path.
     """
+
+    @pytest.mark.asyncio
+    async def test_competing_compose_lease_returns_409_without_persisting_user_message(self, tmp_path) -> None:
+        app, service = _make_app(tmp_path)
+        app.state.composer_service = _make_composer_mock(response_text="must not run")
+
+        @app.exception_handler(SessionOperationConflictError)
+        async def handle_conflict(_request: object, _exc: SessionOperationConflictError) -> JSONResponse:
+            return JSONResponse(status_code=409, content={"detail": "Session operation is already active"})
+
+        session = await service.create_session("alice", "Replica conflict", "local")
+        blocking_context = service.session_operation_authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id="competing-replica",
+            lease_seconds=30,
+        )
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                response = await client.post(
+                    f"/api/sessions/{session.id}/messages",
+                    json={"content": "must remain uncommitted"},
+                )
+        finally:
+            service.session_operation_authority.release(blocking_context)
+
+        assert response.status_code == 409
+        assert await service.get_messages(session.id, limit=None) == []
 
     def test_send_message_proceeds_when_get_messages_returns_stale_pre_insert_snapshot(self, tmp_path) -> None:
         """T2 (structural): a stale get_messages cannot 500 the send path.

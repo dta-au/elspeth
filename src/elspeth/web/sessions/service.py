@@ -6781,17 +6781,37 @@ class SessionServiceImpl:
 
         return self._row_to_session_record(row)
 
-    async def update_session_title(self, session_id: UUID, title: str) -> SessionRecord:
+    async def update_session_title(
+        self,
+        session_id: UUID,
+        title: str,
+        *,
+        session_operation_context: SessionOperationContext | None = None,
+    ) -> SessionRecord:
         """Update a session title and return the refreshed record."""
         sid = str(session_id)
         now = self._now()
 
+        def _write(conn: Connection) -> Any:
+            result = conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(title=title, updated_at=now))
+            if result.rowcount == 0:
+                raise SessionNotFoundError(session_id)
+            return conn.execute(select(sessions_table).where(sessions_table.c.id == sid)).one()
+
         def _sync() -> Any:
-            with self._engine.begin() as conn:
-                result = conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(title=title, updated_at=now))
-                if result.rowcount == 0:
-                    raise SessionNotFoundError(session_id)
-                return conn.execute(select(sessions_table).where(sessions_table.c.id == sid)).one()
+            with self._session_process_locked_begin(sid) as conn:
+                if session_operation_context is None:
+                    return _write(conn)
+                with (
+                    self._session_write_lock(conn, sid),
+                    self._session_composer_mutation_transaction(
+                        conn,
+                        session_id=sid,
+                        session_operation_context=session_operation_context,
+                        expected_kind=SessionOperationKind.COMPOSE,
+                    ),
+                ):
+                    return _write(conn)
 
         row = await self._run_sync(_sync)
         return SessionRecord(
@@ -9384,6 +9404,7 @@ class SessionServiceImpl:
         raw_content: str | None = None,
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> tuple[ChatMessageRecord, list[ChatMessageRecord]]:
         """Insert a chat message and read the full transcript in ONE transaction.
 
@@ -9420,7 +9441,16 @@ class SessionServiceImpl:
         msg_id_holder: dict[str, str] = {}
 
         def _sync() -> tuple[Sequence[Any], Sequence[Any]]:
-            with self._session_process_locked_begin(sid) as conn:
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                ),
+            ):
                 if csid is not None:
                     _assert_state_in_session(
                         conn,
@@ -9428,25 +9458,24 @@ class SessionServiceImpl:
                         expected_session_id=sid,
                         caller="add_message_with_transcript",
                     )
-                with self._session_write_lock(conn, sid):
-                    seq = self._reserve_sequence_range(conn, sid, count=1)
-                    msg_id_holder["id"] = self._insert_chat_message(
-                        conn,
-                        session_id=sid,
-                        role=role,
-                        content=content,
-                        raw_content=raw_content,
-                        # Same deep_thaw rationale as ``add_message``:
-                        # tool_calls may be a frozen mapping/tuple shape the
-                        # JSON encoder rejects.
-                        tool_calls=deep_thaw(tool_calls) if tool_calls else None,
-                        sequence_no=seq,
-                        writer_principal=writer_principal,
-                        composition_state_id=csid,
-                        tool_call_id=tool_call_id,
-                        parent_assistant_id=pid,
-                        created_at=now,
-                    )
+                seq = self._reserve_sequence_range(conn, sid, count=1)
+                msg_id_holder["id"] = self._insert_chat_message(
+                    conn,
+                    session_id=sid,
+                    role=role,
+                    content=content,
+                    raw_content=raw_content,
+                    # Same deep_thaw rationale as ``add_message``:
+                    # tool_calls may be a frozen mapping/tuple shape the
+                    # JSON encoder rejects.
+                    tool_calls=deep_thaw(tool_calls) if tool_calls else None,
+                    sequence_no=seq,
+                    writer_principal=writer_principal,
+                    composition_state_id=csid,
+                    tool_call_id=tool_call_id,
+                    parent_assistant_id=pid,
+                    created_at=now,
+                )
                 conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
                 # Transcript snapshot on the SAME connection, inside the
                 # SAME transaction as the insert — this read sees its own

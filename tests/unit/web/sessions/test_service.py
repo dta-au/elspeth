@@ -296,6 +296,29 @@ class TestSessionCRUD:
         assert fetched.title == "Renamed pipeline"
 
     @pytest.mark.asyncio
+    async def test_auto_title_rejects_released_compose_context_without_mutation(
+        self,
+        service,
+        session_operation_contexts,
+    ) -> None:
+        created = await service.create_session("alice", "Original", "local")
+        context = session_operation_contexts.acquire(
+            service,
+            created.id,
+            SessionOperationKind.COMPOSE,
+        )
+        session_operation_contexts.release(service, context)
+
+        with pytest.raises(SessionOperationFenceLost):
+            await service.update_session_title(
+                created.id,
+                "Stale title",
+                session_operation_context=context,
+            )
+
+        assert (await service.get_session(created.id)).title == "Original"
+
+    @pytest.mark.asyncio
     async def test_get_session_not_found_raises(self, service) -> None:
         with pytest.raises(ValueError, match="not found"):
             await service.get_session(uuid.uuid4())
@@ -3007,16 +3030,43 @@ class TestAddMessageWithTranscript:
     """
 
     @pytest.mark.asyncio
-    async def test_returns_inserted_record_and_full_ordered_transcript(self, service) -> None:
+    async def test_rejects_released_compose_context_without_persisting_message(
+        self,
+        service,
+        session_operation_contexts,
+    ) -> None:
+        session = await service.create_session("alice", "Stale authority", "local")
+        context = session_operation_contexts.acquire(
+            service,
+            session.id,
+            SessionOperationKind.COMPOSE,
+        )
+        session_operation_contexts.release(service, context)
+
+        with pytest.raises(SessionOperationFenceLost):
+            await service.add_message_with_transcript(
+                session.id,
+                "user",
+                "must not persist",
+                writer_principal="route_user_message",
+                session_operation_context=context,
+            )
+
+        assert await service.get_messages(session.id, limit=None) == []
+
+    @pytest.mark.asyncio
+    async def test_returns_inserted_record_and_full_ordered_transcript(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Combined", "local")
         await service.add_message(session.id, "user", "First", writer_principal="route_user_message")
         await service.add_message(session.id, "assistant", "Second", writer_principal="compose_loop")
+        context = session_operation_contexts.acquire(service, session.id, SessionOperationKind.COMPOSE)
 
         record, transcript = await service.add_message_with_transcript(
             session.id,
             "user",
             "Third",
             writer_principal="route_user_message",
+            session_operation_context=context,
         )
 
         assert record.role == "user"
@@ -3030,9 +3080,10 @@ class TestAddMessageWithTranscript:
         assert await service.get_messages(session.id, limit=None) == transcript
 
     @pytest.mark.asyncio
-    async def test_persists_pre_send_state_provenance(self, service) -> None:
+    async def test_persists_pre_send_state_provenance(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Provenance", "local")
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        context = session_operation_contexts.acquire(service, session.id, SessionOperationKind.COMPOSE)
 
         record, transcript = await service.add_message_with_transcript(
             session.id,
@@ -3040,17 +3091,19 @@ class TestAddMessageWithTranscript:
             "hello",
             composition_state_id=state.id,
             writer_principal="route_user_message",
+            session_operation_context=context,
         )
 
         assert record.composition_state_id == state.id
         assert transcript[-1].composition_state_id == state.id
 
     @pytest.mark.asyncio
-    async def test_rejects_cross_session_composition_state(self, service) -> None:
+    async def test_rejects_cross_session_composition_state(self, service, session_operation_contexts) -> None:
         """Parity with add_message: the _assert_state_in_session guard fires."""
         s1 = await service.create_session("alice", "One", "local")
         s2 = await service.create_session("alice", "Two", "local")
         foreign_state = await service.save_composition_state(s2.id, CompositionStateData(is_valid=True), provenance="session_seed")
+        context = session_operation_contexts.acquire(service, s1.id, SessionOperationKind.COMPOSE)
 
         with pytest.raises(RuntimeError, match="add_message_with_transcript"):
             await service.add_message_with_transcript(
@@ -3059,21 +3112,33 @@ class TestAddMessageWithTranscript:
                 "hello",
                 composition_state_id=foreign_state.id,
                 writer_principal="route_user_message",
+                session_operation_context=context,
             )
 
         assert await service.get_messages(s1.id, limit=None) == []
 
     @pytest.mark.asyncio
-    async def test_bumps_session_updated_at(self, service) -> None:
+    async def test_bumps_session_updated_at(self, service, session_operation_contexts) -> None:
         session = await service.create_session("alice", "Updated", "local")
+        context = session_operation_contexts.acquire(service, session.id, SessionOperationKind.COMPOSE)
 
-        await service.add_message_with_transcript(session.id, "user", "hello", writer_principal="route_user_message")
+        await service.add_message_with_transcript(
+            session.id,
+            "user",
+            "hello",
+            writer_principal="route_user_message",
+            session_operation_context=context,
+        )
 
         refreshed = await service.get_session(session.id)
         assert refreshed.updated_at >= session.updated_at
 
     @pytest.mark.asyncio
-    async def test_combined_read_sees_its_own_write_despite_pinned_stale_snapshot(self, tmp_path) -> None:
+    async def test_combined_read_sees_its_own_write_despite_pinned_stale_snapshot(
+        self,
+        tmp_path,
+        session_operation_contexts,
+    ) -> None:
         """T1 (SQLite WAL variant of the pinned-snapshot stale reader).
 
         A second connection holds an open read transaction whose WAL
@@ -3086,6 +3151,7 @@ class TestAddMessageWithTranscript:
         """
         engine = create_session_engine(f"sqlite:///{tmp_path / 'stale-reader-sessions.db'}")
         initialize_session_schema(engine)
+        context: SessionOperationContext | None = None
         try:
             service = SessionServiceImpl(
                 engine,
@@ -3094,6 +3160,7 @@ class TestAddMessageWithTranscript:
             )
             session = await service.create_session("alice", "Stale", "local")
             await service.add_message(session.id, "user", "seed", writer_principal="route_user_message")
+            context = session_operation_contexts.acquire(service, session.id, SessionOperationKind.COMPOSE)
 
             def _count(conn) -> int:
                 return conn.execute(
@@ -3111,6 +3178,7 @@ class TestAddMessageWithTranscript:
                     "user",
                     "hello",
                     writer_principal="route_user_message",
+                    session_operation_context=context,
                 )
 
                 # The pinned snapshot still cannot see the committed
@@ -3124,10 +3192,16 @@ class TestAddMessageWithTranscript:
                 stale_reader.rollback()
                 stale_reader.close()
         finally:
+            if context is not None:
+                session_operation_contexts.release(service, context)
             engine.dispose()
 
     @pytest.mark.asyncio
-    async def test_insert_and_transcript_select_share_one_connection_and_transaction(self, tmp_path) -> None:
+    async def test_insert_and_transcript_select_share_one_connection_and_transaction(
+        self,
+        tmp_path,
+        session_operation_contexts,
+    ) -> None:
         """Pin the MECHANISM, not just the outcome: one connection, one txn.
 
         The sibling tests prove the returned transcript contains the insert;
@@ -3140,6 +3214,7 @@ class TestAddMessageWithTranscript:
         """
         engine = create_session_engine(f"sqlite:///{tmp_path / 'one-conn-sessions.db'}")
         initialize_session_schema(engine)
+        context: SessionOperationContext | None = None
         try:
             service = SessionServiceImpl(
                 engine,
@@ -3148,6 +3223,7 @@ class TestAddMessageWithTranscript:
             )
             session = await service.create_session("alice", "OneConn", "local")
             await service.add_message(session.id, "user", "seed", writer_principal="route_user_message")
+            context = session_operation_contexts.acquire(service, session.id, SessionOperationKind.COMPOSE)
 
             # One ordered event log: cursor executions tagged with their
             # DBAPI connection id, interleaved with commit markers.
@@ -3167,6 +3243,7 @@ class TestAddMessageWithTranscript:
                     "user",
                     "hello",
                     writer_principal="route_user_message",
+                    session_operation_context=context,
                 )
             finally:
                 event.remove(engine, "before_cursor_execute", record_statement)
@@ -3202,6 +3279,8 @@ class TestAddMessageWithTranscript:
             between = events[insert_index + 1 : select_index]
             assert all(kind != "commit" for kind, _conn_id, _statement in between), [entry[:2] for entry in between]
         finally:
+            if context is not None:
+                session_operation_contexts.release(service, context)
             engine.dispose()
 
 
@@ -3280,4 +3359,5 @@ class TestGuidedFailureCohortPoisonPill:
                 "user",
                 "hello",
                 writer_principal="route_user_message",
+                session_operation_context=compose_context,
             )

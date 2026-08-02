@@ -27,6 +27,7 @@ from uuid import UUID
 from litellm.exceptions import APIError as LiteLLMAPIError
 from opentelemetry import metrics
 
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
 
 if TYPE_CHECKING:
@@ -123,6 +124,7 @@ async def maybe_auto_title_session(
     model: str,
     temperature: float | None,
     seed: int | None,
+    session_operation_context: SessionOperationContext,
     api_base: str | None = None,
     api_key: str | None = None,
 ) -> None:
@@ -162,7 +164,11 @@ async def maybe_auto_title_session(
         title = _sanitize_title(admitted.content)
         if not title:
             return
-        await service.update_session_title(session_id, title)
+        await service.update_session_title(
+            session_id,
+            title,
+            session_operation_context=session_operation_context,
+        )
     except (LiteLLMAPIError, TimeoutError, asyncio.CancelledError, _MalformedAutoTitleResponseError) as exc:
         # Auto-titling is best-effort UI metadata for expected provider/
         # scheduling failures, but those failures still need an operational
