@@ -79,6 +79,7 @@ from elspeth.web.coordination.repository import (
     SessionDerivedCustodyError,
     _ForkCreationTransaction,
 )
+from elspeth.web.coordination.run_diagnostics_authority import RepositoryRunDiagnosticsAuditAuthority
 from elspeth.web.coordination.run_recovery_authority import RepositoryGlobalRunRecoveryAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.interpretation_state import (
@@ -226,7 +227,7 @@ from elspeth.web.sessions.protocol import (
     ProposalEventRecord,
     ProposalLifecycleStatus,
     RunDiagnosticsAuditAuthority,
-    RunDiagnosticsAuthorityLostError,
+    RunDiagnosticsAuditMutationAuthority,
     RunEventRecord,
     RunRecord,
     SessionArchiveDisposition,
@@ -4544,6 +4545,7 @@ class SessionServiceImpl:
         session_operation_authority: SessionOperationAuthority | None = None,
         global_run_recovery_authority: GlobalRunRecoveryAuthority | None = None,
         audit_access_log_authority: AuditAccessLogAuthority | None = None,
+        run_diagnostics_audit_authority: RunDiagnosticsAuditMutationAuthority | None = None,
         skill_markdown_history_authority: SkillMarkdownHistoryAuthority | None = None,
         owner_instance_id: str | None = None,
         session_operation_lease_seconds: int = 30,
@@ -4577,6 +4579,7 @@ class SessionServiceImpl:
         self._session_operation_authority = session_operation_authority
         self._global_run_recovery_authority = global_run_recovery_authority or RepositoryGlobalRunRecoveryAuthority(engine)
         self._audit_access_log_authority = audit_access_log_authority or RepositoryAuditAccessLogAuthority(engine)
+        self._run_diagnostics_audit_authority = run_diagnostics_audit_authority or RepositoryRunDiagnosticsAuditAuthority(engine)
         self._skill_markdown_history_authority = skill_markdown_history_authority or RepositorySkillMarkdownHistoryAuthority(engine)
 
     @property
@@ -9360,68 +9363,21 @@ class SessionServiceImpl:
         """Append one run-diagnostics ``role=audit`` row under proven authority.
 
         The authority proof and the insert share one locked transaction,
-        and the proof runs before ``_reserve_sequence_range``, so a
+        and the proof runs before sequence allocation, so a
         refused write aborts without consuming a chat sequence number.
         ``writer_principal`` and ``composition_state_id`` are derived
-        from the authority — this method is the only production writer
-        of ``writer_principal='run_diagnostics'`` rows
+        from the authority. The injected repository authority is the only
+        production writer of ``writer_principal='run_diagnostics'`` rows
         (elspeth-0fcf68d50f).
         """
-        now = self._now()
-        sid = str(authority.session_id)
-        rid = str(authority.run_id)
-        stid = str(authority.state_id)
-        msg_id_holder: dict[str, str] = {}
-        sequence_holder: dict[str, int] = {}
-
-        def _sync() -> None:
-            with self._session_process_locked_begin(sid) as conn:
-                session_row = conn.execute(
-                    select(sessions_table.c.id, sessions_table.c.archived_at).where(sessions_table.c.id == sid)
-                ).one_or_none()
-                if session_row is None:
-                    raise RunDiagnosticsAuthorityLostError(authority, reason="session_missing")
-                if session_row.archived_at is not None:
-                    raise RunDiagnosticsAuthorityLostError(authority, reason="session_archived")
-                run_row = conn.execute(select(runs_table.c.session_id, runs_table.c.state_id).where(runs_table.c.id == rid)).one_or_none()
-                if run_row is None:
-                    raise RunDiagnosticsAuthorityLostError(authority, reason="run_missing")
-                if run_row.session_id != sid or run_row.state_id != stid:
-                    raise RunDiagnosticsAuthorityLostError(authority, reason="run_rebound")
-                with self._session_write_lock(conn, sid):
-                    seq = self._reserve_sequence_range(conn, sid, count=1)
-                    sequence_holder["sequence_no"] = seq
-                    msg_id_holder["id"] = self._insert_chat_message(
-                        conn,
-                        session_id=sid,
-                        role="audit",
-                        content=content,
-                        raw_content=None,
-                        tool_calls=deep_thaw(tool_calls) if tool_calls else None,
-                        sequence_no=seq,
-                        writer_principal="run_diagnostics",
-                        composition_state_id=stid,
-                        tool_call_id=None,
-                        parent_assistant_id=None,
-                        created_at=now,
-                    )
-                conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
-
-        await self._run_sync(_sync)
-
-        return ChatMessageRecord(
-            id=UUID(msg_id_holder["id"]),
-            session_id=authority.session_id,
-            role="audit",
-            content=content,
-            raw_content=None,
-            tool_calls=tool_calls,
-            created_at=now,
-            sequence_no=sequence_holder["sequence_no"],
-            composition_state_id=authority.state_id,
-            writer_principal="run_diagnostics",
-            tool_call_id=None,
-            parent_assistant_id=None,
+        return cast(
+            ChatMessageRecord,
+            await self._run_sync(
+                self._run_diagnostics_audit_authority.append_audit_message,
+                authority=authority,
+                content=content,
+                tool_calls=tool_calls,
+            ),
         )
 
     async def add_message_with_transcript(
