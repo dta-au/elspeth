@@ -931,19 +931,9 @@ def test_rejected_proposal_authority_reads_are_zero_dml_and_leave_checkpoint_unc
     tmp_path: Path,
 ) -> None:
     payload_store = FilesystemPayloadStore(tmp_path / "rejected-read")
-    stage_command, session_id = asyncio.run(_command(service, payload_store))
-    staged = asyncio.run(service.stage_guided_pipeline_proposal(stage_command, payload_store=payload_store))
-    asyncio.run(
-        service.reject_pipeline_composition_proposal(
-            session_id=session_id,
-            proposal_id=stage_command.proposal_id,
-            draft_hash=stage_command.plan.proposal.draft_hash,
-            reviewed_facts=guided_private_reviewed_facts(_guided()),
-            reason="operator_rejected",
-            dispatch=None,
-            actor="test",
-        )
-    )
+    stage_command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason="operator_rejected"))
+    staged = asyncio.run(service.get_current_state(session_id))
+    assert staged is not None
     statements: list[str] = []
 
     def observe_dml(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
@@ -963,9 +953,45 @@ def test_rejected_proposal_authority_reads_are_zero_dml_and_leave_checkpoint_unc
     finally:
         sqlalchemy_event.remove(service._engine, "before_cursor_execute", observe_dml)
 
-    assert current is not None and current.id == staged.result_state.id
+    assert current is not None and current.id == staged.id
     assert authority.row.status == "rejected"
     assert statements == []
+
+
+async def _stage_and_reject(
+    service: SessionServiceImpl,
+    payload_store: FilesystemPayloadStore,
+    *,
+    reason: str,
+) -> tuple[GuidedPipelineProposalStageCommand, UUID]:
+    """Fabricate a terminal row behind an active guided reference.
+
+    The generic pipeline rejection is fenced on this branch, so this test
+    helper supplies the same exact COMPOSE authority that staged the guided
+    checkpoint. The intentionally mismatched lifecycle remains useful to pin
+    GET's fail-closed, zero-DML behavior (elspeth-4dc78b3897).
+    """
+    authority_service = service
+    if not isinstance(authority_service, DualFencedSessionServiceHarness):
+        authority_service = DualFencedSessionServiceHarness(
+            service._engine,
+            telemetry=build_sessions_telemetry(),
+            log=structlog.get_logger("test.guided.proposal.release-integration"),
+        )
+    command, session_id = await _command(authority_service, payload_store)
+    await authority_service.stage_guided_pipeline_proposal(command, payload_store=payload_store)
+    context = await authority_service._guided_test_context(session_id, "guided")
+    await authority_service.reject_pipeline_composition_proposal(
+        session_id=session_id,
+        proposal_id=command.proposal_id,
+        draft_hash=command.plan.proposal.draft_hash,
+        reviewed_facts=guided_private_reviewed_facts(_guided()),
+        reason=reason,  # type: ignore[arg-type]
+        dispatch=None,
+        actor="test",
+        session_operation_context=context,
+    )
+    return command, session_id
 
 
 # ---------------------------------------------------------------------------

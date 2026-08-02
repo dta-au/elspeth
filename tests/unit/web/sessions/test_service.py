@@ -70,6 +70,8 @@ from elspeth.web.sessions.protocol import (
     CompositionStateRecord,
     GuidedOperationClaimed,
     RunAlreadyActiveError,
+    RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuthorityLostError,
     RunRecord,
     SessionGuidedOperationInProgressError,
     SessionRecord,
@@ -2968,6 +2970,117 @@ class TestArchiveSessionWithActiveRun:
 
         with_archived = await service.list_sessions("alice", "local", include_archived=True)
         assert session.id in [s.id for s in with_archived], "Soft-archived session must be retrievable via include_archived"
+
+
+class TestRunDiagnosticsAuditMessage:
+    """add_run_diagnostics_audit_message proves authority durably (elspeth-0fcf68d50f)."""
+
+    async def _session_state_run(self, service, session_operation_contexts):
+        session = await service.create_session("alice", "Pipeline", "local")
+        state = await _save_composition_state(
+            service,
+            session_operation_contexts,
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+        )
+        context = session_operation_contexts.acquire(service, session.id, SessionOperationKind.EXECUTE)
+        try:
+            run = await service.create_run(session.id, state.id, session_operation_context=context)
+        finally:
+            session_operation_contexts.release(service, context)
+        return session, state, run
+
+    @pytest.mark.asyncio
+    async def test_success_appends_run_attributed_audit_row(self, service, session_operation_contexts) -> None:
+        session, state, run = await self._session_state_run(service, session_operation_contexts)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+
+        record = await service.add_run_diagnostics_audit_message(
+            authority,
+            "diagnostics explanation audited",
+            tool_calls=[{"_kind": "llm_call_audit", "run_id": str(run.id), "call": {}}],
+        )
+
+        assert record.role == "audit"
+        assert record.writer_principal == "run_diagnostics"
+        assert record.composition_state_id == state.id
+        messages = await service.get_messages(session.id)
+        (stored,) = [m for m in messages if m.id == record.id]
+        assert stored.writer_principal == "run_diagnostics"
+        assert stored.sequence_no == record.sequence_no
+        refreshed = await service.get_session(session.id)
+        assert refreshed.updated_at >= session.updated_at
+
+    @pytest.mark.asyncio
+    async def test_missing_run_refused_without_consuming_sequence(self, service, session_operation_contexts) -> None:
+        session = await service.create_session("alice", "Pipeline", "local")
+        state = await _save_composition_state(
+            service,
+            session_operation_contexts,
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+        )
+        before = await service.add_message(session.id, "user", "hello", writer_principal="route_user_message")
+        authority = RunDiagnosticsAuditAuthority(run_id=uuid.uuid4(), session_id=session.id, state_id=state.id)
+
+        with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
+            await service.add_run_diagnostics_audit_message(authority, "orphaned")
+        assert exc_info.value.reason == "run_missing"
+
+        after = await service.add_message(session.id, "user", "again", writer_principal="route_user_message")
+        assert after.sequence_no == before.sequence_no + 1, "refused authority must not consume a chat sequence number"
+        contents = [m.content for m in await service.get_messages(session.id)]
+        assert "orphaned" not in contents
+
+    @pytest.mark.asyncio
+    async def test_state_rebound_refused(self, service, session_operation_contexts) -> None:
+        session, _state, run = await self._session_state_run(service, session_operation_contexts)
+        other_state = await _save_composition_state(
+            service,
+            session_operation_contexts,
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+        )
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=other_state.id)
+
+        with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
+            await service.add_run_diagnostics_audit_message(authority, "wrong state")
+        assert exc_info.value.reason == "run_rebound"
+
+    @pytest.mark.asyncio
+    async def test_foreign_session_refused(self, service, session_operation_contexts) -> None:
+        _session, state, run = await self._session_state_run(service, session_operation_contexts)
+        other_session = await service.create_session("alice", "Other", "local")
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=other_session.id, state_id=state.id)
+
+        with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
+            await service.add_run_diagnostics_audit_message(authority, "wrong session")
+        assert exc_info.value.reason == "run_rebound"
+        assert await service.get_messages(other_session.id) == []
+
+    @pytest.mark.asyncio
+    async def test_archived_session_refused(self, service, session_operation_contexts) -> None:
+        session, state, run = await self._session_state_run(service, session_operation_contexts)
+        # A session with a durable run is soft-archived, so the row and
+        # its archived_at survive for this authority check to see.
+        await service.archive_session(session.id)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+
+        with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
+            await service.add_run_diagnostics_audit_message(authority, "after archive")
+        assert exc_info.value.reason == "session_archived"
+
+    @pytest.mark.asyncio
+    async def test_missing_session_refused(self, service, session_operation_contexts) -> None:
+        _session, state, run = await self._session_state_run(service, session_operation_contexts)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=uuid.uuid4(), state_id=state.id)
+
+        with pytest.raises(RunDiagnosticsAuthorityLostError) as exc_info:
+            await service.add_run_diagnostics_audit_message(authority, "no session")
+        assert exc_info.value.reason == "session_missing"
 
 
 class TestGetMessagesNonexistentSession:

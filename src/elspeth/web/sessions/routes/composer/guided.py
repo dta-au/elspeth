@@ -747,9 +747,13 @@ async def get_guided(
 
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
     async with compose_lock:
-        # GET holds the process-local compose lock only to project a
-        # consistent snapshot against in-flight turns. Durable changes are
-        # reserved for a later fenced mutation; this endpoint performs none.
+        # elspeth-23fc70ce9c: GET holds the compose lock only to read a
+        # consistent snapshot against in-flight compose turns. It performs
+        # no writes of any kind: the recorder-drain scaffolding that once
+        # lived here fed nothing, and the unfenced rejected-proposal
+        # reconciliation that once wrote a composition state on read
+        # (elspeth-4dc78b3897) contradicted the endpoint's
+        # no-write-on-GET custody contract.
         state_record_out: CompositionStateRecord | None = None
 
         # Load or create CompositionState.
@@ -799,9 +803,14 @@ async def get_guided(
                 raise AuditIntegrityError("guided proposal authority has a non-present base")
             if proposal.base.state_id != state_record_out.id or proposal.base.composition_content_hash != composition_content_hash(state):
                 raise AuditIntegrityError("guided proposal base differs from current checkpoint")
-            if active_authority.row.status == "rejected":
-                raise AuditIntegrityError("guided active proposal is already terminal")
-            elif active_authority.row.status != "pending":
+            if active_authority.row.status != "pending":
+                # elspeth-4dc78b3897: a terminal row behind a still-active
+                # checkpoint reference cannot arise from any fenced
+                # lifecycle — reject, supersede, revert, and back-edit all
+                # clear the reference in the same transaction that
+                # terminalizes the row. It is integrity evidence, so the
+                # read path fails closed and preserves it instead of
+                # writing an unfenced reconciliation state on GET.
                 raise AuditIntegrityError("guided active proposal is unexpectedly terminal")
 
         existing_record_for_step = (

@@ -225,6 +225,8 @@ from elspeth.web.sessions.protocol import (
     PreparedGuidedJsonPayload,
     ProposalEventRecord,
     ProposalLifecycleStatus,
+    RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuthorityLostError,
     RunEventRecord,
     RunRecord,
     SessionArchiveDisposition,
@@ -9346,6 +9348,80 @@ class SessionServiceImpl:
             writer_principal=writer_principal,
             tool_call_id=tool_call_id,
             parent_assistant_id=parent_assistant_id,
+        )
+
+    async def add_run_diagnostics_audit_message(
+        self,
+        authority: RunDiagnosticsAuditAuthority,
+        content: str,
+        *,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
+    ) -> ChatMessageRecord:
+        """Append one run-diagnostics ``role=audit`` row under proven authority.
+
+        The authority proof and the insert share one locked transaction,
+        and the proof runs before ``_reserve_sequence_range``, so a
+        refused write aborts without consuming a chat sequence number.
+        ``writer_principal`` and ``composition_state_id`` are derived
+        from the authority — this method is the only production writer
+        of ``writer_principal='run_diagnostics'`` rows
+        (elspeth-0fcf68d50f).
+        """
+        now = self._now()
+        sid = str(authority.session_id)
+        rid = str(authority.run_id)
+        stid = str(authority.state_id)
+        msg_id_holder: dict[str, str] = {}
+        sequence_holder: dict[str, int] = {}
+
+        def _sync() -> None:
+            with self._session_process_locked_begin(sid) as conn:
+                session_row = conn.execute(
+                    select(sessions_table.c.id, sessions_table.c.archived_at).where(sessions_table.c.id == sid)
+                ).one_or_none()
+                if session_row is None:
+                    raise RunDiagnosticsAuthorityLostError(authority, reason="session_missing")
+                if session_row.archived_at is not None:
+                    raise RunDiagnosticsAuthorityLostError(authority, reason="session_archived")
+                run_row = conn.execute(select(runs_table.c.session_id, runs_table.c.state_id).where(runs_table.c.id == rid)).one_or_none()
+                if run_row is None:
+                    raise RunDiagnosticsAuthorityLostError(authority, reason="run_missing")
+                if run_row.session_id != sid or run_row.state_id != stid:
+                    raise RunDiagnosticsAuthorityLostError(authority, reason="run_rebound")
+                with self._session_write_lock(conn, sid):
+                    seq = self._reserve_sequence_range(conn, sid, count=1)
+                    sequence_holder["sequence_no"] = seq
+                    msg_id_holder["id"] = self._insert_chat_message(
+                        conn,
+                        session_id=sid,
+                        role="audit",
+                        content=content,
+                        raw_content=None,
+                        tool_calls=deep_thaw(tool_calls) if tool_calls else None,
+                        sequence_no=seq,
+                        writer_principal="run_diagnostics",
+                        composition_state_id=stid,
+                        tool_call_id=None,
+                        parent_assistant_id=None,
+                        created_at=now,
+                    )
+                conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+
+        await self._run_sync(_sync)
+
+        return ChatMessageRecord(
+            id=UUID(msg_id_holder["id"]),
+            session_id=authority.session_id,
+            role="audit",
+            content=content,
+            raw_content=None,
+            tool_calls=tool_calls,
+            created_at=now,
+            sequence_no=sequence_holder["sequence_no"],
+            composition_state_id=authority.state_id,
+            writer_principal="run_diagnostics",
+            tool_call_id=None,
+            parent_assistant_id=None,
         )
 
     async def add_message_with_transcript(

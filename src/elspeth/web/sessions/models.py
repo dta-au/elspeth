@@ -921,9 +921,14 @@ guided_operations_table = Table(
         "(json_type(unproducible_output_fields) = 'array' AND json_array_length(unproducible_output_fields) > 0)",
         name="ck_guided_operations_unproducible_output_fields_shape",
     ).ddl_if(dialect="sqlite"),
+    # The ``'array'::text`` spelling matches PostgreSQL's deparse of the
+    # untyped literal (json_typeof returns text), so the declared and
+    # reflected constraints parse identically for the fail-closed
+    # schema-shape comparator; a bare ``'array'`` reflects as a cast and
+    # classifies a fresh database as non-current.
     CheckConstraint(
         "unproducible_output_fields IS NULL OR "
-        "(json_typeof(unproducible_output_fields) = 'array' AND json_array_length(unproducible_output_fields) > 0)",
+        "(json_typeof(unproducible_output_fields) = 'array'::text AND json_array_length(unproducible_output_fields) > 0)",
         name="ck_guided_operations_unproducible_output_fields_shape",
     ).ddl_if(dialect="postgresql"),
     CheckConstraint(
