@@ -3944,19 +3944,6 @@ class SessionServiceProtocol(Protocol):
         actor: str,
     ) -> GuidedOperationFailed: ...
 
-    async def cancel_orphaned_runs(
-        self,
-        session_id: UUID,
-        max_age_seconds: int = 3600,
-    ) -> list[RunRecord]:
-        """Force-cancel runs stuck in 'running' status beyond max_age_seconds.
-
-        Returns the list of cancelled RunRecords. Called by the execution
-        service on startup and periodically to prevent orphaned runs from
-        permanently blocking sessions.
-        """
-        ...
-
     async def cancel_all_orphaned_runs(
         self,
         max_age_seconds: int | None = None,

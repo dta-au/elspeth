@@ -1265,7 +1265,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13768,
+        line=13714,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1275,7 +1275,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13779,
+        line=13725,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1285,7 +1285,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         2,
         "SessionForkAuthority",
-        line=13798,
+        line=13744,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1295,7 +1295,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13846,
+        line=13792,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1305,7 +1305,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13900,
+        line=13846,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -4159,6 +4159,7 @@ def test_global_run_recovery_writer_is_exact_contained_and_replaces_direct_servi
         for site in scanned
         if site.symbol
         in {
+            "SessionServiceImpl.cancel_orphaned_runs._sync",
             "SessionServiceImpl.cancel_all_orphaned_run_records",
             "SessionServiceImpl.mark_landscape_reconciliation_outcomes",
         }

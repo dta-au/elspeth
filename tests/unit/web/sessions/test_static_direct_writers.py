@@ -780,9 +780,8 @@ _INLINE_ALLOCATION_SCOPE = frozenset({"save_composition_state", "set_active_stat
 def _is_docstring_constant(node: ast.Constant) -> bool:
     """Return True iff ``node`` is the docstring literal of its enclosing scope.
 
-    A docstring quoting the allocation SQL (as ``save_composition_state``'s
-    own prose does for the version contract) is documentation, not an
-    allocation site.
+    A docstring quoting allocation SQL is documentation, not an allocation
+    site.
     """
 
     parent = getattr(node, "parent", None)
@@ -922,14 +921,16 @@ def check_inline_state_version_allocation(
 ) -> list[InlineAllocViolation]:
     """Reject inline ``composition_states.version`` allocation outside the write lock.
 
-    Closes the review finding that ``save_composition_state`` and
-    ``set_active_state`` previously allocated state versions inline
-    without holding ``_session_write_lock``. Covers BOTH allocation
+    Keeps the legacy ``set_active_state`` allocator under
+    ``_session_write_lock`` while it remains and retains adversarial coverage
+    for the former ``save_composition_state`` shape. Ordinary
+    composition-state appends now live behind the typed session-operation
+    authority and the exhaustive architecture gate. Covers BOTH allocation
     forms — raw ``MAX(...version...)`` SQL strings and the SQLAlchemy
     ``func.max(composition_states_table.c.version)`` call the live
     allocators actually use — and matches the scope functions anywhere
-    in the enclosing dotted symbol, because the real sites live in
-    nested ``_sync`` closures (``...save_composition_state._sync``).
+    in the enclosing dotted symbol, including synthetic nested ``_sync``
+    closures used to prove both historical forms remain detectable.
 
     Conditional-dormant: returns ``[]`` until ``_session_write_lock``
     is defined.
@@ -1004,24 +1005,16 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
     # exists violates the "do not leave stale promises" rule (Task 10
     # handover pitfall §5).
     ReviewedWriter(
-        path="src/elspeth/web/sessions/service.py",
-        enclosing_symbol="SessionServiceImpl.save_composition_state._write",
+        path="src/elspeth/web/coordination/repository.py",
+        enclosing_symbol="_RepositoryCompositionStateMutations.append_state",
         table="composition_states",
         operation="sqlalchemy_insert_call",
         purpose=(
-            "save_composition_state inline writer; Task 10 lock-retrofits "
-            "in place (NOT helper-routed) per plan §2128-2133 — uniform "
-            "helper-routing would either lose the per-site retry semantics "
-            "(race risk) or grow per-site escape hatches. The SELECT-MAX + "
-            "INSERT region locally asserts and is wrapped in "
-            "``_session_write_lock`` so the "
-            "inline allocation runs under the same per-session write "
-            "discipline as ``_insert_composition_state``. The B3 "
-            "belt-and-suspenders retry loop was deleted: under CLAUDE.md "
-            "No Legacy Code Policy a 'slated for removal' shim is "
-            "forbidden, and the loop's RuntimeError fallback masked the "
-            "uq_composition_state_version IntegrityError chain that names "
-            "any future lock-discipline regression directly"
+            "Ordinary composition-state appends are exposed only through the "
+            "COMPOSE-only SessionOperationMutationTransaction facet. The "
+            "authority validates the exact live session fence, allocates the "
+            "next version, and inserts within one locked transaction without "
+            "exposing a Connection to the service."
         ),
     ),
     ReviewedWriter(
@@ -1030,8 +1023,8 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
         table="composition_states",
         operation="sqlalchemy_insert_call",
         purpose=(
-            "set_active_state inline writer; same lock-retrofit-in-place "
-            "discipline as save_composition_state above. The B3 "
+            "set_active_state legacy inline writer retains its local "
+            "session-write-lock discipline. The B3 "
             "belt-and-suspenders retry loop was deleted with the same "
             "rationale (No Legacy Code Policy + diagnostic-preservation)"
         ),

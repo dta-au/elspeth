@@ -13000,60 +13000,6 @@ class SessionServiceImpl:
 
         return cast("CompositionStateRecord", await self._run_sync(_sync))
 
-    async def cancel_orphaned_runs(
-        self,
-        session_id: UUID,
-        max_age_seconds: int = 3600,
-    ) -> list[RunRecord]:
-        """Force-cancel runs stuck in 'pending' or 'running' beyond max_age_seconds.
-
-        Returns the list of cancelled RunRecords. Called by the execution
-        service on startup and periodically to prevent orphaned runs from
-        permanently blocking sessions (D5). Includes 'pending' because a
-        crash between create_run() and the first update_run_status("running")
-        would leave a permanently unblockable session otherwise.
-        """
-        sid = str(session_id)
-        now = self._now()
-        cutoff = now - timedelta(seconds=max_age_seconds)
-
-        def _sync() -> list[RunRecord]:
-            cancelled: list[RunRecord] = []
-            with self._engine.begin() as conn:
-                stale_rows = conn.execute(
-                    select(runs_table).where(
-                        runs_table.c.session_id == sid,
-                        runs_table.c.status.in_(["pending", "running"]),
-                        runs_table.c.started_at <= cutoff,
-                    )
-                ).fetchall()
-
-                for row in stale_rows:
-                    conn.execute(update(runs_table).where(runs_table.c.id == row.id).values(status="cancelled", finished_at=now))
-                    cancelled.append(
-                        RunRecord(
-                            id=UUID(row.id),
-                            session_id=UUID(row.session_id),
-                            state_id=UUID(row.state_id),
-                            status="cancelled",
-                            started_at=self._ensure_utc(row.started_at),
-                            finished_at=now,
-                            rows_processed=row.rows_processed,
-                            rows_succeeded=row.rows_succeeded,
-                            rows_failed=row.rows_failed,
-                            rows_routed_success=row.rows_routed_success,
-                            rows_routed_failure=row.rows_routed_failure,
-                            rows_quarantined=row.rows_quarantined,
-                            error=row.error,
-                            landscape_run_id=row.landscape_run_id,
-                            pipeline_yaml=row.pipeline_yaml,
-                        )
-                    )
-            return cancelled
-
-        result: list[RunRecord] = cast(list[RunRecord], await self._run_sync(_sync))
-        return result
-
     async def cancel_all_orphaned_runs(
         self,
         max_age_seconds: int | None = None,
