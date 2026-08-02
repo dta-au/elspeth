@@ -1018,6 +1018,18 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
     ),
     ReviewedWriter(
         path="src/elspeth/web/coordination/repository.py",
+        enclosing_symbol="_RepositoryInterpretationMutations.create_or_reconcile_pending",
+        table="composition_states",
+        operation="sqlalchemy_insert_call",
+        purpose=(
+            "Pending interpretation creation may append an opted-out materialized "
+            "state only through the COMPOSE-or-PROPOSAL interpretation facet. The facet "
+            "revalidates the retained session fence and performs decision, version "
+            "allocation, event write, and state insert in one locked transaction."
+        ),
+    ),
+    ReviewedWriter(
+        path="src/elspeth/web/coordination/repository.py",
         enclosing_symbol="_ForkChildSessionMutations.append_child_messages",
         table="chat_messages",
         operation="sqlalchemy_insert_call",

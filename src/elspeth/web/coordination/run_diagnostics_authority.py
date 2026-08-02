@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, final
 from uuid import uuid4
 
-from sqlalchemy import Connection, Engine, func, insert, select, update
+from sqlalchemy import Engine, func, insert, select, update
 
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.sessions.locking import locked_session_transaction
@@ -17,21 +17,6 @@ from elspeth.web.sessions.protocol import (
     RunDiagnosticsAuditAuthority,
     RunDiagnosticsAuthorityLostError,
 )
-
-
-def _database_now(conn: Connection) -> datetime:
-    dialect = conn.dialect.name
-    if dialect == "postgresql":
-        value = conn.exec_driver_sql("SELECT clock_timestamp()").scalar_one()
-    elif dialect == "sqlite":
-        value = conn.exec_driver_sql("SELECT CURRENT_TIMESTAMP").scalar_one()
-    else:  # pragma: no cover - rejected by the constructor
-        raise NotImplementedError(f"sessions database time not implemented for {dialect}")
-    if isinstance(value, str):
-        value = datetime.fromisoformat(value)
-    if not isinstance(value, datetime):
-        raise RuntimeError("sessions database clock returned a non-datetime value")
-    return value.astimezone(UTC) if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 @final
@@ -68,7 +53,12 @@ class RepositoryRunDiagnosticsAuditAuthority:
         # process/file mutex. A waiter therefore rechecks after the winning
         # writer commits rather than acting on a stale pre-lock snapshot.
         with locked_session_transaction(self._engine, sid) as conn:
-            now = _database_now(conn)
+            # Use the session store's Python-clock convention, but sample only
+            # after acquiring the canonical lock so commit/sequence order
+            # cannot move ``created_at`` or ``sessions.updated_at`` backwards.
+            # SQLite CURRENT_TIMESTAMP is not suitable here because it truncates
+            # to whole seconds and is incomparable with sibling microsecond rows.
+            now = datetime.now(UTC)
             session_row = conn.execute(
                 select(sessions_table.c.id, sessions_table.c.archived_at).where(sessions_table.c.id == sid).with_for_update()
             ).one_or_none()

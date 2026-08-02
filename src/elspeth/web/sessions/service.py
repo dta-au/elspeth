@@ -7743,8 +7743,8 @@ class SessionServiceImpl:
     ) -> ChatMessageRecord:
         """Append one run-diagnostics ``role=audit`` row under proven authority.
 
-        The authority proof and the insert share one locked transaction,
-        and the proof runs before sequence allocation, so a
+        The canonical same-session lock is acquired before the custody
+        proof, and the proof runs before sequence allocation, so a
         refused write aborts without consuming a chat sequence number.
         ``writer_principal`` and ``composition_state_id`` are derived
         from the authority. The injected repository authority is the only

@@ -464,6 +464,11 @@ def test_shutdown_does_not_suppress_tier_one_resource_cleanup_failure(
         tracer.flush = fail_tracer_flush  # type: ignore[method-assign]
     _install_provider(source, provider)
     source._tracer = tracer
+
+    def probe_telemetry(event: object) -> None:
+        del event
+
+    source._telemetry_emit = probe_telemetry
     shutdown_event = threading.Event()
     shutdown_event.set()
     source_context.shutdown_event = shutdown_event
@@ -478,6 +483,54 @@ def test_shutdown_does_not_suppress_tier_one_resource_cleanup_failure(
     assert tracer.flush_calls == 1
     assert source._provider is None
     assert source._tracer is None
+    assert source._telemetry_emit is not probe_telemetry
+
+
+def test_first_tier_one_cleanup_failure_wins_and_masked_failures_are_logged(
+    source: LLMSource,
+    source_context: PluginContext,
+) -> None:
+    """Cleanup primacy: when every detached resource fails Tier-1, the first
+    (provider) invariant failure propagates, the tracer flush is still
+    attempted, the telemetry callback is still reset, and the masked tracer
+    failure is logged rather than silently discarded."""
+    provider = FakeProvider(close_error=FrameworkBugError("provider cleanup invariant failed"))
+    tracer = RecordingTracer()
+
+    def fail_tracer_flush() -> None:
+        tracer.flush_calls += 1
+        raise FrameworkBugError("tracer cleanup invariant failed")
+
+    tracer.flush = fail_tracer_flush  # type: ignore[method-assign]
+    _install_provider(source, provider)
+    source._tracer = tracer
+
+    def probe_telemetry(event: object) -> None:
+        del event
+
+    source._telemetry_emit = probe_telemetry
+
+    with capture_logs() as logs, pytest.raises(FrameworkBugError, match="provider cleanup invariant failed"):
+        list(source.load(source_context))
+
+    assert provider.calls == 1
+    assert provider.close_calls == 1
+    assert tracer.flush_calls == 1
+    assert source._provider is None
+    assert source._tracer is None
+    assert source._telemetry_emit is not probe_telemetry
+    masked = [entry for entry in logs if entry["event"] == "resource_cleanup_tier_one_failure_masked"]
+    assert masked == [
+        {
+            "event": "resource_cleanup_tier_one_failure_masked",
+            "log_level": "error",
+            "component": "llm_source",
+            "resource": "tracer",
+            "error_type": "FrameworkBugError",
+            "primary_resource": "provider",
+            "primary_error_type": "FrameworkBugError",
+        }
+    ]
 
 
 def test_tier_one_cleanup_reporting_failure_defers_until_tracer_flush(

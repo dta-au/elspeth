@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
 import structlog
 from sqlalchemy import Engine, event, func, select
 
+import elspeth.web.coordination.run_diagnostics_authority as run_diagnostics_authority_module
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table
@@ -198,3 +200,49 @@ async def test_diagnostics_winning_advisory_lock_commits_before_archive(deployme
     assert record.writer_principal == "run_diagnostics"
     assert _message_count(diagnostics_engine, run.session_id) == 1
     assert (await archive.get_session(run.session_id)).archived_at is not None
+
+
+@pytest.mark.asyncio
+async def test_lock_order_also_orders_diagnostics_timestamps(deployment, monkeypatch: pytest.MonkeyPatch) -> None:
+    diagnostics_engine, _peer_engine, diagnostics, peer = deployment
+    run = await _create_pending_run(diagnostics)
+    authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=run.session_id, state_id=run.state_id)
+    earlier = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    later = earlier + timedelta(seconds=1)
+    clock_values = iter((earlier, later))
+    clock_lock = threading.Lock()
+
+    class SequencedDateTime:
+        @classmethod
+        def now(cls, tz) -> datetime:
+            assert tz is UTC
+            with clock_lock:
+                return next(clock_values)
+
+    monkeypatch.setattr(run_diagnostics_authority_module, "datetime", SequencedDateTime)
+
+    first_request_attempted_lock = threading.Event()
+    allow_first_request_to_lock = threading.Event()
+
+    def pause_first_request_before_lock(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        if "pg_catalog.pg_advisory_xact_lock" not in " ".join(statement.lower().split()):
+            return
+        first_request_attempted_lock.set()
+        if not allow_first_request_to_lock.wait(timeout=10):
+            raise TimeoutError("first diagnostics writer never resumed")
+
+    event.listen(diagnostics_engine, "before_cursor_execute", pause_first_request_before_lock)
+    try:
+        first_task = asyncio.create_task(diagnostics.add_run_diagnostics_audit_message(authority, "sampled first, commits second"))
+        assert await asyncio.to_thread(first_request_attempted_lock.wait, 10), "first writer never attempted the session lock"
+
+        second_record = await peer.add_run_diagnostics_audit_message(authority, "sampled second, commits first")
+        allow_first_request_to_lock.set()
+        first_record = await first_task
+    finally:
+        allow_first_request_to_lock.set()
+        event.remove(diagnostics_engine, "before_cursor_execute", pause_first_request_before_lock)
+
+    assert second_record.sequence_no < first_record.sequence_no
+    assert second_record.created_at < first_record.created_at
+    assert (await diagnostics.get_session(run.session_id)).updated_at == first_record.created_at
