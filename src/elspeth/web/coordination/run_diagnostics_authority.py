@@ -46,13 +46,6 @@ class RepositoryRunDiagnosticsAuditAuthority:
         rid = str(authority.run_id)
         stid = str(authority.state_id)
         message_id = uuid4()
-        # The Python wall clock is the session store's timestamp source for
-        # every chat/session row (SessionServiceImpl._now). Reading the DB
-        # clock here instead would make this one row's ``created_at`` and the
-        # session's ``updated_at`` incomparable with their siblings, and on
-        # SQLite CURRENT_TIMESTAMP truncates to whole seconds. Lock ordering,
-        # not the clock source, is what closes the stale-authority race.
-        now = datetime.now(UTC)
 
         # The canonical same-session lock is acquired before either proof.
         # On PostgreSQL this is the transaction advisory lock shared by
@@ -60,6 +53,17 @@ class RepositoryRunDiagnosticsAuditAuthority:
         # process/file mutex. A waiter therefore rechecks after the winning
         # writer commits rather than acting on a stale pre-lock snapshot.
         with locked_session_transaction(self._engine, sid) as conn:
+            # Stamped under the lock: an append that waited on the session
+            # lock must not record a time from before its own transaction.
+            #
+            # The Python wall clock is the session store's timestamp source
+            # for every chat/session row (SessionServiceImpl._now). Reading
+            # the DB clock here instead would make this row's ``created_at``
+            # and the session's ``updated_at`` incomparable with their
+            # siblings, and on SQLite CURRENT_TIMESTAMP truncates to whole
+            # seconds. Lock ordering, not the clock source, is what closes
+            # the stale-authority race.
+            now = datetime.now(UTC)
             session_row = conn.execute(
                 select(sessions_table.c.id, sessions_table.c.archived_at).where(sessions_table.c.id == sid).with_for_update()
             ).one_or_none()

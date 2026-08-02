@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import uuid
 from datetime import UTC, datetime
 
@@ -1556,6 +1557,17 @@ class TestArchiveSessionWithActiveRun:
         assert session.id in [s.id for s in with_archived], "Soft-archived session must be retrievable via include_archived"
 
 
+class _FrozenClock:
+    """Stand in for the ``datetime`` module with a caller-controlled ``now``."""
+
+    def __init__(self, clock: dict[str, datetime]) -> None:
+        self._clock = clock
+
+    def now(self, tz=None):
+        del tz
+        return self._clock["now"]
+
+
 class TestRunDiagnosticsAuditMessage:
     """add_run_diagnostics_audit_message proves authority durably (elspeth-0fcf68d50f)."""
 
@@ -1564,6 +1576,38 @@ class TestRunDiagnosticsAuditMessage:
         state = await service.save_composition_state(session.id, CompositionStateData(is_valid=True), provenance="session_seed")
         run = await service.create_run(session.id, state.id)
         return session, state, run
+
+    @pytest.mark.asyncio
+    async def test_audit_row_is_stamped_under_the_lock_not_at_call_entry(self, service, monkeypatch) -> None:
+        """The audit row must be timed by the transaction that writes it.
+
+        An append that waits on the session lock must not carry a timestamp
+        from before the transaction it commits in. The clock is advanced
+        exactly when the lock is taken, so a pre-lock capture is
+        distinguishable from a post-lock one without depending on timing.
+        """
+        session, state, run = await self._session_state_run(service)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+
+        before_lock = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC)
+        after_lock = datetime(2026, 8, 2, 12, 0, 30, tzinfo=UTC)
+        clock = {"now": before_lock}
+        import elspeth.web.coordination.run_diagnostics_authority as authority_module
+
+        original_lock = authority_module.locked_session_transaction
+
+        @contextlib.contextmanager
+        def advance_clock_on_lock(engine, session_id):
+            clock["now"] = after_lock
+            with original_lock(engine, session_id) as conn:
+                yield conn
+
+        monkeypatch.setattr(authority_module, "locked_session_transaction", advance_clock_on_lock)
+        monkeypatch.setattr(authority_module, "datetime", _FrozenClock(clock))
+
+        record = await service.add_run_diagnostics_audit_message(authority, "stamped under the lock")
+
+        assert record.created_at == after_lock, "the audit row was stamped before the writing transaction acquired the lock"
 
     @pytest.mark.asyncio
     async def test_service_delegates_to_handle_free_repository_authority(self, service) -> None:
