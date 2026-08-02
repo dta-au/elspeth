@@ -381,6 +381,49 @@ class SessionGuidedOperationInProgressError(RuntimeError):
         super().__init__(f"Session has an in-progress {kind} operation")
 
 
+@final
+@dataclass(frozen=True, slots=True)
+class RunDiagnosticsAuditAuthority:
+    """Handle-free write authority for run-diagnostics LLM audit rows.
+
+    Run-diagnostics evaluation holds no operation lease, so unlike
+    :class:`GuidedOperationFence` there is no token to present. The
+    authority is instead the run row's own custody of its session/state
+    binding, and it MUST be re-proven durably — run row still exists with
+    exactly this binding, owning session present and not archived —
+    inside the same locked transaction that appends the audit row
+    (elspeth-0fcf68d50f).
+    """
+
+    run_id: UUID
+    session_id: UUID
+    state_id: UUID
+
+    def __post_init__(self) -> None:
+        if type(self.run_id) is not UUID:
+            raise AuditIntegrityError("RunDiagnosticsAuditAuthority.run_id must be a UUID")
+        if type(self.session_id) is not UUID:
+            raise AuditIntegrityError("RunDiagnosticsAuditAuthority.session_id must be a UUID")
+        if type(self.state_id) is not UUID:
+            raise AuditIntegrityError("RunDiagnosticsAuditAuthority.state_id must be a UUID")
+
+
+RUN_DIAGNOSTICS_AUTHORITY_LOSS_REASONS: frozenset[str] = frozenset({"session_missing", "session_archived", "run_missing", "run_rebound"})
+
+
+class RunDiagnosticsAuthorityLostError(RuntimeError):
+    """The run/session/state binding behind a diagnostics write no longer holds."""
+
+    def __init__(self, authority: RunDiagnosticsAuditAuthority, *, reason: str) -> None:
+        if reason not in RUN_DIAGNOSTICS_AUTHORITY_LOSS_REASONS:
+            raise AuditIntegrityError(f"RunDiagnosticsAuthorityLostError reason {reason!r} is outside the closed vocabulary")
+        self.run_id = authority.run_id
+        self.session_id = authority.session_id
+        self.state_id = authority.state_id
+        self.reason = reason
+        super().__init__(f"Run-diagnostics audit authority is no longer current: {reason}")
+
+
 # Legal run status transitions. Implementations MUST reject any
 # transition not in this table.
 #
@@ -2851,6 +2894,27 @@ class SessionServiceProtocol(Protocol):
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
     ) -> ChatMessageRecord: ...
+
+    async def add_run_diagnostics_audit_message(
+        self,
+        authority: RunDiagnosticsAuditAuthority,
+        content: str,
+        *,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
+    ) -> ChatMessageRecord:
+        """Append one ``role=audit`` row under run-diagnostics authority.
+
+        The row's ``writer_principal`` (``run_diagnostics``) and
+        ``composition_state_id`` (``authority.state_id``) are derived from
+        the authority, never caller-supplied. Implementations MUST
+        re-prove the authority durably inside the same locked
+        transaction as the insert — run row present with exactly the
+        authority's session/state binding, session present and not
+        archived — and MUST raise
+        :class:`RunDiagnosticsAuthorityLostError` without consuming a
+        chat sequence number when the proof fails.
+        """
+        ...
 
     async def get_messages(
         self,

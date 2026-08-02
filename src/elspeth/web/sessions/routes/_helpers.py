@@ -155,7 +155,6 @@ from elspeth.web.sessions.protocol import (
     SESSION_TERMINAL_RUN_STATUS_VALUES,
     ChatMessageRecord,
     ChatMessageRole,
-    ChatMessageWriterPrincipal,
     ComposerSessionPreferencesRecord,
     CompositionProposalRecord,
     CompositionStateData,
@@ -169,6 +168,8 @@ from elspeth.web.sessions.protocol import (
     InvalidForkTargetError,
     ProposalEventRecord,
     ProposalLifecycleStatus,
+    RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuthorityLostError,
     RunRecord,
     SessionRecord,
     SessionServiceProtocol,
@@ -1468,7 +1469,6 @@ async def _persist_llm_calls(
     composition_state_id: UUID | None,
     *,
     plugin_crash_pending: bool,
-    writer_principal: ChatMessageWriterPrincipal = "compose_loop",
 ) -> None:
     """Persist per-LLM-call audit records as audit-only ``role=audit`` rows.
 
@@ -1478,10 +1478,10 @@ async def _persist_llm_calls(
     is a Tier-1 audit corruption that must crash; unwind-path failure
     is recorded via counter + slog so it cannot mask the primary error.
 
-    ``writer_principal`` defaults to ``compose_loop`` because every
-    compose-turn drain site writes as the compose loop; the run-
-    diagnostics route overrides it with ``run_diagnostics`` so its rows
-    are not misattributed to a compose turn (elspeth-0fcf68d50f).
+    Every caller is a compose-turn drain site, so rows are attributed to
+    the compose loop; the run-diagnostics route uses
+    :func:`_persist_run_diagnostics_llm_calls` instead, which writes
+    under a durably re-proven run authority (elspeth-0fcf68d50f).
     """
     for call in llm_calls:
         content = llm_call_audit_summary(call)
@@ -1492,7 +1492,7 @@ async def _persist_llm_calls(
                 content,
                 tool_calls=[llm_call_audit_envelope(call)],
                 composition_state_id=composition_state_id,
-                writer_principal=writer_principal,
+                writer_principal="compose_loop",
             )
         except SQLAlchemyError as save_err:
             if plugin_crash_pending:
@@ -1515,6 +1515,77 @@ async def _persist_llm_calls(
             raise AuditIntegrityError(
                 f"composer_llm_call_persist_failed: audit insert failed for "
                 f"session_id={session_id!r} on success path — Tier-1 audit "
+                f"corruption (no recovery)"
+            ) from save_err
+
+
+async def _persist_run_diagnostics_llm_calls(
+    service: SessionServiceProtocol,
+    authority: RunDiagnosticsAuditAuthority,
+    llm_calls: tuple[ComposerLLMCall, ...],
+    *,
+    plugin_crash_pending: bool,
+) -> None:
+    """Persist run-diagnostics LLM audit rows under run-scoped authority.
+
+    Sibling of :func:`_persist_llm_calls` with the same audit-primacy
+    disposition, but every row goes through
+    ``add_run_diagnostics_audit_message`` so the run/session/state
+    binding is re-proven durably inside the write transaction, and the
+    audit envelope carries ``run_id`` so an auditor can answer "which
+    operation wrote this" from the row alone (elspeth-0fcf68d50f).
+
+    Authority loss is custody movement, not audit corruption: on the
+    success path it propagates so the route refuses to return an
+    unaudited explanation; on the unwind path it is recorded and
+    swallowed so it cannot mask the primary error.
+    """
+    for call in llm_calls:
+        content = llm_call_audit_summary(call)
+        envelope = {**llm_call_audit_envelope(call), "run_id": str(authority.run_id)}
+        try:
+            await service.add_run_diagnostics_audit_message(
+                authority,
+                content,
+                tool_calls=[envelope],
+            )
+        except RunDiagnosticsAuthorityLostError as lost:
+            if plugin_crash_pending:
+                _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
+                    1,
+                    {"helper": "run_diagnostics_llm_calls"},
+                )
+                slog.error(
+                    "run_diagnostics_audit_authority_lost_during_unwind",
+                    session_id=str(authority.session_id),
+                    run_id=str(authority.run_id),
+                    reason=lost.reason,
+                )
+                continue
+            raise
+        except SQLAlchemyError as save_err:
+            if plugin_crash_pending:
+                _COMPOSER_PERSIST_FAILED_DURING_UNWIND_COUNTER.add(
+                    1,
+                    {"helper": "run_diagnostics_llm_calls"},
+                )
+                slog.error(
+                    "run_diagnostics_llm_call_persist_failed_during_unwind",
+                    session_id=str(authority.session_id),
+                    run_id=str(authority.run_id),
+                    model_requested=call.model_requested,
+                    status=call.status.value,
+                    exc_class=type(save_err).__name__,
+                )
+                continue
+            _COMPOSER_TIER1_VIOLATION_COUNTER.add(
+                1,
+                {"helper": "run_diagnostics_llm_calls"},
+            )
+            raise AuditIntegrityError(
+                f"run_diagnostics_llm_call_persist_failed: audit insert failed "
+                f"for session_id={authority.session_id!r} "
+                f"run_id={authority.run_id!r} on success path — Tier-1 audit "
                 f"corruption (no recovery)"
             ) from save_err
 

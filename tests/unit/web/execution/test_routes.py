@@ -47,7 +47,15 @@ from elspeth.web.execution.schemas import (
     ValidationResult,
 )
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
-from elspeth.web.sessions.protocol import CompositionStateRecord, RunAlreadyActiveError, RunRecord, SessionRecord, SessionServiceProtocol
+from elspeth.web.sessions.protocol import (
+    CompositionStateRecord,
+    RunAlreadyActiveError,
+    RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuthorityLostError,
+    RunRecord,
+    SessionRecord,
+    SessionServiceProtocol,
+)
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -1280,15 +1288,22 @@ class TestRunDiagnosticsEndpoint:
                 )
             assert exc_info.value.status_code == expected_http_status
 
-        assert app.state.session_service.add_message.await_count == 1
-        audit_args = app.state.session_service.add_message.await_args
-        assert audit_args.args[0] == session_id
-        assert audit_args.args[1] == "audit"
-        assert json.loads(audit_args.args[2])["status"] == status_by_outcome[outcome].value
-        assert audit_args.kwargs["composition_state_id"] == state_id
-        # elspeth-0fcf68d50f: diagnostics audit rows are attributed to their
-        # real writer, not misattributed to the compose loop.
-        assert audit_args.kwargs["writer_principal"] == "run_diagnostics"
+        persist = app.state.session_service.add_run_diagnostics_audit_message
+        assert persist.await_count == 1
+        audit_args = persist.await_args
+        # elspeth-0fcf68d50f: every diagnostics audit row is written under a
+        # minted run-scoped authority, and its envelope names the run, so
+        # the row is attributable to this exact operation.
+        assert audit_args.args[0] == RunDiagnosticsAuditAuthority(
+            run_id=run_id,
+            session_id=session_id,
+            state_id=state_id,
+        )
+        assert json.loads(audit_args.args[1])["status"] == status_by_outcome[outcome].value
+        (envelope,) = audit_args.kwargs["tool_calls"]
+        assert envelope["_kind"] == "llm_call_audit"
+        assert envelope["run_id"] == str(run_id)
+        assert app.state.session_service.add_message.await_count == 0
         serialized_audit = repr(audit_args)
         assert "SECRET_DIAGNOSTICS_PROMPT" not in serialized_audit
         assert "secret-provider-token-must-not-persist" not in serialized_audit
@@ -1383,7 +1398,10 @@ class TestRunDiagnosticsEndpoint:
         async def _record_lock_state(*args: Any, **kwargs: Any) -> None:
             held_during_persist.append(compose_lock.locked())
 
-        app.state.session_service.add_message = AsyncMock(spec=SessionServiceProtocol.add_message, side_effect=_record_lock_state)
+        app.state.session_service.add_run_diagnostics_audit_message = AsyncMock(
+            spec=SessionServiceProtocol.add_run_diagnostics_audit_message,
+            side_effect=_record_lock_state,
+        )
 
         endpoint = _route_endpoint(app, "evaluate_run_diagnostics")
         await endpoint(
@@ -1396,6 +1414,139 @@ class TestRunDiagnosticsEndpoint:
 
         assert held_during_persist == [True]
         assert not compose_lock.locked()
+
+    @staticmethod
+    def _diagnostics_evaluation_app(monkeypatch: pytest.MonkeyPatch, *, fail_llm: bool) -> tuple[Any, Any, UUID, UUID, UUID, UUID]:
+        """Minimal evaluate-diagnostics app whose composer records one LLM call."""
+        import time
+
+        from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+        from elspeth.web.composer.audit import BufferingRecorder
+        from elspeth.web.composer.llm_response_parsing import build_llm_call_record
+        from elspeth.web.composer.protocol import ComposerServiceError
+
+        run_id = uuid4()
+        session_id = uuid4()
+        state_id = uuid4()
+        svc = _execution_service()
+        svc.get_status = AsyncMock(
+            spec=ExecutionService.get_status,
+            return_value=RunStatusResponse(
+                run_id=str(run_id),
+                status="running",
+                started_at=datetime.now(UTC),
+                finished_at=None,
+                error=None,
+                landscape_run_id=str(run_id),
+            ),
+        )
+        diagnostics = RunDiagnosticsResponse(
+            run_id=str(run_id),
+            landscape_run_id=str(run_id),
+            run_status="running",
+            summary=RunDiagnosticSummary(
+                token_count=0,
+                preview_limit=50,
+                preview_truncated=False,
+                state_counts={},
+                operation_counts={},
+                latest_activity_at=None,
+            ),
+            tokens=[],
+            operations=[],
+            artifacts=[],
+        )
+        monkeypatch.setattr(
+            "elspeth.web.execution.routes.load_run_diagnostics_for_settings",
+            lambda *args, **kwargs: diagnostics,
+        )
+
+        class FakeComposer:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: BufferingRecorder | None = None,
+            ) -> str:
+                assert recorder is not None
+                recorder.record_llm_call(
+                    build_llm_call_record(
+                        model_requested="test/diagnostics",
+                        messages=[{"role": "user", "content": "prompt"}],
+                        tools=None,
+                        status=ComposerLLMCallStatus.TIMEOUT if fail_llm else ComposerLLMCallStatus.SUCCESS,
+                        started_at=datetime.now(UTC),
+                        started_ns=time.monotonic_ns(),
+                        temperature=None,
+                        seed=None,
+                        error_class="TimeoutError" if fail_llm else None,
+                        error_message="timed out" if fail_llm else None,
+                    )
+                )
+                if fail_llm:
+                    raise ComposerServiceError("Run diagnostics explanation timed out")
+                return '{"headline":"Run active","evidence":[],"meaning":"Work continues.","next_steps":[]}'
+
+        app = _create_test_app(execution_service=svc)
+        app.state.composer_service = FakeComposer()
+        app.state.session_service.get_run.return_value = _run_record(
+            run_id=run_id,
+            session_id=session_id,
+            state_id=state_id,
+        )
+        authority = RunDiagnosticsAuditAuthority(run_id=run_id, session_id=session_id, state_id=state_id)
+        app.state.session_service.add_run_diagnostics_audit_message = AsyncMock(
+            spec=SessionServiceProtocol.add_run_diagnostics_audit_message,
+            side_effect=RunDiagnosticsAuthorityLostError(authority, reason="session_archived"),
+        )
+        return app, svc, run_id, session_id, state_id, authority.run_id
+
+    @pytest.mark.asyncio
+    async def test_evaluate_diagnostics_authority_lost_refuses_unaudited_result(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """elspeth-0fcf68d50f: when the run/session/state custody moves before
+        the audit row lands, the route must refuse to hand back the
+        unaudited explanation rather than degrade to an unattributed write."""
+        from fastapi import HTTPException
+
+        app, svc, run_id, _session_id, _state_id, _ = self._diagnostics_evaluation_app(monkeypatch, fail_llm=False)
+        endpoint = _route_endpoint(app, "evaluate_run_diagnostics")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await endpoint(
+                run_id,
+                _request_for_app(app),
+                limit=50,
+                user=UserIdentity(user_id=_TEST_USER_ID, username="testuser"),
+                service=svc,
+            )
+
+        assert exc_info.value.status_code == 409
+        assert exc_info.value.detail["error_type"] == "run_diagnostics_audit_authority_lost"
+        assert "session_archived" in exc_info.value.detail["detail"]
+
+    @pytest.mark.asyncio
+    async def test_evaluate_diagnostics_authority_lost_during_unwind_preserves_primary_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Authority loss on the unwind path is recorded but must never mask
+        the primary LLM failure the client needs to see."""
+        from fastapi import HTTPException
+
+        app, svc, run_id, _session_id, _state_id, _ = self._diagnostics_evaluation_app(monkeypatch, fail_llm=True)
+        endpoint = _route_endpoint(app, "evaluate_run_diagnostics")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await endpoint(
+                run_id,
+                _request_for_app(app),
+                limit=50,
+                user=UserIdentity(user_id=_TEST_USER_ID, username="testuser"),
+                service=svc,
+            )
+
+        assert exc_info.value.status_code == 502
+        assert exc_info.value.detail["error_type"] == "run_diagnostics_explanation_failed"
 
     @pytest.mark.asyncio
     async def test_evaluate_diagnostics_redacts_error_payloads_before_llm_prompt(self, monkeypatch: pytest.MonkeyPatch) -> None:
