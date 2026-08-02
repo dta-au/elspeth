@@ -46,7 +46,6 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.provider_config_policy import (
-    LLM_BASE_URL_POLICY_ERROR,
     web_aws_s3_endpoint_url_policy_error,
     web_aws_s3_source_policy_error,
     web_llm_base_url_policy_error,
@@ -63,8 +62,8 @@ class _LLMPolicyComponent:
     component_id: str
     component_type: Literal["source", "transform"]
     label: str
-    plugin: object
-    options: object
+    plugin: str | None
+    options: Mapping[str, Any]
 
 
 def _source_policy_component_id(source_name: object) -> str:
@@ -307,15 +306,7 @@ def validate_llm_retry_budget_policy(materialized: MaterializedYaml) -> PhaseRep
 def validate_llm_base_url_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
     """Reject web-authored OpenRouter base URL overrides."""
     for component in _llm_policy_components(materialized.authored.policy.state):
-        options = component.options if isinstance(component.options, Mapping) else {}
-        try:
-            policy_error = web_llm_base_url_policy_error(
-                component.plugin if type(component.plugin) is str else None,
-                options,
-            )
-        except (TypeError, ValueError):
-            # Fail closed without reflecting malformed author-controlled URLs.
-            policy_error = LLM_BASE_URL_POLICY_ERROR
+        policy_error = web_llm_base_url_policy_error(component.plugin, component.options)
         if policy_error is None:
             continue
         policy_message = policy_error if component.component_type == "transform" else policy_error.replace("LLM nodes", "LLM sources")
@@ -362,11 +353,7 @@ def validate_llm_base_url_policy(materialized: MaterializedYaml) -> PhaseReport[
 def validate_llm_tracing_policy(materialized: MaterializedYaml) -> PhaseReport[MaterializedYaml] | PhaseFailure:
     """Reject author-controlled LLM tracing configuration."""
     for component in _llm_policy_components(materialized.authored.policy.state):
-        options = component.options if isinstance(component.options, Mapping) else {}
-        policy_error = web_llm_tracing_policy_error(
-            component.plugin if type(component.plugin) is str else None,
-            options,
-        )
+        policy_error = web_llm_tracing_policy_error(component.plugin, component.options)
         if policy_error is None:
             continue
         policy_message = policy_error if component.component_type == "transform" else policy_error.replace("LLM nodes", "LLM sources")

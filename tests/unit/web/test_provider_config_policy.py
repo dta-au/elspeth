@@ -16,11 +16,23 @@ from elspeth.web.plugin_policy.models import PluginUnavailableReason
 from elspeth.web.provider_config_policy import (
     AWS_S3_ENDPOINT_URL_POLICY_ERROR,
     AWS_S3_SOURCE_POLICY_ERROR,
+    LLM_BASE_URL_POLICY_ERROR,
     LLM_TRACING_POLICY_ERROR,
     web_aws_s3_endpoint_url_policy_error,
     web_aws_s3_source_policy_error,
+    web_llm_base_url_policy_error,
     web_llm_tracing_policy_error,
 )
+
+
+class TestWebLlmBaseUrlPolicy:
+    def test_malformed_url_is_rejected_without_reflecting_it(self) -> None:
+        malformed_canary = "https://[BASE_URL_CANARY"
+
+        error = web_llm_base_url_policy_error("llm", {"base_url": malformed_canary})
+
+        assert error == LLM_BASE_URL_POLICY_ERROR
+        assert "BASE_URL_CANARY" not in error
 
 
 class TestWebAwsS3SourcePolicy:

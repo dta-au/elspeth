@@ -237,7 +237,13 @@ def web_llm_base_url_policy_error(plugin: str | None, options: Mapping[str, Any]
         # Non-string base_url is rejected at config construction (pydantic); the
         # network-policy gate only adjudicates author-chosen string endpoints.
         return None
-    if normalize_openrouter_base_url(base_url.strip()) == normalize_openrouter_base_url(OPENROUTER_BASE_URL):
+    try:
+        normalized_base_url = normalize_openrouter_base_url(base_url.strip())
+    except (TypeError, ValueError):
+        # Malformed author-controlled URLs are unsafe overrides. Keep the
+        # diagnostic static so the submitted value is never reflected.
+        return LLM_BASE_URL_POLICY_ERROR
+    if normalized_base_url == normalize_openrouter_base_url(OPENROUTER_BASE_URL):
         return None
     return LLM_BASE_URL_POLICY_ERROR
 
