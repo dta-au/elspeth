@@ -135,8 +135,6 @@ from .._helpers import (
     _get_session_compose_lock_registry,
     _initial_composition_state_with_guided_session,
     _inspect_latest_ready_session_blob,
-    _persist_llm_calls,
-    _persist_tool_invocations,
     _replace,
     _request_plugin_policy_context,
     _safe_frame_strings,
@@ -163,7 +161,6 @@ from .._helpers import (
     generate_public_yaml,
     get_current_user,
     slog,
-    sys,
 )
 from .guided_plan import _guided_full_failure_code
 from .guided_plan import router as guided_plan_router
@@ -724,11 +721,10 @@ async def get_guided(
 ) -> GetGuidedResponse:
     """Return the current guided-mode state for a session.
 
-    Fresh sessions are non-mutating on first visit: if there is no
-    existing CompositionState, the initial GuidedSession and first turn are
-    built in memory and returned with ``composition_state=None``. This keeps
-    the version history from starting with an empty graph solely because
-    the frontend auto-loaded guided mode.
+    This read is non-mutating. If there is no existing CompositionState, the
+    initial GuidedSession and first turn are built in memory and returned with
+    ``composition_state=None``. This keeps the version history from starting
+    with an empty graph solely because the frontend auto-loaded guided mode.
 
     A missing occurrence is projected prospectively for both fresh and
     persisted sessions. GET never writes half of the state/evidence pair; the
@@ -748,204 +744,172 @@ async def get_guided(
 
     service: SessionServiceProtocol = request.app.state.session_service
     catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
-    recorder = BufferingRecorder()
 
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
     async with compose_lock:
-        # PR-review B3: drain the recorder on every exit path, including
-        # ``raise HTTPException`` rejections.  Without this, any audit
-        # event emitted before a mid-body raise would be discarded — a
-        # CLAUDE.md auditability violation ("rejected requests are facts
-        # worth recording").  ``state_record_out`` is hoisted so the
-        # finally block can pass its id (or None) regardless of where
-        # control left the try.
         state_record_out: CompositionStateRecord | None = None
-        try:
-            # Load or create CompositionState.
-            state_record = await service.get_current_state(session_id)
-            if state_record is None:
-                state = _initial_composition_state_with_guided_session()
-            else:
-                state = _state_from_record(state_record)
-                state_record_out = state_record
 
-            # Reject freeform sessions.
-            if state.guided_session is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Session is not in guided mode. Use /api/sessions/{id}/messages.",
-                )
+        # Load or create CompositionState.
+        state_record = await service.get_current_state(session_id)
+        if state_record is None:
+            state = _initial_composition_state_with_guided_session()
+        else:
+            state = _state_from_record(state_record)
+            state_record_out = state_record
 
-            guided = state.guided_session
-            current_step = guided.step
-
-            active_authority = None
-            if current_step is GuidedStep.STEP_3_TRANSFORMS and guided.active_proposal is not None:
-                if state_record_out is None:
-                    raise AuditIntegrityError("guided active proposal has no persisted checkpoint")
-                reviewed_facts = guided_private_reviewed_facts(guided)
-                try:
-                    active_authority = await service.get_authoritative_pipeline_proposal(
-                        session_id=session_id,
-                        proposal_id=guided.active_proposal.proposal_id,
-                        reviewed_facts=reviewed_facts,
-                    )
-                except (KeyError, ValueError) as exc:
-                    raise AuditIntegrityError("guided proposal authority is missing or cross-session") from exc
-                active = guided.active_proposal
-                proposal = active_authority.proposal
-                if (
-                    active.draft_hash != proposal.draft_hash
-                    or active.base != proposal.base
-                    or active.reviewed_anchor_hash != proposal.reviewed_anchor_hash
-                    or active.covered_deferred_intent_ids != proposal.covered_deferred_intent_ids
-                    or active.creation_event_schema != "pipeline_proposal_created.v1"
-                    or active.supersedes_proposal_id != active_authority.supersedes_proposal_id
-                    or active.supersedes_draft_hash != proposal.supersedes_draft_hash
-                ):
-                    raise AuditIntegrityError("guided proposal reference differs from private authority")
-                if type(proposal.base) is not PresentBase:
-                    raise AuditIntegrityError("guided proposal authority has a non-present base")
-                if proposal.base.state_id != state_record_out.id or proposal.base.composition_content_hash != composition_content_hash(
-                    state
-                ):
-                    raise AuditIntegrityError("guided proposal base differs from current checkpoint")
-                if active_authority.row.status == "rejected":
-                    raise AuditIntegrityError("guided active proposal is already terminal")
-                elif active_authority.row.status != "pending":
-                    raise AuditIntegrityError("guided active proposal is unexpectedly terminal")
-
-            existing_record_for_step = (
-                guided.history[-1]
-                if guided.history and guided.history[-1].step is current_step and guided.history[-1].response_hash is None
-                else None
+        # Reject freeform sessions.
+        if state.guided_session is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Session is not in guided mode. Use /api/sessions/{id}/messages.",
             )
 
-            # A persisted unanswered occurrence is immutable replay authority:
-            # load its purpose-bound CAS payload exactly, without consulting
-            # the live catalog or current plugin availability. Only a missing
-            # occurrence is projected prospectively from live state.
-            turn: Turn | None
-            if guided.terminal is None:
-                if existing_record_for_step is not None:
-                    turn, _prepared = _load_durable_current_turn(
-                        guided,
-                        payload_store=request.app.state.payload_store,
-                    )
-                    if current_step is GuidedStep.STEP_3_TRANSFORMS:
-                        if active_authority is None or guided.active_proposal is None:
-                            raise AuditIntegrityError("guided proposal occurrence has no private authority")
-                        catalog_ids = {
-                            "source": frozenset(item.name for item in catalog.list_sources()),
-                            "transform": frozenset(item.name for item in catalog.list_transforms()),
-                            "sink": frozenset(item.name for item in catalog.list_sinks()),
-                        }
-                        verify_guided_proposal_projection(
-                            payload=turn["payload"],
-                            proposal_id=guided.active_proposal.proposal_id,
-                            proposal=active_authority.proposal,
-                            guided=guided,
-                            catalog_plugin_ids=catalog_ids,
-                        )
-                else:
-                    try:
-                        turn = _build_get_guided_turn(state, guided, catalog=catalog)
-                    except InvariantError as exc:
-                        # Same B1-sanitization rationale as the POST /respond
-                        # dispatcher's InvariantError catch: ``str(exc)`` can embed
-                        # ``{d!r}`` of a corrupted Tier-1 record including Tier-3
-                        # sample_rows. Static detail; slog carries exc_class +
-                        # frames only.
-                        slog.error(
-                            "guided.invariant_violated",
-                            session_id=str(session_id),
-                            user_id=user.user_id,
-                            exc_class=type(exc).__name__,
-                            site="get_guided._build_get_guided_turn",
-                            frames=_safe_frame_strings(exc),
-                        )
-                        raise HTTPException(
-                            status_code=500,
-                            detail={
-                                "error_type": "server_invariant_violated",
-                                "detail": "Server invariant violated. See application audit log for diagnostic detail.",
-                            },
-                        ) from exc
-                    if turn is not None:
-                        turn = _finalize_guided_turn(
-                            turn,
-                            shield_available=_resolve_shield_available(plugin_snapshot),
-                        )
-            else:
-                turn = None
-            turn_type: TurnType | None = TurnType(turn["type"]) if turn is not None else None
-            payload_hash: str | None = guided_json_payload_id("turn", turn["payload"]) if turn is not None else None
+        guided = state.guided_session
+        current_step = guided.step
 
-            if existing_record_for_step is None and turn is not None:
-                # First fetch for this step AND a turn exists: record TurnRecord,
-                # persist, emit audit. When turn is None (terminal state or
-                # STEP_3) there is no turn to record.
-                # Guaranteed by the conditional assignments above: turn is not
-                # None on this branch, so both turn_type and payload_hash were
-                # populated from turn["type"] / stable_hash(turn["payload"]).
-                # Use InvariantError (not bare assert) so python -O does not
-                # strip the gate and silently feed None to TurnRecord.
-                if turn_type is None:
-                    raise InvariantError(
-                        "GET guided: turn is not None but turn_type is None — TurnType derivation skipped despite turn being present."
-                    )
-                if payload_hash is None:
-                    raise InvariantError(
-                        "GET guided: turn is not None but payload_hash is None — stable_hash derivation skipped despite turn being present."
-                    )
-                new_guided, _new_record, turn_type, payload_hash = _append_server_turn_record(
-                    guided,
-                    current_step=current_step,
-                    turn=turn,
+        active_authority = None
+        if current_step is GuidedStep.STEP_3_TRANSFORMS and guided.active_proposal is not None:
+            if state_record_out is None:
+                raise AuditIntegrityError("guided active proposal has no persisted checkpoint")
+            reviewed_facts = guided_private_reviewed_facts(guided)
+            try:
+                active_authority = await service.get_authoritative_pipeline_proposal(
+                    session_id=session_id,
+                    proposal_id=guided.active_proposal.proposal_id,
+                    reviewed_facts=reviewed_facts,
                 )
-                guided = new_guided
+            except (KeyError, ValueError) as exc:
+                raise AuditIntegrityError("guided proposal authority is missing or cross-session") from exc
+            active = guided.active_proposal
+            proposal = active_authority.proposal
+            if (
+                active.draft_hash != proposal.draft_hash
+                or active.base != proposal.base
+                or active.reviewed_anchor_hash != proposal.reviewed_anchor_hash
+                or active.covered_deferred_intent_ids != proposal.covered_deferred_intent_ids
+                or active.creation_event_schema != "pipeline_proposal_created.v1"
+                or active.supersedes_proposal_id != active_authority.supersedes_proposal_id
+                or active.supersedes_draft_hash != proposal.supersedes_draft_hash
+            ):
+                raise AuditIntegrityError("guided proposal reference differs from private authority")
+            if type(proposal.base) is not PresentBase:
+                raise AuditIntegrityError("guided proposal authority has a non-present base")
+            if proposal.base.state_id != state_record_out.id or proposal.base.composition_content_hash != composition_content_hash(state):
+                raise AuditIntegrityError("guided proposal base differs from current checkpoint")
+            if active_authority.row.status == "rejected":
+                raise AuditIntegrityError("guided active proposal is already terminal")
+            elif active_authority.row.status != "pending":
+                raise AuditIntegrityError("guided active proposal is unexpectedly terminal")
 
-            # Build response.  On re-fetch the same turn is returned (deterministic
-            # rebuild) and the payload_hash matches what was recorded on first visit.
-            terminal = guided.terminal
-            shield_available = _resolve_shield_available(plugin_snapshot)
-            return GetGuidedResponse(
-                guided_session=GuidedSessionResponse(
-                    step=guided.step.value,
-                    history=[
-                        TurnRecordResponse(
-                            step=r.step.value,
-                            turn_type=r.turn_type.value,
-                            payload_hash=r.payload_hash,
-                            response_hash=r.response_hash,
-                            summary=r.summary,
-                            emitter=r.emitter,
-                        )
-                        for r in guided.history
-                    ],
-                    terminal=TerminalStateResponse(
-                        kind=terminal.kind.value,
-                        reason=terminal.reason.value if terminal.reason is not None else None,
-                        pipeline_yaml=terminal.pipeline_yaml,
+        existing_record_for_step = (
+            guided.history[-1]
+            if guided.history and guided.history[-1].step is current_step and guided.history[-1].response_hash is None
+            else None
+        )
+
+        # A persisted unanswered occurrence is immutable replay authority:
+        # load its purpose-bound CAS payload exactly, without consulting
+        # the live catalog or current plugin availability. Only a missing
+        # occurrence is projected prospectively from live state.
+        turn: Turn | None
+        if guided.terminal is None:
+            if existing_record_for_step is not None:
+                turn, _prepared = _load_durable_current_turn(
+                    guided,
+                    payload_store=request.app.state.payload_store,
+                )
+                if current_step is GuidedStep.STEP_3_TRANSFORMS:
+                    if active_authority is None or guided.active_proposal is None:
+                        raise AuditIntegrityError("guided proposal occurrence has no private authority")
+                    catalog_ids = {
+                        "source": frozenset(item.name for item in catalog.list_sources()),
+                        "transform": frozenset(item.name for item in catalog.list_transforms()),
+                        "sink": frozenset(item.name for item in catalog.list_sinks()),
+                    }
+                    verify_guided_proposal_projection(
+                        payload=turn["payload"],
+                        proposal_id=guided.active_proposal.proposal_id,
+                        proposal=active_authority.proposal,
+                        guided=guided,
+                        catalog_plugin_ids=catalog_ids,
                     )
-                    if terminal is not None
-                    else None,
-                    chat_history=[
-                        ChatTurnResponse(
-                            role=t.role.value,
-                            content=t.content,
-                            seq=t.seq,
-                            step=t.step.value,
-                            ts_iso=t.ts_iso,
-                            assistant_message_kind=t.assistant_message_kind,
-                            synthetic_failure_reason=t.synthetic_failure_reason,
-                        )
-                        for t in guided.chat_history
-                    ],
-                    chat_turn_seq=guided.chat_turn_seq,
-                    profile=_workflow_profile_response(guided),
-                ),
-                next_turn=_turn_payload_response(turn, guided=guided, shield_available=shield_available),
+            else:
+                try:
+                    turn = _build_get_guided_turn(state, guided, catalog=catalog)
+                except InvariantError as exc:
+                    # Same B1-sanitization rationale as the POST /respond
+                    # dispatcher's InvariantError catch: ``str(exc)`` can embed
+                    # ``{d!r}`` of a corrupted Tier-1 record including Tier-3
+                    # sample_rows. Static detail; slog carries exc_class +
+                    # frames only.
+                    slog.error(
+                        "guided.invariant_violated",
+                        session_id=str(session_id),
+                        user_id=user.user_id,
+                        exc_class=type(exc).__name__,
+                        site="get_guided._build_get_guided_turn",
+                        frames=_safe_frame_strings(exc),
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail={
+                            "error_type": "server_invariant_violated",
+                            "detail": "Server invariant violated. See application audit log for diagnostic detail.",
+                        },
+                    ) from exc
+                if turn is not None:
+                    turn = _finalize_guided_turn(
+                        turn,
+                        shield_available=_resolve_shield_available(plugin_snapshot),
+                    )
+        else:
+            turn = None
+        turn_type: TurnType | None = TurnType(turn["type"]) if turn is not None else None
+        payload_hash: str | None = guided_json_payload_id("turn", turn["payload"]) if turn is not None else None
+
+        if existing_record_for_step is None and turn is not None:
+            # Project the missing TurnRecord into the response. The first
+            # fenced mutation persists the occurrence and its audit evidence.
+            # When turn is None (terminal state or STEP_3), there is no turn
+            # to project.
+            # Guaranteed by the conditional assignments above: turn is not
+            # None on this branch, so both turn_type and payload_hash were
+            # populated from turn["type"] / stable_hash(turn["payload"]).
+            # Use InvariantError (not bare assert) so python -O does not
+            # strip the gate and silently feed None to TurnRecord.
+            if turn_type is None:
+                raise InvariantError(
+                    "GET guided: turn is not None but turn_type is None — TurnType derivation skipped despite turn being present."
+                )
+            if payload_hash is None:
+                raise InvariantError(
+                    "GET guided: turn is not None but payload_hash is None — stable_hash derivation skipped despite turn being present."
+                )
+            new_guided, _new_record, turn_type, payload_hash = _append_server_turn_record(
+                guided,
+                current_step=current_step,
+                turn=turn,
+            )
+            guided = new_guided
+
+        # Build the deterministic response. A repeated read projects the same
+        # missing occurrence and payload hash until a fenced mutation persists it.
+        terminal = guided.terminal
+        shield_available = _resolve_shield_available(plugin_snapshot)
+        return GetGuidedResponse(
+            guided_session=GuidedSessionResponse(
+                step=guided.step.value,
+                history=[
+                    TurnRecordResponse(
+                        step=r.step.value,
+                        turn_type=r.turn_type.value,
+                        payload_hash=r.payload_hash,
+                        response_hash=r.response_hash,
+                        summary=r.summary,
+                        emitter=r.emitter,
+                    )
+                    for r in guided.history
+                ],
                 terminal=TerminalStateResponse(
                     kind=terminal.kind.value,
                     reason=terminal.reason.value if terminal.reason is not None else None,
@@ -953,105 +917,31 @@ async def get_guided(
                 )
                 if terminal is not None
                 else None,
-                composition_state=_state_response(state_record_out, policy_catalog=catalog) if state_record_out is not None else None,
+                chat_history=[
+                    ChatTurnResponse(
+                        role=t.role.value,
+                        content=t.content,
+                        seq=t.seq,
+                        step=t.step.value,
+                        ts_iso=t.ts_iso,
+                        assistant_message_kind=t.assistant_message_kind,
+                        synthetic_failure_reason=t.synthetic_failure_reason,
+                    )
+                    for t in guided.chat_history
+                ],
+                chat_turn_seq=guided.chat_turn_seq,
+                profile=_workflow_profile_response(guided),
+            ),
+            next_turn=_turn_payload_response(turn, guided=guided, shield_available=shield_available),
+            terminal=TerminalStateResponse(
+                kind=terminal.kind.value,
+                reason=terminal.reason.value if terminal.reason is not None else None,
+                pipeline_yaml=terminal.pipeline_yaml,
             )
-        finally:
-            # PR-review B3: drain the recorder unconditionally — success
-            # paths and ``raise HTTPException`` rejection paths take the
-            # same exit.  Empty drains are a no-op (BufferingRecorder
-            # starts with an empty invocations list and
-            # ``_persist_tool_invocations`` iterates an empty tuple).
-            #
-            # The suppress-and-log path is only for exception unwinds:
-            # Python's default behaviour is to let a ``finally``-block
-            # exception replace the original, which would surface a generic
-            # 500 instead of the intended 400/409.  On a successful return,
-            # audit persist failures must propagate — otherwise a state
-            # write can succeed while the guided audit row silently
-            # disappears.  Per CLAUDE.md telemetry/logging primacy,
-            # audit-system failures during exception handling are the one
-            # exemption where ``slog`` is the correct channel.  The log
-            # payload follows the B1 convention: ``exc_class`` + ``frames``
-            # only, never ``str(exc)`` or ``exc_info`` (frames are bounded
-            # and value-free; the exception message can carry Tier-bearing
-            # strings).
-            #
-            # The two recorder channels (tool invocations and LLM calls)
-            # drain through TWO separate try blocks so that a failure
-            # persisting one does not skip the other.  ``_persist_llm_calls``
-            # covers any :class:`ComposerLLMCall` rows buffered during guided
-            # model invocations.
-            # Without the second drain the LLM-call audit would be
-            # garbage-collected with the recorder at function exit.
-            primary_exc = sys.exception()
-            if primary_exc is None:
-                await _persist_tool_invocations(
-                    service,
-                    session_id,
-                    recorder.invocations,
-                    state_record_out.id if state_record_out is not None else None,
-                    # Success path: no primary exception is in flight, so the
-                    # success disposition applies. ``plugin_crash_pending``
-                    # means "are we unwinding from a primary failure?", NOT
-                    # "did a plugin crash" — here no, so a persist failure is
-                    # a Tier-1 audit corruption that must raise (False). The
-                    # unwind (else) branch below passes True.
-                    plugin_crash_pending=False,
-                )
-                await _persist_llm_calls(
-                    service,
-                    session_id,
-                    recorder.llm_calls,
-                    state_record_out.id if state_record_out is not None else None,
-                    plugin_crash_pending=False,
-                )
-            else:
-                # Unwind path: a primary exception is in flight (this is the
-                # ``finally`` block). ``plugin_crash_pending`` asks "are we
-                # unwinding from a primary failure?", NOT "did a plugin
-                # crash" — here the answer is yes. True selects the helper's
-                # record-and-continue disposition (unwind counter + slog) so
-                # an audit-persist failure does NOT raise AuditIntegrityError
-                # and mask the primary failure the operator needs to see.
-                try:
-                    await _persist_tool_invocations(
-                        service,
-                        session_id,
-                        recorder.invocations,
-                        state_record_out.id if state_record_out is not None else None,
-                        plugin_crash_pending=True,
-                    )
-                except Exception as persist_exc:
-                    # Terminal logger-of-last-resort: no safer channel exists if structlog itself raises here.
-                    with contextlib.suppress(Exception):
-                        slog.error(
-                            "guided.audit_persist_failed_during_exception_handling",
-                            session_id=str(session_id),
-                            user_id=user.user_id,
-                            site="get_guided",
-                            channel="tool_invocations",
-                            exc_class=type(persist_exc).__name__,
-                            frames=_safe_frame_strings(persist_exc),
-                        )
-                try:
-                    await _persist_llm_calls(
-                        service,
-                        session_id,
-                        recorder.llm_calls,
-                        state_record_out.id if state_record_out is not None else None,
-                        plugin_crash_pending=True,
-                    )
-                except Exception as persist_exc:
-                    with contextlib.suppress(Exception):
-                        slog.error(
-                            "guided.audit_persist_failed_during_exception_handling",
-                            session_id=str(session_id),
-                            user_id=user.user_id,
-                            site="get_guided",
-                            channel="llm_calls",
-                            exc_class=type(persist_exc).__name__,
-                            frames=_safe_frame_strings(persist_exc),
-                        )
+            if terminal is not None
+            else None,
+            composition_state=_state_response(state_record_out, policy_catalog=catalog) if state_record_out is not None else None,
+        )
 
 
 @router.get("/{session_id}/guided/tutorial-sample", response_model=TutorialSampleResponse)

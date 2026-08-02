@@ -25,3 +25,12 @@ def test_get_guided_has_no_rejected_proposal_reconciliation_dml_path() -> None:
     }
 
     assert "reconcile_rejected_guided_pipeline_proposal" not in called_attributes
+
+
+def test_get_guided_has_no_audit_recorder_or_drain_path() -> None:
+    """Read-only guided fetches must not create or drain audit recorders."""
+    module = ast.parse(GUIDED_ROUTES.read_text(encoding="utf-8"), filename=str(GUIDED_ROUTES))
+    get_guided = next(node for node in module.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "get_guided")
+    called_names = {node.func.id for node in ast.walk(get_guided) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)}
+
+    assert called_names.isdisjoint({"BufferingRecorder", "_persist_tool_invocations", "_persist_llm_calls"})
