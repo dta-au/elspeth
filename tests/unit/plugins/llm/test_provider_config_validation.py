@@ -6,7 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import patch
 
 import pytest
@@ -91,49 +91,38 @@ def test_source_openrouter_import_registers_declared_catalogue() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def _source_options(**provider_options: Any) -> dict[str, Any]:
-    return {**_SOURCE_COMMON, **provider_options}
+# Sentinel distinguishing "the model key is omitted entirely" from an
+# explicit ``None``/``""`` value in the absent-model parametrization below.
+_MODEL_KEY_OMITTED: Any = object()
 
 
-def _transform_options(**provider_options: Any) -> dict[str, Any]:
-    return {**_TRANSFORM_COMMON, **provider_options}
-
-
-@pytest.mark.parametrize(
-    ("config_model", "options"),
-    [
-        (
-            AzureOpenAILLMSourceConfig,
-            _source_options(
-                provider="azure",
-                deployment_name="gpt-4o-mini",
-                endpoint="https://example.openai.azure.com",
-                api_key="test-api-key",
-            ),
-        ),
-        (
-            AzureOpenAIConfig,
-            _transform_options(
-                provider="azure",
-                deployment_name="gpt-4o-mini",
-                endpoint="https://example.openai.azure.com",
-                api_key="test-api-key",
-            ),
-        ),
-    ],
-)
-def test_azure_deployment_fallback_matches(config_model: type[Any], options: dict[str, Any]) -> None:
+@pytest.mark.parametrize("config_model,common", [(AzureOpenAILLMSourceConfig, _SOURCE_COMMON), (AzureOpenAIConfig, _TRANSFORM_COMMON)])
+@pytest.mark.parametrize("absent_model", [_MODEL_KEY_OMITTED, None, ""], ids=["missing", "none", "empty"])
+def test_azure_deployment_fallback_matches(config_model: type[Any], common: dict[str, Any], absent_model: Any) -> None:
+    """Only the genuinely-absent forms — key omitted, ``None``, ``""`` —
+    inherit ``deployment_name``; anything else must not silently default."""
+    options = {
+        **common,
+        "provider": "azure",
+        "deployment_name": "gpt-4o-mini",
+        "endpoint": "https://example.openai.azure.com",
+        "api_key": "test-api-key",
+    }
+    if absent_model is not _MODEL_KEY_OMITTED:
+        options["model"] = absent_model
     cfg = config_model.model_validate(options)
     assert cfg.model == "gpt-4o-mini"
 
 
 @pytest.mark.parametrize("config_model,common", [(AzureOpenAILLMSourceConfig, _SOURCE_COMMON), (AzureOpenAIConfig, _TRANSFORM_COMMON)])
-@pytest.mark.parametrize("malformed_model", [0, False])
-def test_azure_rejects_falsey_non_string_model_values(
+@pytest.mark.parametrize("malformed_model", [0, False, [], {}, 123], ids=["zero", "false", "empty-list", "empty-dict", "int"])
+def test_azure_rejects_non_string_model_values(
     config_model: type[Any],
     common: dict[str, Any],
     malformed_model: object,
 ) -> None:
+    """A present-but-wrong-type model (falsey or not) must fail Pydantic
+    validation — never be silently masked by the deployment_name fallback."""
     with pytest.raises(ValidationError, match="model"):
         config_model.model_validate(
             {
@@ -145,6 +134,39 @@ def test_azure_rejects_falsey_non_string_model_values(
                 "api_key": "test-api-key",
             }
         )
+
+
+@pytest.mark.parametrize(
+    ("config_model", "common", "component_type"),
+    [
+        (AzureOpenAILLMSourceConfig, _SOURCE_COMMON, "source"),
+        (AzureOpenAIConfig, _TRANSFORM_COMMON, "transform"),
+    ],
+)
+def test_azure_whitespace_model_is_present_not_absent(
+    config_model: type[Any],
+    common: dict[str, Any],
+    component_type: Literal["source", "transform"],
+) -> None:
+    """A whitespace-only model is present-but-wrong, not absent: it must NOT
+    silently inherit ``deployment_name``, and the sibling-derivation walker
+    surfaces it as a structured finding rather than masking it."""
+    cfg = config_model.model_validate(
+        {
+            **common,
+            "provider": "azure",
+            "model": "   ",
+            "deployment_name": "gpt-4o-mini",
+            "endpoint": "https://example.openai.azure.com",
+            "api_key": "test-api-key",
+        }
+    )
+    assert cfg.model == "   "
+
+    findings = check_config_value_sources(cfg, component_id="llm", component_type=component_type)
+
+    assert len(findings) == 1
+    assert findings[0].field_name == "model"
 
 
 @pytest.mark.parametrize("config_model,common", [(AzureOpenAILLMSourceConfig, _SOURCE_COMMON), (AzureOpenAIConfig, _TRANSFORM_COMMON)])
@@ -196,6 +218,10 @@ def test_openrouter_normalizes_url_and_rejects_remote_http(config_model: type[An
 @pytest.mark.parametrize(
     "equivalent_url",
     [
+        # Uppercase scheme and host are pure spelling variants under RFC 3986
+        # (scheme and host are case-insensitive) — wire-identical to the
+        # canonical endpoint, so the catalogue gate must still apply.
+        "HTTPS://OPENROUTER.AI/api/v1",
         "https://OPENROUTER.AI/api/v1",
         "https://openrouter.ai:443/api/v1",
         # elspeth-5653909057: dot-segment spellings are collapsed client-side by
@@ -229,6 +255,39 @@ def test_openrouter_provider_equivalent_urls_keep_catalog_enforcement(
     assert config.base_url == OPENROUTER_BASE_URL
     assert len(findings) == 1
     assert findings[0].field_name == "model"
+
+
+@pytest.mark.parametrize(
+    ("config_model", "common", "component_type"),
+    [
+        (OpenRouterLLMSourceConfig, _SOURCE_COMMON, "source"),
+        (OpenRouterConfig, _TRANSFORM_COMMON, "transform"),
+    ],
+)
+def test_openrouter_non_canonical_endpoint_skips_catalog_enforcement(
+    config_model: type[Any],
+    common: dict[str, Any],
+    component_type: Literal["source", "transform"],
+) -> None:
+    """A genuinely different endpoint owns its model-identifier semantics —
+    the OpenRouter catalogue ``applies_when`` gate must skip, not reject."""
+    config = config_model.model_validate(
+        {
+            **common,
+            "provider": "openrouter",
+            "model": "not/in-catalog",
+            "api_key": "test-api-key",
+            "base_url": "https://private-gateway.example.com/api/v1",
+        }
+    )
+
+    with patch(
+        "elspeth.engine.orchestrator.preflight.get_catalog_values",
+        return_value=frozenset({"known/model"}),
+    ):
+        findings = check_config_value_sources(config, component_id="llm", component_type=component_type)
+
+    assert findings == ()
 
 
 @pytest.mark.parametrize(
