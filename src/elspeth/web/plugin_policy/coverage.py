@@ -177,18 +177,29 @@ def _control_covers_fields(node: NodeSpec, protected_fields: frozenset[str]) -> 
 def _llm_input_fields(node: NodeSpec) -> _ProtectedFields:
     """Return known prompt fields without erasing whether the set is complete."""
     prompt_fields = _template_input_fields(node.options.get("prompt_template"))
-    fields = set(prompt_fields.fields)
-    provable = prompt_fields.provable
 
     queries = node.options.get("queries")
     if queries is None:
-        return _ProtectedFields(frozenset(fields), provable)
+        return prompt_fields
     if isinstance(queries, Mapping):
         definitions = tuple(queries.values())
     elif isinstance(queries, Sequence) and not isinstance(queries, (str, bytes)):
         definitions = tuple(queries)
     else:
-        return _ProtectedFields(frozenset(fields), False)
+        return _ProtectedFields(prompt_fields.fields, False)
+
+    # Each query renders its own ``template`` override when present and falls
+    # back to the node-level ``prompt_template`` otherwise (QueryDefinition,
+    # multi_query.py). A shared template every definition overrides is dead —
+    # it never renders, and config validation deliberately skips it
+    # (``LLMConfig._validate_template_variable_bindings``) — so it must not
+    # decide provability here either. Malformed definitions fail closed as
+    # live: the loop below already returns unprovable for them.
+    node_template_live = not definitions or any(
+        not isinstance(definition, Mapping) or definition.get("template") is None for definition in definitions
+    )
+    fields = set(prompt_fields.fields) if node_template_live else set()
+    provable = prompt_fields.provable if node_template_live else True
 
     for definition in definitions:
         if not isinstance(definition, Mapping):

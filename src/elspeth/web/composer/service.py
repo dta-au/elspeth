@@ -6582,15 +6582,17 @@ def _advisor_prompt_template_injection_finding(state: CompositionState, *, user_
     scan covers it rather than relying solely on the advisor's own judgment
     of fenced-and-labeled untrusted text.
     """
-    if user_message:
-        unquoted_user_message, quotes_balanced, _quoted_material_seen = _no_tool_policy._strip_quoted_text(user_message)
-        # The originating request may legitimately name an injection string as
-        # quoted data. Elide only fully balanced quoted spans; an unclosed quote
-        # keeps the original text under the fail-closed scan. Prompt/template
-        # option values below never take this exception and remain raw-scanned.
-        user_message_to_scan = unquoted_user_message if quotes_balanced else user_message
-        if _looks_like_advisor_prompt_injection(user_message_to_scan):
-            return "FLAGGED: the user's message contains advisor-instruction injection text; remove it before sign-off."
+    # Scan the RAW message — never a quote-elided view. Quotes do not
+    # create a trusted data channel for an LLM: the quoted text is still
+    # delivered verbatim into the advisor prompt by
+    # ``_build_advisor_user_message``, so eliding balanced quoted spans here
+    # let a quote-wrapped payload bypass the deterministic force-FLAGGED and
+    # induce a false CLEAN sign-off. A user legitimately naming an injection
+    # string as quoted data receives the FLAGGED finding and rewords —
+    # fail-closed is the safe direction for a sign-off gate, matching the
+    # raw-scanned option values below.
+    if user_message and _looks_like_advisor_prompt_injection(user_message):
+        return "FLAGGED: the user's message contains advisor-instruction injection text; remove it before sign-off."
 
     for source_name, source in state.sources.items():
         for key, value in _advisor_prompt_option_values(source.options):

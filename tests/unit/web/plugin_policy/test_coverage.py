@@ -1164,6 +1164,116 @@ def test_missing_shield_preserves_the_unprovable_prompt_field_diagnosis() -> Non
     ]
 
 
+def _multi_query_llm(
+    *,
+    prompt_template: str,
+    queries: dict[str, object],
+    input_stream: str = "llm_in",
+    on_success: str = "main",
+) -> NodeSpec:
+    """A multi-query LLM whose shared template may be dead (all queries override)."""
+    return _node(
+        "judge",
+        "llm",
+        input_stream,
+        on_success,
+        options={
+            "prompt_template": prompt_template,
+            "required_input_fields": [],
+            "response_field": "llm_response",
+            "queries": queries,
+        },
+    )
+
+
+def test_dead_shared_template_does_not_poison_prompt_field_provability() -> None:
+    """A node template every query overrides never renders, so it must not decide provability.
+
+    ``queries.*.template`` is a per-query override (``None`` = fall back to the
+    node-level ``prompt_template`` — multi_query.py), and config validation
+    deliberately skips a shared template no query falls back to
+    (``LLMConfig._validate_template_variable_bindings``). Coverage must apply
+    the same liveness rule: with every override static, the protected set is
+    provably {prompt} and a shield scanning exactly that field is credited.
+    """
+    state = _state(
+        _shield("shield", "raw", "llm_in", fields=("prompt",)),
+        _multi_query_llm(
+            prompt_template="Classify: {{ row[lookup.field_name] }}",
+            queries={"q.a": {"input_fields": {"prompt": "prompt"}, "template": "Classify: {{ row.prompt }}"}},
+        ),
+        source_target="raw",
+    )
+
+    assert control_coverage_findings(state, PluginCapability.PROMPT_SHIELD) == ()
+
+
+def test_dead_shared_template_missing_shield_is_an_auto_wirable_topology_failure() -> None:
+    """With the dead template ignored, a missing shield is the wirable diagnosis.
+
+    Required-control auto-wiring acts only on ``input_not_dominated``
+    (required_controls._AUTO_WIRE_ACTIONABLE_REASONS); reporting the dead
+    template's dynamic access as ``input_fields_unprovable`` left the required
+    shield unwired and failed the gate later.
+    """
+    state = _state(
+        _multi_query_llm(
+            prompt_template="Classify: {{ row[lookup.field_name] }}",
+            queries={"q.a": {"input_fields": {"prompt": "prompt"}, "template": "Classify: {{ row.prompt }}"}},
+        )
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_not_dominated"),
+    ]
+    assert findings[0].protected_fields == ("prompt",)
+
+
+def test_query_fallback_keeps_node_template_in_provability() -> None:
+    """A query WITHOUT an override still pulls the shared template into the set."""
+    llm = _multi_query_llm(
+        prompt_template="{{ row.shared_context }}",
+        queries={
+            "q.a": {"input_fields": {"prompt": "prompt"}},
+            "q.b": {"input_fields": {"prompt": "prompt"}, "template": "Classify: {{ row.prompt }}"},
+        },
+    )
+
+    partial = _state(_shield("shield", "raw", "llm_in", fields=("prompt",)), llm, source_target="raw")
+    findings = control_coverage_findings(partial, PluginCapability.PROMPT_SHIELD)
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_not_dominated"),
+    ]
+    assert findings[0].protected_fields == ("prompt", "shared_context")
+
+    covered = _state(
+        _shield("shield", "raw", "llm_in", fields=("prompt", "shared_context")),
+        llm,
+        source_target="raw",
+    )
+    assert control_coverage_findings(covered, PluginCapability.PROMPT_SHIELD) == ()
+
+
+def test_dynamic_shared_template_with_a_falling_back_query_stays_unprovable() -> None:
+    """Liveness is per-query: one fallback keeps the dynamic template authoritative."""
+    state = _state(
+        _shield("shield", "raw", "llm_in", fields=("prompt",)),
+        _multi_query_llm(
+            prompt_template="Classify: {{ row[lookup.field_name] }}",
+            queries={"q.a": {"input_fields": {"prompt": "prompt"}}},
+        ),
+        source_target="raw",
+    )
+
+    findings = control_coverage_findings(state, PluginCapability.PROMPT_SHIELD)
+
+    assert [(finding.component_id, finding.reason) for finding in findings] == [
+        ("judge", "input_fields_unprovable"),
+    ]
+
+
 def test_mismatched_shield_still_fires_and_carries_both_field_sets() -> None:
     """The real finding must survive the credit fix, with both sets named."""
     state = _state(

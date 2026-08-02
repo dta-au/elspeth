@@ -60,6 +60,12 @@ def _run_container_insights_cleanup(
 
     script = f"""
 set -Eeuo pipefail
+# Bash's SECONDS is special: every read returns the assigned base plus real
+# wall-clock seconds since assignment, so a loaded test host would leak real
+# time into the runbook's elapsed/quiet arithmetic. Unsetting it strips the
+# special behavior for this shell (and its subshells), leaving an ordinary
+# variable that the mocked sleep below fully owns — a deterministic clock.
+unset SECONDS
 SECONDS=0
 sleep() {{ SECONDS=$((SECONDS + $1)); }}
 aws_capture() {{
