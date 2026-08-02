@@ -1777,41 +1777,47 @@ async def test_guided_start_atomic_seed_serializes_two_sqlite_services(file_engi
     service_a = DualFencedSessionServiceHarness(file_engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.a"))
     service_b = DualFencedSessionServiceHarness(file_engine, telemetry=build_sessions_telemetry(), log=structlog.get_logger("test.b"))
     session = await service_a.create_session("alice", "Pipeline", "local")
-    fence_a = await _claim(
-        service_a,
-        session.id,
-        operation_id="00000000-0000-4000-8000-000000000011",
-        kind="guided_start",
-        request_hash="b" * 64,
-    )
-    fence_b = await _claim(
-        service_b,
-        session.id,
-        operation_id="00000000-0000-4000-8000-000000000012",
-        kind="guided_start",
-        request_hash="c" * 64,
-    )
     state_data = CompositionStateData(
         composer_meta={"guided_session": {"schema_version": 9}},
         is_valid=True,
     )
 
-    outcomes = await asyncio.gather(
-        service_a.seed_or_complete_guided_start_operation(
-            fence_a,
-            state=state_data,
-            provenance="session_seed",
-            actor="route-a",
-            response_hash_factory=lambda state: stable_hash({"state_id": str(state.id)}),
-        ),
-        service_b.seed_or_complete_guided_start_operation(
-            fence_b,
-            state=state_data,
-            provenance="session_seed",
-            actor="route-b",
-            response_hash_factory=lambda state: stable_hash({"state_id": str(state.id)}),
-        ),
-    )
+    async with _compose_context(service_a, session.id) as operation_context:
+        fence_a = await _claim(
+            service_a,
+            session.id,
+            operation_id="00000000-0000-4000-8000-000000000011",
+            kind="guided_start",
+            request_hash="b" * 64,
+            session_operation_context=operation_context,
+        )
+        fence_b = await _claim(
+            service_b,
+            session.id,
+            operation_id="00000000-0000-4000-8000-000000000012",
+            kind="guided_start",
+            request_hash="c" * 64,
+            session_operation_context=operation_context,
+        )
+
+        outcomes = await asyncio.gather(
+            service_a.seed_or_complete_guided_start_operation(
+                fence_a,
+                state=state_data,
+                provenance="session_seed",
+                actor="route-a",
+                response_hash_factory=lambda state: stable_hash({"state_id": str(state.id)}),
+                session_operation_context=operation_context,
+            ),
+            service_b.seed_or_complete_guided_start_operation(
+                fence_b,
+                state=state_data,
+                provenance="session_seed",
+                actor="route-b",
+                response_hash_factory=lambda state: stable_hash({"state_id": str(state.id)}),
+                session_operation_context=operation_context,
+            ),
+        )
 
     assert {type(outcome) for outcome in outcomes} == {
         GuidedStartStateSeeded,
