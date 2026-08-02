@@ -199,6 +199,64 @@ def _full_guided_session(body: dict) -> dict:
     return body["composition_state"]["composer_meta"]["guided_session"]
 
 
+def _rival_pipeline_proposal(client: TestClient, session_id: str, *, captured: Mapping[str, Any], base_record) -> UUID:
+    """Create a second genuine PIPELINE proposal with its own planner identity.
+
+    Built from the captured plan's own pipeline/base/reviewed facts so it is
+    a real pipeline proposal, but under a different skill hash and model, so
+    selecting it instead of the originating proposal is detectable field by
+    field rather than only by classification.
+    """
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.core.canonical import stable_hash
+    from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
+    from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+    from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, PresentBase
+    from elspeth.web.composer.redaction import redact_tool_call_arguments
+    from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
+
+    plan = captured["plan"]
+    rival = PipelineProposal.create(
+        pipeline=deep_thaw(plan.proposal.pipeline),
+        base=PresentBase(
+            state_id=base_record.id,
+            composition_content_hash=composition_content_hash(state_from_record(base_record)),
+        ),
+        reviewed_facts=guided_private_reviewed_facts(captured["guided"]),
+        surface=PlannerSurface.GUIDED_STAGED,
+        repair_count=0,
+        skill_hash=stable_hash("rival-planner-skill"),
+        covered_deferred_intent_ids=(),
+        supersedes_draft_hash=None,
+    )
+    record = asyncio.run(
+        client.app.state.session_service.create_pipeline_composition_proposal(
+            session_id=UUID(session_id),
+            plan=PipelinePlanResult(
+                proposal=rival,
+                tool_call_id=f"rival-pipeline-{uuid4()}",
+                custody_result="not_required",
+                model_identifier="rival-model",
+                model_version="rival-v9",
+                provider="rival-provider",
+            ),
+            summary="rival pipeline proposal",
+            rationale="shares the committed state",
+            affects=["nodes"],
+            arguments_redacted_json=redact_tool_call_arguments(
+                "set_pipeline",
+                deep_thaw(rival.pipeline),
+                telemetry=NoopRedactionTelemetry(),
+            ),
+            actor="test",
+            composer_model_identifier="rival-model",
+            composer_model_version="rival-v9",
+            composer_provider="rival-provider",
+        )
+    )
+    return record.id
+
+
 def _llm_prompt_template_planner(prompt: str, *, extra_node_id: str | None = None):
     """Plan llm node(s) carrying PENDING ``llm_prompt_template`` requirements.
 
@@ -4017,20 +4075,29 @@ class TestStep2IntraStep:
         assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == events_before
         assert asyncio.run(session_service.get_state_versions(UUID(session_id))) == versions_before
 
-    def test_confirm_wiring_replay_binds_its_own_proposal_when_another_shares_the_state(
+    def test_confirm_wiring_replay_binds_its_own_proposal_when_others_share_the_state(
         self,
         composer_test_client: TestClient,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A state id is not a unique proposal locator; the operation's is.
 
-        A blob-only approval can legitimately mark a second proposal committed
-        against an EXISTING state, so resolving the proposal by committed
-        state is ambiguous — it can select unrelated provenance or find more
-        than one row. The replay must bind the exact proposal its own result
-        locator names, and the surfaced review must therefore carry the
-        original planner's provenance even with a second committed proposal
-        sharing the same state.
+        ``mark_composition_proposal_committed`` accepts any existing state, so
+        more than one proposal can name one committed state — resolving a
+        proposal BY committed state is therefore ambiguous, and can select
+        unrelated provenance or find several rows. The replay must bind the
+        exact proposal its own result locator names.
+
+        Rivals are committed on BOTH sides of the originating proposal in
+        creation order, so neither an oldest-row nor a newest-row state lookup
+        can coincide with the right answer. Provenance is asserted against the
+        originating proposal row field by field, not merely as "different from
+        the rival".
+
+        Scope note: the rivals are constructed directly through the proposal
+        lifecycle API. This test does NOT drive the real blob acceptance path
+        that motivates the shared-state case in production; it reproduces the
+        shared-state CONDITION, not that workflow.
         """
         from elspeth.web.composer import service as composer_service_module
 
@@ -4039,10 +4106,47 @@ class TestStep2IntraStep:
 
         session_id = _create_session(composer_test_client)
         prompt = "Summarise this row in one short sentence."
+        session_service = composer_test_client.app.state.session_service
+
+        def _rival(label: str) -> UUID:
+            """One generic proposal that will later name the settled state."""
+            return asyncio.run(
+                session_service.create_composition_proposal(
+                    session_id=UUID(session_id),
+                    tool_call_id=f"{label}-{uuid4()}",
+                    tool_name="set_pipeline",
+                    summary=f"{label} approval",
+                    rationale="shares the committed state",
+                    affects=["nodes"],
+                    arguments_json={"pipeline": {}},
+                    arguments_redacted_json={"pipeline": {}},
+                    base_state_id=None,
+                    actor="test",
+                    composer_model_identifier=f"{label}-model",
+                    composer_model_version=f"{label}-v9",
+                    composer_provider=f"{label}-provider",
+                    composer_skill_hash="f" * 64,
+                    tool_arguments_hash="a" * 64,
+                )
+            ).id
+
+        # Created BEFORE the guided proposal, so it is the oldest row.
+        older_rival = _rival("older-rival")
+
+        captured: dict[str, Any] = {}
+        planner = _llm_prompt_template_planner(prompt)
+
+        async def _capturing_planner(*, guided, base, **kwargs):
+            result = await planner(guided=guided, base=base, **kwargs)
+            captured["plan"] = result[0]
+            captured["guided"] = guided
+            captured["base"] = base
+            return result
+
         monkeypatch.setattr(
             composer_test_client.app.state.composer_service,
             "plan_guided_pipeline",
-            _llm_prompt_template_planner(prompt),
+            _capturing_planner,
         )
         staged = self._stage_proposal(composer_test_client, session_id, filename="llm_shared_state.jsonl")
         assert staged["next_turn"]["type"] == "propose_pipeline"
@@ -4076,62 +4180,67 @@ class TestStep2IntraStep:
             original_surface,
         )
 
-        # A SECOND committed proposal now names the very same state.
-        session_service = composer_test_client.app.state.session_service
+        # Rivals on BOTH sides of the originating proposal now name its state.
+        # The newer one is a genuine PIPELINE proposal carrying its own
+        # planner provenance, so a wrong pick survives the pipeline-authority
+        # guard and is caught by the provenance comparison rather than by
+        # classification. The older one is generic, exercising that guard.
         committed_state = asyncio.run(session_service.get_current_state(UUID(session_id)))
         assert committed_state is not None
-        rival = asyncio.run(
-            session_service.create_composition_proposal(
-                session_id=UUID(session_id),
-                tool_call_id=f"rival-{uuid4()}",
-                tool_name="set_pipeline",
-                summary="rival blob-only approval",
-                rationale="shares the committed state",
-                affects=["nodes"],
-                arguments_json={"pipeline": {}},
-                arguments_redacted_json={"pipeline": {}},
-                base_state_id=committed_state.id,
-                actor="test",
-                composer_model_identifier="rival-model",
-                composer_model_version="rival-v9",
-                composer_provider="rival-provider",
-                composer_skill_hash="f" * 64,
-                tool_arguments_hash="a" * 64,
-            )
+        newer_rival = _rival_pipeline_proposal(
+            composer_test_client,
+            session_id,
+            captured=captured,
+            base_record=committed_state,
         )
-        asyncio.run(
-            session_service.mark_composition_proposal_committed(
-                session_id=UUID(session_id),
-                proposal_id=rival.id,
-                committed_state_id=committed_state.id,
-                actor="test",
+        for rival_id in (older_rival, newer_rival):
+            asyncio.run(
+                session_service.mark_composition_proposal_committed(
+                    session_id=UUID(session_id),
+                    proposal_id=rival_id,
+                    committed_state_id=committed_state.id,
+                    actor="test",
+                )
             )
-        )
 
-        # The ambiguity this guards against is now real: resolving a proposal
-        # by committed state would find two rows, not one.
+        # The ambiguity this guards against is now real, and brackets the
+        # originating proposal in creation order.
         engine = composer_test_client.app.state.session_engine
         with engine.begin() as connection:
-            sharing = connection.execute(
-                select(func.count())
-                .select_from(composition_proposals_table)
-                .where(composition_proposals_table.c.session_id == session_id)
-                .where(composition_proposals_table.c.committed_state_id == str(committed_state.id))
-            ).scalar_one()
-        assert sharing == 2, sharing
+            sharing = [
+                row.id
+                for row in connection.execute(
+                    select(composition_proposals_table)
+                    .where(composition_proposals_table.c.session_id == session_id)
+                    .where(composition_proposals_table.c.committed_state_id == str(committed_state.id))
+                    .order_by(composition_proposals_table.c.created_at)
+                )
+            ]
+        assert sharing == [str(older_rival), request_body["proposal_id"], str(newer_rival)], sharing
 
         replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
-        assert replayed.status_code == 200, replayed.json()
+        assert replayed.status_code == 200, replayed.text
         assert replayed.json()["terminal"]["kind"] == "completed"
 
         events = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
         prompt_events = [event for event in events if event.affected_node_id == "summarize_rows"]
         assert len(prompt_events) == 1, [(event.affected_node_id, event.model_identifier) for event in events]
-        # The ORIGINAL planner, never the rival that also names this state.
-        assert prompt_events[0].model_identifier == "llm-prompt-review-test-planner"
-        assert prompt_events[0].model_version == "v1"
-        assert prompt_events[0].provider == "test"
-        assert prompt_events[0].composer_skill_hash != "f" * 64
+        # Exactly the originating proposal's own recorded provenance.
+        origin = asyncio.run(
+            session_service.get_authoritative_composition_proposal(
+                session_id=UUID(session_id),
+                proposal_id=UUID(request_body["proposal_id"]),
+                reviewed_facts=None,
+            )
+        )
+        assert origin.pipeline is not None
+        expected = origin.pipeline.row
+        surfaced_event = prompt_events[0]
+        assert surfaced_event.model_identifier == expected.composer_model_identifier
+        assert surfaced_event.model_version == expected.composer_model_version
+        assert surfaced_event.provider == expected.composer_provider
+        assert surfaced_event.composer_skill_hash == expected.composer_skill_hash
+        assert expected.composer_skill_hash not in (None, "f" * 64)
 
     def test_confirm_wiring_replay_after_resolution_returns_the_stored_response_unchanged(
         self,
@@ -4197,6 +4306,100 @@ class TestStep2IntraStep:
         assert asyncio.run(session_service.get_state_versions(UUID(session_id))) == versions_before
         current_after = asyncio.run(session_service.get_current_state(UUID(session_id)))
         assert current_after is not None and current_after.id == current_before.id
+
+    def test_confirm_wiring_replay_after_advancement_returns_the_stored_response(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Obsolete debt must not turn a verified replay into a 500.
+
+        The evidence read is not atomic with the surfacing write, so a site
+        can be superseded between them — and here NO event ever existed, so
+        no evidence check can cover it. The first attempt dies before
+        surfacing, the session then advances past the committed node, and the
+        replay's repair finds a node the writer boundary refuses
+        (InterpretationNodeMissingError / InterpretationPlaceholderConsumed
+        Error, both InterpretationResolveError). The writer is the authority
+        on whether the debt still exists; when it says no, the replay must
+        still return its stored response.
+        """
+        from elspeth.web.composer import service as composer_service_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_advanced.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+
+        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+
+        def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            _crash_between_settlement_and_surfacing,
+        )
+        with pytest.raises(_SurfacingWorkerCrash):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            original_surface,
+        )
+
+        session_service = composer_test_client.app.state.session_service
+        # No event was ever created, so the debt is outstanding and no
+        # evidence check can discharge it.
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == []
+
+        committed = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert committed is not None
+        asyncio.run(
+            session_service.save_composition_state(
+                UUID(session_id),
+                CompositionStateData(
+                    sources=committed.sources or {},
+                    nodes=[],
+                    edges=[],
+                    outputs=committed.outputs or [],
+                    metadata_=committed.metadata_ or {},
+                    is_valid=False,
+                    validation_errors=["advanced past the surfaced node"],
+                    composer_meta=committed.composer_meta or {},
+                ),
+                provenance="tool_call",
+            )
+        )
+
+        events_before = asyncio.run(session_service.list_interpretation_events(UUID(session_id)))
+        versions_before = asyncio.run(session_service.get_state_versions(UUID(session_id)))
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.text
+        assert replayed.json()["terminal"]["kind"] == "completed"
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == events_before
+        assert asyncio.run(session_service.get_state_versions(UUID(session_id))) == versions_before
 
     def test_confirm_wiring_replay_repairs_only_the_genuinely_missing_site(
         self,

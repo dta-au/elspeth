@@ -1085,6 +1085,7 @@ async def _auto_surface_prompt_template_reviews_for_state(
     provider: str,
     composer_skill_hash: str,
     already_surfaced: frozenset[tuple[str, str, InterpretationKind]] = frozenset(),
+    repair_mode: bool = False,
 ) -> None:
     """Canonical ``llm_prompt_template`` surfacing pass (see the instance method).
 
@@ -1094,6 +1095,8 @@ async def _auto_surface_prompt_template_reviews_for_state(
     provenance they actually hold (for guided commits: the proposal row's
     planner identity).
     """
+
+    from elspeth.web.sessions.protocol import InterpretationResolveError
 
     for site in interpretation_sites(state):
         if site.kind is not InterpretationKind.LLM_PROMPT_TEMPLATE:
@@ -1121,19 +1124,33 @@ async def _auto_surface_prompt_template_reviews_for_state(
             continue
         if (site.component_id, site.user_term, InterpretationKind.LLM_PROMPT_TEMPLATE) in already_surfaced:
             continue
-        await sessions_service.create_pending_interpretation_event(
-            session_id=UUID(session_id),
-            composition_state_id=UUID(current_state_id),
-            affected_node_id=site.component_id,
-            tool_call_id=f"backend_auto_surface:{uuid4()}",  # (D1)
-            user_term=site.user_term,
-            kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-            llm_draft=prompt_template,
-            model_identifier=model_identifier,  # (D2)
-            model_version=model_version,  # (D2)
-            provider=provider,  # (D2)
-            composer_skill_hash=composer_skill_hash,  # (D2)
-        )
+        try:
+            await sessions_service.create_pending_interpretation_event(
+                session_id=UUID(session_id),
+                composition_state_id=UUID(current_state_id),
+                affected_node_id=site.component_id,
+                tool_call_id=f"backend_auto_surface:{uuid4()}",  # (D1)
+                user_term=site.user_term,
+                kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+                llm_draft=prompt_template,
+                model_identifier=model_identifier,  # (D2)
+                model_version=model_version,  # (D2)
+                provider=provider,  # (D2)
+                composer_skill_hash=composer_skill_hash,  # (D2)
+            )
+        except InterpretationResolveError:
+            # Settlement keeps the unguarded raise: a fresh state that cannot
+            # accept its own surfacing IS a Tier-1 anomaly.
+            if not repair_mode:
+                raise
+            # Repair cannot: the evidence read above is NOT atomic with this
+            # write, and the site can be superseded in between — the node
+            # removed or mutated by a later state, or the placeholder consumed
+            # by a concurrent resolve. The writer boundary is the authority on
+            # whether the debt still exists, and it has just said no. Skipping
+            # keeps the already-verified stored response intact; raising would
+            # turn a valid replay into a 500 over debt that no longer exists.
+            continue
 
 
 def _backend_surface_args_for_site(
@@ -1259,6 +1276,7 @@ async def surface_pending_interpretation_reviews_for_state(
         provider=provider,
         composer_skill_hash=composer_skill_hash,
         already_surfaced=already_surfaced,
+        repair_mode=only_missing_evidence,
     )
     for site in interpretation_sites(state):
         if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:

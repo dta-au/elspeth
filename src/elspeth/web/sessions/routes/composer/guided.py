@@ -2647,12 +2647,16 @@ async def post_guided_respond(
         proposal by committed state could select unrelated provenance.
 
         Only a PIPELINE proposal that committed THIS EXACT state owes
-        surfacing. The other shapes are ordinary, not anomalies: an operation
-        that settled no proposal carries no proposal id, and a proposal-
-        STAGING operation carries its still-pending proposal's id. Neither
-        published a committed state, so neither owes anything — and refusing
-        to write without all three conditions is what keeps a replay from
-        attributing a review to a proposal that did not author it.
+        surfacing. Not every proposal-bearing result does: a proposal-STAGING
+        RESPOND carries its still-pending proposal's id and has published no
+        committed state, so it owes nothing. A result with no proposal id
+        settled no proposal and likewise owes nothing.
+
+        A result whose proposal does not classify as a pipeline proposal is
+        different in kind. Every proposal-bearing guided RESPOND originates in
+        a pipeline workflow, so a generic classification means the stored
+        locator does not describe the operation that produced it — a corrupt
+        binding, which fails closed rather than silently declining to repair.
         """
 
         if type(result) is not GuidedCompositionStateResult:
@@ -2666,7 +2670,7 @@ async def post_guided_respond(
         )
         pipeline_authority = authority.pipeline
         if pipeline_authority is None:
-            return
+            raise AuditIntegrityError("Guided RESPOND replay result names a proposal that is not a pipeline proposal")
         row = pipeline_authority.row
         if row.status != "committed" or row.committed_state_id != result.state_id:
             return
