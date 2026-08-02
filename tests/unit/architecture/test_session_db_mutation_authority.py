@@ -1674,6 +1674,11 @@ _NON_SESSION_ENGINE_TYPES = frozenset(
         "elspeth.core.landscape.database.Tier1Engine",
     }
 )
+_EXPLICIT_NON_SQL_EXECUTE_RECEIVER_TYPES = frozenset(
+    {
+        "elspeth.web.execution.protocol.ExecutionService",
+    }
+)
 _TRANSPARENT_SQLALCHEMY_STATEMENT_METHODS = frozenset(
     {
         "cte",
@@ -1682,11 +1687,13 @@ _TRANSPARENT_SQLALCHEMY_STATEMENT_METHODS = frozenset(
         "from_select",
         "group_by",
         "inline",
+        "join",
         "limit",
         "on_conflict_do_nothing",
         "on_conflict_do_update",
         "order_by",
         "ordered_values",
+        "offset",
         "outerjoin",
         "prefix_with",
         "return_defaults",
@@ -2406,6 +2413,35 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                     )
             scope = self._next_lookup_scope(scope)
         return None
+
+    def _binding_annotation_qualified_name(self, binding: _NameBinding, name: str) -> str | None:
+        node = binding.node
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+            argument = next((candidate for candidate in arguments if candidate.arg == name), None)
+            parent = getattr(node, "_inventory_parent", None)
+            if argument is None or parent is None:
+                return None
+            return self._annotation_imported_qualified_name(
+                argument.annotation,
+                definition=node,
+                scope=self._lexical_scope(parent),
+            )
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == name:
+            return self._imported_qualified_name(node.annotation)
+        return None
+
+    def _has_explicit_non_sql_execute_receiver(self, execution: ast.Call) -> bool:
+        if not (
+            isinstance(execution.func, ast.Attribute) and execution.func.attr == "execute" and isinstance(execution.func.value, ast.Name)
+        ):
+            return False
+        receiver = execution.func.value
+        reaching, complete, _ = self._visible_reaching_bindings(execution, receiver.id)
+        if not complete or not reaching:
+            return False
+        receiver_types = {self._binding_annotation_qualified_name(binding, receiver.id) for binding in reaching}
+        return bool(receiver_types) and receiver_types <= _EXPLICIT_NON_SQL_EXECUTE_RECEIVER_TYPES
 
     def _annotation_database_domain(
         self,
@@ -3491,6 +3527,9 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 continue
             call = node
             func = call.func
+            if self._has_explicit_non_sql_execute_receiver(call):
+                self.classified_execution_calls.add(id(call))
+                continue
             for acquisition in self._connection_acquisitions_for_expression(call, call):
                 stored_callable = isinstance(acquisition.func, (ast.Attribute, ast.Subscript)) and not (
                     isinstance(acquisition.func, ast.Attribute) and acquisition.func.attr in {"begin", "connect"}
@@ -3612,6 +3651,9 @@ class _ProductionWriterCollector(ast.NodeVisitor):
 def scan_production_writers(files: Iterable[Path], *, anchor: Path) -> list[WriterIdentity]:
     sites: list[WriterIdentity] = []
     for source_file in sorted(files):
+        relative_path = source_file.resolve().relative_to(anchor.resolve())
+        if "node_modules" in relative_path.parts:
+            continue
         try:
             source = source_file.read_bytes().decode("utf-8")
         except UnicodeDecodeError as error:
@@ -3621,7 +3663,7 @@ def scan_production_writers(files: Iterable[Path], *, anchor: Path) -> list[Writ
         except SyntaxError as error:
             raise InventoryScanError(f"cannot parse production source {source_file}: {error}") from error
         _attach_parents(tree)
-        relative = source_file.resolve().relative_to(anchor.resolve()).as_posix()
+        relative = relative_path.as_posix()
         sites.extend(_ProductionWriterCollector(relative, tree).collect())
     return sites
 
@@ -4341,6 +4383,37 @@ def test_injected_connections_with_unknown_execute_payloads_fail_closed(tmp_path
             ("driver_sql_unknown", "<unresolved-session-write>", "unknown_exec_driver_sql"): 1,
         }
     )
+
+
+def test_explicit_non_sql_execute_receiver_types_are_not_database_writers(tmp_path: Path) -> None:
+    source = tmp_path / "typed_non_sql_execute.py"
+    source.write_text(
+        textwrap.dedent(
+            """\
+            from elspeth.web.execution.protocol import ExecutionService
+
+            async def injected_service(service: ExecutionService, session_id):
+                return await service.execute(session_id)
+
+            async def locally_annotated_service(request, session_id):
+                service: ExecutionService = request.app.state.execution_service
+                return await service.execute(session_id)
+
+            def dynamic_connection(conn, statement):
+                return conn.execute(statement)
+
+            def reassigned_service(service: ExecutionService, replacement, statement):
+                service = replacement
+                return service.execute(statement)
+            """
+        )
+    )
+
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert [(site.symbol, site.table, site.operation) for site in sites] == [
+        ("dynamic_connection", "<unresolved-session-write>", "unknown_execute"),
+        ("reassigned_service", "<unresolved-session-write>", "unknown_execute"),
+    ]
 
 
 def test_chained_and_container_escaped_connections_fail_closed(tmp_path: Path) -> None:
@@ -6472,6 +6545,14 @@ def test_live_sqlalchemy_fluent_methods_and_read_only_pragma_preserve_non_sessio
                 with engine.connect() as conn:
                     conn.execute(sa.select(runs_table).outerjoin(runs_table, runs_table.c.run_id == runs_table.c.run_id))
 
+            def join(engine: Tier1Engine):
+                with engine.connect() as conn:
+                    conn.execute(sa.select(runs_table).join(runs_table, runs_table.c.run_id == runs_table.c.run_id))
+
+            def offset(engine: Tier1Engine):
+                with engine.connect() as conn:
+                    conn.execute(sa.select(runs_table).offset(1))
+
             def exact_assignment(engine: Tier1Engine):
                 statement = sa.select(runs_table).limit(1)
                 with engine.connect() as conn:
@@ -6503,6 +6584,8 @@ def test_live_sqlalchemy_fluent_methods_and_read_only_pragma_preserve_non_sessio
                 "distinct",
                 "group_by",
                 "outerjoin",
+                "join",
+                "offset",
                 "exact_assignment",
                 "chained_assignment",
                 "read_only_journal_mode",
@@ -7055,6 +7138,21 @@ def test_production_scanner_ignores_sql_words_in_prose(tmp_path: Path) -> None:
             '''
         )
     )
+    assert scan_production_writers([source], anchor=tmp_path) == []
+
+
+def test_production_scanner_prunes_node_modules(tmp_path: Path) -> None:
+    source = tmp_path / "src/elspeth/web/frontend/node_modules/package/embedded.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        textwrap.dedent(
+            """\
+            def unrelated_library_method(program, value):
+                return program.execute(value)
+            """
+        )
+    )
+
     assert scan_production_writers([source], anchor=tmp_path) == []
 
 
