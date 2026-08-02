@@ -1,6 +1,29 @@
+locals {
+  # Mirrors modules/scenario/locals.tf exactly: both scenario namespaces
+  # (and the bucket names built from them) are pure functions of run_id,
+  # so the boundary below can name only THIS run's resources instead of
+  # every a-*/b-* sibling in the account.
+  scenario_namespaces = {
+    for scenario_id in ["A", "B"] :
+    scenario_id => format(
+      "%s-%s",
+      lower(scenario_id),
+      substr(sha256("${lower(var.run_id)}\u0000${scenario_id}"), 0, 20),
+    )
+  }
+  compact_run_id = replace(var.run_id, "-", "")
+  scenario_buckets = [
+    for namespace in values(local.scenario_namespaces) :
+    "elspeth-${namespace}-${substr(local.compact_run_id, 0, 12)}"
+  ]
+}
+
 resource "aws_s3_bucket" "terraform_state" {
-  bucket        = var.backend_state_bucket
-  force_destroy = true
+  # No force_destroy: the versioned bucket may hold live state for a
+  # scenario the operator has not destroyed (Scenario B shares this
+  # backend). Teardown empties it explicitly only after the runbook's
+  # census proves every scenario state is resource-free.
+  bucket = var.backend_state_bucket
 }
 
 resource "aws_s3_bucket_ownership_controls" "terraform_state" {
@@ -52,17 +75,22 @@ resource "aws_ecr_repository" "acceptance" {
 }
 
 resource "aws_ecr_lifecycle_policy" "acceptance" {
+  # Untagged-only expiry, mirroring the agent repository below. The old
+  # tagged rule expired acceptance-* after one day — exactly the tag the
+  # runbook publishes — and ECR expiry deletes the image itself, so the
+  # deployed digest became unpullable and task replacement failed after
+  # day one. Deployed images persist until teardown (force_delete on the
+  # repository removes everything).
   repository = aws_ecr_repository.acceptance.name
   policy = jsonencode({
     rules = [{
       rulePriority = 1
-      description  = "Expire temporary acceptance images"
+      description  = "Expire only untagged application images after 30 days"
       selection = {
-        tagStatus     = "tagged"
-        tagPrefixList = ["acceptance-"]
-        countType     = "sinceImagePushed"
-        countUnit     = "days"
-        countNumber   = 1
+        tagStatus   = "untagged"
+        countType   = "sinceImagePushed"
+        countUnit   = "days"
+        countNumber = 30
       }
       action = { type = "expire" }
     }]
@@ -110,7 +138,10 @@ data "aws_iam_policy_document" "ecs_permissions_boundary" {
       "ecr:BatchGetImage",
       "ecr:GetDownloadUrlForLayer",
     ]
-    resources = ["arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/elspeth-*"]
+    resources = [
+      "arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/${var.ecr_repository}",
+      "arn:aws:ecr:${var.aws_region}:${var.aws_account_id}:repository/${var.cloudwatch_agent_ecr_repository}",
+    ]
   }
 
   statement {
@@ -126,22 +157,29 @@ data "aws_iam_policy_document" "ecs_permissions_boundary" {
       "logs:DescribeLogStreams",
       "logs:PutLogEvents",
     ]
-    resources = [
-      "arn:aws:logs:${var.aws_region}:${var.aws_account_id}:log-group:/aws/ecs/*",
-      "arn:aws:logs:${var.aws_region}:${var.aws_account_id}:log-group:/aws/ecs/*:log-stream:*",
-    ]
+    resources = flatten([
+      for namespace in values(local.scenario_namespaces) : [
+        "arn:aws:logs:${var.aws_region}:${var.aws_account_id}:log-group:/aws/ecs/${namespace}*",
+        "arn:aws:logs:${var.aws_region}:${var.aws_account_id}:log-group:/aws/ecs/${namespace}*:log-stream:*",
+        "arn:aws:logs:${var.aws_region}:${var.aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${namespace}-cluster/*",
+        "arn:aws:logs:${var.aws_region}:${var.aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${namespace}-cluster/*:log-stream:*",
+      ]
+    ])
   }
 
   statement {
     sid     = "ReadRunSecrets"
     actions = ["secretsmanager:GetSecretValue"]
     resources = [
-      "arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:a-*-database-*",
-      "arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:b-*-database-*",
+      for namespace in values(local.scenario_namespaces) :
+      "arn:aws:secretsmanager:${var.aws_region}:${var.aws_account_id}:secret:${namespace}-database-*"
     ]
   }
 
   statement {
+    # Exact bucket names, never elspeth-*: the wildcard also matched every
+    # sibling run's bucket AND this run's Terraform state bucket, so a task
+    # role widened up to this boundary could read state and cross-run data.
     sid = "UseElspethObjects"
     actions = [
       "s3:DeleteObject",
@@ -149,7 +187,7 @@ data "aws_iam_policy_document" "ecs_permissions_boundary" {
       "s3:GetObjectVersion",
       "s3:PutObject",
     ]
-    resources = ["arn:aws:s3:::elspeth-*/*"]
+    resources = [for bucket in local.scenario_buckets : "arn:aws:s3:::${bucket}/*"]
   }
 
   statement {
@@ -157,7 +195,7 @@ data "aws_iam_policy_document" "ecs_permissions_boundary" {
     # runtime task policy needs it so a missing acceptance object reports 404, not 403.
     sid       = "ListElspethBuckets"
     actions   = ["s3:ListBucket"]
-    resources = ["arn:aws:s3:::elspeth-*"]
+    resources = [for bucket in local.scenario_buckets : "arn:aws:s3:::${bucket}"]
   }
 
   statement {
@@ -172,9 +210,18 @@ data "aws_iam_policy_document" "ecs_permissions_boundary" {
   }
 
   statement {
+    # Guardrail ids are unknowable before the scenario apply, so the run
+    # binding is the ACCEPTANCE_RUN_ID tag the scenario stamps on every
+    # guardrail rather than a name pattern.
     sid       = "ApplyRunGuardrails"
     actions   = ["bedrock:ApplyGuardrail", "bedrock:GetGuardrail"]
     resources = ["arn:aws:bedrock:${var.aws_region}:${var.aws_account_id}:guardrail/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/ACCEPTANCE_RUN_ID"
+      values   = [var.run_id]
+    }
   }
 
   statement {
@@ -189,12 +236,20 @@ data "aws_iam_policy_document" "ecs_permissions_boundary" {
   }
 
   statement {
+    # File-system ids are unknowable before the scenario apply; the run
+    # binding is the ACCEPTANCE_RUN_ID tag, mirroring ApplyRunGuardrails.
     sid = "MountRunFileSystems"
     actions = [
       "elasticfilesystem:ClientMount",
       "elasticfilesystem:ClientWrite",
     ]
     resources = ["arn:aws:elasticfilesystem:${var.aws_region}:${var.aws_account_id}:file-system/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/ACCEPTANCE_RUN_ID"
+      values   = [var.run_id]
+    }
   }
 
   statement {

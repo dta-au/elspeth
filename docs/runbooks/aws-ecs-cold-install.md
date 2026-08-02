@@ -329,10 +329,11 @@ CLOUDWATCH_AGENT_IMAGE="$AGENT_REPOSITORY_URL@$AGENT_DIGEST"
 docker logout "$ECR_REGISTRY"
 ```
 
-Both references are digests, never tags. The two bootstrap repositories expire
-images differently: temporary application tags may expire, while the agent
-repository expires only untagged images after 30 days. A digest reference
-survives either policy; a tag reference does not.
+Both references are digests, never tags. Digest references are still not
+expiry-proof — ECR lifecycle expiry deletes the matching image itself, so any
+rule that expires a tagged image also makes its digest unpullable. Both
+bootstrap repositories therefore expire only untagged images (after 30 days);
+tagged images persist until teardown deletes the repositories.
 
 Require both ECR Basic scans to complete with zero findings:
 
@@ -728,6 +729,45 @@ terraform -chdir=scenario-a plan -destroy \
 terraform -chdir=scenario-a show -no-color .terraform/scenario-a-destroy.tfplan
 terraform -chdir=scenario-a apply .terraform/scenario-a-destroy.tfplan
 test -z "$(terraform -chdir=scenario-a state list)"
+```
+
+The backend bucket is shared by every scenario and workspace, so destroying
+Scenario A proves nothing about Scenario B. Census every state object in the
+bucket — bootstrap teardown must not proceed while any of them still tracks
+resources:
+
+```bash
+for key in $(aws s3api list-objects-v2 \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --bucket "$STATE_BUCKET" \
+  --query 'Contents[].Key' --output text); do
+  test "$key" != None || break
+  aws s3api get-object \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --bucket "$STATE_BUCKET" --key "$key" /dev/stdout \
+    | jq -e '(.resources // []) | length == 0' >/dev/null || {
+    printf 'state object %s still tracks live resources\n' "$key" >&2
+    exit 1
+  }
+done
+```
+
+The versioned backend bucket deliberately carries no `force_destroy`:
+bootstrap destroy refuses a non-empty bucket, so a live state can never be
+erased by teardown ordering alone. Empty the bucket explicitly — object
+versions and delete markers both — only after the census above has passed:
+
+```bash
+while :; do
+  batch=$(aws s3api list-object-versions \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --bucket "$STATE_BUCKET" --max-items 1000 --output json \
+    | jq -c '{Objects: ([.Versions[]?, .DeleteMarkers[]?] | map({Key, VersionId})), Quiet: true}')
+  test "$(jq '.Objects | length' <<<"$batch")" -gt 0 || break
+  aws s3api delete-objects \
+    --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+    --bucket "$STATE_BUCKET" --delete "$batch" >/dev/null
+done
 
 terraform -chdir=bootstrap plan -destroy \
   -var-file=../examples/bootstrap.tfvars \

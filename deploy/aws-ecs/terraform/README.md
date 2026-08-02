@@ -112,6 +112,13 @@ commit. Concretely for 0.7.2: the image must include commit `a04021af6`
 (`ELSPETH_WEB__DEFAULT_LLM_PROFILE`); every image published before
 `v0.7.2-RC-300726` predates it and cannot boot under this package.
 
+Image admission at apply time is an operator-claim check, not provenance: it
+proves the digest the operator named is what ECR serves and that the image's
+self-declared revision label matches the SHA the operator supplied. It cannot
+prove the label is truthful or that the image satisfies this package's
+settings contract, so supply values only from the same-commit build you
+performed yourself.
+
 ### Installer policy and task-role boundary
 
 The package deliberately splits IAM authority across two principals:
@@ -221,9 +228,11 @@ Scenario B first, then destroy bootstrap last so the boundary, state bucket,
 and repositories remain available throughout scenario teardown.
 
 The bootstrap creates separate ECR repositories for ELSPETH and the
-shell-bearing CloudWatch agent. Temporary application tags may expire. The
-agent repository expires only untagged images after 30 days. Deploy the
-CloudWatch agent by digest (`repository@sha256:...`), never by tag.
+shell-bearing CloudWatch agent. Both repositories expire only untagged
+images after 30 days — ECR lifecycle expiry deletes the matching image
+itself, so expiring a tagged image would also make its digest unpullable
+and break task replacement for the deployed release. Deploy both images by
+digest (`repository@sha256:...`), never by tag.
 
 Build `cloudwatch-agent-image/Dockerfile` with
 `--build-arg ELSPETH_RELEASE_SHA="$CANDIDATE_SHA"`, publish it to that dedicated
@@ -898,7 +907,25 @@ task definition; it does not select the revision Terraform just registered.
 Pinning `ca_cert_identifier` on an existing Aurora instance triggers
 a database modification with engine-dependent restart semantics — expect and
 schedule it. No pre-trust-root image digest is rollback-eligible after the
-upgrade.
+upgrade — which is why the deployment circuit breaker halts a failed
+deployment but does not roll back automatically: restoring the previous
+image would restore a crash-loop while reading as recovery. Fix forward.
+
+Then prove the candidate is what actually runs; generic service stability
+also describes a healthy old deployment:
+
+```sh
+aws ecs wait services-stable \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+deployed=$(aws ecs describe-services \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE" \
+  --query 'services[0].deployments[?status==`PRIMARY`] | [0]' --output json)
+test "$(jq -r '.taskDefinition' <<<"$deployed")" = "$CANDIDATE_TASK_DEFINITION"
+test "$(jq -r '.rolloutState' <<<"$deployed")" = "COMPLETED"
+jq -e '.runningCount > 0' <<<"$deployed" >/dev/null
+```
 
 ## Scenario B
 
@@ -914,6 +941,29 @@ terraform -chdir=scenario-b workspace show
 terraform -chdir=scenario-b workspace select default
 terraform -chdir=scenario-b apply \
   -var-file=../examples/scenario-b.tfvars
+```
+
+On a fresh Scenario B, leave `cognito_subject_sub` empty for that first
+apply — the subject cannot exist before the apply creates the user pool.
+Then create the acceptance user in the new pool, read its `sub`, and
+re-apply with the value to bind the acceptance identity; the acceptance
+inventory check refuses to run while the pool has no bound subject:
+
+```sh
+POOL_ID=$(terraform -chdir=scenario-b output -json resolved_inventory \
+  | jq -er '.values.COGNITO_USER_POOL_ID')
+aws cognito-idp admin-create-user \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --user-pool-id "$POOL_ID" --username acceptance-operator \
+  --message-action SUPPRESS
+COGNITO_SUBJECT_SUB=$(aws cognito-idp admin-get-user \
+  --profile "$AWS_PROFILE" --region "$AWS_REGION" \
+  --user-pool-id "$POOL_ID" --username acceptance-operator \
+  --query "UserAttributes[?Name=='sub'].Value | [0]" --output text)
+test -n "$COGNITO_SUBJECT_SUB" && test "$COGNITO_SUBJECT_SUB" != None
+terraform -chdir=scenario-b apply \
+  -var-file=../examples/scenario-b.tfvars \
+  -var "cognito_subject_sub=$COGNITO_SUBJECT_SUB"
 ```
 
 ## Outputs and teardown

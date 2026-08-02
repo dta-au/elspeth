@@ -1,5 +1,13 @@
 data "aws_availability_zones" "available" {
   state = "available"
+
+  # Standard availability zones only: with Local Zones opted in, the
+  # unfiltered list can select zones where Aurora, EFS, and internet-facing
+  # ALBs are unsupported, and these subnets host all three.
+  filter {
+    name   = "zone-type"
+    values = ["availability-zone"]
+  }
 }
 
 resource "aws_vpc" "scenario" {
@@ -146,6 +154,11 @@ resource "aws_lb" "web" {
   idle_timeout               = 300
   drop_invalid_header_fields = true
   enable_deletion_protection = false
+
+  # An internet-facing ALB requires the VPC's internet gateway to be
+  # attached; nothing else in this resource references the gateway, so
+  # without the explicit edge a fresh apply can race the attachment.
+  depends_on = [aws_internet_gateway.scenario]
 
   tags = merge(local.tags, { Name = "${local.namespace}-alb" })
 }

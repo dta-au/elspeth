@@ -483,7 +483,24 @@ jobs:
         working-directory: ${{ env.CI_CHECKOUT_PATH }}
         run: |
           apt-get update -q
-          apt-get install -y -q libsqlcipher-dev jq
+          apt-get install -y -q libsqlcipher-dev jq unzip
+
+      - name: Install Terraform (native deployment-package contract tests)
+        working-directory: ${{ env.CI_CHECKOUT_PATH }}
+        # Without a terraform binary the native mock-plan contract tests in
+        # tests/unit/deployment/test_aws_ecs_terraform_package.py skipped
+        # silently, so CI proved nothing about the shipped package
+        # (elspeth-af1efcb8d8). The tests now fail loudly under
+        # GITHUB_ACTIONS when terraform is absent, and this step supplies
+        # it, checksum-pinned against the official release manifest.
+        run: |
+          TF_VERSION=1.15.7
+          TF_SHA256=73bbb8f5188ad75d4fb853fd100ae4d7e146ef7af7db18776109642fdb7759d2
+          curl -fsSLo /tmp/terraform.zip \
+            "https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip"
+          printf '%s  /tmp/terraform.zip\n' "$TF_SHA256" | sha256sum -c -
+          unzip -o -q /tmp/terraform.zip -d /usr/local/bin terraform
+          terraform version
 
       - name: Install dependencies
         working-directory: ${{ env.CI_CHECKOUT_PATH }}

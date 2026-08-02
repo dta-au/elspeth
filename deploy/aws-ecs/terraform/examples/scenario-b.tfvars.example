@@ -34,7 +34,10 @@ scenario_tf_dir                       = "/iac/scenario-b"
 scenario_tf_vars                      = "/iac/scenario-b.tfvars"
 scenario_tf_binding_file              = "/iac/scenario-b.tf-binding.json"
 transaction_search_baseline_sha256    = "REPLACE_WITH_TRANSACTION_SEARCH_BASELINE_SHA256"
-cognito_subject_sub                   = "REPLACE_WITH_SCENARIO_B_COGNITO_SUBJECT"
+# Empty on the fresh apply: the subject cannot exist before this apply
+# creates the user pool. Create the acceptance user in the new pool, then
+# re-apply with its sub (see README "Scenario B").
+cognito_subject_sub                   = ""
 
 database_name               = "elspeth"
 session_database_name       = "elspeth_session"

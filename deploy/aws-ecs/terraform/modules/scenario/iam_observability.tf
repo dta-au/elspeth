@@ -6,6 +6,21 @@ data "aws_iam_policy_document" "ecs_tasks_assume" {
       type        = "Service"
       identifiers = ["ecs-tasks.amazonaws.com"]
     }
+
+    # Confused-deputy fences per the AWS ECS task-role guidance: only ECS
+    # entities in this account and region may assume these roles through
+    # the service principal.
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [var.aws_account_id]
+    }
+
+    condition {
+      test     = "ArnLike"
+      variable = "aws:SourceArn"
+      values   = ["arn:aws:ecs:${var.aws_region}:${var.aws_account_id}:*"]
+    }
   }
 }
 

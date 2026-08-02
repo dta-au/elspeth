@@ -463,10 +463,20 @@ resource "aws_ecs_service" "web" {
   deployment_maximum_percent         = 100
   wait_for_steady_state              = false
 
+  # rollback stays OFF: the README's upgrade contract makes the previous
+  # image ineligible after the settings/secret transition (it crash-loops
+  # on the rotated canonical URLs), so an automatic rollback restores a
+  # known-bad deployment while reading as recovery. The breaker still
+  # halts a failing deployment; the runbook's posture is fix forward.
   deployment_circuit_breaker {
     enable   = true
-    rollback = true
+    rollback = false
   }
+
+  # The acceptance service is enabled (scaled up) outside Terraform, so a
+  # destroy can meet running tasks; force_delete lets teardown proceed
+  # instead of wedging on a service it cannot scale down itself.
+  force_delete = true
 
   network_configuration {
     subnets          = aws_subnet.public[*].id

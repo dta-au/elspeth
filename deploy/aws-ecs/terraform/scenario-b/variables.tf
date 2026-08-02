@@ -106,8 +106,11 @@ variable "iam_permissions_boundary_arn" {
   description = "Narrow run-scoped boundary output by bootstrap and required on every generated ECS role."
 
   validation {
-    condition     = can(regex("^arn:aws:iam::${var.aws_account_id}:policy/elspeth-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}-ecs-boundary$", var.iam_permissions_boundary_arn))
-    error_message = "iam_permissions_boundary_arn must be a run-scoped boundary output by bootstrap in aws_account_id."
+    # Pins THIS run's boundary, not merely a boundary-shaped ARN: any
+    # UUID previously matched, so a scenario could be applied under a
+    # sibling run's (differently scoped) boundary without complaint.
+    condition     = var.iam_permissions_boundary_arn == "arn:aws:iam::${var.aws_account_id}:policy/elspeth-${var.run_id}-ecs-boundary"
+    error_message = "iam_permissions_boundary_arn must be exactly this run's boundary output by bootstrap in aws_account_id."
   }
 }
 
@@ -205,14 +208,16 @@ variable "transaction_search_baseline_sha256" {
 }
 
 variable "cognito_subject_sub" {
-  type = string
+  type        = string
+  default     = ""
+  description = "OIDC subject bound to the acceptance identity. Empty on the fresh apply (the pool does not exist yet); after creating the acceptance user in the new pool, re-apply with its sub. Acceptance refuses to run until the subject is bound."
 
   validation {
     condition = (
-      length(trimspace(var.cognito_subject_sub)) > 0
-      && can(regex("^[\\x20-\\x7e]{1,128}$", var.cognito_subject_sub))
+      var.cognito_subject_sub == ""
+      || can(regex("^[\\x20-\\x7e]{1,128}$", var.cognito_subject_sub))
     )
-    error_message = "cognito_subject_sub must be a nonempty printable subject of at most 128 characters."
+    error_message = "cognito_subject_sub must be empty (pre-bind fresh apply) or a printable subject of at most 128 characters."
   }
 }
 
@@ -236,11 +241,18 @@ variable "alb_https_ingress_cidrs" {
       alltrue([
         for cidr in var.alb_https_ingress_cidrs : try(cidrnetmask(cidr) != "0.0.0.0", false)
       ]) &&
+      # A prefix floor, not just a /0 ban: a pair of /1 entries (or a
+      # handful of /2..../7) reopens the world while every entry passes
+      # the parseability check. /8 is far broader than any operator
+      # egress allowlist legitimately needs.
+      alltrue([
+        for cidr in var.alb_https_ingress_cidrs : try(tonumber(split("/", cidr)[1]) >= 8, false)
+      ]) &&
       length(distinct([
         for cidr in var.alb_https_ingress_cidrs : try(cidrsubnet(cidr, 0, 0), cidr)
       ])) == length(var.alb_https_ingress_cidrs)
     )
-    error_message = "alb_https_ingress_cidrs must be a non-empty list of parseable IPv4 CIDRs (IPv6 is not supported), each covering a distinct network, and none may be a /0 in any spelling because that opens the ALB to the whole internet."
+    error_message = "alb_https_ingress_cidrs must be a non-empty list of parseable IPv4 CIDRs (IPv6 is not supported), each covering a distinct network with a prefix of /8 or narrower, because /0 in any spelling — including unions of broader prefixes — opens the ALB to the whole internet."
   }
 }
 
