@@ -228,6 +228,7 @@ from elspeth.web.sessions.protocol import (
     RunEventRecord,
     RunRecord,
     SessionArchiveDisposition,
+    SessionCompositionStateCreation,
     SessionForkAuthority,
     SessionForkChildCreation,
     SessionForkChildMessageCreation,
@@ -9849,8 +9850,8 @@ class SessionServiceImpl:
     ) -> CompositionStateRecord:
         """Save a new immutable composition state snapshot.
 
-        A live, exact COMPOSE ``SessionOperationContext`` is validated in the
-        same locked transaction before any state write.
+        The session-operation authority owns the locked transaction, exact
+        COMPOSE fence validation, version allocation, and insert.
 
         Version is max(existing versions for session) + 1, starting at 1.
 
@@ -9866,78 +9867,27 @@ class SessionServiceImpl:
         state_id = uuid.uuid4()
         now = self._now()
         sid = str(session_id)
-
-        def _write(conn: Connection) -> int:
-            self._assert_session_write_lock_held(
-                conn,
-                sid,
-                caller="save_composition_state._write",
-            )
-            # The per-session write lock makes the SELECT-MAX +
-            # INSERT sequence atomic against every other writer for
-            # this session_id on both PostgreSQL (advisory lock) and
-            # SQLite (process-wide per-session RLock). If the lock
-            # invariant is ever broken in a refactor, the
-            # IntegrityError on uq_composition_state_version names the
-            # constraint directly — no retry layer is permitted to
-            # consume that diagnostic before it reaches the operator
-            # (CLAUDE.md No Legacy Code Policy: no belt-and-suspenders).
-            result = conn.execute(
-                select(func.max(composition_states_table.c.version)).where(composition_states_table.c.session_id == sid)
-            ).scalar()
-            version = (result or 0) + 1
-
-            conn.execute(
-                insert(composition_states_table).values(
-                    id=str(state_id),
-                    session_id=sid,
-                    version=version,
-                    source=None,
-                    sources=_enveloped_state_column(state.sources),
-                    nodes=_enveloped_state_column(state.nodes),
-                    edges=_enveloped_state_column(state.edges),
-                    outputs=_enveloped_state_column(state.outputs),
-                    metadata_=_enveloped_state_column(state.metadata_),
-                    is_valid=state.is_valid,
-                    validation_errors=deep_thaw(state.validation_errors),
-                    composer_meta=_enveloped_state_column(state.composer_meta),
-                    derived_from_state_id=None,
-                    provenance=provenance,
-                    created_at=now,
-                )
-            )
-            return version
-
-        def _sync() -> int:
-            with (
-                self._session_process_locked_begin(sid) as conn,
-                self._session_write_lock(conn, sid),
-                self._session_composer_mutation_transaction(
-                    conn,
-                    session_id=sid,
-                    session_operation_context=session_operation_context,
-                    expected_kind=SessionOperationKind.COMPOSE,
-                ),
-            ):
-                return _write(conn)
-
-        version = await self._run_sync(_sync)
-
-        return CompositionStateRecord(
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if (
+            session_operation_context.operation_kind is not SessionOperationKind.COMPOSE
+            or session_operation_context.fence.session_id != sid
+        ):
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+        creation = SessionCompositionStateCreation(
             id=state_id,
-            session_id=session_id,
-            version=version,
-            source=None,
-            sources=state.sources,
-            nodes=state.nodes,
-            edges=state.edges,
-            outputs=state.outputs,
-            metadata_=state.metadata_,
-            is_valid=state.is_valid,
-            validation_errors=state.validation_errors,
+            data=state,
+            provenance=provenance,
             created_at=now,
             derived_from_state_id=None,
-            composer_meta=state.composer_meta,
+        )
+        return cast(
+            "CompositionStateRecord",
+            await self._run_sync(
+                self._session_operation_authority.mutate,
+                session_operation_context,
+                lambda transaction: transaction.composition_states.append_state(creation),
+            ),
         )
 
     async def commit_transition_response(

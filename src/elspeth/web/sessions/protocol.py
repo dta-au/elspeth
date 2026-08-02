@@ -958,6 +958,33 @@ class CompositionStateData:
 
 @final
 @dataclass(frozen=True, slots=True)
+class SessionCompositionStateCreation:
+    """One ordinary COMPOSE checkpoint with repository-owned versioning."""
+
+    id: UUID
+    data: CompositionStateData
+    provenance: CompositionStateProvenance
+    created_at: datetime
+    derived_from_state_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.id) is not UUID:
+            raise AuditIntegrityError("SessionCompositionStateCreation.id must be UUID")
+        if type(self.data) is not CompositionStateData:
+            raise AuditIntegrityError("SessionCompositionStateCreation.data must be exact")
+        provenance: object = self.provenance
+        if type(provenance) is not str or provenance not in COMPOSITION_STATE_PROVENANCE_VALUES:
+            raise AuditIntegrityError("SessionCompositionStateCreation.provenance is invalid")
+        created_at: object = self.created_at
+        if type(created_at) is not datetime or created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise AuditIntegrityError("SessionCompositionStateCreation.created_at must be an aware exact datetime")
+        derived_from_state_id: object = self.derived_from_state_id
+        if derived_from_state_id is not None and type(derived_from_state_id) is not UUID:
+            raise AuditIntegrityError("SessionCompositionStateCreation.derived_from_state_id must be UUID or None")
+
+
+@final
+@dataclass(frozen=True, slots=True)
 class SessionForkChildStateCreation:
     """One fork child checkpoint with repository-owned version allocation."""
 
@@ -2613,6 +2640,15 @@ class SessionOperationSessionMutations(Protocol):
     ) -> SessionArchiveDisposition: ...
 
 
+class SessionOperationCompositionMutations(Protocol):
+    """Composition-state mutations under one exact COMPOSE operation fence."""
+
+    def append_state(
+        self,
+        creation: SessionCompositionStateCreation,
+    ) -> CompositionStateRecord: ...
+
+
 class SessionOperationRunMutations(Protocol):
     """Run mutations available inside one exact EXECUTE operation fence."""
 
@@ -2885,6 +2921,9 @@ class SessionOperationMutationTransaction(Protocol):
 
     @property
     def session(self) -> SessionOperationSessionMutations: ...
+
+    @property
+    def composition_states(self) -> SessionOperationCompositionMutations: ...
 
     @property
     def runs(self) -> SessionOperationRunMutations: ...

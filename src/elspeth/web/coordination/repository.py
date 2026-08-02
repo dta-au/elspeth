@@ -97,6 +97,7 @@ from elspeth.web.sessions.protocol import (
     RunEventRecord,
     RunRecord,
     SessionArchiveDisposition,
+    SessionCompositionStateCreation,
     SessionForkAuthority,
     SessionForkChildCreation,
     SessionForkChildMessageCreation,
@@ -109,6 +110,7 @@ from elspeth.web.sessions.protocol import (
     SessionNotFoundError,
     SessionOperationBlobMutations,
     SessionOperationComposerProgressMutations,
+    SessionOperationCompositionMutations,
     SessionOperationMutationTransaction,
     SessionOperationRunMutations,
     SessionOperationSessionMutations,
@@ -389,6 +391,11 @@ def _ensure_utc(value: datetime) -> datetime:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
+def _composition_state_column(value: Any) -> Any:
+    raw = deep_thaw(value)
+    return None if raw is None else {"_version": 1, "data": raw}
+
+
 def _validate_owner(owner_instance_id: str) -> None:
     if type(owner_instance_id) is not str or not owner_instance_id.strip():
         raise ValueError("owner_instance_id must be a nonblank exact string")
@@ -592,6 +599,90 @@ class _RepositorySessionMutations:
         if result.rowcount != 1:
             raise SessionNotFoundError(UUID(session_id))
         return SessionArchiveDisposition.SOFT_ARCHIVED
+
+
+@final
+class _RepositoryCompositionStateMutations:
+    """COMPOSE-only immutable checkpoint appends under exact session custody."""
+
+    __slots__ = ("__state",)
+
+    def __init__(self, state: _RepositoryMutationState) -> None:
+        self.__state = state
+
+    def append_state(
+        self,
+        creation: SessionCompositionStateCreation,
+    ) -> CompositionStateRecord:
+        state = self.__state
+        state._require_active()
+        if type(creation) is not SessionCompositionStateCreation:
+            raise TypeError("composition state creation must be exact")
+        context = state._operation_context
+        if (
+            type(context) is not SessionOperationContext
+            or context.operation_kind is not SessionOperationKind.COMPOSE
+            or context.fence.session_id != state._session_id
+        ):
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+
+        connection = _resolve_mutation_connection(state._connection_token)
+        derived_from_state_id = creation.derived_from_state_id
+        if derived_from_state_id is not None:
+            predecessor = connection.execute(
+                select(composition_states_table.c.id)
+                .where(
+                    composition_states_table.c.id == str(derived_from_state_id),
+                    composition_states_table.c.session_id == state._session_id,
+                )
+                .with_for_update()
+            ).one_or_none()
+            if predecessor is None:
+                raise SessionDerivedCustodyError
+
+        version = int(
+            connection.execute(
+                select(func.coalesce(func.max(composition_states_table.c.version), 0) + 1).where(
+                    composition_states_table.c.session_id == state._session_id
+                )
+            ).scalar_one()
+        )
+        data = creation.data
+        connection.execute(
+            insert(composition_states_table).values(
+                id=str(creation.id),
+                session_id=state._session_id,
+                version=version,
+                source=None,
+                sources=_composition_state_column(data.sources),
+                nodes=_composition_state_column(data.nodes),
+                edges=_composition_state_column(data.edges),
+                outputs=_composition_state_column(data.outputs),
+                metadata_=_composition_state_column(data.metadata_),
+                is_valid=data.is_valid,
+                validation_errors=deep_thaw(data.validation_errors),
+                composer_meta=_composition_state_column(data.composer_meta),
+                derived_from_state_id=(str(derived_from_state_id) if derived_from_state_id is not None else None),
+                provenance=creation.provenance,
+                created_at=creation.created_at,
+            )
+        )
+        return CompositionStateRecord(
+            id=creation.id,
+            session_id=UUID(state._session_id),
+            version=version,
+            source=None,
+            sources=data.sources,
+            nodes=data.nodes,
+            edges=data.edges,
+            outputs=data.outputs,
+            metadata_=data.metadata_,
+            is_valid=data.is_valid,
+            validation_errors=data.validation_errors,
+            created_at=creation.created_at,
+            derived_from_state_id=derived_from_state_id,
+            composer_meta=data.composer_meta,
+        )
 
 
 @final
@@ -2575,7 +2666,15 @@ class _RepositoryBlobMutations:
 class _RepositoryMutationTransaction:
     """Read-only composition of exact capabilities over one transaction."""
 
-    __slots__ = ("__blobs", "__composer_completion", "__composer_progress", "__runs", "__session", "__state")
+    __slots__ = (
+        "__blobs",
+        "__composer_completion",
+        "__composer_progress",
+        "__composition_states",
+        "__runs",
+        "__session",
+        "__state",
+    )
 
     def __init__(
         self,
@@ -2594,6 +2693,7 @@ class _RepositoryMutationTransaction:
         try:
             self.__state = state
             self.__session = _RepositorySessionMutations(state)
+            self.__composition_states = _RepositoryCompositionStateMutations(state)
             self.__runs = _RepositoryRunMutations(state)
             self.__blobs = _RepositoryBlobMutations(state)
             self.__composer_progress = RepositoryComposerProgressMutations(state)
@@ -2611,6 +2711,11 @@ class _RepositoryMutationTransaction:
     def session(self) -> SessionOperationSessionMutations:
         self.__state._require_active()
         return self.__session
+
+    @property
+    def composition_states(self) -> SessionOperationCompositionMutations:
+        self.__state._require_active()
+        return self.__composition_states
 
     @property
     def runs(self) -> SessionOperationRunMutations:
@@ -2664,8 +2769,7 @@ class _ForkChildSessionMutations:
 
     @staticmethod
     def _state_column(value: Any) -> Any:
-        raw = deep_thaw(value)
-        return None if raw is None else {"_version": 1, "data": raw}
+        return _composition_state_column(value)
 
     def _require_exact_child_context(self) -> Connection:
         connection = _resolve_fork_mutation_connection(

@@ -1438,6 +1438,31 @@ class TestCompositionStateVersioning:
     """Tests for immutable state snapshots with monotonic versioning."""
 
     @pytest.mark.asyncio
+    async def test_save_routes_the_append_through_session_operation_authority(
+        self,
+        engine,
+    ) -> None:
+        service, authority = _service_with_recording_authority(engine)
+        session = await service.create_session("alice", "Pipeline", "local")
+        context = authority.acquire(
+            session_id=session.id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id="test-composition-owner",
+            lease_seconds=30,
+        )
+        authority.events.clear()
+
+        state = await service.save_composition_state(
+            session.id,
+            CompositionStateData(is_valid=True),
+            provenance="session_seed",
+            session_operation_context=context,
+        )
+
+        assert state.version == 1
+        assert authority.events == ["mutate"]
+
+    @pytest.mark.asyncio
     async def test_missing_compose_context_is_rejected_without_consuming_version(
         self,
         service,

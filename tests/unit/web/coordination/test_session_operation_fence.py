@@ -419,6 +419,7 @@ async def test_active_mutation_object_graph_has_no_database_handle_or_cross_sess
         capabilities = (
             transaction,
             transaction.session,
+            transaction.composition_states,
             transaction.runs,
             transaction.blobs,
             transaction.composer_progress,
@@ -457,6 +458,7 @@ async def test_every_mutation_capability_is_confined_to_the_callback_thread(serv
         actions = {
             "outer": lambda: transaction.database_now,
             "session": lambda: transaction.session.decide_and_soft_archive(archived_at=datetime.now(UTC)),
+            "composition_states": lambda: transaction.composition_states.append_state(object()),
             "runs": lambda: transaction.runs.list_run_events_after(run_id=uuid4(), after_sequence=0),
             "blobs": lambda: transaction.blobs.list_blob_run_links(blob_id=uuid4()),
             "composer_progress": transaction.composer_progress.retire_session_progress,
@@ -669,6 +671,7 @@ async def test_mutation_facade_exposes_no_handle_and_closes_after_callback(servi
             (
                 transaction,
                 transaction.session,
+                transaction.composition_states,
                 transaction.runs,
                 transaction.blobs,
                 transaction.composer_progress,
@@ -678,11 +681,12 @@ async def test_mutation_facade_exposes_no_handle_and_closes_after_callback(servi
 
     authority.mutate(context, capture_all_capabilities)
 
-    transaction, session, runs, blobs, composer_progress, composer_completion = captured
+    transaction, session, composition_states, runs, blobs, composer_progress, composer_completion = captured
     assert {name for name in dir(transaction) if not name.startswith("_")} == {
         "blobs",
         "composer_completion",
         "composer_progress",
+        "composition_states",
         "database_now",
         "runs",
         "session",
@@ -691,6 +695,8 @@ async def test_mutation_facade_exposes_no_handle_and_closes_after_callback(servi
         _ = transaction.database_now  # type: ignore[attr-defined]
     with pytest.raises(RuntimeError, match="closed"):
         session.decide_and_soft_archive(archived_at=datetime.now(UTC))  # type: ignore[attr-defined]
+    with pytest.raises(RuntimeError, match="closed"):
+        composition_states.append_state(object())  # type: ignore[attr-defined, arg-type]
     with pytest.raises(RuntimeError, match="closed"):
         runs.list_run_events_after(run_id=uuid4(), after_sequence=0)  # type: ignore[attr-defined]
     with pytest.raises(RuntimeError, match="closed"):

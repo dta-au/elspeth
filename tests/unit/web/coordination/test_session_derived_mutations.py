@@ -24,6 +24,7 @@ from elspeth.web.sessions.models import (
     run_events_table,
     runs_table,
 )
+from elspeth.web.sessions.protocol import CompositionStateData, SessionCompositionStateCreation
 
 
 def _create(authority: SQLiteLocalSessionOperationAuthority, *, title: str):
@@ -112,6 +113,98 @@ def _acquire(authority: SQLiteLocalSessionOperationAuthority, *, session_id: UUI
         owner_instance_id="sqlite-owner",
         lease_seconds=30,
     )
+
+
+def _state_creation(
+    *,
+    derived_from_state_id: UUID | None = None,
+) -> SessionCompositionStateCreation:
+    return SessionCompositionStateCreation(
+        id=uuid4(),
+        data=CompositionStateData(
+            sources={"orders": {"plugin": "csv", "options": {"path": "orders.csv"}}},
+            is_valid=True,
+        ),
+        provenance="session_seed",
+        created_at=datetime.now(UTC),
+        derived_from_state_id=derived_from_state_id,
+    )
+
+
+def test_composition_state_facet_allocates_versions_and_preserves_owned_lineage(engine: Engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = _create(authority, title="composition authority")
+    context = authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+
+    first_creation = _state_creation()
+    first = authority.mutate(
+        context,
+        lambda transaction: transaction.composition_states.append_state(first_creation),
+    )
+    second_creation = _state_creation(derived_from_state_id=first.id)
+    second = authority.mutate(
+        context,
+        lambda transaction: transaction.composition_states.append_state(second_creation),
+    )
+
+    assert (first.version, second.version) == (1, 2)
+    assert second.derived_from_state_id == first.id
+    assert second.sources == second_creation.data.sources
+    with engine.connect() as connection:
+        rows = connection.execute(
+            select(composition_states_table)
+            .where(composition_states_table.c.session_id == str(session.id))
+            .order_by(composition_states_table.c.version)
+        ).all()
+    assert [row.version for row in rows] == [1, 2]
+    assert rows[0].sources == {"_version": 1, "data": {"orders": {"plugin": "csv", "options": {"path": "orders.csv"}}}}
+    assert rows[1].derived_from_state_id == str(first.id)
+
+
+def test_composition_state_facet_rejects_wrong_kind_and_foreign_lineage_without_consuming_version(engine: Engine) -> None:
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    owned = _create(authority, title="owned composition")
+    foreign = _create(authority, title="foreign composition")
+    foreign_context = authority.acquire(
+        session_id=foreign.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+    foreign_state = authority.mutate(
+        foreign_context,
+        lambda transaction: transaction.composition_states.append_state(_state_creation()),
+    )
+    execute_context = _acquire(authority, session_id=owned.id)
+
+    with pytest.raises(SessionOperationFenceLost):
+        authority.mutate(
+            execute_context,
+            lambda transaction: transaction.composition_states.append_state(_state_creation()),
+        )
+    authority.release(execute_context)
+    compose_context = authority.acquire(
+        session_id=owned.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="sqlite-owner",
+        lease_seconds=30,
+    )
+    with pytest.raises(SessionDerivedCustodyError, match="derived record is unavailable"):
+        authority.mutate(
+            compose_context,
+            lambda transaction: transaction.composition_states.append_state(_state_creation(derived_from_state_id=foreign_state.id)),
+        )
+
+    owned_state = authority.mutate(
+        compose_context,
+        lambda transaction: transaction.composition_states.append_state(_state_creation()),
+    )
+    assert owned_state.version == 1
 
 
 def test_derived_mutations_reject_foreign_parents_and_raw_execute(engine: Engine) -> None:
