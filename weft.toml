@@ -5,3 +5,7 @@
 source_roots = ["src"]
 exclude = [".git/**", ".venv/**", "venv/**", ".uv-cache/**", ".mypy_cache/**", ".pytest_cache/**", ".ruff_cache/**", ".tox/**", ".nox/**", "node_modules/**", "telemetry/**", "data/**"]
 packs = ["scripts.wardline_pack"]
+
+[wardline.judge]
+transport = "codex-cli"
+codex_model = "gpt-5.6-sol"
