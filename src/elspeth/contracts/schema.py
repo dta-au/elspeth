@@ -67,6 +67,15 @@ FIELD_PATTERN = re.compile(r"^(\w+):\s*(str|int|float|bool|any)(\?)?$")
 # heuristic growth would rebuild runtime validation piecemeal in the composer.
 _TEXT_HEURISTIC_PLUGINS: frozenset[str] = frozenset({"text"})
 
+# Single-request "llm" nodes (the LLM source, and the LLM transform when no
+# `queries` are configured) always emit <response_field>, <response_field>_usage,
+# and <response_field>_model. Mirrors LLM_GUARANTEED_SUFFIXES in
+# plugins/transforms/llm/__init__.py (L0 cannot import L3); parity is pinned by
+# tests/unit/core/dag/test_llm_source_guarantees.py (elspeth-db98d3f660).
+_LLM_HEURISTIC_PLUGIN = "llm"
+_LLM_GUARANTEED_SUFFIXES: tuple[str, ...] = ("", "_usage", "_model")
+_LLM_DEFAULT_RESPONSE_FIELD = "llm_response"
+
 
 def _field_spec_invalid_identifier_message(name: str, spec: str) -> str:
     if name and name[0].isdigit():
@@ -837,6 +846,15 @@ def get_raw_producer_guaranteed_fields(
         column = options.get("column")
         if isinstance(column, str) and column.isidentifier() and not keyword.iskeyword(column):
             return frozenset({column})
+    # Single-request llm arm (elspeth-db98d3f660): union — not replace — the
+    # trio, matching the runtime augmentation in both the LLM source config
+    # rewrite and the single-query LLM transform's _output_schema_config.
+    # `queries is not None` selects the multi-query strategy at runtime, whose
+    # emitted fields are query-prefixed, so it must not claim the bare trio.
+    if plugin_name == _LLM_HEURISTIC_PLUGIN and options.get("queries") is None:
+        response_field = options.get("response_field", _LLM_DEFAULT_RESPONSE_FIELD)
+        if isinstance(response_field, str) and response_field.isidentifier() and not keyword.iskeyword(response_field):
+            return guaranteed | frozenset(f"{response_field}{suffix}" for suffix in _LLM_GUARANTEED_SUFFIXES)
     return guaranteed
 
 

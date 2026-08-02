@@ -90,7 +90,7 @@ from elspeth.web.sessions.protocol import (
     SessionServiceProtocol,
     TerminalSessionRunStatus,
 )
-from elspeth.web.sessions.routes._helpers import _litellm_error_detail, _persist_llm_calls
+from elspeth.web.sessions.routes._helpers import _get_session_compose_lock_registry, _litellm_error_detail, _persist_llm_calls
 
 slog = structlog.get_logger()
 _ARTIFACT_SNAPSHOT_CHUNK_SIZE = 1024 * 1024
@@ -1163,19 +1163,35 @@ def create_execution_router() -> APIRouter:
         composer: ComposerService = request.app.state.composer_service
         settings: WebSettings = request.app.state.settings
         recorder = BufferingRecorder()
+
+        async def _persist_diagnostics_llm_calls(*, plugin_crash_pending: bool) -> None:
+            # elspeth-0fcf68d50f: diagnostics audit rows land in the same
+            # per-session ``chat_messages`` sequence the compose loop
+            # writes, so serialize on the same per-session compose lock the
+            # compose/guided routes hold. The lock wraps ONLY this persist
+            # step — never the LLM call above — so a slow diagnostics
+            # evaluation cannot starve an in-flight compose turn, and the
+            # lock order (compose lock, then the service's internal
+            # session write lock inside ``add_message``) matches every
+            # compose-route writer, so no inverted-order deadlock exists.
+            compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(run.session_id))
+            async with compose_lock:
+                await _persist_llm_calls(
+                    request.app.state.session_service,
+                    run.session_id,
+                    recorder.llm_calls,
+                    run.state_id,
+                    plugin_crash_pending=plugin_crash_pending,
+                    writer_principal="run_diagnostics",
+                )
+
         try:
             explanation = await composer.explain_run_diagnostics(
                 llm_safe_diagnostics_snapshot(diagnostics),
                 recorder=recorder,
             )
         except _BadRequestLLMError as exc:
-            await _persist_llm_calls(
-                request.app.state.session_service,
-                run.session_id,
-                recorder.llm_calls,
-                run.state_id,
-                plugin_crash_pending=True,
-            )
+            await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
             # Provider rejected the request (400-class). Carrier exposes
             # `provider_detail` / `provider_status_code` precisely because
             # `str(exc)` is redacted to the class-name wrap. Delegate to
@@ -1190,34 +1206,16 @@ def create_execution_router() -> APIRouter:
                 ),
             ) from exc
         except ComposerServiceError as exc:
-            await _persist_llm_calls(
-                request.app.state.session_service,
-                run.session_id,
-                recorder.llm_calls,
-                run.state_id,
-                plugin_crash_pending=True,
-            )
+            await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
             raise HTTPException(
                 status_code=502,
                 detail={"error_type": "run_diagnostics_explanation_failed", "detail": str(exc)},
             ) from exc
         except BaseException:
-            await _persist_llm_calls(
-                request.app.state.session_service,
-                run.session_id,
-                recorder.llm_calls,
-                run.state_id,
-                plugin_crash_pending=True,
-            )
+            await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
             raise
         else:
-            await _persist_llm_calls(
-                request.app.state.session_service,
-                run.session_id,
-                recorder.llm_calls,
-                run.state_id,
-                plugin_crash_pending=False,
-            )
+            await _persist_diagnostics_llm_calls(plugin_crash_pending=False)
 
         explanation, working_view = _parse_run_diagnostics_working_view(explanation, diagnostics)
         return RunDiagnosticsEvaluationResponse(

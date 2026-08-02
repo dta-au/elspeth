@@ -196,8 +196,9 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_42() -> None:
-    assert SESSION_SCHEMA_EPOCH == 42
+def test_current_session_schema_epoch_is_43() -> None:
+    # 43: chat_messages.writer_principal gains run_diagnostics (elspeth-0fcf68d50f).
+    assert SESSION_SCHEMA_EPOCH == 43
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

@@ -2,9 +2,9 @@
 
 Use this runbook when a pre-1.0 schema change requires deleting or archiving stale `sessions.db` and Landscape databases. Any deploy that changes both `SESSION_SCHEMA_EPOCH` and `SQLITE_SCHEMA_EPOCH` must coordinate both databases in one service-stop window. Before 1.0, the supported upgrade is uninstall, archive/export when required, recreate, and reinstall; ELSPETH does not migrate either database in place. Phase 4 adds tutorial run/audit-story columns on both sides of the web/Landscape boundary; Phase 5b (commit `2e390fc0b`) adds the later cross-DB invariant where `interpretation_events.resolved_prompt_template_hash` is byte-equal to the matching Landscape `calls_table.resolved_prompt_template_hash`. See [Phase 5b: Two-DB Reset](#phase-5b-two-db-reset) below. Payload storage, blobs outside the session DB, and Filigree tracker data are still out of scope for this runbook.
 
-## Current Cutover: 0.7.2 blob cleanup, guided decline, and row_union barrier (session epoch 42 and Landscape epoch 30)
+## Current Cutover: 0.7.2 blob cleanup, guided decline, and row_union barrier (session epoch 43 and Landscape epoch 30)
 
-0.7.2 advances `SESSION_SCHEMA_EPOCH` from 35 to 42. Epoch 36 ensures a committed
+0.7.2 advances `SESSION_SCHEMA_EPOCH` from 35 to 43. Epoch 36 ensures a committed
 blob deletion whose tombstone unlink or directory fsync fails remains retryable
 after restart. Epoch 37 adds the completed `guided_plan` `declined`
 result kind and its state-only result locator. Epoch 38 additionally retains the
@@ -20,8 +20,10 @@ without that key and are rejected at startup instead of failing during replay.
 Epoch 41 requires the `node_options_summary` key the review cards render, on
 both the proposal and wiring node projections, for the same reason. Epoch 42
 adds the reviewed output-field gap to failed guided operations so the initial
-and replayed HTTP failures remain equivalent.
-An epoch-35 through epoch-41 database cannot represent
+and replayed HTTP failures remain equivalent. Epoch 43 adds the
+`run_diagnostics` chat writer principal so run-diagnostics LLM audit rows are
+attributed to their real writer instead of the compose loop.
+An epoch-35 through epoch-42 database cannot represent
 the complete current contract and must be recreated. Only `sessions.db` is
 recreated — `data/auth.db` and the content-addressed payload store are never
 deleted by this procedure; recreating the session DB severs stale payload
@@ -41,8 +43,9 @@ exclusive guided-confirmation proposal admission (35), retryable blob-deletion
 cleanup (36), ordinary guided-plan decline settlement (37), exact decline
 replay message identity (38), the permanent `policy_blocked` guided-operation
 failure code (39), explicit persisted coalesce timeout metadata (40), the
-guided `node_options_summary` projection the review cards render (41), and
-operation failure output-field replay enrichment (42). The
+guided `node_options_summary` projection the review cards render (41),
+operation failure output-field replay enrichment (42), and the
+`run_diagnostics` chat writer principal (43). The
 universal web plugin-policy work in 0.7.1 also advances
 `SQLITE_SCHEMA_EPOCH` from 22 to 23 and adds `run_web_plugin_policy`. This
 table is optional per run but required in the schema: web runs receive one
@@ -78,9 +81,9 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-42 release forward,
+unsupported: keep the service drained, repair the epoch-43 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-42/Landscape-epoch-30 record when binding candidate and rollback
+session-epoch-43/Landscape-epoch-30 record when binding candidate and rollback
 decisions.
 
 Deployments crossing the 0.7.0 boundary from an older release must also account
@@ -551,7 +554,7 @@ After health checks pass, prove the recreated session store carries the current
 hard-cut sentinel before creating any session:
 
 ```bash
-sqlite3 "$DB_PATH" 'PRAGMA user_version;'  # expect 42 (== SESSION_SCHEMA_EPOCH)
+sqlite3 "$DB_PATH" 'PRAGMA user_version;'  # expect 43 (== SESSION_SCHEMA_EPOCH)
 ```
 
 An epoch-35, epoch-36, epoch-37, epoch-38, epoch-39, or epoch-40 result is not repairable in place: keep the service drained,

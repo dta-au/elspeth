@@ -51,7 +51,6 @@ from elspeth.web.composer.state import (
     queue_node_contract_error,
 )
 from elspeth.web.composer.tools._common import (
-    _DEFAULT_SOURCE_VALIDATION_FAILURE,
     _FULL_STATE_COMPONENT_ALIAS_SET,
     _SOURCE_VALIDATION_FAILURE_DESCRIPTION,
     ReviewedSourceAuthority,
@@ -89,6 +88,7 @@ from elspeth.web.composer.tools._common import (
     _validate_transform_provider_config_path,
     _validate_transform_provider_config_policy,
     _vf_destination_note,
+    canonicalize_source_validation_failure,
     normalize_tool_result_validation,
     validate_composer_file_sink_collision_policy,
 )
@@ -551,7 +551,9 @@ def build_set_pipeline_candidate(
                 return _failure_result(state, "set_pipeline sources keys must be non-empty source names.")
             src_plugin = source_model.plugin
             src_options = dict(source_model.options)
-            src_on_vf = source_model.on_validation_failure or _DEFAULT_SOURCE_VALIDATION_FAILURE
+            # None and "" both mean 'discard' — one shared owner
+            # (elspeth-bcd7051143), so persistence agrees with auto-wiring.
+            src_on_vf = canonicalize_source_validation_failure(source_model.on_validation_failure)
             reviewed_options = _reviewed_source_options(
                 source_name=source_name,
                 plugin=src_plugin,
@@ -709,7 +711,9 @@ def build_set_pipeline_candidate(
             )
         source_blob_id = legacy_source_model.blob_id
         inline_blob = legacy_source_model.inline_blob
-        src_on_vf = legacy_source_model.on_validation_failure or _DEFAULT_SOURCE_VALIDATION_FAILURE
+        # None and "" both mean 'discard' — one shared owner
+        # (elspeth-bcd7051143), so persistence agrees with auto-wiring.
+        src_on_vf = canonicalize_source_validation_failure(legacy_source_model.on_validation_failure)
         single_source_on_vf = src_on_vf
         if source_blob_id is not None and inline_blob is not None:
             return _failure_result(state, "set_pipeline source must use either an existing blob_id or inline_blob, not both.")

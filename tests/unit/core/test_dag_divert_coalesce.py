@@ -45,15 +45,24 @@ def _build_graph_with_divert(
     divert_on: str | None = None,
     policy: str = "require_all",
     multi_step: bool = False,
+    pre_fork_divert: bool = False,
 ) -> tuple[ExecutionGraph, dict[NodeID, CoalesceSettings]]:
     """Build a fork/coalesce graph with optional DIVERT edge.
 
     Creates: source → gate → [path_a transforms, path_b transforms] → coalesce → sink
 
+    The gate carries ``fork_to`` in its node config, matching the shape the
+    builder writes for fork gates (builder.py stamps ``fork_to`` onto the gate
+    node config) — the divert scan discovers a coalesce's originating fork
+    gate(s) from exactly that key.
+
     Args:
         divert_on: Transform node to add a DIVERT edge to (or None).
         policy: Coalesce policy.
         multi_step: If True, add two transforms per branch instead of one.
+        pre_fork_divert: If True, route the gate's input through a pre-fork
+            transform ``pre_fork_tag`` that has a DIVERT edge — upstream of
+            the fork, so it must never be charged to a branch.
 
     Returns:
         (graph, coalesce_configs) tuple for passing to warn_divert_coalesce_interactions.
@@ -64,11 +73,20 @@ def _build_graph_with_divert(
     graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="test-source", config={})
 
     # Gate
-    graph.add_node("gate", node_type=NodeType.GATE, plugin_name="test-gate", config={})
-    graph.add_edge("source", "gate", label="continue")
+    graph.add_node("gate", node_type=NodeType.GATE, plugin_name="test-gate", config={"fork_to": ["path_a", "path_b"]})
 
     # Error sink (for DIVERT edges)
     graph.add_node("error_sink", node_type=NodeType.SINK, plugin_name="error-sink", config={})
+
+    if pre_fork_divert:
+        # source → pre_fork_tag (DIVERTs to error_sink) → gate. The transform
+        # sits UPSTREAM of the fork: a row diverted here never forks at all.
+        graph.add_node("pre_fork_tag", node_type=NodeType.TRANSFORM, plugin_name="pre-fork-tag", config={})
+        graph.add_edge("source", "pre_fork_tag", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("pre_fork_tag", "gate", label="continue", mode=RoutingMode.MOVE)
+        graph.add_edge("pre_fork_tag", "error_sink", label="__error_pre_fork_tag__", mode=RoutingMode.DIVERT)
+    else:
+        graph.add_edge("source", "gate", label="continue")
 
     if multi_step:
         # Path A: t_a1 → t_a2
@@ -206,11 +224,50 @@ class TestDivertCoalesceWarning:
         assert len(warnings) == 1
         assert "t_a2" in warnings[0].message
 
+    def test_divert_upstream_of_the_fork_emits_no_require_all_warning(self) -> None:
+        """A DIVERT before the fork strands no coalesce group (elspeth-321f335ff2).
+
+        A row diverted upstream of the fork never forked, so NO branch arrives
+        and no group forms — nothing waits. A transform-chain branch is wired
+        gate -> first transform as a MOVE edge, so an unbounded backward MOVE
+        walk runs straight through the coalesce's originating fork gate into
+        pre-fork topology and charges EVERY branch with the pre-fork
+        transform — one false warning per branch (the row_union sibling of
+        elspeth-94d68e7aca).
+        """
+        graph, configs = _build_graph_with_divert(divert_on=None, pre_fork_divert=True)
+        warnings = graph.warn_divert_coalesce_interactions(configs)
+        assert warnings == [], [w.message for w in warnings]
+
+    def test_pre_fork_divert_not_collected_alongside_branch_local_divert(self) -> None:
+        """The boundary must not mask genuine in-branch diverts — or name pre-fork ones.
+
+        t_a diverts INSIDE path_a: that warning is real and must survive,
+        naming t_a only. The pre-fork transform must not be swept into it, and
+        path_b (whose only reachable DIVERT sits upstream of the fork) must
+        not warn at all.
+        """
+        graph, configs = _build_graph_with_divert(divert_on="t_a", pre_fork_divert=True)
+        warnings = graph.warn_divert_coalesce_interactions(configs)
+
+        assert len(warnings) == 1, [w.message for w in warnings]
+        warning = warnings[0]
+        assert warning.code == "DIVERT_COALESCE_REQUIRE_ALL"
+        assert "t_a" in warning.message
+        assert "pre_fork_tag" not in warning.message
+        assert "t_a" in warning.node_ids
+        assert not any("pre_fork_tag" in nid for nid in warning.node_ids)
+
     def test_intermediate_gate_branch_preserves_require_all_warning(self) -> None:
-        """Intermediate gates must not hide upstream DIVERT transforms."""
+        """Intermediate gates must not hide upstream DIVERT transforms.
+
+        The scan boundary is the coalesce's ORIGINATING fork gate (the gate
+        whose ``fork_to`` declares the coalesce's branches), not 'any gate': a
+        routing gate between two branch transforms must still be crossed.
+        """
         graph = ExecutionGraph()
         graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="src", config={})
-        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="fork", config={})
+        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="fork", config={"fork_to": ["path_a", "path_b"]})
         graph.add_node("t_a1", node_type=NodeType.TRANSFORM, plugin_name="transform-a1", config={})
         graph.add_node("inner_gate", node_type=NodeType.GATE, plugin_name="route-gate", config={})
         graph.add_node("t_a2", node_type=NodeType.TRANSFORM, plugin_name="transform-a2", config={})
@@ -352,6 +409,7 @@ class TestDivertCoalesceExclusiveFields:
         divert_on: str | None = None,
         policy: str = "best_effort",
         merge: str = "union",
+        pre_fork_divert: bool = False,
     ) -> tuple[ExecutionGraph, dict[NodeID, CoalesceSettings]]:
         """Build a graph with explicit schema configs on transforms.
 
@@ -361,6 +419,8 @@ class TestDivertCoalesceExclusiveFields:
             divert_on: Transform to add DIVERT edge to
             policy: Coalesce policy
             merge: Coalesce merge strategy
+            pre_fork_divert: If True, route the gate's input through a
+                pre-fork transform ``pre_fork_tag`` that has a DIVERT edge.
         """
         from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 
@@ -369,12 +429,19 @@ class TestDivertCoalesceExclusiveFields:
         # Source
         graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="src", config={})
 
-        # Gate
-        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="gate", config={})
-        graph.add_edge("source", "gate", label="continue")
+        # Gate (fork gates carry fork_to in node config — builder shape)
+        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="gate", config={"fork_to": ["path_a", "path_b"]})
 
         # Error sink
         graph.add_node("error_sink", node_type=NodeType.SINK, plugin_name="err", config={})
+
+        if pre_fork_divert:
+            graph.add_node("pre_fork_tag", node_type=NodeType.TRANSFORM, plugin_name="pre-fork-tag", config={})
+            graph.add_edge("source", "pre_fork_tag", label="continue", mode=RoutingMode.MOVE)
+            graph.add_edge("pre_fork_tag", "gate", label="continue", mode=RoutingMode.MOVE)
+            graph.add_edge("pre_fork_tag", "error_sink", label="__error_pre_fork_tag__", mode=RoutingMode.DIVERT)
+        else:
+            graph.add_edge("source", "gate", label="continue")
 
         # Build schema configs
         def _make_schema(fields: tuple[str, ...] | None) -> SchemaConfig:
@@ -539,13 +606,34 @@ class TestDivertCoalesceExclusiveFields:
         assert "DIVERT_COALESCE_REQUIRE_ALL" in codes
         assert "DIVERT_COALESCE_EXCLUSIVE_FIELDS" in codes
 
+    def test_divert_upstream_of_the_fork_emits_no_exclusive_fields_warning(self) -> None:
+        """A pre-fork DIVERT loses the whole row, not a branch (elspeth-321f335ff2).
+
+        The exclusive-fields warning describes a PARTIAL merge: one branch's
+        contribution silently absent while the group still releases. A row
+        diverted upstream of the fork never forks, so no branch arrives, no
+        group forms, and no merged output exists to be missing fields — the
+        row's absence is recorded by the DIVERT itself. Charging the pre-fork
+        transform to a branch is therefore a false positive for this warning
+        too, not merely for require_all timing.
+        """
+        graph, configs = self._build_graph_with_schemas(
+            branch_a_fields=("shared", "only_a"),
+            branch_b_fields=("shared",),
+            divert_on=None,
+            pre_fork_divert=True,
+            policy="best_effort",
+        )
+        warnings = graph.warn_divert_coalesce_interactions(configs)
+        assert warnings == [], [w.message for w in warnings]
+
     def test_intermediate_gate_branch_preserves_exclusive_fields_warning(self) -> None:
         """Intermediate gates must not hide branch-exclusive field warnings."""
         from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 
         graph = ExecutionGraph()
         graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="src", config={})
-        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="fork", config={})
+        graph.add_node("gate", node_type=NodeType.GATE, plugin_name="fork", config={"fork_to": ["path_a", "path_b"]})
         graph.add_node(
             "t_a1",
             node_type=NodeType.TRANSFORM,

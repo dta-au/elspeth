@@ -1056,3 +1056,80 @@ class TestRawSchemaHelpers:
         )
 
         assert guaranteed == frozenset()
+
+    def test_llm_single_request_infers_response_trio(self) -> None:
+        """Single-request llm nodes guarantee the response trio (elspeth-db98d3f660)."""
+        from elspeth.contracts.schema import get_raw_producer_guaranteed_fields
+
+        guaranteed = get_raw_producer_guaranteed_fields(
+            "llm",
+            {
+                "response_field": "briefing",
+                "schema": {"mode": "observed"},
+            },
+            owner="source:llm_brief",
+        )
+
+        assert guaranteed == frozenset({"briefing", "briefing_usage", "briefing_model"})
+
+    def test_llm_single_request_defaults_response_field(self) -> None:
+        """Absent response_field falls back to the plugin default llm_response."""
+        from elspeth.contracts.schema import get_raw_producer_guaranteed_fields
+
+        guaranteed = get_raw_producer_guaranteed_fields(
+            "llm",
+            {"schema": {"mode": "observed"}},
+            owner="source:llm_brief",
+        )
+
+        assert guaranteed == frozenset({"llm_response", "llm_response_usage", "llm_response_model"})
+
+    def test_llm_single_request_unions_trio_with_explicit_guarantees(self) -> None:
+        """Runtime augmentation unions declared guarantees with the trio; raw synthesis must match."""
+        from elspeth.contracts.schema import get_raw_producer_guaranteed_fields
+
+        guaranteed = get_raw_producer_guaranteed_fields(
+            "llm",
+            {
+                "response_field": "briefing",
+                "schema": {"mode": "observed", "guaranteed_fields": ["briefing"]},
+            },
+            owner="source:llm_brief",
+        )
+
+        assert guaranteed == frozenset({"briefing", "briefing_usage", "briefing_model"})
+
+    def test_llm_multi_query_does_not_infer_unprefixed_trio(self) -> None:
+        """Multi-query llm transforms emit prefixed fields; the unprefixed trio is not guaranteed."""
+        from elspeth.contracts.schema import get_raw_producer_guaranteed_fields
+
+        guaranteed = get_raw_producer_guaranteed_fields(
+            "llm",
+            {
+                "response_field": "briefing",
+                "queries": [{"name": "quality", "template": "Rate {{ row.text }}"}],
+                "schema": {"mode": "observed"},
+            },
+            owner="transform:assess",
+        )
+
+        assert guaranteed == frozenset()
+
+    @pytest.mark.parametrize("response_field", ["class", "not-valid", 7])
+    def test_llm_invalid_response_field_does_not_infer_trio(
+        self,
+        response_field: object,
+    ) -> None:
+        """Invalid response_field values must not synthesize guarantees."""
+        from elspeth.contracts.schema import get_raw_producer_guaranteed_fields
+
+        guaranteed = get_raw_producer_guaranteed_fields(
+            "llm",
+            {
+                "response_field": response_field,
+                "schema": {"mode": "observed"},
+            },
+            owner="source:llm_brief",
+        )
+
+        assert guaranteed == frozenset()

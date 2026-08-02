@@ -281,6 +281,43 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
         assert bind_result.success is True
         assert bind_result.updated_state.sources["source"].on_success == "out"
 
+    def test_empty_on_validation_failure_canonicalizes_to_discard(self, tmp_path: Path) -> None:
+        """elspeth-bcd7051143: this seam used to preserve "" (``is not None``)
+        while set_pipeline coerced it — an accepted-then-wedged divergence.
+        Every seam now routes through the shared canonicalizer: "" names no
+        route (sink names are non-empty), so it persists as 'discard'."""
+        user_message_content = "Use this exact text:\nhello"
+        engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
+        catalog = _mock_catalog()
+
+        ctx = ToolContext(
+            catalog=catalog,
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            user_message_id=user_message_id,
+            user_message_content=user_message_content,
+        )
+        create_result = _execute_create_blob(
+            {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
+            _empty_state(),
+            ctx,
+        )
+        assert create_result.success is True
+
+        bind_result = _execute_set_source_from_blob(
+            {
+                "blob_id": create_result.data["blob_id"],
+                "on_success": "out",
+                "options": {"column": "text", "schema": {"mode": "observed"}},
+                "on_validation_failure": "",
+            },
+            _empty_state(),
+            ctx,
+        )
+        assert bind_result.success is True
+        assert bind_result.updated_state.sources["source"].on_validation_failure == "discard"
+
     def test_omitted_options_validates_at_model_layer(self) -> None:
         """``options`` is optional at the model layer (default ``{}``).
 

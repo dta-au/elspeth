@@ -197,6 +197,14 @@ class SourceProtocol(_PluginReferenceContent, _PluginAssistanceHooks, Protocol):
     # Set from the source's effective SchemaConfig guarantees at construction.
     declared_guaranteed_fields: frozenset[str]
 
+    # Plugin-computed output contract, recorded by
+    # BaseSource._initialize_declared_guaranteed_fields(). The DAG builder
+    # prefers this over re-parsing raw options so source-specific schema
+    # rewrites (e.g. the LLM source's guaranteed-field augmentation) reach
+    # build-time graph validation (elspeth-db98d3f660). None = the source
+    # computes no output contract; the builder parses raw options instead.
+    _output_schema_config: SchemaConfig | None
+
     # Lifecycle guards (set by BaseSource.on_start()/on_complete()).
     # All sources must inherit BaseSource which manages these. Contract tests
     # use these flags as falsifiable post-conditions for lifecycle invocation

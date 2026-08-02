@@ -25,6 +25,11 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tools import _options_with_default_llm_reviews
 
+# The shared on_validation_failure canonicalizer is the single owner of the
+# missing/"" -> 'discard' fold (elspeth-bcd7051143); deep-importing
+# tools._common is the established cross-package pattern.
+from elspeth.web.composer.tools._common import canonicalize_source_validation_failure
+
 MAX_RUNTIME_YAML_IMPORT_CHARS = 262_144
 _UNSUPPORTED_COALESCE_FIELDS = frozenset(
     {
@@ -214,8 +219,14 @@ def _source_from_runtime_entry(source_name: str, entry: Any) -> SourceSpec:
     option_on_validation_failure = options.pop("on_validation_failure", None)
     if on_validation_failure is None:
         on_validation_failure = option_on_validation_failure
-    if not isinstance(on_validation_failure, str) or not on_validation_failure:
-        on_validation_failure = "discard"
+    if not isinstance(on_validation_failure, str):
+        # Non-string spellings are malformed at this Tier-3 boundary; fold
+        # them into the unspecified case per the decorator invariant.
+        on_validation_failure = None
+    # None and "" both mean 'discard' via the shared canonicalizer — the
+    # single owner of that fold (elspeth-bcd7051143), shared with every
+    # composer source-authoring seam.
+    on_validation_failure = canonicalize_source_validation_failure(on_validation_failure)
     return SourceSpec(
         plugin=_require_str(source, "plugin", f"sources.{source_name}"),
         on_success=_require_str(source, "on_success", f"sources.{source_name}"),

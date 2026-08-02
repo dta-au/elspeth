@@ -282,12 +282,21 @@ def build_execution_graph(
     source_ids: dict[str, NodeID] = {}
     for source_name, source_instance in sources.items():
         source_config = source_instance.config
-        source_schema_config = _parse_contract_schema_config(
-            source_config,
-            owner=f"source:{source_name}",
-            component_id=source_name,
-            component_type="source",
-        )
+        # Prefer the plugin-computed output contract over re-parsing the raw
+        # options dict — the source-side mirror of the transform path below.
+        # Sources that rewrite their schema at construction (the LLM source's
+        # guaranteed-field augmentation) must feed the augmented contract into
+        # graph validation (elspeth-db98d3f660). getattr sentinel: legacy test
+        # stubs predate the SourceProtocol attribute; absence means the same
+        # as None — the source computes no output contract.
+        source_schema_config: SchemaConfig | None = getattr(source_instance, "_output_schema_config", None)
+        if source_schema_config is None:
+            source_schema_config = _parse_contract_schema_config(
+                source_config,
+                owner=f"source:{source_name}",
+                component_id=source_name,
+                component_type="source",
+            )
         source_node_config = dict(source_config)
         source_node_config["source_name"] = source_name
         source_id = node_id("source", source_name, source_node_config)

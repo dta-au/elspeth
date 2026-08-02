@@ -1144,6 +1144,9 @@ class TestRunDiagnosticsEndpoint:
             pytest.param("timeout", 502, id="timeout"),
             pytest.param("malformed", 502, id="malformed"),
             pytest.param("provider_error", 502, id="provider-error"),
+            # elspeth-0fcf68d50f: the route's ``except BaseException`` arm
+            # must persist the audit row too before re-raising.
+            pytest.param("crash", None, id="crash"),
         ],
     )
     @pytest.mark.asyncio
@@ -1204,6 +1207,7 @@ class TestRunDiagnosticsEndpoint:
             "timeout": ComposerLLMCallStatus.TIMEOUT,
             "malformed": ComposerLLMCallStatus.MALFORMED_RESPONSE,
             "provider_error": ComposerLLMCallStatus.BAD_REQUEST_ERROR,
+            "crash": ComposerLLMCallStatus.API_ERROR,
         }
 
         class FakeComposer:
@@ -1234,6 +1238,8 @@ class TestRunDiagnosticsEndpoint:
                     raise ComposerServiceError("LLM returned an empty diagnostics explanation")
                 if outcome == "provider_error":
                     raise _BadRequestLLMError("LLM request rejected (BadRequestError)")
+                if outcome == "crash":
+                    raise RuntimeError("diagnostics crashed mid-flight")
                 return '{"headline":"Run active","evidence":[],"meaning":"Work continues.","next_steps":[]}'
 
         app = _create_test_app(execution_service=svc)
@@ -1245,7 +1251,17 @@ class TestRunDiagnosticsEndpoint:
         )
         endpoint = _route_endpoint(app, "evaluate_run_diagnostics")
 
-        if expected_http_status is None:
+        if outcome == "crash":
+            # The BaseException arm persists, then re-raises the original.
+            with pytest.raises(RuntimeError, match="diagnostics crashed mid-flight"):
+                await endpoint(
+                    run_id,
+                    _request_for_app(app),
+                    limit=50,
+                    user=UserIdentity(user_id=_TEST_USER_ID, username="testuser"),
+                    service=svc,
+                )
+        elif expected_http_status is None:
             await endpoint(
                 run_id,
                 _request_for_app(app),
@@ -1270,10 +1286,116 @@ class TestRunDiagnosticsEndpoint:
         assert audit_args.args[1] == "audit"
         assert json.loads(audit_args.args[2])["status"] == status_by_outcome[outcome].value
         assert audit_args.kwargs["composition_state_id"] == state_id
-        assert audit_args.kwargs["writer_principal"] == "compose_loop"
+        # elspeth-0fcf68d50f: diagnostics audit rows are attributed to their
+        # real writer, not misattributed to the compose loop.
+        assert audit_args.kwargs["writer_principal"] == "run_diagnostics"
         serialized_audit = repr(audit_args)
         assert "SECRET_DIAGNOSTICS_PROMPT" not in serialized_audit
         assert "secret-provider-token-must-not-persist" not in serialized_audit
+
+    @pytest.mark.asyncio
+    async def test_evaluate_diagnostics_persists_under_session_compose_lock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """elspeth-0fcf68d50f: the diagnostics audit persist must hold the
+        same per-session compose lock the compose/guided routes serialize
+        on, so its ``role=audit`` rows cannot interleave inside an
+        in-flight compose turn's sequence range."""
+        import time
+
+        from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+        from elspeth.web.composer.audit import BufferingRecorder
+        from elspeth.web.composer.llm_response_parsing import build_llm_call_record
+        from elspeth.web.sessions.routes._helpers import _get_session_compose_lock_registry
+
+        run_id = uuid4()
+        session_id = uuid4()
+        state_id = uuid4()
+        svc = _execution_service()
+        svc.get_status = AsyncMock(
+            spec=ExecutionService.get_status,
+            return_value=RunStatusResponse(
+                run_id=str(run_id),
+                status="running",
+                started_at=datetime.now(UTC),
+                finished_at=None,
+                error=None,
+                landscape_run_id=str(run_id),
+            ),
+        )
+        diagnostics = RunDiagnosticsResponse(
+            run_id=str(run_id),
+            landscape_run_id=str(run_id),
+            run_status="running",
+            summary=RunDiagnosticSummary(
+                token_count=0,
+                preview_limit=50,
+                preview_truncated=False,
+                state_counts={},
+                operation_counts={},
+                latest_activity_at=None,
+            ),
+            tokens=[],
+            operations=[],
+            artifacts=[],
+        )
+        monkeypatch.setattr(
+            "elspeth.web.execution.routes.load_run_diagnostics_for_settings",
+            lambda *args, **kwargs: diagnostics,
+        )
+
+        class FakeComposer:
+            async def explain_run_diagnostics(
+                self,
+                snapshot: dict[str, object],
+                *,
+                recorder: BufferingRecorder | None = None,
+            ) -> str:
+                assert recorder is not None
+                recorder.record_llm_call(
+                    build_llm_call_record(
+                        model_requested="test/diagnostics",
+                        messages=[{"role": "user", "content": "prompt"}],
+                        tools=None,
+                        status=ComposerLLMCallStatus.SUCCESS,
+                        started_at=datetime.now(UTC),
+                        started_ns=time.monotonic_ns(),
+                        temperature=None,
+                        seed=None,
+                        error_class=None,
+                        error_message=None,
+                    )
+                )
+                return '{"headline":"Run active","evidence":[],"meaning":"Work continues.","next_steps":[]}'
+
+        app = _create_test_app(execution_service=svc)
+        app.state.composer_service = FakeComposer()
+        app.state.session_service.get_run.return_value = _run_record(
+            run_id=run_id,
+            session_id=session_id,
+            state_id=state_id,
+        )
+        request = _request_for_app(app)
+        # Borrow the exact lock object the route must serialize on. The
+        # registry is weak-valued, so the strong local reference keeps
+        # identity stable across the request.
+        compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
+        held_during_persist: list[bool] = []
+
+        async def _record_lock_state(*args: Any, **kwargs: Any) -> None:
+            held_during_persist.append(compose_lock.locked())
+
+        app.state.session_service.add_message = AsyncMock(spec=SessionServiceProtocol.add_message, side_effect=_record_lock_state)
+
+        endpoint = _route_endpoint(app, "evaluate_run_diagnostics")
+        await endpoint(
+            run_id,
+            request,
+            limit=50,
+            user=UserIdentity(user_id=_TEST_USER_ID, username="testuser"),
+            service=svc,
+        )
+
+        assert held_during_persist == [True]
+        assert not compose_lock.locked()
 
     @pytest.mark.asyncio
     async def test_evaluate_diagnostics_redacts_error_payloads_before_llm_prompt(self, monkeypatch: pytest.MonkeyPatch) -> None:

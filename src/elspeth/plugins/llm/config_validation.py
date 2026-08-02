@@ -60,8 +60,78 @@ def derive_azure_model(data: Any) -> Any:
     return data
 
 
+# elspeth-5653909057: character sets for the base_url path ambiguity checks.
+# RFC 3986 unreserved characters — a percent-encoded octet in this set is a
+# respelling of the plain character whose wire treatment is server-dependent.
+_URL_PATH_UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+_URL_HEX_DIGITS = frozenset("0123456789ABCDEFabcdef")
+
+
+def _remove_dot_segments(path: str) -> str:
+    """Collapse ``.``/``..`` path segments per RFC 3986 section 5.2.4.
+
+    elspeth-5653909057: mirrors httpx's client-side normalization so the
+    stored config value matches the path the runtime actually puts on the
+    wire. Empty segments are preserved (the wire algorithm never merges
+    ``//``) except where a following ``..`` pops one, exactly as httpx does.
+    """
+    if not path:
+        return path
+    collapsed: list[str] = []
+    for segment in path.split("/")[1:]:
+        if segment == ".":
+            continue
+        if segment == "..":
+            if collapsed:
+                collapsed.pop()
+            continue
+        collapsed.append(segment)
+    return "/" + "/".join(collapsed)
+
+
+def _assert_unambiguous_path_percent_encoding(path: str) -> None:
+    """Reject percent-encodings whose wire equivalence is server-dependent.
+
+    elspeth-5653909057: httpx sends percent triplets in the path as-is, so a
+    percent-encoded unreserved octet (``/%61pi/v1``) may or may not be decoded
+    to the canonical ``/api/v1`` by the server — an ambiguous respelling that
+    would otherwise slip past the catalogue ``applies_when`` gate. Malformed
+    triplets are rejected for the same reason. Percent-encoded *reserved*
+    octets (e.g. ``%2F``) are not equivalent to their decoded form per RFC
+    3986 and pass through unchanged.
+    """
+    index = path.find("%")
+    while index != -1:
+        triplet = path[index + 1 : index + 3]
+        if len(triplet) != 2 or any(char not in _URL_HEX_DIGITS for char in triplet):
+            raise ValueError("base_url path contains malformed percent-encoding")
+        if chr(int(triplet, 16)) in _URL_PATH_UNRESERVED:
+            raise ValueError(
+                f"base_url path contains ambiguous percent-encoding %{triplet} of an unreserved character; spell the character directly"
+            )
+        index = path.find("%", index + 3)
+
+
 def normalize_openrouter_base_url(value: str) -> str:
-    """Normalize base URL spellings that runtime HTTP joining treats as identical."""
+    """Normalize base URL spellings the runtime treats as identical; reject wire-ambiguous ones.
+
+    elspeth-5653909057: the catalogue ``applies_when`` gate compares this
+    function's output against the canonical OpenRouter endpoint by string
+    equality, so every spelling the wire treats as canonical must normalize to
+    it — otherwise the spelling silently disables model-catalogue enforcement.
+    Two deliberate treatments:
+
+    * **Normalize** spellings the client itself rewrites, so they are
+      wire-identical: host case, default port, trailing slashes (runtime HTTP
+      joining), and ``.``/``..`` dot segments (httpx applies RFC 3986
+      remove_dot_segments before sending).
+    * **Reject** spellings that reach the wire unchanged but whose server-side
+      treatment is undefined — percent-encoded unreserved octets, empty path
+      segments, and a host trailing dot (Host header/SNI differ). Rewriting
+      them would change the wire bytes; accepting them would leave the gate
+      defeatable. This matches ``validate_gateway_endpoint``'s stance on
+      ambiguous segments.
+    """
     parsed = urlsplit(value)
     hostname = parsed.hostname
     if hostname is None:
@@ -71,11 +141,21 @@ def normalize_openrouter_base_url(value: str) -> str:
     except ValueError as exc:
         raise ValueError(f"base_url must have a valid port: {exc}") from exc
     normalized_host = hostname.lower()
+    if normalized_host.endswith("."):
+        # elspeth-5653909057: a root-qualified host resolves to the same DNS
+        # name but sends a different Host header and SNI — server-dependent.
+        raise ValueError("base_url host must not end with a trailing dot")
     if ":" in normalized_host:
         normalized_host = f"[{normalized_host}]"
     default_port = 443 if parsed.scheme == "https" else 80 if parsed.scheme == "http" else None
     netloc = normalized_host if port is None or port == default_port else f"{normalized_host}:{port}"
-    path = parsed.path.rstrip("/")
+    _assert_unambiguous_path_percent_encoding(parsed.path)
+    path = _remove_dot_segments(parsed.path).rstrip("/")
+    if "" in path.split("/")[1:]:
+        # elspeth-5653909057: httpx preserves ``//`` on the wire; whether the
+        # server collapses it is server-dependent. (An empty segment consumed
+        # by a following ``..`` never reaches the wire and is fine.)
+        raise ValueError("base_url path must not contain empty path segments")
     return urlunsplit((parsed.scheme, netloc, path, parsed.query, parsed.fragment))
 
 
