@@ -2,8 +2,17 @@
 
 from __future__ import annotations
 
+import io
+import json
+import os
 import re
 import shlex
+import subprocess
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -59,6 +68,67 @@ def _step_index(job: dict[str, Any], step_name: str) -> int:
         if step.get("name") == step_name:
             return index
     raise AssertionError(f"Missing CI step {step_name!r}")
+
+
+def _embedded_python(run: str, marker: str) -> str:
+    """Extract one marker-delimited Python heredoc from a workflow step."""
+    lines = run.splitlines()
+    start = lines.index(marker)
+    end = lines.index("PY", start + 1)
+    return "\n".join(lines[start + 1 : end]) + "\n"
+
+
+class _ApiResponse(io.BytesIO):
+    """Minimal context-managed HTTP response for embedded resolver tests."""
+
+    def __init__(self, payload: object, *, link: str | None = None) -> None:
+        super().__init__(json.dumps(payload).encode())
+        self.headers = {"Link": link} if link is not None else {}
+
+
+def _ratchet_resolver_script() -> str:
+    workflow = _ci_workflow()
+    run = _step_run(
+        workflow["jobs"]["static-analysis"],
+        "Reject touched or broadened permanent multi-rule per-file blankets",
+    )
+    return _embedded_python(run, "# resolve-nearest-successful-ratchet-baseline")
+
+
+def _set_ratchet_resolver_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_API_URL", "https://api.github.invalid")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "owner/repo")
+    monkeypatch.setenv("CURRENT_RUN_ID", "999")
+    monkeypatch.setenv("GITHUB_RUN_ID", "999")
+    monkeypatch.setenv("GITHUB_SHA", "f" * 40)
+    monkeypatch.setenv("GH_TOKEN", "read-only-token")
+
+
+def _workflow_run(run_id: int, sha: str, *, conclusion: str) -> dict[str, object]:
+    return {
+        "id": run_id,
+        "head_sha": sha,
+        "event": "push",
+        "status": "completed",
+        "conclusion": conclusion,
+    }
+
+
+def _ratchet_job(run_id: int, sha: str, *, step_conclusion: str, attempt: int = 1) -> dict[str, object]:
+    return {
+        "id": run_id * 10 + attempt,
+        "run_id": run_id,
+        "run_attempt": attempt,
+        "head_sha": sha,
+        "name": "Static analysis",
+        "steps": [
+            {
+                "name": "Reject touched or broadened permanent multi-rule per-file blankets",
+                "status": "completed",
+                "conclusion": step_conclusion,
+            }
+        ],
+    }
 
 
 def _pytest_args(run: str) -> list[str]:
@@ -441,21 +511,30 @@ def test_static_analysis_ratchets_permanent_multi_rule_blankets_repo_wide_on_prs
     """The transitional blanket debt may shrink after merge but never grow."""
     workflow = _ci_workflow()
     static_analysis = workflow["jobs"]["static-analysis"]
+    assert workflow["permissions"] == {"actions": "read", "contents": "read"}
 
     step_name = "Reject touched or broadened permanent multi-rule per-file blankets"
     step = _step(static_analysis, step_name)
     assert "if" not in step, "blanket ratchet must run for protected pushes as well as PRs"
     env = step.get("env")
     assert isinstance(env, dict)
-    assert env.get("BASELINE_REF") == (
-        "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}"
-    )
+    assert env.get("PR_BASELINE_REF") == "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || '' }}"
+    assert env.get("GH_TOKEN") == "${{ github.event_name != 'pull_request' && github.token || '' }}"
+    assert env.get("CURRENT_RUN_ID") == "${{ github.run_id }}"
 
     run = _step_run(static_analysis, step_name)
-    assert 'if [[ "$BASELINE_REF" == "0000000000000000000000000000000000000000" ]]' in run
-    assert 'git fetch --no-tags --depth=2 origin "$GITHUB_SHA"' in run
-    assert 'BASELINE_REF="$(git rev-parse "$GITHUB_SHA^")"' in run
-    assert 'git fetch --no-tags --depth=1 origin "$BASELINE_REF"' in run
+    assert 'BASELINE_REF="$PR_BASELINE_REF"' in run, "PRs must preserve the event's exact base SHA"
+    assert "github.event.before" not in str(step), "a cancelled push predecessor is not policy authority"
+    assert "default_branch" not in str(step), "a divergent default branch is not release debt authority"
+    assert "actions/workflows/ci.yaml/runs" in run
+    assert "actions/runs/{run_id}/jobs" in run
+    assert '"event": "push"' in run
+    assert '{"filter": "all"' in run, "rerun attempts must be visible"
+    assert 'rel="next"' in run, "workflow-run and job result sets must be paginated"
+    assert '["git", "rev-list", "--parents"' in run
+    assert "first-parent" in run, "merge authority must stay on the protected branch lineage"
+    assert "Reject touched or broadened permanent multi-rule per-file blankets" in run
+    assert "No successful ancestor baseline was found" in run
     assert "check-per-file-blanket-ratchet" in run
     assert '--baseline-ref "$BASELINE_REF"' in run
     assert "--allowlist-root config/cicd" in run
@@ -464,6 +543,424 @@ def test_static_analysis_ratchets_permanent_multi_rule_blankets_repo_wide_on_prs
     gate_index = _step_index(static_analysis, step_name)
     assert gate_index < _step_index(static_analysis, "Reject unverified PR signed allowlist edits")
     assert gate_index < _step_index(static_analysis, "Run trust-tier elspeth-lints rule")
+
+
+def test_push_ratchet_resolver_accepts_successful_step_from_failed_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Later job failures must not erase this exact ratchet step's successful authority."""
+    _set_ratchet_resolver_env(monkeypatch)
+    baseline_sha = "e" * 40
+
+    def urlopen(request: urllib.request.Request, **_kwargs: object) -> _ApiResponse:
+        if "/actions/workflows/ci.yaml/runs?" in request.full_url:
+            return _ApiResponse({"workflow_runs": [_workflow_run(200, baseline_sha, conclusion="failure")]})
+        if "/actions/runs/200/jobs?" in request.full_url:
+            return _ApiResponse({"jobs": [_ratchet_job(200, baseline_sha, step_conclusion="success")]})
+        raise AssertionError(request.full_url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=f"{'f' * 40} {baseline_sha}\n{baseline_sha}\n"),
+    )
+
+    exec(compile(_ratchet_resolver_script(), "<ratchet-baseline-resolver>", "exec"), {"__name__": "__main__"})
+
+    assert capsys.readouterr().out.splitlines() == [baseline_sha]
+
+
+def test_push_ratchet_resolver_ignores_failed_and_skipped_steps(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only a completed successful execution of the exact ratchet step is authority."""
+    _set_ratchet_resolver_env(monkeypatch)
+    failed_sha = "e" * 40
+    skipped_sha = "d" * 40
+    successful_sha = "c" * 40
+    runs = [
+        _workflow_run(300, failed_sha, conclusion="failure"),
+        _workflow_run(200, skipped_sha, conclusion="cancelled"),
+        _workflow_run(100, successful_sha, conclusion="failure"),
+    ]
+
+    def urlopen(request: urllib.request.Request, **_kwargs: object) -> _ApiResponse:
+        if "/actions/workflows/ci.yaml/runs?" in request.full_url:
+            return _ApiResponse({"workflow_runs": runs})
+        run_id = int(re.search(r"/actions/runs/(\d+)/jobs", request.full_url).group(1))  # type: ignore[union-attr]
+        sha, conclusion = {
+            300: (failed_sha, "failure"),
+            200: (skipped_sha, "skipped"),
+            100: (successful_sha, "success"),
+        }[run_id]
+        return _ApiResponse({"jobs": [_ratchet_job(run_id, sha, step_conclusion=conclusion)]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    graph = f"{'f' * 40} {failed_sha}\n{failed_sha} {skipped_sha}\n{skipped_sha} {successful_sha}\n{successful_sha}\n"
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(stdout=graph))
+
+    exec(compile(_ratchet_resolver_script(), "<ratchet-baseline-resolver>", "exec"), {"__name__": "__main__"})
+
+    assert capsys.readouterr().out.splitlines() == [successful_sha]
+
+
+def test_push_ratchet_resolver_paginates_runs_and_rerun_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Authorities beyond page one and in a successful rerun attempt remain discoverable."""
+    _set_ratchet_resolver_env(monkeypatch)
+    baseline_sha = "e" * 40
+    # GitHub canonicalizes Link URLs to the numeric /repositories/{id} route.
+    runs_page_two = "https://api.github.invalid/repositories/123/actions/workflows/ci.yaml/runs?event=push&per_page=100&page=2"
+    jobs_page_two = "https://api.github.invalid/repositories/123/actions/runs/200/jobs?filter=all&per_page=100&page=2"
+
+    def urlopen(request: urllib.request.Request, **_kwargs: object) -> _ApiResponse:
+        if request.full_url == runs_page_two:
+            return _ApiResponse({"workflow_runs": [_workflow_run(200, baseline_sha, conclusion="failure")]})
+        if "/actions/workflows/ci.yaml/runs?" in request.full_url:
+            return _ApiResponse({"workflow_runs": []}, link=f'<{runs_page_two}>; rel="next"')
+        if request.full_url == jobs_page_two:
+            return _ApiResponse({"jobs": [_ratchet_job(200, baseline_sha, step_conclusion="success", attempt=2)]})
+        if "/actions/runs/200/jobs?" in request.full_url:
+            return _ApiResponse(
+                {"jobs": [_ratchet_job(200, baseline_sha, step_conclusion="failure", attempt=1)]},
+                link=f'<{jobs_page_two}>; rel="next"',
+            )
+        raise AssertionError(request.full_url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=f"{'f' * 40} {baseline_sha}\n{baseline_sha}\n"),
+    )
+
+    exec(compile(_ratchet_resolver_script(), "<ratchet-baseline-resolver>", "exec"), {"__name__": "__main__"})
+
+    assert capsys.readouterr().out.splitlines() == [baseline_sha]
+
+
+def test_push_ratchet_resolver_uses_graph_nearest_authority_not_api_order(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Older debt cannot be restored merely because its successful run is listed first."""
+    _set_ratchet_resolver_env(monkeypatch)
+    older_sha = "c" * 40
+    newer_sha = "e" * 40
+    runs = [
+        _workflow_run(100, older_sha, conclusion="success"),
+        _workflow_run(200, newer_sha, conclusion="failure"),
+    ]
+
+    def urlopen(request: urllib.request.Request, **_kwargs: object) -> _ApiResponse:
+        if "/actions/workflows/ci.yaml/runs?" in request.full_url:
+            return _ApiResponse({"workflow_runs": runs})
+        match = re.search(r"/actions/runs/(\d+)/jobs", request.full_url)
+        assert match is not None
+        run_id = int(match.group(1))
+        sha = {100: older_sha, 200: newer_sha}[run_id]
+        return _ApiResponse({"jobs": [_ratchet_job(run_id, sha, step_conclusion="success")]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    graph = f"{'f' * 40} {newer_sha}\n{newer_sha} {older_sha}\n{older_sha}\n"
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(stdout=graph))
+
+    exec(compile(_ratchet_resolver_script(), "<ratchet-baseline-resolver>", "exec"), {"__name__": "__main__"})
+
+    assert capsys.readouterr().out.splitlines() == [newer_sha]
+
+
+def test_push_ratchet_resolver_excludes_every_run_at_current_sha(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A duplicate successful run at GITHUB_SHA must not make the current tree its own baseline."""
+    _set_ratchet_resolver_env(monkeypatch)
+    current_sha = "f" * 40
+    parent_sha = "e" * 40
+    runs = [
+        _workflow_run(300, current_sha, conclusion="failure"),
+        _workflow_run(200, parent_sha, conclusion="failure"),
+    ]
+
+    def urlopen(request: urllib.request.Request, **_kwargs: object) -> _ApiResponse:
+        if "/actions/workflows/ci.yaml/runs?" in request.full_url:
+            return _ApiResponse({"workflow_runs": runs})
+        match = re.search(r"/actions/runs/(\d+)/jobs", request.full_url)
+        assert match is not None
+        run_id = int(match.group(1))
+        sha = {200: parent_sha, 300: current_sha}[run_id]
+        return _ApiResponse({"jobs": [_ratchet_job(run_id, sha, step_conclusion="success")]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=f"{current_sha} {parent_sha}\n{parent_sha}\n"),
+    )
+
+    exec(compile(_ratchet_resolver_script(), "<ratchet-baseline-resolver>", "exec"), {"__name__": "__main__"})
+
+    assert capsys.readouterr().out.splitlines() == [parent_sha]
+
+
+def test_push_ratchet_resolver_uses_first_parent_authority_at_merge(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A debt-bearing second parent cannot grandfather reintroduction at a merge."""
+    _set_ratchet_resolver_env(monkeypatch)
+    current_sha = "f" * 40
+    stricter_first_parent_sha = "e" * 40
+    debt_bearing_second_parent_sha = "a" * 40
+    shared_ancestor_sha = "9" * 40
+    runs = [
+        _workflow_run(100, debt_bearing_second_parent_sha, conclusion="failure"),
+        _workflow_run(200, stricter_first_parent_sha, conclusion="failure"),
+    ]
+
+    def urlopen(request: urllib.request.Request, **_kwargs: object) -> _ApiResponse:
+        if "/actions/workflows/ci.yaml/runs?" in request.full_url:
+            return _ApiResponse({"workflow_runs": runs})
+        match = re.search(r"/actions/runs/(\d+)/jobs", request.full_url)
+        assert match is not None
+        run_id = int(match.group(1))
+        sha = {100: debt_bearing_second_parent_sha, 200: stricter_first_parent_sha}[run_id]
+        return _ApiResponse({"jobs": [_ratchet_job(run_id, sha, step_conclusion="success")]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    graph = (
+        f"{current_sha} {stricter_first_parent_sha} {debt_bearing_second_parent_sha}\n"
+        f"{stricter_first_parent_sha} {shared_ancestor_sha}\n"
+        f"{debt_bearing_second_parent_sha} {shared_ancestor_sha}\n"
+        f"{shared_ancestor_sha}\n"
+    )
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(stdout=graph))
+
+    exec(compile(_ratchet_resolver_script(), "<ratchet-baseline-resolver>", "exec"), {"__name__": "__main__"})
+
+    assert capsys.readouterr().out.splitlines() == [stricter_first_parent_sha]
+
+
+def test_push_ratchet_resolver_rejects_successful_non_ancestor_run(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A successful step on another branch cannot become authority without ancestry."""
+    _set_ratchet_resolver_env(monkeypatch)
+    unrelated_sha = "a" * 40
+
+    def urlopen(request: urllib.request.Request, **_kwargs: object) -> _ApiResponse:
+        if "/actions/workflows/ci.yaml/runs?" in request.full_url:
+            return _ApiResponse({"workflow_runs": [_workflow_run(100, unrelated_sha, conclusion="success")]})
+        raise AssertionError("non-ancestor workflow jobs must not be queried")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(stdout=f"{'f' * 40}\n"))
+
+    with pytest.raises(SystemExit) as exc_info:
+        exec(compile(_ratchet_resolver_script(), "<ratchet-baseline-resolver>", "exec"), {"__name__": "__main__"})
+
+    assert exc_info.value.code == 2
+    assert "No successful ancestor baseline was found" in capsys.readouterr().err
+
+
+def test_push_ratchet_resolver_fails_closed_on_malformed_ratchet_job(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_ratchet_resolver_env(monkeypatch)
+    baseline_sha = "e" * 40
+
+    def urlopen(request: urllib.request.Request, **_kwargs: object) -> _ApiResponse:
+        if "/actions/workflows/ci.yaml/runs?" in request.full_url:
+            return _ApiResponse({"workflow_runs": [_workflow_run(200, baseline_sha, conclusion="failure")]})
+        if "/actions/runs/200/jobs?" in request.full_url:
+            malformed_job = _ratchet_job(200, baseline_sha, step_conclusion="success")
+            malformed_job["steps"] = "not-a-list"
+            return _ApiResponse({"jobs": [malformed_job]})
+        raise AssertionError(request.full_url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=f"{'f' * 40} {baseline_sha}\n{baseline_sha}\n"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        exec(compile(_ratchet_resolver_script(), "<ratchet-baseline-resolver>", "exec"), {"__name__": "__main__"})
+
+    assert exc_info.value.code == 2
+    assert "malformed ratchet job" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_error"),
+    (
+        (b"{", "could not read workflow runs"),
+        (b'{"workflow_runs": "not-a-list"}', "malformed Actions API response"),
+        (
+            b'{"workflow_runs": [{"id": 1, "head_sha": "not-a-sha", "event": "push", "status": "completed", "conclusion": "failure"}]}',
+            "malformed workflow run",
+        ),
+    ),
+)
+def test_push_ratchet_baseline_resolver_fails_closed_on_malformed_api_results(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    response: bytes,
+    expected_error: str,
+) -> None:
+    _set_ratchet_resolver_env(monkeypatch)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *_args, **_kwargs: io.BytesIO(response))
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(stdout=f"{'f' * 40}\n"))
+
+    with pytest.raises(SystemExit) as exc_info:
+        exec(compile(_ratchet_resolver_script(), "<ratchet-baseline-resolver>", "exec"), {"__name__": "__main__"})
+
+    assert exc_info.value.code == 2
+    assert expected_error in capsys.readouterr().err
+
+
+def test_push_ratchet_baseline_resolver_fails_closed_when_actions_api_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_ratchet_resolver_env(monkeypatch)
+
+    def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise urllib.error.URLError("offline")
+
+    monkeypatch.setattr(urllib.request, "urlopen", unavailable)
+    monkeypatch.setattr(subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(stdout=f"{'f' * 40}\n"))
+
+    with pytest.raises(SystemExit) as exc_info:
+        exec(compile(_ratchet_resolver_script(), "<ratchet-baseline-resolver>", "exec"), {"__name__": "__main__"})
+
+    assert exc_info.value.code == 2
+    assert "could not read workflow runs" in capsys.readouterr().err
+
+
+def test_push_ratchet_baseline_resolver_fails_closed_without_token(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _set_ratchet_resolver_env(monkeypatch)
+    monkeypatch.delenv("GH_TOKEN")
+
+    with pytest.raises(SystemExit) as exc_info:
+        exec(compile(_ratchet_resolver_script(), "<ratchet-baseline-resolver>", "exec"), {"__name__": "__main__"})
+
+    assert exc_info.value.code == 2
+    assert "GH_TOKEN is unavailable" in capsys.readouterr().err
+
+
+def test_new_branch_full_shell_uses_nearest_cross_branch_ratchet_authority(tmp_path: Path) -> None:
+    """A release-derived branch bootstraps from its nearest vetted ancestor, not stale main."""
+    remote = tmp_path / "remote.git"
+    checkout = tmp_path / "checkout"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "init", str(checkout)], check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "ci@example.invalid"], cwd=checkout, check=True)
+    subprocess.run(["git", "config", "user.name", "CI Test"], cwd=checkout, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=checkout, check=True)
+
+    fixture = checkout / "fixture.txt"
+    fixture.write_text("old debt\n", encoding="utf-8")
+    subprocess.run(["git", "add", "fixture.txt"], cwd=checkout, check=True)
+    subprocess.run(["git", "commit", "-m", "older authority"], cwd=checkout, check=True, capture_output=True)
+    older_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout, check=True, capture_output=True, text=True).stdout.strip()
+    fixture.write_text("reduced debt\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-am", "newer authority"], cwd=checkout, check=True, capture_output=True)
+    newer_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout, check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(["git", "branch", "-M", "release/0.7.2"], cwd=checkout, check=True)
+    subprocess.run(["git", "push", "-u", "origin", "release/0.7.2"], cwd=checkout, check=True, capture_output=True)
+    subprocess.run(["git", "switch", "-c", "release/demo"], cwd=checkout, check=True, capture_output=True)
+    fixture.write_text("attempted reintroduction\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "-am", "new branch push"], cwd=checkout, check=True, capture_output=True)
+    current_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout, check=True, capture_output=True, text=True).stdout.strip()
+
+    routes = {
+        "/repos/owner/repo/actions/workflows/ci.yaml/runs?event=push&per_page=100": {
+            "workflow_runs": [
+                _workflow_run(100, older_sha, conclusion="success"),
+                _workflow_run(200, newer_sha, conclusion="failure"),
+            ]
+        },
+        "/repos/owner/repo/actions/runs/200/jobs?filter=all&per_page=100": {
+            "jobs": [_ratchet_job(200, newer_sha, step_conclusion="success")]
+        },
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            payload = routes.get(self.path)
+            if payload is None:
+                self.send_error(404)
+                return
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    try:
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        capture = tmp_path / "uv-args.txt"
+        fake_uv = fake_bin / "uv"
+        fake_uv.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$RATCHET_CAPTURE"\n', encoding="utf-8")
+        fake_uv.chmod(0o755)
+        env = os.environ.copy()
+        env.update(
+            {
+                "CURRENT_RUN_ID": "999",
+                "GH_TOKEN": "read-only-token",
+                "GITHUB_API_URL": f"http://127.0.0.1:{server.server_port}",
+                "GITHUB_REPOSITORY": "owner/repo",
+                "GITHUB_RUN_ID": "999",
+                "GITHUB_SHA": current_sha,
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "PR_BASELINE_REF": "",
+                "RATCHET_CAPTURE": str(capture),
+            }
+        )
+
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                _step_run(
+                    _ci_workflow()["jobs"]["static-analysis"],
+                    "Reject touched or broadened permanent multi-rule per-file blankets",
+                ),
+            ],
+            cwd=checkout,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+    assert completed.returncode == 0, completed.stderr
+    captured_args = capture.read_text(encoding="utf-8").splitlines()
+    assert captured_args[captured_args.index("--baseline-ref") + 1] == newer_sha
 
 
 def test_judge_quality_never_receives_openrouter_credentials_on_prs() -> None:
