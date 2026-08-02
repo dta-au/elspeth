@@ -2386,6 +2386,18 @@ class ToolCallIDMismatchError(RuntimeError):
         )
 
 
+class RunDiagnosticsAuditMutationAuthority(Protocol):
+    """Handle-free authority for one run-diagnostics audit append."""
+
+    def append_audit_message(
+        self,
+        *,
+        authority: RunDiagnosticsAuditAuthority,
+        content: str,
+        tool_calls: Sequence[Mapping[str, Any]] | None,
+    ) -> ChatMessageRecord: ...
+
+
 class SessionServiceProtocol(Protocol):
     """Protocol for session persistence operations."""
 

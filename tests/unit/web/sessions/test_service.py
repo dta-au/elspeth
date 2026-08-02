@@ -1566,6 +1566,21 @@ class TestRunDiagnosticsAuditMessage:
         return session, state, run
 
     @pytest.mark.asyncio
+    async def test_service_delegates_to_handle_free_repository_authority(self, service) -> None:
+        """The service must own no inline writer — every append goes through the authority."""
+        session, state, run = await self._session_state_run(service)
+        authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
+
+        class RefusingAuthority:
+            def append_audit_message(self, **_kwargs) -> ChatMessageRecord:
+                raise RuntimeError("delegated-to-run-diagnostics-authority")
+
+        service._run_diagnostics_audit_authority = RefusingAuthority()
+
+        with pytest.raises(RuntimeError, match="delegated-to-run-diagnostics-authority"):
+            await service.add_run_diagnostics_audit_message(authority, "must delegate")
+
+    @pytest.mark.asyncio
     async def test_success_appends_run_attributed_audit_row(self, service) -> None:
         session, state, run = await self._session_state_run(service)
         authority = RunDiagnosticsAuditAuthority(run_id=run.id, session_id=session.id, state_id=state.id)
