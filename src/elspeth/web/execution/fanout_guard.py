@@ -432,6 +432,10 @@ def _provider_calls_per_row(options: Mapping[str, Any]) -> int:
 
 
 def _estimate_source_rows(source: SourceSpec, *, data_dir: Path) -> int | None:
+    if source.plugin == "llm":
+        # One authored prompt can emit at most one row; validation discard,
+        # provider failure, or shutdown may reduce that count to zero.
+        return 1
     path = _source_path(source, data_dir=data_dir)
     if path is None:
         return _remote_source_limit(source)

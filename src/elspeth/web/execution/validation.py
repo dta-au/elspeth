@@ -2857,9 +2857,9 @@ def validate_pipeline(
     # Static-prompt LLM advisory — same non-blocking, happy-path-only contract
     # as the two advisories above. Operator direction (elspeth-6bdb7e7736):
     # a static-prompt llm transform is essentially a *source* shape
-    # (generating rows) mis-declared as a transform, and an llm source
-    # plugin kind may exist in future — so this never escalates to a
-    # rejection, now or later.
+    # (generating rows) mis-declared as a transform. The live source:llm
+    # capability is the value-safe repair guidance; this never escalates to a
+    # rejection.
     for static_prompt_finding in _find_static_llm_prompt_advisories(state):
         checks.append(
             ValidationCheck(
@@ -2870,8 +2870,8 @@ def validate_pipeline(
                     "data, so every row receives an identical prompt to the model — one call would do the "
                     "same work as looping over every row. If the intent is transformation, add a 'row.*' "
                     "reference so each row's prompt reflects its own data. If the intent is generation "
-                    "(producing rows from a fixed prompt, not transforming existing ones), that is a "
-                    "source-shaped need the 'llm' transform kind cannot express today."
+                    "(producing one row from one fixed prompt, not transforming existing rows), use the "
+                    "'llm' source (source:llm); it accepts no input rows and emits one response row."
                 ),
                 affected_nodes=(static_prompt_finding.node_id,),
                 outcome_code=None,

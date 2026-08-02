@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import threading
 from collections.abc import Callable, Generator
+from io import StringIO
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+from structlog.testing import capture_logs
 
 from elspeth.contracts import Determinism, SourceRow
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.events import ResourceCleanupFailed
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.token_usage import TokenUsage
@@ -23,6 +27,8 @@ from elspeth.plugins.transforms.llm.providers.azure import AzureLLMProvider
 from elspeth.plugins.transforms.llm.providers.bedrock import BedrockLLMProvider
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayLLMProvider
 from elspeth.plugins.transforms.llm.providers.openrouter import OPENROUTER_BASE_URL, OpenRouterLLMProvider
+from elspeth.telemetry.exporters.console import ConsoleExporter
+from tests.fixtures.factories import make_operation_context
 from tests.unit.plugins.sources.llm.conftest import FakeProvider, RecordingTracer
 
 
@@ -542,6 +548,167 @@ def test_real_lifecycle_order_correlates_post_load_cleanup_telemetry(
     assert event.error_type == "RuntimeError"  # type: ignore[attr-defined]
     assert event.suppressed is True  # type: ignore[attr-defined]
     assert "secret" not in repr(event)
+
+
+def test_cleanup_telemetry_and_fallback_logs_exclude_all_llm_source_payload_sentinels(
+    openrouter_config: Callable[..., dict[str, Any]],
+    source_context: PluginContext,
+) -> None:
+    prompt_sentinel = "TASK12_PROMPT_LITERAL_7f48d44a"
+    secret_reference_sentinel = "${TASK12_LOOKUP_SECRET_REF_91b4c672}"
+    credential_sentinel = "TASK12_RUNTIME_CREDENTIAL_2dd630ef"
+    response_sentinel = "TASK12_PROVIDER_RESPONSE_884cb157"
+    provider_body_sentinel = "TASK12_PROVIDER_ERROR_BODY_35a8e99c"
+    sentinels = (
+        prompt_sentinel,
+        secret_reference_sentinel,
+        credential_sentinel,
+        response_sentinel,
+        provider_body_sentinel,
+    )
+    assert len(set(sentinels)) == 5
+
+    events: list[ResourceCleanupFailed] = []
+
+    def capture_then_fail(event: object) -> None:
+        assert isinstance(event, ResourceCleanupFailed)
+        events.append(event)
+        raise RuntimeError("telemetry callback unavailable")
+
+    source_context.telemetry_emit = capture_then_fail
+    source = LLMSource(
+        openrouter_config(
+            api_key=credential_sentinel,
+            prompt_template=f"{prompt_sentinel}: {{{{ lookup.secret_reference }}}}",
+            lookup={"secret_reference": secret_reference_sentinel},
+            response_field="answer",
+        )
+    )
+    source.on_start(source_context)
+    runtime_provider = source._provider
+    assert isinstance(runtime_provider, OpenRouterLLMProvider)
+    assert runtime_provider._request_headers["Authorization"] == f"Bearer {credential_sentinel}"
+
+    provider = FakeProvider(
+        LLMQueryResult(
+            content=response_sentinel,
+            usage=TokenUsage.known(prompt_tokens=5, completion_tokens=2),
+            model="served-model",
+            finish_reason=FinishReason.STOP,
+        ),
+        close_error=RuntimeError("provider cleanup failed"),
+    )
+    _install_provider(source, provider)
+
+    rows = source.load(source_context)
+    row = next(rows)
+    assert row.row["answer"] == response_sentinel
+    assert provider.messages == [
+        [
+            {
+                "role": "user",
+                "content": f"{prompt_sentinel}: {secret_reference_sentinel}",
+            }
+        ]
+    ]
+
+    provider_error_context = make_operation_context(
+        run_id="test-run-provider-error",
+        plugin_name="llm",
+    )
+    provider_error_context.telemetry_emit = capture_then_fail
+    provider_error_source = LLMSource(
+        openrouter_config(
+            api_key=credential_sentinel,
+            prompt_template=f"{prompt_sentinel}: {{{{ lookup.secret_reference }}}}",
+            lookup={"secret_reference": secret_reference_sentinel},
+            response_field="answer",
+        )
+    )
+    provider_error_source.on_start(provider_error_context)
+    provider_error = FakeProvider(
+        LLMClientError(f"provider error body: {provider_body_sentinel}", retryable=False),
+        close_error=RuntimeError("provider cleanup failed"),
+    )
+    _install_provider(provider_error_source, provider_error)
+
+    with capture_logs() as logs, pytest.raises(LLMClientError) as exc_info:
+        cast(Generator[SourceRow, None, None], rows).close()
+        list(provider_error_source.load(provider_error_context))
+
+    assert provider.close_calls == 1
+    assert provider_error.calls == 1
+    assert provider_error.close_calls == 1
+    assert provider_body_sentinel in str(exc_info.value)
+    assert len(events) == 2
+    assert logs == [
+        {
+            "event": "resource_cleanup_telemetry_failed",
+            "log_level": "warning",
+            "component": "llm_source",
+            "resource": "provider",
+            "error_type": "RuntimeError",
+        },
+        {
+            "event": "resource_cleanup_telemetry_failed",
+            "log_level": "warning",
+            "component": "llm_source",
+            "resource": "provider",
+            "error_type": "RuntimeError",
+        },
+    ]
+
+    exporter = ConsoleExporter()
+    exporter.configure({"format": "json", "output": "stdout"})
+    console = StringIO()
+    exporter._stream = console
+    contexts = (source_context, provider_error_context)
+    for event, context in zip(events, contexts, strict=True):
+        operation_id = context.operation_id
+        assert operation_id is not None
+        recorder = context.landscape
+        assert recorder is not None
+        operation = cast(Any, recorder)._execution.get_operation(operation_id)
+        assert operation is not None
+        assert operation.operation_type == "source_load"
+        assert operation.run_id == context.run_id
+        assert operation.node_id == context.node_id
+        assert event.to_dict() == {
+            "timestamp": event.timestamp,
+            "run_id": context.run_id,
+            "component": "llm_source",
+            "resource": "provider",
+            "error_type": "RuntimeError",
+            "suppressed": True,
+            "state_id": None,
+            "operation_id": operation_id,
+            "token_id": None,
+        }
+        exporter.export(event)
+
+    serialized_console = console.getvalue()
+    console_events = [json.loads(line) for line in serialized_console.splitlines()]
+    assert console_events == [
+        {
+            "timestamp": event.timestamp.isoformat(),
+            "run_id": context.run_id,
+            "component": "llm_source",
+            "resource": "provider",
+            "error_type": "RuntimeError",
+            "suppressed": True,
+            "state_id": None,
+            "operation_id": context.operation_id,
+            "token_id": None,
+            "event_type": "ResourceCleanupFailed",
+        }
+        for event, context in zip(events, contexts, strict=True)
+    ]
+
+    captured_logs = json.dumps(logs, sort_keys=True)
+    for sentinel in sentinels:
+        assert all(sentinel not in repr(event) for event in events)
+        assert sentinel not in serialized_console
+        assert sentinel not in captured_logs
 
 
 def test_initialization_cleanup_without_load_operation_emits_no_correlated_event(

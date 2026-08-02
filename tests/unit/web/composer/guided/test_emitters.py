@@ -255,6 +255,34 @@ def _schema_output_state(fields: list[object]) -> CompositionState:
     )
 
 
+def _llm_source_state() -> CompositionState:
+    return CompositionState(
+        source=SourceSpec(
+            plugin="llm",
+            on_success="primary",
+            options={
+                "profile": "approved-generation",
+                "prompt_template": "Write one briefing.",
+                "response_field": "briefing",
+                "schema": {"mode": "observed"},
+            },
+            on_validation_failure="discard",
+        ),
+        nodes=(),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="primary",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(name="LLM source wire review", description=""),
+        version=1,
+    )
+
+
 def _stable_id(index: int) -> str:
     return f"00000000-0000-4000-8000-{index:012d}"
 
@@ -561,6 +589,25 @@ class TestStep4WireEmitter:
         assert payload["warnings"] == []
         assert len(payload["blockers"]) == 2
         assert payload["can_confirm"] is False
+
+    def test_llm_source_projects_zero_or_one_for_validation_discard(self) -> None:
+        turn = _wire_turn(_llm_source_state())
+
+        assert turn["payload"]["sources"][0]["row_cardinality"] == {
+            "input": "none",
+            "output": "zero_or_one",
+            "expected_output_count": None,
+        }
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+
+    def test_generic_source_keeps_variable_row_cardinality(self) -> None:
+        turn = _wire_turn(_schema_output_state([]))
+
+        assert turn["payload"]["sources"][0]["row_cardinality"] == {
+            "input": "none",
+            "output": "zero_or_many",
+            "expected_output_count": None,
+        }
 
     def test_emits_queue_node_generically_without_a_queue_branch(self) -> None:
         # A declared queue fan-in flows through the generic emitter unchanged:

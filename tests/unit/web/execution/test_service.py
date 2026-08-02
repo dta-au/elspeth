@@ -1345,6 +1345,32 @@ def _queue_fan_in_state(*, sources: dict[str, Any], extra_nodes: tuple[Any, ...]
 
 
 class TestExecutionFanoutGuard:
+    def test_source_native_llm_bounds_downstream_llm_transform_to_one_row(self, tmp_path: Path) -> None:
+        """A source:llm may emit zero or one row, never unknown fanout."""
+        from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
+        from elspeth.web.execution.fanout_guard import evaluate_execution_fanout_guard
+
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="llm",
+                on_success="generated",
+                options={
+                    "provider": "openrouter",
+                    "model": "openai/gpt-4o-mini",
+                    "prompt_template": "Write one briefing.",
+                    "schema": {"mode": "observed"},
+                },
+                on_validation_failure="discard",
+            ),
+            nodes=(_fanout_llm_node("generated", node_id="refine"),),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        assert evaluate_execution_fanout_guard(state, data_dir=tmp_path) is None
+
     @pytest.mark.asyncio
     async def test_line_explode_to_llm_requires_ack_before_run_creation(
         self,

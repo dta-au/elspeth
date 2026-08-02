@@ -30,10 +30,10 @@ _BLOB_REF = "9f2b3c1d-4e5a-4b6c-8d7e-0f1a2b3c4d5e"
 _STORAGE_PATH = "/var/lib/elspeth/blobs/9f2b3c1d-4e5a-4b6c-8d7e-0f1a2b3c4d5e/input.csv"
 
 
-def _state_with_source_options(options: dict[str, object]) -> CompositionState:
+def _state_with_source_options(options: dict[str, object], *, plugin: str = "csv") -> CompositionState:
     return CompositionState(
         source=SourceSpec(
-            plugin="csv",
+            plugin=plugin,
             options=deep_freeze(options),
             on_success="rows",
             on_validation_failure="discard",
@@ -183,3 +183,56 @@ def test_named_sources_each_project_their_own_blob_ref() -> None:
 
     assert values == {f"blob:{_BLOB_REF}", f"blob:{other_ref}"}
     assert "/var/lib/elspeth/blobs/" not in json.dumps(build_implicit_decisions_report(state))
+
+
+@pytest.mark.parametrize("field", ["provider", "model", "temperature", "pool_size"])
+def test_llm_source_model_binding_options_use_model_category(field: str) -> None:
+    state = _state_with_source_options(
+        {
+            "provider": "openrouter",
+            "model": "openai/gpt-4o-mini",
+            "temperature": 0.2,
+            "pool_size": 2,
+            "prompt_template": "Write one briefing.",
+        },
+        plugin="llm",
+    )
+
+    entry = _entries_by_path(state)[f"source.{field}"]
+
+    assert entry == {
+        "path": f"source.{field}",
+        "value": state.sources["source"].options[field],
+        "category": "model",
+        "provenance": "picked",
+    }
+
+
+def test_llm_source_non_model_options_and_routing_keep_source_contract() -> None:
+    state = _state_with_source_options(
+        {
+            "provider": "openrouter",
+            "prompt_template": "Write one briefing.",
+            "response_field": "briefing",
+            "schema": {"mode": "observed"},
+        },
+        plugin="llm",
+    )
+
+    by_path = _entries_by_path(state)
+
+    assert by_path["source.prompt_template"] == {
+        "path": "source.prompt_template",
+        "value": "Write one briefing.",
+        "category": "source",
+        "provenance": "composer_selected",
+    }
+    assert by_path["source.response_field"]["category"] == "source"
+    assert by_path["source.schema.mode"]["category"] == "source"
+    assert by_path["source.on_validation_failure"] == {
+        "path": "source.on_validation_failure",
+        "value": "discard",
+        "category": "error_routing",
+        "provenance": "picked",
+        "candidate_alternatives": ["discard", "named_sink"],
+    }

@@ -11,7 +11,9 @@ syntactically legal, but every row gets an identical prompt, which is
 almost always an authoring mistake. It mirrors identity_node_advisory's
 contract exactly: registered in VALIDATION_CHECK_NAMES, present in the
 advisory list, absent from VALIDATION_BLOCKING_CHECK_NAMES and _ALL_CHECKS,
-``passed=True`` always, emitted only on the happy path.
+``passed=True`` always, emitted only on the happy path. Generation guidance
+must point at the live ``source:llm`` capability without echoing authored
+prompt content.
 """
 
 from __future__ import annotations
@@ -359,9 +361,10 @@ def test_validate_pipeline_emits_advisory_and_does_not_block(
     mock_build_graph.return_value = _RuntimeGraphDouble()
     mock_assemble.return_value = object()
 
+    prompt_sentinel = "STATIC_PROMPT_MUST_NOT_REACH_THE_ADVISORY"
     state = _make_state_with(
         source=_allowlisted_source(),
-        nodes=(_make_llm_node(prompt_template="Static prompt with no interpolation at all."),),
+        nodes=(_make_llm_node(prompt_template=prompt_sentinel),),
         outputs=(_allowlisted_observed_sink(),),
     )
     # allow_pending_interpretation_placeholders masks the llm node's pending
@@ -380,6 +383,12 @@ def test_validate_pipeline_emits_advisory_and_does_not_block(
     assert advisory.passed is True, "Advisory entries are passed=True (informational)"
     assert "classify" in advisory.detail
     assert advisory.affected_nodes == ("classify",)
+    assert (
+        "If the intent is generation (producing one row from one fixed prompt, not transforming existing rows), "
+        "use the 'llm' source (source:llm); it accepts no input rows and emits one response row."
+    ) in advisory.detail
+    assert "cannot express today" not in advisory.detail
+    assert prompt_sentinel not in advisory.detail
 
 
 @patch("elspeth.web.execution.validation.assemble_and_validate_pipeline_config")

@@ -63,7 +63,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.guided.resolved import SinkOutputResolved, SinkResolved, SourceResolved
     from elspeth.web.composer.guided.state_machine import GuidedSession, SourceIntent
     from elspeth.web.composer.source_inspection import SourceInspectionFacts
-    from elspeth.web.composer.state import CompositionState, ValidationSummary
+    from elspeth.web.composer.state import CompositionState, SourceSpec, ValidationSummary
 
 
 def build_initial_step_1_turn(
@@ -658,6 +658,12 @@ def _node_cardinality(node: Any, executable_node: Any) -> _WireRowCardinality:
         transform.close()
 
 
+def _source_cardinality(source: SourceSpec) -> _WireRowCardinality:
+    if source.plugin == "llm":
+        return {"input": "none", "output": "zero_or_one", "expected_output_count": None}
+    return {"input": "none", "output": "zero_or_many", "expected_output_count": None}
+
+
 def _build_wire_projection(
     state: CompositionState,
     *,
@@ -696,7 +702,7 @@ def _build_wire_projection(
             "plugin": source.plugin,
             "on_validation_failure": source.on_validation_failure,
             "guaranteed_fields": fields_for(public["stable_id"], produced=True),
-            "row_cardinality": {"input": "none", "output": "zero_or_many", "expected_output_count": None},
+            "row_cardinality": _source_cardinality(source),
         }
         for public, source in zip(public_sources, state.sources.values(), strict=True)
     ]
