@@ -1466,6 +1466,7 @@ class TierModelVisitor(ast.NodeVisitor):
     def visit_Assign(self, node: ast.Assign) -> None:
         state = self._current_derived_state()
         snapshot = frozenset() if state is None else state.snapshot()
+        assigned_import = self._qualified_import_name(node.value)
 
         self._visit_ast_child("value", node.value)
         for index, target in enumerate(node.targets):
@@ -1474,6 +1475,8 @@ class TierModelVisitor(ast.NodeVisitor):
         self._assign_targets_from_value(node.targets, node.value, snapshot)
         for target in node.targets:
             self._invalidate_import_aliases(assignment_target_names(target))
+            if isinstance(target, ast.Name) and assigned_import == "inspect.getattr_static":
+                self._import_aliases[target.id] = assigned_import
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         state = self._current_derived_state()
@@ -1722,7 +1725,8 @@ class TierModelVisitor(ast.NodeVisitor):
         for index, statement in enumerate(node.body):
             self._visit_ast_list_item("body", index, statement)
 
-    def _restore_comprehension_targets(self, original_names: set[str], target_names: set[str]) -> None:
+    def _restore_comprehension_scope(self, original_names: set[str], target_names: set[str]) -> None:
+        self._pop_import_scope()
         state = self._current_derived_state()
         if state is None:
             return
@@ -1733,23 +1737,36 @@ class TierModelVisitor(ast.NodeVisitor):
                 state.names.discard(name)
 
     def _visit_comprehension_generators(self, generators: list[ast.comprehension]) -> tuple[set[str], set[str]]:
+        if not generators:
+            raise AssertionError("comprehensions always contain at least one generator")
         state = self._current_derived_state()
         original_names = set() if state is None else set(state.names)
         target_names: set[str] = set()
-        for index, generator in enumerate(generators):
-            self.path_stack.append(f"generators[{index}]")
-            try:
-                snapshot = frozenset() if state is None else state.snapshot()
-                target_is_derived = subject_is_rooted(generator.iter, snapshot)
-                self._visit_ast_child("iter", generator.iter)
-                if state is not None:
-                    state.assign_target(generator.target, is_derived=target_is_derived)
-                target_names.update(assignment_target_names(generator.target))
-                self._visit_ast_child("target", generator.target)
-                for if_index, if_node in enumerate(generator.ifs):
-                    self._visit_ast_list_item("ifs", if_index, if_node)
-            finally:
-                self.path_stack.pop()
+        alias_scope_pushed = False
+        try:
+            for index, generator in enumerate(generators):
+                self.path_stack.append(f"generators[{index}]")
+                try:
+                    snapshot = frozenset() if state is None else state.snapshot()
+                    target_is_derived = subject_is_rooted(generator.iter, snapshot)
+                    self._visit_ast_child("iter", generator.iter)
+                    if not alias_scope_pushed:
+                        self._push_import_scope("comprehension")
+                        alias_scope_pushed = True
+                    if state is not None:
+                        state.assign_target(generator.target, is_derived=target_is_derived)
+                    bound_names = assignment_target_names(generator.target)
+                    target_names.update(bound_names)
+                    self._visit_ast_child("target", generator.target)
+                    self._invalidate_import_aliases(bound_names)
+                    for if_index, if_node in enumerate(generator.ifs):
+                        self._visit_ast_list_item("ifs", if_index, if_node)
+                finally:
+                    self.path_stack.pop()
+        except BaseException:
+            if alias_scope_pushed:
+                self._pop_import_scope()
+            raise
         return original_names, target_names
 
     def visit_ListComp(self, node: ast.ListComp) -> None:
@@ -1757,14 +1774,14 @@ class TierModelVisitor(ast.NodeVisitor):
         try:
             self._visit_ast_child("elt", node.elt)
         finally:
-            self._restore_comprehension_targets(original_names, target_names)
+            self._restore_comprehension_scope(original_names, target_names)
 
     def visit_SetComp(self, node: ast.SetComp) -> None:
         original_names, target_names = self._visit_comprehension_generators(node.generators)
         try:
             self._visit_ast_child("elt", node.elt)
         finally:
-            self._restore_comprehension_targets(original_names, target_names)
+            self._restore_comprehension_scope(original_names, target_names)
 
     def visit_DictComp(self, node: ast.DictComp) -> None:
         original_names, target_names = self._visit_comprehension_generators(node.generators)
@@ -1772,14 +1789,14 @@ class TierModelVisitor(ast.NodeVisitor):
             self._visit_ast_child("key", node.key)
             self._visit_ast_child("value", node.value)
         finally:
-            self._restore_comprehension_targets(original_names, target_names)
+            self._restore_comprehension_scope(original_names, target_names)
 
     def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
         original_names, target_names = self._visit_comprehension_generators(node.generators)
         try:
             self._visit_ast_child("elt", node.elt)
         finally:
-            self._restore_comprehension_targets(original_names, target_names)
+            self._restore_comprehension_scope(original_names, target_names)
 
     def visit_Call(self, node: ast.Call) -> None:
         """Detect R1, R2 attribute defaults, R3, R5, and R8/R9 mapping defaults."""
