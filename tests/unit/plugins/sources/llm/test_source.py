@@ -480,6 +480,61 @@ def test_shutdown_does_not_suppress_tier_one_resource_cleanup_failure(
     assert source._tracer is None
 
 
+def test_tier_one_cleanup_reporting_failure_defers_until_tracer_flush(
+    source: LLMSource,
+    source_context: PluginContext,
+) -> None:
+    """elspeth-f5a9515d58: a Tier-1 raised while reporting a cleanup failure must not skip the tracer flush."""
+    provider = FakeProvider(close_error=RuntimeError("provider cleanup failed"))
+    tracer = RecordingTracer()
+    _install_provider(source, provider)
+    source._tracer = tracer
+
+    def tier_one_telemetry(_event: object) -> None:
+        raise FrameworkBugError("cleanup telemetry invariant failed")
+
+    source._telemetry_emit = tier_one_telemetry
+
+    with pytest.raises(FrameworkBugError, match="cleanup telemetry invariant failed"):
+        list(source.load(source_context))
+
+    assert provider.calls == 1
+    assert provider.close_calls == 1
+    assert tracer.flush_calls == 1
+    assert source._provider is None
+    assert source._tracer is None
+    assert source._telemetry_emit is not tier_one_telemetry
+
+
+def test_shutdown_tier_one_cleanup_reporting_failure_defers_until_tracer_flush(
+    source: LLMSource,
+    source_context: PluginContext,
+) -> None:
+    """elspeth-f5a9515d58: the deferral holds on the suppress-errors shutdown path too."""
+    provider = FakeProvider(close_error=RuntimeError("provider cleanup failed"))
+    tracer = RecordingTracer()
+    _install_provider(source, provider)
+    source._tracer = tracer
+
+    def tier_one_telemetry(_event: object) -> None:
+        raise FrameworkBugError("cleanup telemetry invariant failed")
+
+    source._telemetry_emit = tier_one_telemetry
+    shutdown_event = threading.Event()
+    shutdown_event.set()
+    source_context.shutdown_event = shutdown_event
+
+    with pytest.raises(FrameworkBugError, match="cleanup telemetry invariant failed"):
+        list(source.load(source_context))
+
+    assert provider.calls == 0
+    assert provider.close_calls == 1
+    assert tracer.flush_calls == 1
+    assert source._provider is None
+    assert source._tracer is None
+    assert source._telemetry_emit is not tier_one_telemetry
+
+
 def test_shutdown_does_not_suppress_tier_one_generator_close_failure(
     source: LLMSource,
     source_context: PluginContext,

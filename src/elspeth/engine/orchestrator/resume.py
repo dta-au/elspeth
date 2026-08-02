@@ -243,12 +243,24 @@ def run_resume_processing_loop(
     # checkpointed again instead of being flushed to sinks.
     interrupted_by_shutdown = shutdown_event is not None and shutdown_event.is_set()
 
-    # elspeth-0bffbd1af1: restored pending groups carry backdated arrival
-    # anchors, so a group whose timeout expired during downtime is already
-    # stale HERE — sweep it closed before the scheduler drain or the source
-    # replay can supply its missing branch and release it. Skipped on an
-    # already-requested shutdown so restored barrier state stays pending for
-    # the next checkpoint instead of being failed by the sweep.
+    # elspeth-0bffbd1af1 / elspeth-321f335ff2: restored pending groups carry
+    # backdated arrival anchors, so a group whose timeout expired during
+    # downtime is already stale HERE — sweep it closed before the scheduler
+    # drain or the source replay can supply its missing branch and complete
+    # it. Skipped on an already-requested shutdown so restored barrier state
+    # stays pending for the next checkpoint instead of being failed by the
+    # sweep. Coalesce before row_union: the same order as every other sweep
+    # boundary.
+    if not interrupted_by_shutdown and coalesce_executor is not None:
+        handle_coalesce_timeouts(
+            coalesce_executor=coalesce_executor,
+            coalesce_node_map=coalesce_node_map,
+            processor=processor,
+            ctx=ctx,
+            counters=counters,
+            pending_tokens=pending_tokens,
+        )
+
     if not interrupted_by_shutdown and row_union_executor is not None:
         handle_row_union_timeouts(
             row_union_executor=row_union_executor,

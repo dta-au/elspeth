@@ -1434,7 +1434,12 @@ class SetSourceFromBlobArgumentsModel(BaseModel):
     ``_resolve_source_blob``; ``on_validation_failure`` absent falls back
     to ``_DEFAULT_SOURCE_VALIDATION_FAILURE`` ("discard").  A default of
     ``""`` would conflate "operator did not specify" with "operator
-    specified empty string" — fabrication (CLAUDE.md trust model).
+    specified empty string" — fabrication (CLAUDE.md trust model).  The
+    model deliberately does NOT judge an authored ``""`` either: what an
+    empty string means is owned by exactly one place, the handler-side
+    ``canonicalize_source_validation_failure`` (``tools/_common``), which
+    folds it into "discard" because "" can never name a sink route
+    (elspeth-bcd7051143).
 
     ``extra="forbid"`` is required (rev-2 M.1).  Fields belonging to
     neighbouring tools (``filename``, ``mime_type``, ``content``,
@@ -1666,11 +1671,14 @@ class _SetPipelineSourceModel(_SetPipelineNamedSourceModel):
 
     ``on_validation_failure`` default
     ----------------------------------
-    The handler at :func:`_execute_set_pipeline` falls back to
-    ``_DEFAULT_SOURCE_VALIDATION_FAILURE`` ("discard") when absent
-    (``tools.py:4038``).  The model preserves operator-omitted-vs-specified
-    semantics with ``str | None = None`` so the handler can apply the
-    fallback explicitly (not via fabrication; CLAUDE.md trust model).
+    The handler at :func:`_execute_set_pipeline` canonicalizes both absent
+    (``None``) and the unroutable ``""`` spelling to
+    ``_DEFAULT_SOURCE_VALIDATION_FAILURE`` ("discard") via
+    ``canonicalize_source_validation_failure`` — the single owner of that
+    fold shared by every source-authoring seam (elspeth-bcd7051143).  The
+    model preserves operator-omitted-vs-specified semantics with
+    ``str | None = None`` so the handler can apply the fold explicitly
+    (not via fabrication; CLAUDE.md trust model).
 
     ``blob_id`` / ``inline_blob`` exclusivity
     ------------------------------------------

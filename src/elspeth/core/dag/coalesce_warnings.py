@@ -41,10 +41,10 @@ def find_divert_transforms_in_chain(
         start_node: The node to start walking backwards from
         divert_transforms: Pre-computed set of transforms with DIVERT edges
         stop_nodes: Walk boundary. A stop node is never collected or
-            crossed — the walk ends BEFORE examining it. The row_union
-            caller passes the union's originating fork gate(s) here
-            (elspeth-94d68e7aca); the default empty set preserves the
-            historical unbounded walk for the coalesce path.
+            crossed — the walk ends BEFORE examining it. Both barrier
+            callers pass their barrier's originating fork gate(s) here
+            (row_union: elspeth-94d68e7aca; coalesce: elspeth-321f335ff2);
+            the default empty set leaves the walk unbounded.
 
     Returns:
         Set of transform node IDs in the chain that have DIVERT edges.
@@ -129,10 +129,42 @@ def warn_divert_coalesce_interactions(
     if not divert_transforms:
         return []
 
+    # Fork gates by node id, with the branch names their fork_to declares.
+    # Gate node configs carry fork_to from the builder; after
+    # finalize_node_configs the config is a deep-frozen mapping and the list
+    # a tuple, so access stays Mapping-safe.
+    fork_gate_branches: dict[NodeID, frozenset[str]] = {}
+    for node in graph.get_nodes():
+        if node.node_type != NodeType.GATE:
+            continue
+        fork_to = node.config.get("fork_to")
+        if fork_to:
+            fork_gate_branches[node.node_id] = frozenset(str(branch) for branch in fork_to)
+
     warnings: list[GraphValidationWarning] = []
 
     # Step 2: check each coalesce for DIVERT interactions
     for coalesce_nid, coal_config in coalesce_configs.items():
+        # The walk below runs BACKWARD and MUST stop at THIS coalesce's
+        # originating fork gate(s) — the gate(s) whose fork_to declares any of
+        # the coalesce's branches (elspeth-321f335ff2, mirroring the
+        # row_union bound from elspeth-94d68e7aca). Fork -> branch is a COPY
+        # edge only for an identity branch; a transform-chain branch is wired
+        # gate -> first transform as MOVE, so an unbounded backward walk would
+        # cross into pre-fork topology and charge every branch with a DIVERT
+        # that sits before the fork. That is a false positive for BOTH
+        # warnings here: a row diverted upstream of the fork never forks, so
+        # no branch arrives, no group forms or waits (require_all), and no
+        # merged output exists to be silently missing the branch's exclusive
+        # fields — the row's absence is the DIVERT's own audit record. A fork
+        # for another barrier is not a boundary: stopping there would hide
+        # genuine branch-local diverts deeper in the current chain.
+        # Intermediate non-fork routing gates are still crossed.
+        coalesce_branch_names = frozenset(str(branch) for branch in coal_config.branches)
+        origin_fork_gates = frozenset(
+            gate_nid for gate_nid, forked_branches in fork_gate_branches.items() if forked_branches & coalesce_branch_names
+        )
+
         # Track incoming edges and whether their chains have DIVERT transforms
         # Maps: from_node → (edge_label, edge_mode, divert_transforms_in_chain)
         incoming_divert_map: dict[NodeID, tuple[str, RoutingMode, set[NodeID]]] = {}
@@ -148,7 +180,12 @@ def warn_divert_coalesce_interactions(
 
             # Transform branch: walk backwards to find DIVERT transforms
             if edge_mode == RoutingMode.MOVE:
-                chain_diverts = find_divert_transforms_in_chain(graph, from_nid, divert_transforms)
+                chain_diverts = find_divert_transforms_in_chain(
+                    graph,
+                    from_nid,
+                    divert_transforms,
+                    stop_nodes=origin_fork_gates,
+                )
                 if chain_diverts:
                     incoming_divert_map[from_nid] = (edge_label, edge_mode, chain_diverts)
 

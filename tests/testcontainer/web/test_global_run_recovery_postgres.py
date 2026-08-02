@@ -13,7 +13,7 @@ from sqlalchemy import Engine, insert, update
 
 from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationKind
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import session_operation_fences_table, web_instances_table
+from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH, session_operation_fences_table, web_instances_table
 from elspeth.web.sessions.protocol import CompositionStateData, RunRecord
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -56,7 +56,7 @@ def _register_live_instance(engine: Engine, instance_id: str) -> None:
                 instance_id=instance_id,
                 deployment_target="testcontainer",
                 deployment_generation="global-run-recovery",
-                session_epoch=43,
+                session_epoch=SESSION_SCHEMA_EPOCH,
                 landscape_epoch=29,
                 coordination_protocol=1,
                 image_digest="sha256:global-run-recovery",

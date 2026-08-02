@@ -32,6 +32,20 @@ def test_source_from_runtime_entry_rejects_non_mapping_entry() -> None:
         _source_from_runtime_entry("s", ["not", "a", "mapping"])
 
 
+@pytest.mark.parametrize("authored", ["", None, 17])
+def test_source_from_runtime_entry_canonicalizes_unroutable_validation_failure_to_discard(
+    authored: object,
+) -> None:
+    """elspeth-bcd7051143 pin: missing, empty, and non-string spellings all
+    fall back to 'discard' through the shared source-validation-failure
+    canonicalizer — the single owner every authoring seam routes through."""
+    spec = _source_from_runtime_entry(
+        "s",
+        {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": authored},
+    )
+    assert spec.on_validation_failure == "discard"
+
+
 def test_nodes_from_runtime_list_rejects_non_sequence_section() -> None:
     with pytest.raises(RuntimeYamlImportError, match="transforms must be a list"):
         _nodes_from_runtime_list("not-a-list", "transforms", "transform")

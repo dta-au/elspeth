@@ -159,6 +159,44 @@ class TestWalkerBehaviour:
         assert finding.field_name == "model"
         assert "anthropic/claude-3.5-sonnet" in finding.reason
 
+    def test_openrouter_llm_rejects_hallucinated_model_with_dot_segment_base_url(self) -> None:
+        """elspeth-5653909057: dot-segment respellings of the canonical URL are
+        collapsed client-side by httpx (RFC 3986 remove_dot_segments), so they
+        hit the same endpoint. The normalizer must collapse them too, keeping
+        the ``applies_when`` predicate — and therefore the catalog check — live.
+        """
+        from unittest.mock import patch
+
+        from elspeth.engine.orchestrator.preflight import validate_value_source_compliance
+        from elspeth.engine.orchestrator.value_source_validation import ValueSourceValidationError
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        plugin = LLMTransform(
+            {
+                "provider": "openrouter",
+                "api_key": "placeholder",
+                "model": "anthropic/claude-3.5-sonnet",
+                "base_url": "https://openrouter.ai/api/./v1",
+                "prompt_template": "Hello",
+                "schema": {"mode": "observed"},
+                "required_input_fields": [],
+            }
+        )
+        wired = SimpleNamespace(plugin=plugin, settings=SimpleNamespace(name="openrouter_node_1"))
+        with (
+            patch(
+                "elspeth.engine.orchestrator.preflight.get_catalog_values",
+                return_value=frozenset({"openai/gpt-4o"}),
+            ),
+            pytest.raises(ValueSourceValidationError) as exc_info,
+        ):
+            validate_value_source_compliance([wired])
+
+        finding = exc_info.value.findings[0]
+        assert finding.component_id == "openrouter_node_1"
+        assert finding.field_name == "model"
+        assert "anthropic/claude-3.5-sonnet" in finding.reason
+
     def test_bedrock_llm_without_catalog_passes_runtime_walker(self) -> None:
         """Bedrock model access is resolved by AWS, not a local model catalog."""
         from elspeth.engine.orchestrator.preflight import validate_value_source_compliance

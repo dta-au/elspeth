@@ -29,7 +29,7 @@ from elspeth.web.sessions.models import (
     websocket_tickets_table,
 )
 from elspeth.web.sessions.schema import (
-    _EPOCH_43_COORDINATION_TABLES,
+    _EPOCH_44_COORDINATION_TABLES,
     SessionSchemaError,
     _stamp_schema_sentinels,
     _user_tables,
@@ -267,12 +267,12 @@ def test_blob_reservation_rejects_partial_or_invalid_custody(
             conn.execute(insert(blobs_table).values(**values))
 
 
-def test_current_schema_includes_epoch_43_coordination_tables_and_expiry_indexes() -> None:
+def test_current_schema_includes_epoch_44_coordination_tables_and_expiry_indexes() -> None:
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
     inspector = inspect(eng)
 
-    assert SESSION_SCHEMA_EPOCH == 43
+    assert SESSION_SCHEMA_EPOCH == 44
     expected_tables = frozenset(
         {
             "web_instances",
@@ -287,7 +287,7 @@ def test_current_schema_includes_epoch_43_coordination_tables_and_expiry_indexes
             "sessions_cleanup_claims",
         }
     )
-    assert expected_tables == _EPOCH_43_COORDINATION_TABLES
+    assert expected_tables == _EPOCH_44_COORDINATION_TABLES
     assert expected_tables <= set(inspector.get_table_names())
     assert not any("deleted" in table and "session" in table for table in inspector.get_table_names())
 
@@ -313,7 +313,7 @@ def test_current_schema_includes_epoch_43_coordination_tables_and_expiry_indexes
     assert {"ix_runs_owner_lease_expires_at", "ix_runs_saga_state"} <= run_indexes
 
 
-def test_epoch_43_coordination_check_constraints_are_exact() -> None:
+def test_epoch_44_coordination_check_constraints_are_exact() -> None:
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
     inspector = inspect(eng)
@@ -421,7 +421,7 @@ def test_session_operation_authority_shape_retains_exact_nonnull_fields() -> Non
     assert session_operation_fences_table.primary_key.columns.keys() == ["session_id"]
 
 
-def test_epoch_36_database_is_rejected_by_epoch_43_runtime() -> None:
+def test_epoch_36_database_is_rejected_by_epoch_44_runtime() -> None:
     eng = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(eng)
     with eng.begin() as conn:
@@ -430,7 +430,7 @@ def test_epoch_36_database_is_rejected_by_epoch_43_runtime() -> None:
 
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH=43.*Delete the session DB file and restart",
+        match=rf"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*Delete the session DB file and restart",
     ):
         initialize_session_schema(eng)
 
@@ -950,7 +950,7 @@ def test_initialize_session_schema_rejects_epoch_35_database() -> None:
     assert probe_current_schema(eng) is False
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH=43.*Delete the session DB file and restart",
+        match=rf"Session DB schema version 35 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*Delete the session DB file and restart",
     ):
         initialize_session_schema(eng)
 
@@ -999,7 +999,7 @@ def test_epoch_36_database_without_declined_result_contract_fails_at_sentinel(tm
 
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH=43.*"
+        match=rf"Session DB schema version 36 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*"
         r"Delete the session DB file and restart",
     ):
         initialize_session_schema(stale_engine)
@@ -1040,7 +1040,7 @@ def test_epoch_30_database_without_schema_9_operation_contract_fails_closed_with
 
     with pytest.raises(
         SessionSchemaError,
-        match=r"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH=43.*"
+        match=rf"Session DB schema version 30 does not match SESSION_SCHEMA_EPOCH={SESSION_SCHEMA_EPOCH}.*"
         r"Delete the session DB file and restart",
     ):
         initialize_session_schema(stale_engine)

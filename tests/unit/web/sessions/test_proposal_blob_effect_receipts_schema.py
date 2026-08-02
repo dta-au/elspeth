@@ -8,7 +8,7 @@ from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH, proposal_blob_effe
 
 
 def test_proposal_blob_effect_receipt_schema_is_exact(engine) -> None:
-    assert SESSION_SCHEMA_EPOCH == 43
+    assert SESSION_SCHEMA_EPOCH == 44
     assert tuple(proposal_blob_effect_receipts_table.primary_key.columns.keys()) == ("proposal_id",)
     assert set(proposal_blob_effect_receipts_table.c.keys()) == {
         "proposal_id",

@@ -13,6 +13,8 @@ discipline regardless of which binding tool it invoked.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,7 @@ from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.enums import CreationModality
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSummary
@@ -38,6 +41,7 @@ from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import _execute_create_blob, _execute_patch_source_options, _execute_set_source_from_blob
 from elspeth.web.composer.tools._common import ToolContext as _ToolContext
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY, SOURCE_AUTHORING_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
@@ -112,28 +116,55 @@ def _session_engine_with_session() -> tuple[Any, str]:
     return engine, session_id
 
 
-def _session_engine_with_user_message(content: str) -> tuple[Any, str, str]:
-    engine, session_id = _session_engine_with_session()
-    user_message_id = str(uuid4())
-    now = datetime.now(UTC)
-    with engine.begin() as conn:
-        conn.execute(
-            insert(chat_messages_table).values(
-                id=user_message_id,
-                session_id=session_id,
-                role="user",
-                content=content,
-                raw_content=None,
-                tool_calls=None,
-                tool_call_id=None,
-                sequence_no=1,
-                writer_principal="route_user_message",
-                created_at=now,
-                composition_state_id=None,
-                parent_assistant_id=None,
+@contextmanager
+def _session_engine_with_user_message(
+    content: str,
+) -> Iterator[tuple[Any, str, str, SQLiteLocalSessionOperationAuthority, SessionOperationContext]]:
+    engine = create_session_engine(
+        "sqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    initialize_session_schema(engine)
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    session = authority.create_session_with_initial_fence(
+        user_id="test-user",
+        title="Test Session",
+        auth_provider_type="local",
+        owner_instance_id="promote-set-source-from-blob-bootstrap",
+        lease_seconds=30,
+    )
+    session_id = str(session.id)
+    operation_context = authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id="promote-set-source-from-blob-test",
+        lease_seconds=30,
+    )
+    try:
+        user_message_id = str(uuid4())
+        now = datetime.now(UTC)
+        with engine.begin() as conn:
+            conn.execute(
+                insert(chat_messages_table).values(
+                    id=user_message_id,
+                    session_id=session_id,
+                    role="user",
+                    content=content,
+                    raw_content=None,
+                    tool_calls=None,
+                    tool_call_id=None,
+                    sequence_no=1,
+                    writer_principal="route_user_message",
+                    created_at=now,
+                    composition_state_id=None,
+                    parent_assistant_id=None,
+                )
             )
-        )
-    return engine, session_id, user_message_id
+        yield engine, session_id, user_message_id, authority, operation_context
+    finally:
+        authority.release(operation_context)
+        engine.dispose()
 
 
 # ---------------------------------------------------------------------------
@@ -250,36 +281,87 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
         (versus only the validation gate).
         """
         user_message_content = "Use this exact text:\nhello"
-        engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
-        catalog = _mock_catalog()
+        with _session_engine_with_user_message(user_message_content) as (
+            engine,
+            session_id,
+            user_message_id,
+            authority,
+            operation_context,
+        ):
+            catalog = _mock_catalog()
+            ctx = ToolContext(
+                catalog=catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=authority,
+                session_operation_context=operation_context,
+                user_message_id=user_message_id,
+                user_message_content=user_message_content,
+            )
+            create_result = _execute_create_blob(
+                {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
+                _empty_state(),
+                ctx,
+            )
+            assert create_result.success is True
+            blob_id = create_result.data["blob_id"]
 
-        ctx = ToolContext(
-            catalog=catalog,
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            session_id=session_id,
-            user_message_id=user_message_id,
-            user_message_content=user_message_content,
-        )
-        create_result = _execute_create_blob(
-            {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
-            _empty_state(),
-            ctx,
-        )
-        assert create_result.success is True
-        blob_id = create_result.data["blob_id"]
+            bind_result = _execute_set_source_from_blob(
+                {
+                    "blob_id": blob_id,
+                    "on_success": "out",
+                    "options": {"column": "text", "schema": {"mode": "observed"}},
+                },
+                _empty_state(),
+                ctx,
+            )
+            assert bind_result.success is True
+            assert bind_result.updated_state.sources["source"].on_success == "out"
 
-        bind_result = _execute_set_source_from_blob(
-            {
-                "blob_id": blob_id,
-                "on_success": "out",
-                "options": {"column": "text", "schema": {"mode": "observed"}},
-            },
-            _empty_state(),
-            ctx,
-        )
-        assert bind_result.success is True
-        assert bind_result.updated_state.sources["source"].on_success == "out"
+    def test_empty_on_validation_failure_canonicalizes_to_discard(self, tmp_path: Path) -> None:
+        """elspeth-bcd7051143: this seam used to preserve "" (``is not None``)
+        while set_pipeline coerced it — an accepted-then-wedged divergence.
+        Every seam now routes through the shared canonicalizer: "" names no
+        route (sink names are non-empty), so it persists as 'discard'."""
+        user_message_content = "Use this exact text:\nhello"
+        with _session_engine_with_user_message(user_message_content) as (
+            engine,
+            session_id,
+            user_message_id,
+            authority,
+            operation_context,
+        ):
+            catalog = _mock_catalog()
+            ctx = ToolContext(
+                catalog=catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=authority,
+                session_operation_context=operation_context,
+                user_message_id=user_message_id,
+                user_message_content=user_message_content,
+            )
+            create_result = _execute_create_blob(
+                {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
+                _empty_state(),
+                ctx,
+            )
+            assert create_result.success is True
+
+            bind_result = _execute_set_source_from_blob(
+                {
+                    "blob_id": create_result.data["blob_id"],
+                    "on_success": "out",
+                    "options": {"column": "text", "schema": {"mode": "observed"}},
+                    "on_validation_failure": "",
+                },
+                _empty_state(),
+                ctx,
+            )
+            assert bind_result.success is True
+            assert bind_result.updated_state.sources["source"].on_validation_failure == "discard"
 
     def test_omitted_options_validates_at_model_layer(self) -> None:
         """``options`` is optional at the model layer (default ``{}``).
@@ -312,84 +394,92 @@ class TestPromoteSetSourceFromBlobArgErrorRouting:
     def test_llm_authored_blob_binding_stamps_source_authoring_without_unlocking_path(self, tmp_path: Path) -> None:
         """Blob-backed source provenance is stamped while path/blob_ref stay locked."""
         user_message_content = "Create generated text content for the source."
-        engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
-        catalog = _mock_catalog()
-        ctx = ToolContext(
-            catalog=catalog,
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            session_id=session_id,
-            user_message_id=user_message_id,
-            user_message_content=user_message_content,
-            composer_model_identifier="openai/gpt-5-mini",
-            composer_model_version="gpt-5-mini-2026-05-01",
-            composer_provider="openai",
-            composer_skill_hash="a" * 64,
-            tool_arguments_hash="b" * 64,
-        )
-        create_result = _execute_create_blob(
-            {"filename": "generated.txt", "mime_type": "text/plain", "content": "generated row text"},
-            _empty_state(),
-            ctx,
-        )
-        assert create_result.success is True
+        with _session_engine_with_user_message(user_message_content) as (
+            engine,
+            session_id,
+            user_message_id,
+            authority,
+            operation_context,
+        ):
+            catalog = _mock_catalog()
+            ctx = ToolContext(
+                catalog=catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=authority,
+                session_operation_context=operation_context,
+                user_message_id=user_message_id,
+                user_message_content=user_message_content,
+                composer_model_identifier="openai/gpt-5-mini",
+                composer_model_version="gpt-5-mini-2026-05-01",
+                composer_provider="openai",
+                composer_skill_hash="a" * 64,
+                tool_arguments_hash="b" * 64,
+            )
+            create_result = _execute_create_blob(
+                {"filename": "generated.txt", "mime_type": "text/plain", "content": "generated row text"},
+                _empty_state(),
+                ctx,
+            )
+            assert create_result.success is True
 
-        bind_result = _execute_set_source_from_blob(
-            {
-                "blob_id": create_result.data["blob_id"],
-                "on_success": "out",
-                "options": {"column": "text", "schema": {"mode": "observed"}},
-            },
-            _empty_state(),
-            ctx,
-        )
+            bind_result = _execute_set_source_from_blob(
+                {
+                    "blob_id": create_result.data["blob_id"],
+                    "on_success": "out",
+                    "options": {"column": "text", "schema": {"mode": "observed"}},
+                },
+                _empty_state(),
+                ctx,
+            )
 
-        assert bind_result.success is True, bind_result.data
-        assert "source" in bind_result.updated_state.sources
-        options = bind_result.updated_state.sources["source"].options
-        assert options[SOURCE_AUTHORING_KEY] == {
-            "modality": CreationModality.LLM_GENERATED.value,
-            "content_hash": create_result.data["content_hash"],
-            "review_event_id": None,
-            "resolved_kind": None,
-        }
-        requirement = options[INTERPRETATION_REQUIREMENTS_KEY][0]
-        assert requirement == {
-            "id": "source_review:inline_source_data",
-            "kind": "invented_source",
-            "user_term": "inline_source_data",
-            "status": "pending",
-            "draft": "generated row text",
-            "event_id": None,
-            "accepted_value": None,
-            "accepted_artifact_hash": None,
-            "resolved_prompt_template_hash": None,
-        }
+            assert bind_result.success is True, bind_result.data
+            assert "source" in bind_result.updated_state.sources
+            options = bind_result.updated_state.sources["source"].options
+            assert options[SOURCE_AUTHORING_KEY] == {
+                "modality": CreationModality.LLM_GENERATED.value,
+                "content_hash": create_result.data["content_hash"],
+                "review_event_id": None,
+                "resolved_kind": None,
+            }
+            requirement = options[INTERPRETATION_REQUIREMENTS_KEY][0]
+            assert requirement == {
+                "id": "source_review:inline_source_data",
+                "kind": "invented_source",
+                "user_term": "inline_source_data",
+                "status": "pending",
+                "draft": "generated row text",
+                "event_id": None,
+                "accepted_value": None,
+                "accepted_artifact_hash": None,
+                "resolved_prompt_template_hash": None,
+            }
 
-        forged_authoring_patch = _execute_patch_source_options(
-            {
-                "patch": {
-                    SOURCE_AUTHORING_KEY: {
-                        "modality": CreationModality.VERBATIM.value,
-                        "content_hash": "0" * 64,
-                        "review_event_id": "forged-review",
-                        "resolved_kind": "forged-kind",
+            forged_authoring_patch = _execute_patch_source_options(
+                {
+                    "patch": {
+                        SOURCE_AUTHORING_KEY: {
+                            "modality": CreationModality.VERBATIM.value,
+                            "content_hash": "0" * 64,
+                            "review_event_id": "forged-review",
+                            "resolved_kind": "forged-kind",
+                        }
                     }
-                }
-            },
-            bind_result.updated_state,
-            ctx,
-        )
-        assert forged_authoring_patch.success is False
-        assert SOURCE_AUTHORING_KEY in forged_authoring_patch.data["error"]
+                },
+                bind_result.updated_state,
+                ctx,
+            )
+            assert forged_authoring_patch.success is False
+            assert SOURCE_AUTHORING_KEY in forged_authoring_patch.data["error"]
 
-        patch_result = _execute_patch_source_options(
-            {"patch": {"path": str(tmp_path / "other.txt")}},
-            bind_result.updated_state,
-            ctx,
-        )
-        assert patch_result.success is False
-        assert "Cannot patch" in patch_result.data["error"]
+            patch_result = _execute_patch_source_options(
+                {"patch": {"path": str(tmp_path / "other.txt")}},
+                bind_result.updated_state,
+                ctx,
+            )
+            assert patch_result.success is False
+            assert "Cannot patch" in patch_result.data["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -468,32 +558,39 @@ class TestSetSourceFromBlobTsvDelimiter:
         # the harness free of full composer provenance just to exercise the
         # delimiter-derivation path.
         user_message_content = f"Bind this tabular blob as the source:\n{content}"
-        engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
-        catalog = _mock_catalog()
-        ctx = ToolContext(
-            catalog=catalog,
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            session_id=session_id,
-            user_message_id=user_message_id,
-            user_message_content=user_message_content,
-        )
-        create_result = _execute_create_blob(
-            {"filename": filename, "mime_type": "text/csv", "content": content},
-            _empty_state(),
-            ctx,
-        )
-        assert create_result.success is True, create_result.data
-        bind_result = _execute_set_source_from_blob(
-            {
-                "blob_id": create_result.data["blob_id"],
-                "on_success": "out",
-                "options": options if options is not None else {"schema": {"mode": "observed"}},
-            },
-            _empty_state(),
-            ctx,
-        )
-        return bind_result
+        with _session_engine_with_user_message(user_message_content) as (
+            engine,
+            session_id,
+            user_message_id,
+            authority,
+            operation_context,
+        ):
+            catalog = _mock_catalog()
+            ctx = ToolContext(
+                catalog=catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=authority,
+                session_operation_context=operation_context,
+                user_message_id=user_message_id,
+                user_message_content=user_message_content,
+            )
+            create_result = _execute_create_blob(
+                {"filename": filename, "mime_type": "text/csv", "content": content},
+                _empty_state(),
+                ctx,
+            )
+            assert create_result.success is True, create_result.data
+            return _execute_set_source_from_blob(
+                {
+                    "blob_id": create_result.data["blob_id"],
+                    "on_success": "out",
+                    "options": options if options is not None else {"schema": {"mode": "observed"}},
+                },
+                _empty_state(),
+                ctx,
+            )
 
     def test_tsv_blob_binds_csv_source_with_tab_delimiter(self, tmp_path: Path) -> None:
         bind_result = self._bind_csv_blob(

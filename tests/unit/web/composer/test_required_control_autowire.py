@@ -397,17 +397,137 @@ class TestLLMSourceAutoWireSplicing:
 
         assert wire_required_controls(candidate, snapshot, view) is candidate
 
-    @pytest.mark.parametrize("failure_route", ["quarantine", "", 17])
-    def test_non_discard_or_malformed_validation_failure_refuses_the_entire_candidate(
+    @pytest.mark.parametrize("failure_route", ["quarantine", 17])
+    def test_unrepairable_source_only_candidate_is_identity_returned(
         self,
         tmp_path: Path,
         llm_source_policy_manager: PluginManager,
         failure_route: object,
     ) -> None:
+        """A candidate whose ONLY LLM component is unrepairable stays identity.
+
+        elspeth-5b3d8d7b68 scoped the non-discard refusal to the offending
+        source, but with nothing else to repair the pass makes no progress and
+        the finalizer's no-op identity contract applies: the source's coverage
+        finding survives untouched for the execution gate. A malformed route
+        (17) fails the candidate-state projection instead — same identity
+        outcome, owned by downstream validation."""
         view, snapshot = _guardrail_profile_view(tmp_path)
         candidate = _bare_llm_source_candidate(on_validation_failure=failure_route)
 
         assert wire_required_controls(candidate, snapshot, view) is candidate
+
+    @pytest.mark.parametrize("container", ["source", "sources"])
+    def test_empty_string_validation_failure_is_canonicalized_and_auto_wired(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+        container: str,
+    ) -> None:
+        """elspeth-bcd7051143: "" on_validation_failure has ONE owner.
+
+        An empty string can never name a sink route, so the shared
+        canonicalizer folds it into 'discard' — auto-wiring must therefore
+        treat "" exactly as the persistence seams do (which already coerced
+        it) instead of refusing the candidate it will later be persisted as."""
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_source_candidate(container=container, source_name="briefing", on_validation_failure="")
+
+        wired = wire_required_controls(candidate, snapshot, view)
+
+        assert wired is not candidate
+        assert _nodes_by_id(dict(wired))["content_safety_auto_1"]["plugin"] == "aws_bedrock_content_safety"
+
+    def test_autowire_and_set_pipeline_agree_on_empty_string_validation_failure(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+    ) -> None:
+        """End-to-end (elspeth-bcd7051143): one "" candidate, both seams agree.
+
+        The auto-wire pass splices Content Safety for the ""-routed LLM source
+        AND set_pipeline persists the same source as 'discard', so the
+        coverage gate credits the spliced control — no more accepted-then-
+        wedged states where persistence coerced "" but the wiring pass had
+        refused the whole candidate."""
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        context = _custody_context(tmp_path, _INLINE_CONTENT, view=view, snapshot=snapshot)
+        bare = _bare_llm_source_candidate(on_validation_failure="")
+
+        wired = wire_required_controls(bare, snapshot, view)
+        candidate = build_set_pipeline_candidate(wired, _empty_state(), context)
+
+        rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
+        assert candidate.acceptable is True, f"wired candidate rejected: {rejection}"
+        state = candidate.result.updated_state
+        assert state.sources["source"].on_validation_failure == "discard"
+        result = view.validate_authored_state(state)
+        coverage = [finding for finding in result.findings if finding.stage == "required_control_coverage"]
+        assert coverage == [], [finding.message for finding in coverage]
+
+    def test_non_discard_source_refusal_is_scoped_to_that_source(
+        self,
+        tmp_path: Path,
+        llm_source_policy_manager: PluginManager,
+    ) -> None:
+        """elspeth-5b3d8d7b68: one quarantine-routed LLM source must not
+        suppress unrelated repairs. The transform still receives its Prompt
+        Shield (input edge) and Content Safety (output edge), the sibling
+        discard-routed LLM source still receives Content Safety, while the
+        refused source is left exactly as authored and its own coverage
+        finding survives for the fail-closed execution gate."""
+        from elspeth.web.composer.required_controls import _parse_candidate_state
+        from elspeth.web.plugin_policy.coverage import control_coverage_findings
+
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        candidate = _bare_llm_candidate()
+        briefing = _bare_llm_source_candidate(container="sources", source_name="briefing")["sources"]["briefing"]
+        briefing["on_success"] = "briefing_rows"
+        briefing["on_validation_failure"] = "quarantine"
+        sibling = copy.deepcopy(briefing)
+        sibling["on_success"] = "sibling_rows"
+        sibling["on_validation_failure"] = "discard"
+        sibling["options"]["response_field"] = "sibling_text"
+        candidate["sources"] = {
+            "briefing": briefing,
+            "sibling": sibling,
+            "records": candidate["source"],
+        }
+        del candidate["source"]
+        candidate["outputs"].extend(
+            {**copy.deepcopy(candidate["outputs"][0]), "sink_name": name} for name in ("briefing_rows", "sibling_rows", "quarantine")
+        )
+
+        wired = wire_required_controls(candidate, snapshot, view)
+
+        assert wired is not candidate, "unrelated repairs must not be suppressed"
+        nodes = _nodes_by_id(dict(wired))
+        # The transform's two protected edges are both repaired.
+        shields = [node for node in nodes.values() if node.get("plugin") == "aws_bedrock_prompt_shield"]
+        assert len(shields) == 1
+        assert shields[0]["input"] == "rows"
+        assert nodes["assess_ticket"]["input"] == shields[0]["on_success"]
+        safety_fields = {
+            tuple(node["options"]["fields"]): node for node in nodes.values() if node.get("plugin") == "aws_bedrock_content_safety"
+        }
+        assert ("assessment",) in safety_fields, "transform output Content Safety must still be wired"
+        # The sibling discard-routed source is still repaired.
+        assert ("sibling_text",) in safety_fields, "sibling discard-routed source must still be wired"
+        assert wired["sources"]["sibling"]["on_success"] == safety_fields[("sibling_text",)]["input"]
+        # The refused source is untouched — same object, no control authored
+        # against its output, and its finding is preserved for the gate.
+        assert ("briefing",) not in safety_fields
+        assert wired["sources"]["briefing"] is candidate["sources"]["briefing"]
+        assert wired["sources"]["briefing"]["on_success"] == "briefing_rows"
+        state = _parse_candidate_state(wired)
+        assert state is not None
+        residual = control_coverage_findings(state, PluginCapability.CONTENT_SAFETY)
+        assert [(finding.component_id, finding.reason) for finding in residual] == [("source:briefing", "output_not_post_dominated")]
+        # The refused source's persistent finding must not provoke splice
+        # churn: a second pass over the partially-repaired candidate is a
+        # no-op and honours the finalizer identity contract.
+        assert wire_required_controls(wired, snapshot, view) is wired
 
     @pytest.mark.parametrize("container", ["source", "sources"])
     @pytest.mark.parametrize("default_spelling", ["omitted", "null"])

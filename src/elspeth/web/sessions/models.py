@@ -1,6 +1,6 @@
 """SQLAlchemy Core table definitions for the session database.
 
-Tables include session content plus epoch-43 web coordination authority,
+Tables include session content plus epoch-44 web coordination authority,
 run-start, transient handoff, rate-limit, and cleanup state.
 
 Current schema bootstrap lives in ``sessions/schema.py``. Pre-release
@@ -197,12 +197,19 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        to reproduce the original closed HTTP failure envelope exactly.
 #        Epoch 41 rows cannot represent that replay enrichment and are rejected
 #        outright; no migration or compatibility decoder exists.
-#   43 -> persistent session-operation authority, compatible-generation
+#   43 -> ``chat_messages.writer_principal`` closed enum gains the
+#        ``run_diagnostics`` value so run-diagnostics LLM audit rows are
+#        attributed to their real writer instead of being misattributed to
+#        ``compose_loop`` (elspeth-0fcf68d50f). SQLite cannot ALTER a CHECK
+#        constraint in place, so pre-release policy remains delete-and-
+#        recreate for stale session databases (sessions.db only — auth.db is
+#        never touched).
+#   44 -> persistent session-operation authority, compatible-generation
 #        membership/run-start coordination, cross-replica ticket/progress/rate
 #        state, bounded cleanup claims, monotonic user-secret row versions, and
-#        durable proposal blob-effect receipts. Epoch 42 cannot represent these
+#        durable proposal blob-effect receipts. Epoch 43 cannot represent these
 #        authorities or receipts and is rejected outright; no migration exists.
-SESSION_SCHEMA_EPOCH = 43
+SESSION_SCHEMA_EPOCH = 44
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -525,7 +532,7 @@ chat_messages_table = Table(
         name="ck_chat_messages_parent_role",
     ),
     CheckConstraint(
-        "writer_principal IN ('compose_loop', 'route_user_message', 'route_system_message', 'admin_tool', 'session_fork')",
+        "writer_principal IN ('compose_loop', 'route_user_message', 'route_system_message', 'admin_tool', 'session_fork', 'run_diagnostics')",
         name="ck_chat_messages_writer_principal",
     ),
     Index(
@@ -2279,7 +2286,7 @@ run_start_permits_table = Table(
 )
 
 # Immutable, secret-reference-only envelope substrate. Task 8 owns the public
-# serialization and resolver carrier; epoch 43 reserves and constrains its
+# serialization and resolver carrier; epoch 44 reserves and constrains its
 # durable shape now so deployment compatibility cannot drift underneath it.
 _RUN_EXECUTION_IDENTITY_COLUMNS = (
     "canonical_input_digest",

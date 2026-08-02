@@ -747,6 +747,9 @@ async def get_guided(
 
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
     async with compose_lock:
+        # GET holds the process-local compose lock only to project a
+        # consistent snapshot against in-flight turns. Durable changes are
+        # reserved for a later fenced mutation; this endpoint performs none.
         state_record_out: CompositionStateRecord | None = None
 
         # Load or create CompositionState.

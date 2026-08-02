@@ -1510,14 +1510,14 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "the production tool handlers."
         ),
     ),
-    # ------ test_schema.py — epoch-43 coordination schema fixture ------
+    # ------ test_schema.py — epoch-44 coordination schema fixture ------
     ReviewedWriter(
         path="tests/unit/web/sessions/test_schema.py",
         enclosing_symbol="_seed_session_state",
         table="composition_states",
         operation="sqlalchemy_insert_call",
         purpose=(
-            "epoch-43 coordination schema fixture: seeds the parent "
+            "epoch-44 coordination schema fixture: seeds the parent "
             "composition_states row required by runs_table's composite FK so "
             "direct negative inserts can isolate the new coordination CHECK "
             "constraints. The test owns the in-memory SQLite engine and is "

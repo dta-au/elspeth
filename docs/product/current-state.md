@@ -1,6 +1,6 @@
 # Current State — ELSPETH
 
-**Checkpoint:** 2026-07-24
+**Checkpoint:** 2026-08-02
 **Release branch:** `release/0.7.2`
 **Release-prep issue:** `elspeth-64c319bf4d`
 **Release milestone:** `elspeth-6343920a47`
@@ -23,10 +23,10 @@ not remain folded into the historical 0.7.1 notes.
   epoch-36 blob-deletion cleanup, the epoch-37 guided-plan decline contract,
   the epoch-38 decline replay message locator, the epoch-39 policy refusal
   code, and the epoch-40 coalesce timeout and epoch-41 node option summary payload
-  cutovers, epoch-42 failed guided-operation replay enrichment, and the
-  epoch-43 compatible-generation session-operation coordination schema to
-  0.7.2.
-- `SESSION_SCHEMA_EPOCH` is 43, guided checkpoint schema is 10, and
+  cutovers, epoch-42 failed guided-operation replay enrichment, epoch-43
+  run-diagnostics writer attribution, and the epoch-44 compatible-generation
+  session-operation coordination schema to 0.7.2.
+- `SESSION_SCHEMA_EPOCH` is 44, guided checkpoint schema is 10, and
   `SQLITE_SCHEMA_EPOCH` is 30. An upgrade from 0.7.1 recreates both a stale
   session store and a Landscape store left at epoch 29.
 - Web Composer freeform and guided authoring, Composer tools, YAML
@@ -36,7 +36,8 @@ not remain folded into the historical 0.7.1 notes.
   configuration, build, contract, runtime, and guided evidence is present, but
   audit, recovery, concurrency, browser-backed round-trip, and scale acceptance
   remains deferred.
-- No 0.7.2 tag or final release candidate has been published.
+- No final 0.7.2 release or candidate carrying the current epoch-44 schema has
+  been published; the older `0.7.2-RC` tag predates this release state.
 
 ## Release Gates
 

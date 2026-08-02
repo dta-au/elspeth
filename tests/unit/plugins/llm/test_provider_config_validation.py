@@ -21,6 +21,7 @@ from elspeth.plugins.llm.config_validation import (
     OPENROUTER_BASE_URL,
     OPENROUTER_BASE_URL_APPLIES_WHEN,
     OPENROUTER_MODEL_VALUE_SOURCES,
+    normalize_openrouter_base_url,
 )
 from elspeth.plugins.sources.llm.config import (
     AzureOpenAILLMSourceConfig,
@@ -192,7 +193,18 @@ def test_openrouter_normalizes_url_and_rejects_remote_http(config_model: type[An
     ("config_model", "common"),
     [(OpenRouterLLMSourceConfig, _SOURCE_COMMON), (OpenRouterConfig, _TRANSFORM_COMMON)],
 )
-@pytest.mark.parametrize("equivalent_url", ["https://OPENROUTER.AI/api/v1", "https://openrouter.ai:443/api/v1"])
+@pytest.mark.parametrize(
+    "equivalent_url",
+    [
+        "https://OPENROUTER.AI/api/v1",
+        "https://openrouter.ai:443/api/v1",
+        # elspeth-5653909057: dot-segment spellings are collapsed client-side by
+        # httpx (RFC 3986 remove_dot_segments), so they are wire-identical to
+        # the canonical endpoint and must not defeat the applies_when gate.
+        "https://openrouter.ai/api/./v1",
+        "https://openrouter.ai/api/x/../v1",
+    ],
+)
 def test_openrouter_provider_equivalent_urls_keep_catalog_enforcement(
     config_model: type[Any],
     common: dict[str, Any],
@@ -217,6 +229,88 @@ def test_openrouter_provider_equivalent_urls_keep_catalog_enforcement(
     assert config.base_url == OPENROUTER_BASE_URL
     assert len(findings) == 1
     assert findings[0].field_name == "model"
+
+
+@pytest.mark.parametrize(
+    ("config_model", "common"),
+    [(OpenRouterLLMSourceConfig, _SOURCE_COMMON), (OpenRouterConfig, _TRANSFORM_COMMON)],
+)
+@pytest.mark.parametrize(
+    "ambiguous_url",
+    [
+        # elspeth-5653909057: these spellings reach the wire unchanged (httpx
+        # does not rewrite them), so whether the server treats them as the
+        # canonical endpoint is server-dependent. They are rejected rather than
+        # normalized — silently rewriting would change the wire bytes, and
+        # silently accepting would defeat the catalogue applies_when gate.
+        "https://openrouter.ai/%61pi/v1",  # percent-encoded unreserved octet
+        "https://openrouter.ai/api%2v1",  # malformed percent triplet
+        "https://openrouter.ai//api/v1",  # empty path segment
+        "https://openrouter.ai./api/v1",  # host trailing dot
+    ],
+)
+def test_openrouter_rejects_wire_ambiguous_base_url_spellings(
+    config_model: type[Any],
+    common: dict[str, Any],
+    ambiguous_url: str,
+) -> None:
+    with pytest.raises(ValidationError, match="base_url"):
+        config_model.model_validate(
+            {
+                **common,
+                "provider": "openrouter",
+                "model": "openai/gpt-4o-mini",
+                "api_key": "test-api-key",
+                "base_url": ambiguous_url,
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("spelling", "expected"),
+    [
+        # elspeth-5653909057: RFC 3986 remove_dot_segments, mirroring httpx's
+        # client-side collapse — these spellings are wire-identical to their
+        # collapsed form.
+        ("https://openrouter.ai/api/./v1", OPENROUTER_BASE_URL),
+        ("https://openrouter.ai/api/x/../v1", OPENROUTER_BASE_URL),
+        ("https://openrouter.ai/./api/v1", OPENROUTER_BASE_URL),
+        ("https://openrouter.ai/../api/v1", OPENROUTER_BASE_URL),
+        # An empty segment consumed by a following ".." never reaches the wire
+        # (httpx pops it identically), so no ambiguity remains to reject.
+        ("https://openrouter.ai/api//../v1", OPENROUTER_BASE_URL),
+        # Trailing slashes collapse (pre-existing behaviour, preserved).
+        ("https://openrouter.ai/api/v1//", OPENROUTER_BASE_URL),
+    ],
+)
+def test_normalize_openrouter_base_url_removes_dot_segments(spelling: str, expected: str) -> None:
+    assert normalize_openrouter_base_url(spelling) == expected
+
+
+@pytest.mark.parametrize(
+    ("spelling", "match"),
+    [
+        ("https://openrouter.ai/%61pi/v1", "percent-encoding"),
+        ("https://openrouter.ai/api%2v1", "percent-encoding"),
+        ("https://openrouter.ai/a%2", "percent-encoding"),
+        ("https://openrouter.ai//api/v1", "empty path segment"),
+        ("https://openrouter.ai./api/v1", "trailing dot"),
+    ],
+)
+def test_normalize_openrouter_base_url_rejects_wire_ambiguous_spellings(spelling: str, match: str) -> None:
+    # elspeth-5653909057: server-dependent equivalence classes are rejected,
+    # matching validate_gateway_endpoint's stance on ambiguous segments.
+    with pytest.raises(ValueError, match=match):
+        normalize_openrouter_base_url(spelling)
+
+
+def test_normalize_openrouter_base_url_keeps_percent_encoded_reserved_octets() -> None:
+    # elspeth-5653909057: %2F decodes to '/', a reserved character, so the
+    # encoded and decoded spellings are NOT equivalent per RFC 3986 — the URL
+    # is genuinely non-canonical, not an ambiguous respelling of the canonical
+    # endpoint. It passes through unchanged (catalogue gate legitimately skips).
+    url = "https://gateway.example.com/tenant%2Fprod/v1"
+    assert normalize_openrouter_base_url(url) == url
 
 
 @pytest.mark.parametrize(

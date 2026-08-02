@@ -103,7 +103,6 @@ def test_current_operator_runbooks_use_072_candidate_and_071_baseline() -> None:
     assert (
         '"structural_changes": '
         f'"session_epoch_35_to_{SESSION_SCHEMA_EPOCH}_landscape_epoch_29_to_30_'
-        "blob_cleanup_guided_decline_row_union_barrier_failed_guided_output_"
-        'replay_and_coordination_schema"'
+        'blob_cleanup_guided_decline_row_union_barrier_and_coordination_schema"'
     ) in aws
     assert f"repair forward with epoch-{SESSION_SCHEMA_EPOCH} session/epoch-30 Landscape code" in aws

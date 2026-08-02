@@ -1489,6 +1489,14 @@ class BaseSource(ABC):
     # Empty frozenset = no guaranteed-field contract.
     declared_guaranteed_fields: frozenset[str] = frozenset()
 
+    # Plugin-computed output contract, recorded by
+    # _initialize_declared_guaranteed_fields(). The DAG builder prefers this
+    # over re-parsing the raw options dict — the source-side mirror of
+    # BaseTransform._output_schema_config — so source-specific schema rewrites
+    # (e.g. the LLM source's guaranteed-field augmentation) reach build-time
+    # graph validation, not just per-row enforcement (elspeth-db98d3f660).
+    _output_schema_config: SchemaConfig | None
+
     # Schema contract for row validation
     _schema_contract: SchemaContract | None = None
 
@@ -1532,6 +1540,7 @@ class BaseSource(ABC):
         self._on_complete_called: bool = False
         self._schema_contract = None
         self.declared_guaranteed_fields = frozenset()
+        self._output_schema_config: SchemaConfig | None = None
 
     @abstractmethod
     def load(self, ctx: SourceContext) -> Iterator[SourceRow]:
@@ -1596,9 +1605,12 @@ class BaseSource(ABC):
 
         Call this after any source-specific schema rewrite so the runtime
         contract surface matches the source's effective guarantees, not the
-        caller's raw config dict.
+        caller's raw config dict. Also records the schema as the source's
+        plugin-computed output contract, which the DAG builder prefers over
+        re-parsing raw options (elspeth-db98d3f660).
         """
         self.declared_guaranteed_fields = schema_config.get_effective_guaranteed_fields()
+        self._output_schema_config = schema_config
 
     # === Lifecycle Hooks ===
     # Call ordering: on_start -> load -> on_complete -> close

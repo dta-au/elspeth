@@ -115,7 +115,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:c63cd6b96f4c7372"
+    source_file_hash: str | None = "sha256:d6bd80c569341f34"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
@@ -576,7 +576,16 @@ class LLMSource(BaseSource):
                     tier_one_failures.append(exc)
                 elif isinstance(exc, Exception):
                     failures.append(exc)
-                    self._report_cleanup_failure(resource=resource, error=exc, suppressed=suppress_errors)
+                    try:
+                        self._report_cleanup_failure(resource=resource, error=exc, suppressed=suppress_errors)
+                    except BaseException as report_error:
+                        if not isinstance(report_error, contract_errors.TIER_1_ERRORS):
+                            raise
+                        # elspeth-f5a9515d58: a Tier-1 raised while reporting a
+                        # cleanup failure is deferred exactly like a Tier-1 from
+                        # close_resource, so the tracer flush attempt and the
+                        # telemetry reset below stay unconditional.
+                        tier_one_failures.append(report_error)
                 else:
                     raise
         self._telemetry_emit = make_warn_telemetry_before_start(logger)
