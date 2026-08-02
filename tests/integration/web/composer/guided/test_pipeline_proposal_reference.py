@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import func, select
 from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -748,6 +748,14 @@ async def _stage_and_reject(
     *,
     reason: str,
 ) -> tuple[GuidedPipelineProposalStageCommand, UUID]:
+    """Fabricate the rejected-row-behind-active-reference orphan.
+
+    ``reject_pipeline_composition_proposal`` terminalizes the durable row
+    without clearing the guided checkpoint reference — a state no fenced
+    lifecycle produces. Used by ``tests/unit/web/sessions/test_routes.py``
+    to pin that GET /guided fails closed on it without mutating state
+    (elspeth-4dc78b3897).
+    """
     command, session_id = await _command(service, payload_store)
     await service.stage_guided_pipeline_proposal(command, payload_store=payload_store)
     await service.reject_pipeline_composition_proposal(
@@ -760,115 +768,6 @@ async def _stage_and_reject(
         actor="test",
     )
     return command, session_id
-
-
-@pytest.mark.parametrize("reason", ("operator_rejected", "superseded"))
-def test_reconcile_exact_explicit_rejection_clears_reference_and_occurrence(
-    service: SessionServiceImpl,
-    tmp_path: Path,
-    reason: str,
-) -> None:
-    payload_store = FilesystemPayloadStore(tmp_path / reason)
-    command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason=reason))
-
-    reconciled = asyncio.run(
-        service.reconcile_rejected_guided_pipeline_proposal(
-            session_id=session_id,
-            expected_current_state_id=command.checkpoint_state_id,
-            proposal_id=command.proposal_id,
-            draft_hash=command.plan.proposal.draft_hash,
-            reviewed_facts=guided_private_reviewed_facts(_guided()),
-        )
-    )
-
-    guided = _state_from_record(reconciled).guided_session
-    assert guided is not None
-    assert guided.active_proposal is None
-    assert guided.active_edit_target is None
-    assert not guided.history
-    assert reconciled.derived_from_state_id == command.checkpoint_state_id
-
-
-@pytest.mark.parametrize("tamper", ("missing", "cross_session", "draft", "duplicate_event", "committed"))
-def test_reconcile_missing_cross_session_or_altered_authority_is_a_hard_conflict(
-    service: SessionServiceImpl,
-    tmp_path: Path,
-    tamper: str,
-) -> None:
-    payload_store = FilesystemPayloadStore(tmp_path / tamper)
-    command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason="operator_rejected"))
-    reconcile_session_id = session_id
-    expected_state_id = command.checkpoint_state_id
-    proposal_id = command.proposal_id
-    draft_hash = command.plan.proposal.draft_hash
-
-    if tamper == "missing":
-        proposal_id = uuid4()
-    elif tamper == "cross_session":
-        other = asyncio.run(service.create_session("alice", "other", "local"))
-        other_state = asyncio.run(service.save_composition_state(other.id, _state_data(_guided()), provenance="session_seed"))
-        reconcile_session_id = other.id
-        expected_state_id = other_state.id
-    elif tamper == "draft":
-        draft_hash = "f" * 64
-    elif tamper == "duplicate_event":
-        event = asyncio.run(service.list_proposal_events(session_id))[0]
-        with service._engine.begin() as conn:
-            conn.execute(
-                insert(proposal_events_table).values(
-                    id=str(uuid4()),
-                    session_id=str(session_id),
-                    proposal_id=str(command.proposal_id),
-                    event_type="proposal.created",
-                    actor="tamper",
-                    payload=deep_thaw(event.payload),
-                    created_at=event.created_at,
-                )
-            )
-    else:
-        with service._engine.begin() as conn:
-            conn.execute(
-                update(composition_proposals_table)
-                .where(composition_proposals_table.c.id == str(command.proposal_id))
-                .values(status="committed", committed_state_id=str(command.checkpoint_state_id))
-            )
-
-    with pytest.raises((AuditIntegrityError, KeyError)):
-        asyncio.run(
-            service.reconcile_rejected_guided_pipeline_proposal(
-                session_id=reconcile_session_id,
-                expected_current_state_id=expected_state_id,
-                proposal_id=proposal_id,
-                draft_hash=draft_hash,
-                reviewed_facts=guided_private_reviewed_facts(_guided()),
-            )
-        )
-
-
-def test_reconcile_checkpoint_fault_keeps_active_reference(service: SessionServiceImpl, tmp_path: Path, monkeypatch) -> None:
-    payload_store = FilesystemPayloadStore(tmp_path / "fault")
-    command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason="operator_rejected"))
-
-    def fail_insert(*_args, **_kwargs):
-        raise RuntimeError("synthetic checkpoint failure")
-
-    monkeypatch.setattr(service, "_insert_composition_state", fail_insert)
-    with pytest.raises(RuntimeError, match="synthetic checkpoint failure"):
-        asyncio.run(
-            service.reconcile_rejected_guided_pipeline_proposal(
-                session_id=session_id,
-                expected_current_state_id=command.checkpoint_state_id,
-                proposal_id=command.proposal_id,
-                draft_hash=command.plan.proposal.draft_hash,
-                reviewed_facts=guided_private_reviewed_facts(_guided()),
-            )
-        )
-
-    current = asyncio.run(service.get_current_state(session_id))
-    assert current is not None and current.id == command.checkpoint_state_id
-    guided = _state_from_record(current).guided_session
-    assert guided is not None and guided.active_proposal is not None
-    assert guided.active_proposal.proposal_id == command.proposal_id
 
 
 # ---------------------------------------------------------------------------

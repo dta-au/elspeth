@@ -6301,6 +6301,43 @@ class TestGuidedBootstrapStateVersions:
         assert versions_resp.status_code == 200
         assert versions_resp.json() == []
 
+    def test_get_guided_rejected_proposal_reference_fails_closed_without_mutation(self, tmp_path) -> None:
+        """elspeth-4dc78b3897: GET must not reconcile a rejected reference.
+
+        A terminally rejected proposal row behind a still-active checkpoint
+        reference cannot arise from any fenced lifecycle — every
+        terminalization clears the reference in the same transaction — so
+        the read path fails closed and leaves the durable evidence exactly
+        as it found it, rather than writing a reconciliation state with no
+        operation fence.
+        """
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.web.sessions.converters import state_from_record
+        from tests.integration.web.composer.guided.test_pipeline_proposal_reference import _stage_and_reject
+
+        app, service = _make_app(tmp_path)
+        catalog = MagicMock(spec=CatalogService)
+        catalog.list_sources.return_value = []
+        catalog.list_transforms.return_value = []
+        catalog.list_sinks.return_value = []
+        app.state.catalog_service = catalog
+        app.state.session_engine = service._engine
+        payload_store = FilesystemPayloadStore(tmp_path / "stage-payloads")
+        command, session_id = asyncio.run(_stage_and_reject(service, payload_store, reason="operator_rejected"))
+        before_versions = [record.id for record in asyncio.run(service.get_state_versions(session_id))]
+
+        client = TestClient(app)
+        with pytest.raises(AuditIntegrityError, match="unexpectedly terminal"):
+            client.get(f"/api/sessions/{session_id}/guided")
+
+        after_versions = [record.id for record in asyncio.run(service.get_state_versions(session_id))]
+        assert after_versions == before_versions, "GET must not allocate a composition state"
+        current = asyncio.run(service.get_current_state(session_id))
+        assert current is not None and current.id == command.checkpoint_state_id
+        guided = state_from_record(current).guided_session
+        assert guided is not None and guided.active_proposal is not None
+        assert guided.active_proposal.proposal_id == command.proposal_id
+
 
 class TestRevertEndpoint:
     """Tests for POST /api/sessions/{id}/state/revert (R1)."""

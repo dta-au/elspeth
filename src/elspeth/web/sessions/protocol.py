@@ -2517,16 +2517,6 @@ class SessionServiceProtocol(Protocol):
         command: GuidedFullPipelineDeclineCommand,
     ) -> GuidedFullPipelineDeclineSettlement: ...
 
-    async def reconcile_rejected_guided_pipeline_proposal(
-        self,
-        *,
-        session_id: UUID,
-        expected_current_state_id: UUID,
-        proposal_id: UUID,
-        draft_hash: str,
-        reviewed_facts: Mapping[str, Any],
-    ) -> CompositionStateRecord: ...
-
     async def accept_guided_pipeline_proposal(
         self,
         command: GuidedPipelineProposalAcceptCommand,

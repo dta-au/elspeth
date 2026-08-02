@@ -742,10 +742,11 @@ async def get_guided(
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
     async with compose_lock:
         # elspeth-23fc70ce9c: GET holds the compose lock only to read a
-        # consistent snapshot against in-flight compose turns (and to run
-        # the fenced rejected-proposal reconciliation below). It performs
-        # no chat-message writes: the recorder-drain scaffolding that once
-        # lived here fed nothing and contradicted the endpoint's
+        # consistent snapshot against in-flight compose turns. It performs
+        # no writes of any kind: the recorder-drain scaffolding that once
+        # lived here fed nothing, and the unfenced rejected-proposal
+        # reconciliation that once wrote a composition state on read
+        # (elspeth-4dc78b3897) contradicted the endpoint's
         # no-write-on-GET custody contract.
         state_record_out: CompositionStateRecord | None = None
         # Load or create CompositionState.
@@ -795,21 +796,14 @@ async def get_guided(
                 raise AuditIntegrityError("guided proposal authority has a non-present base")
             if proposal.base.state_id != state_record_out.id or proposal.base.composition_content_hash != composition_content_hash(state):
                 raise AuditIntegrityError("guided proposal base differs from current checkpoint")
-            if active_authority.row.status == "rejected":
-                state_record_out = await service.reconcile_rejected_guided_pipeline_proposal(
-                    session_id=session_id,
-                    expected_current_state_id=state_record_out.id,
-                    proposal_id=active.proposal_id,
-                    draft_hash=active.draft_hash,
-                    reviewed_facts=reviewed_facts,
-                )
-                state = _state_from_record(state_record_out)
-                if state.guided_session is None:  # pragma: no cover - service contract
-                    raise AuditIntegrityError("guided proposal reconciliation removed guided checkpoint")
-                guided = state.guided_session
-                current_step = guided.step
-                active_authority = None
-            elif active_authority.row.status != "pending":
+            if active_authority.row.status != "pending":
+                # elspeth-4dc78b3897: a terminal row behind a still-active
+                # checkpoint reference cannot arise from any fenced
+                # lifecycle — reject, supersede, revert, and back-edit all
+                # clear the reference in the same transaction that
+                # terminalizes the row. It is integrity evidence, so the
+                # read path fails closed and preserves it instead of
+                # writing an unfenced reconciliation state on GET.
                 raise AuditIntegrityError("guided active proposal is unexpectedly terminal")
 
         existing_record_for_step = (
