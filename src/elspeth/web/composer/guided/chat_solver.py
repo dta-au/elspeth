@@ -1585,7 +1585,7 @@ def _parse_step_1_source_tool_arguments(arguments: str, *, plugin_hint: str | No
     # models omit constant fields, so absence is accepted as its only legal
     # value while a present-but-wrong value stays rejected (mirrors the
     # resolve_sink treatment and the on_validation_failure default below).
-    missing = {
+    required = {
         "plugin",
         "filename",
         "mime_type",
@@ -1594,9 +1594,15 @@ def _parse_step_1_source_tool_arguments(arguments: str, *, plugin_hint: str | No
         "observed_columns",
         "sample_rows",
         "assistant_message",
-    } - set(data.keys())
+    }
+    missing = required - set(data)
     if missing:
         raise GuidedToolArgumentShapeError(f"resolve_source arguments missing required keys: {sorted(missing)}")
+    allowed = required | {"resolution", "on_validation_failure"}
+    unexpected = set(data) - allowed
+    if unexpected:
+        unexpected_keys = _shape_safe_keys(dict.fromkeys(unexpected))
+        raise GuidedToolArgumentShapeError(f"resolve_source arguments contain unexpected keys: {unexpected_keys}")
     if data.get("resolution", "source") != "source":
         raise GuidedToolArgumentShapeError("resolve_source resolution key must be exactly 'source' when provided")
 
@@ -2448,6 +2454,16 @@ async def maybe_resolve_step_2_sink_chat(
                 # stage output values with a future-stage instruction must lose
                 # neither half (elspeth-a96b2f1b0a / R2-F15).
                 is_retained_pair = len(tool_calls) == 2 and len(terminal_calls) == 2 and len(retain_calls) == 1 and len(sink_calls) == 1
+                is_sink_only = len(tool_calls) == 1 and len(terminal_calls) == 1 and len(sink_calls) == 1
+                if pending_deferred is not None and not (is_sink_only or is_retained_pair):
+                    # The prior round already validated this retain. A later
+                    # terminal action that omits the corrected resolution must
+                    # not replace or silently discard that held instruction.
+                    status = ComposerLLMCallStatus.SUCCESS
+                    return GuidedChatDeferredIntentWithheldResolutionOutcome(
+                        action=pending_deferred,
+                        resolution_error_class="PairedResolutionNotResent",
+                    )
                 if not is_retained_pair and (len(terminal_calls) != 1 or len(tool_calls) != 1):
                     raise _terminal_shape_error_type(terminal_calls)(
                         "step-2 chat must return exactly one terminal guided action, or one resolve_sink + retain_deferred_intent pair"

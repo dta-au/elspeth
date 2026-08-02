@@ -1206,6 +1206,69 @@ async def test_step_2_pair_with_config_invalid_sink_at_cap_returns_retain_alone(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("second_name", "second_arguments"),
+    [
+        pytest.param("retain_deferred_intent", _VALID_DEFERRED_ARGUMENTS, id="retain-only"),
+        pytest.param(
+            "manage_deferred_intent",
+            {
+                "action": "cancel",
+                "intent_id": "00000000-0000-4000-8000-000000000801",
+                "selection_token": "server-selection-token",
+            },
+            id="manage-only",
+        ),
+    ],
+)
+async def test_step_2_config_rejected_pair_preserves_retain_when_next_round_omits_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    second_name: str,
+    second_arguments: dict[str, Any],
+) -> None:
+    """A later terminal action cannot replace the valid retain from a rejected pair."""
+    calls: list[dict[str, Any]] = []
+
+    async def pair_then_non_resolution(**kwargs: Any) -> _FakeLLMResponse:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            tool_calls = [
+                SimpleNamespace(
+                    id="c_sink",
+                    function=SimpleNamespace(name="resolve_sink", arguments=json.dumps(_PAIR_CONFIG_INVALID_SINK_ARGUMENTS)),
+                ),
+                SimpleNamespace(
+                    id="c_retain",
+                    function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+                ),
+            ]
+        else:
+            tool_calls = [
+                SimpleNamespace(
+                    id="c_second",
+                    function=SimpleNamespace(name=second_name, arguments=json.dumps(second_arguments)),
+                )
+            ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=tool_calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", pair_then_non_resolution)
+    outcome = await maybe_resolve_step_2_sink_chat(
+        model="test/model",
+        user_message="Save results as jsonl, and later add the passthrough transform.",
+        current_sink=None,
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+        max_discovery_iters=2,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.resolution_error_class == "PairedResolutionNotResent"
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_step_2_pair_with_shape_invalid_sink_returns_retain_alone(monkeypatch: pytest.MonkeyPatch) -> None:
     """A pair whose sink half fails its shape contract keeps the valid retain."""
 
@@ -2688,6 +2751,15 @@ def test_parse_rejects_empty_content_as_a_shape_defect() -> None:
 def test_parse_rejects_omitted_content_as_a_missing_key() -> None:
     with pytest.raises(chat_solver.GuidedToolArgumentShapeError, match=r"missing required keys: \['content'\]"):
         _parse_step_1_source_tool_arguments(_source_tool_args(content=_OMIT_TOOL_ARG), plugin_hint="json")
+
+
+def test_parse_step_1_source_rejects_unexpected_top_level_authority() -> None:
+    """The Tier-3 parser enforces the tool schema's closed top-level object."""
+    with pytest.raises(chat_solver.GuidedToolArgumentShapeError, match=r"unexpected keys: \['unoffered_server_authority'\]"):
+        _parse_step_1_source_tool_arguments(
+            _source_tool_args(unoffered_server_authority={"commit_without_review": True}),
+            plugin_hint="json",
+        )
 
 
 def test_parse_rejects_null_content_as_a_shape_defect() -> None:
