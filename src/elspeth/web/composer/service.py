@@ -1045,6 +1045,35 @@ def _compose_preflight_repair_message(runtime_result: ValidationResult, *, next_
     )
 
 
+async def _surfaced_evidence_keys(
+    sessions_service: SessionServiceProtocol,
+    *,
+    session_id: str,
+    current_state_id: str,
+) -> frozenset[tuple[str, str, InterpretationKind]]:
+    """Per-site surfacing evidence on one state, in ANY resolution status.
+
+    The interpretation_events rows bound to a committed state ARE the durable
+    completion record for that state's surfacing debt: resolving or
+    abandoning a review updates its row, it never removes it, and the state
+    the rows bind to is immutable. A pending-only check would therefore read
+    an already-resolved site as still owed and recreate it against stale
+    historical state — which the writer boundary rejects outright once the
+    placeholder has been consumed.
+    """
+
+    events = await sessions_service.list_interpretation_events(
+        UUID(session_id),
+        status="all",
+        composition_state_id=UUID(current_state_id),
+    )
+    return frozenset(
+        (event.affected_node_id, event.user_term, event.kind)
+        for event in events
+        if event.affected_node_id is not None and event.user_term is not None and event.kind is not None
+    )
+
+
 async def _auto_surface_prompt_template_reviews_for_state(
     state: CompositionState,
     *,
@@ -1055,6 +1084,7 @@ async def _auto_surface_prompt_template_reviews_for_state(
     model_version: str,
     provider: str,
     composer_skill_hash: str,
+    already_surfaced: frozenset[tuple[str, str, InterpretationKind]] = frozenset(),
 ) -> None:
     """Canonical ``llm_prompt_template`` surfacing pass (see the instance method).
 
@@ -1088,6 +1118,8 @@ async def _auto_surface_prompt_template_reviews_for_state(
         # requirement is the requirement-None enumerator branch
         # (_missing_prompt_template_review_sites) and is left to the orphan gate.
         if not ComposerServiceImpl._has_pending_prompt_template_requirement(options, user_term=site.user_term):
+            continue
+        if (site.component_id, site.user_term, InterpretationKind.LLM_PROMPT_TEMPLATE) in already_surfaced:
             continue
         await sessions_service.create_pending_interpretation_event(
             session_id=UUID(session_id),
@@ -1182,8 +1214,18 @@ async def surface_pending_interpretation_reviews_for_state(
     model_version: str,
     provider: str,
     composer_skill_hash: str,
+    only_missing_evidence: bool = False,
 ) -> None:
     """Kind-general pending-review surfacer over one persisted state (B1).
+
+    ``only_missing_evidence`` repairs a surfacing DEBT rather than surfacing
+    afresh: every site already carrying evidence on this state — in any
+    resolution status — is left alone, and only genuinely missing sites are
+    written. The guided replay arm needs it because it re-runs this pass over
+    a historical committed state that may since have been reviewed and
+    superseded. Settlement-time callers leave it False: their state is new,
+    nothing can have evidence yet, and the writer's own draft-aware dedup
+    must stay free to supersede stale cards.
 
     Canonical shared implementation behind
     :meth:`ComposerServiceImpl.surface_pending_interpretation_reviews` — see
@@ -1198,6 +1240,13 @@ async def surface_pending_interpretation_reviews_for_state(
 
     if session_id is None or current_state_id is None:
         return
+    already_surfaced: frozenset[tuple[str, str, InterpretationKind]] = frozenset()
+    if only_missing_evidence:
+        already_surfaced = await _surfaced_evidence_keys(
+            sessions_service,
+            session_id=session_id,
+            current_state_id=current_state_id,
+        )
     # llm_prompt_template is already handled by the existing surfacer,
     # which carries the exact draft-aware dedup the writer boundary needs.
     await _auto_surface_prompt_template_reviews_for_state(
@@ -1209,6 +1258,7 @@ async def surface_pending_interpretation_reviews_for_state(
         model_version=model_version,
         provider=provider,
         composer_skill_hash=composer_skill_hash,
+        already_surfaced=already_surfaced,
     )
     for site in interpretation_sites(state):
         if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
@@ -1217,6 +1267,8 @@ async def surface_pending_interpretation_reviews_for_state(
         if surfaced is None:
             continue
         affected_node_id, user_term, llm_draft = surfaced
+        if (affected_node_id, user_term, site.kind) in already_surfaced:
+            continue
         # Do not pre-deduplicate by draft text here. The writer compares the
         # canonical per-kind reviewed artifact under the session transaction,
         # reusing only coherent authority and abandoning superseded cards.

@@ -26,6 +26,7 @@ from litellm.exceptions import APIError as LiteLLMAPIError
 from sqlalchemy import event, func, select
 from sqlalchemy.sql.dml import Insert, Update
 
+from elspeth.contracts.composer_interpretation import InterpretationChoice
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -198,12 +199,14 @@ def _full_guided_session(body: dict) -> dict:
     return body["composition_state"]["composer_meta"]["guided_session"]
 
 
-def _llm_prompt_template_planner(prompt: str):
-    """Plan one llm node carrying a PENDING ``llm_prompt_template`` requirement.
+def _llm_prompt_template_planner(prompt: str, *, extra_node_id: str | None = None):
+    """Plan llm node(s) carrying PENDING ``llm_prompt_template`` requirements.
 
-    Shared by the two wire-confirm surfacing tests so the first-attempt arm
-    and the replay arm are provably driven by the identical committed
-    pipeline; a drifted fixture would make that comparison meaningless.
+    Shared by the wire-confirm surfacing tests so the first-attempt arm and
+    the replay arm are provably driven by the identical committed pipeline; a
+    drifted fixture would make that comparison meaningless. ``extra_node_id``
+    chains a second interpretation site so partial multi-site repair can be
+    exercised.
     """
     from elspeth.contracts.freeze import deep_thaw
     from elspeth.core.canonical import stable_hash
@@ -223,6 +226,13 @@ def _llm_prompt_template_planner(prompt: str):
         del recorder, correction_target
         source = guided.reviewed_sources[guided.source_order[0]]
         output = guided.reviewed_outputs[guided.output_order[0]]
+        if extra_node_id is None:
+            _chain = [("summarize_rows", "llm_rows", output.name)]
+        else:
+            _chain = [
+                ("summarize_rows", "llm_rows", f"{extra_node_id}_rows"),
+                (extra_node_id, f"{extra_node_id}_rows", output.name),
+            ]
         pipeline = {
             "sources": {
                 source.name: {
@@ -234,11 +244,11 @@ def _llm_prompt_template_planner(prompt: str):
             },
             "nodes": [
                 {
-                    "id": "summarize_rows",
+                    "id": node_id,
                     "node_type": "transform",
                     "plugin": "llm",
-                    "input": "llm_rows",
-                    "on_success": output.name,
+                    "input": node_input,
+                    "on_success": node_on_success,
                     "on_error": "discard",
                     "options": {
                         "schema": {"mode": "observed"},
@@ -247,15 +257,16 @@ def _llm_prompt_template_planner(prompt: str):
                         "response_field": "summary",
                         "interpretation_requirements": [
                             {
-                                "id": "llm_prompt_template:summarize_rows:summarize_rows",
+                                "id": f"llm_prompt_template:{node_id}:{node_id}",
                                 "kind": "llm_prompt_template",
-                                "user_term": "llm_prompt_template:summarize_rows",
+                                "user_term": f"llm_prompt_template:{node_id}",
                                 "status": "pending",
                                 "draft": prompt,
                             }
                         ],
                     },
                 }
+                for node_id, node_input, node_on_success in _chain
             ],
             "edges": [],
             "outputs": [
@@ -3972,6 +3983,391 @@ class TestStep2IntraStep:
         assert replayed.json()["terminal"]["kind"] == "completed"
         after_replay = _pending_prompt_events()
         assert len(after_replay) == 1, [(event.id, event.user_term, event.llm_draft) for event in after_replay]
+
+    def test_guided_respond_replay_without_a_proposal_surfaces_nothing(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """A RESPOND that settles no proposal owes no surfacing on replay.
+
+        The replay arm derives identity from the operation's own result
+        locator, whose proposal_id is None for every ordinary guided turn.
+        Such a replay must write nothing at all — not an interpretation row,
+        not a state version.
+        """
+        session_id = _create_session(composer_test_client)
+        self._drive_to_step_2_single_select(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "chosen": ["json"],
+        }
+        session_service = composer_test_client.app.state.session_service
+        settled = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert settled.status_code == 200, settled.json()
+
+        events_before = asyncio.run(session_service.list_interpretation_events(UUID(session_id)))
+        versions_before = asyncio.run(session_service.get_state_versions(UUID(session_id)))
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json() == settled.json()
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == events_before
+        assert asyncio.run(session_service.get_state_versions(UUID(session_id))) == versions_before
+
+    def test_confirm_wiring_replay_binds_its_own_proposal_when_another_shares_the_state(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A state id is not a unique proposal locator; the operation's is.
+
+        A blob-only approval can legitimately mark a second proposal committed
+        against an EXISTING state, so resolving the proposal by committed
+        state is ambiguous — it can select unrelated provenance or find more
+        than one row. The replay must bind the exact proposal its own result
+        locator names, and the surfaced review must therefore carry the
+        original planner's provenance even with a second committed proposal
+        sharing the same state.
+        """
+        from elspeth.web.composer import service as composer_service_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_shared_state.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+
+        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+
+        def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            _crash_between_settlement_and_surfacing,
+        )
+        with pytest.raises(_SurfacingWorkerCrash):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            original_surface,
+        )
+
+        # A SECOND committed proposal now names the very same state.
+        session_service = composer_test_client.app.state.session_service
+        committed_state = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert committed_state is not None
+        rival = asyncio.run(
+            session_service.create_composition_proposal(
+                session_id=UUID(session_id),
+                tool_call_id=f"rival-{uuid4()}",
+                tool_name="set_pipeline",
+                summary="rival blob-only approval",
+                rationale="shares the committed state",
+                affects=["nodes"],
+                arguments_json={"pipeline": {}},
+                arguments_redacted_json={"pipeline": {}},
+                base_state_id=committed_state.id,
+                actor="test",
+                composer_model_identifier="rival-model",
+                composer_model_version="rival-v9",
+                composer_provider="rival-provider",
+                composer_skill_hash="f" * 64,
+                tool_arguments_hash="a" * 64,
+            )
+        )
+        asyncio.run(
+            session_service.mark_composition_proposal_committed(
+                session_id=UUID(session_id),
+                proposal_id=rival.id,
+                committed_state_id=committed_state.id,
+                actor="test",
+            )
+        )
+
+        # The ambiguity this guards against is now real: resolving a proposal
+        # by committed state would find two rows, not one.
+        engine = composer_test_client.app.state.session_engine
+        with engine.begin() as connection:
+            sharing = connection.execute(
+                select(func.count())
+                .select_from(composition_proposals_table)
+                .where(composition_proposals_table.c.session_id == session_id)
+                .where(composition_proposals_table.c.committed_state_id == str(committed_state.id))
+            ).scalar_one()
+        assert sharing == 2, sharing
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json()["terminal"]["kind"] == "completed"
+
+        events = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+        prompt_events = [event for event in events if event.affected_node_id == "summarize_rows"]
+        assert len(prompt_events) == 1, [(event.affected_node_id, event.model_identifier) for event in events]
+        # The ORIGINAL planner, never the rival that also names this state.
+        assert prompt_events[0].model_identifier == "llm-prompt-review-test-planner"
+        assert prompt_events[0].model_version == "v1"
+        assert prompt_events[0].provider == "test"
+        assert prompt_events[0].composer_skill_hash != "f" * 64
+
+    def test_confirm_wiring_replay_after_resolution_returns_the_stored_response_unchanged(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Replay after the review was resolved must not touch anything.
+
+        Once the surfaced event is resolved the session state advances and the
+        historical committed state's placeholder is consumed. Re-running the
+        surfacing pass against that stale state raises
+        InterpretationPlaceholderConsumedError, so a pending-row-only
+        precheck is not enough: the resolved row is the durable evidence that
+        the debt was already discharged.
+        """
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_resolved.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+        settled = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert settled.status_code == 200, settled.json()
+
+        session_service = composer_test_client.app.state.session_service
+        pending = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+        surfaced = [event for event in pending if event.affected_node_id == "summarize_rows"]
+        assert len(surfaced) == 1
+        asyncio.run(
+            session_service.resolve_interpretation_event(
+                session_id=UUID(session_id),
+                event_id=surfaced[0].id,
+                choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+                amended_value=None,
+                actor="test-user",
+            )
+        )
+
+        events_before = asyncio.run(session_service.list_interpretation_events(UUID(session_id)))
+        versions_before = asyncio.run(session_service.get_state_versions(UUID(session_id)))
+        current_before = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert current_before is not None
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json() == settled.json()
+
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == events_before
+        assert asyncio.run(session_service.get_state_versions(UUID(session_id))) == versions_before
+        current_after = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert current_after is not None and current_after.id == current_before.id
+
+    def test_confirm_wiring_replay_repairs_only_the_genuinely_missing_site(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Partial surfacing must be repaired per site, not wholesale.
+
+        An attempt that died midway through a multi-site pass leaves some
+        sites surfaced and others not. The replay must add exactly the
+        missing ones and leave the existing evidence untouched.
+        """
+        from elspeth.web.composer import service as composer_service_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt, extra_node_id="second_summary"),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_partial.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+
+        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+        original_create = type(composer_test_client.app.state.session_service).create_pending_interpretation_event
+        created = 0
+
+        async def _crash_after_the_first_site(self, **kwargs):
+            nonlocal created
+            if created >= 1:
+                raise _SurfacingWorkerCrash("worker lost partway through a multi-site surfacing pass")
+            created += 1
+            return await original_create(self, **kwargs)
+
+        monkeypatch.setattr(
+            type(composer_test_client.app.state.session_service),
+            "create_pending_interpretation_event",
+            _crash_after_the_first_site,
+        )
+        with pytest.raises(_SurfacingWorkerCrash):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        monkeypatch.setattr(
+            type(composer_test_client.app.state.session_service),
+            "create_pending_interpretation_event",
+            original_create,
+        )
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            original_surface,
+        )
+
+        session_service = composer_test_client.app.state.session_service
+
+        def _surfaced_nodes() -> list[str]:
+            events = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+            return sorted(event.affected_node_id for event in events if event.affected_node_id is not None)
+
+        partial = _surfaced_nodes()
+        assert len(partial) == 1, partial
+        surviving_id = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))[0].id
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.json()
+        assert _surfaced_nodes() == sorted(["summarize_rows", "second_summary"])
+        # The already-surfaced site was repaired, not recreated.
+        assert surviving_id in {
+            event.id for event in asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+        }
+
+    def test_confirm_wiring_replay_writes_nothing_when_the_stored_response_hash_mismatches(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Response-hash verification must precede every replay write.
+
+        The replay arm repairs surfacing debt, so if that repair ran before
+        the projected response was proven identical to the stored one, a
+        corrupt projection could mutate audit-primary state and only then
+        fail integrity verification. The mismatch must abort with ZERO
+        interpretation and session writes.
+        """
+        from elspeth.web.composer import service as composer_service_module
+
+        class _SurfacingWorkerCrash(BaseException):
+            """Escape the route exactly as a process loss would."""
+
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_tampered.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+
+        original_surface = composer_service_module.surface_pending_interpretation_reviews_for_state
+
+        def _crash_between_settlement_and_surfacing(*_args, **_kwargs):
+            raise _SurfacingWorkerCrash("worker lost after durable settlement, before surfacing")
+
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            _crash_between_settlement_and_surfacing,
+        )
+        with pytest.raises(_SurfacingWorkerCrash):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        monkeypatch.setattr(
+            composer_service_module,
+            "surface_pending_interpretation_reviews_for_state",
+            original_surface,
+        )
+
+        # The surfacing debt is real and outstanding — so if repair ran before
+        # verification, this replay is exactly when it would write.
+        session_service = composer_test_client.app.state.session_service
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == []
+
+        # Corrupt the PROJECTION, not the stored row: guided_operations
+        # terminal rows are immutable by database trigger, and a corrupt
+        # projection is the failure this ordering actually guards against.
+        from elspeth.web.sessions.routes.composer import guided as guided_route
+
+        original_project = guided_route.project_guided_response
+
+        def _corrupt_projection(record, *, payloads):
+            projected = original_project(record, payloads=payloads)
+            return projected.model_copy(update={"composition_state": None})
+
+        monkeypatch.setattr(guided_route, "project_guided_response", _corrupt_projection)
+
+        versions_before = asyncio.run(session_service.get_state_versions(UUID(session_id)))
+        current_before = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert current_before is not None
+
+        with pytest.raises(AuditIntegrityError):
+            composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+
+        assert asyncio.run(session_service.list_interpretation_events(UUID(session_id))) == []
+        assert asyncio.run(session_service.get_state_versions(UUID(session_id))) == versions_before
+        current_after = asyncio.run(session_service.get_current_state(UUID(session_id)))
+        assert current_after is not None and current_after.id == current_before.id
 
     def test_confirm_wiring_failure_after_dispatch_audit_insert_preserves_failure_evidence_only(
         self,

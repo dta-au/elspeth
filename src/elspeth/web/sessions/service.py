@@ -6483,38 +6483,6 @@ class SessionServiceImpl:
 
         return cast(list[CompositionProposalRecord], await self._run_sync(_sync))
 
-    async def get_proposal_by_committed_state(
-        self,
-        *,
-        session_id: UUID,
-        committed_state_id: UUID,
-    ) -> CompositionProposalRecord | None:
-        """Find the proposal that published one committed state, if any.
-
-        The guided wire-confirm replay arm re-derives the planner provenance
-        it must attribute a resurfaced interpretation review to; the settling
-        attempt reads it off the live authority row, which a replay does not
-        hold. Returns ``None`` for a state no proposal published (every
-        guided RESPOND that settles no proposal), which owes no surfacing.
-        """
-        sid = str(session_id)
-        state_id = str(committed_state_id)
-
-        def _sync() -> CompositionProposalRecord | None:
-            with self._engine.connect() as conn:
-                rows = conn.execute(
-                    select(composition_proposals_table)
-                    .where(composition_proposals_table.c.session_id == sid)
-                    .where(composition_proposals_table.c.committed_state_id == state_id)
-                ).fetchall()
-            if not rows:
-                return None
-            if len(rows) != 1:
-                raise AuditIntegrityError("one committed composition state was published by more than one proposal")
-            return _proposal_record_from_row(rows[0])
-
-        return cast("CompositionProposalRecord | None", await self._run_sync(_sync))
-
     async def reject_composition_proposal(
         self,
         *,

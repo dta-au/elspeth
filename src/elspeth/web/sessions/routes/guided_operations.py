@@ -183,10 +183,22 @@ def raise_guided_operation_failure(
 async def _replay_completed[ResponseT: BaseModel](
     outcome: GuidedOperationCompleted,
     replay: Callable[[GuidedOperationResult], Awaitable[ResponseT]],
+    after_verified: Callable[[GuidedOperationResult], Awaitable[None]] | None = None,
 ) -> ResponseT:
+    """Project the stored response, verify it, and only then repair any debt.
+
+    ``replay`` MUST be side-effect-free: it runs before the integrity check,
+    so a corrupt projection that wrote anything would mutate audit-primary
+    state and only afterwards be rejected. Every write a replay owes belongs
+    in ``after_verified``, which runs solely once the projected response has
+    been proven identical to the stored one.
+    """
+
     response = await replay(outcome.result)
     if guided_response_hash(response) != outcome.response_hash:
         raise AuditIntegrityError("Guided operation replay response hash does not match its stored response hash")
+    if after_verified is not None:
+        await after_verified(outcome.result)
     return response
 
 
@@ -198,6 +210,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
     kind: GuidedOperationKind,
     request: BaseModel,
     replay: Callable[[GuidedOperationResult], Awaitable[ResponseT]],
+    after_verified: Callable[[GuidedOperationResult], Awaitable[None]] | None = None,
     reserve_if_absent: Literal[False],
     takeover_expired: Literal[False],
 ) -> GuidedOperationLease | GuidedOperationExpired | ResponseT | None: ...
@@ -211,6 +224,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
     kind: GuidedOperationKind,
     request: BaseModel,
     replay: Callable[[GuidedOperationResult], Awaitable[ResponseT]],
+    after_verified: Callable[[GuidedOperationResult], Awaitable[None]] | None = None,
     reserve_if_absent: bool = True,
     takeover_expired: Literal[True] = True,
 ) -> GuidedOperationLease | ResponseT | None: ...
@@ -224,6 +238,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
     kind: GuidedOperationKind,
     request: BaseModel,
     replay: Callable[[GuidedOperationResult], Awaitable[ResponseT]],
+    after_verified: Callable[[GuidedOperationResult], Awaitable[None]] | None = None,
     reserve_if_absent: Literal[True] = True,
     takeover_expired: Literal[False],
 ) -> Never: ...
@@ -236,10 +251,15 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
     kind: GuidedOperationKind,
     request: BaseModel,
     replay: Callable[[GuidedOperationResult], Awaitable[ResponseT]],
+    after_verified: Callable[[GuidedOperationResult], Awaitable[None]] | None = None,
     reserve_if_absent: bool = True,
     takeover_expired: bool = True,
 ) -> GuidedOperationLease | GuidedOperationExpired | ResponseT | None:
     """Claim one operation or synchronously join its immutable terminal result.
+
+    ``replay`` projects the stored response and MUST NOT write: it runs
+    before the response-hash integrity check. Writes a replay owes go in
+    ``after_verified``, which runs only after that check passes.
 
     Active requests are polled to a terminal result.  Once a lease expires the
     caller returns to the atomic reserve primitive, which either performs the
@@ -300,7 +320,7 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
         if isinstance(outcome, (GuidedOperationClaimed, GuidedOperationTakenOver)):
             return GuidedOperationLease(fence=outcome.fence)
         if isinstance(outcome, GuidedOperationCompleted):
-            return await _replay_completed(outcome, replay)
+            return await _replay_completed(outcome, replay, after_verified)
         if isinstance(outcome, GuidedOperationFailed):
             raise_guided_operation_failure(outcome)
         if not isinstance(outcome, GuidedOperationActive):

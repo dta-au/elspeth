@@ -2705,13 +2705,6 @@ class SessionServiceProtocol(Protocol):
         status: ProposalLifecycleStatus | None = None,
     ) -> list[CompositionProposalRecord]: ...
 
-    async def get_proposal_by_committed_state(
-        self,
-        *,
-        session_id: UUID,
-        committed_state_id: UUID,
-    ) -> CompositionProposalRecord | None: ...
-
     async def reject_composition_proposal(
         self,
         *,

@@ -68,6 +68,7 @@ from elspeth.web.sessions.protocol import (
     GuidedOperationCompleted,
     GuidedOperationConflictError,
     GuidedOperationFailed,
+    GuidedOperationResult,
     GuidedOriginatingUserMessageDraft,
     GuidedPendingProposalInvalidation,
     GuidedReplayTurn,
@@ -2605,8 +2606,23 @@ async def post_guided_respond(
             raise AuditIntegrityError("Guided RESPOND projection returned the wrong response type")
         return response
 
-    async def _resurface_replayed_interpretation_reviews(record: CompositionStateRecord) -> None:
-        """Run the post-commit surfacing pass this operation's settlement owed.
+    async def _replay(result: object) -> GuidedRespondResponse:
+        """Project the stored response for an already-terminal operation.
+
+        MUST stay side-effect-free. This runs BEFORE the response-hash
+        integrity check in reserve_or_replay_guided_operation, so anything
+        written here would mutate audit-primary state under a projection not
+        yet proven to match the stored response. The surfacing debt this
+        operation may still owe is repaired in
+        _repair_replayed_surfacing_debt, which runs only after that check.
+        """
+
+        if type(result) is not GuidedCompositionStateResult:
+            raise AuditIntegrityError("Guided RESPOND replay has a non-state result locator")
+        return _response_from_record(await service.get_state_in_session(result.state_id, session_id))
+
+    async def _repair_replayed_surfacing_debt(result: GuidedOperationResult) -> None:
+        """Repair the post-commit surfacing this operation's settlement owed.
 
         accept_guided_pipeline_proposal terminalizes the guided operation in
         the same transaction that settles the proposal, but the surfacing pass
@@ -2616,21 +2632,52 @@ async def post_guided_respond(
         Accept card renders and /execute fails closed with
         UnresolvedInterpretationPlaceholderError with nothing the user can
         resolve, forever. Mirrors the freeform exact-committed replay arm
-        (pipeline_settlement.py). The pass is idempotent, so this is a no-op
-        whenever the settling attempt already completed it.
+        (pipeline_settlement.py).
 
-        Provenance is re-derived from the proposal that published this state,
-        so a replayed surface names the same planner the settling attempt
-        would have named. A state no proposal published (every guided RESPOND
-        that settles no proposal) owes no surfacing.
+        The debt is computed per site against durable evidence in ANY
+        resolution status, so this repairs only genuinely missing sites and
+        writes nothing once the settling attempt (or a prior replay) covered
+        them. That matters beyond idempotence: a replay arriving after the
+        review was resolved and the session advanced must not recreate a
+        consumed placeholder against the stale historical state.
+
+        Identity comes from the operation's own result locator, never from a
+        state lookup: a state id is not a unique proposal locator (a blob-only
+        approval can legitimately reuse an existing state), so resolving the
+        proposal by committed state could select unrelated provenance.
+
+        Only a PIPELINE proposal that committed THIS EXACT state owes
+        surfacing. The other shapes are ordinary, not anomalies: an operation
+        that settled no proposal carries no proposal id, and a proposal-
+        STAGING operation carries its still-pending proposal's id. Neither
+        published a committed state, so neither owes anything — and refusing
+        to write without all three conditions is what keeps a replay from
+        attributing a review to a proposal that did not author it.
         """
 
-        proposal = await service.get_proposal_by_committed_state(
-            session_id=session_id,
-            committed_state_id=record.id,
-        )
-        if proposal is None:
+        if type(result) is not GuidedCompositionStateResult:
+            raise AuditIntegrityError("Guided RESPOND replay has a non-state result locator")
+        if result.proposal_id is None:
             return
+        authority = await service.get_authoritative_composition_proposal(
+            session_id=session_id,
+            proposal_id=result.proposal_id,
+            reviewed_facts=None,
+        )
+        pipeline_authority = authority.pipeline
+        if pipeline_authority is None:
+            return
+        row = pipeline_authority.row
+        if row.status != "committed" or row.committed_state_id != result.state_id:
+            return
+        if (
+            row.composer_model_identifier is None
+            or row.composer_model_version is None
+            or row.composer_provider is None
+            or row.composer_skill_hash is None
+        ):
+            raise AuditIntegrityError("Guided RESPOND replay result proposal has incomplete composer provenance")
+        record = await service.get_state_in_session(result.state_id, session_id)
         from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
 
         await surface_pending_interpretation_reviews_for_state(
@@ -2638,18 +2685,12 @@ async def post_guided_respond(
             sessions_service=service,
             session_id=str(session_id),
             current_state_id=str(record.id),
-            model_identifier=proposal.composer_model_identifier or "guided-planner",
-            model_version=proposal.composer_model_version or "guided-planner",
-            provider=proposal.composer_provider or "unknown",
-            composer_skill_hash=proposal.composer_skill_hash or "",
+            model_identifier=row.composer_model_identifier,
+            model_version=row.composer_model_version,
+            provider=row.composer_provider,
+            composer_skill_hash=row.composer_skill_hash,
+            only_missing_evidence=True,
         )
-
-    async def _replay(result: object) -> GuidedRespondResponse:
-        if type(result) is not GuidedCompositionStateResult:
-            raise AuditIntegrityError("Guided RESPOND replay has a non-state result locator")
-        record = await service.get_state_in_session(result.state_id, session_id)
-        await _resurface_replayed_interpretation_reviews(record)
-        return _response_from_record(record)
 
     def _require_bound_revision_target(current_turn: Turn, *, public_error: bool) -> None:
         """Require the exact stable target advertised by the pending proposal."""
@@ -2983,6 +3024,7 @@ async def post_guided_respond(
         kind="guided_respond",
         request=body,
         replay=_replay,
+        after_verified=_repair_replayed_surfacing_debt,
         reserve_if_absent=False,
         takeover_expired=False,
     )
@@ -3022,6 +3064,7 @@ async def post_guided_respond(
                 kind="guided_respond",
                 request=body,
                 replay=_replay,
+                after_verified=_repair_replayed_surfacing_debt,
             )
             if pending is None:  # pragma: no cover
                 raise AuditIntegrityError("Guided RESPOND takeover was not reserved")
@@ -3046,6 +3089,7 @@ async def post_guided_respond(
                     kind="guided_respond",
                     request=body,
                     replay=_replay,
+                    after_verified=_repair_replayed_surfacing_debt,
                     reserve_if_absent=False,
                     takeover_expired=False,
                 )
@@ -3081,6 +3125,7 @@ async def post_guided_respond(
                 kind="guided_respond",
                 request=body,
                 replay=_replay,
+                after_verified=_repair_replayed_surfacing_debt,
             )
             pending = None
             if reserved is None:  # pragma: no cover
@@ -4887,6 +4932,7 @@ async def post_guided_respond(
                 kind="guided_respond",
                 request=body,
                 replay=_replay,
+                after_verified=_repair_replayed_surfacing_debt,
                 reserve_if_absent=False,
             )
             if joined is None:
