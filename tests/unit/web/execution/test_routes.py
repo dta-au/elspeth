@@ -1383,7 +1383,7 @@ class TestRunDiagnosticsEndpoint:
         async def _record_lock_state(*args: Any, **kwargs: Any) -> None:
             held_during_persist.append(compose_lock.locked())
 
-        app.state.session_service.add_message = AsyncMock(side_effect=_record_lock_state)
+        app.state.session_service.add_message = AsyncMock(spec=SessionServiceProtocol.add_message, side_effect=_record_lock_state)
 
         endpoint = _route_endpoint(app, "evaluate_run_diagnostics")
         await endpoint(
