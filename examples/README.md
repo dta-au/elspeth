@@ -100,6 +100,7 @@ export OPENROUTER_API_KEY="your-key-from-openrouter.ai"
 
 | Example | What It Demonstrates |
 |---------|---------------------|
+| [`llm_source`](llm_source/) | One authored prompt becomes one generated row through the source-native `llm` plugin |
 | [`openrouter_sentiment`](openrouter_sentiment/) | Single-query sentiment analysis (sequential and pooled modes) |
 | [`openrouter_multi_query_assessment`](openrouter_multi_query_assessment/) | Multi-query matrix (case studies x criteria) with stress/overflow variants |
 | [`schema_contracts_llm_assessment`](schema_contracts_llm_assessment/) | LLM pipeline with DAG-time schema contract validation |
@@ -125,7 +126,6 @@ shown in the individual READMEs.
 
 | Example | What It Demonstrates |
 |---------|---------------------|
-| [`llm_source`](llm_source/) | One authored prompt becomes one generated row through the source-native `llm` plugin |
 | [`chaosllm_sentiment`](chaosllm_sentiment/) | Sentiment analysis against ChaosLLM (mirrors `openrouter_sentiment`) |
 | [`chaosllm_endurance`](chaosllm_endurance/) | Multi-query endurance test with fault injection |
 | [`rate_limited_llm`](rate_limited_llm/) | LLM pipeline with rate limiting (30 req/min cap) |

@@ -43,6 +43,7 @@ _EXAMPLES_WITH_ENV_VARS: frozenset[str] = frozenset(
         "azure_keyvault_secrets",
         "azure_openai_sentiment",
         "chroma_rag_qa",
+        "llm_source",
         "multi_query_assessment",
         "openrouter_multi_query_assessment",
         "openrouter_sentiment",
@@ -331,7 +332,9 @@ class TestShippedExamples:
 
         options = source["options"]
         assert options["provider"] == "openrouter"
-        assert options["base_url"] == "http://127.0.0.1:8199/v1"
+        assert options["api_key"] == "${OPENROUTER_API_KEY}"
+        assert options["model"] == "openai/gpt-4.1-mini"
+        assert "base_url" not in options
         assert isinstance(options["prompt_template"], str) and options["prompt_template"].strip()
         assert "{{" not in options["prompt_template"]
         assert "{%" not in options["prompt_template"]
@@ -361,6 +364,7 @@ class TestShippedExamples:
 
         monkeypatch.setattr(OpenRouterLLMProvider, "runtime_preflight", reject_provider_call)
         monkeypatch.setattr(OpenRouterLLMProvider, "execute_query", reject_provider_call)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "provider-token-placeholder")
         monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
         monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
 
