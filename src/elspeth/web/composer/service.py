@@ -6723,6 +6723,12 @@ _ADVISOR_SUMMARY_VALUE_KEYS: Final[frozenset[str]] = frozenset(
     }
 )
 _ADVISOR_SUMMARY_VALUE_MAX_CHARS: Final[int] = 120
+# Fixed/flexible schema values carry several bounded field declarations. The
+# generic compact cap can cut a normal two-field contract mid-declaration,
+# hiding the second field's type/required/nullability facts from the advisor.
+# Keep schemas bounded, but give this closed structural value enough room to
+# render ordinary explicit contracts completely.
+_ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS: Final[int] = 1000
 # Prompt-shaped option values (``prompt_template``/``template``) get a much
 # larger render budget so the advisor sees the WHOLE prompt — its rubric
 # anchors and (for the degeneracy check) its row-field interpolations — not
@@ -6852,9 +6858,12 @@ def _render_options_for_advisor(options: Mapping[str, Any]) -> str:
     name_only: list[str] = []
     for key in sorted(options.keys()):
         if key in _ADVISOR_SUMMARY_VALUE_KEYS:
-            limit = (
-                _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS if key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS else _ADVISOR_SUMMARY_VALUE_MAX_CHARS
-            )
+            if key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
+                limit = _ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS
+            elif key == "schema":
+                limit = _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS
+            else:
+                limit = _ADVISOR_SUMMARY_VALUE_MAX_CHARS
             rendered = _truncate_for_advisor(str(options[key]), limit)
             if key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
                 value_parts.append(f"{key}_untrusted_json={json.dumps(rendered)}")
@@ -6874,8 +6883,8 @@ def _truncate_for_advisor(value: str, limit: int = _ADVISOR_SUMMARY_VALUE_MAX_CH
     """Bound a rendered value so the summary stays compact. Never raises.
 
     ``limit`` defaults to the global compact cap; prompt-shaped keys pass the
-    larger :data:`_ADVISOR_SUMMARY_PROMPT_VALUE_MAX_CHARS` so the advisor sees
-    the whole prompt. Every other call site is unaffected.
+    larger schema/prompt budgets so the advisor sees complete ordinary field
+    contracts and the whole prompt. Every other call site is unaffected.
     """
     if len(value) <= limit:
         return value

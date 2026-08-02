@@ -631,9 +631,7 @@ def test_summarize_renders_dynamic_field_contract_values() -> None:
 def _textract_advisor_state(
     *,
     schema_mode: str = "fixed",
-    schema_field_type: str = "str",
     schema_field_required: bool = True,
-    schema_field_nullable: bool = False,
     text_field: str = "document_text",
     page_count_field: str = "document_pages",
     region: str = "ap-southeast-2",
@@ -649,11 +647,17 @@ def _textract_advisor_state(
                 "mode": schema_mode,
                 "fields": [
                     {
-                        "name": "doc",
-                        "type": schema_field_type,
+                        "name": "doc_bucket",
+                        "type": "str",
                         "required": schema_field_required,
-                        "nullable": schema_field_nullable,
-                    }
+                        "nullable": False,
+                    },
+                    {
+                        "name": "doc_key",
+                        "type": "int",
+                        "required": schema_field_required,
+                        "nullable": True,
+                    },
                 ],
             },
         },
@@ -707,8 +711,17 @@ def test_summarize_renders_complete_textract_contract_and_changes_with_committed
     sink_line = next(line for line in summary.splitlines() if "analysed_documents: plugin=json" in line)
 
     assert "schema=" in source_line
-    for schema_fact in ("'mode': 'fixed'", "'name': 'doc'", "'type': 'str'", "'required': True", "'nullable': False"):
+    for schema_fact in (
+        "'mode': 'fixed'",
+        "'name': 'doc_bucket'",
+        "'type': 'str'",
+        "'nullable': False",
+        "'name': 'doc_key'",
+        "'type': 'int'",
+        "'nullable': True",
+    ):
         assert schema_fact in source_line
+    assert source_line.count("'required': True") == 2
     assert "bucket_field=document_bucket" in node_line
     assert "key_field=document_key" in node_line
     assert "text_field=document_text" in node_line
@@ -725,9 +738,7 @@ def test_summarize_renders_complete_textract_contract_and_changes_with_committed
 
     changed = _textract_advisor_state(
         schema_mode="flexible",
-        schema_field_type="int",
         schema_field_required=False,
-        schema_field_nullable=True,
         text_field="ocr_text",
         page_count_field="page_total",
         region="us-east-1",
@@ -738,8 +749,9 @@ def test_summarize_renders_complete_textract_contract_and_changes_with_committed
     changed_node_line = next(line for line in changed_summary.splitlines() if "analyse_document" in line)
 
     assert summary != changed_summary
-    for schema_fact in ("'mode': 'flexible'", "'type': 'int'", "'required': False", "'nullable': True"):
+    for schema_fact in ("'mode': 'flexible'", "'name': 'doc_bucket'", "'name': 'doc_key'"):
         assert schema_fact in changed_source_line
+    assert changed_source_line.count("'required': False") == 2
     assert "text_field=ocr_text" in changed_node_line
     assert "page_count_field=page_total" in changed_node_line
     assert "region=us-east-1" in changed_node_line
@@ -2076,6 +2088,35 @@ def test_render_options_untruncates_prompt_but_caps_other_values():
     expr_value = expr_segment.split(",", 1)[0].split(";", 1)[0]
     assert len(expr_value) <= _ADVISOR_SUMMARY_VALUE_MAX_CHARS
     assert "xxxxxxxxxx" in expr_value  # it really is the (truncated) expression
+
+
+def test_render_options_uses_a_larger_but_bounded_schema_budget():
+    from elspeth.web.composer.service import (
+        _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS,
+        _ADVISOR_SUMMARY_VALUE_MAX_CHARS,
+        _render_options_for_advisor,
+    )
+
+    schema = {
+        "mode": "fixed",
+        "fields": [
+            {
+                "name": f"field_{index:03d}",
+                "type": "str",
+                "required": True,
+                "nullable": False,
+            }
+            for index in range(100)
+        ],
+    }
+
+    rendered = _render_options_for_advisor({"schema": schema})
+    schema_value = rendered.removeprefix("options: schema=")
+
+    assert _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS > _ADVISOR_SUMMARY_VALUE_MAX_CHARS
+    assert "field_001" in schema_value  # schema evidence survives beyond the generic 120-char cap
+    assert len(schema_value) <= _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS
+    assert schema_value.endswith("…")
 
 
 def test_render_options_template_key_also_untruncated():
