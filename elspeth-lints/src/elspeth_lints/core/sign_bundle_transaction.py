@@ -25,7 +25,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 from elspeth_lints.core.atomic_io import allowlist_mutation_lock, atomic_update_text
 from elspeth_lints.core.strict_json import StrictJSONError, strict_json_loads
@@ -550,6 +550,27 @@ def rollback_pending_publish(tx_path: Path, manifest: dict[str, Any]) -> None:
         save_manifest(tx_path, manifest)
 
 
+def _raise_source_validation_failure_after_rollback(
+    *,
+    tx_path: Path,
+    manifest: dict[str, Any],
+    message: str,
+    primary_error: Exception | None,
+) -> NoReturn:
+    """Restore the base while keeping source validation as the primary failure."""
+    try:
+        rollback_pending_publish(tx_path, manifest)
+    except Exception as rollback_error:
+        failure = SignBundleTransactionError(
+            f"{message}; rollback also failed with {type(rollback_error).__name__}; active allowlist recovery remains required"
+        )
+        failure.add_note(f"Secondary source-validation rollback failure: {type(rollback_error).__name__}.")
+        if primary_error is not None:
+            raise failure from primary_error
+        raise failure from rollback_error
+    raise SignBundleTransactionError(f"{message}; rolled back active allowlist") from primary_error
+
+
 def _validate_pending_source_publish(
     *,
     bundle: Any,
@@ -575,14 +596,20 @@ def _validate_pending_source_publish(
             allowlist_dir=Path(manifest["candidate_dir"]),
             bundle_allowlist_dir=args.allowlist_dir,
         )
-    except ValueError:
-        rollback_pending_publish(tx_path, manifest)
-        raise SignBundleTransactionError(
-            "source tree or bundle bindings changed during coherent publish; rolled back active allowlist"
-        ) from None
+    except Exception as exc:
+        _raise_source_validation_failure_after_rollback(
+            tx_path=tx_path,
+            manifest=manifest,
+            message=f"source verification failed during coherent publish ({type(exc).__name__})",
+            primary_error=exc,
+        )
     if not verification.ok:
-        rollback_pending_publish(tx_path, manifest)
-        raise SignBundleTransactionError("source tree or bundle bindings changed during coherent publish; rolled back active allowlist")
+        _raise_source_validation_failure_after_rollback(
+            tx_path=tx_path,
+            manifest=manifest,
+            message="source tree or bundle bindings changed during coherent publish",
+            primary_error=None,
+        )
     manifest["source_validation_state"] = _SOURCE_VALIDATION_VALIDATED
     save_manifest(tx_path, manifest)
 

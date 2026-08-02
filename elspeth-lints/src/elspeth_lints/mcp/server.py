@@ -142,15 +142,17 @@ _OPERATOR_KEY_PLACEHOLDER = f"{_JUDGE_METADATA_SIGNATURE_ENV_VAR}=<operator-held
 
 def _require_str_arg(arguments: dict[str, Any], name: str) -> str:
     value = arguments.get(name)
-    if not isinstance(value, str) or not value:
+    if type(value) is not str or not value:
         raise ValueError(f"argument {name!r} is required and must be a non-empty string")
     return value
 
 
 def _resolve_bundle_path(ctx: _ServerContext, arguments: dict[str, Any]) -> Path:
     """Resolve ``<staged_dir>/<bundle_id>.json`` from the ``bundle_id`` arg."""
+    from elspeth_lints.core.review_bundle import resolve_staged_bundle_path
+
     bundle_id = _require_str_arg(arguments, "bundle_id")
-    return ctx.staged_dir / f"{bundle_id}.json"
+    return resolve_staged_bundle_path(staged_dir=ctx.staged_dir, bundle_id=bundle_id)
 
 
 def _shell_join_keep_user(parts: list[str]) -> str:
@@ -325,14 +327,27 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
         diagnose_judge_signatures,
     )
     from elspeth_lints.core.review_bundle import BundleAction
-    from elspeth_lints.core.tier_model_scan import census_tree_targets, plan_non_judge_rotations
-    from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
+    from elspeth_lints.core.tier_model_scan import (
+        TargetCoverage,
+        census_tree_targets,
+        plan_judge_cleanup_groups,
+        plan_non_judge_rotations,
+        scan_tree_findings,
+    )
     from elspeth_lints.rules.trust_tier.tier_model.rule import _load_tier_model_allowlist
 
     actions: list[Any] = []
 
     # drift_repair + stale_delete from the keyless diagnosis index.
     diagnosis = diagnose_judge_signatures(root=ctx.root, allowlist_dir=ctx.allowlist_dir)
+    diagnosis_keys: set[str] = set()
+    duplicate_diagnosis_keys: set[str] = set()
+    for item in diagnosis.items:
+        if item.key in diagnosis_keys:
+            duplicate_diagnosis_keys.add(item.key)
+        diagnosis_keys.add(item.key)
+    if duplicate_diagnosis_keys:
+        raise ValueError("stage_scan found duplicate diagnosis key(s): " + ", ".join(repr(key) for key in sorted(duplicate_diagnosis_keys)))
     for item in diagnosis.items:
         if item.status in _SIGNABLE_DIAGNOSIS_STATUSES:
             actions.append(
@@ -350,21 +365,31 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
     # Scan once, classify full coverage, then remove findings already assigned
     # to judge-gated diagnosis before planning the residual pre-judge lane.
     allowlist = _load_tier_model_allowlist(ctx.allowlist_dir)
-    covered_prefixes: set[str] = set()
-    for entry in allowlist.entries:
-        try:
-            covered_prefixes.add(identity_prefix(entry.key))
-        except ValueError:
-            continue  # a malformed (non-canonical) key cannot own a prefix
-    target_scan = census_tree_targets(
-        root=ctx.root,
-        covered_prefixes=covered_prefixes,
-        per_file_rules=allowlist.per_file_rules,
-    )
+    raw_findings = tuple(scan_tree_findings(root=ctx.root))
     rotation_plan = plan_non_judge_rotations(
-        findings=target_scan.findings,
+        findings=raw_findings,
         allowlist=allowlist,
         diagnosis_items=diagnosis.items,
+    )
+    cleanup_groups = plan_judge_cleanup_groups(
+        findings=raw_findings,
+        allowlist=allowlist,
+        orphan_keys=frozenset(item.key for item in diagnosis.items if item.status in _STALE_DELETE_ORPHAN_STATUSES),
+    )
+    resign_assigned_keys = {rotation.new_key for rotation in rotation_plan.rotations}
+    resign_assigned_keys.update(finding_key for group in cleanup_groups for finding_key in group.finding_keys)
+    target_coverage = TargetCoverage(
+        exact_keys=frozenset(entry.key for entry in allowlist.entries),
+        diagnosis_assigned_keys=frozenset(
+            item.repair_key for item in diagnosis.items if item.status in _SIGNABLE_DIAGNOSIS_STATUSES and item.repair_key is not None
+        ),
+        resign_assigned_keys=frozenset(resign_assigned_keys),
+    )
+    target_scan = census_tree_targets(
+        root=ctx.root,
+        findings=raw_findings,
+        coverage=target_coverage,
+        per_file_rules=allowlist.per_file_rules,
     )
     if rotation_plan.ambiguous:
         groups = ", ".join(
@@ -379,6 +404,16 @@ def _build_scan_plan(ctx: _ServerContext) -> tuple[list[Any], Any]:
         actions.append(_new_judgment_action_from_finding(finding))
 
     actions.sort(key=lambda action: (action.kind, action.key))
+    action_keys: set[str] = set()
+    duplicate_action_keys: set[str] = set()
+    for action in actions:
+        if action.key in action_keys:
+            duplicate_action_keys.add(action.key)
+        action_keys.add(action.key)
+    if duplicate_action_keys:
+        raise ValueError(
+            "stage_scan found duplicate semantic action key(s): " + ", ".join(repr(key) for key in sorted(duplicate_action_keys))
+        )
     return actions, target_scan.census
 
 
@@ -407,8 +442,7 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
 
     from elspeth_lints.core.review_bundle import ReviewBundle, write_bundle
 
-    bundle_id_arg = arguments.get("bundle_id")
-    bundle_id = bundle_id_arg if isinstance(bundle_id_arg, str) and bundle_id_arg else f"stage-scan-{uuid.uuid4().hex[:12]}"
+    bundle_id = _require_str_arg(arguments, "bundle_id") if "bundle_id" in arguments else f"stage-scan-{uuid.uuid4().hex[:12]}"
     staged_by_arg = arguments.get("staged_by")
     staged_by = staged_by_arg if isinstance(staged_by_arg, str) and staged_by_arg else "elspeth-judge-agent"
 
@@ -441,6 +475,8 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
         "target_census": {
             "raw_target_count": target_census.raw_target_count,
             "exact_covered_count": target_census.exact_covered_count,
+            "diagnosis_assigned_count": target_census.diagnosis_assigned_count,
+            "resign_assigned_count": target_census.resign_assigned_count,
             "per_file_covered_count": target_census.per_file_covered_count,
             "uncovered_count": target_census.uncovered_count,
         },
@@ -589,8 +625,7 @@ def _tool_stage_rekey(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
 
     old_key_env = _require_str_arg(arguments, "old_key_env")
     new_key_env = _require_str_arg(arguments, "new_key_env")
-    bundle_id_arg = arguments.get("bundle_id")
-    bundle_id = bundle_id_arg if isinstance(bundle_id_arg, str) and bundle_id_arg else f"stage-rekey-{uuid.uuid4().hex[:12]}"
+    bundle_id = _require_str_arg(arguments, "bundle_id") if "bundle_id" in arguments else f"stage-rekey-{uuid.uuid4().hex[:12]}"
     staged_by_arg = arguments.get("staged_by")
     staged_by = staged_by_arg if isinstance(staged_by_arg, str) and staged_by_arg else "elspeth-judge-agent"
 

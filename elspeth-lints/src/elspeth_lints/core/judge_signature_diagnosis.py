@@ -15,7 +15,7 @@ import json
 import os
 import shlex
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -47,6 +47,7 @@ from elspeth_lints.core.source_excerpt import (
 from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
 
 VerificationMode = Literal["shape-only", "authoritative"]
+SignatureFailureStatus = Literal["MISSING_SIGNATURE", "INVALID_SIGNATURE"]
 
 _OPERATOR_KEY_PLACEHOLDER = f"{_JUDGE_METADATA_SIGNATURE_ENV_VAR}=<operator-held-key>"
 _OK_STATUSES = frozenset({"OK_SHAPE_ONLY", "OK_AUTHORITATIVE", "PRE_JUDGE"})
@@ -83,6 +84,8 @@ class JudgeSignatureDiagnosis:
     repair_command: str | None = None
     repair_key: str | None = None
     detail: str | None = None
+    signature_status: SignatureFailureStatus | None = None
+    signature_detail: str | None = None
 
     @property
     def requires_action(self) -> bool:
@@ -164,11 +167,12 @@ def _downgrade_multiply_owned_identity_replacements(
             resolved.append(item)
             continue
         resolved.append(
-            JudgeSignatureDiagnosis(
+            replace(
+                item,
                 status="NO_MATCHING_FINDING",
-                key=item.key,
-                source_file=item.source_file,
                 note="multiple allowlist rows own this identity; delete stale authority before judging the live finding",
+                repair_command=None,
+                repair_key=None,
                 detail=f"identity_owner_keys={sorted(owner.key for owner in owners)!r}",
             )
         )
@@ -213,6 +217,10 @@ def render_judge_signature_diagnosis_text(report: JudgeSignatureDiagnosisReport)
         lines.append(f"  note: {item.note}")
         if item.detail is not None:
             lines.append(f"  detail: {item.detail}")
+        if item.signature_status is not None:
+            lines.append(f"  signature_status: {item.signature_status}")
+        if item.signature_detail is not None:
+            lines.append(f"  signature_detail: {item.signature_detail}")
         if item.repair_command is not None:
             lines.append(f"  repair: {item.repair_command}")
         if item.repair_key is not None and item.repair_key != item.key:
@@ -233,6 +241,8 @@ def render_judge_signature_diagnosis_json(report: JudgeSignatureDiagnosisReport)
                 "source_file": item.source_file,
                 "note": item.note,
                 "detail": item.detail,
+                "signature_status": item.signature_status,
+                "signature_detail": item.signature_detail,
                 "repair_command": item.repair_command,
                 "repair_key": item.repair_key,
                 "requires_action": item.requires_action,
@@ -397,28 +407,35 @@ def _diagnose_raw_entry(
             source_file=source_file,
             note="entry predates signed judge metadata; no signed metadata repair command is applicable",
         )
-    if entry.judge_metadata_signature is None:
-        return JudgeSignatureDiagnosis(
-            status="MISSING_SIGNATURE",
-            key=entry.key,
-            source_file=source_file,
-            note="re-justify required; post-judge metadata is unsigned editable text",
-            repair_command=_justify_command(entry=entry, root=root, allowlist_dir=allowlist_dir),
-        )
+    binding_diagnosis = _diagnose_entry_binding(
+        entry=entry,
+        source_file=source_file,
+        root=root,
+        allowlist_dir=allowlist_dir,
+        mode=mode,
+        findings_by_file=findings_by_file,
+    )
+    return _layer_signature_condition(
+        entry=entry,
+        source_file=source_file,
+        index=index,
+        root=root,
+        allowlist_dir=allowlist_dir,
+        mode=mode,
+        binding_diagnosis=binding_diagnosis,
+    )
 
-    if mode == "authoritative":
-        try:
-            _verify_judge_metadata_signature_at_load(entry, context=f"{source_file}:allow_hits[{index}]")
-        except ValueError as exc:
-            return JudgeSignatureDiagnosis(
-                status="INVALID_SIGNATURE",
-                key=entry.key,
-                source_file=source_file,
-                note="re-justify required; persisted signed judge metadata does not match the operator HMAC recompute",
-                detail=str(exc),
-                repair_command=_justify_command(entry=entry, root=root, allowlist_dir=allowlist_dir),
-            )
 
+def _diagnose_entry_binding(
+    *,
+    entry: AllowlistEntry,
+    source_file: str,
+    root: Path,
+    allowlist_dir: Path,
+    mode: VerificationMode,
+    findings_by_file: dict[Path, list[Any]],
+) -> JudgeSignatureDiagnosis:
+    """Derive the live source disposition before considering signature state."""
     key_parts = _parse_entry_key(entry.key)
     if key_parts is None:
         return JudgeSignatureDiagnosis(
@@ -480,6 +497,63 @@ def _diagnose_raw_entry(
         root=root,
         allowlist_dir=allowlist_dir,
     )
+
+
+def _layer_signature_condition(
+    *,
+    entry: AllowlistEntry,
+    source_file: str,
+    index: int,
+    root: Path,
+    allowlist_dir: Path,
+    mode: VerificationMode,
+    binding_diagnosis: JudgeSignatureDiagnosis,
+) -> JudgeSignatureDiagnosis:
+    """Preserve binding-owned routing while exposing signed-metadata failure.
+
+    A shifted or missing source determines whether the action is a re-judgment
+    or deletion. Missing/invalid HMAC metadata remains explicit secondary
+    evidence on that diagnosis. Only an otherwise-current binding routes to a
+    signature-only repair status.
+    """
+    signature_status: SignatureFailureStatus | None = None
+    signature_detail: str | None = None
+    if entry.judge_metadata_signature is None:
+        signature_status = "MISSING_SIGNATURE"
+    elif mode == "authoritative":
+        try:
+            _verify_judge_metadata_signature_at_load(entry, context=f"{source_file}:allow_hits[{index}]")
+        except ValueError as exc:
+            signature_status = "INVALID_SIGNATURE"
+            signature_detail = str(exc)
+
+    if binding_diagnosis.status not in _OK_STATUSES:
+        return replace(
+            binding_diagnosis,
+            signature_status=signature_status,
+            signature_detail=signature_detail,
+        )
+    if signature_status == "MISSING_SIGNATURE":
+        return JudgeSignatureDiagnosis(
+            status=signature_status,
+            key=entry.key,
+            source_file=source_file,
+            note="re-justify required; post-judge metadata is unsigned editable text",
+            repair_command=_justify_command(entry=entry, root=root, allowlist_dir=allowlist_dir),
+            signature_status=signature_status,
+        )
+    if signature_status == "INVALID_SIGNATURE":
+        return JudgeSignatureDiagnosis(
+            status=signature_status,
+            key=entry.key,
+            source_file=source_file,
+            note="re-justify required; persisted signed judge metadata does not match the operator HMAC recompute",
+            detail=signature_detail,
+            repair_command=_justify_command(entry=entry, root=root, allowlist_dir=allowlist_dir),
+            signature_status=signature_status,
+            signature_detail=signature_detail,
+        )
+    return _ok(entry=entry, source_file=source_file, mode=mode)
 
 
 def _diagnose_v1_entry(

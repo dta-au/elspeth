@@ -28,7 +28,7 @@ from elspeth_lints.core.allowlist import (
     compute_judge_metadata_signature,
 )
 from elspeth_lints.core.judge import JUDGE_POLICY_HASH, TRANSPORT_CODEX_CLI, JudgeConfigurationError
-from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle, read_bundle, write_bundle
+from elspeth_lints.core.review_bundle import BundleAction, ReviewBundle, dump_bundle, read_bundle, write_bundle
 from elspeth_lints.mcp import server as judge_server
 from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
 
@@ -278,6 +278,23 @@ def test_stage_status_reads_bundle(tmp_path: Path) -> None:
     assert "--dry-run" in payload["sign_bundle_command"]
 
 
+def test_stage_status_rejects_bundle_id_path_escape(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    staged_dir.mkdir()
+    (tmp_path / "outside.json").write_text(dump_bundle(_status_bundle(root, allowlist_dir, ())), encoding="utf-8")
+
+    outcome = judge_server._run_tool(
+        _context(root, allowlist_dir, staged_dir),
+        "stage_status",
+        {"bundle_id": "../outside"},
+    )
+
+    assert outcome.is_error is True
+    assert "bundle_id" in outcome.text
+
+
 def test_stage_status_fails_closed_with_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(_JUDGE_METADATA_SIGNATURE_ENV_VAR, "x" * 32)
     ctx = _context(_build_root(tmp_path), _build_allowlist_dir(tmp_path), tmp_path / "staged")
@@ -353,6 +370,8 @@ def test_stage_scan_builds_bundle(tmp_path: Path) -> None:
     assert payload["target_census"] == {
         "raw_target_count": 2,
         "exact_covered_count": 1,
+        "diagnosis_assigned_count": 0,
+        "resign_assigned_count": 0,
         "per_file_covered_count": 0,
         "uncovered_count": 1,
     }
@@ -444,6 +463,30 @@ def test_stage_scan_accepts_mixed_signed_and_prejudge_exact_same_prefix_group(tm
     bundle = _scan_and_read(ctx, "mixed-exact")
 
     assert bundle.actions == ()
+
+
+def test_stage_scan_stages_unsigned_second_same_prefix_finding(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    target = root / "plugins" / "gadget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'anonymous')\n"
+        "        return payload.get('second', first)\n",
+        encoding="utf-8",
+    )
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(findings) == 2
+    assert len({identity_prefix(_canonical_key(finding)) for finding in findings}) == 1
+    _write_signed_v2_entry(allowlist_dir, "signed.yaml", finding=findings[0])
+
+    bundle = _scan_and_read(_context(root, allowlist_dir, staged_dir), "distinct-same-prefix")
+
+    assert [action.key for action in bundle.actions if action.kind == "justify"] == [_canonical_key(findings[1])]
 
 
 def test_stage_scan_does_not_stage_per_file_rule_covered_finding(tmp_path: Path) -> None:
@@ -642,6 +685,99 @@ def test_stage_scan_multiple_stale_rows_for_one_semantic_replacement_uses_two_cy
     assert stale_keys == {first_key, second_key}
     assert all(action.kind != "drift_repair" for action in bundle.actions)
     assert all(action.kind != "justify" for action in bundle.actions)
+
+
+def test_stage_scan_symmetric_stale_rows_and_live_replacements_uses_two_cycle_path(tmp_path: Path) -> None:
+    """A 2:2 signed cleanup group must not enter mechanical rotation."""
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    target = root / "plugins" / "widget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'old-first')\n"
+        "        return payload.get('second', 'old-second') + first\n",
+        encoding="utf-8",
+    )
+    old_findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(old_findings) == 2
+    old_keys = {_write_signed_v2_entry(allowlist_dir, f"old-{index}.yaml", finding=finding) for index, finding in enumerate(old_findings)}
+
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'new-first')\n"
+        "        return payload.get('second', 'new-second') + first\n",
+        encoding="utf-8",
+    )
+    replacements = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    replacement_keys = {_canonical_key(finding) for finding in replacements}
+    assert len(replacement_keys) == 2
+    assert old_keys.isdisjoint(replacement_keys)
+    assert len({identity_prefix(key) for key in old_keys | replacement_keys}) == 1
+
+    bundle = _scan_and_read(_context(root, allowlist_dir, staged_dir), "scan-symmetric-cleanup-cycle-1")
+
+    assert {action.key for action in bundle.actions if action.kind == "stale_delete"} == old_keys
+    assert all(action.kind not in {"drift_repair", "rotation", "justify"} for action in bundle.actions)
+
+
+def test_stage_scan_rejects_duplicate_signed_diagnosis_keys_before_bundle_write(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "first.yaml", finding=finding)
+    assert _write_signed_v2_entry(allowlist_dir, "second.yaml", finding=finding) == key
+
+    with pytest.raises(ValueError, match="duplicate diagnosis key"):
+        judge_server.build_scan_actions(root=root, allowlist_dir=allowlist_dir)
+
+    outcome = judge_server._run_tool(
+        _context(root, allowlist_dir, staged_dir),
+        "stage_scan",
+        {"bundle_id": "duplicate-diagnosis"},
+    )
+    assert outcome.is_error is True
+    assert "duplicate diagnosis key" in outcome.text
+    assert not (staged_dir / "duplicate-diagnosis.json").exists()
+
+
+def test_stage_scan_rejects_duplicate_prejudge_rotation_owners_before_bundle_write(tmp_path: Path) -> None:
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    staged_dir = tmp_path / "staged"
+    target = root / "plugins" / "widget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'first')\n"
+        "        return payload.get('second', 'second') + first\n",
+        encoding="utf-8",
+    )
+    findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(findings) == 2
+    stale_key = identity_prefix(_canonical_key(findings[0])) + ":fp=deadbeefdeadbeef"
+    _write_pre_judge_entry(allowlist_dir, "first.yaml", key=stale_key)
+    _write_pre_judge_entry(allowlist_dir, "second.yaml", key=stale_key)
+
+    with pytest.raises(ValueError, match="duplicate diagnosis key"):
+        judge_server.build_scan_actions(root=root, allowlist_dir=allowlist_dir)
+
+    outcome = judge_server._run_tool(
+        _context(root, allowlist_dir, staged_dir),
+        "stage_scan",
+        {"bundle_id": "duplicate-rotation-owner"},
+    )
+    assert outcome.is_error is True
+    assert "duplicate diagnosis key" in outcome.text
+    assert not (staged_dir / "duplicate-rotation-owner.json").exists()
 
 
 def test_stage_scan_new_judgment_and_drift_repair_prefixes_are_disjoint(tmp_path: Path) -> None:

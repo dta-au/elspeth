@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 from elspeth_lints.core.allowlist import Allowlist, PerFileRule
 
 if TYPE_CHECKING:
-    from elspeth_lints.rules.trust_tier.tier_model.rotate import RotationPlan
+    from elspeth_lints.rules.trust_tier.tier_model.rotate import AmbiguousGroup, RotationPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +31,24 @@ class TargetCensus:
     exact_covered_count: int
     per_file_covered_count: int
     uncovered_count: int
+    diagnosis_assigned_count: int = 0
+    resign_assigned_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class TargetCoverage:
+    """Canonical keys that already have authority in the target tree.
+
+    ``exact_keys`` are live allowlist keys. ``diagnosis_assigned_keys`` are
+    different live keys that the judge-signature diagnosis has paired with a
+    drifted allowlist entry. Keeping the two sets separate in the API prevents
+    one covered fingerprint from silently covering another finding with the
+    same identity prefix.
+    """
+
+    exact_keys: frozenset[str]
+    diagnosis_assigned_keys: frozenset[str] = frozenset()
+    resign_assigned_keys: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,27 +97,47 @@ def scan_tree_findings(*, root: Path) -> list[Any]:
 def census_tree_targets(
     *,
     root: Path,
-    covered_prefixes: frozenset[str] | set[str],
+    findings: tuple[Any, ...] | None = None,
+    covered_prefixes: frozenset[str] | set[str] | None = None,
+    coverage: TargetCoverage | None = None,
     per_file_rules: list[PerFileRule],
 ) -> TargetCensusResult:
-    """Run the raw scan, then classify every target against live coverage."""
+    """Run the raw scan, then classify every target against live coverage.
+
+    New callers should supply ``coverage`` so coverage is exact at the
+    canonical-finding-key level. ``covered_prefixes`` remains accepted for
+    compatibility with older callers, but retains its legacy prefix-wide
+    semantics and must not be used for completeness/security decisions.
+    """
     from elspeth_lints.rules.trust_tier.tier_model.rotate import (
         _finding_covered_by_per_file_rule,
         identity_prefix,
     )
 
-    findings = tuple(scan_tree_findings(root=root))
+    if coverage is not None and covered_prefixes is not None:
+        raise ValueError("provide coverage or covered_prefixes, not both")
+    if coverage is None and covered_prefixes is None:
+        raise ValueError("coverage is required")
+
+    findings = tuple(scan_tree_findings(root=root)) if findings is None else findings
     seen: set[str] = set()
     uncovered: list[Any] = []
     exact_covered_count = 0
+    diagnosis_assigned_count = 0
+    resign_assigned_count = 0
     per_file_covered_count = 0
     for finding in findings:
         key = _finding_canonical_key(finding)
         if key in seen:
             raise ValueError(f"target census produced duplicate canonical key {key!r}")
         seen.add(key)
-        prefix = identity_prefix(key)
-        if prefix in covered_prefixes:
+        if coverage is not None and key in coverage.exact_keys:
+            exact_covered_count += 1
+        elif coverage is not None and key in coverage.diagnosis_assigned_keys:
+            diagnosis_assigned_count += 1
+        elif coverage is not None and key in coverage.resign_assigned_keys:
+            resign_assigned_count += 1
+        elif covered_prefixes is not None and identity_prefix(key) in covered_prefixes:
             exact_covered_count += 1
         elif _finding_covered_by_per_file_rule(finding, per_file_rules):
             per_file_covered_count += 1
@@ -111,6 +149,8 @@ def census_tree_targets(
             exact_covered_count=exact_covered_count,
             per_file_covered_count=per_file_covered_count,
             uncovered_count=len(uncovered),
+            diagnosis_assigned_count=diagnosis_assigned_count,
+            resign_assigned_count=resign_assigned_count,
         ),
         findings=findings,
         uncovered_findings=tuple(uncovered),
@@ -153,6 +193,58 @@ def plan_non_judge_rotations(
         findings=residual_findings,
         allowlist_entries=pre_judge_entries,
         per_file_rules=allowlist.per_file_rules,
+    )
+
+
+def plan_judge_cleanup_groups(
+    *,
+    findings: tuple[Any, ...],
+    allowlist: Allowlist,
+    orphan_keys: frozenset[str],
+) -> tuple[AmbiguousGroup, ...]:
+    """Return exact live keys deferred behind signed-orphan cleanup.
+
+    This is deliberately a cleanup-only grouping pass, not a rotation plan.
+    Judge-gated orphan entries must be deleted before their same-prefix live
+    findings can receive fresh judgments, so even a symmetric N:N population
+    is a two-cycle cleanup group. Consumers assign the group's exact finding
+    keys for this cycle; they must never rotate the signed entries or treat the
+    identity prefix itself as coverage.
+    """
+    from collections import defaultdict
+
+    from elspeth_lints.rules.trust_tier.tier_model.rotate import (
+        AmbiguousGroup,
+        _finding_covered_by_per_file_rule,
+        identity_prefix,
+    )
+
+    orphan_entries = [entry for entry in allowlist.entries if entry.key in orphan_keys]
+    if not orphan_entries:
+        return ()
+
+    entries_by_prefix: dict[str, list[Any]] = defaultdict(list)
+    for entry in orphan_entries:
+        entries_by_prefix[identity_prefix(entry.key)].append(entry)
+    findings_by_prefix: dict[str, list[Any]] = defaultdict(list)
+    for finding in findings:
+        if _finding_covered_by_per_file_rule(finding, allowlist.per_file_rules):
+            continue
+        key = _finding_canonical_key(finding)
+        prefix = identity_prefix(key)
+        if prefix in entries_by_prefix:
+            findings_by_prefix[prefix].append(finding)
+
+    return tuple(
+        AmbiguousGroup(
+            prefix=prefix,
+            finding_count=len(findings_by_prefix[prefix]),
+            entry_count=len(entries),
+            entry_keys=tuple(sorted(entry.key for entry in entries)),
+            finding_keys=tuple(sorted(_finding_canonical_key(finding) for finding in findings_by_prefix[prefix])),
+        )
+        for prefix, entries in sorted(entries_by_prefix.items())
+        if findings_by_prefix[prefix]
     )
 
 

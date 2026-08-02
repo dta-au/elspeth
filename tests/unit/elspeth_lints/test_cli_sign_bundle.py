@@ -53,6 +53,7 @@ from elspeth_lints.core.review_bundle import (
     ReviewBundle,
     write_bundle,
 )
+from elspeth_lints.mcp.server import build_scan_actions
 from elspeth_lints.rules.trust_tier.tier_model.rotate import identity_prefix
 
 _HMAC_KEY = "x" * 32
@@ -232,6 +233,18 @@ def _write_signed_entry_with_spare(
     ]
     (allowlist_dir / yaml_name).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return key
+
+
+def _apply_signature_problem(yaml_path: Path, signature_problem: str) -> None:
+    text = yaml_path.read_text(encoding="utf-8")
+    if signature_problem == "missing":
+        lines = [line for line in text.splitlines() if "judge_metadata_signature:" not in line]
+        yaml_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
+    if signature_problem == "invalid":
+        yaml_path.write_text(text.replace(_RATIONALE, "tampered signed rationale"), encoding="utf-8")
+        return
+    raise AssertionError(f"unknown signature problem: {signature_problem}")
 
 
 # --------------------------------------------------------------------------- #
@@ -499,6 +512,232 @@ def test_sign_bundle_aborts_before_transaction_when_target_census_is_incomplete(
     assert _tree_bytes(allowlist_dir) == before
     assert not (allowlist_dir.parent / ".sign-bundle-transactions").exists()
     assert "target census missing justify action" in capsys.readouterr().err
+
+
+def test_sign_bundle_operator_repairs_invalid_signature_omitted_by_keyless_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Operator-key verification closes the keyless INVALID_SIGNATURE blind spot."""
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "plugins.yaml", finding=finding)
+
+    # The staging surface deliberately has no key and therefore sees a
+    # shape-valid signed row as covered rather than as an actionable repair.
+    monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY")
+    staged_actions = build_scan_actions(root=root, allowlist_dir=allowlist_dir)
+    assert staged_actions == ()
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, staged_actions))
+
+    # Firing with a different operator key authoritatively detects the invalid
+    # HMAC. It must make that repair explicit before confirmation and execute
+    # it, rather than deadlocking with an impossible "re-run stage_scan" loop.
+    monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", "y" * 32)
+    with _patch_judge(_accept_all) as judge_calls:
+        exit_code = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert judge_calls == ["plugins/widget.py"]
+    assert "operator-key verification added 1 invalid-signature repair" in captured.out
+    assert f"operator-derived drift_repair key={key!r} source_file='plugins.yaml' diagnosis_status='INVALID_SIGNATURE'" in captured.out
+    assert any(item.key == key and item.status == "OK_AUTHORITATIVE" for item in _diagnose(root, allowlist_dir).items)
+
+
+def test_sign_bundle_dry_run_rejects_duplicate_operator_derived_invalid_signature_repairs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Duplicate signed owners cannot bypass bundle action uniqueness."""
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "first.yaml", finding=finding)
+    assert _write_signed_v2_entry(allowlist_dir, "second.yaml", finding=finding) == key
+
+    # Model a bundle staged while the tree was still unique, followed by a
+    # duplicate row appearing before the operator fires it. The authoritative
+    # verify boundary must reject the now-ambiguous ownership.
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, ()))
+    monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", "y" * 32)
+
+    exit_code = main(_argv(bundle_path, root, allowlist_dir, extra=("--dry-run",)))
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "duplicate diagnosis key" in captured.err
+    assert "operator-key verification added" not in captured.out
+    assert not (allowlist_dir.parent / ".sign-bundle-transactions").exists()
+
+
+def test_sign_bundle_resume_rederives_operator_invalid_signature_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Recovery deterministically reconstructs the operator-derived action."""
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "plugins.yaml", finding=finding)
+    before = _tree_bytes(allowlist_dir)
+
+    monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY")
+    staged_actions = build_scan_actions(root=root, allowlist_dir=allowlist_dir)
+    assert staged_actions == ()
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, staged_actions))
+    monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", "y" * 32)
+
+    with patch.object(cli_module, "_run_justify", side_effect=KeyboardInterrupt()):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    assert _tree_bytes(allowlist_dir) == before
+
+    with _patch_judge(_accept_all) as resumed_calls:
+        exit_code = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert exit_code == 0
+    assert resumed_calls == ["plugins/widget.py"]
+    assert any(item.key == key and item.status == "OK_AUTHORITATIVE" for item in _diagnose(root, allowlist_dir).items)
+
+
+@pytest.mark.parametrize("signature_problem", ["missing", "invalid"])
+def test_sign_bundle_shifted_signature_problem_converges_from_keyless_stage_through_fire(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    signature_problem: str,
+) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    old_key = _write_signed_entry_with_spare(allowlist_dir, "plugins.yaml", finding=finding)
+    _apply_signature_problem(allowlist_dir / "plugins.yaml", signature_problem)
+    source.write_text("_SHIM = 1\n\n\n" + _src("widget"), encoding="utf-8")
+    live_key = _canonical_key(_live_finding(root, "plugins/widget.py"))
+    assert live_key != old_key
+
+    monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY")
+    staged_actions = build_scan_actions(root=root, allowlist_dir=allowlist_dir)
+    assert [(action.kind, action.key, action.diagnosis_status) for action in staged_actions] == [
+        ("drift_repair", old_key, "AST_PATH_BINDING_DRIFT")
+    ]
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, staged_actions))
+    before = _tree_bytes(allowlist_dir)
+
+    monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", _HMAC_KEY)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--dry-run",))) == 0
+    assert _tree_bytes(allowlist_dir) == before
+    dry_run = capsys.readouterr()
+    expected_signature_status = "MISSING_SIGNATURE" if signature_problem == "missing" else "INVALID_SIGNATURE"
+    assert (
+        f"signature-condition key={old_key!r} source_file='plugins.yaml' "
+        f"binding_status='AST_PATH_BINDING_DRIFT' signature_status={expected_signature_status!r}" in dry_run.out
+    )
+
+    with _patch_judge(_accept_all) as judge_calls:
+        exit_code = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert exit_code == 0
+    assert judge_calls == ["plugins/widget.py"]
+    post = _diagnose(root, allowlist_dir)
+    assert any(item.key == live_key and item.status == "OK_AUTHORITATIVE" for item in post.items)
+    assert all(item.key != old_key for item in post.items)
+
+
+@pytest.mark.parametrize("signature_problem", ["missing", "invalid"])
+def test_sign_bundle_shifted_signature_problem_resume_reuses_live_repair_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    signature_problem: str,
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    old_key = _write_signed_entry_with_spare(allowlist_dir, "plugins.yaml", finding=finding)
+    _apply_signature_problem(allowlist_dir / "plugins.yaml", signature_problem)
+    source.write_text("_SHIM = 1\n\n\n" + _src("widget"), encoding="utf-8")
+    live_key = _canonical_key(_live_finding(root, "plugins/widget.py"))
+
+    monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY")
+    staged_actions = build_scan_actions(root=root, allowlist_dir=allowlist_dir)
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, staged_actions))
+    before = _tree_bytes(allowlist_dir)
+    monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", _HMAC_KEY)
+
+    with patch.object(cli_module, "_run_justify", side_effect=KeyboardInterrupt()):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    assert _tree_bytes(allowlist_dir) == before
+
+    with _patch_judge(_accept_all) as judge_calls:
+        exit_code = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert exit_code == 0
+    assert judge_calls == ["plugins/widget.py"]
+    post = _diagnose(root, allowlist_dir)
+    assert any(item.key == live_key and item.status == "OK_AUTHORITATIVE" for item in post.items)
+    assert all(item.key != old_key for item in post.items)
+
+
+@pytest.mark.parametrize("signature_problem", ["missing", "invalid"])
+def test_sign_bundle_missing_source_signature_problem_stays_stale_delete_through_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    signature_problem: str,
+) -> None:
+    import elspeth_lints.core.cli as cli_module
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    old_key = _write_signed_v2_entry(allowlist_dir, "plugins.yaml", finding=finding)
+    _apply_signature_problem(allowlist_dir / "plugins.yaml", signature_problem)
+    source.unlink()
+
+    monkeypatch.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY")
+    staged_actions = build_scan_actions(root=root, allowlist_dir=allowlist_dir)
+    assert [(action.kind, action.key, action.source_file) for action in staged_actions] == [("stale_delete", old_key, "plugins.yaml")]
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, staged_actions))
+    before = _tree_bytes(allowlist_dir)
+
+    monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", _HMAC_KEY)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--dry-run",))) == 0
+    assert _tree_bytes(allowlist_dir) == before
+    dry_run = capsys.readouterr()
+    expected_signature_status = "MISSING_SIGNATURE" if signature_problem == "missing" else "INVALID_SIGNATURE"
+    assert (
+        f"signature-condition key={old_key!r} source_file='plugins.yaml' "
+        f"binding_status='SOURCE_FILE_MISSING' signature_status={expected_signature_status!r}" in dry_run.out
+    )
+
+    with patch.object(cli_module, "_execute_stale_delete_action", side_effect=KeyboardInterrupt()):
+        assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    assert _tree_bytes(allowlist_dir) == before
+
+    with _patch_judge(lambda _file_path: (_ for _ in ()).throw(AssertionError("stale_delete must not invoke judge"))) as judge_calls:
+        exit_code = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    assert exit_code == 0
+    assert judge_calls == []
+    assert old_key not in (allowlist_dir / "plugins.yaml").read_text(encoding="utf-8")
 
 
 # =========================================================================== #
@@ -2168,6 +2407,118 @@ def test_sign_bundle_rolls_back_if_source_changes_at_directory_exchange(
     assert "source tree or bundle bindings changed during coherent publish" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("verification_error_type", (OSError, RuntimeError), ids=("oserror", "runtimeerror"))
+def test_sign_bundle_rolls_back_if_post_exchange_source_scan_raises_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    verification_error_type: type[Exception],
+) -> None:
+    from elspeth_lints.core import bundle_verify, sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+        ),
+    )
+    real_verify = bundle_verify.verify_bundle_against_tree
+    verified_allowlist_dirs: list[Path] = []
+
+    def _fail_post_exchange_verification(*args: Any, **kwargs: Any) -> Any:
+        verified_allowlist_dir = Path(kwargs["allowlist_dir"]).resolve()
+        verified_allowlist_dirs.append(verified_allowlist_dir)
+        if verified_allowlist_dir != allowlist_dir.resolve():
+            raise verification_error_type("simulated private source-scan failure")
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(bundle_verify, "verify_bundle_against_tree", _fail_post_exchange_verification)
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    stderr = capsys.readouterr().err
+    transaction = _recovery_path(stderr)
+    manifest = sign_bundle_transaction.load_manifest(transaction)
+    candidate = Path(manifest["candidate_dir"])
+    assert verified_allowlist_dirs == [allowlist_dir.resolve(), allowlist_dir.resolve(), candidate.resolve()]
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert orphan_key in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert orphan_key not in (candidate / "widget.yaml").read_text(encoding="utf-8")
+    assert sign_bundle_transaction.publication_disposition(manifest) == "not_published"
+    assert not sign_bundle_transaction.source_validation_pending(manifest)
+    assert (
+        f"source verification failed during coherent publish ({verification_error_type.__name__}); rolled back active allowlist" in stderr
+    )
+    assert "simulated private source-scan failure" not in stderr
+
+
+def test_sign_bundle_preserves_source_scan_failure_if_rollback_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import bundle_verify, sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+        ),
+    )
+    real_verify = bundle_verify.verify_bundle_against_tree
+    real_exchange = sign_bundle_transaction._rename_exchange
+    exchange_calls = 0
+
+    def _fail_post_exchange_verification(*args: Any, **kwargs: Any) -> Any:
+        if Path(kwargs["allowlist_dir"]).resolve() != allowlist_dir.resolve():
+            raise OSError("simulated private source-scan failure")
+        return real_verify(*args, **kwargs)
+
+    def _fail_rollback_exchange(source: Path, destination: Path) -> None:
+        nonlocal exchange_calls
+        if source.resolve() == allowlist_dir.resolve() or destination.resolve() == allowlist_dir.resolve():
+            exchange_calls += 1
+            if exchange_calls == 2:
+                raise sign_bundle_transaction.SignBundleTransactionError("simulated rollback exchange failure")
+        real_exchange(source, destination)
+
+    monkeypatch.setattr(bundle_verify, "verify_bundle_against_tree", _fail_post_exchange_verification)
+    monkeypatch.setattr(sign_bundle_transaction, "_rename_exchange", _fail_rollback_exchange)
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    stderr = capsys.readouterr().err
+    transaction = _recovery_path(stderr)
+    manifest = sign_bundle_transaction.load_manifest(transaction)
+    assert rc == 2
+    assert exchange_calls == 2
+    assert sign_bundle_transaction.publication_disposition(manifest) == "published"
+    assert sign_bundle_transaction.source_validation_pending(manifest)
+    assert "source verification failed during coherent publish (OSError)" in stderr
+    assert "rollback also failed with SignBundleTransactionError" in stderr
+    assert "active allowlist recovery remains required" in stderr
+    assert "simulated private source-scan failure" not in stderr
+    assert "simulated rollback exchange failure" not in stderr
+
+
 @pytest.mark.parametrize("legacy_manifest", [False, True])
 def test_sign_bundle_resume_rolls_back_pending_publish_if_source_changed(
     tmp_path: Path,
@@ -2217,6 +2568,61 @@ def test_sign_bundle_resume_rolls_back_pending_publish_if_source_changed(
     assert "staged claims no longer match" in capsys.readouterr().err
 
 
+def test_sign_bundle_resume_preserves_source_mismatch_if_rollback_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source_path = _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+        ),
+    )
+    real_publish = sign_bundle_transaction.publish_candidate
+
+    def _publish_then_interrupt(transaction: Path, manifest: dict[str, Any]) -> None:
+        real_publish(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _publish_then_interrupt)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    source_path.write_text(_src("widget"), encoding="utf-8")
+    rollback_calls = 0
+
+    def _fail_rollback(_transaction: Path, _manifest: dict[str, Any]) -> None:
+        nonlocal rollback_calls
+        rollback_calls += 1
+        raise sign_bundle_transaction.SignBundleTransactionError("simulated mismatch rollback failure")
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", real_publish)
+    monkeypatch.setattr(sign_bundle_transaction, "rollback_pending_publish", _fail_rollback)
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    stderr = capsys.readouterr().err
+    manifest = sign_bundle_transaction.load_manifest(transaction)
+    assert rc == 2
+    assert rollback_calls == 1
+    assert sign_bundle_transaction.publication_disposition(manifest) == "published"
+    assert sign_bundle_transaction.source_validation_pending(manifest)
+    assert "staged claims no longer match source tree during sign-bundle re-verification" in stderr
+    assert "rollback also failed with SignBundleTransactionError" in stderr
+    assert "active allowlist recovery remains required" in stderr
+    assert "simulated mismatch rollback failure" not in stderr
+
+
 def test_sign_bundle_resume_rolls_back_pending_publish_if_source_root_is_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2257,6 +2663,135 @@ def test_sign_bundle_resume_rolls_back_pending_publish_if_source_root_is_unavail
     assert _tree_bytes(allowlist_dir) == before
     assert orphan_key in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
     assert "verify error" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("verification_error_type", (OSError, RuntimeError), ids=("oserror", "runtimeerror"))
+def test_sign_bundle_resume_rolls_back_pending_publish_if_reverify_raises_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    verification_error_type: type[Exception],
+) -> None:
+    from elspeth_lints.core import bundle_verify, sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    before = _tree_bytes(allowlist_dir)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+        ),
+    )
+    real_publish = sign_bundle_transaction.publish_candidate
+
+    def _publish_then_interrupt(transaction: Path, manifest: dict[str, Any]) -> None:
+        real_publish(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _publish_then_interrupt)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    pending_manifest = sign_bundle_transaction.load_manifest(transaction)
+    candidate = Path(pending_manifest["candidate_dir"])
+    assert sign_bundle_transaction.publication_disposition(pending_manifest) == "published"
+    assert sign_bundle_transaction.source_validation_pending(pending_manifest)
+
+    real_verify = bundle_verify.verify_bundle_against_tree
+
+    def _raise_resume_reverify_error(*args: Any, **kwargs: Any) -> Any:
+        if Path(kwargs["allowlist_dir"]).resolve() == candidate.resolve():
+            raise verification_error_type("simulated resume source-scan failure")
+        return real_verify(*args, **kwargs)
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", real_publish)
+    monkeypatch.setattr(bundle_verify, "verify_bundle_against_tree", _raise_resume_reverify_error)
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    stderr = capsys.readouterr().err
+    manifest = sign_bundle_transaction.load_manifest(transaction)
+    assert rc == 2
+    assert _tree_bytes(allowlist_dir) == before
+    assert orphan_key in (allowlist_dir / "widget.yaml").read_text(encoding="utf-8")
+    assert orphan_key not in (candidate / "widget.yaml").read_text(encoding="utf-8")
+    assert sign_bundle_transaction.publication_disposition(manifest) == "not_published"
+    assert not sign_bundle_transaction.source_validation_pending(manifest)
+    assert (
+        "source verification failed during sign-bundle re-verification "
+        f"({verification_error_type.__name__}); rolled back active allowlist" in stderr
+    )
+    assert "simulated resume source-scan failure" not in stderr
+
+
+def test_sign_bundle_resume_preserves_reverify_failure_if_rollback_also_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from elspeth_lints.core import bundle_verify, sign_bundle_transaction
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    orphan_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    bundle_path = _write_bundle_file(
+        tmp_path,
+        _bundle(
+            root,
+            allowlist_dir,
+            (BundleAction(lane="resign", kind="stale_delete", key=orphan_key, source_file="widget.yaml"),),
+        ),
+    )
+    real_publish = sign_bundle_transaction.publish_candidate
+
+    def _publish_then_interrupt(transaction: Path, manifest: dict[str, Any]) -> None:
+        real_publish(transaction, manifest)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", _publish_then_interrupt)
+    assert main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",))) == 130
+    transaction = _recovery_path(capsys.readouterr().err)
+    pending_manifest = sign_bundle_transaction.load_manifest(transaction)
+    candidate = Path(pending_manifest["candidate_dir"])
+    real_verify = bundle_verify.verify_bundle_against_tree
+    rollback_calls = 0
+
+    def _raise_resume_reverify_oserror(*args: Any, **kwargs: Any) -> Any:
+        if Path(kwargs["allowlist_dir"]).resolve() == candidate.resolve():
+            raise OSError("simulated resume source-scan failure")
+        return real_verify(*args, **kwargs)
+
+    def _fail_rollback(_transaction: Path, _manifest: dict[str, Any]) -> None:
+        nonlocal rollback_calls
+        rollback_calls += 1
+        raise sign_bundle_transaction.SignBundleTransactionError("simulated resume rollback failure")
+
+    monkeypatch.setattr(sign_bundle_transaction, "publish_candidate", real_publish)
+    monkeypatch.setattr(bundle_verify, "verify_bundle_against_tree", _raise_resume_reverify_oserror)
+    monkeypatch.setattr(sign_bundle_transaction, "rollback_pending_publish", _fail_rollback)
+
+    rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes", "--resume", str(transaction))))
+
+    stderr = capsys.readouterr().err
+    manifest = sign_bundle_transaction.load_manifest(transaction)
+    assert rc == 2
+    assert rollback_calls == 1
+    assert sign_bundle_transaction.publication_disposition(manifest) == "published"
+    assert sign_bundle_transaction.source_validation_pending(manifest)
+    assert "source verification failed during sign-bundle re-verification (OSError)" in stderr
+    assert "rollback also failed with SignBundleTransactionError" in stderr
+    assert "active allowlist recovery remains required" in stderr
+    assert "simulated resume source-scan failure" not in stderr
+    assert "simulated resume rollback failure" not in stderr
 
 
 def test_sign_bundle_resume_rejects_tampered_transaction_signature(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -2456,10 +2991,9 @@ def _dup_key_signed_block(key: str) -> list[str]:
 def test_sign_bundle_dup_key_bundle_aborts(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """A duplicate-key bundle fails closed before either action can mutate it.
 
-    The same key K appears twice -- once judge-gated (filtered out of the
-    non-judge-gated rotation survey) and once non-judge-gated (the staged
-    rotation). The full worklist also sees the signed copy as an orphan, so a
-    rotation-only bundle is rejected before transaction creation.
+    The same key K appears twice -- once judge-gated and once non-judge-gated.
+    From-tree verification rejects the duplicate diagnosis identity before an
+    operator-derived or staged action can select either owner.
     """
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
@@ -2477,7 +3011,7 @@ def test_sign_bundle_dup_key_bundle_aborts(tmp_path: Path, capsys: pytest.Captur
 
     assert rc == 2
     assert yaml_path.read_text(encoding="utf-8").count(f"- key: {stale_key}") == 2  # both copies preserved
-    assert "missing stale_delete action" in capsys.readouterr().err
+    assert "duplicate diagnosis key" in capsys.readouterr().err
 
 
 def test_sign_bundle_noncanonical_allowlist_skips_baseline_regen(

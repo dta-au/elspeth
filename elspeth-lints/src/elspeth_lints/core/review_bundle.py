@@ -262,8 +262,29 @@ def write_bundle(bundle: ReviewBundle, *, staged_dir: Path) -> Path:
     Creates ``staged_dir`` if absent (``.elspeth/staged-reviews/`` is already
     gitignored).
     """
-    path = Path(staged_dir) / f"{bundle.bundle_id}.json"
+    path = resolve_staged_bundle_path(staged_dir=staged_dir, bundle_id=bundle.bundle_id)
     atomic_update_text(path, lambda _current: dump_bundle(bundle), create_parent=True)
+    return path
+
+
+def resolve_staged_bundle_path(*, staged_dir: Path, bundle_id: str) -> Path:
+    """Resolve one local bundle ID beneath ``staged_dir``.
+
+    ``bundle_id`` crosses the MCP trust boundary.  It names a bundle, not a
+    caller-controlled path, so absolute paths and path components are invalid.
+    The resolved-parent check additionally rejects an existing target symlink
+    that redirects outside the configured staging directory.
+    """
+    if type(bundle_id) is not str or not bundle_id:
+        raise ValueError("bundle_id must be a non-empty string")
+    bundle_name = Path(bundle_id)
+    if bundle_name.is_absolute() or bundle_name.parts != (bundle_id,) or bundle_name.name != bundle_id:
+        raise ValueError(f"bundle_id must be one local filename stem; got {bundle_id!r}")
+
+    staged_root = Path(staged_dir)
+    path = staged_root / f"{bundle_id}.json"
+    if path.resolve().parent != staged_root.resolve():
+        raise ValueError(f"bundle_id resolves outside staged_dir; got {bundle_id!r}")
     return path
 
 

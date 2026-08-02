@@ -3939,12 +3939,12 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
     from elspeth_lints.core.review_bundle import load_bundle
     from elspeth_lints.core.sign_bundle_transaction import (
         SignBundleTransactionError,
+        _raise_source_validation_failure_after_rollback,
         assert_active_unchanged,
         assert_resume_identity,
         create_transaction,
         load_manifest,
         publication_disposition,
-        rollback_pending_publish,
         source_validation_pending,
         transaction_lock,
     )
@@ -4006,7 +4006,7 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
             allowlist_dir=verification_allowlist_dir,
             bundle_allowlist_dir=args.allowlist_dir,
         )
-    except ValueError as exc:
+    except Exception as exc:
         if (
             args.resume is not None
             and not args.dry_run
@@ -4018,9 +4018,14 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
             try:
                 with transaction_lock(args.allowlist_dir, create=False):
                     pending_manifest = load_manifest(args.resume)
-                    rollback_pending_publish(args.resume, pending_manifest)
-            except SignBundleTransactionError as rollback_exc:
-                sys.stderr.write(f"sign-bundle: transaction error while rolling back source-unverifiable publish: {rollback_exc}\n")
+                    _raise_source_validation_failure_after_rollback(
+                        tx_path=args.resume,
+                        manifest=pending_manifest,
+                        message=f"source verification failed during sign-bundle re-verification ({type(exc).__name__})",
+                        primary_error=exc,
+                    )
+            except SignBundleTransactionError as transaction_exc:
+                sys.stderr.write(f"sign-bundle: verify error: {transaction_exc}\n")
                 return 2
         sys.stderr.write(f"sign-bundle: verify error: {exc}\n")
         return 2
@@ -4036,14 +4041,23 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
             try:
                 with transaction_lock(args.allowlist_dir, create=False):
                     pending_manifest = load_manifest(args.resume)
-                    rollback_pending_publish(args.resume, pending_manifest)
-            except SignBundleTransactionError as exc:
-                sys.stderr.write(f"sign-bundle: transaction error while rolling back source-invalid publish: {exc}\n")
+                    _raise_source_validation_failure_after_rollback(
+                        tx_path=args.resume,
+                        manifest=pending_manifest,
+                        message="staged claims no longer match source tree during sign-bundle re-verification",
+                        primary_error=None,
+                    )
+            except SignBundleTransactionError as transaction_exc:
+                sys.stderr.write(f"sign-bundle: verify error: {transaction_exc}\n")
+                for mismatch in verification.mismatches:
+                    sys.stderr.write(f"  mismatch: {mismatch}\n")
                 return 2
         sys.stderr.write("sign-bundle: staged claims no longer match the source tree; refusing to sign (re-run stage_scan):\n")
         for mismatch in verification.mismatches:
             sys.stderr.write(f"  mismatch: {mismatch}\n")
         return 2
+
+    bundle = _with_operator_derived_bundle_actions(bundle, verification=verification)
 
     # --- Pre-write summary (pure read) ---------------------------------------
     _emit_sign_bundle_summary(bundle, verification=verification, args=args)
@@ -4119,6 +4133,23 @@ def _run_sign_bundle(args: argparse.Namespace) -> int:
     return code
 
 
+def _with_operator_derived_bundle_actions(bundle: Any, *, verification: Any) -> Any:
+    """Add repairs that only the operator-key verification could discover.
+
+    The staged bundle remains key-free and byte-bound to the transaction. These
+    actions are a deterministic consequence of its authenticated source tree
+    plus the operator key, and are surfaced before confirmation. A resumed
+    transaction re-derives the same inventory before executing any action.
+    """
+    actions = verification.operator_derived_actions
+    if not actions:
+        return bundle
+
+    from dataclasses import replace as dataclass_replace
+
+    return dataclass_replace(bundle, actions=(*bundle.actions, *actions))
+
+
 def _sign_bundle_signing_policy(args: argparse.Namespace) -> dict[str, Any]:
     """Bind every non-secret option that can change resumed judgment semantics."""
     return {
@@ -4147,6 +4178,31 @@ def _emit_sign_bundle_summary(bundle: Any, *, verification: Any, args: argparse.
         counts[action.kind] = counts.get(action.kind, 0) + 1
     planned_override = (counts["justify"] + counts["drift_repair"]) if args.operator_override else 0
 
+    operator_derived_count = len(verification.operator_derived_actions)
+    if operator_derived_count:
+        suffix = "" if operator_derived_count == 1 else "s"
+        sys.stdout.write(
+            "sign-bundle: operator-key verification added "
+            f"{operator_derived_count} invalid-signature repair{suffix} to the reviewed transaction\n"
+        )
+        for action in verification.operator_derived_actions:
+            sys.stdout.write(
+                "sign-bundle: operator-derived "
+                f"{action.kind} key={action.key!r} source_file={action.source_file!r} "
+                f"diagnosis_status={action.diagnosis_status!r}\n"
+            )
+
+    signature_conditions = sorted(
+        (item for item in verification.diagnosis.items if item.signature_status is not None),
+        key=lambda item: (item.source_file, item.key),
+    )
+    for item in signature_conditions:
+        sys.stdout.write(
+            "sign-bundle: signature-condition "
+            f"key={item.key!r} source_file={item.source_file!r} "
+            f"binding_status={item.status!r} signature_status={item.signature_status!r}\n"
+        )
+
     sys.stdout.write(
         "sign-bundle: "
         f"{len(bundle.actions)} action(s) -- "
@@ -4157,6 +4213,8 @@ def _emit_sign_bundle_summary(bundle: Any, *, verification: Any, args: argparse.
     sys.stdout.write(
         "sign-bundle: empty-allowlist target census -- "
         f"raw={census.raw_target_count}, exact_covered={census.exact_covered_count}, "
+        f"diagnosis_assigned={census.diagnosis_assigned_count}, "
+        f"resign_assigned={census.resign_assigned_count}, "
         f"per_file_covered={census.per_file_covered_count}, uncovered={census.uncovered_count}\n"
     )
     sys.stdout.write(f"sign-bundle: planned operator-override actions: {planned_override}\n")

@@ -243,6 +243,55 @@ def test_verify_rejects_bundle_omitting_live_rotation(tmp_path: Path) -> None:
     assert any("target census" in mismatch and "missing rotation action" in mismatch for mismatch in report.mismatches)
 
 
+def test_verify_rejects_rotation_wrong_owning_yaml(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/gadget.py", "gadget")
+    finding = _live_finding(root, "plugins/gadget.py")
+    stale_key = identity_prefix(_canonical_key(finding)) + ":fp=deadbeefdeadbeef"
+    _write_pre_judge_entry(allowlist_dir, "gadget.yaml", key=stale_key)
+    bundle = _bundle(
+        root,
+        allowlist_dir,
+        (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="other.yaml"),),
+    )
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("owning YAML" in mismatch and "gadget.yaml" in mismatch for mismatch in report.mismatches)
+
+
+def test_verify_rejects_rotation_with_duplicate_old_key_owners(tmp_path: Path) -> None:
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    target = root / "plugins" / "widget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'first')\n"
+        "        return payload.get('second', 'second') + first\n",
+        encoding="utf-8",
+    )
+    findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(findings) == 2
+    stale_key = identity_prefix(_canonical_key(findings[0])) + ":fp=deadbeefdeadbeef"
+    _write_pre_judge_entry(allowlist_dir, "first.yaml", key=stale_key)
+    _write_pre_judge_entry(allowlist_dir, "second.yaml", key=stale_key)
+    bundle = _bundle(
+        root,
+        allowlist_dir,
+        (BundleAction(lane="resign", kind="rotation", key=stale_key, source_file="first.yaml"),),
+    )
+
+    report = verify_bundle_against_tree(bundle, root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok is False
+    assert any("rotation old_key" in mismatch and "2 owners" in mismatch for mismatch in report.mismatches)
+
+
 def test_verify_rejects_ambiguous_same_prefix_target_group(tmp_path: Path) -> None:
     root = _build_root(tmp_path)
     allowlist_dir = _build_allowlist_dir(tmp_path)
@@ -289,6 +338,77 @@ def test_verify_accepts_mixed_signed_and_prejudge_exact_same_prefix_group(tmp_pa
 
     assert report.ok is True
     assert report.mismatches == ()
+
+
+def test_verify_rejects_empty_bundle_when_second_same_prefix_finding_is_unsigned(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    target = root / "plugins" / "gadget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'anonymous')\n"
+        "        return payload.get('second', first)\n",
+        encoding="utf-8",
+    )
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(findings) == 2
+    assert len({identity_prefix(_canonical_key(finding)) for finding in findings}) == 1
+    _write_signed_v2_entry(allowlist_dir, "signed.yaml", finding=findings[0])
+
+    report = verify_bundle_against_tree(_bundle(root, allowlist_dir, ()), root=root, allowlist_dir=allowlist_dir)
+
+    second_key = _canonical_key(findings[1])
+    assert report.ok is False
+    assert any("missing justify action" in mismatch and second_key in mismatch for mismatch in report.mismatches)
+
+
+def test_operator_verify_accepts_symmetric_signed_cleanup_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Authoritative 2:2 cleanup verification must not rotate signed rows."""
+    from elspeth_lints.rules.trust_tier.tier_model.rule import scan_file
+
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    target = root / "plugins" / "widget.py"
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'old-first')\n"
+        "        return payload.get('second', 'old-second') + first\n",
+        encoding="utf-8",
+    )
+    old_findings = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(old_findings) == 2
+    old_entries = [
+        (
+            _write_signed_v2_entry(allowlist_dir, f"old-{index}.yaml", finding=finding),
+            f"old-{index}.yaml",
+        )
+        for index, finding in enumerate(old_findings)
+    ]
+
+    target.write_text(
+        "class Widget:\n"
+        "    def lookup(self, payload: dict) -> str:\n"
+        "        first = payload.get('first', 'new-first')\n"
+        "        return payload.get('second', 'new-second') + first\n",
+        encoding="utf-8",
+    )
+    replacements = [finding for finding in scan_file(target.resolve(), root) if finding.rule_id == "R1"]
+    assert len(replacements) == 2
+    monkeypatch.setenv("ELSPETH_JUDGE_METADATA_HMAC_KEY", _HMAC_KEY)
+    actions = tuple(BundleAction(lane="resign", kind="stale_delete", key=key, source_file=source_file) for key, source_file in old_entries)
+
+    report = verify_bundle_against_tree(_bundle(root, allowlist_dir, actions), root=root, allowlist_dir=allowlist_dir)
+
+    assert report.ok, report.mismatches
+    assert report.target_census.resign_assigned_count == 2
+    assert report.target_census.uncovered_count == 0
 
 
 def test_verify_rejects_relative_paths_recorded_in_bundle(tmp_path: Path) -> None:
