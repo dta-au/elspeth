@@ -250,9 +250,11 @@ def _refuse_in_repo_elspeth_writes() -> Iterator[None]:
       Refusing there names the offending test and, by raising before the call,
       keeps the directory from being created at all.
     * The fd-relative walk in ``core.audit_export_content_store`` passes bare
-      component names against a parent descriptor, so a path-based hook cannot
-      see where they resolve. The recursive session-end fingerprint catches
-      that and native-extension writes.
+      component names against a parent descriptor. The ``os.mkdir`` patch
+      resolves ``dir_fd`` through ``/proc/self/fd`` (Linux), so directory
+      creation there is attributed to the running test; fd-relative file
+      writes beneath pre-existing directories, subprocess writes, and
+      native-extension writes fall to the recursive session-end fingerprint.
 
     Fix a firing guard at the test, never by relaxing this fixture:
 
@@ -286,26 +288,33 @@ def _refuse_in_repo_elspeth_writes() -> Iterator[None]:
     original_mkdir = os.mkdir
 
     def guarded_mkdir(path: object, mode: int = 0o777, *, dir_fd: int | None = None) -> None:
-        # dir_fd calls carry a bare component name that cannot be resolved to
-        # an absolute path here; the session-end sweep below covers them.
-        if dir_fd is None:
-            candidate = os.fspath(path) if isinstance(path, (str, bytes, os.PathLike)) else None
-            if isinstance(candidate, bytes):
-                candidate = candidate.decode(errors="replace")
-            # Cheap pre-filter: almost no mkdir in the suite mentions .elspeth,
-            # and resolve() is a syscall we should not pay on every call.
-            if candidate is not None and ".elspeth" in candidate:
-                resolved = _in_repo_elspeth(candidate)
-                if resolved is not None:
-                    # BaseException-derived (pytest.fail), so the `except OSError`
-                    # and `suppress(FileExistsError)` guards around production
-                    # mkdir calls cannot swallow it.
-                    pytest.fail(
-                        f"Test wrote into the repository checkout: {resolved}\n"
-                        f"A CWD-relative `.elspeth/` default was left unredirected. Redirect it in "
-                        f"the test — see tests/conftest.py::_refuse_in_repo_elspeth_writes.",
-                        pytrace=True,
-                    )
+        candidate = os.fspath(path) if isinstance(path, (str, bytes, os.PathLike)) else None
+        if isinstance(candidate, bytes):
+            candidate = candidate.decode(errors="replace")
+        if dir_fd is not None and candidate is not None:
+            # dir_fd calls carry a bare component name; on Linux the parent
+            # directory is recoverable from the descriptor, which lets this
+            # layer name the offending test instead of deferring to the
+            # anonymous session-end sweep.
+            try:
+                parent = os.readlink(f"/proc/self/fd/{dir_fd}")
+            except OSError:
+                parent = None
+            candidate = os.path.join(parent, candidate) if parent is not None else None
+        # Cheap pre-filter: almost no mkdir in the suite mentions .elspeth,
+        # and resolve() is a syscall we should not pay on every call.
+        if candidate is not None and ".elspeth" in candidate:
+            resolved = _in_repo_elspeth(candidate)
+            if resolved is not None:
+                # BaseException-derived (pytest.fail), so the `except OSError`
+                # and `suppress(FileExistsError)` guards around production
+                # mkdir calls cannot swallow it.
+                pytest.fail(
+                    f"Test wrote into the repository checkout: {resolved}\n"
+                    f"A CWD-relative `.elspeth/` default was left unredirected. Redirect it in "
+                    f"the test — see tests/conftest.py::_refuse_in_repo_elspeth_writes.",
+                    pytrace=True,
+                )
         return original_mkdir(path, mode, dir_fd=dir_fd)  # type: ignore[arg-type]
 
     patch = pytest.MonkeyPatch()
@@ -319,9 +328,14 @@ def _refuse_in_repo_elspeth_writes() -> Iterator[None]:
         after = _elspeth_tree_snapshot(_REPO_ELSPETH)
         if after != before:
             pytest.fail(
-                f"Suite modified contents under {_REPO_ELSPETH}\n"
-                f"A CWD-relative `.elspeth/` default was left unredirected. Redirect it in "
-                f"the test — see tests/conftest.py::_refuse_in_repo_elspeth_writes.",
+                f"Contents under {_REPO_ELSPETH} changed while this worker ran.\n"
+                f"This is the anonymous end-of-session sweep: the writer was NOT the test "
+                f"named above (the per-write hooks would have failed it directly). Either a "
+                f"test wrote through a channel the hooks cannot see (subprocess, fd-relative "
+                f"file write), or a concurrent process outside pytest wrote into the checkout "
+                f"— e.g. an `elspeth run` of an example, or a signing/staging tool. Compare "
+                f"mtimes under {_REPO_ELSPETH} against the suite window before hunting in the "
+                f"suite — see tests/conftest.py::_refuse_in_repo_elspeth_writes.",
                 pytrace=False,
             )
 

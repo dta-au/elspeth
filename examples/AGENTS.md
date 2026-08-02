@@ -48,6 +48,15 @@ Run pattern:
 elspeth run --settings examples/<name>/settings.yaml --execute
 ```
 
+Do not run examples in a checkout while `pytest tests/` is running there.
+Example runs write working state into the checkout's `.elspeth/` by design
+(`audit_export` writes its export spool and content store there — the
+validator pins those roots), and the test suite's pollution guard
+(`tests/conftest.py::_refuse_in_repo_elspeth_writes`) fingerprints that
+directory for the whole session: a concurrent example run fails every
+pytest-xdist worker at teardown with "Contents under .../.elspeth changed".
+Run examples before or after the suite, or from a separate worktree.
+
 ### Container-only
 
 | Example | Notes |
