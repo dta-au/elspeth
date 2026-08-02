@@ -544,6 +544,48 @@ def test_update_blob_commit_then_wrapper_raise_is_recovered_as_committed_by_succ
     assert after_row.content_hash == hashlib.sha256(b"replacement").hexdigest()
 
 
+def test_update_blob_postcommit_backup_unlink_failure_preserves_committed_success(
+    blob_env: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = _create_blob(blob_env, filename="cleanup-failure.txt", content="original")
+    blob_id = created.data["blob_id"]
+    with blob_env["engine"].connect() as conn:
+        before_row = conn.execute(blobs_table.select().where(blobs_table.c.id == blob_id)).one()
+    storage = Path(before_row.storage_path)
+    real_unlink = Path.unlink
+
+    def fail_backup_unlink(path: Path, *args: Any, **kwargs: Any) -> None:
+        if path.name.endswith(".backup"):
+            raise OSError("simulated post-commit backup cleanup failure")
+        real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_backup_unlink)
+    result = execute_tool(
+        "update_blob",
+        {"blob_id": blob_id, "content": "replacement"},
+        created.updated_state,
+        _catalog(),
+        data_dir=blob_env["data_dir"],
+        session_engine=blob_env["engine"],
+        session_id=blob_env["session_id"],
+        session_operation_authority=blob_env["session_operation_authority"],
+        session_operation_context=blob_env["session_operation_context"],
+        user_message_id="user-message-1",
+        user_message_content="replacement",
+    )
+
+    assert result.success is True
+    assert storage.read_bytes() == b"replacement"
+    with blob_env["engine"].connect() as conn:
+        after_row = conn.execute(blobs_table.select().where(blobs_table.c.id == blob_id)).one()
+        cleanup = conn.execute(blob_replacement_cleanups_table.select().where(blob_replacement_cleanups_table.c.blob_id == blob_id)).one()
+    assert after_row.size_bytes == len(b"replacement")
+    assert after_row.content_hash == hashlib.sha256(b"replacement").hexdigest()
+    assert cleanup.phase == "purge_pending"
+    assert Path(cleanup.backup_path).read_bytes() == b"original"
+
+
 def test_update_blob_definite_precommit_failure_restores_old_and_aborts(
     blob_env: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,

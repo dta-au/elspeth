@@ -4236,17 +4236,23 @@ class _BlobReplacementCoordinator:
                 raise AuditIntegrityError("committed replacement lost exact proposed bytes")
             os.replace(staging, storage)
             _fsync_parent_directory(storage.parent)
-        if backup.exists():
-            if not self._matches(self._path_evidence(backup, plan), "old"):
-                raise AuditIntegrityError("committed replacement backup contains unexpected bytes")
-            backup.unlink()
-        if staging.exists():
-            if not self._matches(self._path_evidence(staging, plan), "new"):
-                raise AuditIntegrityError("committed replacement staging contains unexpected bytes")
-            staging.unlink()
-        if temporary.exists():
-            temporary.unlink()
-        _fsync_parent_directory(storage.parent)
+        try:
+            if backup.exists():
+                if not self._matches(self._path_evidence(backup, plan), "old"):
+                    raise AuditIntegrityError("committed replacement backup contains unexpected bytes")
+                backup.unlink()
+            if staging.exists():
+                if not self._matches(self._path_evidence(staging, plan), "new"):
+                    raise AuditIntegrityError("committed replacement staging contains unexpected bytes")
+                staging.unlink()
+            if temporary.exists():
+                temporary.unlink()
+            _fsync_parent_directory(storage.parent)
+        except OSError:
+            # The canonical bytes and metadata are already committed. Keep the
+            # purge_pending ledger as the durable retry obligation; cleanup
+            # failure must not replace the successful update result.
+            return
         self._session_operation_authority.compare_and_swap(context)
         try:
             retired = self._session_operation_authority.mutate(
