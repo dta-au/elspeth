@@ -562,7 +562,7 @@ class LLMSource(BaseSource):
         # Both resources are already detached. Defer Tier-1 propagation until
         # the tracer has been attempted, then raise the first invariant failure
         # regardless of the caller's ordinary-error suppression policy.
-        tier_one_failures: list[Exception] = []
+        tier_one_failures: list[tuple[str, Exception]] = []
         for resource, close_resource in (
             ("provider", provider.close if provider is not None else None),
             ("tracer", tracer.flush if tracer else None),
@@ -573,7 +573,7 @@ class LLMSource(BaseSource):
                 close_resource()
             except BaseException as exc:
                 if isinstance(exc, contract_errors.TIER_1_ERRORS):
-                    tier_one_failures.append(exc)
+                    tier_one_failures.append((resource, exc))
                 elif isinstance(exc, Exception):
                     failures.append(exc)
                     try:
@@ -585,12 +585,25 @@ class LLMSource(BaseSource):
                         # cleanup failure is deferred exactly like a Tier-1 from
                         # close_resource, so the tracer flush attempt and the
                         # telemetry reset below stay unconditional.
-                        tier_one_failures.append(report_error)
+                        tier_one_failures.append((f"{resource}:cleanup_report", report_error))
                 else:
                     raise
         self._telemetry_emit = make_warn_telemetry_before_start(logger)
         if tier_one_failures:
-            raise tier_one_failures[0]
+            primary_resource, primary_failure = tier_one_failures[0]
+            # Raising the first invariant failure must not silently discard the
+            # later ones: log each masked Tier-1 through the last-resort process
+            # logger (type names only — cleanup errors may wrap payloads).
+            for masked_resource, masked_failure in tier_one_failures[1:]:
+                logger.error(
+                    "resource_cleanup_tier_one_failure_masked",
+                    component="llm_source",
+                    resource=masked_resource,
+                    error_type=type(masked_failure).__name__,
+                    primary_resource=primary_resource,
+                    primary_error_type=type(primary_failure).__name__,
+                )
+            raise primary_failure
         if failures and not suppress_errors:
             raise failures[0]
 
