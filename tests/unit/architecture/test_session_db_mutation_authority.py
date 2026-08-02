@@ -1265,7 +1265,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13714,
+        line=13626,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1275,7 +1275,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13725,
+        line=13637,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1285,7 +1285,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         2,
         "SessionForkAuthority",
-        line=13744,
+        line=13656,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1295,7 +1295,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13792,
+        line=13704,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1305,7 +1305,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13846,
+        line=13758,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -4172,6 +4172,14 @@ def test_global_run_recovery_writer_is_exact_contained_and_replaces_direct_servi
     assert inventory_drift(run_writes, reviewed) == ([], [])
     assert authority_policy_violations(run_writes, _TABLE_POLICIES) == ([], [])
     assert connection_authority_violations(authority_live) == []
+
+
+def test_removed_unfenced_state_pruner_is_absent() -> None:
+    root = _repo_root()
+    service_path = root / "src/elspeth/web/sessions/service.py"
+    scanned = scan_production_writers([service_path], anchor=root)
+
+    assert not [site for site in scanned if site.symbol == "SessionServiceImpl.prune_state_versions._sync"]
 
 
 def test_composer_completion_facet_writer_identities_are_exact_and_bidirectional() -> None:

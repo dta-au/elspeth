@@ -3903,19 +3903,6 @@ class SessionServiceProtocol(Protocol):
         session_id: UUID,
     ) -> RunRecord | None: ...
 
-    async def prune_state_versions(
-        self,
-        session_id: UUID,
-        keep_latest: int = 50,
-    ) -> int:
-        """Delete old composition state versions beyond keep_latest.
-
-        Preserves the most recent `keep_latest` versions and any versions
-        referenced by a run (via runs.state_id). Returns the count of
-        deleted versions.
-        """
-        ...
-
     async def fork_session(
         self,
         authority: SessionForkParentAuthority,
