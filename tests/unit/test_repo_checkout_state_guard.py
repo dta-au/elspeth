@@ -41,7 +41,28 @@ def test_repo_elspeth_guard_detects_file_created_beneath_existing_entry(
         os.close(directory_fd)
 
     assert leaked.exists()
-    with pytest.raises(pytest.fail.Exception, match=r"Suite modified .*\.elspeth"):
+    with pytest.raises(pytest.fail.Exception, match=r"Contents under .*\.elspeth changed while this worker ran"):
+        next(guard)
+
+
+def test_repo_elspeth_guard_attributes_fd_relative_mkdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dir_fd mkdir (the content-store pattern) fails at the call, attributed."""
+    repo_elspeth = tmp_path / ".elspeth"
+    repo_elspeth.mkdir()
+    guard = _start_repo_elspeth_guard(repo_elspeth, monkeypatch)
+
+    directory_fd = os.open(repo_elspeth, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(pytest.fail.Exception, match=r"Test wrote into the repository checkout"):
+            os.mkdir("audit-export-content-store", dir_fd=directory_fd)
+    finally:
+        os.close(directory_fd)
+
+    assert not (repo_elspeth / "audit-export-content-store").exists()
+    with pytest.raises(StopIteration):
         next(guard)
 
 
