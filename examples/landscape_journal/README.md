@@ -8,7 +8,7 @@ This is optional, redundant logging (disabled by default).
 ## Run
 
 ```bash
-uv run elspeth run -s examples/landscape_journal/settings.yaml --execute
+.venv/bin/elspeth run -s examples/landscape_journal/settings.yaml --execute
 ```
 
 ## Outputs

@@ -526,6 +526,26 @@ class TestLifecycle:
 
         assert not thread_obj._thread.is_alive()
 
+    def test_stop_can_skip_final_beat_for_known_terminal_exit(self) -> None:
+        """A caller that observed terminal state can stop without re-beating a departed row."""
+        repo = _StubRepo()
+        repo.snapshot = _EVICTED_SNAPSHOT
+        thread_obj = RunHeartbeatThread(
+            repo,
+            token=_TOKEN,
+            wait_fn=None,
+        )
+        thread_obj.start()
+
+        try:
+            thread_obj.stop(final_beat=False)
+        finally:
+            if thread_obj._thread.is_alive():
+                thread_obj.stop()
+
+        assert repo.worker_heartbeat_calls == []
+        assert not thread_obj.coordination_lost
+
     def test_thread_is_daemon(self) -> None:
         """The heartbeat thread is a daemon so it does not block process exit."""
         thread_obj = RunHeartbeatThread(

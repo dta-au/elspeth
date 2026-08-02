@@ -52,7 +52,10 @@ the current directory and otherwise defaults to 90 days.
 
 ```bash
 # interactive TUI (a row/token selector is optional in interactive mode)
-elspeth explain --run latest --database examples/retention_purge/runs/audit.db
+elspeth explain \
+  --run latest \
+  --settings examples/retention_purge/settings.yaml \
+  --database examples/retention_purge/runs/audit.db
 
 # Non-interactive text output requires a row or token selector
 DB=examples/retention_purge/runs/audit.db
@@ -62,8 +65,13 @@ elspeth explain \
   --run latest \
   --row "$ROW_ID" \
   --no-tui \
+  --settings examples/retention_purge/settings.yaml \
   --database "$DB"
 ```
+
+Supplying the settings file gives `explain` the configured payload-store
+location, so it can resolve retained payload content instead of reporting it
+as unavailable.
 
 ## Payload Store Configuration
 

@@ -180,17 +180,22 @@ class _StubHeartbeat:
     start() and stop() are no-ops.
     """
 
-    def __init__(self, *, evicted: bool = False) -> None:
+    def __init__(self, *, evicted: bool = False, lifecycle_events: list[str] | None = None) -> None:
         self._evicted = evicted
+        self._lifecycle_events = lifecycle_events
         self.start_called = False
         self.stop_called = False
+        self.stop_final_beats: list[bool] = []
         self.check_calls = 0
 
     def start(self) -> None:
         self.start_called = True
 
-    def stop(self) -> None:
+    def stop(self, *, final_beat: bool = True) -> None:
         self.stop_called = True
+        self.stop_final_beats.append(final_beat)
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("heartbeat_stop")
 
     @property
     def coordination_lost(self) -> bool:
@@ -212,9 +217,16 @@ class _StubRunCoordRepo:
     Controls what live_leader() returns and records depart_worker() calls.
     """
 
-    def __init__(self, *, seat_live: bool = True, seat_present: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        seat_live: bool = True,
+        seat_present: bool = True,
+        lifecycle_events: list[str] | None = None,
+    ) -> None:
         self._seat_live = seat_live
         self._seat_present = seat_present
+        self._lifecycle_events = lifecycle_events
         self.depart_calls: list[dict[str, Any]] = []
         self.live_leader_calls: list[dict[str, Any]] = []
         self.worker_heartbeat_calls: list[dict[str, Any]] = []
@@ -238,6 +250,8 @@ class _StubRunCoordRepo:
 
     def depart_worker(self, *, worker_id: str, now: datetime) -> None:
         self.depart_calls.append({"worker_id": worker_id, "now": now})
+        if self._lifecycle_events is not None:
+            self._lifecycle_events.append("worker_depart")
 
     def worker_heartbeat(self, *, worker_id: str, now: datetime, window_seconds: float) -> Any:
         from elspeth.contracts.coordination import CoordinationSnapshot
@@ -1209,6 +1223,22 @@ class TestFollowerHeartbeatLifecycle:
             follower.run(ctx=_ctx())
         assert heartbeat.start_called
         assert heartbeat.stop_called
+
+    def test_terminal_exit_stops_without_final_beat_before_departure(self) -> None:
+        """A known-terminal follower must not beat its already-departed row."""
+        lifecycle_events: list[str] = []
+        coord_repo = _StubRunCoordRepo(lifecycle_events=lifecycle_events)
+        heartbeat = _StubHeartbeat(lifecycle_events=lifecycle_events)
+        follower, _, _, _, _ = _make_follower(
+            coord_repo=coord_repo,
+            factory=_StubFactory(running=False),
+        )
+
+        with patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat):
+            follower.run(ctx=_ctx())
+
+        assert heartbeat.stop_final_beats == [False]
+        assert lifecycle_events == ["heartbeat_stop", "worker_depart"]
 
     def test_heartbeat_stopped_on_eviction(self) -> None:
         processor = _CountingDrainProcessor()
