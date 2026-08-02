@@ -96,7 +96,6 @@
         "ecr:UntagResource",
         "ecs:DeleteCluster",
         "ecs:DeleteService",
-        "ecs:DeregisterTaskDefinition",
         "ecs:TagResource",
         "ecs:UntagResource",
         "ecs:UpdateClusterSettings",
@@ -148,6 +147,32 @@
           "aws:RequestedRegion": "${aws_region}"
         }
       }
+    },
+    {
+      "Sid": "DeregisterTaskDefinitionsRegionScopedOnly",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DeregisterTaskDefinition"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
+      "Sid": "DeleteUntaggedContainerInsightsOrphanLogGroups",
+      "Effect": "Allow",
+      "Action": [
+        "logs:DeleteLogGroup"
+      ],
+      "Resource": [
+        "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_a_namespace}-cluster/performance",
+        "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_a_namespace}-cluster/performance:*",
+        "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_b_namespace}-cluster/performance",
+        "arn:aws:logs:${aws_region}:${aws_account_id}:log-group:/aws/ecs/containerinsights/acceptance-${scenario_b_namespace}-cluster/performance:*"
+      ]
     },
     {
       "Sid": "CreateRunTaggedXrayResources",
