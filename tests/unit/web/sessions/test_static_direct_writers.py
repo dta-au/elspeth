@@ -669,10 +669,92 @@ def check_helper_lock_assertions(
 # ---------------------------------------------------------------------------
 
 
-_INLINE_VERSION_PATTERN = re.compile(
-    r"SELECT\s+MAX\s*\(\s*composition_states\.version",
+_INLINE_VERSION_QUALIFIED_SQL = re.compile(
+    r"MAX\s*\(\s*composition_states\.version",
     re.IGNORECASE,
 )
+_INLINE_VERSION_BARE_SQL = re.compile(r"MAX\s*\(\s*version\b", re.IGNORECASE)
+_INLINE_VERSION_TABLE_SQL = re.compile(r"\bFROM\s+composition_states\b", re.IGNORECASE)
+
+_INLINE_ALLOCATION_SCOPE = frozenset({"save_composition_state", "set_active_state"})
+
+
+def _is_docstring_constant(node: ast.Constant) -> bool:
+    """Return True iff ``node`` is the docstring literal of its enclosing scope.
+
+    A docstring quoting the allocation SQL (as ``save_composition_state``'s
+    own prose does for the version contract) is documentation, not an
+    allocation site.
+    """
+
+    parent = getattr(node, "parent", None)
+    if not isinstance(parent, ast.Expr):
+        return False
+    grandparent = getattr(parent, "parent", None)
+    if not isinstance(grandparent, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+        return False
+    return bool(grandparent.body) and grandparent.body[0] is parent
+
+
+def _is_raw_state_version_max_sql(value: str) -> bool:
+    """Match realistic raw-SQL version allocation, qualified or bare.
+
+    ``MAX(composition_states.version`` matches on its own; the bare
+    ``MAX(version`` form (the shape real raw SQL takes, e.g.
+    ``SELECT COALESCE(MAX(version), 0) + 1 FROM composition_states``)
+    must also name the table in the same string to count.
+    """
+
+    if _INLINE_VERSION_QUALIFIED_SQL.search(value):
+        return True
+    return bool(_INLINE_VERSION_BARE_SQL.search(value)) and bool(_INLINE_VERSION_TABLE_SQL.search(value))
+
+
+def _is_sqlalchemy_state_version_max_call(node: ast.Call) -> bool:
+    """Match ``func.max(composition_states_table.c.version)`` allocation calls.
+
+    The live allocators (``save_composition_state._sync``,
+    ``set_active_state._sync``, ``_insert_composition_state``) all use
+    this SQLAlchemy form, not raw SQL — a raw-string-only scan is inert
+    over every real site (elspeth-13cadbc73d).
+    """
+
+    if _call_callable_name(node) != "max":
+        return False
+    for arg in node.args:
+        if (
+            isinstance(arg, ast.Attribute)
+            and arg.attr == "version"
+            and isinstance(arg.value, ast.Attribute)
+            and arg.value.attr == "c"
+            and isinstance(arg.value.value, ast.Name)
+            and arg.value.value.id == "composition_states_table"
+        ):
+            return True
+    return False
+
+
+def _with_block_invokes_session_write_lock(with_node: ast.With | ast.AsyncWith) -> bool:
+    """Name-only lock check for allocation sites.
+
+    ``_with_block_establishes_session_write_lock`` additionally matches
+    the writer call's exact conn/session arguments, but an allocation
+    site is a ``select``/string expression, not a helper call — there
+    are no writer arguments to match against. Presence of a
+    ``_session_write_lock`` / ``_session_pair_locked_begin`` context in
+    the same function is the invariant this checker can and does
+    enforce; conn/session binding for the subsequent INSERT is enforced
+    by the writer-level checkers above.
+    """
+
+    for item in with_node.items:
+        ctx = item.context_expr
+        if isinstance(ctx, ast.Call) and _call_callable_name(ctx) in (
+            _SESSION_WRITE_LOCK_NAME,
+            _PAIRED_SESSION_WRITE_LOCK_NAME,
+        ):
+            return True
+    return False
 
 
 def check_inline_state_version_allocation(
@@ -680,11 +762,16 @@ def check_inline_state_version_allocation(
     *,
     path_anchor: Path | None = None,
 ) -> list[InlineAllocViolation]:
-    """Reject inline ``SELECT MAX(composition_states.version)`` outside the write lock.
+    """Reject inline ``composition_states.version`` allocation outside the write lock.
 
     Closes the review finding that ``save_composition_state`` and
     ``set_active_state`` previously allocated state versions inline
-    without holding ``_session_write_lock``.
+    without holding ``_session_write_lock``. Covers BOTH allocation
+    forms — raw ``MAX(...version...)`` SQL strings and the SQLAlchemy
+    ``func.max(composition_states_table.c.version)`` call the live
+    allocators actually use — and matches the scope functions anywhere
+    in the enclosing dotted symbol, because the real sites live in
+    nested ``_sync`` closures (``...save_composition_state._sync``).
 
     Conditional-dormant: returns ``[]`` until ``_session_write_lock``
     is defined.
@@ -712,15 +799,20 @@ def check_inline_state_version_allocation(
         source_lines = source.splitlines()
 
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
-                continue
-            if _INLINE_VERSION_PATTERN.search(node.value) is None:
+            if isinstance(node, ast.Constant):
+                if not isinstance(node.value, str) or _is_docstring_constant(node):
+                    continue
+                if not _is_raw_state_version_max_sql(node.value):
+                    continue
+            elif isinstance(node, ast.Call):
+                if not _is_sqlalchemy_state_version_max_call(node):
+                    continue
+            else:
                 continue
             symbol = _qualified_symbol(node)
-            simple_name = symbol.rsplit(".", 1)[-1]
-            if simple_name not in {"save_composition_state", "set_active_state"}:
+            if not _INLINE_ALLOCATION_SCOPE & set(symbol.split(".")):
                 continue
-            inside_lock = any(_with_block_establishes_session_write_lock(w) for w in _enclosing_with_blocks(node))
+            inside_lock = any(_with_block_invokes_session_write_lock(w) for w in _enclosing_with_blocks(node))
             if inside_lock:
                 continue
             line = getattr(node, "lineno", 0)
@@ -2092,3 +2184,147 @@ def test_lock_discipline_dormant_when_session_write_lock_absent(tmp_path: Path) 
     )
     findings = check_lock_discipline([synthetic_root], path_anchor=tmp_path)
     assert findings == [], f"lock-discipline checker should be dormant without _session_write_lock; findings={findings}"
+
+
+# ---------------------------------------------------------------------------
+# Inline composition_states.version allocation checker self-tests
+# (regression for elspeth-13cadbc73d: arity crash, SQLAlchemy-form
+# inertness, and nested-closure scope blindness)
+# ---------------------------------------------------------------------------
+
+
+_INLINE_ALLOC_LOCK_PREAMBLE = """\
+from contextlib import contextmanager
+
+from sqlalchemy import func, select
+
+from synthetic_models import composition_states_table
+
+
+@contextmanager
+def _session_write_lock(conn, sid):
+    yield
+
+
+"""
+
+
+def test_inline_allocation_checker_survives_locked_raw_qualified_site(tmp_path: Path) -> None:
+    """A compliant raw-SQL allocation inside the lock must scan clean, not crash.
+
+    Regression for the elspeth-13cadbc73d arity defect: the checker
+    called ``_with_block_establishes_session_write_lock(w)`` with one
+    argument while the predicate requires ``(with_node, writer)``, so
+    the first matched raw-SQL site that WAS inside a ``with`` block —
+    the compliant case — raised ``TypeError`` and crashed the gate.
+    """
+
+    synthetic_root = tmp_path / "src"
+    synthetic_root.mkdir()
+    (synthetic_root / "synthetic_service.py").write_text(
+        _INLINE_ALLOC_LOCK_PREAMBLE
+        + textwrap.dedent("""\
+        class LockedQualifiedRawService:
+            def save_composition_state(self, conn, sid):
+                with _session_write_lock(conn, sid):
+                    conn.exec_driver_sql(
+                        "SELECT MAX(composition_states.version) FROM composition_states WHERE session_id = ?",
+                        (sid,),
+                    )
+    """)
+    )
+    findings = check_inline_state_version_allocation([synthetic_root], path_anchor=tmp_path)
+    assert findings == [], f"locked qualified raw-SQL allocation must not be flagged (and must not crash); findings={findings}"
+
+
+def test_inline_allocation_checker_covers_both_forms_and_lock_contexts(tmp_path: Path) -> None:
+    """Both allocation forms are detected, and only the unlocked sites are flagged.
+
+    Mirrors the live-tree shapes: ``save_composition_state`` /
+    ``set_active_state`` allocate inside a nested ``_sync`` closure
+    (so the enclosing symbol ends in ``._sync``, exercising the
+    symbol-path scope match), via either the SQLAlchemy
+    ``select(func.max(composition_states_table.c.version))`` form or a
+    raw ``SELECT COALESCE(MAX(version), 0) + 1 FROM composition_states``
+    string. Locked variants must scan clean; unlocked variants must be
+    flagged; the ``_insert_composition_state`` helper (whose lock
+    precondition is enforced by ``check_helper_lock_assertions``) and a
+    docstring quoting the SQL must stay out of scope.
+    """
+
+    synthetic_root = tmp_path / "src"
+    synthetic_root.mkdir()
+    (synthetic_root / "synthetic_service.py").write_text(
+        _INLINE_ALLOC_LOCK_PREAMBLE
+        + textwrap.dedent("""\
+        class LockedSqlalchemyService:
+            def save_composition_state(self, sid):
+                def _sync():
+                    with self._session_process_locked_begin(sid) as conn:
+                        with _session_write_lock(conn, sid):
+                            conn.execute(
+                                select(func.max(composition_states_table.c.version)).where(
+                                    composition_states_table.c.session_id == sid
+                                )
+                            )
+                return _sync
+
+
+        class UnlockedSqlalchemyService:
+            def save_composition_state(self, sid):
+                def _sync():
+                    with self._session_process_locked_begin(sid) as conn:
+                        conn.execute(
+                            select(func.max(composition_states_table.c.version)).where(
+                                composition_states_table.c.session_id == sid
+                            )
+                        )
+                return _sync
+
+
+        class LockedRawService:
+            def set_active_state(self, sid):
+                def _sync():
+                    with self._session_process_locked_begin(sid) as conn:
+                        with _session_write_lock(conn, sid):
+                            conn.exec_driver_sql(
+                                "SELECT COALESCE(MAX(version), 0) + 1 FROM composition_states WHERE session_id = ?",
+                                (sid,),
+                            )
+                return _sync
+
+
+        class UnlockedRawService:
+            def set_active_state(self, sid):
+                def _sync():
+                    with self._session_process_locked_begin(sid) as conn:
+                        conn.exec_driver_sql(
+                            "SELECT COALESCE(MAX(version), 0) + 1 FROM composition_states WHERE session_id = ?",
+                            (sid,),
+                        )
+                return _sync
+
+
+        class DocstringService:
+            def save_composition_state(self, sid):
+                '''Allocates via SELECT COALESCE(MAX(version), 0) + 1 FROM composition_states.'''
+                return None
+
+
+        def _insert_composition_state(conn, sid):
+            conn.execute(
+                select(func.max(composition_states_table.c.version)).where(
+                    composition_states_table.c.session_id == sid
+                )
+            )
+    """)
+    )
+    findings = check_inline_state_version_allocation([synthetic_root], path_anchor=tmp_path)
+    symbols = {finding.enclosing_symbol for finding in findings}
+    assert symbols == {
+        "UnlockedSqlalchemyService.save_composition_state._sync",
+        "UnlockedRawService.set_active_state._sync",
+    }, (
+        "inline-allocation checker must flag exactly the unlocked SQLAlchemy-form and "
+        f"raw-form allocation sites (and nothing else); findings={findings}"
+    )
