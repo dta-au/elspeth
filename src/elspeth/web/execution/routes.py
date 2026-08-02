@@ -88,12 +88,18 @@ from elspeth.web.paths import allowed_sink_directories
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.ownership import verify_session_ownership
 from elspeth.web.sessions.protocol import (
+    RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuthorityLostError,
     RunEventRecord,
     RunRecord,
     SessionServiceProtocol,
     TerminalSessionRunStatus,
 )
-from elspeth.web.sessions.routes._helpers import _get_session_compose_lock_registry, _litellm_error_detail, _persist_llm_calls
+from elspeth.web.sessions.routes._helpers import (
+    _get_session_compose_lock_registry,
+    _litellm_error_detail,
+    _persist_run_diagnostics_llm_calls,
+)
 
 slog = structlog.get_logger()
 _ARTIFACT_SNAPSHOT_CHUNK_SIZE = 1024 * 1024
@@ -1217,6 +1223,11 @@ def create_execution_router() -> APIRouter:
         composer: ComposerService = request.app.state.composer_service
         settings: WebSettings = request.app.state.settings
         recorder = BufferingRecorder()
+        audit_authority = RunDiagnosticsAuditAuthority(
+            run_id=run.id,
+            session_id=run.session_id,
+            state_id=run.state_id,
+        )
 
         async def _persist_diagnostics_llm_calls(*, plugin_crash_pending: bool) -> None:
             # elspeth-0fcf68d50f: diagnostics audit rows land in the same
@@ -1226,17 +1237,17 @@ def create_execution_router() -> APIRouter:
             # step — never the LLM call above — so a slow diagnostics
             # evaluation cannot starve an in-flight compose turn, and the
             # lock order (compose lock, then the service's internal
-            # session write lock inside ``add_message``) matches every
+            # session write lock inside the persist) matches every
             # compose-route writer, so no inverted-order deadlock exists.
+            # The write itself re-proves ``audit_authority`` durably in
+            # the same transaction as the insert.
             compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(run.session_id))
             async with compose_lock:
-                await _persist_llm_calls(
+                await _persist_run_diagnostics_llm_calls(
                     request.app.state.session_service,
-                    run.session_id,
+                    audit_authority,
                     recorder.llm_calls,
-                    run.state_id,
                     plugin_crash_pending=plugin_crash_pending,
-                    writer_principal="run_diagnostics",
                 )
 
         try:
@@ -1269,7 +1280,21 @@ def create_execution_router() -> APIRouter:
             await _persist_diagnostics_llm_calls(plugin_crash_pending=True)
             raise
         else:
-            await _persist_diagnostics_llm_calls(plugin_crash_pending=False)
+            try:
+                await _persist_diagnostics_llm_calls(plugin_crash_pending=False)
+            except RunDiagnosticsAuthorityLostError as lost:
+                # Custody moved (run/session/state binding no longer holds)
+                # before the audit row could land. Refuse to hand back an
+                # unaudited explanation — audit rows are the product here.
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error_type": "run_diagnostics_audit_authority_lost",
+                        "detail": (
+                            f"Run diagnostics audit authority lost ({lost.reason}); the explanation was discarded because its audit row could not be written."
+                        ),
+                    },
+                ) from lost
 
         explanation, working_view = _parse_run_diagnostics_working_view(explanation, diagnostics)
         return RunDiagnosticsEvaluationResponse(

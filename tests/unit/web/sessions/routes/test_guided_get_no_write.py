@@ -31,6 +31,23 @@ def test_get_guided_has_no_recorder_or_audit_drain() -> None:
     assert "add_message" not in source
 
 
+def test_get_guided_has_no_state_write_or_reconciliation() -> None:
+    """GET must not write composition state, not even to reconcile.
+
+    elspeth-4dc78b3897: ``get_guided`` once reconciled a terminally
+    rejected proposal reference by writing a new composition state with
+    no operation fence. Every fenced lifecycle (reject, supersede,
+    revert, back-edit) already clears the reference atomically in the
+    same transaction that terminalizes the row, so a rejected row behind
+    an active reference is integrity evidence — GET fails closed and
+    preserves it.
+    """
+    source = inspect.getsource(get_guided)
+    assert "reconcile" not in source
+    assert "save_composition_state" not in source
+    assert "_insert_composition_state" not in source
+
+
 def test_persist_chat_turns_helper_is_deleted() -> None:
     """``_persist_chat_turns`` had zero production callers; it must stay gone
     rather than invite a fourth context-free ``add_message`` drain."""

@@ -562,6 +562,10 @@ def test_postgresql_literal_case_drift_is_not_normalized_away() -> None:
             "(status = 'live' OR path IS NULL) = (path IS NOT NULL)",
             "status::text = 'live'::text OR path IS NULL) = (path IS NOT NULL",
         ),
+        (
+            "path IS NULL OR (json_typeof(path) = 'array'::text AND json_array_length(path) > 0)",
+            "path IS NULL OR json_typeof(path) = 'array'::text AND json_array_length(path) > 0",
+        ),
     ],
 )
 def test_collector_pins_postgresql_check_reflection_forms(declared_sql: str, reflected_sql: str) -> None:
@@ -862,6 +866,7 @@ def _static_check_issues(
         ("trusted.next_id() > 0", "attacker.next_id() > 0"),
         ("trusted.pg_demo.amount > 0", "attacker.pg_demo.amount > 0"),
         ("__elspeth_literal_0__ = 'safe'", "'safe' = 'safe'"),
+        ("json_typeof(a) = 'array'", "json_typeof(a) = 'array'::text"),
     ],
 )
 def test_collector_rejects_unproven_expression_equivalences(declared_sql: str, reflected_sql: str) -> None:

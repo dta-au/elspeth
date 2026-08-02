@@ -80,6 +80,7 @@ from elspeth.web.coordination.repository import (
     _RepositoryInterpretationMutations,
     _RepositoryMutationState,
 )
+from elspeth.web.coordination.run_diagnostics_authority import RepositoryRunDiagnosticsAuditAuthority
 from elspeth.web.coordination.run_recovery_authority import RepositoryGlobalRunRecoveryAuthority
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.sessions._persist_payload import AuditOutcome, RedactedToolRow, StatePayload
@@ -228,6 +229,8 @@ from elspeth.web.sessions.protocol import (
     PreparedGuidedJsonPayload,
     ProposalEventRecord,
     ProposalLifecycleStatus,
+    RunDiagnosticsAuditAuthority,
+    RunDiagnosticsAuditMutationAuthority,
     RunEventRecord,
     RunRecord,
     SessionArchiveDisposition,
@@ -3407,6 +3410,7 @@ class SessionServiceImpl:
         session_operation_authority: SessionOperationAuthority | None = None,
         global_run_recovery_authority: GlobalRunRecoveryAuthority | None = None,
         audit_access_log_authority: AuditAccessLogAuthority | None = None,
+        run_diagnostics_audit_authority: RunDiagnosticsAuditMutationAuthority | None = None,
         skill_markdown_history_authority: SkillMarkdownHistoryAuthority | None = None,
         owner_instance_id: str | None = None,
         session_operation_lease_seconds: int = 30,
@@ -3440,6 +3444,7 @@ class SessionServiceImpl:
         self._session_operation_authority = session_operation_authority
         self._global_run_recovery_authority = global_run_recovery_authority or RepositoryGlobalRunRecoveryAuthority(engine)
         self._audit_access_log_authority = audit_access_log_authority or RepositoryAuditAccessLogAuthority(engine)
+        self._run_diagnostics_audit_authority = run_diagnostics_audit_authority or RepositoryRunDiagnosticsAuditAuthority(engine)
         self._skill_markdown_history_authority = skill_markdown_history_authority or RepositorySkillMarkdownHistoryAuthority(engine)
 
     @property
@@ -7727,6 +7732,33 @@ class SessionServiceImpl:
             writer_principal=writer_principal,
             tool_call_id=tool_call_id,
             parent_assistant_id=parent_assistant_id,
+        )
+
+    async def add_run_diagnostics_audit_message(
+        self,
+        authority: RunDiagnosticsAuditAuthority,
+        content: str,
+        *,
+        tool_calls: Sequence[Mapping[str, Any]] | None = None,
+    ) -> ChatMessageRecord:
+        """Append one run-diagnostics ``role=audit`` row under proven authority.
+
+        The authority proof and the insert share one locked transaction,
+        and the proof runs before sequence allocation, so a
+        refused write aborts without consuming a chat sequence number.
+        ``writer_principal`` and ``composition_state_id`` are derived
+        from the authority. The injected repository authority is the only
+        production writer of ``writer_principal='run_diagnostics'`` rows
+        (elspeth-0fcf68d50f).
+        """
+        return cast(
+            ChatMessageRecord,
+            await self._run_sync(
+                self._run_diagnostics_audit_authority.append_audit_message,
+                authority=authority,
+                content=content,
+                tool_calls=tool_calls,
+            ),
         )
 
     async def add_message_with_transcript(
