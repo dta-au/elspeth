@@ -126,6 +126,33 @@ async def _persist(sessions_service: SessionServiceImpl, state: CompositionState
     return session_id, record.id
 
 
+async def _surface(
+    composer: ComposerServiceImpl,
+    sessions_service: SessionServiceImpl,
+    state: CompositionState,
+    *,
+    session_id: UUID,
+    state_id: UUID,
+) -> None:
+    context = await sessions_service._run_sync(
+        lambda: sessions_service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        await composer.surface_pending_interpretation_reviews(
+            state,
+            session_id=str(session_id),
+            current_state_id=str(state_id),
+            session_operation_context=context,
+        )
+    finally:
+        await sessions_service._run_sync(sessions_service.session_operation_authority.release, context)
+
+
 async def _save_state_for_session(
     sessions_service: SessionServiceImpl,
     session_id: UUID,
@@ -168,7 +195,7 @@ async def test_surfacer_surfaces_prompt_template(tmp_path, sessions_service) -> 
         version=1,
     )
     session_id, state_id = await _persist(sessions_service, state)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     kinds = {e.kind for e in events}
     assert InterpretationKind.LLM_PROMPT_TEMPLATE in kinds
@@ -231,7 +258,7 @@ async def test_surfacer_surfaces_model_choice(tmp_path, sessions_service) -> Non
         version=1,
     )
     session_id, state_id = await _persist(sessions_service, state)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     kinds = {e.kind for e in events}
     assert InterpretationKind.LLM_MODEL_CHOICE in kinds
@@ -250,8 +277,8 @@ async def test_surfacer_is_idempotent(tmp_path, sessions_service) -> None:
         version=1,
     )
     session_id, state_id = await _persist(sessions_service, state)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     mc = [e for e in events if e.kind is InterpretationKind.LLM_MODEL_CHOICE]
     assert len(mc) == 1
@@ -272,7 +299,7 @@ async def test_model_choice_changed_identity_supersedes_old_event(tmp_path, sess
         version=1,
     )
     session_id, old_state_id = await _persist(sessions_service, old_state)
-    await composer.surface_pending_interpretation_reviews(old_state, session_id=str(session_id), current_state_id=str(old_state_id))
+    await _surface(composer, sessions_service, old_state, session_id=session_id, state_id=old_state_id)
 
     new_state = CompositionState(
         source=None,
@@ -283,7 +310,7 @@ async def test_model_choice_changed_identity_supersedes_old_event(tmp_path, sess
         version=2,
     )
     new_record = await _save_state_for_session(sessions_service, session_id, new_state)
-    await composer.surface_pending_interpretation_reviews(new_state, session_id=str(session_id), current_state_id=str(new_record.id))
+    await _surface(composer, sessions_service, new_state, session_id=session_id, state_id=new_record.id)
     events = await sessions_service.list_interpretation_events(session_id, status="all")
     model_events = [event for event in events if event.kind is InterpretationKind.LLM_MODEL_CHOICE]
     assert [(event.llm_draft, event.choice) for event in model_events] == [
@@ -345,7 +372,7 @@ async def test_surfacer_surfaces_staged_vague_term(tmp_path, sessions_service) -
         version=1,
     )
     session_id, state_id = await _persist(sessions_service, state)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     vt = [e for e in events if e.kind is InterpretationKind.VAGUE_TERM]
     assert len(vt) == 1
@@ -389,7 +416,7 @@ async def test_surfacer_skips_bare_vague_term(tmp_path, sessions_service) -> Non
     # node has a non-empty prompt_template, so _find_llm_transform_node passes
     # and the else-branch does no VAGUE_TERM check; the skip is the designed
     # advisory polarity, not protection against a writer rejection.)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     vt = [e for e in events if e.kind is InterpretationKind.VAGUE_TERM]
     assert vt == []
@@ -453,7 +480,7 @@ async def test_surfacer_skips_model_only_node_without_prompt_template(tmp_path, 
     )
     session_id, state_id = await _persist(sessions_service, state)
     # Must NOT raise even though the writer boundary would reject this shape.
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     mc = [e for e in events if e.kind is InterpretationKind.LLM_MODEL_CHOICE]
     assert mc == []
@@ -508,7 +535,7 @@ async def test_surfacer_surfaces_every_named_invented_source(tmp_path, sessions_
         version=1,
     )
     session_id, state_id = await _persist(sessions_service, state)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     invented_source_events = [event for event in events if event.kind is InterpretationKind.INVENTED_SOURCE]
     assert {event.affected_node_id for event in invented_source_events} == {"source", "source:orders"}
@@ -575,7 +602,7 @@ async def test_surfacer_surfaces_pipeline_decision(tmp_path, sessions_service) -
         version=1,
     )
     session_id, state_id = await _persist(sessions_service, state)
-    await composer.surface_pending_interpretation_reviews(state, session_id=str(session_id), current_state_id=str(state_id))
+    await _surface(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     kinds = {e.kind for e in events}
     assert InterpretationKind.PIPELINE_DECISION in kinds
@@ -596,7 +623,7 @@ async def test_pipeline_decision_changed_identity_supersedes_old_event(tmp_path,
         version=1,
     )
     session_id, old_state_id = await _persist(sessions_service, old_state)
-    await composer.surface_pending_interpretation_reviews(old_state, session_id=str(session_id), current_state_id=str(old_state_id))
+    await _surface(composer, sessions_service, old_state, session_id=session_id, state_id=old_state_id)
 
     new_state = CompositionState(
         source=None,
@@ -607,7 +634,7 @@ async def test_pipeline_decision_changed_identity_supersedes_old_event(tmp_path,
         version=2,
     )
     new_record = await _save_state_for_session(sessions_service, session_id, new_state)
-    await composer.surface_pending_interpretation_reviews(new_state, session_id=str(session_id), current_state_id=str(new_record.id))
+    await _surface(composer, sessions_service, new_state, session_id=session_id, state_id=new_record.id)
     events = await sessions_service.list_interpretation_events(session_id, status="all")
     decision_events = [event for event in events if event.kind is InterpretationKind.PIPELINE_DECISION]
     assert [(event.llm_draft, event.choice) for event in decision_events] == [

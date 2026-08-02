@@ -157,6 +157,7 @@ async def test_surface_imported_reviews_skips_writer_rejected_rows() -> None:
     writer; only surviving pending rows surface (elspeth-ae5160c3cb)."""
     from uuid import uuid4
 
+    from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
     from elspeth.web.sessions.routes.composer.state import _surface_imported_interpretation_review_events
 
     surfaced: list[dict] = []
@@ -210,11 +211,21 @@ async def test_surface_imported_reviews_skips_writer_rejected_rows() -> None:
         ]
     )
 
+    session_id = uuid4()
     await _surface_imported_interpretation_review_events(
         service,  # type: ignore[arg-type]
-        session_id=uuid4(),
+        session_id=session_id,
         state=state,
         composition_state_id=uuid4(),
+        session_operation_context=SessionOperationContext(
+            fence=SessionOperationFence(
+                session_id=str(session_id),
+                operation_id="yaml-import",
+                lease_token="yaml-import-token",
+                operation_epoch=1,
+            ),
+            operation_kind=SessionOperationKind.COMPOSE,
+        ),
     )
 
     assert [call["user_term"] for call in surfaced] == ["llm_prompt_template:score"]

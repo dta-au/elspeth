@@ -105,11 +105,22 @@ def engine():
 
 @pytest.fixture
 def service(engine) -> SessionServiceImpl:
-    return SessionServiceImpl(
+    instance = SessionServiceImpl(
         engine,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
     )
+    create_pending = instance.create_pending_interpretation_event
+
+    async def _create_pending_with_test_lease(**kwargs: Any) -> InterpretationEventRecord:
+        """Keep legacy semantic cases focused while production callers pass authority explicitly."""
+        if "session_operation_context" in kwargs:
+            return await create_pending(**kwargs)
+        async with _compose_operation(instance, kwargs["session_id"]) as context:
+            return await create_pending(**kwargs, session_operation_context=context)
+
+    instance.create_pending_interpretation_event = _create_pending_with_test_lease  # type: ignore[method-assign]
+    return instance
 
 
 def _insert_session(conn, session_id: str) -> None:
@@ -165,11 +176,15 @@ async def _save_composition_state(
 
 
 @asynccontextmanager
-async def _compose_operation(service: SessionServiceImpl, session_id: UUID) -> AsyncIterator[SessionOperationContext]:
+async def _compose_operation(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
+) -> AsyncIterator[SessionOperationContext]:
     context = await service._run_sync(
         lambda: service.session_operation_authority.acquire(
             session_id=session_id,
-            operation_kind=SessionOperationKind.COMPOSE,
+            operation_kind=operation_kind,
             owner_instance_id=service.session_operation_owner_instance_id,
             lease_seconds=service.session_operation_lease_seconds,
         )
@@ -598,24 +613,27 @@ async def _create_prompt_template_interpretation_event(
 
 
 @pytest.mark.asyncio
-async def test_01_create_pending_interpretation_event_inserts_row(service) -> None:
+@pytest.mark.parametrize("operation_kind", [SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL])
+async def test_01_create_pending_interpretation_event_inserts_row(service, operation_kind: SessionOperationKind) -> None:
     """Spec test 1: pending row inserted with all required fields."""
     session_id = uuid4()
     state = await _seed_state_with_llm_node(service, session_id=session_id)
 
-    event = await service.create_pending_interpretation_event(
-        session_id=session_id,
-        composition_state_id=state.id,
-        affected_node_id="llm_transform_1",
-        tool_call_id="call_42",
-        user_term="cool",
-        kind=InterpretationKind.VAGUE_TERM,
-        llm_draft="A draft definition of cool",
-        model_identifier="anthropic/claude-opus-4-7",
-        model_version="2026-05-01",
-        provider="anthropic",
-        composer_skill_hash="a" * 64,
-    )
+    async with _compose_operation(service, session_id, operation_kind) as context:
+        event = await service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=state.id,
+            affected_node_id="llm_transform_1",
+            tool_call_id="call_42",
+            user_term="cool",
+            kind=InterpretationKind.VAGUE_TERM,
+            llm_draft="A draft definition of cool",
+            model_identifier="anthropic/claude-opus-4-7",
+            model_version="2026-05-01",
+            provider="anthropic",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
 
     assert event.choice is InterpretationChoice.PENDING
     assert event.interpretation_source is InterpretationSource.USER_APPROVED
@@ -662,20 +680,22 @@ async def test_02_create_pending_rejects_unknown_node_id(service) -> None:
         node=_llm_node(node_id="node-A"),
     )
 
-    with pytest.raises(ValueError, match=r"node-does-not-exist|not present"):
-        await service.create_pending_interpretation_event(
-            session_id=session_id,
-            composition_state_id=state.id,
-            affected_node_id="node-does-not-exist",
-            tool_call_id="call_42",
-            user_term="cool",
-            kind=InterpretationKind.VAGUE_TERM,
-            llm_draft="A draft of cool",
-            model_identifier="anthropic/claude-opus-4-7",
-            model_version="2026-05-01",
-            provider="anthropic",
-            composer_skill_hash="a" * 64,
-        )
+    async with _compose_operation(service, session_id) as context:
+        with pytest.raises(ValueError, match=r"node-does-not-exist|not present"):
+            await service.create_pending_interpretation_event(
+                session_id=session_id,
+                composition_state_id=state.id,
+                affected_node_id="node-does-not-exist",
+                tool_call_id="call_42",
+                user_term="cool",
+                kind=InterpretationKind.VAGUE_TERM,
+                llm_draft="A draft of cool",
+                model_identifier="anthropic/claude-opus-4-7",
+                model_version="2026-05-01",
+                provider="anthropic",
+                composer_skill_hash="a" * 64,
+                session_operation_context=context,
+            )
 
     with service._engine.begin() as conn:
         count = conn.execute(
@@ -1320,19 +1340,21 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
         return session_id, saved_state
 
     session_id, saved = await save_profiled_state()
-    event = await policy_service.create_pending_interpretation_event(
-        session_id=session_id,
-        composition_state_id=saved.id,
-        affected_node_id="llm1",
-        tool_call_id="call_profiled_prompt_template",
-        user_term=user_term,
-        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-        llm_draft=prompt_template,
-        model_identifier="composer-model",
-        model_version="composer-model",
-        provider="openrouter",
-        composer_skill_hash="a" * 64,
-    )
+    async with _compose_operation(policy_service, session_id) as context:
+        event = await policy_service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=saved.id,
+            affected_node_id="llm1",
+            tool_call_id="call_profiled_prompt_template",
+            user_term=user_term,
+            kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+            llm_draft=prompt_template,
+            model_identifier="composer-model",
+            model_version="composer-model",
+            provider="openrouter",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
 
     _resolved, new_state = await policy_service.resolve_interpretation_event(
         session_id=session_id,
@@ -1346,19 +1368,21 @@ async def test_resolve_profiled_llm_review_revalidates_lowered_contract(engine) 
     assert new_state.validation_errors is None
 
     opted_out_session_id, opted_out_saved = await save_profiled_state(review_disabled=True)
-    opted_out_event = await policy_service.create_pending_interpretation_event(
-        session_id=opted_out_session_id,
-        composition_state_id=opted_out_saved.id,
-        affected_node_id="llm1",
-        tool_call_id="call_profiled_prompt_template_opt_out",
-        user_term=user_term,
-        kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
-        llm_draft=prompt_template,
-        model_identifier="composer-model",
-        model_version="composer-model",
-        provider="openrouter",
-        composer_skill_hash="a" * 64,
-    )
+    async with _compose_operation(policy_service, opted_out_session_id) as context:
+        opted_out_event = await policy_service.create_pending_interpretation_event(
+            session_id=opted_out_session_id,
+            composition_state_id=opted_out_saved.id,
+            affected_node_id="llm1",
+            tool_call_id="call_profiled_prompt_template_opt_out",
+            user_term=user_term,
+            kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
+            llm_draft=prompt_template,
+            model_identifier="composer-model",
+            model_version="composer-model",
+            provider="openrouter",
+            composer_skill_hash="a" * 64,
+            session_operation_context=context,
+        )
     opted_out_state = await policy_service.get_current_state(opted_out_session_id)
 
     assert opted_out_event.choice is InterpretationChoice.OPTED_OUT

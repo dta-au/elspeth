@@ -1056,6 +1056,7 @@ async def _auto_surface_prompt_template_reviews_for_state(
     model_version: str,
     provider: str,
     composer_skill_hash: str,
+    session_operation_context: SessionOperationContext,
 ) -> None:
     """Canonical ``llm_prompt_template`` surfacing pass (see the instance method).
 
@@ -1102,6 +1103,7 @@ async def _auto_surface_prompt_template_reviews_for_state(
             model_version=model_version,  # (D2)
             provider=provider,  # (D2)
             composer_skill_hash=composer_skill_hash,  # (D2)
+            session_operation_context=session_operation_context,
         )
 
 
@@ -1183,6 +1185,7 @@ async def surface_pending_interpretation_reviews_for_state(
     model_version: str,
     provider: str,
     composer_skill_hash: str,
+    session_operation_context: SessionOperationContext,
 ) -> None:
     """Kind-general pending-review surfacer over one persisted state (B1).
 
@@ -1210,6 +1213,7 @@ async def surface_pending_interpretation_reviews_for_state(
         model_version=model_version,
         provider=provider,
         composer_skill_hash=composer_skill_hash,
+        session_operation_context=session_operation_context,
     )
     for site in interpretation_sites(state):
         if site.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
@@ -1245,6 +1249,7 @@ async def surface_pending_interpretation_reviews_for_state(
                 model_version=model_version,
                 provider=provider,
                 composer_skill_hash=composer_skill_hash,
+                session_operation_context=session_operation_context,
             )
         except ValueError:
             continue
@@ -1700,6 +1705,7 @@ class ComposerServiceImpl:
         *,
         session_id: str | None,
         current_state_id: str | None,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Surface a pending ``llm_prompt_template`` review EVENT, backend-derived.
 
@@ -1733,6 +1739,7 @@ class ComposerServiceImpl:
             model_version=self._model,  # (D2)
             provider=self._availability.provider or "unknown",  # (D2)
             composer_skill_hash=self._composer_skill_hash,  # (D2)
+            session_operation_context=session_operation_context,
         )
 
     @staticmethod
@@ -1779,6 +1786,7 @@ class ComposerServiceImpl:
         *,
         session_id: str | None,
         current_state_id: str | None,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Kind-general backend surfacer for the GUIDED commit path (B1).
 
@@ -1817,6 +1825,7 @@ class ComposerServiceImpl:
             model_version=self._model,
             provider=self._availability.provider or "unknown",
             composer_skill_hash=self._composer_skill_hash,
+            session_operation_context=session_operation_context,
         )
 
     @staticmethod
@@ -3579,10 +3588,13 @@ class ComposerServiceImpl:
             # The branch is intentionally narrower than "any review tool
             # succeeded": a review followed by another tool call or a mixed
             # success/error batch is not a terminal user-action boundary.
+            if session_operation_context is None:
+                raise RuntimeError("terminal interpretation handoff lost its compose operation context")
             await self.surface_pending_interpretation_reviews(
                 state,
                 session_id=session_id,
                 current_state_id=persist.current_state_id,
+                session_operation_context=session_operation_context,
             )
             runtime_result: ValidationResult | None = last_runtime_preflight
             if state.version > initial_version:
@@ -3603,6 +3615,7 @@ class ComposerServiceImpl:
                     state=state,
                     session_id=session_id,
                     current_state_id=persist.current_state_id,
+                    session_operation_context=session_operation_context,
                     progress=progress,
                     recorder=recorder,
                     initial_version=initial_version,
@@ -3669,6 +3682,7 @@ class ComposerServiceImpl:
                         state=state,
                         session_id=session_id,
                         current_state_id=persist.current_state_id,
+                        session_operation_context=session_operation_context,
                         assistant_message=assistant_message,
                         llm_messages=llm_messages,
                         recorder=recorder,
@@ -3715,6 +3729,7 @@ class ComposerServiceImpl:
                         state=state,
                         session_id=session_id,
                         current_state_id=persist.current_state_id,
+                        session_operation_context=session_operation_context,
                         progress=progress,
                         recorder=recorder,
                         initial_version=initial_version,
@@ -3775,6 +3790,7 @@ class ComposerServiceImpl:
         state: CompositionState,
         session_id: str | None,
         current_state_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         initial_version: int,
         user_id: str | None,
         last_runtime_preflight: ValidationResult | None,
@@ -3927,6 +3943,7 @@ class ComposerServiceImpl:
             state=state,
             session_id=session_id,
             current_state_id=current_state_id,
+            session_operation_context=session_operation_context,
             assistant_message=assistant_message,
             llm_messages=llm_messages,
             recorder=recorder,
@@ -3998,6 +4015,7 @@ class ComposerServiceImpl:
             state=state,
             session_id=session_id,
             current_state_id=current_state_id,
+            session_operation_context=session_operation_context,
             progress=progress,
             recorder=recorder,
             initial_version=initial_version,
@@ -4029,6 +4047,7 @@ class ComposerServiceImpl:
         state: CompositionState,
         session_id: str | None,
         current_state_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         assistant_message: Any,
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None,
@@ -4070,11 +4089,15 @@ class ComposerServiceImpl:
         # surface-early = Case B in the repair loop). The orphan gate below
         # (unfiltered) then sees the PT event present; if this helper ever no-ops,
         # it stays fail-closed.
-        await self._auto_surface_prompt_template_reviews(
-            state,
-            session_id=session_id,
-            current_state_id=current_state_id,
-        )
+        if session_id is not None and current_state_id is not None:
+            if session_operation_context is None:
+                raise RuntimeError("pending interpretation surfacing requires the compose operation context")
+            await self._auto_surface_prompt_template_reviews(
+                state,
+                session_id=session_id,
+                current_state_id=current_state_id,
+                session_operation_context=session_operation_context,
+            )
         orphaned_sites = await self._missing_pending_interpretation_review_sites(
             state,
             session_id=session_id,
@@ -4132,6 +4155,7 @@ class ComposerServiceImpl:
         state: CompositionState,
         session_id: str | None,
         current_state_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         progress: ComposerProgressSink | None,
         recorder: BufferingRecorder,
         initial_version: int,
@@ -4160,6 +4184,7 @@ class ComposerServiceImpl:
             state=state,
             session_id=session_id,
             current_state_id=current_state_id,
+            session_operation_context=session_operation_context,
             assistant_message=assistant_message,
             recorder=recorder,
             progress=progress,
@@ -4199,6 +4224,7 @@ class ComposerServiceImpl:
         state: CompositionState,
         session_id: str | None,
         current_state_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         assistant_message: Any,
         llm_messages: list[dict[str, Any]],
         recorder: BufferingRecorder,
@@ -4275,6 +4301,7 @@ class ComposerServiceImpl:
                 state=state,
                 session_id=session_id,
                 current_state_id=current_state_id,
+                session_operation_context=session_operation_context,
                 assistant_message=assistant_message,
                 recorder=recorder,
                 progress=progress,
@@ -4542,6 +4569,7 @@ class ComposerServiceImpl:
                     state=state,
                     session_id=session_id,
                     current_state_id=current_state_id,
+                    session_operation_context=session_operation_context,
                     initial_version=initial_version,
                     user_id=user_id,
                     last_runtime_preflight=last_runtime_preflight,
@@ -5213,6 +5241,8 @@ class ComposerServiceImpl:
                 f"_get_litellm_tools() should not advertise session-aware tools to "
                 f"the LLM on unsaved-session compose calls."
             )
+        if session_operation_context is None:
+            raise RuntimeError(f"Session-aware tool {tool_name!r} dispatched without its compose operation context.")
         if current_state_id is None:
             # Fresh chat sessions legitimately start without a
             # composition_states row. A session-aware tool can only write
@@ -5266,6 +5296,7 @@ class ComposerServiceImpl:
             current_state_id=current_state_id,
             tool_call_id=tool_call_id,
             response=response,
+            session_operation_context=session_operation_context,
         )
 
         try:
@@ -5394,6 +5425,7 @@ class ComposerServiceImpl:
         current_state_id: str,
         tool_call_id: str,
         response: Any,
+        session_operation_context: SessionOperationContext,
     ) -> dict[str, Any]:
         """Build the kwarg dict for a session-aware tool handler.
 
@@ -5424,6 +5456,7 @@ class ComposerServiceImpl:
                 "model_version": safe_response_model(response) or self._model,
                 "provider": self._availability.provider or "unknown",
                 "composer_skill_hash": self._composer_skill_hash,
+                "session_operation_context": session_operation_context,
                 "create_pending_interpretation_event": sessions_service.create_pending_interpretation_event,
                 "list_interpretation_events": sessions_service.list_interpretation_events,
             }

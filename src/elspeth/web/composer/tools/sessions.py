@@ -115,6 +115,7 @@ from elspeth.web.composer.tools.sources import (
     _source_authoring_options,
     _source_component_id,
 )
+from elspeth.web.coordination.contracts import SessionOperationContext
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX,
@@ -2342,6 +2343,7 @@ async def _handle_request_interpretation_review(
     model_version: str,
     provider: str,
     composer_skill_hash: str,
+    session_operation_context: SessionOperationContext,
     create_pending_interpretation_event: Callable[..., Awaitable[InterpretationEventRecord]],
     list_interpretation_events: Callable[..., Awaitable[list[InterpretationEventRecord]]],
 ) -> ToolResult:
@@ -2478,6 +2480,7 @@ async def _handle_request_interpretation_review(
             model_version=model_version,
             provider=provider,
             composer_skill_hash=composer_skill_hash,
+            session_operation_context=session_operation_context,
         )
     except InterpretationPlaceholderConsumedError as exc:
         # The compose snapshot passed the Tier-3 component check above, but

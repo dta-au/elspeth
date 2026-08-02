@@ -1254,6 +1254,7 @@ class ComposerService(Protocol):
         *,
         session_id: str | None,
         current_state_id: str | None,
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Kind-general backend surfacer for the GUIDED commit path (B1).
 

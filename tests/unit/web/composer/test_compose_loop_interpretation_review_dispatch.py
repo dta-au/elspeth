@@ -48,6 +48,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.composer_interpretation import (
     InterpretationChoice,
+    InterpretationEventRecord,
     InterpretationKind,
     InterpretationSource,
 )
@@ -561,6 +562,108 @@ async def _save_composition_state_with_compose_authority(
             state,
             provenance=provenance,
             session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
+async def _auto_surface_with_compose_authority(
+    composer: ComposerServiceImpl,
+    service: SessionServiceImpl,
+    state: CompositionState,
+    *,
+    session_id: UUID,
+    state_id: UUID,
+) -> None:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        await composer._auto_surface_prompt_template_reviews(
+            state,
+            session_id=str(session_id),
+            current_state_id=str(state_id),
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
+async def _create_pending_with_compose_authority(
+    service: SessionServiceImpl,
+    *,
+    session_id: UUID,
+    **kwargs: Any,
+) -> InterpretationEventRecord:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await service.create_pending_interpretation_event(
+            session_id=session_id,
+            session_operation_context=context,
+            **kwargs,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
+async def _surface_with_compose_authority(
+    composer: ComposerServiceImpl,
+    service: SessionServiceImpl,
+    state: CompositionState,
+    *,
+    session_id: UUID,
+    state_id: UUID,
+) -> None:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        await composer.surface_pending_interpretation_reviews(
+            state,
+            session_id=str(session_id),
+            current_state_id=str(state_id),
+            session_operation_context=context,
+        )
+    finally:
+        await service._run_sync(service.session_operation_authority.release, context)
+
+
+async def _try_terminate_with_compose_authority(
+    composer: ComposerServiceImpl,
+    service: SessionServiceImpl,
+    session_id: UUID,
+    **kwargs: Any,
+) -> Any:
+    context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
+    try:
+        return await composer._try_terminate_no_tools(
+            session_id=str(session_id),
+            session_operation_context=context,
+            **kwargs,
         )
     finally:
         await service._run_sync(service.session_operation_authority.release, context)
@@ -1311,7 +1414,8 @@ async def test_prompt_template_review_event_does_not_trigger_vague_term_repair(
     state = _state_with_prompt_template_review_node()
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    await sessions_service.create_pending_interpretation_event(
+    await _create_pending_with_compose_authority(
+        sessions_service,
         session_id=session_id,
         composition_state_id=state_id,
         affected_node_id="rate_node",
@@ -1381,11 +1485,7 @@ async def test_auto_surface_prompt_template_creates_pending_event_idempotently(
     state = _state_with_prompt_template_review_node()
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
 
-    await composer._auto_surface_prompt_template_reviews(
-        state,
-        session_id=str(session_id),
-        current_state_id=str(state_id),
-    )
+    await _auto_surface_with_compose_authority(composer, sessions_service, state, session_id=session_id, state_id=state_id)
 
     events = await sessions_service.list_interpretation_events(session_id, status="pending")
     pt = [e for e in events if e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE]
@@ -1396,11 +1496,7 @@ async def test_auto_surface_prompt_template_creates_pending_event_idempotently(
     assert pt[0].tool_call_id.startswith("backend_auto_surface:")
 
     # Idempotent: a second call must not create a duplicate.
-    await composer._auto_surface_prompt_template_reviews(
-        state,
-        session_id=str(session_id),
-        current_state_id=str(state_id),
-    )
+    await _auto_surface_with_compose_authority(composer, sessions_service, state, session_id=session_id, state_id=state_id)
     events2 = await sessions_service.list_interpretation_events(session_id, status="pending")
     assert len([e for e in events2 if e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE]) == 1
 
@@ -1428,12 +1524,14 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
     class _AssistantMessage:
         content = "Done — the pipeline is ready."
 
-    outcome = await composer._try_terminate_no_tools(
+    outcome = await _try_terminate_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         assistant_message=_AssistantMessage(),
         message="rate how cool the pages are",
         llm_messages=[],
         state=state,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_version=1,
         user_id="alice",
@@ -1595,11 +1693,7 @@ async def test_auto_surface_re_surfaces_after_prompt_edit_not_bricked(
     state_a = _state_with_prompt_template_review_node()  # prompt == "Read {{ row.html }} and return JSON."
     session_id, state_id_a = await _seed_session_and_state(sessions_service, state=state_a)
 
-    await composer._auto_surface_prompt_template_reviews(
-        state_a,
-        session_id=str(session_id),
-        current_state_id=str(state_id_a),
-    )
+    await _auto_surface_with_compose_authority(composer, sessions_service, state_a, session_id=session_id, state_id=state_id_a)
     events_a = await sessions_service.list_interpretation_events(session_id, status="pending")
     pt_a = [e for e in events_a if e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE]
     assert len(pt_a) == 1
@@ -1659,11 +1753,7 @@ async def test_auto_surface_re_surfaces_after_prompt_edit_not_bricked(
         provenance="tool_call",
     )
 
-    await composer._auto_surface_prompt_template_reviews(
-        state_b,
-        session_id=str(session_id),
-        current_state_id=str(record_b.id),
-    )
+    await _auto_surface_with_compose_authority(composer, sessions_service, state_b, session_id=session_id, state_id=record_b.id)
 
     events_b = await sessions_service.list_interpretation_events(session_id, status="pending")
     pt_b = [e for e in events_b if e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE]
@@ -1729,11 +1819,7 @@ async def test_prompt_auto_surfacer_delegates_same_text_changed_skeleton_to_writ
 
     state_a = _state_with_parts([{"kind": "text", "text": prompt}])
     session_id, state_a_id = await _seed_session_and_state(sessions_service, state=state_a)
-    await composer._auto_surface_prompt_template_reviews(
-        state_a,
-        session_id=str(session_id),
-        current_state_id=str(state_a_id),
-    )
+    await _auto_surface_with_compose_authority(composer, sessions_service, state_a, session_id=session_id, state_id=state_a_id)
     [event_a] = await sessions_service.list_interpretation_events(session_id, status="pending")
 
     split_at = len(prompt) // 2
@@ -1755,11 +1841,7 @@ async def test_prompt_auto_surfacer_delegates_same_text_changed_skeleton_to_writ
         ),
         provenance="tool_call",
     )
-    await composer._auto_surface_prompt_template_reviews(
-        state_b,
-        session_id=str(session_id),
-        current_state_id=str(state_b_record.id),
-    )
+    await _auto_surface_with_compose_authority(composer, sessions_service, state_b, session_id=session_id, state_id=state_b_record.id)
 
     all_events = await sessions_service.list_interpretation_events(session_id, status="all")
     by_id = {event.id: event for event in all_events}
@@ -1829,11 +1911,7 @@ async def test_kind_general_auto_surfacer_delegates_same_text_changed_artifact_t
 
     state_a = _state("original reason")
     session_id, state_a_id = await _seed_session_and_state(sessions_service, state=state_a)
-    await composer.surface_pending_interpretation_reviews(
-        state_a,
-        session_id=str(session_id),
-        current_state_id=str(state_a_id),
-    )
+    await _surface_with_compose_authority(composer, sessions_service, state_a, session_id=session_id, state_id=state_a_id)
     [event_a] = await sessions_service.list_interpretation_events(session_id, status="pending")
 
     state_b = _state("current reason")
@@ -1849,11 +1927,7 @@ async def test_kind_general_auto_surfacer_delegates_same_text_changed_artifact_t
         ),
         provenance="tool_call",
     )
-    await composer.surface_pending_interpretation_reviews(
-        state_b,
-        session_id=str(session_id),
-        current_state_id=str(state_b_record.id),
-    )
+    await _surface_with_compose_authority(composer, sessions_service, state_b, session_id=session_id, state_id=state_b_record.id)
 
     all_events = await sessions_service.list_interpretation_events(session_id, status="all")
     by_id = {event.id: event for event in all_events}
@@ -1999,7 +2073,8 @@ async def test_pending_interpretation_event_with_duplicate_placeholder_forces_pr
     composer = _build_composer(tmp_path, sessions_service)
     state = _state_with_llm_node()
     session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
-    await sessions_service.create_pending_interpretation_event(
+    await _create_pending_with_compose_authority(
+        sessions_service,
         session_id=session_id,
         composition_state_id=state_id,
         affected_node_id="rate_node",
@@ -2450,9 +2525,11 @@ async def test_f5c_deployment_overlay_changes_skill_identity_and_exact_archive(
     replacement_hash = hashlib.sha256(replacement_prompt.encode("utf-8")).hexdigest()
     replacement_llm = _ScriptedLLM([_fake_text_response("Hello with replacement policy.")])
 
-    await replacement._run_one_turn_for_test(
+    await _run_one_turn_with_compose_authority(
+        replacement,
+        sessions_service,
+        replacement_session_id,
         llm=replacement_llm,
-        session_id=str(replacement_session_id),
         current_state_id=str(replacement_state_id),
         initial_state=_state_with_llm_node(),
     )
@@ -2804,12 +2881,14 @@ async def test_end_advisor_gate_reaches_unsurfaced_prompt_template_pipeline_p2(
     class _AssistantMessage:
         content = "Done — the pipeline is ready."
 
-    outcome = await composer._try_terminate_no_tools(
+    outcome = await _try_terminate_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         assistant_message=_AssistantMessage(),
         message="rate how cool the pages are",
         llm_messages=[],
         state=state,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_version=1,
         user_id="alice",
@@ -2947,12 +3026,14 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
     class _AssistantMessage:
         content = "Done — the pipeline is ready."
 
-    outcome = await composer._try_terminate_no_tools(
+    outcome = await _try_terminate_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         assistant_message=_AssistantMessage(),
         message="rate how cool the pages are",
         llm_messages=[],
         state=state,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_version=1,
         user_id="alice",
@@ -3029,12 +3110,14 @@ async def test_advisor_exhausted_terminal_return_surfaces_prompt_template(
     class _AssistantMessage:
         content = "Done — the pipeline is ready."
 
-    outcome = await composer._try_terminate_no_tools(
+    outcome = await _try_terminate_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         assistant_message=_AssistantMessage(),
         message="rate how cool the pages are",
         llm_messages=[],
         state=state,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_version=1,
         user_id="alice",
@@ -3157,12 +3240,14 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
     class _AssistantMessage:
         content = "Done — the pipeline is ready."
 
-    outcome = await composer._try_terminate_no_tools(
+    outcome = await _try_terminate_with_compose_authority(
+        composer,
+        sessions_service,
+        session_id,
         assistant_message=_AssistantMessage(),
         message="rate how cool the pages are",
         llm_messages=[],
         state=state,
-        session_id=str(session_id),
         current_state_id=str(state_id),
         initial_version=1,
         user_id="alice",

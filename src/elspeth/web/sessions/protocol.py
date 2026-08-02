@@ -42,7 +42,7 @@ from elspeth.contracts.composer_llm_audit import ComposerChatTurn, ComposerLLMCa
 from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields, require_int
-from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
 from elspeth.web.composer.guided.deferred_intents import (
     DeferredIntentCancelAction,
     DeferredIntentEditAction,
@@ -1046,6 +1046,210 @@ class CompositionStateRecord:
             non_none.append("composer_meta")
         if non_none:
             freeze_fields(self, *non_none)
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionPendingInterpretationSiteSnapshot:
+    """One pending review site and its immutable surfacing-state snapshot."""
+
+    event: InterpretationEventRecord
+    surfacing_state: CompositionStateRecord | None
+
+    def __post_init__(self) -> None:
+        if type(self.event) is not InterpretationEventRecord:
+            raise AuditIntegrityError("pending interpretation snapshot event must be exact")
+        if self.surfacing_state is not None and type(self.surfacing_state) is not CompositionStateRecord:
+            raise AuditIntegrityError("pending interpretation surfacing state must be exact or None")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionPendingInterpretationSnapshot:
+    """Locked, handle-free inputs for one pending-review policy decision."""
+
+    anchor_state: CompositionStateRecord
+    live_state: CompositionStateRecord
+    pending_sites: tuple[SessionPendingInterpretationSiteSnapshot, ...]
+    review_disabled: bool
+    opt_out_marker_exists: bool
+
+    def __post_init__(self) -> None:
+        if type(self.anchor_state) is not CompositionStateRecord or type(self.live_state) is not CompositionStateRecord:
+            raise AuditIntegrityError("pending interpretation state snapshots must be exact")
+        if self.anchor_state.session_id != self.live_state.session_id:
+            raise AuditIntegrityError("pending interpretation state snapshots must belong to one session")
+        if type(self.pending_sites) is not tuple or any(
+            type(site) is not SessionPendingInterpretationSiteSnapshot for site in self.pending_sites
+        ):
+            raise AuditIntegrityError("pending interpretation sites must be an exact tuple")
+        if type(self.review_disabled) is not bool or type(self.opt_out_marker_exists) is not bool:
+            raise AuditIntegrityError("pending interpretation policy flags must be exact booleans")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionPendingInterpretationDecision:
+    """Exact DML decision returned by pure pending-review policy code."""
+
+    result_event_id: UUID
+    abandoned_event_ids: tuple[UUID, ...] = ()
+    insert_event: bool = False
+    choice: InterpretationChoice | None = None
+    accepted_value: str | None = None
+    resolved_at: datetime | None = None
+    arguments_hash: str | None = None
+    hash_domain_version: str | None = None
+    interpretation_source: InterpretationSource | None = None
+    resolved_prompt_template_hash: str | None = None
+    ensure_opt_out_marker: bool = False
+    appended_state: SessionCompositionStateCreation | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.result_event_id) is not UUID:
+            raise AuditIntegrityError("pending interpretation result event id must be a UUID")
+        if type(self.abandoned_event_ids) is not tuple or any(type(event_id) is not UUID for event_id in self.abandoned_event_ids):
+            raise AuditIntegrityError("abandoned interpretation ids must be an exact UUID tuple")
+        if len(set(self.abandoned_event_ids)) != len(self.abandoned_event_ids):
+            raise AuditIntegrityError("abandoned interpretation ids must be unique")
+        if type(self.insert_event) is not bool or type(self.ensure_opt_out_marker) is not bool:
+            raise AuditIntegrityError("pending interpretation decision flags must be exact booleans")
+        if not self.insert_event:
+            if (
+                any(
+                    value is not None
+                    for value in (
+                        self.choice,
+                        self.accepted_value,
+                        self.resolved_at,
+                        self.arguments_hash,
+                        self.hash_domain_version,
+                        self.interpretation_source,
+                        self.resolved_prompt_template_hash,
+                        self.appended_state,
+                    )
+                )
+                or self.ensure_opt_out_marker
+            ):
+                raise AuditIntegrityError("reuse decisions cannot carry insertion fields")
+            return
+        if type(self.choice) is not InterpretationChoice or type(self.interpretation_source) is not InterpretationSource:
+            raise AuditIntegrityError("insert decisions require exact choice and source values")
+        if self.appended_state is not None and type(self.appended_state) is not SessionCompositionStateCreation:
+            raise AuditIntegrityError("pending interpretation appended state must be exact or None")
+        if self.choice is InterpretationChoice.PENDING and self.interpretation_source is InterpretationSource.USER_APPROVED:
+            if (
+                self.accepted_value is not None
+                or self.resolved_at is not None
+                or self.arguments_hash is not None
+                or self.hash_domain_version is not None
+                or self.resolved_prompt_template_hash is not None
+                or self.ensure_opt_out_marker
+                or self.appended_state is not None
+            ):
+                raise AuditIntegrityError("pending user-approved decisions cannot carry resolution or state fields")
+            return
+        if self.choice is InterpretationChoice.OPTED_OUT and self.interpretation_source is InterpretationSource.AUTO_INTERPRETED_OPT_OUT:
+            if type(self.accepted_value) is not str:
+                raise AuditIntegrityError("automatic opt-out decisions require an exact accepted value")
+            if type(self.resolved_at) is not datetime or self.resolved_at.utcoffset() is None:
+                raise AuditIntegrityError("automatic opt-out decisions require an aware resolved_at")
+            if not is_lower_sha256_hex(self.arguments_hash) or self.hash_domain_version != "v2":
+                raise AuditIntegrityError("automatic opt-out decisions require the v2 lowercase SHA-256 argument binding")
+            if not self.ensure_opt_out_marker or self.appended_state is None:
+                raise AuditIntegrityError("automatic opt-out decisions require the marker and appended state")
+            if self.resolved_prompt_template_hash is not None and not is_lower_sha256_hex(self.resolved_prompt_template_hash):
+                raise AuditIntegrityError("resolved prompt-template hash must be lowercase SHA-256 or None")
+            return
+        raise AuditIntegrityError("pending interpretation decision choice/source pairing is invalid")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionPendingInterpretationValidationCandidate:
+    """Immutable candidate state offered to the validation-only seam."""
+
+    digest: str
+    base_state: CompositionStateRecord
+    data: CompositionStateData
+
+    def __post_init__(self) -> None:
+        if not is_lower_sha256_hex(self.digest):
+            raise AuditIntegrityError("pending interpretation validation candidate digest must be lowercase SHA-256")
+        if type(self.base_state) is not CompositionStateRecord or type(self.data) is not CompositionStateData:
+            raise AuditIntegrityError("pending interpretation validation candidate state must be exact")
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionPendingInterpretationValidationResult:
+    """Digest-bound validation outcome with no authority to describe writes."""
+
+    candidate_digest: str
+    is_valid: bool
+    validation_errors: tuple[str, ...] | None
+
+    def __post_init__(self) -> None:
+        if not is_lower_sha256_hex(self.candidate_digest):
+            raise AuditIntegrityError("pending interpretation validation result digest must be lowercase SHA-256")
+        if type(self.is_valid) is not bool:
+            raise AuditIntegrityError("pending interpretation validation result is_valid must be exact")
+        if self.validation_errors is not None and (
+            type(self.validation_errors) is not tuple or any(type(message) is not str for message in self.validation_errors)
+        ):
+            raise AuditIntegrityError("pending interpretation validation errors must be an exact string tuple or None")
+
+
+SessionPendingInterpretationValidator = Callable[
+    [SessionPendingInterpretationValidationCandidate],
+    SessionPendingInterpretationValidationResult,
+]
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class SessionPendingInterpretationCommand:
+    """Immutable pending-review creation facts; policy and DML stay repository-owned."""
+
+    event_id: UUID
+    opt_out_marker_event_id: UUID
+    composition_state_id: UUID
+    affected_node_id: str
+    tool_call_id: str
+    user_term: str
+    kind: InterpretationKind
+    llm_draft: str
+    model_identifier: str
+    model_version: str
+    provider: str
+    composer_skill_hash: str
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        for field_name in ("event_id", "opt_out_marker_event_id", "composition_state_id"):
+            if type(getattr(self, field_name)) is not UUID:
+                raise AuditIntegrityError(f"SessionPendingInterpretationCommand.{field_name} must be a UUID")
+        if self.event_id == self.opt_out_marker_event_id:
+            raise AuditIntegrityError("pending interpretation event ids must be distinct")
+        if type(self.kind) is not InterpretationKind:
+            raise AuditIntegrityError("SessionPendingInterpretationCommand.kind must be exact")
+        if type(self.created_at) is not datetime or self.created_at.utcoffset() is None:
+            raise AuditIntegrityError("SessionPendingInterpretationCommand.created_at must be timezone-aware")
+        for field_name in (
+            "affected_node_id",
+            "tool_call_id",
+            "user_term",
+            "llm_draft",
+            "model_identifier",
+            "model_version",
+            "provider",
+            "composer_skill_hash",
+        ):
+            if type(getattr(self, field_name)) is not str:
+                raise AuditIntegrityError(f"SessionPendingInterpretationCommand.{field_name} must be an exact string")
+        for field_name in ("affected_node_id", "tool_call_id", "user_term", "model_identifier", "model_version", "provider"):
+            if not getattr(self, field_name).strip():
+                raise AuditIntegrityError(f"SessionPendingInterpretationCommand.{field_name} must be nonblank")
 
 
 @final
@@ -2650,7 +2854,13 @@ class SessionOperationCompositionMutations(Protocol):
 
 
 class SessionOperationInterpretationMutations(Protocol):
-    """Interpretation audit mutations under one exact COMPOSE operation fence."""
+    """Interpretation audit mutations under one exact operation fence."""
+
+    def create_or_reconcile_pending(
+        self,
+        command: SessionPendingInterpretationCommand,
+        validator: SessionPendingInterpretationValidator,
+    ) -> InterpretationEventRecord: ...
 
     def record_session_opt_out(
         self,
@@ -3521,9 +3731,8 @@ class SessionServiceProtocol(Protocol):
         model_version: str,
         provider: str,
         composer_skill_hash: str,
+        session_operation_context: SessionOperationContext,
         created_at: datetime | None = None,
-        session_operation_context: SessionOperationContext | None = None,
-        session_operation_kind: SessionOperationKind | None = None,
     ) -> InterpretationEventRecord:
         """Insert a PENDING interpretation event.
 

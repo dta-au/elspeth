@@ -670,6 +670,7 @@ async def import_state_yaml(
                 session_id=session.id,
                 state=imported_state,
                 composition_state_id=UUID(str(state_record.id)),
+                session_operation_context=lease.context,
             )
             return _state_response(state_record, policy_catalog=catalog)
     finally:
@@ -717,6 +718,7 @@ async def _surface_imported_interpretation_review_events(
     session_id: UUID,
     state: CompositionState,
     composition_state_id: UUID,
+    session_operation_context: SessionOperationContext,
 ) -> None:
     """Surface a resolvable pending interpretation EVENT for every pending
     requirement carried by the just-imported state (elspeth-ae5160c3cb).
@@ -768,6 +770,7 @@ async def _surface_imported_interpretation_review_events(
                     model_version=_YAML_IMPORT_SURFACE_PROVENANCE,
                     provider=_YAML_IMPORT_SURFACE_PROVENANCE,
                     composer_skill_hash=_YAML_IMPORT_SURFACE_PROVENANCE,
+                    session_operation_context=session_operation_context,
                 )
             except ValueError:
                 # W1 backstop, same shape and rationale as the guided B1

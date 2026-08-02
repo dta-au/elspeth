@@ -354,5 +354,6 @@ async def settle_pipeline_proposal_under_compose_lock(
         prepared.result.updated_state,
         session_id=str(proposal.session_id),
         current_state_id=str(settled.state.id),
+        session_operation_context=session_operation_context,
     )
     return PipelineRouteSettlement(settlement=settled, validation=validation)

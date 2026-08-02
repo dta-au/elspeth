@@ -13,9 +13,9 @@ import textwrap
 import types
 import typing
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -29,6 +29,8 @@ from elspeth.contracts.blobs import (
     BlobRunLinkRecord,
 )
 from elspeth.contracts.blobs_inline import ResolvedBlobContent
+from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind, InterpretationSource
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.composer import tool_batch
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerServiceImpl
@@ -38,6 +40,7 @@ from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.sessions import _auto_title
 from elspeth.web.sessions import protocol as sessions_protocol
+from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.protocol import RunEventRecord, SessionServiceProtocol
 from elspeth.web.sessions.routes import interpretation as interpretation_routes
 from elspeth.web.sessions.routes import messages as message_routes
@@ -115,6 +118,139 @@ def test_composition_state_write_requires_exact_compose_context(owner: type[Any]
 def test_simple_interpretation_writes_require_exact_compose_context(owner: type[Any], method_name: str) -> None:
     context = _required_parameter(owner, method_name, "session_operation_context")
     assert context.annotation is SessionOperationContext or context.annotation == "SessionOperationContext"
+
+
+@pytest.mark.parametrize("owner", [SessionServiceProtocol, SessionServiceImpl])
+def test_pending_interpretation_write_requires_exact_operation_context(owner: type[Any]) -> None:
+    context = _required_parameter(owner, "create_pending_interpretation_event", "session_operation_context")
+    assert context.annotation is SessionOperationContext or context.annotation == "SessionOperationContext"
+
+
+def test_pending_interpretation_preparation_is_handle_free_and_exact() -> None:
+    command = getattr(sessions_protocol, "SessionPendingInterpretationCommand", None)
+    snapshot = getattr(sessions_protocol, "SessionPendingInterpretationSnapshot", None)
+    decision = getattr(sessions_protocol, "SessionPendingInterpretationDecision", None)
+    assert command is not None
+    assert snapshot is not None
+    assert decision is not None
+    annotations = inspect.get_annotations(command, eval_str=True)
+    assert "Connection" not in repr(annotations)
+    assert "Engine" not in repr(annotations)
+    assert "planner" not in annotations
+
+
+def _pending_interpretation_command(*, composer_skill_hash: str = "a" * 64) -> sessions_protocol.SessionPendingInterpretationCommand:
+    return sessions_protocol.SessionPendingInterpretationCommand(
+        event_id=uuid4(),
+        opt_out_marker_event_id=uuid4(),
+        composition_state_id=uuid4(),
+        affected_node_id="llm_1",
+        tool_call_id="call_1",
+        user_term="ambiguous",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="A precise draft",
+        model_identifier="composer-model",
+        model_version="composer-model",
+        provider="composer",
+        composer_skill_hash=composer_skill_hash,
+        created_at=datetime.now(UTC),
+    )
+
+
+@pytest.mark.parametrize("composer_skill_hash", ["yaml_import", ""])
+def test_pending_interpretation_command_preserves_non_hash_provenance_sentinels(composer_skill_hash: str) -> None:
+    command = _pending_interpretation_command(composer_skill_hash=composer_skill_hash)
+    assert command.composer_skill_hash == composer_skill_hash
+
+
+def test_pending_interpretation_decision_rejects_cross_mode_fields() -> None:
+    with pytest.raises(AuditIntegrityError, match="pending user-approved"):
+        sessions_protocol.SessionPendingInterpretationDecision(
+            result_event_id=uuid4(),
+            insert_event=True,
+            choice=InterpretationChoice.PENDING,
+            accepted_value="not pending",
+            interpretation_source=InterpretationSource.USER_APPROVED,
+        )
+    with pytest.raises(AuditIntegrityError, match="automatic opt-out"):
+        sessions_protocol.SessionPendingInterpretationDecision(
+            result_event_id=uuid4(),
+            insert_event=True,
+            choice=InterpretationChoice.OPTED_OUT,
+            interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT,
+        )
+    with pytest.raises(AuditIntegrityError, match="choice/source pairing"):
+        sessions_protocol.SessionPendingInterpretationDecision(
+            result_event_id=uuid4(),
+            insert_event=True,
+            choice=InterpretationChoice.PENDING,
+            interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT,
+        )
+
+
+def test_pending_interpretation_policy_is_neutral_and_command_has_one_constructor() -> None:
+    from elspeth.web.sessions import pending_interpretation
+    from elspeth.web.sessions import service as sessions_service
+
+    policy_source = inspect.getsource(pending_interpretation)
+    policy_tree = ast.parse(policy_source)
+    imported_modules = {alias.name for node in ast.walk(policy_tree) if isinstance(node, ast.Import) for alias in node.names} | {
+        node.module or "" for node in ast.walk(policy_tree) if isinstance(node, ast.ImportFrom)
+    }
+    assert not any(module.startswith("sqlalchemy") for module in imported_modules)
+    assert "elspeth.web.sessions.service" not in imported_modules
+    assert policy_source.count("class _SessionPendingInterpretationPlanner") == 1
+    assert inspect.getsource(sessions_service).count("SessionPendingInterpretationCommand(") == 1
+    assert "SessionPendingInterpretationCommand(" not in inspect.getsource(coordination_repository)
+
+
+def test_pending_interpretation_validator_rejects_nested_engine_handle() -> None:
+    from elspeth.web.sessions.pending_interpretation import _SessionPendingInterpretationValidator
+
+    class SlottedCatalogBase:
+        __slots__ = ("engine",)
+
+        def __init__(self, engine: Any) -> None:
+            self.engine = engine
+
+    class MixedStorageCatalog(SlottedCatalogBase):
+        pass
+
+    engine = create_session_engine("sqlite:///:memory:")
+    try:
+        with pytest.raises(TypeError, match=r"retains forbidden runtime handle.*Engine"):
+            _SessionPendingInterpretationValidator(
+                profile_aware=False,
+                plugin_snapshot=None,
+                profile_registry=None,
+                catalog=types.SimpleNamespace(nested={"catalog": MixedStorageCatalog(engine)}),
+            )
+    finally:
+        engine.dispose()
+
+
+def test_pending_interpretation_callers_forward_existing_authority() -> None:
+    from elspeth.web.composer import service as composer_service
+    from elspeth.web.composer import tool_batch
+    from elspeth.web.sessions.routes.composer import state as composer_state
+
+    batch_source = inspect.getsource(tool_batch.run_tool_batch)
+    assert "session_operation_context=ctx.session_operation_context" in batch_source
+    composer_source = inspect.getsource(composer_service.ComposerServiceImpl)
+    assert "session_operation_context=session_operation_context" in composer_source
+    state_source = inspect.getsource(composer_state)
+    assert "session_operation_context=" in state_source
+
+
+def test_guided_atomic_transaction_exposes_interpretation_capability_without_connection_callback() -> None:
+    transaction = sessions_protocol.SessionOperationMutationTransaction
+    interpretations_property = transaction.interpretations
+    assert interpretations_property.fget is not None
+    interpretations = inspect.signature(interpretations_property.fget, eval_str=True).return_annotation
+    assert interpretations is sessions_protocol.SessionOperationInterpretationMutations
+    source = inspect.getsource(SessionServiceImpl.settle_guided_state_operation)
+    assert "Callable[[Connection], InterpretationEventRecord]" not in source
+    assert ".interpretations.create_or_reconcile_pending(" in source
 
 
 def test_opt_out_route_owns_process_lock_and_compose_lease() -> None:
@@ -512,6 +648,21 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
         (
             (interpretation_protocol, implementation_types[5]),
             {
+                "create_or_reconcile_pending": (
+                    (
+                        (
+                            "command",
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            sessions_protocol.SessionPendingInterpretationCommand,
+                        ),
+                        (
+                            "validator",
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            sessions_protocol.SessionPendingInterpretationValidator,
+                        ),
+                    ),
+                    sessions_protocol.InterpretationEventRecord,
+                ),
                 "record_session_opt_out": (
                     (
                         ("event_id", inspect.Parameter.KEYWORD_ONLY, UUID),

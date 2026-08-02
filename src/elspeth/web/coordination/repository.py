@@ -48,7 +48,7 @@ from elspeth.contracts.composer_interpretation import (
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.hashing import is_lower_sha256_hex, stable_hash
 from elspeth.web.coordination import mutation_connection_registry as _mutation_connection_registry
 from elspeth.web.coordination.composer_progress_mutations import RepositoryComposerProgressMutations
 from elspeth.web.coordination.contracts import (
@@ -122,6 +122,11 @@ from elspeth.web.sessions.protocol import (
     SessionOperationMutationTransaction,
     SessionOperationRunMutations,
     SessionOperationSessionMutations,
+    SessionPendingInterpretationCommand,
+    SessionPendingInterpretationDecision,
+    SessionPendingInterpretationSiteSnapshot,
+    SessionPendingInterpretationSnapshot,
+    SessionPendingInterpretationValidator,
     SessionRecord,
     SessionRunEventType,
     SessionRunStatus,
@@ -695,7 +700,7 @@ class _RepositoryCompositionStateMutations:
 
 @final
 class _RepositoryInterpretationMutations:
-    """Interpretation-event capability bound to one private COMPOSE transaction."""
+    """Interpretation-event capability bound to one private operation transaction."""
 
     __slots__ = ("__state",)
 
@@ -712,6 +717,44 @@ class _RepositoryInterpretationMutations:
             or context.fence.session_id != state._session_id
         ):
             raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+
+    def _require_pending_creation_authority(self) -> None:
+        state = self.__state
+        state._require_active()
+        context = state._operation_context
+        if (
+            type(context) is not SessionOperationContext
+            or context.operation_kind not in {SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL}
+            or context.fence.session_id != state._session_id
+        ):
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+
+    @staticmethod
+    def _state_column(value: Any) -> Any:
+        if value is None:
+            return None
+        if type(value) is not dict or value.get("_version") != 1 or "data" not in value:
+            raise AuditIntegrityError("composition state column has no supported version envelope")
+        return value["data"]
+
+    @classmethod
+    def _state_record(cls, row: Row[Any]) -> CompositionStateRecord:
+        return CompositionStateRecord(
+            id=UUID(row.id),
+            session_id=UUID(row.session_id),
+            version=row.version,
+            source=cls._state_column(row.source),
+            sources=cls._state_column(row.sources),
+            nodes=cls._state_column(row.nodes),
+            edges=cls._state_column(row.edges),
+            outputs=cls._state_column(row.outputs),
+            metadata_=cls._state_column(row.metadata_),
+            is_valid=row.is_valid,
+            validation_errors=row.validation_errors,
+            created_at=_ensure_utc(row.created_at),
+            derived_from_state_id=(UUID(row.derived_from_state_id) if row.derived_from_state_id is not None else None),
+            composer_meta=cls._state_column(row.composer_meta),
+        )
 
     @staticmethod
     def _event_record(row: Row[Any]) -> InterpretationEventRecord:
@@ -740,6 +783,271 @@ class _RepositoryInterpretationMutations:
             runtime_model_version_at_resolve=row.runtime_model_version_at_resolve,
             resolved_prompt_template_hash=row.resolved_prompt_template_hash,
         )
+
+    def create_or_reconcile_pending(
+        self,
+        command: SessionPendingInterpretationCommand,
+        validator: SessionPendingInterpretationValidator,
+    ) -> InterpretationEventRecord:
+        """Apply the canonical pending-review decision inside the exact live fence."""
+        self._require_pending_creation_authority()
+        if type(command) is not SessionPendingInterpretationCommand:
+            raise TypeError("pending interpretation command must be exact")
+        from elspeth.web.sessions.pending_interpretation import (
+            _SessionPendingInterpretationPlanner,
+            _SessionPendingInterpretationValidator,
+        )
+
+        if type(validator) is not _SessionPendingInterpretationValidator:
+            raise TypeError("pending interpretation validator must be the exact validation-only capability")
+        state = self.__state
+        connection = _resolve_mutation_connection(state._connection_token)
+        state_id = str(command.composition_state_id)
+        anchor_row = connection.execute(
+            select(composition_states_table)
+            .where(
+                composition_states_table.c.id == state_id,
+                composition_states_table.c.session_id == state._session_id,
+            )
+            .with_for_update()
+        ).one_or_none()
+        if anchor_row is None:
+            raise ValueError(
+                f"create_pending_interpretation_event: composition state {state_id!r} not found in session {state._session_id!r}"
+            )
+        live_row = connection.execute(
+            select(composition_states_table)
+            .where(composition_states_table.c.session_id == state._session_id)
+            .order_by(composition_states_table.c.version.desc())
+            .limit(1)
+            .with_for_update()
+        ).one()
+        pending_rows = connection.execute(
+            select(interpretation_events_table)
+            .where(
+                interpretation_events_table.c.session_id == state._session_id,
+                interpretation_events_table.c.affected_node_id == command.affected_node_id,
+                interpretation_events_table.c.kind == command.kind.value,
+                interpretation_events_table.c.choice == InterpretationChoice.PENDING.value,
+                interpretation_events_table.c.interpretation_source == InterpretationSource.USER_APPROVED.value,
+            )
+            .order_by(interpretation_events_table.c.created_at, interpretation_events_table.c.id)
+            .with_for_update()
+        ).all()
+        pending_sites: list[SessionPendingInterpretationSiteSnapshot] = []
+        for pending_row in pending_rows:
+            surfacing_row = None
+            if pending_row.composition_state_id is not None:
+                surfacing_row = connection.execute(
+                    select(composition_states_table).where(
+                        composition_states_table.c.id == pending_row.composition_state_id,
+                        composition_states_table.c.session_id == state._session_id,
+                    )
+                ).one_or_none()
+            pending_sites.append(
+                SessionPendingInterpretationSiteSnapshot(
+                    event=self._event_record(pending_row),
+                    surfacing_state=(self._state_record(surfacing_row) if surfacing_row is not None else None),
+                )
+            )
+        review_disabled = bool(
+            connection.execute(
+                select(sessions_table.c.interpretation_review_disabled).where(sessions_table.c.id == state._session_id)
+            ).scalar_one()
+        )
+        marker_exists = (
+            connection.execute(
+                select(interpretation_events_table.c.id)
+                .where(
+                    interpretation_events_table.c.session_id == state._session_id,
+                    interpretation_events_table.c.interpretation_source == InterpretationSource.AUTO_INTERPRETED_OPT_OUT.value,
+                    interpretation_events_table.c.kind.is_(None),
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            is not None
+        )
+        snapshot = SessionPendingInterpretationSnapshot(
+            anchor_state=self._state_record(anchor_row),
+            live_state=self._state_record(live_row),
+            pending_sites=tuple(pending_sites),
+            review_disabled=review_disabled,
+            opt_out_marker_exists=marker_exists,
+        )
+        decision = _SessionPendingInterpretationPlanner.plan(command, snapshot, validator)
+        if type(decision) is not SessionPendingInterpretationDecision:
+            raise TypeError("pending interpretation planner must return an exact decision")
+        matching_term_ids = {
+            site.event.id
+            for site in snapshot.pending_sites
+            if type(site.event.user_term) is str and site.event.user_term.strip() == command.user_term.strip()
+        }
+        if not set(decision.abandoned_event_ids).issubset(matching_term_ids):
+            raise SessionDerivedCustodyError
+        if decision.abandoned_event_ids:
+            abandoned = connection.execute(
+                update(interpretation_events_table)
+                .where(
+                    interpretation_events_table.c.id.in_(str(event_id) for event_id in decision.abandoned_event_ids),
+                    interpretation_events_table.c.session_id == state._session_id,
+                    interpretation_events_table.c.choice == InterpretationChoice.PENDING.value,
+                )
+                .values(choice=InterpretationChoice.ABANDONED.value, resolved_at=command.created_at)
+            )
+            if abandoned.rowcount != len(decision.abandoned_event_ids):
+                raise SessionDerivedCustodyError
+
+        if not decision.insert_event:
+            if decision.result_event_id not in matching_term_ids:
+                raise SessionDerivedCustodyError
+            row = connection.execute(
+                select(interpretation_events_table).where(
+                    interpretation_events_table.c.id == str(decision.result_event_id),
+                    interpretation_events_table.c.session_id == state._session_id,
+                )
+            ).one()
+            return self._event_record(row)
+
+        if decision.result_event_id != command.event_id:
+            raise SessionDerivedCustodyError
+        if decision.choice is None or decision.interpretation_source is None:
+            raise SessionDerivedCustodyError
+        appended_state = decision.appended_state
+        if decision.choice is InterpretationChoice.PENDING:
+            if snapshot.review_disabled or decision.interpretation_source is not InterpretationSource.USER_APPROVED:
+                raise SessionDerivedCustodyError
+            if (
+                decision.accepted_value is not None
+                or decision.resolved_at is not None
+                or decision.arguments_hash is not None
+                or decision.hash_domain_version is not None
+                or decision.resolved_prompt_template_hash is not None
+                or decision.ensure_opt_out_marker
+                or appended_state is not None
+            ):
+                raise SessionDerivedCustodyError
+        elif decision.choice is InterpretationChoice.OPTED_OUT:
+            if (
+                not snapshot.review_disabled
+                or decision.interpretation_source is not InterpretationSource.AUTO_INTERPRETED_OPT_OUT
+                or decision.accepted_value != command.llm_draft
+                or decision.resolved_at != command.created_at
+                or not is_lower_sha256_hex(decision.arguments_hash)
+                or decision.hash_domain_version != "v2"
+                or not decision.ensure_opt_out_marker
+                or appended_state is None
+            ):
+                raise SessionDerivedCustodyError
+            if command.kind is InterpretationKind.LLM_PROMPT_TEMPLATE:
+                if not is_lower_sha256_hex(decision.resolved_prompt_template_hash):
+                    raise SessionDerivedCustodyError
+            elif decision.resolved_prompt_template_hash is not None:
+                raise SessionDerivedCustodyError
+            if (
+                appended_state.derived_from_state_id != snapshot.live_state.id
+                or appended_state.provenance != "interpretation_resolve"
+                or appended_state.created_at != command.created_at
+                or appended_state.data.edges != snapshot.live_state.edges
+                or appended_state.data.outputs != snapshot.live_state.outputs
+                or appended_state.data.metadata_ != snapshot.live_state.metadata_
+                or appended_state.data.composer_meta != snapshot.live_state.composer_meta
+            ):
+                raise SessionDerivedCustodyError
+        else:
+            raise SessionDerivedCustodyError
+        if decision.ensure_opt_out_marker and not snapshot.opt_out_marker_exists:
+            connection.execute(
+                insert(interpretation_events_table).values(
+                    id=str(command.opt_out_marker_event_id),
+                    session_id=state._session_id,
+                    composition_state_id=None,
+                    affected_node_id=None,
+                    tool_call_id=None,
+                    user_term=None,
+                    kind=None,
+                    llm_draft=None,
+                    accepted_value=None,
+                    choice=InterpretationChoice.OPTED_OUT.value,
+                    created_at=command.created_at,
+                    resolved_at=command.created_at,
+                    actor="composer-llm",
+                    model_identifier=None,
+                    model_version=None,
+                    provider=None,
+                    composer_skill_hash=None,
+                    arguments_hash=None,
+                    hash_domain_version=None,
+                    interpretation_source=InterpretationSource.AUTO_INTERPRETED_OPT_OUT.value,
+                    runtime_model_identifier_at_resolve=None,
+                    runtime_model_version_at_resolve=None,
+                    resolved_prompt_template_hash=None,
+                )
+            )
+        connection.execute(
+            insert(interpretation_events_table).values(
+                id=str(command.event_id),
+                session_id=state._session_id,
+                composition_state_id=state_id,
+                affected_node_id=command.affected_node_id,
+                tool_call_id=command.tool_call_id,
+                user_term=command.user_term,
+                kind=command.kind.value,
+                llm_draft=command.llm_draft,
+                accepted_value=decision.accepted_value,
+                choice=decision.choice.value,
+                created_at=command.created_at,
+                resolved_at=decision.resolved_at,
+                actor="composer-llm",
+                model_identifier=command.model_identifier,
+                model_version=command.model_version,
+                provider=command.provider,
+                composer_skill_hash=command.composer_skill_hash,
+                arguments_hash=decision.arguments_hash,
+                hash_domain_version=decision.hash_domain_version,
+                interpretation_source=decision.interpretation_source.value,
+                runtime_model_identifier_at_resolve=None,
+                runtime_model_version_at_resolve=None,
+                resolved_prompt_template_hash=decision.resolved_prompt_template_hash,
+            )
+        )
+        if appended_state is not None:
+            predecessor = connection.execute(
+                select(composition_states_table.c.id).where(
+                    composition_states_table.c.id == str(appended_state.derived_from_state_id),
+                    composition_states_table.c.session_id == state._session_id,
+                )
+            ).one_or_none()
+            if predecessor is None:
+                raise SessionDerivedCustodyError
+            version = int(
+                connection.execute(
+                    select(func.coalesce(func.max(composition_states_table.c.version), 0) + 1).where(
+                        composition_states_table.c.session_id == state._session_id
+                    )
+                ).scalar_one()
+            )
+            data = appended_state.data
+            connection.execute(
+                insert(composition_states_table).values(
+                    id=str(appended_state.id),
+                    session_id=state._session_id,
+                    version=version,
+                    source=None,
+                    sources=_composition_state_column(data.sources),
+                    nodes=_composition_state_column(data.nodes),
+                    edges=_composition_state_column(data.edges),
+                    outputs=_composition_state_column(data.outputs),
+                    metadata_=_composition_state_column(data.metadata_),
+                    is_valid=data.is_valid,
+                    validation_errors=deep_thaw(data.validation_errors),
+                    composer_meta=_composition_state_column(data.composer_meta),
+                    derived_from_state_id=str(appended_state.derived_from_state_id),
+                    provenance=appended_state.provenance,
+                    created_at=appended_state.created_at,
+                )
+            )
+        row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(command.event_id))).one()
+        return self._event_record(row)
 
     def record_session_opt_out(
         self,

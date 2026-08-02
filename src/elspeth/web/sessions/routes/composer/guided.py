@@ -4421,6 +4421,7 @@ async def post_guided_respond(
                                 model_version=authority.row.composer_model_version or "guided-planner",
                                 provider=authority.row.composer_provider or "unknown",
                                 composer_skill_hash=authority.row.composer_skill_hash or "",
+                                session_operation_context=reserved.session_operation_context,
                             ),
                             state=cancellation_state,
                         )
