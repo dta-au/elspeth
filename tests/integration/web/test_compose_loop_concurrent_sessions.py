@@ -302,16 +302,16 @@ def test_cross_allocator_save_state_serialises_with_persist_turn(service):
     benign race. (Fabricated Tier-1 violations are evidence-tampering
     under the audit-grade doctrine.)
 
-    Post-B3, ``save_composition_state`` (and ``set_active_state``)
-    also enter ``_session_write_lock`` before their SELECT MAX. The
-    persist side also has the stale-current-state guard introduced in
-    Task 11: if a save wins after the persist worker reads the current
-    state but before it acquires the write lock, ``persist_compose_turn``
-    rejects with ``StaleComposeStateError``. That is the correct
-    compose-vs-revert disposition and must NOT be counted as an audit
-    integrity failure. Successful writers must still leave sequential,
-    contiguous version numbers in ``composition_states`` with NO
-    ``IntegrityError`` raised on either path.
+    Post-B3, ``save_composition_state`` also enters the same-session
+    transaction lock before its SELECT MAX. The persist side also has
+    the stale-current-state guard introduced in Task 11: if a save wins
+    after the persist worker reads the current state but before it
+    acquires the write lock, ``persist_compose_turn`` rejects with
+    ``StaleComposeStateError``. That is the correct compose-vs-save
+    disposition and must NOT be counted as an audit integrity failure.
+    Successful writers must still leave sequential, contiguous version
+    numbers in ``composition_states`` with NO ``IntegrityError`` raised
+    on either path.
 
     This test would have failed pre-B3 by either crashing one path
     with ``IntegrityError`` or, worse, by silently incrementing the

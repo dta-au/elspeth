@@ -921,16 +921,15 @@ def check_inline_state_version_allocation(
 ) -> list[InlineAllocViolation]:
     """Reject inline ``composition_states.version`` allocation outside the write lock.
 
-    Keeps the legacy ``set_active_state`` allocator under
-    ``_session_write_lock`` while it remains and retains adversarial coverage
-    for the former ``save_composition_state`` shape. Ordinary
-    composition-state appends now live behind the typed session-operation
-    authority and the exhaustive architecture gate. Covers BOTH allocation
-    forms — raw ``MAX(...version...)`` SQL strings and the SQLAlchemy
-    ``func.max(composition_states_table.c.version)`` call the live
-    allocators actually use — and matches the scope functions anywhere
-    in the enclosing dotted symbol, including synthetic nested ``_sync``
-    closures used to prove both historical forms remain detectable.
+    Retains adversarial coverage for both former direct-writer names even
+    though neither has a live inline allocator. Ordinary composition-state
+    appends now live behind the typed session-operation authority and the
+    exhaustive architecture gate. Covers BOTH allocation forms — raw
+    ``MAX(...version...)`` SQL strings and the historical SQLAlchemy
+    ``func.max(composition_states_table.c.version)`` shape — and matches the
+    scope functions anywhere in the enclosing dotted symbol, including
+    synthetic nested ``_sync`` closures used to prove both legacy forms
+    remain detectable if reintroduced.
 
     Conditional-dormant: returns ``[]`` until ``_session_write_lock``
     is defined.
@@ -1015,18 +1014,6 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "authority validates the exact live session fence, allocates the "
             "next version, and inserts within one locked transaction without "
             "exposing a Connection to the service."
-        ),
-    ),
-    ReviewedWriter(
-        path="src/elspeth/web/sessions/service.py",
-        enclosing_symbol="SessionServiceImpl.set_active_state._sync",
-        table="composition_states",
-        operation="sqlalchemy_insert_call",
-        purpose=(
-            "set_active_state legacy inline writer retains its local "
-            "session-write-lock discipline. The B3 "
-            "belt-and-suspenders retry loop was deleted with the same "
-            "rationale (No Legacy Code Policy + diagnostic-preservation)"
         ),
     ),
     ReviewedWriter(
@@ -2448,7 +2435,7 @@ def test_inline_version_guard_handles_raw_sql_and_requires_exact_lock_identity(t
 
 
 def test_inline_version_guard_detects_sqlalchemy_allocator_and_nested_assertion(tmp_path: Path) -> None:
-    """The live SQLAlchemy allocator form cannot bypass exact lock proof through nesting."""
+    """The historical SQLAlchemy allocator form cannot bypass exact lock proof."""
 
     synthetic_root = tmp_path / "src"
     synthetic_root.mkdir()
@@ -2582,7 +2569,7 @@ def test_inline_allocation_checker_survives_locked_raw_qualified_site(tmp_path: 
 def test_inline_allocation_checker_covers_both_forms_and_lock_contexts(tmp_path: Path) -> None:
     """Both allocation forms are detected, and only the unlocked sites are flagged.
 
-    Mirrors the live-tree shapes: ``save_composition_state`` /
+    Mirrors the historical direct-writer shapes: ``save_composition_state`` /
     ``set_active_state`` allocate inside a nested ``_sync`` closure
     (so the enclosing symbol ends in ``._sync``, exercising the
     symbol-path scope match), via either the SQLAlchemy

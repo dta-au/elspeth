@@ -3820,18 +3820,6 @@ class SessionServiceProtocol(Protocol):
         offset: int = 0,
     ) -> list[CompositionStateRecord]: ...
 
-    async def set_active_state(
-        self,
-        session_id: UUID,
-        state_id: UUID,
-    ) -> CompositionStateRecord:
-        """Set the active composition state for a session.
-
-        Creates a new state version derived from the specified state_id.
-        Sets derived_from_state_id on the new version to record lineage.
-        """
-        ...
-
     async def create_run(
         self,
         session_id: UUID,

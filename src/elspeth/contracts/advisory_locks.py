@@ -47,9 +47,9 @@ from __future__ import annotations
 # classid assigned in this registry; chosen so a Postgres operator
 # inspecting pg_locks sees a recognisable value rather than a random
 # magic number. Used by SessionServiceImpl._acquire_session_advisory_lock
-# (src/elspeth/web/sessions/service.py) for the session-scoped write
-# lock that serialises persist_compose_turn / save_composition_state /
-# set_active_state writers within a single Postgres cluster.
+# (src/elspeth/web/sessions/service.py) and the shared Sessions locking
+# helpers for the session-scoped write lock that serialises same-session
+# writers within a single Postgres cluster.
 ELSPETH_SESSIONS_LOCK_CLASSID: int = 0x454C5350
 
 # 0x53434845 = ASCII "SCHE". Session and Landscape initialization use the

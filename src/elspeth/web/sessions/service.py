@@ -1170,12 +1170,12 @@ def _assert_state_in_session(
     in caller code, not invalid user input. The audit trail records the
     attempted violation through the standard exception path.
 
-    Contrast with ``set_active_state``, which raises ``ValueError`` for
-    an equivalent-looking cross-session check on purpose: that method
-    receives the state_id from the HTTP body and must map an unknown /
-    non-owned state to 404 rather than 500. The exception type is
-    load-bearing and encodes whether the caller (RuntimeError) or the
-    user (ValueError) is wrong.
+    Contrast with ``revert_state_for_guided_operation``, which raises
+    ``ValueError`` for an equivalent-looking cross-session check on
+    purpose: that method receives the state_id from the HTTP body and
+    must map an unknown / non-owned state to 404 rather than 500. The
+    exception type is load-bearing and encodes whether the caller
+    (RuntimeError) or the user (ValueError) is wrong.
     """
     state_session_id = conn.execute(select(composition_states_table.c.session_id).where(composition_states_table.c.id == state_id)).scalar()
     if state_session_id is None:
@@ -10330,116 +10330,6 @@ class SessionServiceImpl:
             )
         return record
 
-    async def set_active_state(
-        self,
-        session_id: UUID,
-        state_id: UUID,
-    ) -> CompositionStateRecord:
-        """Revert to a prior state by copying it as a new version.
-
-        Creates a new version record that is a copy of the specified prior
-        version (looked up by state_id). The new record gets
-        version = max(existing) + 1. Raises ValueError if state_id not
-        found or does not belong to the session.
-        """
-        sid = str(session_id)
-        new_state_id = uuid.uuid4()
-        now = self._now()
-
-        def _sync() -> tuple[Any, int]:
-            # The per-session write lock makes the prior-row SELECT +
-            # SELECT-MAX + INSERT atomic against every other writer for
-            # this session_id (advisory lock on Postgres, per-session
-            # RLock on SQLite). If the lock invariant is ever broken in
-            # a refactor, the IntegrityError on
-            # uq_composition_state_version names the constraint
-            # directly — no retry layer is permitted to consume that
-            # diagnostic before it reaches the operator (CLAUDE.md No
-            # Legacy Code Policy: no belt-and-suspenders). Same
-            # discipline as save_composition_state._sync above.
-            with self._session_process_locked_begin(sid) as conn:
-                with self._session_write_lock(conn, sid):
-                    prior_row = conn.execute(
-                        select(composition_states_table).where(composition_states_table.c.id == str(state_id))
-                    ).fetchone()
-
-                    # NOTE: Both branches below raise ValueError (not RuntimeError),
-                    # and the HTTP handler at routes.py maps ValueError to 404. This
-                    # is INTENTIONAL and distinct from _assert_state_in_session
-                    # (module-level) which raises RuntimeError on cross-session
-                    # references:
-                    #
-                    #   * _assert_state_in_session guards internal callers that
-                    #     supply BOTH session_id and state_id from the same scope
-                    #     (e.g. add_message, create_run). A mismatch there is a
-                    #     caller-code contract violation — RuntimeError/500 is
-                    #     the correct signal because no legitimate user input
-                    #     can produce it.
-                    #
-                    #   * set_active_state receives state_id from the HTTP body
-                    #     while session_id comes from the authenticated URL path.
-                    #     A state owned by another user's session is
-                    #     indistinguishable from "does not exist" to this user —
-                    #     surfacing a RuntimeError/500 would leak the existence
-                    #     of that other session's states. Collapsing both cases
-                    #     to ValueError -> 404 is the correct information-hiding
-                    #     boundary for user-supplied identifiers.
-                    #
-                    # If you find yourself tempted to consolidate these checks,
-                    # reconsider: the exception type is load-bearing because it
-                    # encodes WHO is wrong (caller code vs. user) and the HTTP
-                    # status depends on it.
-                    if prior_row is None:
-                        raise ValueError(f"State not found: {state_id}")
-                    if prior_row.session_id != sid:
-                        raise ValueError(f"State {state_id} does not belong to session {session_id}")
-
-                    max_version = conn.execute(
-                        select(func.max(composition_states_table.c.version)).where(composition_states_table.c.session_id == sid)
-                    ).scalar()
-                    new_version = (max_version or 0) + 1
-
-                    conn.execute(
-                        insert(composition_states_table).values(
-                            id=str(new_state_id),
-                            session_id=sid,
-                            version=new_version,
-                            # prior_row.* values are already enveloped — copy as-is
-                            source=None,
-                            sources=prior_row.sources,
-                            nodes=prior_row.nodes,
-                            edges=prior_row.edges,
-                            outputs=prior_row.outputs,
-                            metadata_=prior_row.metadata_,
-                            is_valid=prior_row.is_valid,
-                            validation_errors=prior_row.validation_errors,
-                            composer_meta=prior_row.composer_meta,
-                            derived_from_state_id=str(state_id),
-                            provenance="session_seed",
-                            created_at=now,
-                        )
-                    )
-                return prior_row, new_version
-
-        prior_row, new_version = await self._run_sync(_sync)
-
-        return CompositionStateRecord(
-            id=new_state_id,
-            session_id=session_id,
-            version=new_version,
-            source=None,
-            sources=self._unwrap_envelope(prior_row.sources),
-            nodes=self._unwrap_envelope(prior_row.nodes),
-            edges=self._unwrap_envelope(prior_row.edges),
-            outputs=self._unwrap_envelope(prior_row.outputs),
-            metadata_=self._unwrap_envelope(prior_row.metadata_),
-            is_valid=prior_row.is_valid,
-            validation_errors=prior_row.validation_errors,
-            created_at=now,
-            derived_from_state_id=state_id,
-            composer_meta=self._unwrap_envelope(prior_row.composer_meta),
-        )
-
     async def revert_state_for_guided_operation(
         self,
         fence: GuidedOperationFence,
@@ -10456,8 +10346,8 @@ class SessionServiceImpl:
         The fence check, state copy, system audit message, replay locator, and
         response-domain hash all share one session lock and one database
         transaction.  In particular this is not implemented as a public
-        ``require_fence`` followed by ``set_active_state``: takeover between
-        those calls would let a stale worker create a durable version.
+        ``require_fence`` followed by an unfenced state-copy helper: takeover
+        between those calls would let a stale worker create a durable version.
         """
 
         sid = str(fence.session_id)

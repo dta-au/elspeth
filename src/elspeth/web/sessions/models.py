@@ -658,7 +658,8 @@ composition_states_table = Table(
     #                                    routes/composer.py recompose successful
     #                                    LLM-driven state advances, including the
     #                                    transition_consumed metadata-only row.
-    #   - ``session_seed``            — service.py create_session + set_active_state
+    #   - ``session_seed``            — route-driven seed/import writes and
+    #                                    service.py guided state reverts
     #   - ``session_fork``            — service.py fork_session_at_message and
     #                                    routes/sessions.py fork blob-reference
     #                                    rewrite, which is part of the same fork

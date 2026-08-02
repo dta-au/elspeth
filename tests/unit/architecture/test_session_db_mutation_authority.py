@@ -1265,7 +1265,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13626,
+        line=13516,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1275,7 +1275,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13637,
+        line=13527,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1285,7 +1285,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         2,
         "SessionForkAuthority",
-        line=13656,
+        line=13546,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1295,7 +1295,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13704,
+        line=13594,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -1305,7 +1305,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "937f08692f6ed0fa",
         1,
         "SessionForkAuthority",
-        line=13758,
+        line=13648,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/service.py",
@@ -4180,6 +4180,14 @@ def test_removed_unfenced_state_pruner_is_absent() -> None:
     scanned = scan_production_writers([service_path], anchor=root)
 
     assert not [site for site in scanned if site.symbol == "SessionServiceImpl.prune_state_versions._sync"]
+
+
+def test_removed_unfenced_active_state_setter_is_absent() -> None:
+    root = _repo_root()
+    service_path = root / "src/elspeth/web/sessions/service.py"
+    scanned = scan_production_writers([service_path], anchor=root)
+
+    assert not [site for site in scanned if site.symbol == "SessionServiceImpl.set_active_state._sync"]
 
 
 def test_composer_completion_facet_writer_identities_are_exact_and_bidirectional() -> None:
