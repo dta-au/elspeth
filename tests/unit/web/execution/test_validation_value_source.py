@@ -291,6 +291,39 @@ class TestWalkerL2Direct:
         assert finding.component_type == "source"
         assert finding.field_name == "model"
 
+    def test_source_dot_segment_base_url_keeps_catalog_enforcement(self) -> None:
+        """elspeth-5653909057: a dot-segment respelling of the canonical
+        OpenRouter URL is collapsed client-side by httpx, so it targets the
+        canonical endpoint. The source-config normalizer must collapse it too,
+        keeping the ``applies_when`` predicate — and the catalog check — live
+        on the engine-preflight source surface.
+        """
+        plugin = LLMSource(
+            {
+                "provider": "openrouter",
+                "model": "unknown/model",
+                "api_key": "resolved-secret",
+                "base_url": "https://openrouter.ai/api/x/../v1",
+                "prompt_template": "Write one audit briefing.",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            }
+        )
+
+        with (
+            patch(
+                "elspeth.engine.orchestrator.preflight.get_catalog_values",
+                return_value=frozenset({"openai/gpt-5-mini"}),
+            ),
+            pytest.raises(ValueSourceValidationError) as exc_info,
+        ):
+            validate_value_source_compliance([], sources={"generated_brief": plugin})
+
+        finding = exc_info.value.findings[0]
+        assert finding.component_id == "source:generated_brief"
+        assert finding.component_type == "source"
+        assert finding.field_name == "model"
+
     def test_conventional_source_name_uses_unqualified_source_identity(self) -> None:
         plugin = LLMSource(
             {
