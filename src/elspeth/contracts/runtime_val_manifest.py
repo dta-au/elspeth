@@ -49,6 +49,8 @@ import json
 import re
 import sys
 import textwrap
+from collections.abc import Sequence
+from contextvars import ContextVar
 from types import (
     BuiltinFunctionType,
     CodeType,
@@ -89,6 +91,52 @@ _UNSUPPORTED_MANIFEST_VALUE = _UnsupportedManifestValue()
 _MISSING_CLASS_ATTRIBUTE = object()
 _TYPING_SPECIAL_FORM_MODULES = ("typing", "typing_extensions")
 _TYPING_SPECIAL_FORM_NAMES = ("Annotated", "Literal", "NotRequired", "ReadOnly", "Required", "Union")
+
+
+@dataclasses.dataclass
+class _ManifestBuildCache:
+    instructions: dict[CodeType, tuple[dis.Instruction, ...]] = dataclasses.field(default_factory=dict)
+    normalized_code_objects: dict[CodeType, dict[str, object]] = dataclasses.field(default_factory=dict)
+    callable_payloads: dict[
+        tuple[FunctionType, frozenset[int], frozenset[int]],
+        dict[str, object],
+    ] = dataclasses.field(default_factory=dict)
+    callable_hashes: dict[tuple[FunctionType, frozenset[int]], str] = dataclasses.field(default_factory=dict)
+    callable_dependencies: dict[
+        tuple[FunctionType, frozenset[int], type[object] | None],
+        dict[str, object],
+    ] = dataclasses.field(default_factory=dict)
+    class_source_hashes: dict[type[object], str] = dataclasses.field(default_factory=dict)
+    class_bindings: dict[
+        tuple[type[object], str, str, tuple[str, ...], bool, frozenset[int]],
+        dict[str, object],
+    ] = dataclasses.field(default_factory=dict)
+    method_hashes: dict[
+        tuple[type[object], tuple[str, ...], frozenset[int]],
+        dict[str, str],
+    ] = dataclasses.field(default_factory=dict)
+    method_dependencies: dict[
+        tuple[type[object], tuple[str, ...], frozenset[int]],
+        dict[str, object],
+    ] = dataclasses.field(default_factory=dict)
+    payload_schema_hashes: dict[type[object], str] = dataclasses.field(default_factory=dict)
+
+
+_MANIFEST_BUILD_CACHE: ContextVar[_ManifestBuildCache | None] = ContextVar(
+    "runtime_val_manifest_build_cache",
+    default=None,
+)
+
+
+def _instructions(code: CodeType) -> tuple[dis.Instruction, ...]:
+    cache = _MANIFEST_BUILD_CACHE.get()
+    if cache is None:
+        return tuple(dis.get_instructions(code))
+    cached = cache.instructions.get(code)
+    if cached is None:
+        cached = tuple(dis.get_instructions(code))
+        cache.instructions[code] = cached
+    return cached
 
 
 def _type_identity(cls: type[object]) -> str:
@@ -138,45 +186,102 @@ def _typing_special_form_name(value: object) -> str | None:
     return None
 
 
-def _try_normalize_code_constant(value: object) -> object:
+def _preserve_builtin_subclass_identity(value: object, *, normalized_base_value: object) -> object:
+    return {
+        "builtin_subclass": {
+            "type": _type_identity(type(value)),
+            "value": normalized_base_value,
+        }
+    }
+
+
+def _try_normalize_code_constant(value: object, *, seen: frozenset[int] = frozenset()) -> object:
     if isinstance(value, CodeType):
         return {"code": _normalize_code_object(value)}
     if isinstance(value, tuple):
-        tuple_items = [_try_normalize_code_constant(item) for item in value]
+        if id(value) in seen:
+            return _UNSUPPORTED_MANIFEST_VALUE
+        nested_seen = seen | frozenset({id(value)})
+        tuple_items = [_try_normalize_code_constant(item, seen=nested_seen) for item in tuple.__iter__(value)]
         if any(item is _UNSUPPORTED_MANIFEST_VALUE for item in tuple_items):
             return _UNSUPPORTED_MANIFEST_VALUE
-        return {"tuple": tuple_items}
+        normalized_tuple = {"tuple": tuple_items}
+        if type(value) is tuple:
+            return normalized_tuple
+        return _preserve_builtin_subclass_identity(value, normalized_base_value=normalized_tuple)
     if isinstance(value, list):
-        list_items = [_try_normalize_code_constant(item) for item in value]
+        if id(value) in seen:
+            return _UNSUPPORTED_MANIFEST_VALUE
+        nested_seen = seen | frozenset({id(value)})
+        list_items = [_try_normalize_code_constant(item, seen=nested_seen) for item in list.__iter__(value)]
         if any(item is _UNSUPPORTED_MANIFEST_VALUE for item in list_items):
             return _UNSUPPORTED_MANIFEST_VALUE
-        return {"list": list_items}
+        normalized_list = {"list": list_items}
+        if type(value) is list:
+            return normalized_list
+        return _preserve_builtin_subclass_identity(value, normalized_base_value=normalized_list)
     if isinstance(value, (set, frozenset)):
-        collection_items = [_try_normalize_code_constant(item) for item in value]
+        if id(value) in seen:
+            return _UNSUPPORTED_MANIFEST_VALUE
+        nested_seen = seen | frozenset({id(value)})
+        if isinstance(value, set):
+            collection_values = set.__iter__(value)
+            key = "set"
+            exact_type = type(value) is set
+        else:
+            collection_values = frozenset.__iter__(value)
+            key = "frozenset"
+            exact_type = type(value) is frozenset
+        collection_items = [_try_normalize_code_constant(item, seen=nested_seen) for item in collection_values]
         if any(item is _UNSUPPORTED_MANIFEST_VALUE for item in collection_items):
             return _UNSUPPORTED_MANIFEST_VALUE
-        key = "set" if isinstance(value, set) else "frozenset"
-        return {key: sorted(collection_items, key=_normalized_sort_key)}
+        normalized_collection = {key: sorted(collection_items, key=_normalized_sort_key)}
+        if exact_type:
+            return normalized_collection
+        return _preserve_builtin_subclass_identity(value, normalized_base_value=normalized_collection)
     if isinstance(value, dict):
+        if id(value) in seen:
+            return _UNSUPPORTED_MANIFEST_VALUE
+        nested_seen = seen | frozenset({id(value)})
         dict_items: list[dict[str, object]] = []
-        for item_key, item_value in value.items():
-            normalized_key = _try_normalize_code_constant(item_key)
-            normalized_value = _try_normalize_code_constant(item_value)
+        for item_key, item_value in dict.items(value):
+            normalized_key = _try_normalize_code_constant(item_key, seen=nested_seen)
+            normalized_value = _try_normalize_code_constant(item_value, seen=nested_seen)
             if normalized_key is _UNSUPPORTED_MANIFEST_VALUE or normalized_value is _UNSUPPORTED_MANIFEST_VALUE:
                 return _UNSUPPORTED_MANIFEST_VALUE
             dict_items.append({"key": normalized_key, "value": normalized_value})
-        return {"dict": sorted(dict_items, key=_normalized_sort_key)}
+        normalized_dict = {"dict": sorted(dict_items, key=_normalized_sort_key)}
+        if type(value) is dict:
+            return normalized_dict
+        return _preserve_builtin_subclass_identity(value, normalized_base_value=normalized_dict)
     if isinstance(value, bytes):
-        return {"bytes": value.hex()}
+        normalized_bytes = {"bytes": bytes.hex(value)}
+        if type(value) is bytes:
+            return normalized_bytes
+        return _preserve_builtin_subclass_identity(value, normalized_base_value=normalized_bytes)
     if isinstance(value, re.Pattern):
         normalized_pattern = _try_normalize_code_constant(value.pattern)
         if normalized_pattern is _UNSUPPORTED_MANIFEST_VALUE:
             return _UNSUPPORTED_MANIFEST_VALUE
         return {"regex": {"pattern": normalized_pattern, "flags": value.flags}}
     if isinstance(value, complex):
-        return {"complex": [value.real, value.imag]}
-    if isinstance(value, (str, int, float, bool)) or value is None:
+        normalized_complex = {
+            "complex": [
+                complex.real.__get__(value),
+                complex.imag.__get__(value),
+            ]
+        }
+        if type(value) is complex:
+            return normalized_complex
+        return _preserve_builtin_subclass_identity(value, normalized_base_value=normalized_complex)
+    if type(value) in (str, int, float, bool) or value is None:
         return value
+    if isinstance(value, str):
+        return {"primitive_subclass": {"type": _type_identity(type(value)), "value": str.__str__(value)}}
+    if isinstance(value, int):
+        return {"primitive_subclass": {"type": _type_identity(type(value)), "value": int.__int__(value)}}
+    if isinstance(value, float):
+        return {"primitive_subclass": {"type": _type_identity(type(value)), "value": float.__float__(value)}}
     if value is Ellipsis:
         return {"ellipsis": True}
     if value is Required:
@@ -219,20 +324,26 @@ def _normalize_code_constant(value: object) -> object:
 
 
 def _normalize_code_object(code: CodeType) -> dict[str, object]:
-    return {
+    cache = _MANIFEST_BUILD_CACHE.get()
+    if cache is not None and code in cache.normalized_code_objects:
+        return cache.normalized_code_objects[code]
+    normalized = {
         "argcount": code.co_argcount,
         "posonlyargcount": code.co_posonlyargcount,
         "kwonlyargcount": code.co_kwonlyargcount,
         "nlocals": code.co_nlocals,
         "stacksize": code.co_stacksize,
         "flags": code.co_flags,
-        "instructions": [_normalize_instruction(instruction) for instruction in dis.get_instructions(code)],
+        "instructions": [_normalize_instruction(instruction) for instruction in _instructions(code)],
         "names": list(code.co_names),
         "varnames": list(code.co_varnames),
         "freevars": list(code.co_freevars),
         "cellvars": list(code.co_cellvars),
         "exceptiontable": code.co_exceptiontable.hex(),
     }
+    if cache is not None:
+        cache.normalized_code_objects[code] = normalized
+    return normalized
 
 
 def _iter_code_objects(code: CodeType, *, path: str = "<root>") -> list[tuple[str, CodeType]]:
@@ -458,9 +569,13 @@ def _callable_implementation_payload(
     seen_function_ids: frozenset[int],
     seen_dependency_ids: frozenset[int],
 ) -> dict[str, object]:
+    cache = _MANIFEST_BUILD_CACHE.get()
+    cache_key = (func, seen_function_ids, seen_dependency_ids)
+    if cache is not None and cache_key in cache.callable_payloads:
+        return cache.callable_payloads[cache_key]
     next_seen_function_ids = seen_function_ids | frozenset({id(func)})
     next_seen_dependency_ids = seen_dependency_ids | frozenset({id(func)})
-    return {
+    payload = {
         "identity": _callable_dependency_key(func),
         "code": _normalize_code_object(func.__code__),
         "defaults": _normalize_callable_defaults(
@@ -475,16 +590,26 @@ def _callable_implementation_payload(
             seen_dependency_ids=next_seen_dependency_ids,
         ),
     }
+    if cache is not None:
+        cache.callable_payloads[cache_key] = payload
+    return payload
 
 
 def _callable_implementation_hash(func: FunctionType, *, seen: frozenset[int] = frozenset()) -> str:
-    return _json_hash(
+    cache = _MANIFEST_BUILD_CACHE.get()
+    cache_key = (func, seen)
+    if cache is not None and cache_key in cache.callable_hashes:
+        return cache.callable_hashes[cache_key]
+    implementation_hash = _json_hash(
         _callable_implementation_payload(
             func,
             seen_function_ids=seen,
             seen_dependency_ids=seen,
         )
     )
+    if cache is not None:
+        cache.callable_hashes[cache_key] = implementation_hash
+    return implementation_hash
 
 
 def _strip_docstrings(node: ast.AST) -> None:
@@ -502,6 +627,9 @@ def _strip_docstrings(node: ast.AST) -> None:
 
 
 def _class_source_hash(cls: type[object]) -> str:
+    cache = _MANIFEST_BUILD_CACHE.get()
+    if cache is not None and cls in cache.class_source_hashes:
+        return cache.class_source_hashes[cls]
     try:
         source = textwrap.dedent(inspect.getsource(cls))
     except (OSError, TypeError) as exc:
@@ -512,7 +640,10 @@ def _class_source_hash(cls: type[object]) -> str:
         ) from exc
     tree = ast.parse(source)
     _strip_docstrings(tree)
-    return _json_hash(ast.dump(tree, include_attributes=False))
+    source_hash = _json_hash(ast.dump(tree, include_attributes=False))
+    if cache is not None:
+        cache.class_source_hashes[cls] = source_hash
+    return source_hash
 
 
 def _unwrap_callable(attribute: object) -> FunctionType | None:
@@ -555,7 +686,7 @@ def _loaded_binding_attribute_names(
 ) -> list[str]:
     names: set[str] = set()
     for _, nested_code in _iter_code_objects_for_binding(code, binding_name=binding_name):
-        instructions = list(dis.get_instructions(nested_code))
+        instructions = _instructions(nested_code)
         for index, instruction in enumerate(instructions[:-1]):
             if instruction.opname not in load_opnames or instruction.argval != binding_name:
                 continue
@@ -574,7 +705,7 @@ def _binding_is_directly_called(
     binding_name: str,
 ) -> bool:
     for _, nested_code in _iter_code_objects_for_binding(code, binding_name=binding_name):
-        instructions = list(dis.get_instructions(nested_code))
+        instructions = _instructions(nested_code)
         for index, instruction in enumerate(instructions):
             if instruction.opname not in load_opnames or instruction.argval != binding_name:
                 continue
@@ -611,6 +742,17 @@ def _normalize_class_binding(
     directly_called: bool,
     seen: frozenset[int],
 ) -> object:
+    cache = _MANIFEST_BUILD_CACHE.get()
+    cache_key = (
+        cls,
+        owner_module,
+        binding_name,
+        tuple(attribute_names),
+        directly_called,
+        seen,
+    )
+    if cache is not None and cache_key in cache.class_bindings:
+        return dict(cache.class_bindings[cache_key])
     identity = _type_identity(cls)
     cls_module = cls.__module__
     if not _module_is_owned(cls_module, owner_module=owner_module):
@@ -668,6 +810,9 @@ def _normalize_class_binding(
             method_names=fallback_method_names,
             seen=seen,
         )
+    if cache is not None:
+        cache.class_bindings[cache_key] = normalized
+        return dict(normalized)
     return normalized
 
 
@@ -691,7 +836,7 @@ def _add_callable_dependency(
 
 def _loaded_global_names(code: CodeType) -> list[str]:
     names: set[str] = set()
-    for instruction in dis.get_instructions(code):
+    for instruction in _instructions(code):
         if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME"}:
             continue
         name: str = instruction.argval
@@ -699,14 +844,14 @@ def _loaded_global_names(code: CodeType) -> list[str]:
     return sorted(names)
 
 
-def _loaded_owner_attribute_names(code: CodeType) -> list[str]:
+def _loaded_owner_attribute_names(code: CodeType, *, binding_name: str) -> list[str]:
     names: set[str] = set()
-    instructions = list(dis.get_instructions(code))
+    instructions = _instructions(code)
     for index, instruction in enumerate(instructions[1:], start=1):
         if instruction.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
             continue
         receiver_instruction = instructions[index - 1]
-        if receiver_instruction.opname not in {"LOAD_FAST", "LOAD_DEREF"} or receiver_instruction.argval not in {"self", "cls"}:
+        if receiver_instruction.opname not in {"LOAD_FAST", "LOAD_DEREF"} or receiver_instruction.argval != binding_name:
             continue
         name: str = instruction.argval
         names.add(name)
@@ -731,7 +876,7 @@ def _resolve_static_attribute(owner: object, name: str) -> tuple[object, object 
 
 
 def _reject_truncated_descriptor_chain(
-    instructions: list[dis.Instruction],
+    instructions: Sequence[dis.Instruction],
     *,
     terminal_index: int,
     candidate: object,
@@ -751,7 +896,7 @@ def _qualified_global_values(
     name: str,
 ) -> list[tuple[str, object, object | None, bool]]:
     qualified_values: list[tuple[str, object, object | None, bool]] = []
-    instructions = list(dis.get_instructions(code))
+    instructions = _instructions(code)
     for index, instruction in enumerate(instructions[:-1]):
         if instruction.opname not in {"LOAD_GLOBAL", "LOAD_NAME"} or instruction.argval != name:
             continue
@@ -815,7 +960,7 @@ def _qualified_bound_values(
 ) -> list[tuple[str, object, object | None, bool]]:
     qualified_values: list[tuple[str, object, object | None, bool]] = []
     for _, nested_code in _iter_code_objects_for_binding(code, binding_name=binding_name):
-        instructions = list(dis.get_instructions(nested_code))
+        instructions = _instructions(nested_code)
         for index, instruction in enumerate(instructions[:-1]):
             if instruction.opname not in load_opnames or instruction.argval != binding_name:
                 continue
@@ -856,11 +1001,13 @@ def _qualified_bound_values(
 def _qualified_owner_values(
     code: CodeType,
     owner_cls: type[object],
+    *,
+    binding_name: str,
 ) -> list[tuple[str, object, object | None, bool]]:
     qualified_values: list[tuple[str, object, object | None, bool]] = []
-    instructions = list(dis.get_instructions(code))
+    instructions = _instructions(code)
     for index, instruction in enumerate(instructions[:-1]):
-        if instruction.opname not in {"LOAD_FAST", "LOAD_DEREF"} or instruction.argval not in {"self", "cls"}:
+        if instruction.opname not in {"LOAD_FAST", "LOAD_DEREF"} or instruction.argval != binding_name:
             continue
         candidate: object = owner_cls
         candidate_owner: object | None = None
@@ -945,31 +1092,47 @@ def _normalize_dependency_value(
         if id(candidate) in seen:
             raise FrameworkBugError(f"Runtime-VAL dependency {owner_module}:{name} contains a cyclic tuple")
         nested_seen = seen | frozenset({id(candidate)})
-        return {
+        normalized_tuple = {
             "tuple": [
                 _normalize_dependency_value(item, owner_module=owner_module, name=f"{name}[{index}]", seen=nested_seen)
-                for index, item in enumerate(candidate)
+                for index, item in enumerate(tuple.__iter__(candidate))
             ]
         }
+        if type(candidate) is tuple:
+            return normalized_tuple
+        return _preserve_builtin_subclass_identity(candidate, normalized_base_value=normalized_tuple)
     if isinstance(candidate, list):
         if id(candidate) in seen:
             raise FrameworkBugError(f"Runtime-VAL dependency {owner_module}:{name} contains a cyclic list")
         nested_seen = seen | frozenset({id(candidate)})
-        return {
+        normalized_list = {
             "list": [
                 _normalize_dependency_value(item, owner_module=owner_module, name=f"{name}[{index}]", seen=nested_seen)
-                for index, item in enumerate(candidate)
+                for index, item in enumerate(list.__iter__(candidate))
             ]
         }
+        if type(candidate) is list:
+            return normalized_list
+        return _preserve_builtin_subclass_identity(candidate, normalized_base_value=normalized_list)
     if isinstance(candidate, (set, frozenset)):
         if id(candidate) in seen:
             raise FrameworkBugError(f"Runtime-VAL dependency {owner_module}:{name} contains a cyclic set")
         nested_seen = seen | frozenset({id(candidate)})
+        if isinstance(candidate, set):
+            collection_values = set.__iter__(candidate)
+            key = "set"
+            exact_type = type(candidate) is set
+        else:
+            collection_values = frozenset.__iter__(candidate)
+            key = "frozenset"
+            exact_type = type(candidate) is frozenset
         normalized_items = [
-            _normalize_dependency_value(item, owner_module=owner_module, name=f"{name}[]", seen=nested_seen) for item in candidate
+            _normalize_dependency_value(item, owner_module=owner_module, name=f"{name}[]", seen=nested_seen) for item in collection_values
         ]
-        key = "set" if isinstance(candidate, set) else "frozenset"
-        return {key: sorted(normalized_items, key=_normalized_sort_key)}
+        normalized_collection = {key: sorted(normalized_items, key=_normalized_sort_key)}
+        if exact_type:
+            return normalized_collection
+        return _preserve_builtin_subclass_identity(candidate, normalized_base_value=normalized_collection)
     if isinstance(candidate, dict):
         if id(candidate) in seen:
             raise FrameworkBugError(f"Runtime-VAL dependency {owner_module}:{name} contains a cyclic mapping")
@@ -979,9 +1142,12 @@ def _normalize_dependency_value(
                 "key": _normalize_dependency_value(key, owner_module=owner_module, name=f"{name}.<key>", seen=nested_seen),
                 "value": _normalize_dependency_value(value, owner_module=owner_module, name=f"{name}[value]", seen=nested_seen),
             }
-            for key, value in candidate.items()
+            for key, value in dict.items(candidate)
         ]
-        return {"dict": sorted(normalized_items, key=_normalized_sort_key)}
+        normalized_dict = {"dict": sorted(normalized_items, key=_normalized_sort_key)}
+        if type(candidate) is dict:
+            return normalized_dict
+        return _preserve_builtin_subclass_identity(candidate, normalized_base_value=normalized_dict)
     if isinstance(candidate, type) and is_typeddict(candidate):
         return {"typed_dict_hash": _payload_schema_hash(candidate)}
     if isinstance(candidate, type):
@@ -1143,10 +1309,27 @@ def _callable_dependency_hashes(
     seen: frozenset[int] = frozenset(),
     owner_cls: type[object] | None = None,
 ) -> dict[str, object]:
+    cache = _MANIFEST_BUILD_CACHE.get()
+    cache_key = (func, seen, owner_cls)
+    if cache is not None and cache_key in cache.callable_dependencies:
+        return dict(cache.callable_dependencies[cache_key])
     globals_table = func.__globals__
     next_seen = seen | frozenset({id(func)})
     owner_module = _function_module(func)
     dependencies: dict[str, object] = {}
+    owner_binding_name: str | None = None
+    owner_binding_code_objects: frozenset[CodeType] = frozenset()
+    if owner_cls is not None and func.__code__.co_argcount > 0:
+        candidate_owner_binding = func.__code__.co_varnames[0]
+        if candidate_owner_binding in {"self", "cls"}:
+            owner_binding_name = candidate_owner_binding
+            owner_binding_code_objects = frozenset(
+                nested_code
+                for _, nested_code in _iter_code_objects_for_binding(
+                    func.__code__,
+                    binding_name=owner_binding_name,
+                )
+            )
     for code_path, code in _iter_code_objects(func.__code__):
         dependency_scope = f"{_callable_dependency_key(func)}:{code_path}"
         for name in _loaded_global_names(code):
@@ -1213,8 +1396,9 @@ def _callable_dependency_hashes(
                     seen=next_seen,
                     dependency_key=f"{owner_module}:<code>:{dependency_scope}:<global>:{name}",
                 )
-        if owner_cls is not None:
-            for name in _loaded_owner_attribute_names(code):
+        owner_binding_is_live = code in owner_binding_code_objects
+        if owner_cls is not None and owner_binding_name is not None and owner_binding_is_live:
+            for name in _loaded_owner_attribute_names(code, binding_name=owner_binding_name):
                 attribute = _static_class_attribute(owner_cls, name)
                 if attribute is _MISSING_CLASS_ATTRIBUTE:
                     continue
@@ -1241,7 +1425,11 @@ def _callable_dependency_hashes(
                     seen=next_seen,
                     dependency_key=f"{_type_identity(owner_cls)}:<code>:{code_path}:<attribute>:{name}",
                 )
-            for qualified_name, qualified_candidate, qualified_owner, directly_called in _qualified_owner_values(code, owner_cls):
+            for qualified_name, qualified_candidate, qualified_owner, directly_called in _qualified_owner_values(
+                code,
+                owner_cls,
+                binding_name=owner_binding_name,
+            ):
                 _add_resolved_dependency(
                     dependencies,
                     owner_module=_type_identity(owner_cls).partition(":")[0],
@@ -1252,6 +1440,9 @@ def _callable_dependency_hashes(
                     directly_called=directly_called,
                     seen=next_seen,
                 )
+    if cache is not None:
+        cache.callable_dependencies[cache_key] = dependencies
+        return dict(dependencies)
     return dependencies
 
 
@@ -1285,6 +1476,10 @@ def _iter_relevant_method_hashes(
         names = _static_method_names(cls)
     else:
         names = sorted(set(method_names))
+    cache = _MANIFEST_BUILD_CACHE.get()
+    cache_key = (cls, tuple(names), seen)
+    if cache is not None and cache_key in cache.method_hashes:
+        return dict(cache.method_hashes[cache_key])
 
     method_hashes: dict[str, str] = {}
     for name in names:
@@ -1298,6 +1493,9 @@ def _iter_relevant_method_hashes(
             method_hashes[name] = f"callable-reference:{_callable_dependency_key(callable_obj)}"
             continue
         method_hashes[name] = _callable_implementation_hash(callable_obj, seen=seen)
+    if cache is not None:
+        cache.method_hashes[cache_key] = method_hashes
+        return dict(method_hashes)
     return method_hashes
 
 
@@ -1307,8 +1505,13 @@ def _iter_relevant_method_dependency_hashes(
     method_names: list[str],
     seen: frozenset[int] = frozenset(),
 ) -> dict[str, object]:
+    names = tuple(sorted(set(method_names)))
+    cache = _MANIFEST_BUILD_CACHE.get()
+    cache_key = (cls, names, seen)
+    if cache is not None and cache_key in cache.method_dependencies:
+        return dict(cache.method_dependencies[cache_key])
     dependency_hashes: dict[str, object] = {}
-    for name in sorted(set(method_names)):
+    for name in names:
         attribute = _static_class_attribute(cls, name)
         callable_obj = _unwrap_callable(attribute)
         if callable_obj is None:
@@ -1320,10 +1523,16 @@ def _iter_relevant_method_dependency_hashes(
         dependencies = _callable_dependency_hashes(callable_obj, seen=seen, owner_cls=owner_cls)
         if dependencies:
             dependency_hashes[name] = dependencies
+    if cache is not None:
+        cache.method_dependencies[cache_key] = dependency_hashes
+        return dict(dependency_hashes)
     return dependency_hashes
 
 
 def _payload_schema_hash(payload_schema: type) -> str:
+    cache = _MANIFEST_BUILD_CACHE.get()
+    if cache is not None and payload_schema in cache.payload_schema_hashes:
+        return cache.payload_schema_hashes[payload_schema]
     if not is_typeddict(payload_schema):
         raise FrameworkBugError(
             "Runtime-VAL declaration payload_schema must be a TypedDict; "
@@ -1333,7 +1542,7 @@ def _payload_schema_hash(payload_schema: type) -> str:
         annotations = get_type_hints(payload_schema, include_extras=True)
     except (NameError, TypeError) as exc:
         raise FrameworkBugError(f"Runtime-VAL cannot resolve payload schema annotations for {_type_identity(payload_schema)}") from exc
-    return _json_hash(
+    schema_hash = _json_hash(
         {
             "module": payload_schema.__module__,
             "qualname": payload_schema.__qualname__,
@@ -1343,6 +1552,9 @@ def _payload_schema_hash(payload_schema: type) -> str:
             "source_hash": _class_source_hash(payload_schema),
         }
     )
+    if cache is not None:
+        cache.payload_schema_hashes[payload_schema] = schema_hash
+    return schema_hash
 
 
 def _class_implementation_hash(
@@ -1410,28 +1622,32 @@ def _assert_runtime_val_registries_frozen() -> None:
 def build_runtime_val_manifest() -> dict[str, Any]:
     """Return a dict describing the runtime-VAL registries at call time."""
     _assert_runtime_val_registries_frozen()
-    declarations = [
-        {
-            "name": contract.name,
-            "class_name": type(contract).__name__,
-            "class_module": type(contract).__module__,
-            "dispatch_sites": sorted(contract_sites(contract)),
-            "implementation_hash": _declaration_contract_implementation_hash(contract),
+    cache_token = _MANIFEST_BUILD_CACHE.set(_ManifestBuildCache())
+    try:
+        declarations = [
+            {
+                "name": contract.name,
+                "class_name": type(contract).__name__,
+                "class_module": type(contract).__module__,
+                "dispatch_sites": sorted(contract_sites(contract)),
+                "implementation_hash": _declaration_contract_implementation_hash(contract),
+            }
+            for contract in sorted(registered_declaration_contracts(), key=lambda c: c.name)
+        ]
+        tier_1_entries = [
+            {
+                "class_name": cls.__name__,
+                "class_module": cls.__module__,
+                "reason": tier_1_reason(cls),
+                "implementation_hash": _tier_1_implementation_hash(cls),
+            }
+            for cls in sorted(_TIER_1_ERRORS_VIEW, key=lambda c: (c.__module__, c.__name__))
+        ]
+        expected_contract_sites_serialized: dict[str, list[str]] = {name: sorted(sites) for name, sites in EXPECTED_CONTRACT_SITES.items()}
+        return {
+            "declaration_contracts": declarations,
+            "expected_contract_sites": expected_contract_sites_serialized,
+            "tier_1_errors": tier_1_entries,
         }
-        for contract in sorted(registered_declaration_contracts(), key=lambda c: c.name)
-    ]
-    tier_1_entries = [
-        {
-            "class_name": cls.__name__,
-            "class_module": cls.__module__,
-            "reason": tier_1_reason(cls),
-            "implementation_hash": _tier_1_implementation_hash(cls),
-        }
-        for cls in sorted(_TIER_1_ERRORS_VIEW, key=lambda c: (c.__module__, c.__name__))
-    ]
-    expected_contract_sites_serialized: dict[str, list[str]] = {name: sorted(sites) for name, sites in EXPECTED_CONTRACT_SITES.items()}
-    return {
-        "declaration_contracts": declarations,
-        "expected_contract_sites": expected_contract_sites_serialized,
-        "tier_1_errors": tier_1_entries,
-    }
+    finally:
+        _MANIFEST_BUILD_CACHE.reset(cache_token)

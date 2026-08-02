@@ -5,11 +5,15 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Iterator
-from typing import Annotated, ClassVar, Literal, Optional, TypedDict, Union
+from concurrent.futures import ThreadPoolExecutor
+from enum import StrEnum
+from types import FunctionType
+from typing import Annotated, ClassVar, Literal, Optional, TypedDict, Union, cast
 
 import pytest
 import typing_extensions
 
+import elspeth.contracts.runtime_val_manifest as runtime_val_manifest_module
 import elspeth.contracts.schema_contract as schema_contract_module
 import elspeth.contracts.secret_scrub as secret_scrub_module
 import elspeth.engine.executors.declared_output_fields as declared_output_fields_module
@@ -78,6 +82,74 @@ class _RuntimeValManifestHelperClass:
 
 class _RuntimeValManifestExternalOpaque:
     __module__ = "vendor.runtime_val_test"
+
+
+class _RuntimeValManifestBytesOne(bytes):
+    pass
+
+
+class _RuntimeValManifestBytesTwo(bytes):
+    pass
+
+
+class _RuntimeValManifestComplexOne(complex):
+    pass
+
+
+class _RuntimeValManifestComplexTwo(complex):
+    pass
+
+
+class _RuntimeValManifestTupleOne(tuple[object, ...]):
+    pass
+
+
+class _RuntimeValManifestTupleTwo(tuple[object, ...]):
+    pass
+
+
+class _RuntimeValManifestListOne(list[object]):
+    pass
+
+
+class _RuntimeValManifestListTwo(list[object]):
+    pass
+
+
+class _RuntimeValManifestSetOne(set[object]):
+    pass
+
+
+class _RuntimeValManifestSetTwo(set[object]):
+    pass
+
+
+class _RuntimeValManifestFrozenSetOne(frozenset[object]):
+    pass
+
+
+class _RuntimeValManifestFrozenSetTwo(frozenset[object]):
+    pass
+
+
+class _RuntimeValManifestDictOne(dict[str, int]):
+    pass
+
+
+class _RuntimeValManifestDictTwo(dict[str, int]):
+    pass
+
+
+_RUNTIME_VAL_MANIFEST_BUILTIN_SUBCLASS_PAIRS: tuple[tuple[str, object, object], ...] = (
+    ("bytes", _RuntimeValManifestBytesOne(b"shared-value"), _RuntimeValManifestBytesTwo(b"shared-value")),
+    ("complex", _RuntimeValManifestComplexOne(1, 2), _RuntimeValManifestComplexTwo(1, 2)),
+    ("tuple", _RuntimeValManifestTupleOne((1, 2)), _RuntimeValManifestTupleTwo((1, 2))),
+    ("list", _RuntimeValManifestListOne([1, 2]), _RuntimeValManifestListTwo([1, 2])),
+    ("set", _RuntimeValManifestSetOne({1, 2}), _RuntimeValManifestSetTwo({1, 2})),
+    ("frozenset", _RuntimeValManifestFrozenSetOne({1, 2}), _RuntimeValManifestFrozenSetTwo({1, 2})),
+    ("dict", _RuntimeValManifestDictOne({"value": 1}), _RuntimeValManifestDictTwo({"value": 1})),
+)
+_RUNTIME_VAL_MANIFEST_BUILTIN_SUBCLASS_GLOBAL: object = None
 
 
 class _RuntimeValManifestNominalBaseOne:
@@ -421,6 +493,58 @@ def test_build_runtime_val_manifest_requires_frozen_registries(_isolate_runtime_
 
     with pytest.raises(FrameworkBugError, match="frozen"):
         build_runtime_val_manifest()
+
+
+def test_manifest_decodes_each_code_object_once_per_build(
+    _isolate_runtime_val_registries: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import elspeth.contracts.declaration_contracts as dc
+    import elspeth.contracts.tier_registry as tr
+
+    dc._FROZEN = False
+    tr._FROZEN = False
+    prepare_for_run()
+
+    original_get_instructions = runtime_val_manifest_module.dis.get_instructions
+    decode_counts: dict[int, int] = {}
+
+    def tracked_get_instructions(code: object):
+        code_id = id(code)
+        decode_counts[code_id] = decode_counts.get(code_id, 0) + 1
+        return original_get_instructions(code)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(runtime_val_manifest_module.dis, "get_instructions", tracked_get_instructions)
+
+    baseline = build_runtime_val_manifest()
+    first_build_decode_count = sum(decode_counts.values())
+    duplicate_decodes = [count for count in decode_counts.values() if count > 1]
+
+    assert first_build_decode_count > 0
+    assert duplicate_decodes == []
+
+    decode_counts.clear()
+    repeated = build_runtime_val_manifest()
+
+    assert repeated == baseline
+    assert sum(decode_counts.values()) == first_build_decode_count
+    assert all(count == 1 for count in decode_counts.values())
+
+
+def test_manifest_build_cache_is_context_local_across_threads(
+    _isolate_runtime_val_registries: None,
+) -> None:
+    import elspeth.contracts.declaration_contracts as dc
+    import elspeth.contracts.tier_registry as tr
+
+    dc._FROZEN = False
+    tr._FROZEN = False
+    prepare_for_run()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        manifests = list(executor.map(lambda _: build_runtime_val_manifest(), range(2)))
+
+    assert manifests[0] == manifests[1]
 
 
 def test_manifest_records_declaration_contract_implementation_hash(
@@ -1009,6 +1133,266 @@ def test_callable_implementation_hash_records_unshadowed_nested_default_capture(
         mutated = _callable_implementation_hash(dependency_root)
     finally:
         _RuntimeValManifestHelperClass.value.__code__ = original_code
+
+    assert baseline != mutated
+
+
+def test_callable_implementation_hash_preserves_primitive_enum_default_identity() -> None:
+    class _FirstDefault(StrEnum):
+        VALUE = "shared-value"
+
+    class _SecondDefault(StrEnum):
+        VALUE = "shared-value"
+
+    def dependency_root(value: str = _FirstDefault.VALUE) -> str:
+        return value
+
+    baseline = _callable_implementation_hash(dependency_root)
+    original_defaults = dependency_root.__defaults__
+    dependency_root.__defaults__ = (_SecondDefault.VALUE,)
+    try:
+        mutated = _callable_implementation_hash(dependency_root)
+    finally:
+        dependency_root.__defaults__ = original_defaults
+
+    assert baseline != mutated
+
+
+@pytest.mark.parametrize(
+    ("kind", "first", "second"),
+    _RUNTIME_VAL_MANIFEST_BUILTIN_SUBCLASS_PAIRS,
+    ids=[pair[0] for pair in _RUNTIME_VAL_MANIFEST_BUILTIN_SUBCLASS_PAIRS],
+)
+def test_callable_implementation_hash_preserves_builtin_subclass_default_identity(
+    kind: str,
+    first: object,
+    second: object,
+) -> None:
+    del kind
+
+    def dependency_root(value: object = first) -> str:
+        return type(value).__qualname__
+
+    baseline = _callable_implementation_hash(cast(FunctionType, dependency_root))
+    original_defaults = dependency_root.__defaults__
+    dependency_root.__defaults__ = (second,)
+    try:
+        mutated = _callable_implementation_hash(cast(FunctionType, dependency_root))
+    finally:
+        dependency_root.__defaults__ = original_defaults
+
+    assert baseline != mutated
+
+
+@pytest.mark.parametrize(
+    ("kind", "first", "second"),
+    _RUNTIME_VAL_MANIFEST_BUILTIN_SUBCLASS_PAIRS,
+    ids=[pair[0] for pair in _RUNTIME_VAL_MANIFEST_BUILTIN_SUBCLASS_PAIRS],
+)
+def test_builtin_subclass_identity_is_consistent_across_closures_and_dependency_containers(
+    kind: str,
+    first: object,
+    second: object,
+) -> None:
+    del kind
+
+    def closure_factory(value: object) -> Callable[[], object]:
+        def dependency_root() -> object:
+            return value
+
+        return dependency_root
+
+    def global_template() -> object:
+        return _RUNTIME_VAL_MANIFEST_BUILTIN_SUBCLASS_GLOBAL
+
+    first_globals = {
+        "__name__": __name__,
+        "_RUNTIME_VAL_MANIFEST_BUILTIN_SUBCLASS_GLOBAL": {"nested": first},
+    }
+    second_globals = {
+        "__name__": __name__,
+        "_RUNTIME_VAL_MANIFEST_BUILTIN_SUBCLASS_GLOBAL": {"nested": second},
+    }
+    first_global_root = FunctionType(global_template.__code__, first_globals)
+    second_global_root = FunctionType(global_template.__code__, second_globals)
+
+    assert _callable_implementation_hash(cast(FunctionType, closure_factory(first))) != _callable_implementation_hash(
+        cast(FunctionType, closure_factory(second))
+    )
+    assert _callable_dependency_hashes(first_global_root) != _callable_dependency_hashes(second_global_root)
+
+
+@pytest.mark.parametrize(
+    ("kind", "first", "second"),
+    _RUNTIME_VAL_MANIFEST_BUILTIN_SUBCLASS_PAIRS,
+    ids=[pair[0] for pair in _RUNTIME_VAL_MANIFEST_BUILTIN_SUBCLASS_PAIRS],
+)
+def test_generated_code_constant_preserves_builtin_subclass_identity(
+    kind: str,
+    first: object,
+    second: object,
+) -> None:
+    del kind
+    sentinel = b"runtime-val-generated-constant"
+
+    def template() -> bytes:
+        return b"runtime-val-generated-constant"
+
+    constant_index = next(
+        index for index, constant in enumerate(template.__code__.co_consts) if type(constant) is bytes and constant == sentinel
+    )
+
+    def function_with_constant(value: object) -> FunctionType:
+        constants = list(template.__code__.co_consts)
+        constants[constant_index] = value
+        code = template.__code__.replace(co_consts=tuple(constants))
+        return FunctionType(code, {"__name__": __name__})
+
+    assert _callable_implementation_hash(function_with_constant(first)) != _callable_implementation_hash(function_with_constant(second))
+
+
+def test_builtin_subclass_normalization_uses_base_descriptors_without_reconstruction() -> None:
+    class _Bytes(bytes):
+        def hex(self, *args: object, **kwargs: object) -> str:
+            del args, kwargs
+            raise AssertionError("subclass hex must not run")
+
+    class _Complex(complex):
+        @property
+        def real(self) -> float:
+            raise AssertionError("subclass real must not run")
+
+        @property
+        def imag(self) -> float:
+            raise AssertionError("subclass imag must not run")
+
+    class _Tuple(tuple[object, ...]):
+        def __iter__(self) -> Iterator[object]:
+            raise AssertionError("subclass iterator must not run")
+
+    class _List(list[object]):
+        def __iter__(self) -> Iterator[object]:
+            raise AssertionError("subclass iterator must not run")
+
+    class _Set(set[object]):
+        def __iter__(self) -> Iterator[object]:
+            raise AssertionError("subclass iterator must not run")
+
+    class _FrozenSet(frozenset[object]):
+        def __iter__(self) -> Iterator[object]:
+            raise AssertionError("subclass iterator must not run")
+
+    class _Dict(dict[str, object]):
+        def items(self):
+            raise AssertionError("subclass items must not run")
+
+    values = (
+        _Bytes(b"value"),
+        _Complex(1, 2),
+        _Tuple((1, 2)),
+        _List([1, 2]),
+        _Set({1, 2}),
+        _FrozenSet({1, 2}),
+        _Dict({"nested": _Bytes(b"value")}),
+    )
+
+    for index, value in enumerate(values):
+        normalized_constant = _normalize_code_constant(value)
+        normalized_dependency = runtime_val_manifest_module._normalize_dependency_value(
+            value,
+            owner_module=__name__,
+            name=f"value[{index}]",
+        )
+
+        assert normalized_dependency == normalized_constant
+        assert json.dumps(normalized_constant, sort_keys=True).count("builtin_subclass") >= 1
+
+
+def test_builtin_list_subclass_cycle_fails_closed() -> None:
+    class _CyclicList(list[object]):
+        pass
+
+    cyclic = _CyclicList()
+    list.append(cyclic, cyclic)
+
+    with pytest.raises(FrameworkBugError, match="cannot deterministically normalize"):
+        _normalize_code_constant(cyclic)
+    with pytest.raises(FrameworkBugError, match="cyclic list"):
+        runtime_val_manifest_module._normalize_dependency_value(
+            cyclic,
+            owner_module=__name__,
+            name="cyclic",
+        )
+
+
+def test_callable_dependency_hashes_respect_nested_owner_receiver_shadowing() -> None:
+    class _Owner:
+        def value(self) -> str:
+            return "before"
+
+        def dependency_root(self) -> Callable[[object], object]:
+            return lambda self: self.value()  # type: ignore[attr-defined]
+
+    baseline = _callable_dependency_hashes(_Owner.dependency_root, owner_cls=_Owner)
+    original_code = _Owner.value.__code__
+
+    def replacement(self) -> str:
+        return "after"
+
+    _Owner.value.__code__ = replacement.__code__
+    try:
+        mutated = _callable_dependency_hashes(_Owner.dependency_root, owner_cls=_Owner)
+    finally:
+        _Owner.value.__code__ = original_code
+
+    assert baseline == mutated
+
+
+def test_callable_dependency_hashes_respect_captured_shadow_owner_receiver() -> None:
+    class _Owner:
+        def value(self) -> str:
+            return "before"
+
+        def dependency_root(self) -> Callable[[object], Callable[[], object]]:
+            def nested(self: object) -> Callable[[], object]:
+                return lambda: self.value()  # type: ignore[attr-defined]
+
+            return nested
+
+    baseline = _callable_dependency_hashes(_Owner.dependency_root, owner_cls=_Owner)
+    original_code = _Owner.value.__code__
+
+    def replacement(self) -> str:
+        return "after"
+
+    _Owner.value.__code__ = replacement.__code__
+    try:
+        mutated = _callable_dependency_hashes(_Owner.dependency_root, owner_cls=_Owner)
+    finally:
+        _Owner.value.__code__ = original_code
+
+    assert baseline == mutated
+
+
+def test_callable_dependency_hashes_record_unshadowed_nested_owner_capture() -> None:
+    class _Owner:
+        def value(self) -> str:
+            return "before"
+
+        def dependency_root(self) -> Callable[[], str]:
+            return lambda: self.value()
+
+    baseline = _callable_dependency_hashes(_Owner.dependency_root, owner_cls=_Owner)
+    original_code = _Owner.value.__code__
+
+    def replacement(self) -> str:
+        return "after"
+
+    _Owner.value.__code__ = replacement.__code__
+    try:
+        mutated = _callable_dependency_hashes(_Owner.dependency_root, owner_cls=_Owner)
+    finally:
+        _Owner.value.__code__ = original_code
 
     assert baseline != mutated
 
