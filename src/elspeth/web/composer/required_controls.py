@@ -308,7 +308,8 @@ def _parse_source(block: Mapping[str, Any]) -> SourceSpec:
     options = block.get("options")
     plugin = block["plugin"]
     on_success = block.get("on_success", "")
-    on_validation_failure = block.get("on_validation_failure") or "discard"
+    authored_validation_failure = block.get("on_validation_failure")
+    on_validation_failure = "discard" if authored_validation_failure is None else authored_validation_failure
     if type(plugin) is not str or type(on_success) is not str or type(on_validation_failure) is not str or not isinstance(options, Mapping):
         raise TypeError("source string fields must be exact strings")
     return SourceSpec(
@@ -556,8 +557,7 @@ def _splice_source_output_control(
     reserved: set[str],
 ) -> bool:
     """Interpose content safety on one source's successful output route."""
-    validation_failure = location.block.get("on_validation_failure", _MISSING)
-    if type(validation_failure) is not str or validation_failure != "discard":
+    if source.on_validation_failure != "discard":
         return False
     downstream = source.on_success
     if type(downstream) is not str or not downstream:
@@ -679,10 +679,7 @@ def wire_required_controls(
     if not llm_source_locations and llm_node_count == 0:
         # Coverage findings only exist for LLM components; skip the catalog sweep.
         return candidate
-    if any(
-        type(location.block.get("on_validation_failure", _MISSING)) is not str or location.block.get("on_validation_failure") != "discard"
-        for location in llm_source_locations
-    ):
+    if any(state.sources[location.name].on_validation_failure != "discard" for location in llm_source_locations):
         # A source validation-failure route cannot be interposed in the current
         # graph model. Refuse the WHOLE candidate before any transform/source
         # splice so this pass never partially certifies an unrepairable graph.

@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 import structlog
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.events import ResourceCleanupFailed, TelemetryEvent
 
 
@@ -45,7 +46,11 @@ def emit_resource_cleanup_failed(
     token_id: str | None,
     logger: WarningLogger = _logger,
 ) -> None:
-    """Emit bounded cleanup health telemetry; log only if telemetry fails."""
+    """Emit bounded cleanup health telemetry; log ordinary delivery failures.
+
+    Tier-1 invariant failures and process-control exceptions remain
+    unsuppressible; callers must never turn those into best-effort warnings.
+    """
     try:
         telemetry_emit(
             ResourceCleanupFailed(
@@ -60,7 +65,9 @@ def emit_resource_cleanup_failed(
                 token_id=token_id,
             )
         )
-    except BaseException as telemetry_error:
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception as telemetry_error:
         logger.warning(
             "resource_cleanup_telemetry_failed",
             component=component,

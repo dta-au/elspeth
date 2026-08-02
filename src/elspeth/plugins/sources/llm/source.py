@@ -115,7 +115,7 @@ class LLMSource(BaseSource):
     name = "llm"
     determinism = Determinism.NON_DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e9ac6edfe61de6cb"
+    source_file_hash: str | None = "sha256:c63cd6b96f4c7372"
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     capability_tags: tuple[str, ...] = ("llm", "generation", "single-row")
@@ -446,7 +446,9 @@ class LLMSource(BaseSource):
                 extra_metadata=None,
                 system_prompt=self._system_prompt,
             )
-        except BaseException as trace_error:
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as trace_error:
             logger.warning(
                 "llm_trace_emission_failed",
                 plugin=self.name,
@@ -476,7 +478,9 @@ class LLMSource(BaseSource):
                 extra_metadata=None,
                 system_prompt=self._system_prompt,
             )
-        except BaseException as trace_error:
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as trace_error:
             logger.warning(
                 "llm_trace_emission_failed",
                 plugin=self.name,
@@ -555,6 +559,10 @@ class LLMSource(BaseSource):
         tracer, self._tracer = self._tracer, None
         self._limiter = None
         failures: list[Exception] = []
+        # Both resources are already detached. Defer Tier-1 propagation until
+        # the tracer has been attempted, then raise the first invariant failure
+        # regardless of the caller's ordinary-error suppression policy.
+        tier_one_failures: list[Exception] = []
         for resource, close_resource in (
             ("provider", provider.close if provider is not None else None),
             ("tracer", tracer.flush if tracer else None),
@@ -563,12 +571,17 @@ class LLMSource(BaseSource):
                 continue
             try:
                 close_resource()
-            except contract_errors.TIER_1_ERRORS:
-                raise
-            except Exception as exc:
-                failures.append(exc)
-                self._report_cleanup_failure(resource=resource, error=exc, suppressed=suppress_errors)
+            except BaseException as exc:
+                if isinstance(exc, contract_errors.TIER_1_ERRORS):
+                    tier_one_failures.append(exc)
+                elif isinstance(exc, Exception):
+                    failures.append(exc)
+                    self._report_cleanup_failure(resource=resource, error=exc, suppressed=suppress_errors)
+                else:
+                    raise
         self._telemetry_emit = make_warn_telemetry_before_start(logger)
+        if tier_one_failures:
+            raise tier_one_failures[0]
         if failures and not suppress_errors:
             raise failures[0]
 

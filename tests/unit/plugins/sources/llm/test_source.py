@@ -17,8 +17,10 @@ from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.events import ResourceCleanupFailed
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.schema import FieldDefinition, SchemaConfig
 from elspeth.contracts.token_usage import TokenUsage
 from elspeth.plugins.infrastructure.clients.llm import LLMClientError
+from elspeth.plugins.infrastructure.schema_factory import create_schema_from_config
 from elspeth.plugins.sources.llm import LLMSource
 from elspeth.plugins.transforms.llm import populate_llm_operational_fields
 from elspeth.plugins.transforms.llm.langfuse import NoOpLangfuseTracer
@@ -37,6 +39,15 @@ def _install_provider(source: LLMSource, provider: FakeProvider) -> None:
     if original is not None:
         original.close()
     source._provider = provider
+
+
+def _install_runtime_rejecting_schema(source: LLMSource) -> None:
+    """Simulate a runtime schema mismatch without authoring an impossible source contract."""
+    source._schema_class = create_schema_from_config(
+        SchemaConfig(mode="fixed", fields=(FieldDefinition(name="request_id", field_type="str"),)),
+        "RejectLLMSourceRuntimeRow",
+        allow_coercion=False,
+    )
 
 
 def test_load_calls_provider_once_and_emits_one_transform_compatible_row(
@@ -447,6 +458,7 @@ def test_shutdown_does_not_suppress_tier_one_resource_cleanup_failure(
     if failing_resource == "tracer":
 
         def fail_tracer_flush() -> None:
+            tracer.flush_calls += 1
             raise FrameworkBugError("tracer cleanup invariant failed")
 
         tracer.flush = fail_tracer_flush  # type: ignore[method-assign]
@@ -463,6 +475,7 @@ def test_shutdown_does_not_suppress_tier_one_resource_cleanup_failure(
     assert provider.close_calls == 1
     assert tracer.successes == []
     assert tracer.errors == []
+    assert tracer.flush_calls == 1
     assert source._provider is None
     assert source._tracer is None
 
@@ -908,6 +921,72 @@ def test_success_trace_failure_does_not_replace_source_result(
     )
 
 
+def test_error_trace_failure_does_not_replace_provider_error(
+    source: LLMSource,
+    source_context: PluginContext,
+) -> None:
+    provider = FakeProvider(LLMClientError("provider failed", retryable=False))
+    tracer = RecordingTracer()
+    _install_provider(source, provider)
+    source._tracer = tracer
+
+    with (
+        patch.object(tracer, "record_error", side_effect=RuntimeError("tracing unavailable")),
+        patch("elspeth.plugins.sources.llm.source.logger") as mock_logger,
+        pytest.raises(LLMClientError, match="provider failed"),
+    ):
+        list(source.load(source_context))
+
+    mock_logger.warning.assert_called_once_with(
+        "llm_trace_emission_failed",
+        plugin="llm",
+        error_type="RuntimeError",
+    )
+
+
+@pytest.mark.parametrize("failure", [FrameworkBugError("trace invariant failed"), KeyboardInterrupt(), SystemExit(17)])
+def test_success_trace_does_not_suppress_unsuppressible_failures(
+    source: LLMSource,
+    failure: BaseException,
+) -> None:
+    tracer = RecordingTracer()
+    source._tracer = tracer
+
+    with (
+        patch.object(tracer, "record_success", side_effect=failure),
+        pytest.raises(type(failure)),
+    ):
+        source._trace_success(
+            parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+            prompt="prompt",
+            response_content="response",
+            model="served-model",
+            usage=TokenUsage.unknown(),
+            latency_ms=1.0,
+        )
+
+
+@pytest.mark.parametrize("failure", [FrameworkBugError("trace invariant failed"), KeyboardInterrupt(), SystemExit(17)])
+def test_error_trace_does_not_suppress_unsuppressible_failures(
+    source: LLMSource,
+    failure: BaseException,
+) -> None:
+    tracer = RecordingTracer()
+    source._tracer = tracer
+
+    with (
+        patch.object(tracer, "record_error", side_effect=failure),
+        pytest.raises(type(failure)),
+    ):
+        source._trace_error(
+            parent=LLMAuditParent.for_operation(operation_id="operation-1"),
+            prompt="prompt",
+            error_message="provider failed",
+            model="configured-model",
+            latency_ms=1.0,
+        )
+
+
 @pytest.mark.parametrize("destination", ["quarantine", "discard"])
 def test_schema_validation_failure_applies_configured_policy(
     openrouter_config: Callable[..., dict[str, Any]],
@@ -917,10 +996,11 @@ def test_schema_validation_failure_applies_configured_policy(
     source = LLMSource(
         openrouter_config(
             response_field="answer",
-            schema={"mode": "fixed", "fields": ["request_id: str"]},
+            schema={"mode": "observed"},
             on_validation_failure=destination,
         )
     )
+    _install_runtime_rejecting_schema(source)
     source.on_start(source_context)
     provider = FakeProvider()
     _install_provider(source, provider)
@@ -947,10 +1027,11 @@ def test_validation_failure_outcome_remains_primary_when_close_fails(
     source = LLMSource(
         openrouter_config(
             response_field="answer",
-            schema={"mode": "fixed", "fields": ["request_id: str"]},
+            schema={"mode": "observed"},
             on_validation_failure=destination,
         )
     )
+    _install_runtime_rejecting_schema(source)
     source.on_start(source_context)
     provider = FakeProvider(close_error=RuntimeError("cleanup failed"))
     _install_provider(source, provider)
