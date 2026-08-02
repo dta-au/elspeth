@@ -3919,6 +3919,60 @@ class TestStep2IntraStep:
         assert event.model_version == "v1"
         assert event.provider == "test"
 
+    def test_confirm_wiring_ordinary_retry_replays_without_double_surfacing(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The ordinary retry of a SUCCESSFUL settlement must not surface twice.
+
+        The crash window is rare; this is the common one — a client
+        double-submit, a proxy retry, a network blip after the settlement
+        already surfaced. The replay arm re-runs the surfacing pass on the
+        strength of it being idempotent, and the two arms feed it DIFFERENT
+        state objects: the settling attempt passes the in-memory planned
+        state, the replay passes the persisted record (which has been through
+        with_guided_response_descriptor and carries the guided-session
+        composer_meta). If the draft-aware dedup keyed on anything that
+        differs between them, one interpretation site would render two Accept
+        cards.
+        """
+        session_id = _create_session(composer_test_client)
+        prompt = "Summarise this row in one short sentence."
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(prompt),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="llm_retried.jsonl")
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        _review_wiring(composer_test_client, session_id)
+
+        turn = _get_guided(composer_test_client, session_id)["next_turn"]
+        assert turn["type"] == "confirm_wiring"
+        request_body = {
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        }
+
+        def _pending_prompt_events() -> list:
+            session_service = composer_test_client.app.state.session_service
+            events = asyncio.run(session_service.list_interpretation_events(UUID(session_id), status="pending"))
+            return [event for event in events if event.affected_node_id == "summarize_rows"]
+
+        settled = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert settled.status_code == 200, settled.json()
+        assert len(_pending_prompt_events()) == 1
+
+        replayed = composer_test_client.post(f"/api/sessions/{session_id}/guided/respond", json=request_body)
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json()["terminal"]["kind"] == "completed"
+        after_replay = _pending_prompt_events()
+        assert len(after_replay) == 1, [(event.id, event.user_term, event.llm_draft) for event in after_replay]
+
     def test_confirm_wiring_failure_after_dispatch_audit_insert_preserves_failure_evidence_only(
         self,
         composer_test_client: TestClient,
