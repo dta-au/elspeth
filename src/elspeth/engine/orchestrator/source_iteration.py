@@ -667,12 +667,37 @@ class SourceIterationDriver:
                                 loop_ctx,
                                 active_source=active_source,
                             )
-                            # elspeth-c6d083d150: a continuously ready stream of
-                            # quarantined rows never reaches the per-row sweep
-                            # below and keeps the source non-idle (no idle
-                            # pump), so a pending group's deadline would starve
-                            # until EOF and be misclassified there. Sweep at
-                            # this boundary too.
+                            # elspeth-c6d083d150 / elspeth-321f335ff2: a
+                            # continuously ready stream of quarantined rows
+                            # never reaches the per-row sweeps below and keeps
+                            # the source non-idle (no idle pump), so buffered
+                            # aggregation timeouts and pending coalesce /
+                            # row_union group deadlines would starve until EOF
+                            # and be misclassified there. Sweep all three at
+                            # this boundary too, in idle-pump order. Clear
+                            # operation_id first — flushed transform work must
+                            # not inherit the source operation id (same
+                            # contract as the pre-processing check below); the
+                            # restore_source_iteration_context call after the
+                            # sweeps re-establishes source identity.
+                            ctx.operation_id = None
+                            timeout_result = check_aggregation_timeouts(
+                                config=config,
+                                processor=processor,
+                                ctx=ctx,
+                                pending_tokens=pending_tokens,
+                                agg_transform_lookup=agg_transform_lookup,
+                            )
+                            counters.accumulate_flush_result(timeout_result)
+                            if coalesce_executor is not None:
+                                handle_coalesce_timeouts(
+                                    coalesce_executor=coalesce_executor,
+                                    coalesce_node_map=coalesce_node_map,
+                                    processor=processor,
+                                    ctx=ctx,
+                                    counters=counters,
+                                    pending_tokens=pending_tokens,
+                                )
                             if row_union_executor is not None:
                                 handle_row_union_timeouts(
                                     row_union_executor=row_union_executor,
