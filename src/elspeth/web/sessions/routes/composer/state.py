@@ -663,6 +663,7 @@ async def import_state_yaml(
                 session.id,
                 state_data,
                 provenance="session_seed",
+                session_operation_context=lease.context,
             )
             await _surface_imported_interpretation_review_events(
                 service,
@@ -795,56 +796,68 @@ async def seed_state_for_e2e(
 
     session = await _verify_session_ownership(session_id, user, request)
     catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
+    service: SessionServiceProtocol = request.app.state.session_service
+    lease = await SessionOperationLease.acquire(
+        service.session_operation_authority,
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    )
 
     try:
         body = SeedCompositionStateRequest.model_validate(await request.json())
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        await lease.close()
         raise HTTPException(status_code=400, detail="Invalid seed request JSON") from exc
 
     compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session.id))
-    async with compose_lock:
-        try:
-            seeded_state = CompositionState.from_dict(body.state)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise HTTPException(status_code=400, detail="Invalid composition state JSON") from exc
-        _reject_imported_plugin_policy(seeded_state, catalog, plugin_snapshot)
+    try:
+        async with compose_lock:
+            try:
+                seeded_state = CompositionState.from_dict(body.state)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Invalid composition state JSON") from exc
+            _reject_imported_plugin_policy(seeded_state, catalog, plugin_snapshot)
 
-        _reject_unbound_blob_storage_sources(
-            seeded_state,
-            data_dir=str(request.app.state.settings.data_dir),
-        )
-        _reject_disallowed_source_paths(
-            seeded_state,
-            data_dir=str(request.app.state.settings.data_dir),
-            session_id=str(session.id),
-        )
-        _reject_fabricated_secret_literals(
-            seeded_state,
-            secret_service=request.app.state.scoped_secret_resolver,
-            user_id=str(user.user_id),
-        )
+            _reject_unbound_blob_storage_sources(
+                seeded_state,
+                data_dir=str(request.app.state.settings.data_dir),
+            )
+            _reject_disallowed_source_paths(
+                seeded_state,
+                data_dir=str(request.app.state.settings.data_dir),
+                session_id=str(session.id),
+            )
+            _reject_fabricated_secret_literals(
+                seeded_state,
+                secret_service=request.app.state.scoped_secret_resolver,
+                user_id=str(user.user_id),
+            )
 
-        service: SessionServiceProtocol = request.app.state.session_service
-        state_data, _validation = await _state_data_from_composer_state(
-            seeded_state,
-            settings=request.app.state.settings,
-            secret_service=request.app.state.scoped_secret_resolver,
-            user_id=str(user.user_id),
-            session_id=session.id,
-            plugin_snapshot=plugin_snapshot,
-            profile_registry=request.app.state.operator_profile_registry,
-            catalog=request.app.state.catalog_service,
-            runtime_preflight=None,
-            preflight_exception_policy="persist_invalid",
-            initial_version=seeded_state.version,
-            telemetry_source="state_seed",
-        )
-        state_record = await service.save_composition_state(
-            session.id,
-            state_data,
-            provenance="session_seed",
-        )
-        return _state_response(state_record, policy_catalog=catalog)
+            state_data, _validation = await _state_data_from_composer_state(
+                seeded_state,
+                settings=request.app.state.settings,
+                secret_service=request.app.state.scoped_secret_resolver,
+                user_id=str(user.user_id),
+                session_id=session.id,
+                plugin_snapshot=plugin_snapshot,
+                profile_registry=request.app.state.operator_profile_registry,
+                catalog=request.app.state.catalog_service,
+                runtime_preflight=None,
+                preflight_exception_policy="persist_invalid",
+                initial_version=seeded_state.version,
+                telemetry_source="state_seed",
+            )
+            state_record = await service.save_composition_state(
+                session.id,
+                state_data,
+                provenance="session_seed",
+                session_operation_context=lease.context,
+            )
+            return _state_response(state_record, policy_catalog=catalog)
+    finally:
+        await lease.close()
 
 
 def _reattach_guided_blob_refs(state: CompositionState) -> CompositionState:

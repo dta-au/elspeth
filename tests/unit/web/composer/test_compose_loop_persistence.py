@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import threading
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any, cast
@@ -18,8 +19,9 @@ from sqlalchemy import select, text, update
 
 from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToolStatus
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.contracts.session_operation import SessionOperationKind
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
@@ -29,6 +31,7 @@ from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_to
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
@@ -36,6 +39,7 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     interpretation_events_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, CompositionStateData
@@ -48,9 +52,64 @@ async def _run_one_turn(
     llm: Any,
     session_id: str,
     current_state_id: str | None = None,
+    session_operation_context: SessionOperationContext | None = None,
 ) -> Any:
     driver = cast(Any, service)
-    return await driver._run_one_turn_for_test(llm=llm, session_id=session_id, current_state_id=current_state_id)
+    owned_context = session_operation_context
+    acquired_here = owned_context is None
+    if owned_context is None:
+        owned_context = _acquire_compose_authority(
+            service,
+            session_id=session_id,
+            owner="compose-loop-test",
+        )
+    try:
+        return await driver._run_one_turn_for_test(
+            llm=llm,
+            session_id=session_id,
+            current_state_id=current_state_id,
+            session_operation_context=owned_context,
+        )
+    finally:
+        if acquired_here:
+            service._require_sessions_service().session_operation_authority.release(owned_context)  # type: ignore[attr-defined]
+
+
+def _acquire_compose_authority(
+    service: ComposerServiceImpl,
+    *,
+    session_id: str,
+    owner: str,
+) -> SessionOperationContext:
+    sessions_service = service._require_sessions_service()  # type: ignore[attr-defined]
+    return sessions_service.session_operation_authority.acquire(
+        session_id=UUID(session_id),
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=owner,
+        lease_seconds=sessions_service.session_operation_lease_seconds,
+    )
+
+
+def _expire_and_take_over_compose_authority(
+    service: ComposerServiceImpl,
+    *,
+    session_id: str,
+    successor_owner: str,
+) -> SessionOperationContext:
+    sessions_service = service._require_sessions_service()  # type: ignore[attr-defined]
+    with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
+        conn.execute(
+            update(session_operation_fences_table)
+            .where(session_operation_fences_table.c.session_id == session_id)
+            .values(lease_expires_at=datetime.now(UTC) - timedelta(seconds=1))
+        )
+    successor = sessions_service.session_operation_authority.acquire(
+        session_id=UUID(session_id),
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=successor_owner,
+        lease_seconds=sessions_service.session_operation_lease_seconds,
+    )
+    return successor
 
 
 def _patch_auto_commit_preferences(monkeypatch: pytest.MonkeyPatch, sessions_service: Any) -> None:
@@ -352,13 +411,82 @@ async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
         authority_arguments_hash=hashlib.sha256(authority_arguments_canonical.encode()).hexdigest(),
     )
 
-    with pytest.raises(AuditIntegrityError, match="content hash is malformed"):
-        await composer_service_with_real_sessions._persist_pipeline_planner_audit(  # type: ignore[attr-defined]
-            session_id=UUID(result_session_id),
-            current_state_id=None,
-            llm_calls=(),
-            invocations=(invocation,),
+    context = _acquire_compose_authority(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        owner="planner-malformed-hash-test",
+    )
+    try:
+        with pytest.raises(AuditIntegrityError, match="content hash is malformed"):
+            await composer_service_with_real_sessions._persist_pipeline_planner_audit(  # type: ignore[attr-defined]
+                session_id=UUID(result_session_id),
+                current_state_id=None,
+                llm_calls=(),
+                invocations=(invocation,),
+                session_operation_context=context,
+            )
+    finally:
+        composer_service_with_real_sessions._require_sessions_service().session_operation_authority.release(  # type: ignore[attr-defined]
+            context
         )
+
+
+@pytest.mark.asyncio
+async def test_planner_audit_takeover_fences_stale_owner_before_message_insert(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+) -> None:
+    sessions_service = composer_service_with_real_sessions._require_sessions_service()  # type: ignore[attr-defined]
+    predecessor = _acquire_compose_authority(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        owner="planner-predecessor",
+    )
+    successor = _expire_and_take_over_compose_authority(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        successor_owner="planner-successor",
+    )
+    now = datetime(2026, 8, 2, tzinfo=UTC)
+    call = ComposerLLMCall(
+        model_requested="test/planner",
+        model_returned="test/planner",
+        status=ComposerLLMCallStatus.SUCCESS,
+        prompt_tokens=1,
+        completion_tokens=1,
+        total_tokens=2,
+        latency_ms=1,
+        provider_request_id="planner-takeover",
+        messages_hash="m" * 64,
+        tools_spec_hash=None,
+        declared_tool_names=(),
+        started_at=now,
+        finished_at=now,
+        error_class=None,
+        error_message=None,
+        temperature=0.0,
+        seed=1,
+    )
+
+    try:
+        with pytest.raises(SessionOperationFenceLost):
+            await composer_service_with_real_sessions._persist_pipeline_planner_audit(  # type: ignore[attr-defined]
+                session_id=UUID(result_session_id),
+                current_state_id=None,
+                llm_calls=(call,),
+                invocations=(),
+                session_operation_context=predecessor,
+            )
+    finally:
+        sessions_service.session_operation_authority.release(successor)
+
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        rows = conn.execute(
+            select(chat_messages_table.c.id)
+            .where(chat_messages_table.c.session_id == result_session_id)
+            .where(chat_messages_table.c.role == "audit")
+        ).fetchall()
+    assert rows == []
 
 
 @pytest.mark.asyncio
@@ -760,11 +888,32 @@ async def test_tool_batch_snapshots_calls_before_first_await(
 
     monkeypatch.setattr(tool_batch_module, "emit_progress", _mutate_provider_call_after_admission)
 
-    result = await _run_one_turn(
+    sessions_service = composer_service_with_real_sessions._require_sessions_service()  # type: ignore[attr-defined]
+    operation_context = _acquire_compose_authority(
         composer_service_with_real_sessions,
-        llm=_fake_llm,
         session_id=result_session_id,
+        owner="final-response-test",
     )
+    try:
+        result = await _run_one_turn(
+            composer_service_with_real_sessions,
+            llm=_fake_llm,
+            session_id=result_session_id,
+            session_operation_context=operation_context,
+        )
+        tool_state = await sessions_service.get_current_state(UUID(result_session_id))
+        assert tool_state is not None
+        assert result.final_persisted_state_id == tool_state.id
+        settlement = await sessions_service.commit_composition_response(
+            session_id=UUID(result_session_id),
+            expected_current_state_id=result.final_persisted_state_id,
+            state=CompositionStateData(metadata_={"name": "admitted"}),
+            assistant_content="Done.",
+            raw_content=None,
+            session_operation_context=operation_context,
+        )
+    finally:
+        sessions_service.session_operation_authority.release(operation_context)
 
     assert mutated is True
     assert handler_calls == ["set_metadata"]
@@ -772,6 +921,7 @@ async def test_tool_batch_snapshots_calls_before_first_await(
     assert result.tool_outcomes[0].call.function.name == "set_metadata"
     assert result.tool_outcomes[0].response.updated_state.metadata.name == "admitted"
     assert result.persisted_assistant_tool_calls[0]["id"] == "call_admitted"
+    assert settlement.message.composition_state_id == settlement.state.id
     _assert_no_blob_side_effects(
         composer_service_with_real_sessions,
         session_id=result_session_id,
@@ -1972,6 +2122,78 @@ async def test_cancellation_during_sync_tool_waits_for_result_audit_persist(
 
 
 @pytest.mark.asyncio
+async def test_takeover_during_tool_work_fences_stale_p4_before_any_audit_or_state_write(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = composer_service_with_real_sessions
+    sessions_service = service._require_sessions_service()  # type: ignore[attr-defined]
+    _patch_auto_commit_preferences(monkeypatch, sessions_service)
+    predecessor = _acquire_compose_authority(
+        service,
+        session_id=result_session_id,
+        owner="tool-predecessor",
+    )
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    real_execute_tool = tool_batch_module.execute_tool
+
+    def _blocking_tool(*args: Any, **kwargs: Any) -> ToolResult:
+        worker_started.set()
+        if not release_worker.wait(timeout=5.0):
+            raise TimeoutError("test worker was never released")
+        return real_execute_tool(*args, **kwargs)
+
+    monkeypatch.setattr(tool_batch_module, "execute_tool", _blocking_tool)
+    responses = [
+        _metadata_tool_response("call_stale_after_takeover", "must-not-persist"),
+        _text_response("must not reach a successor model turn"),
+    ]
+
+    async def _llm(_messages: Any, _tools: Any) -> Any:
+        return responses.pop(0)
+
+    compose_task = asyncio.create_task(
+        _run_one_turn(
+            service,
+            llm=_llm,
+            session_id=result_session_id,
+            session_operation_context=predecessor,
+        )
+    )
+    assert await asyncio.to_thread(worker_started.wait, 5.0)
+    successor = _expire_and_take_over_compose_authority(
+        service,
+        session_id=result_session_id,
+        successor_owner="tool-successor",
+    )
+    try:
+        release_worker.set()
+        with pytest.raises(SessionOperationFenceLost):
+            await asyncio.wait_for(compose_task, timeout=5.0)
+    finally:
+        release_worker.set()
+        if not compose_task.done():
+            compose_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await compose_task
+        sessions_service.session_operation_authority.release(successor)
+
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        chat_rows = conn.execute(
+            select(chat_messages_table.c.id)
+            .where(chat_messages_table.c.session_id == result_session_id)
+            .where(chat_messages_table.c.role.in_(("assistant", "tool")))
+        ).fetchall()
+        state_rows = conn.execute(
+            select(composition_states_table.c.id).where(composition_states_table.c.session_id == result_session_id)
+        ).fetchall()
+    assert chat_rows == []
+    assert state_rows == []
+
+
+@pytest.mark.asyncio
 async def test_deferred_cancellation_survives_child_failure() -> None:
     """A child failure after cancellation is deferred must not swallow the cancel.
 
@@ -2079,14 +2301,23 @@ async def test_step2_audit_integrity_error_carries_failed_turn_metadata(
     # persist_compose_turn_async commit (the test's actual target), not
     # the audit-archive upsert that fires once per service instance.
     composer_service_with_real_sessions._skill_markdown_history_upserted = True  # type: ignore[attr-defined]
+    context = _acquire_compose_authority(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        owner="audit-integrity-failure-test",
+    )
     inject_commit_OperationalError(sessions_service._engine)  # type: ignore[attr-defined]
 
-    with pytest.raises(AuditIntegrityError) as excinfo:
-        await _run_one_turn(
-            composer_service_with_real_sessions,
-            llm=fake_llm_two_tool_calls,
-            session_id=result_session_id,
-        )
+    try:
+        with pytest.raises(AuditIntegrityError) as excinfo:
+            await _run_one_turn(
+                composer_service_with_real_sessions,
+                llm=fake_llm_two_tool_calls,
+                session_id=result_session_id,
+                session_operation_context=context,
+            )
+    finally:
+        sessions_service.session_operation_authority.release(context)
 
     assert excinfo.value.failed_turn is not None
     assert excinfo.value.failed_turn.assistant_message_id is None
@@ -2117,14 +2348,23 @@ async def test_plugin_crash_unwind_commit_failure_remains_unpersisted_and_retain
         return outcome
 
     monkeypatch.setattr(composer_service_with_real_sessions, "_persist_turn_audit", _capture_persist_outcome)
+    context = _acquire_compose_authority(
+        composer_service_with_real_sessions,
+        session_id=result_session_id,
+        owner="plugin-crash-audit-failure-test",
+    )
     inject_commit_OperationalError(sessions_service._engine)  # type: ignore[attr-defined]
 
-    with pytest.raises(ComposerPluginCrashError) as excinfo:
-        await _run_one_turn(
-            composer_service_with_real_sessions,
-            llm=fake_llm_runtime_error_on_second,
-            session_id=result_session_id,
-        )
+    try:
+        with pytest.raises(ComposerPluginCrashError) as excinfo:
+            await _run_one_turn(
+                composer_service_with_real_sessions,
+                llm=fake_llm_runtime_error_on_second,
+                session_id=result_session_id,
+                session_operation_context=context,
+            )
+    finally:
+        sessions_service.session_operation_authority.release(context)
 
     assert persisted_flags == [False]
     assert [invocation.tool_call_id for invocation in excinfo.value.tool_invocations] == ["call_ok", "call_crash"]

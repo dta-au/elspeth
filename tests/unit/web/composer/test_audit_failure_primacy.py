@@ -30,14 +30,17 @@ from __future__ import annotations
 import contextlib
 import sqlite3
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import UUID, uuid5
 
 import pytest
 import structlog
-from sqlalchemy import Engine
+from sqlalchemy import Engine, insert
 from sqlalchemy.exc import OperationalError
 
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.sessions.models import session_operation_fences_table
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
@@ -51,6 +54,21 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 # ``tests/unit/web/composer/conftest.py``, which does not exist —
 # synthesised review B5).
 from tests.unit.web.conftest import _make_session as _make_session_in_conn
+
+_TEST_FENCE_NAMESPACE = UUID("e88ab5ad-0448-4450-bc4f-cbe901f17c25")
+
+
+def _compose_context(session_id: str) -> SessionOperationContext:
+    operation_id = str(uuid5(_TEST_FENCE_NAMESPACE, session_id))
+    return SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=session_id,
+            operation_id=operation_id,
+            lease_token=f"audit-primacy-token-{operation_id}",
+            operation_epoch=1,
+        ),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
 
 
 @pytest.fixture
@@ -69,6 +87,19 @@ def _make_session(service, session_id):
     can express setup tersely."""
     with service._engine.begin() as conn:
         _make_session_in_conn(conn, session_id=session_id)
+        context = _compose_context(session_id)
+        conn.execute(
+            insert(session_operation_fences_table).values(
+                session_id=session_id,
+                operation_id=context.fence.operation_id,
+                lease_token=context.fence.lease_token,
+                operation_kind=context.operation_kind.value,
+                owner_instance_id="audit-primacy-test-owner",
+                operation_epoch=context.fence.operation_epoch,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+                released_at=None,
+            )
+        )
 
 
 @contextlib.contextmanager
@@ -131,6 +162,7 @@ def test_audit_fail_no_plugin_crash_raises_audit_integrity_error(service):
             expected_current_state_id=None,
             writer_principal="compose_loop",
             plugin_crash_pending=False,
+            session_operation_context=_compose_context("p1"),
         )
 
     # The original OperationalError is preserved as the chained cause.
@@ -171,6 +203,7 @@ def test_audit_fail_during_plugin_crash_records_unwind_failure(service):
             expected_current_state_id=None,
             writer_principal="compose_loop",
             plugin_crash_pending=True,
+            session_operation_context=_compose_context("p2"),
         )
 
     assert outcome.assistant_id is None
@@ -260,6 +293,7 @@ def test_audit_fail_non_integrity_non_operational_raises_audit_integrity_error(s
             expected_current_state_id=None,
             writer_principal="compose_loop",
             plugin_crash_pending=False,
+            session_operation_context=_compose_context("p3"),
         )
 
     # Cause is the simulated DataError (a SQLAlchemyError that is
@@ -307,6 +341,7 @@ def test_audit_fail_non_integrity_non_operational_raises_even_on_unwind_path(ser
             expected_current_state_id=None,
             writer_principal="compose_loop",
             plugin_crash_pending=True,
+            session_operation_context=_compose_context("p4"),
         )
 
     assert isinstance(exc_info.value.__cause__, DataError)
@@ -325,6 +360,8 @@ async def test_compose_loop_rejects_unwind_audit_failure_without_plugin_crash(
     from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord
 
     class _ImpossibleOutcomeSessionsService:
+        session_operation_authority = object()
+
         async def get_composer_preferences(self, session_id: Any) -> ComposerSessionPreferencesRecord:
             return ComposerSessionPreferencesRecord(
                 session_id=session_id,
@@ -357,6 +394,7 @@ async def test_compose_loop_rejects_unwind_audit_failure_without_plugin_crash(
         await composer_service_with_real_sessions._run_one_turn_for_test(
             llm=fake_llm_two_tool_calls,
             session_id=result_session_id,
+            session_operation_context=_compose_context(result_session_id),
         )
 
     assert exc_info.value.failed_turn is not None

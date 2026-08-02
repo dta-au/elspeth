@@ -3332,6 +3332,8 @@ class SessionServiceProtocol(Protocol):
         dispatch: PipelineDispatchAuditBinding,
         actor: str,
         transition_assistant: TransitionAssistantDraft | None = None,
+        require_transition_consumed: bool = True,
+        session_operation_context: SessionOperationContext,
     ) -> PipelineProposalSettlementResult: ...
 
     async def get_pipeline_dispatch_recovery(
@@ -3350,6 +3352,7 @@ class SessionServiceProtocol(Protocol):
         reason: PipelineProposalRejectionReason,
         dispatch: PipelineDispatchAuditBinding | None,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord: ...
 
     async def list_composition_proposals(
@@ -3407,6 +3410,8 @@ class SessionServiceProtocol(Protocol):
         provider: str,
         composer_skill_hash: str,
         created_at: datetime | None = None,
+        session_operation_context: SessionOperationContext | None = None,
+        session_operation_kind: SessionOperationKind | None = None,
     ) -> InterpretationEventRecord:
         """Insert a PENDING interpretation event.
 
@@ -3520,6 +3525,8 @@ class SessionServiceProtocol(Protocol):
         provider: str,
         composer_skill_hash: str,
         created_at: datetime | None = None,
+        session_operation_context: SessionOperationContext | None = None,
+        session_operation_kind: SessionOperationKind | None = None,
     ) -> InterpretationEventRecord:
         """Write an AUTO_INTERPRETED_NO_SURFACES row (Phase 5b Task 5, F-6).
 
@@ -3559,6 +3566,8 @@ class SessionServiceProtocol(Protocol):
         raw_content: str | None = None,
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
+        session_operation_context: SessionOperationContext | None = None,
+        session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
     ) -> ChatMessageRecord: ...
 
     async def get_messages(
@@ -3633,6 +3642,7 @@ class SessionServiceProtocol(Protocol):
         state: CompositionStateData,
         *,
         provenance: CompositionStateProvenance,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> CompositionStateRecord:
         """Save a new immutable composition state snapshot.
 
@@ -3655,11 +3665,29 @@ class SessionServiceProtocol(Protocol):
         state: CompositionStateData,
         assistant_content: str,
         raw_content: str | None,
+        session_operation_context: SessionOperationContext,
     ) -> TransitionResponseSettlement:
         """Atomically consume one guided transition and persist its response.
 
         The state must carry ``guided_session.transition_consumed=true``.
         Implementations must commit both rows or neither row.
+        """
+        ...
+
+    async def commit_composition_response(
+        self,
+        *,
+        session_id: UUID,
+        expected_current_state_id: UUID | None,
+        state: CompositionStateData,
+        assistant_content: str,
+        raw_content: str | None,
+        session_operation_context: SessionOperationContext,
+    ) -> TransitionResponseSettlement:
+        """Atomically persist one post-compose state and its response.
+
+        The exact live COMPOSE authority is validated in the same database
+        transaction as both rows, so takeover commits neither half.
         """
         ...
 
@@ -3901,6 +3929,7 @@ class SessionServiceProtocol(Protocol):
         expected_current_state_id: str | None,
         writer_principal: ChatMessageWriterPrincipal,
         plugin_crash_pending: bool,
+        session_operation_context: SessionOperationContext,
     ) -> Any:
         """Persist one compose turn (assistant + tool rows + per-tool
         composition states) atomically.

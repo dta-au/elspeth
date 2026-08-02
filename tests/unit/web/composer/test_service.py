@@ -7521,6 +7521,20 @@ class TestComposeLoopForcedRepair:
         engine, session_id = _session_engine_with_session()
         self.engine = engine
         self.session_id = session_id
+        now = datetime.now(UTC)
+        with engine.begin() as conn:
+            conn.execute(
+                session_operation_fences_table.insert().values(
+                    session_id=session_id,
+                    operation_id=f"create-{session_id}",
+                    lease_token=f"create-token-{session_id}",
+                    operation_kind=SessionOperationKind.CREATE.value,
+                    owner_instance_id="test-create-owner",
+                    operation_epoch=1,
+                    lease_expires_at=now,
+                    released_at=now,
+                )
+            )
 
         # CSV with three observed columns. Pipeline configured with
         # mode='fixed' + fields=['order_id: str'] + on_validation_failure='discard'
@@ -7554,6 +7568,22 @@ class TestComposeLoopForcedRepair:
             settings=settings,
             sessions_service=_test_sessions_service(engine, tmp_path),
             session_engine=engine,
+        )
+        sessions_service = self.service._require_sessions_service()  # type: ignore[attr-defined]
+        self.operation_context = sessions_service.session_operation_authority.acquire(
+            session_id=UUID(self.session_id),
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions_service.session_operation_owner_instance_id,
+            lease_seconds=sessions_service.session_operation_lease_seconds,
+        )
+        yield
+        sessions_service.session_operation_authority.release(self.operation_context)
+
+    async def _compose(self, *args: Any, **kwargs: Any) -> ComposerResult:
+        return await self.service.compose(
+            *args,
+            **kwargs,
+            session_operation_context=self.operation_context,
         )
 
     def _wire_blocking_pipeline_tool_calls(self) -> list[dict[str, Any]]:
@@ -7731,7 +7761,7 @@ class TestComposeLoopForcedRepair:
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_stall, turn2_build, turn3_done]
-            result = await self.service.compose(
+            result = await self._compose(
                 "Build from my uploaded CSV",
                 [],
                 empty,
@@ -7746,6 +7776,9 @@ class TestComposeLoopForcedRepair:
         assert result.state.sources["source"].options["schema"] == {"mode": "observed"}
         assert result.state.outputs[0].name == "out"
         assert result.runtime_preflight is not None and result.runtime_preflight.is_valid is True
+        current = await self.service._require_sessions_service().get_current_state(UUID(self.session_id))  # type: ignore[attr-defined]
+        assert current is not None
+        assert result.final_persisted_state_id == current.id
 
         turn2_messages = mock_llm.call_args_list[1].args[0]
         repair_msgs = [
@@ -7820,7 +7853,7 @@ class TestComposeLoopForcedRepair:
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_refusal, turn2_build, turn3_done]
-            result = await self.service.compose(
+            result = await self._compose(
                 (
                     "Build a CSV pipeline on the uploaded events.csv, parse payload with "
                     "from_json(payload), gate on event_type, and write signups/upgrades/other."
@@ -7900,7 +7933,7 @@ class TestComposeLoopForcedRepair:
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1, turn2_done, turn3, turn4_done]
-            result = await self.service.compose(
+            result = await self._compose(
                 "Build a pipeline",
                 [],
                 empty,
@@ -7978,7 +8011,7 @@ class TestComposeLoopForcedRepair:
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = turns
-            result = await self.service.compose(
+            result = await self._compose(
                 "Build something",
                 [],
                 empty,
@@ -8041,7 +8074,7 @@ class TestComposeLoopForcedRepair:
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = turns
-            result = await self.service.compose(
+            result = await self._compose(
                 "Build something",
                 [],
                 empty,
@@ -8132,7 +8165,7 @@ class TestComposeLoopForcedRepair:
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_done, turn2_repair, turn3_done]
-            result = await self.service.compose(
+            result = await self._compose(
                 "Continue building",
                 [],
                 resumed_state,
@@ -8206,7 +8239,7 @@ class TestComposeLoopForcedRepair:
             patch.object(self.service, "_runtime_preflight", return_value=passing_preflight),
         ):
             mock_llm.side_effect = [turn1_done]
-            result = await self.service.compose(
+            result = await self._compose(
                 "Anything else?",
                 [],
                 path_source_state,

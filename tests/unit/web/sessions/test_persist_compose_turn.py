@@ -6,18 +6,95 @@ Uses the shared ``engine`` fixture and ``_make_session`` helper from
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from uuid import UUID, uuid5
 
 import pytest
 import structlog
-from sqlalchemy import text
+from sqlalchemy import insert, text
 
 from elspeth.contracts.advisory_locks import ELSPETH_SESSIONS_LOCK_CLASSID
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.sessions._persist_payload import StatePayload
+from elspeth.web.sessions.models import session_operation_fences_table
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.unit.web.conftest import _make_session
+from tests.unit.web.conftest import _make_session as _make_session_row
+
+_TEST_FENCE_NAMESPACE = UUID("6794cf0c-4b9d-40b9-ad19-d6f9afff30dd")
+
+
+def _test_compose_context(session_id: str) -> SessionOperationContext:
+    operation_id = str(uuid5(_TEST_FENCE_NAMESPACE, session_id))
+    return SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=session_id,
+            operation_id=operation_id,
+            lease_token=f"test-compose-token-{operation_id}",
+            operation_epoch=1,
+        ),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
+
+
+def _make_session(conn, *, session_id: str) -> None:
+    """Create the legacy fixture row plus one live exact COMPOSE fence."""
+    _make_session_row(conn, session_id=session_id)
+    context = _test_compose_context(session_id)
+    conn.execute(
+        insert(session_operation_fences_table).values(
+            session_id=session_id,
+            operation_id=context.fence.operation_id,
+            lease_token=context.fence.lease_token,
+            operation_kind=context.operation_kind.value,
+            owner_instance_id="persist-compose-turn-test-owner",
+            operation_epoch=context.fence.operation_epoch,
+            lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            released_at=None,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_transition_response_takeover_rolls_back_state_and_assistant(service) -> None:
+    """A stale COMPOSE owner must not publish either half of the response."""
+    from uuid import uuid4
+
+    from sqlalchemy import update
+
+    from elspeth.web.sessions.protocol import CompositionStateData
+
+    session_id = uuid4()
+    stale_context = _test_compose_context(str(session_id))
+    with service._engine.begin() as conn:
+        _make_session(conn, session_id=str(session_id))
+        conn.execute(
+            update(session_operation_fences_table)
+            .where(session_operation_fences_table.c.session_id == str(session_id))
+            .values(
+                operation_id="successor-operation",
+                lease_token="successor-token",
+                operation_epoch=2,
+                lease_expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+        )
+
+    with pytest.raises(SessionOperationFenceLost):
+        await service.commit_transition_response(
+            session_id=session_id,
+            expected_current_state_id=None,
+            state=CompositionStateData(
+                composer_meta={"guided_session": {"transition_consumed": True}},
+            ),
+            assistant_content="must not persist",
+            raw_content=None,
+            session_operation_context=stale_context,
+        )
+
+    assert await service.get_current_state(session_id) is None
+    assert await service.get_messages(session_id, limit=None) == []
 
 
 @pytest.fixture
@@ -31,12 +108,21 @@ def service(engine, tmp_path) -> SessionServiceImpl:
     fixture — without it, the fixture's untyped parameters poison the
     return type to ``Any`` and helper-method calls return ``Any``.
     """
-    return SessionServiceImpl(
+    instance = SessionServiceImpl(
         engine,
         data_dir=tmp_path,
         telemetry=build_sessions_telemetry(),
         log=structlog.get_logger("test"),
     )
+    persist = instance.persist_compose_turn
+
+    def _persist_with_test_authority(**kwargs):
+        if "session_operation_context" not in kwargs:
+            kwargs["session_operation_context"] = _test_compose_context(kwargs["session_id"])
+        return persist(**kwargs)
+
+    instance.persist_compose_turn = _persist_with_test_authority  # type: ignore[method-assign]
+    return instance
 
 
 def test_advisory_lock_sqlite_is_noop(service):
@@ -1405,6 +1491,7 @@ async def test_persist_compose_turn_async_protocol_dispatch_succeeds_from_async(
         expected_current_state_id=None,
         writer_principal="compose_loop",
         plugin_crash_pending=False,
+        session_operation_context=_test_compose_context("s_run_sync"),
     )
     assert outcome.assistant_id is not None
     assert outcome.unwind_audit_failed is False
@@ -1608,6 +1695,7 @@ async def test_persist_compose_turn_async_caller_cancellation_commits_anyway(ser
             expected_current_state_id=None,
             writer_principal="compose_loop",
             plugin_crash_pending=False,
+            session_operation_context=_test_compose_context("s_cancel"),
         )
 
     inner = asyncio.create_task(_do_persist())

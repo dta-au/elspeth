@@ -10,6 +10,7 @@ from collections.abc import Awaitable, Mapping
 from dataclasses import dataclass
 from typing import Literal
 
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_commit import (
@@ -149,6 +150,8 @@ async def settle_pipeline_proposal_under_compose_lock(
     composer_meta: Mapping[str, object] | None = None,
     telemetry_source: Literal["compose", "recompose"] = "compose",
     transition_assistant: TransitionAssistantDraft | None = None,
+    require_transition_consumed: bool = True,
+    session_operation_context: SessionOperationContext,
 ) -> PipelineRouteSettlement:
     """Settle one exact canonical proposal while the caller holds the lock."""
     service: SessionServiceProtocol = request.app.state.session_service
@@ -221,6 +224,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                         captured,
                         None,
                         plugin_crash_pending=True,
+                        session_operation_context=session_operation_context,
+                        session_operation_kind=session_operation_context.operation_kind,
                     ),
                     state=cancellation_state,
                 )
@@ -244,6 +249,7 @@ async def settle_pipeline_proposal_under_compose_lock(
                         reason=reason,
                         dispatch=persisted_dispatch,
                         actor=f"system:pipeline_commit:user:{user.user_id}",
+                        session_operation_context=session_operation_context,
                     ),
                     state=cancellation_state,
                 )
@@ -265,6 +271,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                     captured,
                     None,
                     plugin_crash_pending=True,
+                    session_operation_context=session_operation_context,
+                    session_operation_kind=session_operation_context.operation_kind,
                 ),
                 state=cancellation_state,
             )
@@ -283,6 +291,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                     (prepared.invocation,),
                     None,
                     plugin_crash_pending=False,
+                    session_operation_context=session_operation_context,
+                    session_operation_kind=session_operation_context.operation_kind,
                 ),
                 state=cancellation_state,
             )
@@ -319,6 +329,8 @@ async def settle_pipeline_proposal_under_compose_lock(
                 dispatch=bindings[0],
                 actor=f"user:{user.user_id}",
                 transition_assistant=transition_assistant,
+                require_transition_consumed=require_transition_consumed,
+                session_operation_context=session_operation_context,
             ),
             state=cancellation_state,
         )

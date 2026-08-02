@@ -33,7 +33,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.enums import CreationModality, TerminalOutcome, TerminalPath
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
-from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import (
     nodes_table,
@@ -535,7 +535,11 @@ class _ProgressRouteSessionService:
         raw_content: str | None = None,
         tool_call_id: str | None = None,
         parent_assistant_id: uuid.UUID | None = None,
+        session_operation_context: SessionOperationContext | None = None,
+        session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
     ) -> ChatMessageRecord:
+        del session_operation_context
+        del session_operation_kind
         if session_id != self.session.id:
             raise ValueError("Session not found")
         message = ChatMessageRecord(
@@ -602,7 +606,9 @@ class _ProgressRouteSessionService:
         data: CompositionStateData,
         *,
         provenance: str,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> CompositionStateRecord:
+        del session_operation_context
         if session_id != self.session.id:
             raise ValueError("Session not found")
         version = 1 if self.current_state is None else self.current_state.version + 1
@@ -638,6 +644,26 @@ class _ProgressRouteSessionService:
         state: CompositionStateData,
         assistant_content: str,
         raw_content: str | None,
+        session_operation_context: SessionOperationContext,
+    ) -> TransitionResponseSettlement:
+        return await self.commit_composition_response(
+            session_id=session_id,
+            expected_current_state_id=expected_current_state_id,
+            state=state,
+            assistant_content=assistant_content,
+            raw_content=raw_content,
+            session_operation_context=session_operation_context,
+        )
+
+    async def commit_composition_response(
+        self,
+        *,
+        session_id: uuid.UUID,
+        expected_current_state_id: uuid.UUID | None,
+        state: CompositionStateData,
+        assistant_content: str,
+        raw_content: str | None,
+        session_operation_context: SessionOperationContext,
     ) -> TransitionResponseSettlement:
         current_id = self.current_state.id if self.current_state is not None else None
         if current_id != expected_current_state_id:
@@ -654,6 +680,7 @@ class _ProgressRouteSessionService:
             raw_content=raw_content,
             composition_state_id=record.id,
             writer_principal="compose_loop",
+            session_operation_context=session_operation_context,
         )
         return TransitionResponseSettlement(state=record, message=message)
 
@@ -10959,12 +10986,13 @@ def test_runtime_preflight_failure_500_detail_does_not_promise_journal_traceback
         partial_state=None,
     )
     service = SimpleNamespace()
+    session_id = _UUID("00000000-0000-4000-8000-000000000001")
 
     body = asyncio.run(
         _handle_runtime_preflight_failure(
             exc,
             service,
-            _UUID("00000000-0000-4000-8000-000000000001"),
+            session_id,
             "user-id",
             "compose",
             None,
@@ -10973,6 +11001,15 @@ def test_runtime_preflight_failure_500_detail_does_not_promise_journal_traceback
             plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service()),
             profile_registry=MagicMock(spec=OperatorProfileRegistry),
             catalog=create_catalog_service(),
+            session_operation_context=SessionOperationContext(
+                fence=SessionOperationFence(
+                    session_id=str(session_id),
+                    operation_id="operation_1",
+                    lease_token="lease_1",
+                    operation_epoch=1,
+                ),
+                operation_kind=SessionOperationKind.COMPOSE,
+            ),
         ),
     )
 

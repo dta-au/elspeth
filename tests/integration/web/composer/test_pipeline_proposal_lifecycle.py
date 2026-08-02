@@ -115,6 +115,24 @@ async def _session_operation_context(
         await service._run_sync(service.session_operation_authority.release, context)
 
 
+async def _settle(service: SessionServiceImpl, **kwargs):
+    session_id = kwargs["session_id"]
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        return await service.settle_pipeline_composition_proposal(
+            **kwargs,
+            session_operation_context=context,
+        )
+
+
+async def _reject(service: SessionServiceImpl, **kwargs):
+    session_id = kwargs["session_id"]
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        return await service.reject_pipeline_composition_proposal(
+            **kwargs,
+            session_operation_context=context,
+        )
+
+
 def _pipeline() -> dict[str, object]:
     return {"sources": {}, "nodes": [], "edges": [], "outputs": []}
 
@@ -379,7 +397,8 @@ async def test_atomic_pipeline_settlement_inserts_state_terminal_event_and_row_t
     binding = await _persist_dispatch(service, session_id)
     final_meta = {"surface": "freeform", "draft_hash": plan.proposal.draft_hash}
 
-    settled = await service.settle_pipeline_composition_proposal(
+    settled = await _settle(
+        service,
         session_id=session_id,
         proposal_id=row.id,
         draft_hash=plan.proposal.draft_hash,
@@ -465,7 +484,7 @@ async def test_transition_assistant_failure_rolls_back_pipeline_settlement(
     }
 
     with pytest.raises(IntegrityError, match="injected proposal transition assistant failure"):
-        await service.settle_pipeline_composition_proposal(**kwargs)
+        await _settle(service, **kwargs)
 
     with service._engine.connect() as conn:
         assert conn.execute(select(composition_proposals_table.c.status)).scalar_one() == "pending"
@@ -477,13 +496,13 @@ async def test_transition_assistant_failure_rolls_back_pipeline_settlement(
             == 0
         )
 
-    settled = await service.settle_pipeline_composition_proposal(**kwargs)
+    settled = await _settle(service, **kwargs)
     assert settled.proposal.status == "committed"
     assert settled.transition_message is not None
     assert settled.transition_message.content == "transition response"
     assert settled.transition_message.composition_state_id == settled.state.id
 
-    retried = await service.settle_pipeline_composition_proposal(**kwargs)
+    retried = await _settle(service, **kwargs)
     assert retried == settled
     with service._engine.connect() as conn:
         assert (
@@ -514,8 +533,8 @@ async def test_atomic_pipeline_settlement_exact_retry_returns_same_state_and_eve
         "actor": "user:alice",
     }
 
-    first = await service.settle_pipeline_composition_proposal(**kwargs)
-    second = await service.settle_pipeline_composition_proposal(**kwargs)
+    first = await _settle(service, **kwargs)
+    second = await _settle(service, **kwargs)
 
     assert second == first
     with service._engine.begin() as conn:
@@ -549,14 +568,14 @@ async def test_atomic_pipeline_settlement_exact_retry_rejects_tampered_terminal_
         "dispatch": binding,
         "actor": "user:alice",
     }
-    await service.settle_pipeline_composition_proposal(**kwargs)
+    await _settle(service, **kwargs)
     with service._engine.begin() as conn:
         conn.execute(
             update(composition_proposals_table).where(composition_proposals_table.c.id == str(row.id)).values(audit_event_id=str(uuid4()))
         )
 
     with pytest.raises(AuditIntegrityError, match="terminal event"):
-        await service.settle_pipeline_composition_proposal(**kwargs)
+        await _settle(service, **kwargs)
 
 
 @pytest.mark.asyncio
@@ -569,7 +588,8 @@ async def test_absent_base_conflicts_when_first_state_appears_before_settlement(
     await service.save_composition_state(session_id, _state_data(), provenance="session_seed")
 
     with pytest.raises(StaleComposeStateError):
-        await service.settle_pipeline_composition_proposal(
+        await _settle(
+            service,
             session_id=session_id,
             proposal_id=row.id,
             draft_hash=plan.proposal.draft_hash,
@@ -596,7 +616,8 @@ async def test_present_base_conflicts_on_same_content_new_state_id(service: Sess
     await service.save_composition_state(session_id, _state_data(), provenance="session_seed")
 
     with pytest.raises(StaleComposeStateError):
-        await service.settle_pipeline_composition_proposal(
+        await _settle(
+            service,
             session_id=session_id,
             proposal_id=row.id,
             draft_hash=plan.proposal.draft_hash,
@@ -628,7 +649,8 @@ async def test_settlement_rolls_back_state_event_and_status_when_interrupted_aft
 
     monkeypatch.setattr(service, "_insert_composition_state", interrupt_after_insert)
     with pytest.raises(RuntimeError, match="settlement interruption"):
-        await service.settle_pipeline_composition_proposal(
+        await _settle(
+            service,
             session_id=session_id,
             proposal_id=row.id,
             draft_hash=plan.proposal.draft_hash,
@@ -666,7 +688,8 @@ async def test_settlement_rejects_missing_or_tampered_durable_dispatch_audit(ser
         conn.execute(update(chat_messages_table).where(chat_messages_table.c.id == audit_row.id).values(tool_calls=envelope))
 
     with pytest.raises(AuditIntegrityError, match="dispatch audit"):
-        await service.settle_pipeline_composition_proposal(
+        await _settle(
+            service,
             session_id=session_id,
             proposal_id=row.id,
             draft_hash=plan.proposal.draft_hash,
@@ -689,7 +712,8 @@ async def test_settlement_rejects_unrelated_successful_dispatch_call_id(service:
     binding = await _persist_dispatch(service, session_id, tool_call_id="unrelated-call")
 
     with pytest.raises(AuditIntegrityError, match="tool call"):
-        await service.settle_pipeline_composition_proposal(
+        await _settle(
+            service,
             session_id=session_id,
             proposal_id=row.id,
             draft_hash=plan.proposal.draft_hash,
@@ -729,7 +753,7 @@ async def test_settlement_rejects_concurrent_successes_for_same_proposal_call_id
     binding = persisted[0][0]
 
     with pytest.raises(AuditIntegrityError, match=r"duplicate|exactly one|one durable|does not match"):
-        await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+        await _settle(service, **_settlement_kwargs(session_id, row.id, plan, binding))
 
 
 @pytest.mark.asyncio
@@ -757,7 +781,7 @@ async def test_settlement_rejects_malformed_or_mismatched_success_for_same_call_
     await _persist_cloned_audit_envelope(service, session_id, malformed)
 
     with pytest.raises(AuditIntegrityError):
-        await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+        await _settle(service, **_settlement_kwargs(session_id, row.id, plan, binding))
 
 
 @pytest.mark.asyncio
@@ -878,7 +902,7 @@ async def test_same_call_success_with_corrupt_audit_kind_fails_closed(
     if operation == "settlement":
         await _persist_cloned_audit_envelope(service, session_id, malformed)
         with pytest.raises(AuditIntegrityError):
-            await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+            await _settle(service, **_settlement_kwargs(session_id, row.id, plan, binding))
     elif operation == "recovery":
         await _persist_cloned_audit_envelope(service, session_id, malformed)
         authority = await service.get_authoritative_pipeline_proposal(
@@ -889,7 +913,7 @@ async def test_same_call_success_with_corrupt_audit_kind_fails_closed(
         with pytest.raises(AuditIntegrityError):
             await service.get_pipeline_dispatch_recovery(authority=authority)
     elif operation == "committed_reload":
-        await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+        await _settle(service, **_settlement_kwargs(session_id, row.id, plan, binding))
         await _persist_cloned_audit_envelope(service, session_id, malformed)
         with pytest.raises(AuditIntegrityError):
             await service.get_authoritative_pipeline_proposal(
@@ -898,7 +922,8 @@ async def test_same_call_success_with_corrupt_audit_kind_fails_closed(
                 reviewed_facts={},
             )
     else:
-        await service.reject_pipeline_composition_proposal(
+        await _reject(
+            service,
             session_id=session_id,
             proposal_id=row.id,
             draft_hash=plan.proposal.draft_hash,
@@ -930,7 +955,7 @@ async def test_unrelated_non_audit_envelope_remains_ignored_for_settlement(servi
     invocation["tool_call_id"] = "unrelated-call"
     await _persist_cloned_audit_envelope(service, session_id, unrelated)
 
-    settled = await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+    settled = await _settle(service, **_settlement_kwargs(session_id, row.id, plan, binding))
 
     assert settled.proposal.status == "committed"
 
@@ -944,7 +969,7 @@ async def test_failed_dispatch_then_one_success_remains_recoverable(service: Ses
     await _persist_failed_dispatch(service, session_id)
     binding = await _persist_dispatch(service, session_id)
 
-    settled = await service.settle_pipeline_composition_proposal(**_settlement_kwargs(session_id, row.id, plan, binding))
+    settled = await _settle(service, **_settlement_kwargs(session_id, row.id, plan, binding))
 
     assert settled.proposal.status == "committed"
 
@@ -957,11 +982,11 @@ async def test_committed_retry_rejects_duplicate_successful_dispatch_evidence(se
     row = await _create(service, session_id, plan)
     binding = await _persist_dispatch(service, session_id)
     kwargs = _settlement_kwargs(session_id, row.id, plan, binding)
-    await service.settle_pipeline_composition_proposal(**kwargs)
+    await _settle(service, **kwargs)
     await _persist_cloned_audit_envelope(service, session_id, _latest_audit_envelope(service))
 
     with pytest.raises(AuditIntegrityError, match=r"duplicated|duplicate|one durable"):
-        await service.settle_pipeline_composition_proposal(**kwargs)
+        await _settle(service, **kwargs)
 
 
 @pytest.mark.asyncio
@@ -974,7 +999,8 @@ async def test_rejection_rejects_duplicate_successful_dispatch_evidence(service:
     await _persist_cloned_audit_envelope(service, session_id, _latest_audit_envelope(service))
 
     with pytest.raises(AuditIntegrityError, match=r"exactly one|duplicate"):
-        await service.reject_pipeline_composition_proposal(
+        await _reject(
+            service,
             session_id=session_id,
             proposal_id=row.id,
             draft_hash=plan.proposal.draft_hash,
@@ -992,7 +1018,8 @@ async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_id
     plan = _plan()
     row = await _create(service, session_id, plan)
 
-    first = await service.reject_pipeline_composition_proposal(
+    first = await _reject(
+        service,
         session_id=session_id,
         proposal_id=row.id,
         draft_hash=plan.proposal.draft_hash,
@@ -1001,7 +1028,8 @@ async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_id
         dispatch=None,
         actor="user:alice",
     )
-    second = await service.reject_pipeline_composition_proposal(
+    second = await _reject(
+        service,
         session_id=session_id,
         proposal_id=row.id,
         draft_hash=plan.proposal.draft_hash,
@@ -1025,7 +1053,8 @@ async def test_pipeline_rejection_uses_closed_versioned_reason_and_is_exactly_id
         "dispatch": None,
     }
     with pytest.raises((TypeError, ValueError, AuditIntegrityError)):
-        await service.reject_pipeline_composition_proposal(
+        await _reject(
+            service,
             session_id=session_id,
             proposal_id=row.id,
             draft_hash=plan.proposal.draft_hash,
@@ -1043,7 +1072,8 @@ async def test_pipeline_request_cancelled_rejection_is_closed_failed_and_dispatc
     plan = _plan()
     row = await _create(service, session_id, plan)
 
-    rejected = await service.reject_pipeline_composition_proposal(
+    rejected = await _reject(
+        service,
         session_id=session_id,
         proposal_id=row.id,
         draft_hash=plan.proposal.draft_hash,
@@ -1093,14 +1123,14 @@ async def test_pipeline_rejection_exact_retry_rejects_tampered_terminal_event_po
         "dispatch": None,
         "actor": "user:alice",
     }
-    await service.reject_pipeline_composition_proposal(**kwargs)
+    await _reject(service, **kwargs)
     with service._engine.begin() as conn:
         conn.execute(
             update(composition_proposals_table).where(composition_proposals_table.c.id == str(row.id)).values(audit_event_id=str(uuid4()))
         )
 
     with pytest.raises(AuditIntegrityError, match="terminal binding"):
-        await service.reject_pipeline_composition_proposal(**kwargs)
+        await _reject(service, **kwargs)
 
 
 async def _reload_canonical_proposal(
@@ -1177,7 +1207,8 @@ async def test_rejected_canonical_reload_fails_closed_on_terminal_corruption(
     _insert_session(service, session_id)
     plan = _plan()
     row = await _create(service, session_id, plan)
-    await service.reject_pipeline_composition_proposal(
+    await _reject(
+        service,
         session_id=session_id,
         proposal_id=row.id,
         draft_hash=plan.proposal.draft_hash,
@@ -1230,7 +1261,8 @@ async def test_pipeline_candidate_executor_mismatch_rejection_binds_dispatch_and
     row = await _create(service, session_id, plan)
     binding = await _persist_dispatch(service, session_id)
 
-    rejected = await service.reject_pipeline_composition_proposal(
+    rejected = await _reject(
+        service,
         session_id=session_id,
         proposal_id=row.id,
         draft_hash=plan.proposal.draft_hash,

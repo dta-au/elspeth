@@ -41,7 +41,7 @@ from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerP
 from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secret_scrub import scrub_text_for_audit
-from elspeth.contracts.session_operation import SessionOperationContext
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.core.canonical import stable_hash
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.landscape.database import LandscapeDB
@@ -123,6 +123,7 @@ from elspeth.web.composer.telemetry_phase8 import (
 )
 from elspeth.web.composer.tools import _DATA_ERROR_KEY, ToolResult, execute_tool
 from elspeth.web.composer.yaml_generator import generate_public_yaml
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
 from elspeth.web.execution.accounting import load_run_accounting_for_settings
 from elspeth.web.execution.completion_gates import (
     COMPLETION_GATES_META_KEY,
@@ -1362,6 +1363,8 @@ async def _persist_tool_invocations(
     *,
     parent_assistant_id: UUID | None = None,
     plugin_crash_pending: bool,
+    session_operation_context: SessionOperationContext | None = None,
+    session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
 ) -> tuple[PipelineDispatchAuditBinding, ...]:
     """Persist per-tool-call audit records, splitting role by parent presence.
 
@@ -1435,6 +1438,8 @@ async def _persist_tool_invocations(
                 writer_principal="compose_loop",
                 tool_call_id=invocation.tool_call_id if role == "tool" else None,
                 parent_assistant_id=parent_assistant_id if role == "tool" else None,
+                session_operation_context=session_operation_context,
+                session_operation_kind=session_operation_kind,
             )
             if invocation.tool_name == "set_pipeline" and invocation.status is ComposerToolStatus.SUCCESS:
                 persisted_pipeline_bindings.append(PipelineDispatchAuditBinding.from_persisted_envelope(envelope))
@@ -1491,6 +1496,7 @@ async def _persist_llm_calls(
     composition_state_id: UUID | None,
     *,
     plugin_crash_pending: bool,
+    session_operation_context: SessionOperationContext | None = None,
 ) -> None:
     """Persist per-LLM-call audit records as audit-only ``role=audit`` rows.
 
@@ -1510,6 +1516,7 @@ async def _persist_llm_calls(
                 tool_calls=[llm_call_audit_envelope(call)],
                 composition_state_id=composition_state_id,
                 writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
             )
         except SQLAlchemyError as save_err:
             if plugin_crash_pending:
@@ -1687,6 +1694,7 @@ async def _persist_chat_turns(
     composition_state_id: UUID | None,
     *,
     request_unwinding: bool,
+    session_operation_context: SessionOperationContext,
 ) -> None:
     """Persist per-chat-turn audit records as audit-only ``role=audit`` rows.
 
@@ -1722,6 +1730,7 @@ async def _persist_chat_turns(
                 tool_calls=[chat_turn_audit_envelope(turn)],
                 composition_state_id=composition_state_id,
                 writer_principal="compose_loop",
+                session_operation_context=session_operation_context,
             )
         except SQLAlchemyError as save_err:
             if request_unwinding:
@@ -1742,6 +1751,8 @@ async def _persist_chat_turns(
                 f"session_id={session_id!r} on success path — Tier-1 audit "
                 f"corruption (no recovery)"
             ) from save_err
+        except SessionOperationFenceLost:
+            raise
         except Exception as save_err:
             if not request_unwinding:
                 raise
@@ -2063,6 +2074,8 @@ async def _handle_planner_failure(
     service: SessionServiceProtocol,
     session_id: UUID,
     llm_composition_state_id: UUID | None,
+    *,
+    session_operation_context: SessionOperationContext,
 ) -> tuple[int, dict[str, object]]:
     """Translate a freeform ``PipelinePlannerError`` into a safe HTTP outcome.
 
@@ -2108,6 +2121,7 @@ async def _handle_planner_failure(
         tool_calls=[envelope],
         composition_state_id=llm_composition_state_id,
         writer_principal="compose_loop",
+        session_operation_context=session_operation_context,
     )
     return status_code, {
         "error_type": "composer_planner_failure",
@@ -2128,6 +2142,7 @@ async def _handle_convergence_error(
     plugin_snapshot: PluginAvailabilitySnapshot,
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
+    session_operation_context: SessionOperationContext,
 ) -> dict[str, object]:
     """Build 422 response body and persist partial state for convergence errors.
 
@@ -2227,6 +2242,7 @@ async def _handle_convergence_error(
                 session_id,
                 state_data,
                 provenance="convergence_persist",
+                session_operation_context=session_operation_context,
             )
             persisted_state_id = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
@@ -2268,6 +2284,7 @@ async def _handle_convergence_error(
             exc.tool_invocations,
             persisted_state_id,
             plugin_crash_pending=True,
+            session_operation_context=session_operation_context,
         )
     if exc.llm_calls:
         await _persist_llm_calls(
@@ -2276,6 +2293,7 @@ async def _handle_convergence_error(
             exc.llm_calls,
             llm_composition_state_id,
             plugin_crash_pending=True,
+            session_operation_context=session_operation_context,
         )
     return response_body
 
@@ -2292,6 +2310,7 @@ async def _handle_plugin_crash(
     plugin_snapshot: PluginAvailabilitySnapshot,
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
+    session_operation_context: SessionOperationContext,
 ) -> dict[str, object]:
     """Build 500 response body and persist partial state for plugin crashes.
 
@@ -2378,6 +2397,7 @@ async def _handle_plugin_crash(
                 session_id,
                 state_data,
                 provenance="plugin_crash_persist",
+                session_operation_context=session_operation_context,
             )
             persisted_state_id_pc = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
@@ -2431,6 +2451,7 @@ async def _handle_plugin_crash(
             exc.tool_invocations,
             persisted_state_id_pc,
             plugin_crash_pending=True,
+            session_operation_context=session_operation_context,
         )
     if exc.llm_calls:
         await _persist_llm_calls(
@@ -2439,6 +2460,7 @@ async def _handle_plugin_crash(
             exc.llm_calls,
             llm_composition_state_id,
             plugin_crash_pending=True,
+            session_operation_context=session_operation_context,
         )
     return response_body
 
@@ -2455,6 +2477,7 @@ async def _handle_runtime_preflight_failure(
     plugin_snapshot: PluginAvailabilitySnapshot,
     profile_registry: OperatorProfileRegistry,
     catalog: CatalogServiceProtocol,
+    session_operation_context: SessionOperationContext,
 ) -> dict[str, object]:
     """Build 500 response body and persist partial state for runtime-preflight failures.
 
@@ -2620,6 +2643,7 @@ async def _handle_runtime_preflight_failure(
                 session_id,
                 state_data,
                 provenance="preflight_persist",
+                session_operation_context=session_operation_context,
             )
             persisted_state_id_rpf = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
@@ -2667,6 +2691,7 @@ async def _handle_runtime_preflight_failure(
             exc.tool_invocations,
             persisted_state_id_rpf,
             plugin_crash_pending=True,
+            session_operation_context=session_operation_context,
         )
     if exc.llm_calls:
         await _persist_llm_calls(
@@ -2675,6 +2700,7 @@ async def _handle_runtime_preflight_failure(
             exc.llm_calls,
             llm_composition_state_id,
             plugin_crash_pending=True,
+            session_operation_context=session_operation_context,
         )
     return response_body
 

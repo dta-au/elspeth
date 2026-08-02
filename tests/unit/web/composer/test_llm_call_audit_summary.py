@@ -45,6 +45,7 @@ from elspeth.contracts.composer_llm_audit import (
     ComposerLLMCall,
     ComposerLLMCallStatus,
 )
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.composer.audit import llm_call_audit_summary
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.sessions.guided_audit import prepare_guided_audit_rows
@@ -282,13 +283,24 @@ class TestAllThreeDrainSitesShareOneProjection:
     async def _composer_service_site_content(call: ComposerLLMCall) -> str:
         service = _CapturingSessionService()
         host = _PlannerAuditHost(service)
+        session_id = uuid4()
+        context = SessionOperationContext(
+            fence=SessionOperationFence(
+                session_id=str(session_id),
+                operation_id=str(uuid4()),
+                lease_token="planner-audit-projection-test",
+                operation_epoch=1,
+            ),
+            operation_kind=SessionOperationKind.COMPOSE,
+        )
 
         await ComposerServiceImpl._persist_pipeline_planner_audit(
             cast(Any, host),
-            session_id=uuid4(),
+            session_id=session_id,
             current_state_id=None,
             llm_calls=(call,),
             invocations=(),
+            session_operation_context=context,
         )
 
         (message,) = service.messages

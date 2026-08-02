@@ -4886,6 +4886,18 @@ class SessionServiceImpl:
             transaction._close()
 
     @staticmethod
+    def _pipeline_settlement_operation_kind(
+        session_operation_context: SessionOperationContext,
+    ) -> SessionOperationKind:
+        """Accept only the two authorities that may settle a proposal."""
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        operation_kind = session_operation_context.operation_kind
+        if operation_kind not in {SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL}:
+            raise ValueError("pipeline settlement requires COMPOSE or PROPOSAL authority")
+        return operation_kind
+
+    @staticmethod
     def _validate_guided_hash(value: str, *, label: str) -> None:
         if not is_lower_sha256_hex(value):
             raise ValueError(f"{label} must be a lowercase SHA-256 hex digest")
@@ -6360,6 +6372,7 @@ class SessionServiceImpl:
         expected_current_state_id: str | None,
         writer_principal: ChatMessageWriterPrincipal,
         plugin_crash_pending: bool,
+        session_operation_context: SessionOperationContext,
     ) -> AuditOutcome:
         """Synchronous, single-transaction persistence of one compose turn.
 
@@ -6438,7 +6451,15 @@ class SessionServiceImpl:
         # -- because only constraint violations belong on this counter.
         try:
             with self._session_process_locked_begin(session_id) as conn:
-                with self._session_write_lock(conn, session_id):
+                with (
+                    self._session_write_lock(conn, session_id),
+                    self._session_composer_mutation_transaction(
+                        conn,
+                        session_id=session_id,
+                        session_operation_context=session_operation_context,
+                        expected_kind=SessionOperationKind.COMPOSE,
+                    ),
+                ):
                     # B5: if a parent
                     # composition state is supplied, it MUST belong to this
                     # session.
@@ -6619,6 +6640,7 @@ class SessionServiceImpl:
         expected_current_state_id: str | None,
         writer_principal: ChatMessageWriterPrincipal,
         plugin_crash_pending: bool,
+        session_operation_context: SessionOperationContext,
     ) -> AuditOutcome:
         """Async dispatcher for :meth:`persist_compose_turn`.
 
@@ -6660,6 +6682,7 @@ class SessionServiceImpl:
                 expected_current_state_id=expected_current_state_id,
                 writer_principal=writer_principal,
                 plugin_crash_pending=plugin_crash_pending,
+                session_operation_context=session_operation_context,
             ),
         )
 
@@ -7345,6 +7368,8 @@ class SessionServiceImpl:
         dispatch: PipelineDispatchAuditBinding,
         actor: str,
         transition_assistant: TransitionAssistantDraft | None = None,
+        require_transition_consumed: bool = True,
+        session_operation_context: SessionOperationContext,
     ) -> PipelineProposalSettlementResult:
         """Atomically publish state and settle a verified pipeline proposal."""
         if type(dispatch) is not PipelineDispatchAuditBinding:
@@ -7353,22 +7378,39 @@ class SessionServiceImpl:
         if candidate_content_hash != executor_content_hash or candidate_content_hash != state_content_hash:
             raise AuditIntegrityError("pipeline candidate/executor/state content hash mismatch")
         settled_state = replace(state, composer_meta=final_composer_metadata)
+        if type(require_transition_consumed) is not bool:
+            raise TypeError("require_transition_consumed must be an exact bool")
         if transition_assistant is not None:
             if type(transition_assistant) is not TransitionAssistantDraft:
                 raise TypeError("transition_assistant must be an exact TransitionAssistantDraft")
-            composer_meta = deep_thaw(settled_state.composer_meta)
-            guided_session = composer_meta["guided_session"] if type(composer_meta) is dict and "guided_session" in composer_meta else None
-            transition_consumed = (
-                guided_session["transition_consumed"] if type(guided_session) is dict and "transition_consumed" in guided_session else None
-            )
-            if type(guided_session) is not dict or transition_consumed is not True:
-                raise AuditIntegrityError("transition assistant requires guided_session.transition_consumed=true")
+            if require_transition_consumed:
+                composer_meta = deep_thaw(settled_state.composer_meta)
+                guided_session = (
+                    composer_meta["guided_session"] if type(composer_meta) is dict and "guided_session" in composer_meta else None
+                )
+                transition_consumed = (
+                    guided_session["transition_consumed"]
+                    if type(guided_session) is dict and "transition_consumed" in guided_session
+                    else None
+                )
+                if type(guided_session) is not dict or transition_consumed is not True:
+                    raise AuditIntegrityError("transition assistant requires guided_session.transition_consumed=true")
         sid = str(session_id)
         pid = str(proposal_id)
         now = self._now()
+        operation_kind = self._pipeline_settlement_operation_kind(session_operation_context)
 
         def _sync() -> tuple[PipelineProposalSettlementResult, bool]:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=operation_kind,
+                ),
+            ):
                 row = conn.execute(
                     select(composition_proposals_table)
                     .where(composition_proposals_table.c.session_id == sid)
@@ -7601,6 +7643,7 @@ class SessionServiceImpl:
         reason: PipelineProposalRejectionReason,
         dispatch: PipelineDispatchAuditBinding | None,
         actor: str,
+        session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord:
         """Atomically terminalise a pipeline proposal with a closed reason."""
         reason = _validated_pipeline_rejection_reason(reason)
@@ -7611,9 +7654,19 @@ class SessionServiceImpl:
         sid = str(session_id)
         pid = str(proposal_id)
         now = self._now()
+        operation_kind = self._pipeline_settlement_operation_kind(session_operation_context)
 
         def _sync() -> tuple[CompositionProposalRecord, bool]:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=operation_kind,
+                ),
+            ):
                 row = conn.execute(
                     select(composition_proposals_table)
                     .where(composition_proposals_table.c.session_id == sid)
@@ -9159,6 +9212,8 @@ class SessionServiceImpl:
         raw_content: str | None = None,
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
+        session_operation_context: SessionOperationContext | None = None,
+        session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
     ) -> ChatMessageRecord:
         """Add a chat message and update the session's ``updated_at``.
 
@@ -9185,6 +9240,12 @@ class SessionServiceImpl:
           ``ck_chat_messages_parent_role`` CHECK constraints enforce
           this at write time.
         """
+        if type(session_operation_kind) is not SessionOperationKind:
+            raise TypeError("session_operation_kind must be an exact SessionOperationKind")
+        if session_operation_kind not in {SessionOperationKind.COMPOSE, SessionOperationKind.PROPOSAL}:
+            raise ValueError("add_message fenced writes require COMPOSE or PROPOSAL authority")
+        if session_operation_context is None and session_operation_kind is not SessionOperationKind.COMPOSE:
+            raise ValueError("non-COMPOSE add_message writes require exact operation authority")
         now = self._now()
         sid = str(session_id)
         csid = str(composition_state_id) if composition_state_id else None
@@ -9192,39 +9253,53 @@ class SessionServiceImpl:
         msg_id_holder: dict[str, str] = {}
         sequence_holder: dict[str, int] = {}
 
+        def _write(conn: Connection) -> None:
+            if csid is not None:
+                _assert_state_in_session(
+                    conn,
+                    state_id=csid,
+                    expected_session_id=sid,
+                    caller="add_message",
+                )
+            seq = self._reserve_sequence_range(conn, sid, count=1)
+            sequence_holder["sequence_no"] = seq
+            msg_id_holder["id"] = self._insert_chat_message(
+                conn,
+                session_id=sid,
+                role=role,
+                content=content,
+                raw_content=raw_content,
+                # ``deep_thaw`` matches the persist_compose_turn site:
+                # SQLAlchemy JSON serialisation handles raw dicts/lists,
+                # but tool_calls may be a ``MappingProxyType`` / ``tuple``
+                # after frozen-dataclass round-trips, which the JSON encoder
+                # rejects.
+                tool_calls=deep_thaw(tool_calls) if tool_calls else None,
+                sequence_no=seq,
+                writer_principal=writer_principal,
+                composition_state_id=csid,
+                tool_call_id=tool_call_id,
+                parent_assistant_id=pid,
+                created_at=now,
+            )
+            conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+
         def _sync() -> None:
             with self._session_process_locked_begin(sid) as conn:
-                if csid is not None:
-                    _assert_state_in_session(
-                        conn,
-                        state_id=csid,
-                        expected_session_id=sid,
-                        caller="add_message",
-                    )
-                with self._session_write_lock(conn, sid):
-                    seq = self._reserve_sequence_range(conn, sid, count=1)
-                    sequence_holder["sequence_no"] = seq
-                    msg_id_holder["id"] = self._insert_chat_message(
+                if session_operation_context is None:
+                    with self._session_write_lock(conn, sid):
+                        _write(conn)
+                    return
+                with (
+                    self._session_write_lock(conn, sid),
+                    self._session_composer_mutation_transaction(
                         conn,
                         session_id=sid,
-                        role=role,
-                        content=content,
-                        raw_content=raw_content,
-                        # ``deep_thaw`` matches the persist_compose_turn
-                        # site: SQLAlchemy JSON serialisation handles raw
-                        # dicts/lists, but tool_calls may be a
-                        # ``MappingProxyType`` / ``tuple`` after frozen-
-                        # dataclass round-trips, which the JSON encoder
-                        # rejects.
-                        tool_calls=deep_thaw(tool_calls) if tool_calls else None,
-                        sequence_no=seq,
-                        writer_principal=writer_principal,
-                        composition_state_id=csid,
-                        tool_call_id=tool_call_id,
-                        parent_assistant_id=pid,
-                        created_at=now,
-                    )
-                conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
+                        session_operation_context=session_operation_context,
+                        expected_kind=session_operation_kind,
+                    ),
+                ):
+                    _write(conn)
 
         await self._run_sync(_sync)
 
@@ -9687,6 +9762,7 @@ class SessionServiceImpl:
         state: CompositionStateData,
         *,
         provenance: CompositionStateProvenance,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> CompositionStateRecord:
         """Save a new immutable composition state snapshot.
 
@@ -9705,7 +9781,7 @@ class SessionServiceImpl:
         now = self._now()
         sid = str(session_id)
 
-        def _sync() -> int:
+        def _write(conn: Connection) -> int:
             # The per-session write lock makes the SELECT-MAX +
             # INSERT sequence atomic against every other writer for
             # this session_id on both PostgreSQL (advisory lock) and
@@ -9715,33 +9791,43 @@ class SessionServiceImpl:
             # constraint directly — no retry layer is permitted to
             # consume that diagnostic before it reaches the operator
             # (CLAUDE.md No Legacy Code Policy: no belt-and-suspenders).
-            with self._session_process_locked_begin(sid) as conn:
-                with self._session_write_lock(conn, sid):
-                    result = conn.execute(
-                        select(func.max(composition_states_table.c.version)).where(composition_states_table.c.session_id == sid)
-                    ).scalar()
-                    version = (result or 0) + 1
+            result = conn.execute(
+                select(func.max(composition_states_table.c.version)).where(composition_states_table.c.session_id == sid)
+            ).scalar()
+            version = (result or 0) + 1
 
-                    conn.execute(
-                        insert(composition_states_table).values(
-                            id=str(state_id),
-                            session_id=sid,
-                            version=version,
-                            source=None,
-                            sources=_enveloped_state_column(state.sources),
-                            nodes=_enveloped_state_column(state.nodes),
-                            edges=_enveloped_state_column(state.edges),
-                            outputs=_enveloped_state_column(state.outputs),
-                            metadata_=_enveloped_state_column(state.metadata_),
-                            is_valid=state.is_valid,
-                            validation_errors=deep_thaw(state.validation_errors),
-                            composer_meta=_enveloped_state_column(state.composer_meta),
-                            derived_from_state_id=None,
-                            provenance=provenance,
-                            created_at=now,
-                        )
-                    )
-                return version
+            conn.execute(
+                insert(composition_states_table).values(
+                    id=str(state_id),
+                    session_id=sid,
+                    version=version,
+                    source=None,
+                    sources=_enveloped_state_column(state.sources),
+                    nodes=_enveloped_state_column(state.nodes),
+                    edges=_enveloped_state_column(state.edges),
+                    outputs=_enveloped_state_column(state.outputs),
+                    metadata_=_enveloped_state_column(state.metadata_),
+                    is_valid=state.is_valid,
+                    validation_errors=deep_thaw(state.validation_errors),
+                    composer_meta=_enveloped_state_column(state.composer_meta),
+                    derived_from_state_id=None,
+                    provenance=provenance,
+                    created_at=now,
+                )
+            )
+            return version
+
+        def _sync() -> int:
+            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+                if session_operation_context is None:
+                    return _write(conn)
+                with self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                ):
+                    return _write(conn)
 
         version = await self._run_sync(_sync)
 
@@ -9770,6 +9856,7 @@ class SessionServiceImpl:
         state: CompositionStateData,
         assistant_content: str,
         raw_content: str | None,
+        session_operation_context: SessionOperationContext,
     ) -> TransitionResponseSettlement:
         """Persist transition consumption and its assistant response atomically."""
         composer_meta = deep_thaw(state.composer_meta)
@@ -9780,12 +9867,42 @@ class SessionServiceImpl:
         if type(guided_session) is not dict or transition_consumed is not True:
             raise AuditIntegrityError("commit_transition_response requires guided_session.transition_consumed=true")
 
+        return await self.commit_composition_response(
+            session_id=session_id,
+            expected_current_state_id=expected_current_state_id,
+            state=state,
+            assistant_content=assistant_content,
+            raw_content=raw_content,
+            session_operation_context=session_operation_context,
+        )
+
+    async def commit_composition_response(
+        self,
+        *,
+        session_id: UUID,
+        expected_current_state_id: UUID | None,
+        state: CompositionStateData,
+        assistant_content: str,
+        raw_content: str | None,
+        session_operation_context: SessionOperationContext,
+    ) -> TransitionResponseSettlement:
+        """Persist a post-compose state and assistant under exact authority."""
+
         sid = str(session_id)
         expected_state_id = str(expected_current_state_id) if expected_current_state_id is not None else None
         now = self._now()
 
         def _sync() -> tuple[CompositionStateRecord, ChatMessageRecord]:
-            with self._session_process_locked_begin(sid) as conn, self._session_write_lock(conn, sid):
+            with (
+                self._session_process_locked_begin(sid) as conn,
+                self._session_write_lock(conn, sid),
+                self._session_composer_mutation_transaction(
+                    conn,
+                    session_id=sid,
+                    session_operation_context=session_operation_context,
+                    expected_kind=SessionOperationKind.COMPOSE,
+                ),
+            ):
                 current_state_id = conn.execute(
                     select(composition_states_table.c.id)
                     .where(composition_states_table.c.session_id == sid)
@@ -9794,7 +9911,7 @@ class SessionServiceImpl:
                 ).scalar_one_or_none()
                 if current_state_id != expected_state_id:
                     raise StaleComposeStateError(
-                        "commit_transition_response: current composition state changed "
+                        "commit_composition_response: current composition state changed "
                         f"for session_id={sid!r}; expected={expected_state_id!r}, "
                         f"actual={current_state_id!r}"
                     )

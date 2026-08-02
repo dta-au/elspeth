@@ -247,17 +247,24 @@ async def accept_composition_proposal(
                 )
                 await _close_proposal_lease_before_commit(lease, primary=request_error)
                 raise request_error
-            cleanup_error, cleanup_cancelled = await _drain_proposal_lease_close(lease)
-            if cleanup_error is not None:
-                raise cleanup_error
+            try:
+                route_settlement = await settle_pipeline_proposal_under_compose_lock(
+                    request=request,
+                    user=user,
+                    authority=pipeline_authority,
+                    draft_hash=body.draft_hash,
+                    session_operation_context=lease.context,
+                )
+            except BaseException as primary:
+                await _close_proposal_lease_before_commit(lease, primary=primary)
+                raise
+            cleanup_cancelled = await _close_proposal_lease_after_commit(
+                lease,
+                session_id=session.id,
+                event="composer_pipeline_proposal_accept_postcommit_cleanup_failed",
+            )
             if cleanup_cancelled:
                 raise asyncio.CancelledError
-            route_settlement = await settle_pipeline_proposal_under_compose_lock(
-                request=request,
-                user=user,
-                authority=pipeline_authority,
-                draft_hash=body.draft_hash,
-            )
             return _composition_proposal_response(route_settlement.settlement.proposal)
 
         durable_transition = False
@@ -561,12 +568,13 @@ async def reject_composition_proposal(
                 raise asyncio.CancelledError
             return response
 
-        await lease.close()
         if authority.pipeline.proposal.surface.value in {"guided_staged", "tutorial_profile"}:
-            raise HTTPException(
+            request_error = HTTPException(
                 status_code=409,
                 detail="This pipeline proposal must be rejected through its guided workflow.",
             )
+            await _close_proposal_lease_before_commit(lease, primary=request_error)
+            raise request_error
         try:
             proposal = await service.reject_pipeline_composition_proposal(
                 session_id=session.id,
@@ -576,8 +584,21 @@ async def reject_composition_proposal(
                 reason="operator_rejected",
                 dispatch=None,
                 actor=f"user:{user.user_id}",
+                session_operation_context=lease.context,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as primary:
+            await _close_proposal_lease_before_commit(lease, primary=primary)
+            raise HTTPException(status_code=409, detail=str(primary)) from primary
+        except BaseException as primary:
+            await _close_proposal_lease_before_commit(lease, primary=primary)
+            raise
         _ = body
-        return _composition_proposal_response(proposal)
+        response = _composition_proposal_response(proposal)
+        cleanup_cancelled = await _close_proposal_lease_after_commit(
+            lease,
+            session_id=session.id,
+            event="composer_pipeline_proposal_reject_postcommit_cleanup_failed",
+        )
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
+        return response

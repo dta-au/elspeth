@@ -1484,6 +1484,7 @@ class ComposerServiceImpl:
             persisted_tool_row_content=tuple(row.content for row in self._phase3_last_redacted_tool_rows),
             tool_invocations=result.tool_invocations,
             runtime_preflight=result.runtime_preflight,
+            final_persisted_state_id=result.final_persisted_state_id,
         )
 
     def _serialize_response_via_walker(
@@ -2935,9 +2936,16 @@ class ComposerServiceImpl:
         current_state_id: UUID | None,
         llm_calls: tuple[ComposerLLMCall, ...],
         invocations: tuple[ComposerToolInvocation, ...],
+        session_operation_context: SessionOperationContext,
     ) -> None:
         """Make planner LLM/discovery evidence durable before proposal authority."""
 
+        if type(session_operation_context) is not SessionOperationContext:
+            raise TypeError("session_operation_context must be an exact SessionOperationContext")
+        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+            raise ValueError("pipeline planner audit persistence requires COMPOSE session authority")
+        if session_operation_context.fence.session_id != str(session_id):
+            raise AuditIntegrityError("Pipeline planner audit authority targets a different session")
         sessions = self._require_sessions_service()
         try:
             for call in llm_calls:
@@ -2949,6 +2957,7 @@ class ComposerServiceImpl:
                     tool_calls=[llm_call_audit_envelope(call)],
                     composition_state_id=current_state_id,
                     writer_principal="compose_loop",
+                    session_operation_context=session_operation_context,
                 )
             for invocation in invocations:
                 content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
@@ -2959,6 +2968,7 @@ class ComposerServiceImpl:
                     tool_calls=[envelope],
                     composition_state_id=current_state_id,
                     writer_principal="compose_loop",
+                    session_operation_context=session_operation_context,
                 )
         except SQLAlchemyError as exc:
             raise AuditIntegrityError("pipeline planner audit persistence failed before proposal creation") from exc
@@ -2983,6 +2993,7 @@ class ComposerServiceImpl:
             current_state_id=current_state_id,
             llm_calls=recorder.llm_calls,
             invocations=recorder.invocations,
+            session_operation_context=session_operation_context,
         )
         arguments = cast(dict[str, Any], deep_thaw(plan.proposal.pipeline))
         redacted_arguments = redact_tool_call_arguments(
@@ -3023,6 +3034,7 @@ class ComposerServiceImpl:
                         reason="request_cancelled",
                         dispatch=None,
                         actor="system:auto_reject_request_cancelled",
+                        session_operation_context=session_operation_context,
                     ),
                     deferred=deferred,
                 )
@@ -3057,6 +3069,12 @@ class ComposerServiceImpl:
         """Build one canonical full-pipeline proposal for an empty topology."""
 
         session_uuid = UUID(session_id)
+        if type(session_operation_context) is not SessionOperationContext:
+            raise AuditIntegrityError("Pipeline planning requires exact session operation authority")
+        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
+            raise ValueError("pipeline planning requires COMPOSE session authority")
+        if session_operation_context.fence.session_id != str(session_uuid):
+            raise AuditIntegrityError("Pipeline planning authority targets a different session")
         message_uuid = UUID(user_message_id)
         state_uuid = UUID(current_state_id) if current_state_id is not None else None
         base = (
@@ -3216,6 +3234,7 @@ class ComposerServiceImpl:
                     current_state_id=state_uuid,
                     llm_calls=recorder.llm_calls[planner_llm_start:],
                     invocations=recorder.invocations[planner_invocation_start:],
+                    session_operation_context=session_operation_context,
                 )
                 decline_message = declined.decline_text.strip() or (
                     "I could not find a way to build this pipeline with the available components."
@@ -3234,6 +3253,7 @@ class ComposerServiceImpl:
                         current_state_id=state_uuid,
                         llm_calls=attached_calls,
                         invocations=recorder.invocations[planner_invocation_start:],
+                        session_operation_context=session_operation_context,
                     ),
                     deferred=exc if type(exc) is asyncio.CancelledError else None,
                 )
@@ -3243,12 +3263,6 @@ class ComposerServiceImpl:
                         raise
                     raise deferred from exc
                 raise
-        if type(session_operation_context) is not SessionOperationContext:
-            raise AuditIntegrityError("Pipeline proposal staging requires exact session operation authority")
-        if session_operation_context.operation_kind is not SessionOperationKind.COMPOSE:
-            raise ValueError("pipeline proposal staging requires COMPOSE session authority")
-        if session_operation_context.fence.session_id != str(session_uuid):
-            raise AuditIntegrityError("Pipeline proposal staging authority targets a different session")
         return await self._stage_pipeline_plan(
             plan=plan,
             state=state,
@@ -3347,6 +3361,7 @@ class ComposerServiceImpl:
         assistant_tool_calls: tuple[Any, ...],
         plugin_crash: ComposerPluginCrashError | None,
         session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         current_state_id: str | None,
         persisted_tool_call_turn: bool,
         persisted_assistant_message_id: str | None,
@@ -3363,6 +3378,7 @@ class ComposerServiceImpl:
             assistant_tool_calls=assistant_tool_calls,
             plugin_crash=plugin_crash,
             session_id=session_id,
+            session_operation_context=session_operation_context,
             current_state_id=current_state_id,
             persisted_tool_call_turn=persisted_tool_call_turn,
             persisted_assistant_message_id=persisted_assistant_message_id,
@@ -3463,6 +3479,7 @@ class ComposerServiceImpl:
         runtime_preflight_cache: _RuntimePreflightCache,
         session_scope: str,
         session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         user_id: str | None,
         mutation_success_seen: bool,
         repair_turns_used: int,
@@ -3515,6 +3532,8 @@ class ComposerServiceImpl:
         if anti_anchor.should_fire():
             hint_text = anti_anchor.build_hint()
             if session_id is not None:
+                if type(session_operation_context) is not SessionOperationContext:
+                    raise AuditIntegrityError("Anti-anchor audit persistence requires exact session operation authority")
                 # Audit publication is a precondition of the provider-visible
                 # intervention. A storage failure propagates before the hint is
                 # appended, so the model can never act on unrecorded control.
@@ -3524,6 +3543,7 @@ class ComposerServiceImpl:
                     hint_text,
                     writer_principal="compose_loop",
                     tool_calls=[anti_anchor_control_envelope(hint_text)],
+                    session_operation_context=session_operation_context,
                 )
             anti_anchor.consume_fire()
             llm_messages.append({"role": "user", "content": hint_text})
@@ -4551,7 +4571,10 @@ class ComposerServiceImpl:
                             "the terminate-phase contract requires result to be set whenever the "
                             "phase signals a return."
                         )
-                    return terminate.result
+                    return replace(
+                        terminate.result,
+                        final_persisted_state_id=UUID(current_state_id) if current_state_id is not None else None,
+                    )
                 repair_turns_used += terminate.repair_turns_delta
                 advisor_checkpoint_passes_used += terminate.advisor_passes_delta
                 if _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE and terminate.advisor_injection_index is not None:
@@ -4623,6 +4646,7 @@ class ComposerServiceImpl:
                     assistant_tool_calls=dispatch_result.assistant_tool_calls,
                     plugin_crash=dispatch_result.plugin_crash,
                     session_id=session_id,
+                    session_operation_context=session_operation_context,
                     current_state_id=_current_state_id,
                     persisted_tool_call_turn=_persisted_tool_call_turn,
                     persisted_assistant_message_id=_persisted_assistant_message_id,
@@ -4743,6 +4767,7 @@ class ComposerServiceImpl:
                 runtime_preflight_cache=runtime_preflight_cache,
                 session_scope=session_scope,
                 session_id=session_id,
+                session_operation_context=session_operation_context,
                 user_id=user_id,
                 mutation_success_seen=mutation_success_seen,
                 repair_turns_used=repair_turns_used,
@@ -4769,7 +4794,10 @@ class ComposerServiceImpl:
                         "the classify-phase contract requires result to be set whenever the "
                         "phase signals a return."
                     )
-                return classify.result
+                return replace(
+                    classify.result,
+                    final_persisted_state_id=UUID(current_state_id) if current_state_id is not None else None,
+                )
             continue
 
     def _persist_crashed_session(self, session_operation_context: SessionOperationContext) -> None:
@@ -6469,6 +6497,7 @@ class ComposeLoopTestResult:
     # (e.g. the fail-closed orphaned-interpretation gate) without bypassing
     # the production ``_compose_loop`` path.
     runtime_preflight: ValidationResult | None = None
+    final_persisted_state_id: UUID | None = None
 
     @property
     def tool_outcomes_for_assertion(self) -> tuple[Any, ...]:
