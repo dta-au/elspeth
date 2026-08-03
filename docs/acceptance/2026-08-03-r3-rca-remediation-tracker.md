@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-03T22:13:28+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-03T22:13:28+10:00
-Release baseline: `release/0.7.2@6844b684a`
+Last refreshed: 2026-08-03T22:37:14+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-03T22:37:14+10:00
+Release baseline: `release/0.7.2@23c1494a2`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -36,16 +36,16 @@ evidence are core/demo-aware work even though they involve AWS. Installing,
 updating, or tearing down the environment through IAM, Terraform, runbooks, or
 shell mechanics remains deferred even when it blocks a fresh install.
 
-## Current roll-up — 44 objective items plus 10 discovered/delivery records
+## Current roll-up — 44 objective items plus 19 discovered/delivery records
 
-| State | Objective 44 | Additional 10 | Meaning |
+| State | Objective 44 | Additional 19 | Meaning |
 |---|---:|---:|---|
-| Closed | 8 | 7 | Tracker says done; closure evidence is still sampled during the completion audit |
-| Verifying | 17 | 2 | Locally fixed; live or requirement-specific acceptance remains |
-| Fixing | 1 | 0 | Owned bug implementation is still in flight |
+| Closed | 9 | 7 | Tracker says done; closure evidence is still sampled during the completion audit |
+| Verifying | 16 | 1 | Locally fixed; live or requirement-specific acceptance remains |
+| Fixing | 2 | 1 | Owned bug implementation is still in flight |
 | In progress | 0 | 0 | A delivery task spanning existing objective defects is in flight |
-| Open | 6 | 1 | Confirmed task/epic work not yet started here |
-| Triage | 9 | 0 | Root cause and reproducibility must be checked against current HEAD before fixing |
+| Open | 5 | 1 | Confirmed task/epic work not yet started here |
+| Triage | 9 | 9 | Root cause and reproducibility must be checked against current HEAD before fixing |
 | Proposed | 3 | 0 | Regression-gate features require approval/acceptance design before implementation |
 
 The additional records are newly discovered gate-custody bug
@@ -57,7 +57,9 @@ children of the systemic provider-projection audit: `elspeth-dca1e81c58`,
 changing the supplied objective's 44-item arithmetic. Three later core splits
 are also tracked: frontend readiness parity `elspeth-4c699cb5d0`, shared
 advisor deadline custody `elspeth-57232f6f3c`, and guided-plan terminal
-progress `elspeth-4e6f2a59e4`.
+progress `elspeth-4e6f2a59e4`. The completed exhaustive provider-projection
+audit added nine precisely scoped implementation records; they are listed in
+the dedicated follow-up table below.
 
 Closed-record assignees below are retained Filigree audit history, not active
 claim custody.
@@ -66,7 +68,7 @@ claim custody.
 
 | Agent | Scope | Worktree/branch | File custody | AWS authority | Status |
 |---|---|---|---|---|---|
-| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`) | This tracker; full-suite regression worktree released after integration | Sole mutation custodian | Active; reviewed settlement/registry repair and stale-fixture correction integrated; CI-equivalent suite green at `6844b684a`; next demo-aware core item selection in progress |
+| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`) | This tracker; advisor evidence-contract worktree next | Sole mutation custodian | Active; CI-equivalent suite green at `6844b684a`, tracker durable at `23c1494a2`, exhaustive provider-projection audit closed, and residual advisor evidence contract is the current demo-aware P1 |
 | `/root/audit_advisor_demo` | D1-D6 and advisor/F14 completion evidence | Shared read-only baseline | None | None | Completed; no residual local code defect found |
 | `/root/audit_compose_loop` | Six compose-loop RCAs and implementation partitioning | Shared read-only baseline | None | None | Completed; all six remain actionable |
 | `/root/audit_gate_routing` | Closed/verifying routing audit plus residual routing RCAs | Shared read-only baseline | None | None | Completed; two residual and one new P1 confirmed |
@@ -81,7 +83,7 @@ claim custody.
 | `/root/impl_run_diagnostics_ui` | Surface routed-failure provenance | `.claude/worktrees/run-diagnostics-ui`; `codex/fix-run-diagnostics-ui` | `RunsHistoryDrawer` and direct frontend diagnostics presentation/tests | None | Complete; integrated as `9130e1209` + `0928c6ac6` |
 | `/root/impl_compose_authoring_aids` | Compose context and truthful field-mapping aids | `.claude/worktrees/compose-authoring-aids`; `codex/fix-compose-authoring-aids` | Released after integration | None | Complete; integrated as `2906409e1` + `e1d31f104` |
 | `/root/impl_compose_required_controls` | Finalize deterministic required controls on both freeform publication paths | `.claude/worktrees/compose-required-controls`; `codex/fix-compose-required-controls` | Released after integration | None | Complete through `32cec3d8a`; independent lifecycle/security review clean and 241 release-checkout proposal/authority/lifecycle tests passed; live Composer acceptance remains |
-| `/root/audit_provider_projection_obligations` | Re-audit provider-facing projection and hidden-option custody on integrated release | Shared read-only `ca375291c` baseline | None | None | Complete; four P1 residuals reproduced and partitioned into three tracked implementation children |
+| Five read-only projection auditors | Reconcile every production provider call against the evidence its prompt asks the model to use | Shared read-only `23c1494a2` baseline | None | None | Complete; Loomweave plus direct inventory covered `src/elspeth`, `elspeth-lints/src`, and `gateway/src`; audit task `6795b3ae3a` closed with comment `2240` and thirteen linked residuals |
 | `/root/impl_guided_chat_revision_custody` | Prevent blind source/sink replacement through guided chat | `.claude/worktrees/guided-chat-revision-custody`; `codex/fix-guided-chat-revision-custody` | Released after integration; `guided_chat_atomic.py` handed to terminal-progress lane | None | Complete as `7afa62b6d` + `c4cade0f0`; independent review clean and 10 exact release regressions passed |
 | `/root/rca_compose_request_correlation` | Emit bounded correlation events for structured HTTP errors and Pydantic 422s | `.claude/worktrees/compose-request-correlation`; `codex/fix-compose-request-correlation` | Released after integration | None | Complete through `39c6b14a7`; 32 exact release-handler regressions passed; live CloudWatch lookup remains |
 | `/root/impl_frontend_readiness_axes` | Apply backend readiness axes to every frontend action | `.claude/worktrees/frontend-readiness-axes`; `codex/fix-frontend-readiness-axes` | Released after integration | None | Complete; integrated through `9016ce6a6`, exact release rerun 148 passed, task closed |
@@ -98,7 +100,7 @@ Parent workstream state:
 
 | Parent record | Live state | Immediate coordination action |
 |---|---|---|
-| `elspeth-7ffd77deca` — advisor gate | `verifying` | Run the merged D1-D6 acceptance matrix on one deployed candidate |
+| `elspeth-7ffd77deca` — advisor gate | `fixing` | Close the residual END evidence/obligation mismatch before deployed acceptance |
 | `elspeth-7da4e52344` — compose loop | `fixing` | Advisor timeout and registry lanes are integrated; run combined release gates and deployed acceptance |
 | `elspeth-e7ff15ac0b` — gate routing | `open` | Reconcile five closed, five verifying, and two residual children |
 | `elspeth-e54343d43b` — AWS installer | `open` | Hold implementation until demo-aware product/system work is accepted; only deconflict existing owners in the meantime |
@@ -107,13 +109,14 @@ Parent workstream state:
 
 | ID | Priority | Live state | Filigree assignee | Next proof/action |
 |---|---:|---|---|---|
-| `elspeth-955438d517` | P1 | `verifying` | `codex-release-0.7.2-integration` | Live Composer run proves complete structural projection, failure routes, and no false sign-off |
+| `elspeth-955438d517` | P1 | `fixing` | `codex-r3-rca-coordinator` | Stop asking the advisor to certify constraints intentionally omitted by the bounded safe projection; retain deterministic validation authority and exact visible-evidence review |
 | `elspeth-fcef029996` | P1 | `verifying` | `codex-release-0.7.2-integration` | Live second-pass re-review converges with prior findings/actions visible |
 | `elspeth-ca751fa4e1` | P1 | `verifying` | `codex-advisor-surface-deadline` | Integrated through `4f70a3619`; live FLAG-to-repair-to-CLEAN must expose only final clean user prose while retaining internal audit evidence |
 | `elspeth-f5a9021d2d` | P2 | `verifying` | `codex-release-0.7.2-integration` | Green runtime preflight remains green while advisor completion is withheld |
 | `elspeth-4b3ac84038` | P1 | `verifying` | `codex-release-0.7.2-integration` | Live surfaces agree on the chosen completion-only policy: execution remains admitted; Save/review completion is refused |
 | `elspeth-1033d97b6c` | P3 | `verifying` | `codex-release-0.7.2-integration` | Live Textract uses deployment-owned region and proves the bucket region before Textract |
 | `elspeth-bc6d1c5d8d` | P2 | `closed` | `codex-release-0.7.2-integration` | Sample merged telemetry and terminology evidence during final audit |
+| `elspeth-cecfeca77b` | P2 | `triage` | unassigned | EARLY advisor must receive user intent or stop evaluating user-intent fidelity |
 
 ## Compose loop — `elspeth-7da4e52344`
 
@@ -139,7 +142,7 @@ Parent workstream state:
 | `elspeth-fd32c3e6fd` | P1 | `verifying` | `codex-gate-proof-guided-validation` | Integrated through `39c7fc635`; live guided numeric-gate build must persist check 25 red and refuse execution before row processing |
 | `elspeth-b326add5be` | P1 | `verifying` | `codex-gate-row-error-policy` | Integrated through `e3804416f`; live mixed good/bad CSV run must route one row per policy without aborting the run |
 | `elspeth-dc07d517cf` | P2 | `closed` | unassigned | Sample clarification intent visibility/claimability at later stages |
-| `elspeth-6795b3ae3a` | P2 | `open` | unassigned | Inventory every provider-facing projection and compare obligations with rendered evidence |
+| `elspeth-6795b3ae3a` | P2 | `closed` | `codex-r3-rca-coordinator` | Exhaustive Loomweave-plus-direct provider-call inventory recorded in Filigree comment `2240` at `23c1494a2` |
 | `elspeth-dca1e81c58` | P1 | `closed` | `codex-r3-rca-coordinator` | Reviewed chain integrated as `e2bc8c5e3` + `45476f021`; selected node identity/type/plugin/hidden options fail closed and source/output wire corrections use the atomic form rewind |
 | `elspeth-3526685369` | P1 | `closed` | `codex-guided-chat-revision-custody` | Integrated as `7afa62b6d` + `c4cade0f0`; form-directed source/sink custody and retained intent verified locally |
 | `elspeth-eacfec09a6` | P1 | `closed` | unassigned | Current-head D1 audit proved unified evidence/injection candidates, withheld-value semantics, complete bounded triples, and failure routes; 12 focused regressions passed at `131a5f584` |
@@ -147,7 +150,7 @@ Parent workstream state:
 | `elspeth-d0d52e2fde` | P2 | `closed` | `codex-release-0.7.2-integration` | Sample the real HTTP/lifecycle regression added with the proof fix |
 | `elspeth-c4734bc69a` | P3 | `verifying` | `codex-r3-rca-coordinator` | Behavior `d78fbbed6` plus corpus `10179f2c1`; combined full-suite gate passed at `6844b684a`, while live catalog acceptance remains |
 | `elspeth-aaa9e3f597` | P2 | `verifying` | `codex-release-0.7.2-integration` | Live guided path retains the decision heading and treats gates as topology, not plugins |
-| `elspeth-1d97fc4b80` | P1 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `b424c08c4`; live correction must preserve unrelated gate routes and LLM prompt/profile options byte-for-byte |
+| `elspeth-1d97fc4b80` | P1 | `fixing` | `codex-r3-rca-coordinator` | Prior hidden-state fix remains; residual proposal revision must use the active candidate and selected gate correction must retain explicit destinations |
 | `elspeth-18b39eb829` | P2 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `0928c6ac6`; live run panel must expose the already-recorded Textract node/code/hint without direct DB access |
 
 ## Related core/demo-aware product and system work
@@ -159,6 +162,24 @@ not gate-routing children.
 |---|---:|---|---|---|
 | `elspeth-926ac02d3e` | P1 | `verifying` | `codex-s3-source-profiles` | Integrated through `131a5f584`; run one live operator-profiled S3 read and confirm redacted audit evidence plus endpoint denial |
 | `elspeth-6801b71f71` | P2 | `closed` | `codex-r3-rca-coordinator` | Read-only live DB proof found complete structured failure and DIVERT provenance; UI gap split to `elspeth-18b39eb829` |
+
+## Provider-projection audit follow-up
+
+These nine records were created by the exhaustive `6795b3ae3a` audit. They
+are ordered with demo-blocking core behavior first; judge/installer-oriented
+supportability remains last.
+
+| ID | Priority | Live state | Surface | Next proof/action |
+|---|---:|---|---|---|
+| `elspeth-71b22759cc` | P1 | `triage` | Freeform planner | Preserve the earlier request when the latest empty-state turn is referential |
+| `elspeth-43208ece4c` | P1 | `triage` | Guided proposal revision | Collect the requested node/edge change instead of requiring an arbitrary mutation |
+| `elspeth-1345480bd7` | P1 | `triage` | Multi-query standard JSON | Send field names/types/enums before enforcing the output contract |
+| `elspeth-8ef90e59cc` | P2 | `triage` | Freeform schema progress | Keep provider-visible schema evidence aligned with the progress state |
+| `elspeth-68a2ff10aa` | P2 | `triage` | Planner repair escape hatch | Retain the final candidate whose remaining error must be repaired |
+| `elspeth-73c1af1562` | P2 | `triage` | Guided advisory chat | Provide graph structure or narrow the requested explanation |
+| `elspeth-b14aa70771` | P2 | `triage` | Run diagnostics | Preserve a safe failure classification through redaction and explanation |
+| `elspeth-cecfeca77b` | P2 | `triage` | EARLY advisor | Provide user intent or remove the unsupported fidelity obligation |
+| `elspeth-0502deb48c` | P1 | `triage` | Judge staging | Deferred: site-specific rationale is a release/supportability surface, after demo core |
 
 ## AWS installer — `elspeth-e54343d43b`
 
@@ -286,6 +307,8 @@ Append entries; do not rewrite history.
 | 2026-08-03 21:15 | Compose registry boundary integrated | Reviewed `e6b44424a` + provider follow-up `f82b5fee6` integrated as `86453aa5c` + `3ec1036d6`; 376 release-local tests passed, supported provider transforms retain exactly the three public terms, and `7bd0141bbe` advanced to verifying |
 | 2026-08-03 21:59 | Full-suite regression candidate approved | Two independent reviews approved `07f86af34` after one stale semantic-failure expectation was corrected; 499 boundary/authority tests, 626 service/guided tests, source-slice mypy, lints, and Wardline passed |
 | 2026-08-03 22:12 | Combined CI-equivalent gate passed and integrated | Exact candidate `07f86af34` completed `pytest tests/` with 36,982 passed, 66 skipped, and one expected trust-tier xfail in 12m15s; cherry-picked byte-identically as release `6844b684a`, then 375 release-local canaries passed |
+| 2026-08-03 22:16 | Structural index refreshed on durable release | Loomweave run `2881b4c0-e280-409d-9e52-93ff39b55b78` completed fresh at exact `23c1494a2` with 71,179 entities and 136,739 edges |
+| 2026-08-03 22:37 | Exhaustive provider-projection audit closed | Five independent read-only audits reconciled Loomweave with every production provider-call family; Filigree comment `2240` records thirteen residual links, nine new implementation issues, known-good boundaries, and no agent AWS mutation |
 
 ## Reconciliation findings
 
