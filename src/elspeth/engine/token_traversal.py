@@ -142,7 +142,12 @@ class TokenTraversalEngine:
                 transform_result=transform_result,
             )
         except MaxRetriesExceeded as e:
-            # All retries exhausted - return FAILED outcome
+            # Defensive backstop for test seams or future processor
+            # implementations that raise above Processor's audited conversion.
+            # RowProcessor._execute_transform_with_retry owns normal retry
+            # exhaustion and returns a routable error result; an exception that
+            # still reaches this boundary has no trustworthy on_error target in
+            # scope, so preserve the fail-closed UNROUTED/barrier-loss behavior.
             error_hash = compute_error_hash(str(e), exception_type=type(e).__name__)
             self._processor._data_flow.record_token_outcome(
                 ref=TokenRef(token_id=current_token.token_id, run_id=self._processor._run_id),
@@ -304,6 +309,11 @@ class TokenTraversalEngine:
             # historical reasons; do NOT extend that fallback to ROUTED_ON_ERROR
             # below — see the offensive guard in the routed branch.
             error_detail = str(transform_result.reason) if transform_result.reason else "unknown_error"
+            branch_loss_reason = (
+                "max_retries_exceeded"
+                if transform_result.reason is not None and transform_result.reason["reason"] == "retry_exhausted"
+                else f"quarantined:{error_detail}"
+            )
             quarantine_error_hash = compute_error_hash(error_detail)
             self._processor._data_flow.record_token_outcome(
                 ref=TokenRef(token_id=current_token.token_id, run_id=self._processor._run_id),
@@ -320,7 +330,7 @@ class TokenTraversalEngine:
             # Notify coalesce if this is a forked branch
             sibling_results = self._processor._notify_barrier_of_lost_branch(
                 current_token,
-                f"quarantined:{error_detail}",
+                branch_loss_reason,
                 child_items,
             )
             current_result = RowResult(
@@ -348,10 +358,13 @@ class TokenTraversalEngine:
                 "fabricate FailureInfo.message='unknown_error' for audit hashing"
             )
         error_detail = str(transform_result.reason)
+        branch_loss_reason = (
+            "max_retries_exceeded" if transform_result.reason["reason"] == "retry_exhausted" else f"error_routed:{error_detail}"
+        )
 
         sibling_results = self._processor._notify_barrier_of_lost_branch(
             current_token,
-            f"error_routed:{error_detail}",
+            branch_loss_reason,
             child_items,
         )
         # Capture the originating transform error so the audit trail records both

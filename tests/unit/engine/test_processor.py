@@ -74,6 +74,7 @@ from elspeth.engine.processor import (
     RowProcessor,
     _FlushContext,
     _LiveBarrierHold,
+    _TransformTerminal,
 )
 from elspeth.engine.retry import RetryManager
 from elspeth.engine.row_union_executor import RowUnionExecutor, RowUnionOutcome
@@ -7088,6 +7089,367 @@ class TestExecuteTransformNoRetry:
 
 class TestExecuteTransformWithRetry:
     """Tests for _execute_transform_with_retry when retry_manager IS configured."""
+
+    def test_exhaustion_returns_named_error_route_with_final_attempt_evidence(self) -> None:
+        """Exhausted retryable attempts retain the transform's on_error route.
+
+        Regression for elspeth-454892147c: MaxRetriesExceeded used to escape
+        this processor seam before ``on_error`` was returned, so traversal
+        could only terminalize the row as FAILURE/UNROUTED.
+        """
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        retry_manager = RetryManager(
+            RuntimeRetryConfig(
+                max_attempts=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0.0,
+                exponential_base=2.0,
+            )
+        )
+        processor = _make_processor(factory, retry_manager=retry_manager)
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+        seen_attempts: list[int] = []
+
+        def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+            attempt = kwargs["attempt"]
+            seen_attempts.append(attempt)
+            error = ConnectionError(f"connection reset on attempt {attempt}")
+            stamp_node_state_id(error, f"state-attempt-{attempt}")
+            raise error
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+            patch.object(factory.execution, "record_routing_event") as record_event,
+        ):
+            result, out_token, error_sink = processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
+
+        assert seen_attempts == [0, 1]
+        assert out_token is token
+        assert result.status == "error"
+        assert result.reason == {
+            "reason": "retry_exhausted",
+            "error": "connection reset on attempt 1",
+            "attempts": 2,
+        }
+        assert result.retryable is False
+        assert error_sink == "error-sink"
+        record_event.assert_called_once()
+        assert record_event.call_args.kwargs["state_id"] == "state-attempt-1"
+
+    def test_exhaustion_scrubs_final_error_before_result_and_audit(self) -> None:
+        """The underlying final exception is scrubbed before any durable use."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        retry_manager = RetryManager(
+            RuntimeRetryConfig(
+                max_attempts=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0.0,
+                exponential_base=2.0,
+            )
+        )
+        processor = _make_processor(factory, retry_manager=retry_manager)
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+        token = make_token_info(data={"value": 42})
+        ctx = make_context()
+        raw_secret = "https://blob.example/path?sig=ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+
+        def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+            attempt = kwargs["attempt"]
+            error = ConnectionError(f"provider failed: {raw_secret}")
+            stamp_node_state_id(error, f"state-attempt-{attempt}")
+            raise error
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+            patch.object(factory.execution, "record_routing_event") as record_event,
+        ):
+            result, _out_token, error_sink = processor._execute_transform_with_retry(
+                transform=transform,
+                token=token,
+                ctx=ctx,
+            )
+
+        assert result.reason == {
+            "reason": "retry_exhausted",
+            "error": "<redacted-secret>",
+            "attempts": 2,
+        }
+        assert error_sink == "error-sink"
+        assert raw_secret not in str(result.reason)
+        assert raw_secret not in str(record_event.call_args.kwargs["reason"])
+
+    def test_exhaustion_with_named_sink_and_missing_state_fails_closed(self) -> None:
+        """A named route may not fabricate DIVERT attribution without a state."""
+        _, factory = _make_factory()
+        retry_manager = Mock(spec=RetryManager)
+        retry_manager.execute_with_retry.side_effect = MaxRetriesExceeded(2, ConnectionError("connection reset"))
+        processor = _make_processor(factory, retry_manager=retry_manager)
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+
+        with pytest.raises(OrchestrationInvariantError, match="state_id is required"):
+            processor._execute_transform_with_retry(
+                transform=transform,
+                token=make_token_info(data={"value": 42}),
+                ctx=make_context(),
+            )
+
+    def test_exhaustion_does_not_misattribute_unstamped_final_attempt(self) -> None:
+        """A prior attempt's state cannot stand in for the final failure."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        processor = _make_processor(
+            factory,
+            retry_manager=RetryManager(
+                RuntimeRetryConfig(
+                    max_attempts=2,
+                    base_delay=0.01,
+                    max_delay=0.1,
+                    jitter=0.0,
+                    exponential_base=2.0,
+                )
+            ),
+        )
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+
+        def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+            attempt = kwargs["attempt"]
+            error = ConnectionError(f"connection reset on attempt {attempt}")
+            if attempt == 0:
+                stamp_node_state_id(error, "state-attempt-0")
+            raise error
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+            pytest.raises(OrchestrationInvariantError, match="state_id is required"),
+        ):
+            processor._execute_transform_with_retry(
+                transform=transform,
+                token=make_token_info(data={"value": 42}),
+                ctx=make_context(),
+            )
+
+    def test_exhaustion_with_named_sink_and_missing_edge_fails_closed(self) -> None:
+        """A named route may not emit half of its required audit pair."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        retry_manager = RetryManager(
+            RuntimeRetryConfig(
+                max_attempts=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0.0,
+                exponential_base=2.0,
+            )
+        )
+        processor = _make_processor(factory, retry_manager=retry_manager)
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+
+        def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+            attempt = kwargs["attempt"]
+            error = ConnectionError("connection reset")
+            stamp_node_state_id(error, f"state-attempt-{attempt}")
+            raise error
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+            pytest.raises(OrchestrationInvariantError, match="no DIVERT edge"),
+        ):
+            processor._execute_transform_with_retry(
+                transform=transform,
+                token=make_token_info(data={"value": 42}),
+                ctx=make_context(),
+            )
+
+    @pytest.mark.parametrize(
+        ("on_error", "expected_path", "expected_sink"),
+        [
+            ("error-sink", TerminalPath.ON_ERROR_ROUTED, "error-sink"),
+            ("discard", TerminalPath.QUARANTINED_AT_SOURCE, None),
+        ],
+    )
+    def test_exhaustion_routes_fork_branch_through_existing_loss_seam(
+        self,
+        on_error: str,
+        expected_path: TerminalPath,
+        expected_sink: str | None,
+    ) -> None:
+        """Every exhausted terminal route notifies coalesce instead of hanging."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        retry_manager = RetryManager(
+            RuntimeRetryConfig(
+                max_attempts=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0.0,
+                exponential_base=2.0,
+            )
+        )
+        coalesce = create_autospec(CoalesceExecutor, instance=True)
+        coalesce.notify_branch_lost.return_value = None
+        coalesce_name = CoalesceName("merge")
+        processor = _make_processor(
+            factory,
+            retry_manager=retry_manager,
+            coalesce_executor=coalesce,
+            branch_to_coalesce={BranchName("path_a"): coalesce_name},
+            coalesce_node_ids={coalesce_name: NodeID("coalesce::merge")},
+        )
+        processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+        transform = _make_mock_transform(node_id="t1", on_error=on_error)
+        token = make_token_info(data={"value": 42}, branch_name="path_a")
+        _persist_token_for_scheduler(factory, token)
+
+        def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+            attempt = kwargs["attempt"]
+            error = ConnectionError("connection reset")
+            stamp_node_state_id(error, f"state-attempt-{attempt}")
+            raise error
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+            patch.object(factory.execution, "record_routing_event"),
+        ):
+            outcome = processor._handle_transform_node(
+                transform=transform,
+                current_token=token,
+                ctx=make_context(),
+                node_id=NodeID("t1"),
+                child_items=[],
+                coalesce_node_id=NodeID("coalesce::merge"),
+                coalesce_name=coalesce_name,
+                current_on_success_sink="default",
+            )
+
+        assert isinstance(outcome, _TransformTerminal)
+        assert isinstance(outcome.result, RowResult)
+        assert (outcome.result.outcome, outcome.result.path, outcome.result.sink_name) == (
+            TerminalOutcome.FAILURE,
+            expected_path,
+            expected_sink,
+        )
+        coalesce.notify_branch_lost.assert_called_once_with(
+            coalesce_name="merge",
+            row_id=token.row_id,
+            lost_branch=token.branch_name,
+            reason="max_retries_exceeded",
+        )
+        assert len(processor._pending_branch_losses) == 1
+
+    def test_retry_configuration_does_not_change_named_error_destination(self) -> None:
+        """Retry-off and exhausted-retry paths produce the same route triple."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, no_retry_factory = _make_factory(run_id="run-no-retry")
+        no_retry = _make_processor(
+            no_retry_factory,
+            run_id="run-no-retry",
+            retry_manager=None,
+        )
+        _, retry_factory = _make_factory(run_id="run-with-retry")
+        with_retry = _make_processor(
+            retry_factory,
+            run_id="run-with-retry",
+            retry_manager=RetryManager(
+                RuntimeRetryConfig(
+                    max_attempts=2,
+                    base_delay=0.01,
+                    max_delay=0.1,
+                    jitter=0.0,
+                    exponential_base=2.0,
+                )
+            ),
+        )
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+        token = make_token_info(data={"value": 42})
+
+        def route_triple(processor: RowProcessor, factory: RecorderFactory) -> tuple[TerminalOutcome | None, TerminalPath, str | None]:
+            processor._error_edge_ids = {NodeID("t1"): "error-edge-1"}
+
+            def fail_attempt(**kwargs: Any) -> tuple[TransformResult, TokenInfo, str | None]:
+                attempt = kwargs["attempt"]
+                error = ConnectionError("same connection failure")
+                stamp_node_state_id(error, f"state-attempt-{attempt}")
+                raise error
+
+            with (
+                patch.object(processor._transform_executor, "execute_transform", side_effect=fail_attempt),
+                patch.object(factory.execution, "record_routing_event"),
+            ):
+                outcome = processor._handle_transform_node(
+                    transform=transform,
+                    current_token=token,
+                    ctx=make_context(run_id=processor.run_id),
+                    node_id=NodeID("t1"),
+                    child_items=[],
+                    coalesce_node_id=None,
+                    coalesce_name=None,
+                    current_on_success_sink="default",
+                )
+            assert isinstance(outcome, _TransformTerminal)
+            assert isinstance(outcome.result, RowResult)
+            return outcome.result.outcome, outcome.result.path, outcome.result.sink_name
+
+        assert (
+            route_triple(no_retry, no_retry_factory)
+            == route_triple(with_retry, retry_factory)
+            == (
+                TerminalOutcome.FAILURE,
+                TerminalPath.ON_ERROR_ROUTED,
+                "error-sink",
+            )
+        )
+
+    def test_non_retryable_exception_still_propagates_unchanged(self) -> None:
+        """The new exhaustion arm does not intercept non-retryable failures."""
+        from elspeth.contracts.config import RuntimeRetryConfig
+
+        _, factory = _make_factory()
+        processor = _make_processor(
+            factory,
+            retry_manager=RetryManager(
+                RuntimeRetryConfig(
+                    max_attempts=2,
+                    base_delay=0.01,
+                    max_delay=0.1,
+                    jitter=0.0,
+                    exponential_base=2.0,
+                )
+            ),
+        )
+        transform = _make_mock_transform(node_id="t1", on_error="error-sink")
+        non_retryable = TypeError("plugin contract bug")
+
+        with (
+            patch.object(processor._transform_executor, "execute_transform", side_effect=non_retryable),
+            pytest.raises(TypeError, match="plugin contract bug") as exc_info,
+        ):
+            processor._execute_transform_with_retry(
+                transform=transform,
+                token=make_token_info(data={"value": 42}),
+                ctx=make_context(),
+            )
+
+        assert exc_info.value is non_retryable
 
     def test_delegates_to_retry_manager(self) -> None:
         """With retry_manager, delegates to execute_with_retry."""

@@ -12,19 +12,36 @@ This verifies the full retry audit chain:
 5. node_states table has `attempt` column with correct values
 """
 
+import json
 from typing import Any
 
 import pytest
 from sqlalchemy import select
 
-from elspeth.contracts import Determinism, NodeType, PluginSchema, RunStatus, TokenInfo, TransformResult
+from elspeth.contracts import (
+    Determinism,
+    NodeType,
+    PluginSchema,
+    RunStatus,
+    TerminalOutcome,
+    TerminalPath,
+    TokenInfo,
+    TransformResult,
+)
 from elspeth.contracts.config import RuntimeRetryConfig
 from elspeth.contracts.contexts import TransformContext
 from elspeth.contracts.errors import MaxRetriesExceeded
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.core.config import ElspethSettings, RetrySettings, SinkSettings, SourceSettings, TransformSettings
+from elspeth.core.dag import ExecutionGraph
+from elspeth.core.dag.wiring import WiredTransform
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import node_states_table
+from elspeth.core.landscape.schema import (
+    node_states_table,
+    routing_events_table,
+    token_outcomes_table,
+    transform_errors_table,
+)
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.executors import TransformExecutor
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
@@ -36,6 +53,7 @@ from tests.fixtures.base_classes import as_sink, as_source, as_transform
 from tests.fixtures.factories import make_context
 from tests.fixtures.landscape import make_factory, make_landscape_db
 from tests.fixtures.pipeline import build_linear_pipeline
+from tests.fixtures.plugins import CollectSink, FailingSink, ListSource
 
 
 def _make_contract(data: dict[str, Any]) -> SchemaContract:
@@ -99,6 +117,179 @@ class AlwaysFailTransform(BaseTransform):
         """Always fail with retryable error."""
         self.fail_count += 1
         raise ConnectionError(f"Permanent failure attempt {self.fail_count}")
+
+
+def _build_retry_exhaustion_pipeline(
+    *,
+    on_error: str,
+    error_sink: CollectSink | None = None,
+) -> tuple[ListSource, AlwaysFailTransform, dict[str, CollectSink], ExecutionGraph, ElspethSettings, PipelineConfig]:
+    """Build the production graph/config pair for retry-exhaustion routing."""
+    source_name = "retry_source"
+    source_connection = "retry_source_out"
+    source = ListSource([{"id": 7, "amount": "250.00"}], name="retry_source_plugin", on_success=source_connection)
+    transform = AlwaysFailTransform({})
+    transform.on_success = "output"
+    transform.on_error = on_error
+    transform_settings = TransformSettings(
+        name="always_fail",
+        plugin=transform.name,
+        input=source_connection,
+        on_success="output",
+        on_error=on_error,
+        options={},
+    )
+    source_settings = SourceSettings(plugin=source.name, on_success=source_connection, options={})
+    sinks = {
+        "output": CollectSink("output"),
+        "quarantine": error_sink or CollectSink("quarantine"),
+    }
+    graph = ExecutionGraph.from_plugin_instances(
+        sources={source_name: as_source(source)},
+        source_settings_map={source_name: source_settings},
+        transforms=[WiredTransform(plugin=as_transform(transform), settings=transform_settings)],
+        sinks={name: as_sink(sink) for name, sink in sinks.items()},
+        aggregations={},
+        gates=[],
+    )
+    settings = ElspethSettings(
+        sources={source_name: source_settings},
+        transforms=[transform_settings],
+        sinks={name: SinkSettings(plugin=sink.name, options={}, on_write_failure="discard") for name, sink in sinks.items()},
+        retry=RetrySettings(
+            max_attempts=2,
+            initial_delay_seconds=0.01,
+            max_delay_seconds=0.1,
+            exponential_base=2.0,
+        ),
+    )
+    config = PipelineConfig(
+        sources={source_name: as_source(source)},
+        transforms=[as_transform(transform)],
+        sinks={name: as_sink(sink) for name, sink in sinks.items()},
+    )
+    return source, transform, sinks, graph, settings, config
+
+
+def test_retry_exhaustion_routes_original_row_once_with_linked_audit_evidence(tmp_path: Any) -> None:
+    """A named on_error sink remains authoritative after retry exhaustion."""
+    db = make_landscape_db()
+    payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+    _source, transform, sinks, graph, settings, config = _build_retry_exhaustion_pipeline(on_error="quarantine")
+
+    result = Orchestrator(db).run(
+        config,
+        graph=graph,
+        settings=settings,
+        payload_store=payload_store,
+        openrouter_catalog_sha256="0" * 64,
+        openrouter_catalog_source="bundled",
+    )
+
+    assert result.status is RunStatus.FAILED
+    assert result.rows_processed == 1
+    assert result.rows_failed == 1
+    assert transform.fail_count == 2
+    assert sinks["output"].results == []
+    assert sinks["quarantine"].results == [{"id": 7, "amount": "250.00"}]
+    assert transform.node_id is not None
+
+    with db.engine.connect() as conn:
+        [outcome] = conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.run_id == result.run_id)).all()
+        states = conn.execute(
+            select(node_states_table)
+            .where(node_states_table.c.run_id == result.run_id)
+            .where(node_states_table.c.node_id == transform.node_id)
+            .order_by(node_states_table.c.attempt)
+        ).all()
+        [transform_error] = conn.execute(select(transform_errors_table).where(transform_errors_table.c.run_id == result.run_id)).all()
+        [routing_event] = conn.execute(select(routing_events_table).where(routing_events_table.c.run_id == result.run_id)).all()
+
+    assert (outcome.outcome, outcome.path, outcome.sink_name, outcome.completed) == (
+        TerminalOutcome.FAILURE.value,
+        TerminalPath.ON_ERROR_ROUTED.value,
+        "quarantine",
+        1,
+    )
+    assert [state.attempt for state in states] == [0, 1]
+    assert [state.status for state in states] == ["failed", "failed"]
+    assert routing_event.state_id == states[-1].state_id
+    assert routing_event.mode == "divert"
+    assert transform_error.token_id == outcome.token_id
+    assert transform_error.destination == "quarantine"
+    assert json.loads(transform_error.row_data_json) == {"id": 7, "amount": "250.00"}
+    assert json.loads(transform_error.error_details_json) == {
+        "reason": "retry_exhausted",
+        "error": "Permanent failure attempt 2",
+        "attempts": 2,
+    }
+
+
+def test_retry_exhaustion_discard_preserves_audited_discard_semantics(tmp_path: Any) -> None:
+    """Discard remains terminal and audited without fabricating a DIVERT edge."""
+    db = make_landscape_db()
+    payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+    _source, transform, sinks, graph, settings, config = _build_retry_exhaustion_pipeline(on_error="discard")
+
+    result = Orchestrator(db).run(
+        config,
+        graph=graph,
+        settings=settings,
+        payload_store=payload_store,
+        openrouter_catalog_sha256="0" * 64,
+        openrouter_catalog_source="bundled",
+    )
+
+    assert result.status is RunStatus.COMPLETED_WITH_FAILURES
+    assert result.rows_processed == 1
+    assert result.rows_failed == 1
+    assert transform.fail_count == 2
+    assert sinks["output"].results == []
+    assert sinks["quarantine"].results == []
+
+    with db.engine.connect() as conn:
+        [outcome] = conn.execute(select(token_outcomes_table).where(token_outcomes_table.c.run_id == result.run_id)).all()
+        [transform_error] = conn.execute(select(transform_errors_table).where(transform_errors_table.c.run_id == result.run_id)).all()
+        routing_events = conn.execute(select(routing_events_table).where(routing_events_table.c.run_id == result.run_id)).all()
+
+    assert (outcome.outcome, outcome.path, outcome.sink_name, outcome.completed) == (
+        TerminalOutcome.FAILURE.value,
+        TerminalPath.QUARANTINED_AT_SOURCE.value,
+        None,
+        1,
+    )
+    assert transform_error.destination == "discard"
+    assert json.loads(transform_error.error_details_json) == {
+        "reason": "retry_exhausted",
+        "error": "Permanent failure attempt 2",
+        "attempts": 2,
+    }
+    assert routing_events == []
+
+
+def test_retry_exhaustion_error_sink_failure_keeps_publication_failure_primacy(tmp_path: Any) -> None:
+    """A failed error-sink publication still propagates the sink failure."""
+    db = make_landscape_db()
+    payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+    failing_sink = FailingSink("quarantine", error_message="error sink unavailable")
+    _source, transform, sinks, graph, settings, config = _build_retry_exhaustion_pipeline(
+        on_error="quarantine",
+        error_sink=failing_sink,
+    )
+
+    with pytest.raises(RuntimeError, match="error sink unavailable"):
+        Orchestrator(db).run(
+            config,
+            graph=graph,
+            settings=settings,
+            payload_store=payload_store,
+            openrouter_catalog_sha256="0" * 64,
+            openrouter_catalog_source="bundled",
+        )
+
+    assert transform.fail_count == 2
+    assert sinks["output"].results == []
+    assert sinks["quarantine"].results == []
 
 
 class TestRetryAuditTrail:

@@ -112,6 +112,7 @@ from elspeth.contracts.errors import (
     CapacityError,
     ExecutionError,
     FrameworkBugError,
+    MaxRetriesExceeded,
     OrchestrationInvariantError,
     PassThroughContractViolation,
     PluginContractViolation,
@@ -1886,7 +1887,7 @@ class RowProcessor:
 
     def _convert_retryable_to_error_result(
         self,
-        exc: Exception,
+        exc: BaseException,
         transform: Any,
         token: TokenInfo,
         ctx: Any,
@@ -1894,13 +1895,15 @@ class RowProcessor:
         *,
         state_id: str | None,
         retryable: bool = True,
+        attempts: int | None = None,
     ) -> tuple[TransformResult, TokenInfo, str | None]:
-        """Convert a retryable exception to a TransformResult.error when no retry manager is configured.
+        """Convert a retryable exception into a routable transform error.
 
         Shared handler for PluginRetryableError (retryable) and transient exceptions
-        (ConnectionError, TimeoutError, OSError, CapacityError). Records the
-        error in the audit trail and emits a DIVERT routing event if on_error
-        routes to a sink.
+        (ConnectionError, TimeoutError, OSError, CapacityError), including
+        shutdown and retry-exhaustion dispositions. Records the error in the
+        audit trail and emits a DIVERT routing event if on_error routes to a
+        sink.
 
         ``state_id`` is the failed attempt's node-state id, carried out of the
         executor on the exception via NodeStateGuard's stamp (ctx.state_id is
@@ -1917,6 +1920,8 @@ class RowProcessor:
             )
 
         error_details: TransformErrorReason = {"reason": reason, "error": scrub_text_for_audit(str(exc))}
+        if attempts is not None:
+            error_details["attempts"] = attempts
         # Shared error-audit routine (elspeth-aeb0a8f756): identical
         # transform_error + DIVERT routing_event recording as the executor's
         # error-result branch. Here the guard already auto-failed the state on
@@ -2056,6 +2061,13 @@ class RowProcessor:
         def execute_attempt() -> tuple[TransformResult, TokenInfo, str | None]:
             attempt = attempt_tracker["current"]
             attempt_tracker["current"] += 1
+            # The state id belongs to this attempt, never merely the most
+            # recent stamped attempt. Keep it across RetryManager backoff so a
+            # shutdown there can cite the attempt that just failed, but clear
+            # it once the next plugin invocation actually begins. An
+            # unstamped final failure must fail closed rather than attach its
+            # DIVERT to an earlier attempt.
+            state_tracker["last_failed_state_id"] = None
             try:
                 return self._transform_executor.execute_transform(
                     transform=transform,
@@ -2102,6 +2114,17 @@ class RowProcessor:
                 # last failed attempt's state is the divert attribution point.
                 state_id=state_id,
                 retryable=False,
+            )
+        except MaxRetriesExceeded as e:
+            return self._convert_retryable_to_error_result(
+                e.last_error,
+                transform,
+                token,
+                ctx,
+                reason="retry_exhausted",
+                state_id=state_tracker["last_failed_state_id"],
+                retryable=False,
+                attempts=e.attempts,
             )
 
     def _record_source_node_state(

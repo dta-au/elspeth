@@ -493,6 +493,7 @@ TransformErrorCategory = Literal[
     "llm_call_failed",
     "network_error",
     "permanent_error",
+    "retry_exhausted",  # Engine retry budget exhausted; final underlying error is preserved
     "retry_timeout",
     "transient_error_no_retry",  # Transient error (connection/timeout) but retry disabled
     # Field/validation errors
@@ -662,6 +663,7 @@ class TransformErrorReason(TypedDict):
         skipped_reasons: Structured reasons for candidate hits rejected before final output
 
     Rate limiting/timeout context:
+        attempts: Total attempts made before an engine retry budget was exhausted
         elapsed_seconds: Time elapsed before timeout
         max_seconds: Maximum allowed time
         status_code: HTTP status code
@@ -776,6 +778,7 @@ class TransformErrorReason(TypedDict):
     violations: NotRequired[list[dict[str, Any]]]
 
     # Rate limiting/timeout context
+    attempts: NotRequired[int]  # Total attempts made before the engine retry budget was exhausted
     elapsed_seconds: NotRequired[float]
     max_seconds: NotRequired[float]
     elapsed_hours: NotRequired[float]  # Batch timeout (hours scale)
