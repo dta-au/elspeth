@@ -6,6 +6,14 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import type { RunDiagnostics } from "@/types/index";
 
+const TEXTRACT_S3_UNREADABLE_HINT =
+  "Amazon Textract could not read the S3 object. Most commonly the object is outside the " +
+  "S3 read scope granted to the pipeline's AWS role (check the role's s3:GetObject prefix " +
+  "against the document's bucket/key and, when version_field is configured, its " +
+  "s3:GetObjectVersion permission); it can also mean the object does not exist or is stored " +
+  "in a different region than the Textract endpoint. Verify access scope before suspecting " +
+  "a corrupt or unsupported file.";
+
 vi.mock("@/components/inspector/RunOutputsPanel", () => ({
   RunOutputsPanel: ({ runId }: { runId: string }) => (
     <div data-testid="run-outputs-panel" data-run-id={runId} />
@@ -329,8 +337,7 @@ describe("RunsHistoryDrawer", () => {
       error_type: "service_error",
       code: "InvalidS3ObjectException",
       cause: "s3_object_unreadable",
-      error:
-        "Amazon Textract could not read the S3 object. Check the task role's s3:GetObject prefix and s3:GetObjectVersion permission.",
+      error: TEXTRACT_S3_UNREADABLE_HINT,
     };
     useExecutionStore.setState({
       runs: [{ id: "r2", status: "completed_with_failures" } as never],
@@ -346,10 +353,82 @@ describe("RunsHistoryDrawer", () => {
     );
     expect(failure).toHaveTextContent("Reason: submit_failed");
     expect(failure).toHaveTextContent("Cause: s3_object_unreadable");
-    expect(failure).toHaveTextContent(
-      "Check the task role's s3:GetObject prefix and s3:GetObjectVersion permission.",
-    );
+    expect(failure).toHaveTextContent(TEXTRACT_S3_UNREADABLE_HINT);
     expect(failure).not.toHaveTextContent("service_error");
+  });
+
+  it("rejects malformed diagnostic identifiers and falls back to the next valid field", async () => {
+    const diagnostics = makeDiagnostics({ failure_detail: null });
+    diagnostics.tokens[0].states[0].node_id = "content_safety";
+    diagnostics.tokens[0].states[0].error = {
+      code: "Invalid S3 Object<script>",
+      error_type: "guardrail_service_error",
+      reason: "api_error\nforged",
+      cause: "provider_rejected",
+    };
+    useExecutionStore.setState({
+      diagnosticsByRunId: { r2: diagnostics },
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+
+    const failure = screen.getByTestId("run-state-failure-state-1");
+    expect(failure).toHaveTextContent(
+      "content_safety failed - guardrail_service_error",
+    );
+    expect(failure).toHaveTextContent("Cause: provider_rejected");
+    expect(failure).not.toHaveTextContent("Invalid S3 Object");
+    expect(failure).not.toHaveTextContent("forged");
+  });
+
+  it("rejects oversized identifiers before selecting a fallback label", async () => {
+    const oversizedCode = "A".repeat(129);
+    const oversizedErrorType = "b".repeat(129);
+    const diagnostics = makeDiagnostics({ failure_detail: null });
+    diagnostics.tokens[0].states[0].node_id = "transform_textract";
+    diagnostics.tokens[0].states[0].error = {
+      code: oversizedCode,
+      error_type: oversizedErrorType,
+      reason: "submit_failed",
+    };
+    useExecutionStore.setState({
+      diagnosticsByRunId: { r2: diagnostics },
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+
+    const failure = screen.getByTestId("run-state-failure-state-1");
+    expect(failure).toHaveTextContent("transform_textract failed - submit_failed");
+    expect(failure).not.toHaveTextContent(oversizedCode);
+    expect(failure).not.toHaveTextContent(oversizedErrorType);
+  });
+
+  it("rejects a forged S3-unreadable tuple with arbitrary free text", async () => {
+    const forgedHint =
+      "Amazon Textract could not read the S3 object. Most commonly the object is outside the arbitrary provider text.";
+    const diagnostics = makeDiagnostics({ failure_detail: null });
+    diagnostics.tokens[0].states[0].node_id = "transform_textract";
+    diagnostics.tokens[0].states[0].error = {
+      reason: "submit_failed",
+      error_type: "service_error",
+      code: "InvalidS3ObjectException",
+      cause: "s3_object_unreadable",
+      error: forgedHint,
+    };
+    useExecutionStore.setState({
+      diagnosticsByRunId: { r2: diagnostics },
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+
+    const failure = screen.getByTestId("run-state-failure-state-1");
+    expect(failure).toHaveTextContent(
+      "transform_textract failed - InvalidS3ObjectException",
+    );
+    expect(failure).not.toHaveTextContent("arbitrary provider text");
   });
 
   it("names the failed node and falls back to error_type without a provider code", async () => {

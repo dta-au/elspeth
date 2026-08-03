@@ -116,10 +116,54 @@ interface VisibleStateFailure {
   hint: string | null;
 }
 
-function nonEmptyDiagnosticText(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const text = value.trim();
-  return text.length > 0 ? text : null;
+// Mirrors the repository's audit-export identifier boundary: one ASCII
+// alphanumeric followed by at most 127 ASCII alphanumeric/code punctuation
+// characters. Diagnostic identifiers are rendered verbatim, so whitespace,
+// markup, control characters, and unbounded provider text are never admitted.
+const DIAGNOSTIC_IDENTIFIER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const TEXTRACT_S3_UNREADABLE_HINT_MAX_CHARS = 512;
+const TEXTRACT_S3_UNREADABLE_HINT_PREFIX =
+  "Amazon Textract could not read the S3 object. Most commonly the object is outside the ";
+const TEXTRACT_S3_UNREADABLE_HINT =
+  TEXTRACT_S3_UNREADABLE_HINT_PREFIX +
+  "S3 read scope granted to the pipeline's AWS role (check the role's s3:GetObject prefix " +
+  "against the document's bucket/key and, when version_field is configured, its " +
+  "s3:GetObjectVersion permission); it can also mean the object does not exist or is stored " +
+  "in a different region than the Textract endpoint. Verify access scope before suspecting " +
+  "a corrupt or unsupported file.";
+
+function safeDiagnosticIdentifier(value: unknown): string | null {
+  return typeof value === "string" && DIAGNOSTIC_IDENTIFIER_PATTERN.test(value)
+    ? value
+    : null;
+}
+
+function safeTextractS3UnreadableHint({
+  code,
+  errorType,
+  reason,
+  cause,
+  error,
+}: {
+  code: string | null;
+  errorType: string | null;
+  reason: string | null;
+  cause: string | null;
+  error: unknown;
+}): string | null {
+  if (
+    code !== "InvalidS3ObjectException" ||
+    errorType !== "service_error" ||
+    reason !== "submit_failed" ||
+    cause !== "s3_object_unreadable" ||
+    typeof error !== "string" ||
+    error.length > TEXTRACT_S3_UNREADABLE_HINT_MAX_CHARS ||
+    !error.startsWith(TEXTRACT_S3_UNREADABLE_HINT_PREFIX) ||
+    error !== TEXTRACT_S3_UNREADABLE_HINT
+  ) {
+    return null;
+  }
+  return error;
 }
 
 function visibleStateFailure(error: unknown): VisibleStateFailure | null {
@@ -128,14 +172,17 @@ function visibleStateFailure(error: unknown): VisibleStateFailure | null {
   }
 
   const record = error as Record<string, unknown>;
-  const code = nonEmptyDiagnosticText(record.code);
-  const errorType = nonEmptyDiagnosticText(record.error_type);
-  const reason = nonEmptyDiagnosticText(record.reason);
-  const cause = nonEmptyDiagnosticText(record.cause);
-  const hint =
-    code === "InvalidS3ObjectException" && cause === "s3_object_unreadable"
-      ? nonEmptyDiagnosticText(record.error)
-      : null;
+  const code = safeDiagnosticIdentifier(record.code);
+  const errorType = safeDiagnosticIdentifier(record.error_type);
+  const reason = safeDiagnosticIdentifier(record.reason);
+  const cause = safeDiagnosticIdentifier(record.cause);
+  const hint = safeTextractS3UnreadableHint({
+    code,
+    errorType,
+    reason,
+    cause,
+    error: record.error,
+  });
 
   if (code === null && errorType === null && reason === null && cause === null && hint === null) {
     return null;
