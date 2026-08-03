@@ -32,6 +32,14 @@ describe("auditCharacteristics metadata", () => {
     expect(lookupAuditCharacteristic("signed")).not.toBeNull();
   });
 
+  it("describes coerce as typed-schema capability, not observed-mode behavior", () => {
+    const meta = lookupAuditCharacteristic("coerce");
+    expect(meta).not.toBeNull();
+    expect(meta?.label).toBe("can coerce types");
+    expect(meta?.tooltip).toMatch(/fixed.*flexible.*declared/i);
+    expect(meta?.tooltip).toMatch(/observed.*string/i);
+  });
+
   it("io_write has informational tone (not attention)", () => {
     const meta = lookupAuditCharacteristic("io_write");
     expect(meta).not.toBeNull();

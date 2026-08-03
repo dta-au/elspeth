@@ -160,12 +160,13 @@ export const AUDIT_CHARACTERISTICS: AuditCharacteristicMeta[] = [
   },
   {
     flag: "coerce",
-    label: "coerces types",
+    label: "can coerce types",
     glyph: "↔",
     tooltip:
-      "Plugin coerces external string-typed cells to typed columns at the " +
-      "Tier-3 boundary (e.g., \"42\" → 42). Coercion is meaning-preserving; " +
-      "fabrication is not. See CLAUDE.md \"Data Manifesto\" for the rule.",
+      "With a fixed or flexible schema, the plugin can coerce external " +
+      "string-typed cells to declared column types at the Tier-3 boundary " +
+      "(e.g., \"42\" → 42). Observed schemas have no declared types, so " +
+      "CSV cells remain strings.",
     tone: "positive",
   },
   {

@@ -2,8 +2,9 @@
 
 Loads rows from CSV files using csv.reader for proper multiline quoted field support.
 
-IMPORTANT: Sources use allow_coercion=True to normalize external data.
-This is the ONLY place in the pipeline where coercion is allowed.
+IMPORTANT: Sources may use allow_coercion=True to normalize external data.
+For CSV, only fixed and flexible schemas declare types to coerce into;
+observed schemas preserve parsed cells as strings.
 """
 
 import codecs
@@ -85,14 +86,14 @@ class CSVSource(BaseSource):
     name = "csv"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:543438de65eb3ce8"
+    source_file_hash: str | None = "sha256:aee7c027b2711f86"
     config_model = CSVSourceConfig
     # Override parent type - SourceDataConfig requires this to be set
     _on_validation_failure: str
 
     usage_when_to_use: str = (
-        "Use for a finite tabular file that should be read incrementally, with type coercion at the source boundary and "
-        "optional quarantine routing for invalid records."
+        "Use for a finite tabular file that should be read incrementally. Observed schemas preserve CSV cells as strings; "
+        "fixed and flexible schemas can coerce declared columns at the source boundary. Invalid records can be quarantined."
     )
     usage_when_not_to_use: str = (
         "Do not use for inline records, live or unbounded streams, or direct HTTP input; materialize a bounded CSV file first."
@@ -112,9 +113,10 @@ class CSVSource(BaseSource):
     audit_characteristics: DeclaredAuditCharacteristics = frozenset({AuditCharacteristic.COERCE, AuditCharacteristic.QUARANTINE})
     # "io_read" is *inferred* by the catalog service from
     # determinism=IO_READ. "coerce" and "quarantine" are declared here:
-    #   - "coerce" describes the CSV source's Tier-3 boundary behaviour
-    #     (string cells -> typed columns) and cannot be inferred from
-    #     determinism alone.
+    #   - "coerce" describes the CSV source's Tier-3 boundary capability:
+    #     fixed/flexible schemas coerce string cells into declared column
+    #     types, while observed schemas preserve strings. This capability
+    #     cannot be inferred from determinism alone.
     #   - "quarantine" describes the runtime behaviour configured via
     #     `on_validation_failure`. The catalog service cannot infer this
     #     from the class because `_on_validation_failure` is a
@@ -146,8 +148,9 @@ class CSVSource(BaseSource):
         self._on_validation_failure = cfg.on_validation_failure
         # on_success is injected by the instantiation bridge (runtime_factory.py)
 
-        # CRITICAL: allow_coercion=True for sources (external data boundary)
-        # Sources are the ONLY place where type coercion is allowed
+        # CSV may coerce at this Tier-3 source boundary, but only explicit
+        # fixed/flexible fields provide target types. Observed mode has no
+        # declared types, so its cells remain strings.
         self._schema_class: type[PluginSchema] = create_schema_from_config(
             self._schema_config,
             "CSVRowSchema",
@@ -646,7 +649,10 @@ class CSVSource(BaseSource):
             return PluginAssistance(
                 plugin_name="csv",
                 issue_code=None,
-                summary="Load tabular data from a CSV file. Coerces strings to declared types at the Tier-3 boundary; quarantines malformed rows.",
+                summary=(
+                    "Load tabular data from a CSV file. Observed schemas preserve cells as strings; fixed and flexible "
+                    "schemas coerce declared fields at the Tier-3 boundary. Malformed rows can be quarantined."
+                ),
                 composer_hints=(
                     "Default schema.mode to 'observed' unless the user explicitly asked to project to a smaller schema.",
                     "Call inspect_source before declaring schema.mode: 'fixed' — fixed mode silently drops rows that don't match.",
