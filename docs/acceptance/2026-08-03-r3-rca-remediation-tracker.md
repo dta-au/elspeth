@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-03T20:50:00+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-03T20:50:00+10:00
-Release baseline: `release/0.7.2@45476f021`
+Last refreshed: 2026-08-03T21:15:46+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-03T21:15:46+10:00
+Release baseline: `release/0.7.2@3ec1036d6`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -40,10 +40,10 @@ shell mechanics remains deferred even when it blocks a fresh install.
 
 | State | Objective 44 | Additional 10 | Meaning |
 |---|---:|---:|---|
-| Closed | 8 | 6 | Tracker says done; closure evidence is still sampled during the completion audit |
-| Verifying | 16 | 2 | Locally fixed; live or requirement-specific acceptance remains |
-| Fixing | 2 | 0 | Owned bug implementation is still in flight |
-| In progress | 0 | 1 | A delivery task spanning existing objective defects is in flight |
+| Closed | 8 | 7 | Tracker says done; closure evidence is still sampled during the completion audit |
+| Verifying | 17 | 2 | Locally fixed; live or requirement-specific acceptance remains |
+| Fixing | 1 | 0 | Owned bug implementation is still in flight |
+| In progress | 0 | 0 | A delivery task spanning existing objective defects is in flight |
 | Open | 6 | 1 | Confirmed task/epic work not yet started here |
 | Triage | 9 | 0 | Root cause and reproducibility must be checked against current HEAD before fixing |
 | Proposed | 3 | 0 | Regression-gate features require approval/acceptance design before implementation |
@@ -66,7 +66,7 @@ claim custody.
 
 | Agent | Scope | Worktree/branch | File custody | AWS authority | Status |
 |---|---|---|---|---|---|
-| `/root` | Integration, tracker custody, compose-registry write-boundary repair, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`); `.claude/worktrees/compose-registry-boundary` (`codex/fix-compose-registry-boundary`) | This tracker plus the isolated registry admission/schema/state/skill files | Sole mutation custodian | Active; registry RED established and localized fix under test |
+| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`) | This tracker; registry worktree released after integration | Sole mutation custodian | Active; advisor timeout and registry chains reviewed, integrated, and release-tested; combined release gates next |
 | `/root/audit_advisor_demo` | D1-D6 and advisor/F14 completion evidence | Shared read-only baseline | None | None | Completed; no residual local code defect found |
 | `/root/audit_compose_loop` | Six compose-loop RCAs and implementation partitioning | Shared read-only baseline | None | None | Completed; all six remain actionable |
 | `/root/audit_gate_routing` | Closed/verifying routing audit plus residual routing RCAs | Shared read-only baseline | None | None | Completed; two residual and one new P1 confirmed |
@@ -87,7 +87,7 @@ claim custody.
 | `/root/impl_frontend_readiness_axes` | Apply backend readiness axes to every frontend action | `.claude/worktrees/frontend-readiness-axes`; `codex/fix-frontend-readiness-axes` | Released after integration | None | Complete; integrated through `9016ce6a6`, exact release rerun 148 passed, task closed |
 | `/root/impl_guided_plan_terminal_progress` | Settle terminal progress for every guided-plan outcome | `.claude/worktrees/guided-plan-terminal-progress`; `codex/fix-guided-plan-terminal-progress` | Released after integration | None | Complete through `859c2a642`; independent adversarial review clean, 87 progress/guided-plan plus 10 chat-custody release tests passed, task closed |
 | `/root/impl_guided_gate_proof_validation` | Make source-proof diagnostics authoritative during guided confirmation | `.claude/worktrees/guided-gate-proof-validation`; `codex/fix-guided-gate-proof-validation` | Released after integration | None | Complete through `39c7fc635`; final lifecycle/custody review clean and 512 release-checkout execution/redaction/guided tests passed; live guided acceptance remains |
-| `/root/impl_advisor_surface_deadline` | Close successful re-review leakage, bind checkpoints to the compose deadline, and preserve truthful tool-timeout counters | `.claude/worktrees/advisor-surface-deadline` (`codex/fix-advisor-surface-deadline`); `.claude/worktrees/advisor-tool-timeout-counters` (`codex/fix-advisor-tool-timeout-counters`) | Advisor surface/deadline files released after integration; fresh lane owns `tool_batch.py` plus the exact service/audit carrier seam | None | D3/deadline chain integrated through `4f70a3619`; fresh timeout-counter RED proves P3 raises before P4 can persist the failed turn; surgical implementation active |
+| `/root/impl_advisor_surface_deadline` | Close successful re-review leakage, bind checkpoints to the compose deadline, and preserve truthful tool-timeout counters | `.claude/worktrees/advisor-surface-deadline` (`codex/fix-advisor-surface-deadline`); `.claude/worktrees/advisor-tool-timeout-counters` (`codex/fix-advisor-tool-timeout-counters`) | Released after reviewed integration | None | Complete through `a913ccb63`; independent follow-up review clean, 79 release-local advisor/persistence tests passed, task closed |
 | `/root/impl_guided_selected_node_custody` | Preserve selected-node hidden state and reuse form rewind for wire edits | `.claude/worktrees/guided-selected-node-custody`; `codex/fix-guided-selected-node-custody` | Released after reviewed integration | None | Complete as `e2bc8c5e3` + `45476f021`; 32 backend and 220 frontend reviewer tests plus 19 release-local backend canaries passed; task closed |
 
 No subagent may mutate AWS or the shared release checkout during this wave.
@@ -99,7 +99,7 @@ Parent workstream state:
 | Parent record | Live state | Immediate coordination action |
 |---|---|---|
 | `elspeth-7ffd77deca` — advisor gate | `verifying` | Run the merged D1-D6 acceptance matrix on one deployed candidate |
-| `elspeth-7da4e52344` — compose loop | `fixing` | Finish the active advisor timeout carrier and compose-registry first-write-boundary lanes, then run combined acceptance |
+| `elspeth-7da4e52344` — compose loop | `fixing` | Advisor timeout and registry lanes are integrated; run combined release gates and deployed acceptance |
 | `elspeth-e7ff15ac0b` — gate routing | `open` | Reconcile five closed, five verifying, and two residual children |
 | `elspeth-e54343d43b` — AWS installer | `open` | Hold implementation until demo-aware product/system work is accepted; only deconflict existing owners in the meantime |
 
@@ -122,11 +122,11 @@ Parent workstream state:
 | `elspeth-981130d70a` | P1 | `verifying` | `codex-compose-required-controls` | Integrated through `32cec3d8a`; prove required controls appear before consent on the deployed freeform path, including named/multiple blob sources |
 | `elspeth-cd98ea9d82` | P1 | `verifying` | `codex-rca-compose-request-correlation` | Integrated through `39c6b14a7`; verify body/header/log equality in deployed CloudWatch events |
 | `elspeth-f159d2394b` | P2 | `confirmed` | unassigned | Core seconds-per-logical-turn premise disproved; defer Terraform/operator timeout tuning as setup ergonomics |
-| `elspeth-7bd0141bbe` | P2 | `fixing` | `codex-r3-rca-coordinator` | Integrated aids fixed prompt delivery and Textract false aid; fresh current-release worktree now rejects invented decision terms before publication and gives bounded allowed/nearest-match repair while preserving open vocabularies |
+| `elspeth-7bd0141bbe` | P2 | `verifying` | `codex-r3-rca-coordinator` | Reviewed `86453aa5c` + `3ec1036d6` reject invented terms before publication and retain the public registry through Anthropic/Bedrock adapters; verify live repair convergence |
 | `elspeth-ecd8594b63` | P3 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `2906409e1` + `e1d31f104`; prove a live freeform fixed-sink build preserves every required field |
 | `elspeth-ebba0b2171` | P3 | `confirmed` | unassigned | Durable provider-call audit exists; logger parity is policy debt, while terminal guided progress is split to `4e6f2a59e4` |
 | `elspeth-73c7a4df36` | P1 | `closed` | `codex-compose-authoring-aids` | Delivery completed at `release/0.7.2@e1d31f104`; assignee retained as audit history |
-| `elspeth-57232f6f3c` | P1 | `in_progress` | `codex-advisor-surface-deadline` | Shared EARLY/END deadline is integrated; active follow-up must carry real completed-turn counters/current failed-turn evidence through P4 without duplicating prior audit or weakening cancellation/provider primacy |
+| `elspeth-57232f6f3c` | P1 | `closed` | `codex-r3-rca-coordinator` | Reviewed chain integrated through `a913ccb63`; complete no-session audit recovery and empty post-P4 replay evidence verified with 79 release-local tests |
 | `elspeth-4e6f2a59e4` | P2 | `closed` | `codex-guided-plan-terminal-progress` | Integrated through `859c2a642`; all guided-plan outcomes terminalize under exact generation and authoritative outcome primacy |
 
 ## Gate routing — `elspeth-e7ff15ac0b`
@@ -282,6 +282,8 @@ Append entries; do not rewrite history.
 | 2026-08-03 20:34 | Advisor surface and deadline integrated | Independently approved three-commit chain integrated through `4f70a3619`; 340 release-checkout advisor/service tests passed; D3 advanced to verifying while truthful `tool_batch.py` timeout counters remain active under `57232f6f3c` |
 | 2026-08-03 20:49 | Selected-node custody integrated | Reviewed `fad962371` + `6db5ca9b8` integrated as `e2bc8c5e3` + `45476f021`; 19 exact release canaries passed after reviewer evidence of 32 backend and 220 frontend; task `dca1e81c58` closed |
 | 2026-08-03 20:50 | Compose registry boundary active | Reclaimed `7bd0141bbe` to the coordinator and opened a clean `4f70a3619`-based worktree; RED proves unknown `pipeline_decision` terms currently publish on all four node writers and the tool schema accepts them; localized fail-closed repair is under test |
+| 2026-08-03 21:13 | Advisor timeout recovery integrated | Independently approved three-commit chain integrated through `a913ccb63`; 79 release-local advisor/persistence tests passed and `57232f6f3c` closed with exact recovery/non-replay evidence |
+| 2026-08-03 21:15 | Compose registry boundary integrated | Reviewed `e6b44424a` + provider follow-up `f82b5fee6` integrated as `86453aa5c` + `3ec1036d6`; 376 release-local tests passed, supported provider transforms retain exactly the three public terms, and `7bd0141bbe` advanced to verifying |
 
 ## Reconciliation findings
 
