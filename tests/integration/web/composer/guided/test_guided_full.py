@@ -41,7 +41,11 @@ from elspeth.web.sessions.routes.composer import guided_plan as guided_plan_rout
 from elspeth.web.sessions.routes.composer.guided_plan import (
     _guided_full_failure_code,
 )
-from elspeth.web.sessions.routes.guided_operations import reserve_or_replay_guided_operation
+from elspeth.web.sessions.routes.guided_operations import (
+    GuidedOperationExpired,
+    GuidedOperationLease,
+    reserve_or_replay_guided_operation,
+)
 from elspeth.web.sessions.schemas import CompositionProposalResponse
 from elspeth.web.sessions.service import _composition_state_data_content_hash
 
@@ -559,6 +563,83 @@ def test_guided_full_no_winner_after_failure_fence_loss_preserves_primary_outcom
         operation_id=operation_id,
         phase="failed",
         reason="provider_unavailable",
+    )
+
+
+@pytest.mark.parametrize(
+    ("lookup_outcome", "expected_log_site"),
+    (
+        ("none", "main_fence_lost_no_winner"),
+        ("lease", "main_fence_lost_no_winner"),
+        ("expired", "main_fence_lost_no_winner"),
+        ("lookup_error", "main_fence_winner_lookup"),
+    ),
+)
+def test_guided_full_main_fence_loss_without_a_replayable_winner_preserves_the_primary_and_terminalizes_progress(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+    lookup_outcome: str,
+    expected_log_site: str,
+) -> None:
+    from structlog.testing import capture_logs
+
+    class _FenceLosingPlanner:
+        def __init__(self) -> None:
+            self.fence = None
+
+        async def plan_guided_full_pipeline(self, **kwargs):
+            self.fence = kwargs["operation_fence"]
+            await kwargs["progress"](
+                ComposerProgressEvent(
+                    phase="calling_model",
+                    headline="The guided planner is preparing a proposal.",
+                    evidence=("A bounded test provider call is active.",),
+                )
+            )
+            raise GuidedOperationFenceLostError(self.fence)
+
+    planner = _FenceLosingPlanner()
+    real_reserve = reserve_or_replay_guided_operation
+
+    async def no_replayable_winner(**kwargs):
+        if kwargs.get("reserve_if_absent") is not False:
+            return await real_reserve(**kwargs)
+        if lookup_outcome == "lease":
+            assert planner.fence is not None
+            return GuidedOperationLease(fence=planner.fence)
+        if lookup_outcome == "expired":
+            return GuidedOperationExpired(attempt=1)
+        if lookup_outcome == "lookup_error":
+            raise RuntimeError("SENSITIVE_LOOKUP_DETAIL")
+        return None
+
+    composer_test_client.app.state.composer_service = planner
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", no_replayable_winner)
+    session = composer_test_client.post("/api/sessions", json={"title": f"guided main fence {lookup_outcome}"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000081"
+
+    async def lose_fence() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            with pytest.raises(GuidedOperationFenceLostError, match="fence is no longer current"):
+                await client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Lose the main operation fence."},
+                )
+
+    with capture_logs() as logs:
+        asyncio.run(lose_fence())
+
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["primary_failure_code"] == "operation_failed"
+    assert secondary_events[0]["site"] == expected_log_site
+    assert "SENSITIVE_LOOKUP_DETAIL" not in str(secondary_events)
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="service_setup_failed",
     )
 
 

@@ -14,7 +14,7 @@ from elspeth.contracts.blobs import (
     BlobIntegrityError,
     BlobQuotaExceededError,
 )
-from elspeth.contracts.composer_progress import ComposerProgressEvent
+from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.audit import BufferingRecorder
@@ -155,6 +155,24 @@ def _note_guided_full_secondary_failure(
             site=site,
             frames=_safe_frame_strings(secondary),
             request_id=_failure_log_request_id(request),
+        )
+
+
+async def _publish_guided_full_terminal_preserving_primary(
+    *,
+    request: Request,
+    progress: ComposerProgressSink,
+    primary_failure_code: GuidedOperationFailureCode,
+) -> None:
+    """Terminalize progress without allowing UI cleanup to replace the primary."""
+    try:
+        await progress(_guided_full_failed_progress_event(primary_failure_code))
+    except Exception as progress_exc:
+        _note_guided_full_secondary_failure(
+            request=request,
+            primary_failure_code=primary_failure_code,
+            secondary=progress_exc,
+            site="terminal_progress",
         )
 
 
@@ -454,17 +472,47 @@ async def post_guided_plan(
         await progress(_guided_full_complete_progress_event())
         return proposal_response
     except (GuidedOperationFenceLostError, BlobGuidedOperationFenceLostError) as exc:
-        joined = await reserve_or_replay_guided_operation(
-            service=service,
-            session_id=session_id,
-            kind="guided_plan",
-            request=body,
-            replay=replay,
-            reserve_if_absent=False,
-            takeover_expired=False,
-        )
+        failure_code = _guided_full_failure_code(exc)
+        lookup_failed = False
+        try:
+            joined = await reserve_or_replay_guided_operation(
+                service=service,
+                session_id=session_id,
+                kind="guided_plan",
+                request=body,
+                replay=replay,
+                reserve_if_absent=False,
+                takeover_expired=False,
+            )
+        except Exception as lookup_exc:
+            lookup_failed = True
+            _note_guided_full_secondary_failure(
+                request=request,
+                primary_failure_code=failure_code,
+                secondary=lookup_exc,
+                site="main_fence_winner_lookup",
+            )
+            joined = None
+        if lookup_failed:
+            await _publish_guided_full_terminal_preserving_primary(
+                request=request,
+                progress=progress,
+                primary_failure_code=failure_code,
+            )
+            raise
         if joined is None or isinstance(joined, (GuidedOperationLease, GuidedOperationExpired)):
-            raise AuditIntegrityError("guided-full fence was lost without a replayable winner") from exc
+            _note_guided_full_secondary_failure(
+                request=request,
+                primary_failure_code=failure_code,
+                secondary=exc,
+                site="main_fence_lost_no_winner",
+            )
+            await _publish_guided_full_terminal_preserving_primary(
+                request=request,
+                progress=progress,
+                primary_failure_code=failure_code,
+            )
+            raise
         await progress(
             _guided_full_complete_progress_event(
                 declined=type(joined) is GuidedPlanDeclinedResponse,
