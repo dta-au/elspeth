@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-04T00:34:38+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-04T00:34:38+10:00
-Release baseline: `release/0.7.2@07f591982`
+Last refreshed: 2026-08-04T01:01:45+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-04T01:01:45+10:00
+Release baseline: `release/0.7.2@8349b9b7f`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -68,8 +68,8 @@ claim custody.
 
 | Agent | Scope | Worktree/branch | File custody | AWS authority | Status |
 |---|---|---|---|---|---|
-| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`); `.claude/worktrees/guided-proposal-feedback` (`codex/fix-guided-proposal-feedback`) | This tracker and guided proposal-feedback implementation | Sole mutation custodian | Active; empty-state freeform history is durable on release through `07f591982`; guided node/edge feedback candidate passed 1,384 Python plus 309 frontend localized tests, static/hooks, and Wardline, with full suite held until focused review |
-| `/root/review_guided_proposal_feedback` | Focused custody, retry, closed-shape, unchanged-target, security, and accessibility review | Read-only `.claude/worktrees/guided-proposal-feedback` | None | None | In progress; no mutation authority |
+| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`); `.claude/worktrees/guided-proposal-feedback` (`codex/fix-guided-proposal-feedback`) | This tracker and guided proposal-feedback implementation | Sole mutation custodian | Active; empty-state freeform history is durable on release; replacement guided feedback candidate `5cbd870a1` passed 1,758 expanded Python, 226 service/shared-planner, and 309 frontend tests plus all static/hooks and Wardline; full suite held for follow-up review |
+| `/root/review_guided_proposal_feedback` | Focused custody, retry, closed-shape, unchanged-target, security, and accessibility review | Read-only `.claude/worktrees/guided-proposal-feedback` | None | None | Initial review correctly blocked post-loop terminal rejection and open TS shapes; exact replacement `5cbd870a1` is in follow-up review with no mutation authority |
 | `/root/review_advisor_evidence_scope` | Adversarial review of bounded evidence and actual checkpoint wire instructions | Shared read-only advisor worktree | None | None | Complete; found and drove repair of the shared stuck-composer system-contract conflict, then approved current bytes with no findings |
 | `/root/audit_advisor_demo` | D1-D6 and advisor/F14 completion evidence | Shared read-only baseline | None | None | Completed; no residual local code defect found |
 | `/root/audit_compose_loop` | Six compose-loop RCAs and implementation partitioning | Shared read-only baseline | None | None | Completed; all six remain actionable |
@@ -174,7 +174,7 @@ supportability remains last.
 | ID | Priority | Live state | Surface | Next proof/action |
 |---|---:|---|---|---|
 | `elspeth-71b22759cc` | P1 | `verifying` | Freeform planner | Integrated as `368a55ef7`; live two-turn acceptance must preserve the first request's topology and threshold through a referential build |
-| `elspeth-43208ece4c` | P1 | `fixing` | Guided proposal revision | Localized candidate staged in `guided-proposal-feedback`: exact node/edge feedback and originating-message custody, target-only source/output rewinds, exact retry identity, and pre-supersession unchanged-target rejection; 1,384 Python plus 309 frontend tests and all focused gates passed; review in progress before full suite |
+| `elspeth-43208ece4c` | P1 | `fixing` | Guided proposal revision | Replacement commit `5cbd870a1` binds exact feedback and retry identity, closes target-only TS shapes, and routes unchanged-target objections through registered bounded repair/hatch before custody; 1,758 Python, 226 service/shared-planner, and 309 frontend tests plus all focused gates passed; follow-up review in progress before full suite |
 | `elspeth-1345480bd7` | P1 | `triage` | Multi-query standard JSON | Send field names/types/enums before enforcing the output contract |
 | `elspeth-8ef90e59cc` | P2 | `triage` | Freeform schema progress | Keep provider-visible schema evidence aligned with the progress state |
 | `elspeth-68a2ff10aa` | P2 | `triage` | Planner repair escape hatch | Retain the final candidate whose remaining error must be repaired |
@@ -315,6 +315,7 @@ Append entries; do not rewrite history.
 | 2026-08-03 23:04 | Advisor full gate passed and integrated | Exact candidate `ffe899fd4` completed `pytest tests/` with 36,986 passed, 66 skipped, and one expected trust-tier xfail in 12m18s; cherry-picked byte-identically as release `a8c6f091d`, exact release advisor rerun 142 passed, and D1/EARLY/parent advanced to verifying |
 | 2026-08-04 00:07 | Empty-state freeform history integrated | Exact candidate `c2d52e552` completed `pytest tests/` with 37,039 passed, 66 skipped, and one expected trust-tier xfail in 12m04s; cherry-picked as release `368a55ef7`, 32 release-local history regressions passed, and `71b22759cc` advanced to verifying for live two-turn acceptance |
 | 2026-08-04 00:34 | Guided proposal-feedback localized candidate | Node/edge revision now collects and atomically binds exact correction feedback, source/output keeps the reviewed form rewind, retry identity includes feedback, and unchanged selected targets cannot supersede the predecessor; 1,384 Python plus 309 frontend tests, static/hooks, Check Contracts, and Wardline passed; full suite held for focused review |
+| 2026-08-04 01:01 | Guided feedback review blockers repaired | Initial review found unchanged-target rejection was post-loop/terminal and TS still represented target-only node/edge actions. Single replacement commit `5cbd870a1` moves the registered objection into post-validation candidate acceptance before custody, preserves normal repair/repeat/hatch behavior, closes the TS unions, and adds positive node custody; 1,758 Python, 226 service/shared-planner, and 309 frontend tests passed before follow-up review |
 
 ## Reconciliation findings
 
