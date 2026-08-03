@@ -21,7 +21,12 @@ from elspeth.web.blobs.service import BlobServiceImpl
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.implicit_decisions import build_implicit_decisions_report
 from elspeth.web.composer.protocol import ComposerPluginCrashError
-from elspeth.web.composer.required_controls import wire_required_controls as real_wire_required_controls
+from elspeth.web.composer.required_controls import (
+    wire_required_controls as real_wire_required_controls,
+)
+from elspeth.web.composer.required_controls import (
+    wire_required_controls_state,
+)
 from elspeth.web.composer.state import CompositionState, OutputSpec, SourceSpec
 from elspeth.web.composer.tools import execute_tool
 from elspeth.web.config import WebSettings
@@ -265,6 +270,7 @@ async def _incremental_textract_state(
         "on_validation_failure": "discard",
     }
     output = args["outputs"][0]
+    output["options"]["path"] = str(tmp_path / "outputs" / harness.session_id / "summary.jsonl")
     args["outputs"] = []
     result = execute_tool(
         "set_pipeline",
@@ -283,6 +289,67 @@ async def _incremental_textract_state(
     assert result.success is True
     assert result.validation.is_valid is False
     return result.updated_state, output
+
+
+async def _incremental_named_blob_state(
+    tmp_path: Path,
+    *,
+    harness: Any,
+    view: PolicyCatalogView,
+    snapshot: PluginAvailabilitySnapshot,
+    source_count: Literal[1, 2],
+) -> tuple[CompositionState, dict[str, Any]]:
+    initial_state, output = await _incremental_textract_state(
+        tmp_path,
+        harness=harness,
+        view=view,
+        snapshot=snapshot,
+    )
+    original_source = initial_state.sources["source"]
+    sources = {"primary": original_source}
+    outputs: tuple[OutputSpec, ...] = ()
+    if source_count == 2:
+        extra_blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
+            UUID(harness.session_id),
+            "secondary.csv",
+            b"doc_bucket,doc_key\ninput-bucket,inbox/secondary.pdf\n",
+            "text/csv",
+        )
+        sources["secondary"] = SourceSpec(
+            plugin=original_source.plugin,
+            on_success="secondary_manifest_rows",
+            options={
+                **deep_thaw(original_source.options),
+                "path": extra_blob.storage_path,
+                "blob_ref": str(extra_blob.id),
+                "mode": "bind_source",
+            },
+            on_validation_failure=original_source.on_validation_failure,
+        )
+        outputs = (
+            OutputSpec(
+                name="secondary_manifest_rows",
+                plugin="json",
+                options={
+                    "path": str(tmp_path / "outputs" / harness.session_id / "secondary.jsonl"),
+                    "schema": {"mode": "observed"},
+                    "format": "jsonl",
+                    "mode": "write",
+                    "collision_policy": "auto_increment",
+                },
+                on_write_failure="discard",
+            ),
+        )
+    named_source_state = CompositionState(
+        sources=sources,
+        nodes=initial_state.nodes,
+        edges=initial_state.edges,
+        outputs=outputs,
+        metadata=initial_state.metadata,
+        version=initial_state.version,
+    )
+    assert view.validate_composition_state(named_source_state).validation.is_valid is False
+    return named_source_state, output
 
 
 def _assert_required_control_disclosures(candidate: dict[str, Any]) -> None:
@@ -634,52 +701,13 @@ async def test_auto_commit_wires_incremental_named_blob_sources_without_public_r
         density_default="high",
         actor="user:proposal-prevalidation-user",
     )
-    initial_state, output = await _incremental_textract_state(
+    named_source_state, output = await _incremental_named_blob_state(
         tmp_path,
         harness=harness,
         view=view,
         snapshot=snapshot,
+        source_count=2,
     )
-    original_source = initial_state.sources["source"]
-    extra_blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
-        UUID(harness.session_id),
-        "secondary.csv",
-        b"doc_bucket,doc_key\ninput-bucket,inbox/secondary.pdf\n",
-        "text/csv",
-    )
-    extra_source = SourceSpec(
-        plugin=original_source.plugin,
-        on_success="secondary_manifest_rows",
-        options={
-            **deep_thaw(original_source.options),
-            "path": extra_blob.storage_path,
-            "blob_ref": str(extra_blob.id),
-            "mode": "bind_source",
-        },
-        on_validation_failure=original_source.on_validation_failure,
-    )
-    named_source_state = CompositionState(
-        sources={"primary": original_source, "secondary": extra_source},
-        nodes=initial_state.nodes,
-        edges=initial_state.edges,
-        outputs=(
-            OutputSpec(
-                name="secondary_manifest_rows",
-                plugin="json",
-                options={
-                    "path": str(tmp_path / "outputs" / harness.session_id / "secondary.jsonl"),
-                    "schema": {"mode": "observed"},
-                    "format": "jsonl",
-                    "mode": "write",
-                    "collision_policy": "auto_increment",
-                },
-                on_write_failure="discard",
-            ),
-        ),
-        metadata=initial_state.metadata,
-        version=initial_state.version,
-    )
-    assert view.validate_composition_state(named_source_state).validation.is_valid is False
     llm = _ScriptedLLM(_tool_turn("call_complete_named_sources", "set_output", output))
 
     with (
@@ -705,6 +733,154 @@ async def test_auto_commit_wires_incremental_named_blob_sources_without_public_r
     ]
     _assert_required_control_disclosures(result.state.to_dict())
     assert _count_rows(harness.engine, composition_states_table) == 1
+
+
+@pytest.mark.parametrize("source_count", [1, 2], ids=("named", "multiple"))
+@pytest.mark.asyncio
+async def test_explicit_incremental_named_blob_completion_proposes_and_accepts_exact_owned_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source_count: Literal[1, 2],
+) -> None:
+    from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+    from elspeth.web.composer.tools import execute_tool
+    from elspeth.web.execution.schemas import ValidationResult
+    from elspeth.web.sessions.converters import state_from_record
+    from elspeth.web.sessions.protocol import CompositionStateData
+    from tests.unit.web._sync_asgi_client import SyncASGITestClient
+    from tests.unit.web.composer.conftest import _make_settings
+    from tests.unit.web.sessions.test_routes import _async_return, _make_app
+
+    app, sessions = _make_app(tmp_path)
+    session = await sessions.create_session("alice", "Owned-state proposal", "local")
+    await sessions.update_composer_preferences(
+        session.id,
+        trust_mode="explicit_approve",
+        density_default="high",
+        actor="user:alice",
+    )
+    user_message = await sessions.add_message(
+        session.id,
+        "user",
+        "Add the final JSON output and prepare the complete pipeline for review.",
+        writer_principal="route_user_message",
+    )
+    view, snapshot = _required_textract_policy(tmp_path)
+    app.state.catalog_service = view._full
+    app.state.operator_profile_registry = view._profiles
+    app.state.plugin_snapshot_factory = lambda _user: snapshot
+    harness = SimpleNamespace(engine=sessions._engine, session_id=str(session.id))
+    initial_state, output = await _incremental_named_blob_state(
+        tmp_path,
+        harness=harness,
+        view=view,
+        snapshot=snapshot,
+        source_count=source_count,
+    )
+    initial_payload = initial_state.to_dict()
+    initial_record = await sessions.save_composition_state(
+        session.id,
+        CompositionStateData(
+            sources=initial_payload["sources"],
+            nodes=initial_payload["nodes"],
+            edges=initial_payload["edges"],
+            outputs=initial_payload["outputs"],
+            metadata_=initial_payload["metadata"],
+            is_valid=False,
+            validation_errors=[entry.message for entry in initial_state.validate().errors],
+        ),
+        provenance="session_seed",
+    )
+    persisted_initial = state_from_record(initial_record)
+    preview = execute_tool(
+        "set_output",
+        output,
+        persisted_initial,
+        view,
+        plugin_snapshot=snapshot,
+        data_dir=str(tmp_path),
+        session_engine=sessions._engine,
+        session_id=str(session.id),
+        user_id="alice",
+        validate_arguments=True,
+        require_data_dir_for_paths=True,
+        raise_schema_argument_errors=True,
+    )
+    assert preview.success is True, preview.data
+    assert preview.validation.is_valid is True, preview.validation
+    expected = wire_required_controls_state(preview.updated_state, snapshot, view)
+    assert expected is not preview.updated_state
+    expected_plugins = _node_plugins(expected.to_dict())
+
+    with patch.object(
+        ComposerServiceImpl,
+        "_compute_availability",
+        return_value=ComposerAvailability(available=True, model="test-model", provider="test"),
+    ):
+        composer = ComposerServiceImpl.for_trained_operator(
+            catalog=view._full,
+            settings=_make_settings(tmp_path),
+            sessions_service=sessions,
+            session_engine=sessions._engine,
+        )
+    app.state.composer_service = composer
+    llm = _ScriptedLLM(_tool_turn(f"call_review_{source_count}_blob_sources", "set_output", output))
+    with (
+        patch.object(composer, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(composer, "_call_llm", new=llm),
+    ):
+        result = await composer.compose(
+            "Add the final JSON output and prepare the complete pipeline for review.",
+            [],
+            persisted_initial,
+            session_id=str(session.id),
+            current_state_id=str(initial_record.id),
+            user_id="alice",
+            user_message_id=str(user_message.id),
+        )
+
+    proposals = await sessions.list_composition_proposals(session.id)
+    assert len(proposals) == 1
+    proposal = proposals[0]
+    assert proposal.pipeline_metadata is not None
+    assert result.state is persisted_initial
+    redacted_text = json.dumps(deep_thaw(proposal.arguments_redacted_json), sort_keys=True)
+    for source in persisted_initial.sources.values():
+        assert str(source.options["blob_ref"]) not in redacted_text
+        assert str(source.options["path"]) not in redacted_text
+    invocation = next(item for item in result.tool_invocations if item.tool_call_id == f"call_review_{source_count}_blob_sources")
+    assert invocation.tool_name == "set_output"
+    assert json.loads(invocation.arguments_canonical) == output
+
+    monkeypatch.setattr(
+        "elspeth.web.sessions.routes._helpers._runtime_preflight_for_state",
+        _async_return(
+            ValidationResult(
+                is_valid=True,
+                checks=[],
+                errors=[],
+                readiness={
+                    "authoring_valid": True,
+                    "execution_ready": True,
+                    "completion_ready": True,
+                    "blockers": [],
+                },
+            )
+        ),
+    )
+    accepted = SyncASGITestClient(app).post(
+        f"/api/sessions/{session.id}/proposals/{proposal.id}/accept",
+        json={"draft_hash": proposal.pipeline_metadata.draft_hash},
+    )
+    assert accepted.status_code == 200, accepted.text
+    committed = await sessions.get_current_state(session.id)
+    assert committed is not None
+    committed_state = state_from_record(committed)
+    assert committed_state.sources.keys() == persisted_initial.sources.keys()
+    assert _node_plugins(committed_state.to_dict()) == expected_plugins
+    _assert_required_control_disclosures(committed_state.to_dict())
+    for source_name, source in persisted_initial.sources.items():
+        assert committed_state.sources[source_name].options["blob_ref"] == source.options["blob_ref"]
 
 
 @pytest.mark.asyncio
@@ -794,6 +970,51 @@ async def test_incremental_required_control_failure_does_not_publish_completed_g
     assert outcome.call.id == "call_incremental_finalizer_failure"
     assert outcome.error_class == "RuntimeError"
     persisted_feedback = _persisted_tool_content(harness, "call_incremental_finalizer_failure")
+    assert json.loads(persisted_feedback) == {
+        "_redaction_status": "plugin_crash",
+        "error_class": "RuntimeError",
+        "error_message": "<redacted-failure-message>",
+    }
+
+
+@pytest.mark.asyncio
+async def test_incremental_owned_state_projection_failure_does_not_publish_proposal(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    view, snapshot = _required_textract_policy(tmp_path)
+    initial_state, output = await _incremental_named_blob_state(
+        tmp_path,
+        harness=harness,
+        view=view,
+        snapshot=snapshot,
+        source_count=2,
+    )
+    llm = _ScriptedLLM(_tool_turn("call_owned_state_projection_failure", "set_output", output))
+    failure = RuntimeError("private owned-state projection failure detail")
+
+    with (
+        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service, "_call_llm", new=llm),
+        patch("elspeth.web.composer.tool_batch.owned_composition_state_authority", side_effect=failure) as projector,
+        pytest.raises(ComposerPluginCrashError) as exc_info,
+    ):
+        await harness.service.compose(
+            "Add the final JSON output and prepare it for review.",
+            [],
+            initial_state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+
+    assert exc_info.value.original_exc is failure
+    assert projector.call_count == 1
+    assert _count_rows(harness.engine, blobs_table) == 2
+    assert _count_rows(harness.engine, composition_proposals_table) == 0
+    assert _count_rows(harness.engine, composition_states_table) == 0
+    outcome = harness.service._phase3_last_tool_outcomes[-1]
+    assert outcome.call.id == "call_owned_state_projection_failure"
+    assert outcome.error_class == "RuntimeError"
+    persisted_feedback = _persisted_tool_content(harness, "call_owned_state_projection_failure")
     assert json.loads(persisted_feedback) == {
         "_redaction_status": "plugin_crash",
         "error_class": "RuntimeError",

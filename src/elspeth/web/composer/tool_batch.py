@@ -85,6 +85,8 @@ from elspeth.web.composer.pipeline_proposal import (
     PlannerSurface,
     PresentBase,
     composition_content_hash,
+    owned_composition_state_authority,
+    owned_composition_state_review_arguments,
 )
 from elspeth.web.composer.progress import (
     emit_progress,
@@ -129,7 +131,7 @@ from elspeth.web.composer.tools import (
     is_session_aware_tool,
     normalize_tool_result_validation,
 )
-from elspeth.web.composer.tools._common import _failure_result, _serialize_set_pipeline_arguments
+from elspeth.web.composer.tools._common import _failure_result
 from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -1078,6 +1080,7 @@ async def run_tool_batch(
 
             proposal_tool_name = tool_name
             proposal_arguments: Mapping[str, Any] = arguments
+            proposal_summary_arguments: Mapping[str, Any] = arguments
             proposal_redacted_arguments = redacted_arguments
 
             if redacted_arguments is not None and tool_name == "set_pipeline":
@@ -1293,72 +1296,19 @@ async def run_tool_batch(
                             )
                             if not finalized_validation.validation.is_valid:
                                 raise AuditIntegrityError("Required-control proposal finalization produced an invalid composition")
-                            serialized, serialization_error = _serialize_set_pipeline_arguments(finalized_validation.authored_state)
-                            if serialized is None:
-                                prevalidated_unapplied_result = normalize_tool_result_validation(
-                                    _failure_result(
-                                        state,
-                                        (
-                                            "The completed pipeline could not be prepared as one review-safe proposal: "
-                                            f"{serialization_error or 'its authored state is not safely reconstructible'}."
-                                        ),
-                                        error_code="PROPOSAL_PIPELINE_NOT_RECONSTRUCTIBLE",
-                                    ),
-                                    ctx.policy_catalog,
-                                )
-                                proposal_redacted_arguments = None
-                            else:
-                                canonical_arguments = canonicalize_authored_node_review_requirements(
-                                    serialized,
-                                    current_state=state,
-                                )
-                                candidate_prior_validation = (
-                                    last_validation
-                                    if last_validation is not None
-                                    else ctx.policy_catalog.validate_composition_state(state).validation
-                                )
-                                candidate_context = ToolContext(
-                                    catalog=ctx.policy_catalog,
-                                    plugin_snapshot=ctx.plugin_snapshot,
-                                    data_dir=ctx.service._data_dir,
-                                    require_data_dir_for_paths=True,
-                                    session_engine=ctx.service._session_engine,
-                                    session_id=session_id,
-                                    secret_service=ctx.service._secret_service,
-                                    user_id=user_id,
-                                    current_validation=candidate_prior_validation,
-                                    max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
-                                    user_message_id=user_message_id,
-                                    user_message_content=user_message_content,
-                                    composer_model_identifier=ctx.service._model,
-                                    composer_model_version=safe_response_model(response) or ctx.service._model,
-                                    composer_provider=ctx.service._availability.provider or "unknown",
-                                    composer_skill_hash=ctx.service._composer_skill_hash,
-                                    tool_arguments_hash=composer_authority_hash(inline_custody_audit_projection(canonical_arguments)),
-                                    _interpretation_requirements_are_internal=True,
-                                )
-                                candidate = await run_sync_in_worker(
-                                    build_set_pipeline_candidate,
-                                    canonical_arguments,
-                                    state,
-                                    candidate_context,
-                                )
-                                if not candidate.acceptable:
-                                    raise AuditIntegrityError(
-                                        "Finalized incremental preview did not reconstruct as an acceptable set_pipeline candidate"
+                            proposal_arguments = owned_composition_state_authority(finalized_validation.authored_state)
+                            proposal_summary_arguments = owned_composition_state_review_arguments(proposal_arguments)
+                            proposal_tool_name = "set_pipeline"
+                            proposal_redacted_arguments = cast(
+                                dict[str, Any],
+                                _remove_inline_blob_redaction_defaults(
+                                    redact_tool_call_arguments(
+                                        proposal_tool_name,
+                                        cast(dict[str, Any], proposal_summary_arguments),
+                                        telemetry=ctx.service._redaction_telemetry,
                                     )
-                                proposal_tool_name = "set_pipeline"
-                                proposal_arguments = canonical_arguments
-                                proposal_redacted_arguments = cast(
-                                    dict[str, Any],
-                                    _remove_inline_blob_redaction_defaults(
-                                        redact_tool_call_arguments(
-                                            proposal_tool_name,
-                                            proposal_arguments,
-                                            telemetry=ctx.service._redaction_telemetry,
-                                        )
-                                    ),
-                                )
+                                ),
+                            )
                 except ToolArgumentError:
                     # Preserve the established explicit-approval contract for
                     # ordinary incremental proposals: semantic tool-argument
@@ -1370,11 +1320,12 @@ async def run_tool_batch(
 
             if proposal_redacted_arguments is not None and proposal_tool_name == tool_name:
                 proposal_arguments = arguments
+                proposal_summary_arguments = arguments
 
             if proposal_redacted_arguments is not None:
                 proposal_summary = build_tool_proposal_summary(
                     tool_name=proposal_tool_name,
-                    arguments=proposal_arguments,
+                    arguments=proposal_summary_arguments,
                     redacted_arguments=proposal_redacted_arguments,
                 )
                 if proposal_tool_name == "set_pipeline":

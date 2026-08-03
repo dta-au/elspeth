@@ -51,6 +51,8 @@ from elspeth.web.composer.pipeline_proposal import (
     PlannerSurface,
     PresentBase,
     composition_content_hash,
+    is_owned_composition_state_authority,
+    owned_composition_state_review_arguments,
     reviewed_anchor_hash,
 )
 from elspeth.web.composer.redaction import redact_tool_call_arguments
@@ -5846,10 +5848,16 @@ class SessionServiceImpl:
             del safe_source["inline_blob"]
             return {**value, "source": safe_source}
 
+        private_pipeline_arguments = deep_thaw(plan.proposal.pipeline)
+        review_arguments = (
+            owned_composition_state_review_arguments(private_pipeline_arguments)
+            if is_owned_composition_state_authority(private_pipeline_arguments)
+            else private_pipeline_arguments
+        )
         expected_redacted_arguments = _without_intercepted_inline_defaults(
             redact_tool_call_arguments(
                 "set_pipeline",
-                deep_thaw(plan.proposal.pipeline),
+                cast(dict[str, Any], review_arguments),
                 telemetry=NoopRedactionTelemetry(),
             )
         )

@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import Connection
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer.pipeline_proposal import is_owned_composition_state_authority
 from elspeth.web.sessions.models import blobs_table, composition_proposals_table
 
 _TOP_LEVEL_BLOB_TOOLS = frozenset(
@@ -31,6 +32,24 @@ def proposal_blob_reference_ids(tool_name: str, arguments: Mapping[str, Any]) ->
         return ()
 
     if tool_name == "set_pipeline":
+        if is_owned_composition_state_authority(arguments):
+            sources = arguments["sources"] if "sources" in arguments else None
+            if type(sources) is not dict:
+                raise ValueError("owned composition-state sources must be a mapping")
+            blob_ids: list[str] = []
+            for source_name, source in sources.items():
+                if type(source_name) is not str or type(source) is not dict:
+                    raise ValueError("owned composition-state sources must contain named mappings")
+                options = source["options"] if "options" in source else None
+                if type(options) is not dict:
+                    raise ValueError(f"owned composition-state source {source_name!r} options must be a mapping")
+                blob_ref = options["blob_ref"] if "blob_ref" in options else None
+                if blob_ref is None:
+                    continue
+                if type(blob_ref) is not str or not blob_ref:
+                    raise ValueError(f"owned composition-state source {source_name!r} blob_ref must be a non-empty string")
+                blob_ids.append(blob_ref)
+            return tuple(blob_ids)
         source = arguments["source"] if "source" in arguments else None
         if source is None:
             return ()

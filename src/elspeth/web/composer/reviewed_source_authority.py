@@ -9,7 +9,9 @@ from uuid import UUID
 from sqlalchemy import Engine, select
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.pipeline_proposal import reviewed_anchor_hash
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import ReviewedSourceAuthority
 from elspeth.web.sessions.models import blobs_table, sessions_table
 
@@ -130,3 +132,41 @@ def resolve_reviewed_source_authority(
         reviewed_sources=sources,
         verified_blob_paths={sentinel: verified_storage_by_blob_id[blob_id] for sentinel, blob_id in sentinel_blob_ids.items()},
     )
+
+
+def resolve_owned_composition_source_authority(
+    *,
+    engine: Engine | None,
+    session_id: str,
+    user_id: str | None,
+    state: CompositionState,
+) -> ReviewedSourceAuthority:
+    """Verify exact owned-state source bindings for private settlement.
+
+    The synthesized reviewed-facts shape never leaves this function. It lets
+    the existing candidate boundary reuse its closed, hash-matched
+    ``ReviewedSourceAuthority`` contract while the proposal itself remains a
+    freeform proposal with an empty public reviewed-facts anchor.
+    """
+    reviewed_sources = {
+        source_name: {
+            "name": source_name,
+            "plugin": source.plugin,
+            "options": deep_thaw(source.options),
+            "observed_columns": [],
+            "sample_rows": [],
+            "on_validation_failure": source.on_validation_failure,
+        }
+        for source_name, source in state.sources.items()
+    }
+    private_facts = {"reviewed_sources": reviewed_sources}
+    authority = resolve_reviewed_source_authority(
+        engine=engine,
+        session_id=session_id,
+        user_id=user_id,
+        reviewed_facts=private_facts,
+        expected_reviewed_anchor_hash=reviewed_anchor_hash(private_facts),
+    )
+    if authority is None:
+        raise AuditIntegrityError("owned composition source authority could not be established")
+    return authority

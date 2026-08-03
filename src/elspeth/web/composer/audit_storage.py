@@ -18,6 +18,10 @@ from elspeth.web.composer.authority_hashing import (
     project_composer_authority_payload,
     restore_composer_authority_payload,
 )
+from elspeth.web.composer.pipeline_proposal import (
+    is_owned_composition_state_authority,
+    owned_composition_state_review_arguments,
+)
 from elspeth.web.composer.redaction import (
     MANIFEST,
     redact_arg_error_response,
@@ -124,10 +128,15 @@ def _redacted_arguments(
         }
     if invocation.tool_name not in MANIFEST:
         return dict(unknown_tool_arguments_redaction(telemetry=telemetry))
+    review_arguments = (
+        owned_composition_state_review_arguments(arguments)
+        if invocation.tool_name == "set_pipeline" and is_owned_composition_state_authority(arguments)
+        else arguments
+    )
     try:
         redacted = redact_tool_call_arguments(
             invocation.tool_name,
-            arguments,
+            cast(dict[str, Any], review_arguments),
             telemetry=telemetry,
         )
     except PydanticValidationError:

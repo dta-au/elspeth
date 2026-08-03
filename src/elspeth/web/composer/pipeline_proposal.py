@@ -1,7 +1,9 @@
 """Canonical, custody-safe pipeline proposal integrity envelope.
 
-``PipelineProposal`` wraps the exact canonical ``set_pipeline`` arguments. It
-does not define another pipeline topology model. The draft hash uses the
+``PipelineProposal`` wraps either exact canonical public ``set_pipeline``
+arguments or the closed private owned-state authority needed when that public
+v1 shape cannot represent the authored topology losslessly. The latter reuses
+``CompositionState`` rather than defining another topology model. The draft hash uses the
 ``composer.pipeline-proposal-envelope.v3`` domain because it covers every
 authority-bearing envelope field. This intentionally supersedes the older
 design's ``composer.pipeline-proposal.v1`` pipeline-only preimage; accepting
@@ -15,7 +17,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Literal, Self, TypedDict, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, Self, TypedDict, cast
 from uuid import UUID
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -35,6 +37,17 @@ if TYPE_CHECKING:
 _DRAFT_HASH_SCHEMA = "composer.pipeline-proposal-envelope.v3"
 _REVIEWED_ANCHOR_SCHEMA = "guided.reviewed-anchors.v1"
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+OWNED_COMPOSITION_STATE_AUTHORITY: Final = "owned_composition_state.v1"
+_OWNED_COMPOSITION_STATE_FIELDS = frozenset(
+    {
+        "authority_kind",
+        "sources",
+        "nodes",
+        "edges",
+        "outputs",
+        "metadata",
+    }
+)
 _PROPOSAL_FIELDS = frozenset(
     {
         "pipeline",
@@ -101,6 +114,27 @@ class PipelineProposalData(TypedDict):
     skill_hash: str
     covered_deferred_intent_ids: list[str]
     supersedes_draft_hash: str | None
+
+
+class OwnedCompositionStateAuthorityData(TypedDict):
+    """Closed, version-free authored-state proposal authority."""
+
+    authority_kind: Literal["owned_composition_state.v1"]
+    sources: dict[str, dict[str, Any]]
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+    outputs: list[dict[str, Any]]
+    metadata: dict[str, Any]
+
+
+class OwnedCompositionStateSetPipelineArguments(TypedDict):
+    """Internal lossless set_pipeline execution/review projection."""
+
+    sources: dict[str, dict[str, Any]]
+    nodes: list[dict[str, Any]]
+    edges: list[dict[str, Any]]
+    outputs: list[dict[str, Any]]
+    metadata: dict[str, Any]
 
 
 def _require_hash(value: object, field_name: str, *, optional: bool = False) -> None:
@@ -259,6 +293,112 @@ def reviewed_anchor_hash(reviewed_facts: Mapping[str, Any]) -> str:
     return stable_hash(preimage)
 
 
+def is_owned_composition_state_authority(value: Mapping[str, Any]) -> bool:
+    """Return whether ``value`` names the closed private owned-state seam."""
+    return value.get("authority_kind") == OWNED_COMPOSITION_STATE_AUTHORITY
+
+
+def _project_owned_composition_state(state: CompositionState) -> OwnedCompositionStateAuthorityData:
+    payload = state.to_dict()
+    return OwnedCompositionStateAuthorityData(
+        authority_kind=OWNED_COMPOSITION_STATE_AUTHORITY,
+        sources=payload["sources"],
+        nodes=payload["nodes"],
+        edges=payload["edges"],
+        outputs=payload["outputs"],
+        metadata=payload["metadata"],
+    )
+
+
+def owned_composition_state_authority(state: CompositionState) -> OwnedCompositionStateAuthorityData:
+    """Project exact authored content for a private pipeline proposal.
+
+    Lifecycle version and guided-session state are deliberately excluded. The
+    proposal base binds the current persisted version/content, while settlement
+    assigns exactly ``current.version + 1``. This seam exists for authored
+    topologies that public ``set_pipeline`` v1 cannot represent losslessly.
+    """
+    if state.guided_session is not None:
+        raise AuditIntegrityError("owned composition-state proposals are freeform-only")
+    authority = _project_owned_composition_state(state)
+    # Reuse the strict restore path here so construction and reload admit the
+    # exact same closed shape.
+    restore_owned_composition_state_authority(authority, version=1)
+    return authority
+
+
+def restore_owned_composition_state_authority(
+    authority: Mapping[str, Any],
+    *,
+    version: int,
+) -> CompositionState:
+    """Restore and exact-round-trip one private owned-state authority."""
+    from elspeth.web.composer.state import CompositionState
+
+    if type(version) is not int or version < 1:
+        raise AuditIntegrityError("owned composition-state version must be a positive exact integer")
+    detached = deep_thaw(authority)
+    if type(detached) is not dict or set(detached) != _OWNED_COMPOSITION_STATE_FIELDS:
+        raise AuditIntegrityError("owned composition-state authority fields are malformed")
+    if detached.get("authority_kind") != OWNED_COMPOSITION_STATE_AUTHORITY:
+        raise AuditIntegrityError("owned composition-state authority kind is malformed")
+    state_payload = {key: value for key, value in detached.items() if key != "authority_kind"}
+    state_payload["version"] = version
+    try:
+        state = CompositionState.from_dict(state_payload)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AuditIntegrityError("owned composition-state authority payload is malformed") from exc
+    if _project_owned_composition_state(state) != detached:
+        raise AuditIntegrityError("owned composition-state authority is not an exact state round-trip")
+    return state
+
+
+def owned_composition_state_execution_arguments(
+    authority: Mapping[str, Any],
+    *,
+    version: int,
+) -> OwnedCompositionStateSetPipelineArguments:
+    """Build private set-pipeline execution arguments without losing state."""
+    state = restore_owned_composition_state_authority(authority, version=version)
+    payload = state.to_dict()
+    return OwnedCompositionStateSetPipelineArguments(
+        sources=payload["sources"],
+        nodes=payload["nodes"],
+        edges=payload["edges"],
+        outputs=[
+            {"sink_name": output["name"], **{key: value for key, value in output.items() if key != "name"}} for output in payload["outputs"]
+        ],
+        metadata=payload["metadata"],
+    )
+
+
+def owned_composition_state_review_arguments(authority: Mapping[str, Any]) -> OwnedCompositionStateSetPipelineArguments:
+    """Return the familiar, manifest-redactable review projection.
+
+    Blob identities and resolver-owned paths never enter this projection. The
+    exact private authority remains separately draft-hashed and persisted.
+    """
+    from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY
+
+    state = restore_owned_composition_state_authority(authority, version=1)
+    payload = owned_composition_state_execution_arguments(authority, version=1)
+    safe_sources: dict[str, Any] = {}
+    for source_name, source in state.sources.items():
+        options = deep_thaw(source.options)
+        for key in ("blob_ref", "path", "file", SOURCE_AUTHORING_KEY):
+            options.pop(key, None)
+        if options.get("mode") == "bind_source":
+            del options["mode"]
+        safe_sources[source_name] = {
+            "plugin": source.plugin,
+            "on_success": source.on_success,
+            "options": options,
+            "on_validation_failure": source.on_validation_failure,
+        }
+    payload["sources"] = safe_sources
+    return payload
+
+
 def pipeline_draft_hash(
     *,
     pipeline: Mapping[str, Any],
@@ -298,7 +438,7 @@ def pipeline_draft_hash(
 
 @dataclass(frozen=True, slots=True)
 class PipelineProposal:
-    """Deeply immutable, hash-verified exact ``set_pipeline`` arguments."""
+    """Deeply immutable, hash-verified canonical pipeline authority."""
 
     pipeline: Mapping[str, Any]
     draft_hash: str
@@ -312,6 +452,8 @@ class PipelineProposal:
 
     def __post_init__(self) -> None:
         frozen_pipeline = _validate_and_freeze_canonical_mapping(self.pipeline, "pipeline")
+        if is_owned_composition_state_authority(frozen_pipeline):
+            restore_owned_composition_state_authority(frozen_pipeline, version=1)
         _base_to_dict(self.base)
         _require_hash(self.draft_hash, "draft_hash")
         _require_hash(self.reviewed_anchor_hash, "reviewed_anchor_hash")

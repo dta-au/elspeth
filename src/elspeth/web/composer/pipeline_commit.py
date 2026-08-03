@@ -33,8 +33,19 @@ from elspeth.web.composer.authority_hashing import (
     project_composer_authority_payload,
     restore_composer_authority_payload,
 )
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PlannerSurface, PresentBase, composition_content_hash
-from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
+from elspeth.web.composer.pipeline_proposal import (
+    AbsentBase,
+    PlannerSurface,
+    PresentBase,
+    composition_content_hash,
+    is_owned_composition_state_authority,
+    owned_composition_state_execution_arguments,
+    restore_owned_composition_state_authority,
+)
+from elspeth.web.composer.reviewed_source_authority import (
+    resolve_owned_composition_source_authority,
+    resolve_reviewed_source_authority,
+)
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._common import RuntimePreflight, ToolContext, ToolResult
 from elspeth.web.composer.tools._dispatch import execute_tool
@@ -345,6 +356,22 @@ async def prepare_pipeline_proposal_commit(
         raise AuditIntegrityError("authoritative pipeline arguments must thaw to an exact mapping")
     if composer_authority_hash(pipeline_arguments) != authority.row.tool_arguments_hash:
         raise AuditIntegrityError("authoritative pipeline arguments do not match the proposal row")
+    owned_state_authority = is_owned_composition_state_authority(pipeline_arguments)
+    proposed_state: CompositionState | None = None
+    execution_arguments: Mapping[str, Any]
+    if owned_state_authority:
+        proposed_state = restore_owned_composition_state_authority(
+            pipeline_arguments,
+            version=current_state.version + 1,
+        )
+        execution_arguments = owned_composition_state_execution_arguments(
+            pipeline_arguments,
+            version=current_state.version + 1,
+        )
+        proposed_content_hash = composition_content_hash(proposed_state)
+    else:
+        execution_arguments = pipeline_arguments
+        proposed_content_hash = None
 
     deadline = asyncio.get_running_loop().time() + float(config.timeout_seconds)
 
@@ -358,6 +385,24 @@ async def prepare_pipeline_proposal_commit(
             raise PipelineCommitError("pipeline commit preparation timed out", code="TIMEOUT") from exc
 
     prior_validation = (await bounded(policy_catalog.validate_composition_state, current_state)).validation
+    if owned_state_authority:
+        assert proposed_state is not None
+        reviewed_source_authority = await bounded(
+            resolve_owned_composition_source_authority,
+            engine=config.session_engine,
+            session_id=str(authority.row.session_id),
+            user_id=config.user_id,
+            state=proposed_state,
+        )
+    else:
+        reviewed_source_authority = await bounded(
+            resolve_reviewed_source_authority,
+            engine=config.session_engine,
+            session_id=str(authority.row.session_id),
+            user_id=config.user_id,
+            reviewed_facts=reviewed_facts,
+            expected_reviewed_anchor_hash=authority.proposal.reviewed_anchor_hash,
+        )
     context = ToolContext(
         catalog=policy_catalog,
         plugin_snapshot=plugin_snapshot,
@@ -378,26 +423,21 @@ async def prepare_pipeline_proposal_commit(
         composer_provider=authority.row.composer_provider,
         composer_skill_hash=authority.row.composer_skill_hash,
         tool_arguments_hash=authority.row.tool_arguments_hash,
-        reviewed_source_authority=await bounded(
-            resolve_reviewed_source_authority,
-            engine=config.session_engine,
-            session_id=str(authority.row.session_id),
-            user_id=config.user_id,
-            reviewed_facts=reviewed_facts,
-            expected_reviewed_anchor_hash=authority.proposal.reviewed_anchor_hash,
-        ),
+        reviewed_source_authority=reviewed_source_authority,
         _interpretation_requirements_are_internal=True,
     )
 
     candidate = await bounded(
         build_set_pipeline_candidate,
-        pipeline_arguments,
+        execution_arguments,
         current_state,
         context,
     )
     if not candidate.acceptable or candidate.prepared_inline_blob is not None:
         raise PipelineCommitError("pipeline proposal failed current candidate validation", code="VALIDATION_FAILED")
     candidate_hash = composition_content_hash(candidate.result.updated_state)
+    if proposed_content_hash is not None and candidate_hash != proposed_content_hash:
+        raise AuditIntegrityError("owned composition-state candidate differs from the exact proposed content")
 
     if (recovery_dispatch is None) != (recovery_executor_content_hash is None):
         raise AuditIntegrityError("pipeline recovery dispatch and executor hash must be supplied together")
@@ -427,7 +467,7 @@ async def prepare_pipeline_proposal_commit(
             await bounded(
                 execute_tool,
                 "set_pipeline",
-                pipeline_arguments,
+                execution_arguments,
                 current_state,
                 policy_catalog,
                 plugin_snapshot=plugin_snapshot,
@@ -473,6 +513,8 @@ async def prepare_pipeline_proposal_commit(
     if invocation.tool_call_id != authority.row.tool_call_id or invocation.authority_arguments_hash != authority.row.tool_arguments_hash:
         raise AuditIntegrityError("pipeline commit dispatch audit does not bind exact proposal arguments")
     executor_hash = composition_content_hash(result.updated_state)
+    if proposed_content_hash is not None and executor_hash != proposed_content_hash:
+        raise AuditIntegrityError("owned composition-state executor differs from the exact proposed content")
     invocation = _bind_executor_content_hash(invocation, executor_content_hash=executor_hash)
     binding = PipelineDispatchAuditBinding.from_invocation(invocation)
     if not result.success or not result.validation.is_valid:
