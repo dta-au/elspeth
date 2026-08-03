@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from typing import Any, Final, cast
+from typing import Annotated, Any, Final, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic import ValidationError as PydanticValidationError
@@ -74,7 +74,7 @@ class _UpsertNodeArgumentsModel(BaseModel):
     input: str
     plugin: str | None = None
     on_success: str | None = None
-    on_error: str | None = None
+    on_error: Annotated[str, Field(min_length=1)] | None = None
     options: dict[str, Any] = Field(default_factory=dict)
     condition: str | None = None
     routes: dict[str, str] | None = None
@@ -213,6 +213,7 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
         },
         "on_error": {
             "type": ["string", "null"],
+            "minLength": 1,
             "description": (
                 "Node-level error policy for transform, aggregation, or gate nodes: use 'discard' or a declared sink name. "
                 "For a gate this handles row expression-evaluation errors; omit it to preserve fail-fast behavior. "

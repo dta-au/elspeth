@@ -1572,6 +1572,7 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                         },
                         "on_error": {
                             "type": ["string", "null"],
+                            "minLength": 1,
                             "description": (
                                 "Node-level error policy for transform, aggregation, or gate nodes: use 'discard' or a declared "
                                 "sink name. For a gate this handles row expression-evaluation errors; omit it to preserve "

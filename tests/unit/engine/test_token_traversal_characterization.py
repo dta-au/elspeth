@@ -350,6 +350,83 @@ class TestProcessSingleTokenOrchestration:
         )
         assert recorded[0]["path"] == TerminalPath.GATE_ERROR_DISCARDED
 
+    @pytest.mark.parametrize(
+        ("on_error", "discarded", "sink_name", "expected_path"),
+        [
+            ("discard", True, None, TerminalPath.GATE_ERROR_DISCARDED),
+            ("gate_errors", False, "gate_errors", TerminalPath.ON_ERROR_ROUTED),
+        ],
+    )
+    def test_gate_error_outcome_survives_gate_evaluated_telemetry_failure_at_process_call_site(
+        self,
+        on_error: str,
+        discarded: bool,
+        sink_name: str | None,
+        expected_path: TerminalPath,
+    ) -> None:
+        """GateEvaluated export cannot replace either handled row-error outcome."""
+        _db, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+        source_node = NodeID("source-0")
+        gate_node = NodeID("gate-1")
+        gate_config = GateSettings(
+            name="threshold",
+            input="default",
+            condition="row['amount'] > 500",
+            routes={"true": "high", "false": "standard"},
+            on_error=on_error,
+        )
+        processor = _make_processor(
+            factory,
+            node_step_map={source_node: 0, gate_node: 1},
+            node_to_next={source_node: gate_node, gate_node: None},
+            node_to_plugin={gate_node: gate_config},
+        )
+        token = make_token_info(row_id="row-1", token_id="tok-1", data={"amount": "bad"})
+        failure = FailureInfo(
+            exception_type="ExpressionEvaluationError",
+            message="gate expression evaluation failed: incompatible runtime types",
+        )
+        gate_outcome = GateOutcome(
+            result=GateResult(
+                row={"amount": "bad"},
+                action=RoutingAction.route(
+                    "__error_threshold__",
+                    mode=RoutingMode.DIVERT,
+                    reason={
+                        "condition": "row['amount'] > 500",
+                        "error_type": "ExpressionEvaluationError",
+                        "error": failure.message,
+                    },
+                ),
+                contract=_make_contract(),
+            ),
+            updated_token=token,
+            sink_name=sink_name,
+            discarded=discarded,
+            error=failure,
+        )
+        recorded: list[dict[str, object]] = []
+
+        def _gate_error(gate_config, node_id, token, ctx, token_manager=None):
+            return gate_outcome
+
+        def _telemetry_failure(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("gate telemetry exporter unavailable")
+
+        processor._gate_executor.execute_config_gate = _gate_error  # type: ignore[method-assign]
+        processor._emit_gate_evaluated = _telemetry_failure  # type: ignore[method-assign]
+        processor._data_flow.record_token_outcome = lambda **kwargs: recorded.append(kwargs)  # type: ignore[method-assign, assignment]
+
+        result, child_items = processor._process_single_token(token=token, ctx=ctx, current_node_id=gate_node)
+
+        assert isinstance(result, RowResult)
+        assert (result.outcome, result.path) == (TerminalOutcome.FAILURE, expected_path)
+        assert result.sink_name == sink_name
+        assert result.error == (None if discarded else failure)
+        assert child_items == []
+        assert [entry["path"] for entry in recorded] == ([TerminalPath.GATE_ERROR_DISCARDED] if discarded else [])
+
     def test_gate_jump_to_node_absent_from_step_map_raises(self) -> None:
         """A gate jump to a node not in the DAG step map is an invariant violation."""
         _db, factory = _make_factory()

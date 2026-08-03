@@ -1786,7 +1786,7 @@ class _PipelineNodeModel(BaseModel):
 
     id: str
     options: _LlmJsonObject = Field(default_factory=dict)
-    on_error: str | None = None
+    on_error: Annotated[str, Field(min_length=1)] | None = None
     node_type: str
     input: str
     plugin: str | None = None

@@ -1940,6 +1940,44 @@ class TestUpsertNode:
         assert result.success is True
         catalog.get_schema.assert_not_called()
 
+    def test_gate_omitted_on_error_preserves_fail_fast_policy(self) -> None:
+        result = execute_tool(
+            "upsert_node",
+            {
+                "id": "g1",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "rows",
+                "condition": "row['amount'] > 500",
+                "routes": {"true": "main", "false": "main"},
+            },
+            _empty_state(),
+            _mock_catalog(),
+        )
+
+        assert result.success is True
+        assert result.updated_state.nodes[0].on_error is None
+
+    @pytest.mark.parametrize("on_error", ["discard", "gate_errors"])
+    def test_gate_accepts_explicit_non_empty_on_error_policy(self, on_error: str) -> None:
+        result = execute_tool(
+            "upsert_node",
+            {
+                "id": "g1",
+                "node_type": "gate",
+                "plugin": None,
+                "input": "rows",
+                "on_error": on_error,
+                "condition": "row['amount'] > 500",
+                "routes": {"true": "main", "false": "main"},
+            },
+            _empty_state(),
+            _mock_catalog(),
+        )
+
+        assert result.success is True
+        assert result.updated_state.nodes[0].on_error == on_error
+
     def test_upsert_node_unknown_transform_plugin_fails(self) -> None:
         """W-4B-1: LLM hallucinates a transform plugin name."""
         state = _empty_state()
@@ -2997,6 +3035,28 @@ class TestLegacyMutationArgumentGuards:
             )
 
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
+
+    def test_upsert_gate_rejects_empty_on_error_before_state_mutation(self) -> None:
+        from elspeth.web.composer.protocol import ToolArgumentError
+
+        state = _empty_state()
+        with pytest.raises(ToolArgumentError) as exc_info:
+            execute_tool(
+                "upsert_node",
+                {
+                    "id": "gate1",
+                    "node_type": "gate",
+                    "input": "rows",
+                    "on_error": "",
+                    "condition": "row['amount'] > 500",
+                    "routes": {"true": "main", "false": "main"},
+                },
+                state,
+                _mock_catalog(),
+            )
+
+        assert isinstance(exc_info.value.__cause__, PydanticValidationError)
+        assert state.nodes == ()
 
 
 class TestSetOutput:
@@ -8795,6 +8855,40 @@ class TestSetPipeline:
         ]
         return catalog
 
+    def _gate_pipeline_args(self, *, on_error: str | None, include_on_error: bool) -> dict[str, Any]:
+        args = _valid_pipeline_args()
+        args["source"]["on_success"] = "rows"
+        gate = {
+            "id": "threshold",
+            "node_type": "gate",
+            "plugin": None,
+            "input": "rows",
+            "condition": "row['amount'] > 500",
+            "routes": {"true": "main", "false": "main"},
+        }
+        if include_on_error:
+            gate["on_error"] = on_error
+        args["nodes"] = [gate]
+        args["edges"] = [
+            {
+                "id": "e1",
+                "from_node": "source",
+                "to_node": "threshold",
+                "edge_type": "on_success",
+                "label": None,
+            }
+        ]
+        if on_error == "gate_errors":
+            args["outputs"].append(
+                {
+                    "sink_name": "gate_errors",
+                    "plugin": "csv",
+                    "options": {"path": "/data/gate-errors.csv", "schema": {"mode": "observed"}},
+                    "on_write_failure": "discard",
+                }
+            )
+        return args
+
     def test_set_pipeline_creates_valid_state(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
@@ -8803,6 +8897,44 @@ class TestSetPipeline:
         assert result.validation is not None
         assert result.validation.is_valid is True
         assert result.updated_state.version == 2  # incremented from 1
+
+    def test_set_pipeline_gate_omitted_on_error_preserves_fail_fast_policy(self) -> None:
+        result = execute_tool(
+            "set_pipeline",
+            self._gate_pipeline_args(on_error=None, include_on_error=False),
+            _empty_state(),
+            _mock_catalog(),
+        )
+
+        assert result.success is True
+        assert result.updated_state.nodes[0].on_error is None
+
+    @pytest.mark.parametrize("on_error", ["discard", "gate_errors"])
+    def test_set_pipeline_gate_accepts_explicit_non_empty_on_error_policy(self, on_error: str) -> None:
+        result = execute_tool(
+            "set_pipeline",
+            self._gate_pipeline_args(on_error=on_error, include_on_error=True),
+            _empty_state(),
+            _mock_catalog(),
+        )
+
+        assert result.success is True
+        assert result.updated_state.nodes[0].on_error == on_error
+
+    def test_set_pipeline_gate_rejects_empty_on_error_before_state_mutation(self) -> None:
+        from elspeth.web.composer.protocol import ToolArgumentError
+
+        state = _empty_state()
+        with pytest.raises(ToolArgumentError) as exc_info:
+            execute_tool(
+                "set_pipeline",
+                self._gate_pipeline_args(on_error="", include_on_error=True),
+                state,
+                _mock_catalog(),
+            )
+
+        assert isinstance(exc_info.value.__cause__, PydanticValidationError)
+        assert state.nodes == ()
 
     def test_set_pipeline_accepts_named_sources_mapping(self) -> None:
         state = _empty_state()

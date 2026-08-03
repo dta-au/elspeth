@@ -187,7 +187,7 @@ ExpressionParser(condition)
 Result conversion:
     bool  → "true" / "false"
     str   → use as route label directly
-    other → str(result)
+    other → raise TypeError (unsupported route value)
     │
     ▼
 Route resolution:

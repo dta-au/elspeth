@@ -149,6 +149,7 @@ def test_provider_schemas_advertise_gate_error_policy_as_node_level_authoring() 
     for properties in (upsert["parameters"]["properties"], pipeline_node["properties"]):
         description = properties["on_error"]["description"]
         lowered = description.lower()
+        assert properties["on_error"]["minLength"] == 1
         assert "gate" in lowered
         assert "node-level" in lowered
         assert "discard" in lowered
@@ -159,6 +160,27 @@ def test_provider_schemas_advertise_gate_error_policy_as_node_level_authoring() 
     assert "transform/aggregation" in edge_description
     assert "gate" in edge_description
     assert "upsert_node" in edge_description
+
+
+def test_set_pipeline_schema_and_model_reject_empty_gate_on_error() -> None:
+    payload = deepcopy(_BASE_PIPELINE)
+    payload["nodes"] = [
+        {
+            "id": "threshold",
+            "node_type": "gate",
+            "input": "rows",
+            "on_error": "",
+            "condition": "row['amount'] > 500",
+            "routes": {"true": "main", "false": "main"},
+        }
+    ]
+
+    with pytest.raises(ValueError):
+        SetPipelineArgumentsModel.model_validate(payload)
+
+    errors = list(Draft202012Validator(_registered_set_pipeline_schema()).iter_errors(payload))
+    assert len(errors) == 1
+    assert list(errors[0].absolute_path) == ["nodes", 0, "on_error"]
 
 
 def test_canonical_schema_accessor_returns_isolated_registered_copies() -> None:

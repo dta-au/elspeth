@@ -413,13 +413,19 @@ class TokenTraversalEngine:
 
         # 2. Emit GateEvaluated telemetry AFTER Landscape recording succeeds
         # (Landscape recording happens inside execute_config_gate)
-        self._processor._emit_gate_evaluated(
-            token=current_token,
+        with best_effort(
+            "GateEvaluated telemetry after gate audit",
+            run_id=self._processor._run_id,
+            token_id=current_token.token_id,
             gate_name=gate.name,
-            gate_node_id=node_id,
-            routing_mode=outcome.result.action.mode,
-            destinations=self._processor._get_gate_destinations(outcome),
-        )
+        ):
+            self._processor._emit_gate_evaluated(
+                token=current_token,
+                gate_name=gate.name,
+                gate_node_id=node_id,
+                routing_mode=outcome.result.action.mode,
+                destinations=self._processor._get_gate_destinations(outcome),
+            )
 
         # 3. A configured row-level evaluation failure is terminal for this
         # token only. The source loop can continue with unaffected rows.
