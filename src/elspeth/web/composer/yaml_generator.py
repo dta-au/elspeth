@@ -36,10 +36,10 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.guided.state_machine import TerminalKind
 from elspeth.web.composer.guided_blob_refs import (
-    GUIDED_REVIEWED_BLOB_PATH_KEYS,
+    GuidedReviewedBlobBinding,
     validate_guided_reviewed_blob_binding,
-    validate_guided_reviewed_blob_ref,
     validate_guided_reviewed_blob_source_mapping,
+    validate_guided_reviewed_sentinel_source_mapping,
 )
 from elspeth.web.composer.state import COMPOSER_NODE_TYPES, CompositionState, queue_node_contract_error
 from elspeth.web.interpretation_state import AUTHORING_METADATA_OPTION_KEYS
@@ -340,42 +340,20 @@ def reattach_guided_blob_refs_for_public_export(state: CompositionState) -> Comp
         return state
 
     reviewed_bindings: list[tuple[str, frozenset[str], str]] = []
-    sentinel_bindings: list[tuple[str, str]] = []
+    sentinel_bindings: list[tuple[str, GuidedReviewedBlobBinding]] = []
     reviewed_names: set[str] = set()
     for snapshot in guided.reviewed_sources.values():
         source_name = snapshot.name
         if source_name in reviewed_names:
             raise AuditIntegrityError("guided reviewed source names must be unique")
         reviewed_names.add(source_name)
-        snapshot_options = snapshot.options
-        sentinel_paths = frozenset(
-            value
-            for key in GUIDED_REVIEWED_BLOB_PATH_KEYS
-            if key in snapshot_options and type(value := snapshot_options[key]) is str and value.startswith("blob:")
-        )
-        if sentinel_paths:
-            sentinel_path_carriers: set[str] = set()
-            for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
-                if key not in snapshot_options:
-                    continue
-                value = snapshot_options[key]
-                if type(value) is not str or not value or "\x00" in value:
-                    raise AuditIntegrityError("guided reviewed blob source path carrier must be an exact non-empty string without NUL")
-                sentinel_path_carriers.add(value)
-            if sentinel_paths != frozenset(sentinel_path_carriers):
-                raise AuditIntegrityError("guided reviewed blob source mixes public sentinels and private paths")
-            sentinel_ids = {validate_guided_reviewed_blob_ref(sentinel.removeprefix("blob:")) for sentinel in sentinel_paths}
-            if len(sentinel_ids) != 1:
-                raise AuditIntegrityError("guided reviewed blob sentinel and blob_ref differ")
-            blob_ref = next(iter(sentinel_ids))
-            if "blob_ref" in snapshot_options and validate_guided_reviewed_blob_ref(snapshot_options["blob_ref"]) != blob_ref:
-                raise AuditIntegrityError("guided reviewed blob sentinel and blob_ref differ")
-            sentinel_bindings.append((source_name, blob_ref))
+        binding = validate_guided_reviewed_blob_binding(snapshot.options)
+        if binding is None:
             continue
-        if "blob_ref" not in snapshot_options:
+        if binding.is_sentinel:
+            sentinel_bindings.append((source_name, binding))
             continue
-        blob_ref, blob_backed_paths = validate_guided_reviewed_blob_binding(snapshot_options)
-        reviewed_bindings.append((source_name, blob_backed_paths, blob_ref))
+        reviewed_bindings.append((source_name, binding.paths, binding.blob_ref))
 
     if not reviewed_bindings and not sentinel_bindings:
         return state
@@ -410,20 +388,19 @@ def reattach_guided_blob_refs_for_public_export(state: CompositionState) -> Comp
         reattached[source_name] = replace(source, options=merged)
         changed = True
 
-    for source_name, blob_ref in sentinel_bindings:
-        sentinel_source = state.sources.get(source_name)
-        if sentinel_source is None:
-            raise AuditIntegrityError("guided blob source mapping is inconsistent")
-        live_carriers = [sentinel_source.options[key] for key in GUIDED_REVIEWED_BLOB_PATH_KEYS if key in sentinel_source.options]
-        if not live_carriers or any(type(value) is not str or not value or "\x00" in value for value in live_carriers):
-            raise AuditIntegrityError("guided blob source mapping is inconsistent")
+    live_source_options = {name: source.options for name, source in state.sources.items()}
+    for source_name, binding in sentinel_bindings:
+        validate_guided_reviewed_sentinel_source_mapping(
+            binding,
+            source_name=source_name,
+            live_source_options=live_source_options,
+        )
+        sentinel_source = state.sources[source_name]
         options = sentinel_source.options
         if "blob_ref" in options:
-            if options["blob_ref"] != blob_ref:
-                raise AuditIntegrityError("guided blob source mapping is inconsistent")
             continue
         merged = dict(options)
-        merged["blob_ref"] = blob_ref
+        merged["blob_ref"] = binding.blob_ref
         reattached[source_name] = replace(sentinel_source, options=merged)
         changed = True
 

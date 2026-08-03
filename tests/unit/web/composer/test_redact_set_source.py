@@ -306,6 +306,91 @@ def test_redact_guided_snapshot_projects_canonical_blob_sentinel_by_exact_name()
     assert composer_meta["guided_session"]["reviewed_sources"]["22222222-2222-4222-8222-222222222222"]["options"]["path"] == sentinel
 
 
+def test_redact_guided_snapshot_projects_plural_canonical_sentinels_by_exact_carrier() -> None:
+    first_path = "/internal/blobs/session/first.csv"
+    second_path = "/internal/blobs/session/second.csv"
+    first_sentinel = "blob:11111111-1111-4111-8111-111111111111"
+    second_sentinel = "blob:22222222-2222-4222-8222-222222222222"
+    sources = {
+        "first": {"options": {"path": first_path}},
+        "second": {"options": {"file": second_path}},
+    }
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "33333333-3333-4333-8333-333333333333": {
+                    "name": "first",
+                    "options": {"path": first_sentinel},
+                },
+                "44444444-4444-4444-8444-444444444444": {
+                    "name": "second",
+                    "options": {"file": second_sentinel},
+                },
+            },
+            "pending_source_intents": {},
+        }
+    }
+
+    sources_out, meta_out = redact_guided_snapshot_storage_paths(sources, composer_meta)
+
+    assert sources_out["first"]["options"]["path"] == first_sentinel
+    assert sources_out["second"]["options"]["file"] == second_sentinel
+    assert first_path not in repr((sources_out, meta_out))
+    assert second_path not in repr((sources_out, meta_out))
+
+
+def test_redact_guided_snapshot_rejects_sentinel_mixed_with_private_file_before_projection() -> None:
+    private_path = "/internal/blobs/session/source.csv"
+    private_file = "/internal/blobs/secret.csv"
+    sentinel = "blob:11111111-1111-4111-8111-111111111111"
+    sources = {"source": {"options": {"path": private_path, "file": private_file}}}
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "22222222-2222-4222-8222-222222222222": {
+                    "name": "source",
+                    "options": {"path": sentinel, "file": private_file},
+                }
+            },
+            "pending_source_intents": {},
+        }
+    }
+
+    with pytest.raises(AuditIntegrityError, match="mixes public sentinels and private paths"):
+        redact_guided_snapshot_storage_paths(sources, composer_meta)
+
+    assert sources["source"]["options"]["file"] == private_file
+    reviewed = composer_meta["guided_session"]["reviewed_sources"]["22222222-2222-4222-8222-222222222222"]
+    assert reviewed["options"]["file"] == private_file
+
+
+def test_redact_guided_snapshot_rejects_live_blob_ref_conflicting_with_reviewed_sentinel() -> None:
+    reviewed_blob_id = "11111111-1111-4111-8111-111111111111"
+    conflicting_blob_id = "33333333-3333-4333-8333-333333333333"
+    sources = {
+        "source": {
+            "options": {
+                "path": "/internal/blobs/session/source.csv",
+                "blob_ref": conflicting_blob_id,
+            }
+        }
+    }
+    composer_meta = {
+        "guided_session": {
+            "reviewed_sources": {
+                "22222222-2222-4222-8222-222222222222": {
+                    "name": "source",
+                    "options": {"path": f"blob:{reviewed_blob_id}"},
+                }
+            },
+            "pending_source_intents": {},
+        }
+    }
+
+    with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+        redact_guided_snapshot_storage_paths(sources, composer_meta)
+
+
 def test_redact_guided_snapshot_accepts_matching_fork_sentinel_and_blob_ref() -> None:
     blob_id = "11111111-1111-4111-8111-111111111111"
     sentinel = f"blob:{blob_id}"

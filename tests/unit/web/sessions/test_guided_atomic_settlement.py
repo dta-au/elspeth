@@ -35,6 +35,7 @@ from elspeth.web.composer.guided.deferred_intents import DeferredIntentAction, D
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.intent_management import deferred_intent_management_option
 from elspeth.web.composer.guided.protocol import ChatRole, ChatTurn, GuidedStep, TurnType
+from elspeth.web.composer.guided.resolved import SourceResolved
 from elspeth.web.composer.guided.stage_subjects import ComponentCountConstraint
 from elspeth.web.composer.guided.state_machine import (
     DeferredStageIntent,
@@ -1098,6 +1099,7 @@ def _replay_record(
     descriptor: GuidedResponseDescriptor,
     guided: GuidedSession,
     validation_errors: list[str] | None = None,
+    sources: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> CompositionStateRecord:
     replay = importlib.import_module("elspeth.web.sessions.guided_replay")
     state = replay.with_guided_response_descriptor(
@@ -1112,7 +1114,7 @@ def _replay_record(
         id=uuid4(),
         session_id=uuid4(),
         version=1,
-        sources=None,
+        sources=sources,
         source=None,
         nodes=None,
         edges=None,
@@ -1124,6 +1126,68 @@ def _replay_record(
         derived_from_state_id=None,
         composer_meta=state.composer_meta,
     )
+
+
+def _guided_with_replay_source(options: Mapping[str, object]) -> GuidedSession:
+    stable_id = "11111111-1111-4111-8111-111111111111"
+    return replace(
+        GuidedSession.initial(),
+        source_order=(stable_id,),
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name="source",
+                plugin="csv",
+                options=options,
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+    )
+
+
+def test_guided_replay_rejects_mixed_sentinel_before_private_composer_meta_can_project() -> None:
+    replay = importlib.import_module("elspeth.web.sessions.guided_replay")
+    private_path = "/internal/blobs/source.csv"
+    private_file = "/internal/blobs/private-file.csv"
+    descriptor = GuidedResponseDescriptor(kind="guided_respond", next_turn=None, assistant_turn_seq=None)
+    guided = _guided_with_replay_source(
+        {
+            "path": "blob:22222222-2222-4222-8222-222222222222",
+            "file": private_file,
+        }
+    )
+    record = _replay_record(
+        descriptor=descriptor,
+        guided=guided,
+        sources={"source": {"plugin": "csv", "options": {"path": private_path, "file": private_file}}},
+    )
+
+    with pytest.raises(AuditIntegrityError, match="mixes public sentinels and private paths"):
+        replay.project_guided_response(record, payloads=())
+
+
+def test_guided_replay_redacts_canonical_sentinel_in_sources_and_persisted_composer_meta() -> None:
+    replay = importlib.import_module("elspeth.web.sessions.guided_replay")
+    private_path = "/internal/blobs/source.csv"
+    blob_id = "22222222-2222-4222-8222-222222222222"
+    sentinel = f"blob:{blob_id}"
+    descriptor = GuidedResponseDescriptor(kind="guided_respond", next_turn=None, assistant_turn_seq=None)
+    guided = _guided_with_replay_source({"path": sentinel})
+    record = _replay_record(
+        descriptor=descriptor,
+        guided=guided,
+        sources={"source": {"plugin": "csv", "options": {"path": private_path}}},
+    )
+
+    response = replay.project_guided_response(record, payloads=())
+
+    state = response.composition_state
+    assert state is not None and state.sources is not None and state.composer_meta is not None
+    assert state.sources["source"]["options"]["path"] == sentinel
+    reviewed = state.composer_meta["guided_session"]["reviewed_sources"]["11111111-1111-4111-8111-111111111111"]
+    assert reviewed["options"]["path"] == sentinel
+    assert private_path not in repr(response)
 
 
 def test_replay_rejects_descriptor_step_index_that_disagrees_with_turn_record() -> None:

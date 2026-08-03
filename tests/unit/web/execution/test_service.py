@@ -57,7 +57,7 @@ from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import run_attributions_table, runs_table
 from elspeth.telemetry.manager import TelemetryManager
-from elspeth.web.blobs.protocol import BlobFinalizationResult, BlobRecord, BlobServiceProtocol
+from elspeth.web.blobs.protocol import BlobFinalizationResult, BlobNotFoundError, BlobRecord, BlobServiceProtocol
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.execution.errors import CompletionGateIntegrityError, ExecutionReadinessError, PipelineValidationError
@@ -599,6 +599,35 @@ def _proof_gate_state(
         metadata=PipelineMetadata(name="Proof gate"),
         version=1,
     )
+
+
+def _guided_sentinel_proof_gate_state(*, source_path: Path, blob_id: UUID) -> Any:
+    """Observed CSV numeric gate whose reviewed source claims blob custody."""
+    from dataclasses import replace
+
+    from elspeth.web.composer.guided.resolved import SourceResolved
+    from elspeth.web.composer.guided.state_machine import GuidedSession
+
+    live_state = _proof_gate_state(source_path=source_path, blob_id=None)
+    stable_id = str(uuid4())
+    guided = replace(
+        GuidedSession.initial(),
+        source_order=(stable_id,),
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name="source",
+                plugin="csv",
+                options={
+                    "path": f"blob:{blob_id}",
+                    "schema": {"mode": "observed"},
+                },
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+    )
+    return replace(live_state, guided_session=guided)
 
 
 def _install_ready_proof_blob(
@@ -1534,6 +1563,85 @@ class TestExecutionFlow:
 
 
 class TestAuthoritativeProofDiagnostics:
+    @pytest.mark.asyncio
+    async def test_guided_sentinel_with_valid_custody_reads_once_and_rejects_numeric_gate(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "guided-sentinel-amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        state = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+        blob_service.get_blob.assert_awaited_once_with(blob_id)
+        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
+            blob_id,
+            prefix_bytes=8 * 1024,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "custody_failure",
+        ["wrong_session", "wrong_path", "not_ready", "not_found"],
+    )
+    async def test_guided_sentinel_with_failed_custody_is_invalid_without_reading(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+        custody_failure: str,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / f"guided-sentinel-{custody_failure}.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        state = _guided_sentinel_proof_gate_state(source_path=source_path, blob_id=blob_id)
+        blob_service = create_autospec(BlobServiceProtocol, instance=True)
+        if custody_failure == "not_found":
+            blob_service.get_blob.side_effect = BlobNotFoundError(str(blob_id))
+        else:
+            blob_service.get_blob.return_value = _blob_record_stub(
+                blob_id=blob_id,
+                session_id=uuid4() if custody_failure == "wrong_session" else session_id,
+                filename=source_path.name,
+                mime_type="text/csv",
+                size_bytes=source_path.stat().st_size,
+                content_hash=hashlib.sha256(source_path.read_bytes()).hexdigest(),
+                storage_path=(str(tmp_path / "different-custody-path.csv") if custody_failure == "wrong_path" else str(source_path)),
+                status="pending" if custody_failure == "not_ready" else "ready",
+            )
+        service._blob_service = blob_service
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is False
+        assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
+        blob_service.get_blob.assert_awaited_once_with(blob_id)
+        blob_service.read_blob_content_prefix_verified.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_observed_csv_numeric_gate_after_declared_queue_is_rejected(
         self,

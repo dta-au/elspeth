@@ -13,6 +13,7 @@ exactly how a projection came to report absence as fact (see
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from uuid import UUID
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -20,6 +21,23 @@ from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 
 GUIDED_REVIEWED_BLOB_PATH_KEYS = ("path", "file")
 GUIDED_REVIEWED_EXPLICIT_SCHEMA_MODES = ("fixed", "flexible")
+
+
+def _is_blob_sentinel(value: object) -> bool:
+    return type(value) is str and value.startswith(BLOB_REF_PATH_PREFIX)
+
+
+@dataclass(frozen=True, slots=True)
+class GuidedReviewedBlobBinding:
+    """One validated reviewed-source custody claim and its path carriers."""
+
+    blob_ref: str
+    carriers: tuple[tuple[str, str], ...]
+    is_sentinel: bool
+
+    @property
+    def paths(self) -> frozenset[str]:
+        return frozenset(value for _key, value in self.carriers)
 
 
 def validate_guided_reviewed_blob_ref(value: object) -> str:
@@ -35,20 +53,65 @@ def validate_guided_reviewed_blob_ref(value: object) -> str:
     return value
 
 
-def validate_guided_reviewed_blob_binding(options: Mapping[str, object]) -> tuple[str, frozenset[str]]:
-    """Validate and return one complete reviewed blob binding."""
-    blob_ref = validate_guided_reviewed_blob_ref(options["blob_ref"])
-    paths: set[str] = set()
+def validate_guided_reviewed_blob_binding(options: Mapping[str, object]) -> GuidedReviewedBlobBinding | None:
+    """Validate one explicit-ref or public-sentinel reviewed binding."""
+    has_explicit_ref = "blob_ref" in options
+    has_sentinel = any(_is_blob_sentinel(options[key]) for key in GUIDED_REVIEWED_BLOB_PATH_KEYS if key in options)
+    if not has_explicit_ref and not has_sentinel:
+        return None
+
+    carriers: list[tuple[str, str]] = []
     for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
         if key not in options:
             continue
         value = options[key]
         if type(value) is not str or not value or "\x00" in value:
             raise AuditIntegrityError("guided reviewed blob source path carrier must be an exact non-empty string without NUL")
-        paths.add(value)
-    if not paths:
+        carriers.append((key, value))
+    if not carriers:
         raise AuditIntegrityError("guided reviewed blob source is missing a string path carrier")
-    return blob_ref, frozenset(paths)
+
+    if has_sentinel:
+        if any(not value.startswith(BLOB_REF_PATH_PREFIX) for _key, value in carriers):
+            raise AuditIntegrityError("guided reviewed blob source mixes public sentinels and private paths")
+        sentinel_ids = {validate_guided_reviewed_blob_ref(value.removeprefix(BLOB_REF_PATH_PREFIX)) for _key, value in carriers}
+        if len(sentinel_ids) != 1:
+            raise AuditIntegrityError("guided reviewed blob sentinel and blob_ref differ")
+        blob_ref = next(iter(sentinel_ids))
+        if has_explicit_ref and validate_guided_reviewed_blob_ref(options["blob_ref"]) != blob_ref:
+            raise AuditIntegrityError("guided reviewed blob sentinel and blob_ref differ")
+        return GuidedReviewedBlobBinding(blob_ref=blob_ref, carriers=tuple(carriers), is_sentinel=True)
+
+    blob_ref = validate_guided_reviewed_blob_ref(options["blob_ref"])
+    return GuidedReviewedBlobBinding(blob_ref=blob_ref, carriers=tuple(carriers), is_sentinel=False)
+
+
+def validate_guided_reviewed_sentinel_source_mapping(
+    binding: GuidedReviewedBlobBinding,
+    *,
+    source_name: str,
+    live_source_options: Mapping[str, Mapping[str, object]],
+) -> tuple[tuple[str, str], ...]:
+    """Validate the exact live source identity and carriers for a sentinel."""
+    if not binding.is_sentinel:
+        raise TypeError("sentinel source mapping requires a sentinel binding")
+    if source_name not in live_source_options:
+        raise AuditIntegrityError("guided blob source mapping is inconsistent")
+    options = live_source_options[source_name]
+    expected_keys = {key for key, _value in binding.carriers}
+    live_keys = {key for key in GUIDED_REVIEWED_BLOB_PATH_KEYS if key in options}
+    if live_keys != expected_keys:
+        raise AuditIntegrityError("guided blob source mapping is inconsistent")
+
+    live_carriers: list[tuple[str, str]] = []
+    for key, _sentinel in binding.carriers:
+        value = options[key]
+        if type(value) is not str or not value or "\x00" in value or value.startswith(BLOB_REF_PATH_PREFIX):
+            raise AuditIntegrityError("guided blob source mapping is inconsistent")
+        live_carriers.append((key, value))
+    if "blob_ref" in options and validate_guided_reviewed_blob_ref(options["blob_ref"]) != binding.blob_ref:
+        raise AuditIntegrityError("guided blob source mapping is inconsistent")
+    return tuple(live_carriers)
 
 
 def validate_guided_reviewed_blob_source_mapping(

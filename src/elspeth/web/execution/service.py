@@ -150,7 +150,7 @@ from elspeth.web.sessions.telemetry import _SessionsTelemetry
 if TYPE_CHECKING:
     from elspeth.core.landscape.database import LandscapeDB
     from elspeth.web.catalog.protocol import CatalogService
-    from elspeth.web.composer.tools.generation import ResolvedProofBlob
+    from elspeth.web.composer.tools.generation import ResolvedProofBlob, UnresolvedClaimedProofBlob
 
 slog = structlog.get_logger()
 _meter = metrics.get_meter(__name__)
@@ -748,11 +748,19 @@ class ExecutionServiceImpl:
         state: CompositionState,
         *,
         session_id: UUID | None,
-    ) -> Callable[[str], ResolvedProofBlob | None]:
+    ) -> Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]:
         """Resolve only exact, session-owned, ready blob bindings for proof."""
+        from elspeth.web.composer.guided_blob_refs import validate_guided_reviewed_blob_binding
         from elspeth.web.composer.tools.blobs import BlobToolRecord
-        from elspeth.web.composer.tools.generation import ResolvedProofBlob
+        from elspeth.web.composer.tools.generation import ResolvedProofBlob, UnresolvedClaimedProofBlob
         from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
+
+        claimed_sentinel_blob_ids: set[str] = set()
+        if state.guided_session is not None:
+            for reviewed_source in state.guided_session.reviewed_sources.values():
+                binding = validate_guided_reviewed_blob_binding(reviewed_source.options)
+                if binding is not None and binding.is_sentinel:
+                    claimed_sentinel_blob_ids.add(binding.blob_ref)
 
         expected_paths_by_blob_id: dict[str, set[str]] = {}
         for source in state.sources.values():
@@ -778,27 +786,30 @@ class ExecutionServiceImpl:
                 expected_paths_by_blob_id[raw_blob_id] = set()
             expected_paths_by_blob_id[raw_blob_id].update(paths)
 
-        resolved_by_blob_id: dict[str, ResolvedProofBlob | None] = {}
+        resolved_by_blob_id: dict[str, ResolvedProofBlob | UnresolvedClaimedProofBlob | None] = {}
 
-        def _resolve(blob_id: str) -> ResolvedProofBlob | None:
+        def _unresolved(blob_id: str) -> UnresolvedClaimedProofBlob | None:
+            return UnresolvedClaimedProofBlob() if blob_id in claimed_sentinel_blob_ids else None
+
+        def _resolve(blob_id: str) -> ResolvedProofBlob | UnresolvedClaimedProofBlob | None:
             if blob_id in resolved_by_blob_id:
                 return resolved_by_blob_id[blob_id]
             if self._blob_service is None or session_id is None or blob_id not in expected_paths_by_blob_id:
-                resolved_by_blob_id[blob_id] = None
-                return None
+                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
+                return resolved_by_blob_id[blob_id]
             try:
                 parsed_blob_id = UUID(blob_id)
             except ValueError:
-                resolved_by_blob_id[blob_id] = None
-                return None
+                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
+                return resolved_by_blob_id[blob_id]
             if str(parsed_blob_id) != blob_id:
-                resolved_by_blob_id[blob_id] = None
-                return None
+                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
+                return resolved_by_blob_id[blob_id]
             try:
                 record = self._call_async(self._blob_service.get_blob(parsed_blob_id))
             except BlobNotFoundError:
-                resolved_by_blob_id[blob_id] = None
-                return None
+                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
+                return resolved_by_blob_id[blob_id]
             if type(record) is not BlobRecord:
                 raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
             if (
@@ -807,8 +818,8 @@ class ExecutionServiceImpl:
                 or record.status != "ready"
                 or expected_paths_by_blob_id[blob_id] != {record.storage_path}
             ):
-                resolved_by_blob_id[blob_id] = None
-                return None
+                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
+                return resolved_by_blob_id[blob_id]
             metadata = cast(
                 BlobToolRecord,
                 {

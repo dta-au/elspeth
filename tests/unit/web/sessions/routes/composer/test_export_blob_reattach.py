@@ -12,6 +12,8 @@ redact_guided_snapshot_storage_paths; the public response still omits the UUID.
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 
@@ -25,6 +27,8 @@ from elspeth.web.composer.guided.state_machine import (
 )
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.composer.yaml_generator import generate_public_pipeline_dict
+from elspeth.web.sessions.protocol import CompositionStateRecord
+from elspeth.web.sessions.routes._helpers import _state_response
 from elspeth.web.sessions.routes.composer.state import _reattach_guided_blob_refs
 
 BLOB_PATH = "/data/blobs/sess-1/abc12300-0000-4000-8000-000000000000_data.csv"
@@ -171,6 +175,81 @@ def test_rejects_guided_native_blob_sentinel_mixed_with_private_path_carrier() -
 
     with pytest.raises(AuditIntegrityError, match="mixes public sentinels and private paths"):
         _reattach_guided_blob_refs(state)
+
+
+def test_state_response_rejects_mixed_guided_sentinel_before_private_file_can_project() -> None:
+    private_path = "/internal/blobs/source.csv"
+    private_file = "/internal/blobs/private-file.csv"
+    record = CompositionStateRecord(
+        id=uuid4(),
+        session_id=uuid4(),
+        version=1,
+        sources={"source": {"plugin": "csv", "options": {"path": private_path, "file": private_file}}},
+        source=None,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata_=None,
+        is_valid=False,
+        validation_errors=("guided_composition_invalid",),
+        created_at=datetime.now(UTC),
+        derived_from_state_id=None,
+        composer_meta={
+            "guided_session": {
+                "reviewed_sources": {
+                    "11111111-1111-4111-8111-111111111111": {
+                        "name": "source",
+                        "options": {
+                            "path": f"blob:{BLOB_REF}",
+                            "file": private_file,
+                        },
+                    }
+                },
+                "pending_source_intents": {},
+            }
+        },
+    )
+
+    with pytest.raises(AuditIntegrityError, match="mixes public sentinels and private paths"):
+        _state_response(record)
+
+
+def test_state_response_rejects_live_blob_ref_conflicting_with_guided_sentinel() -> None:
+    conflicting_blob_ref = "def45600-0000-4000-8000-000000000000"
+    record = CompositionStateRecord(
+        id=uuid4(),
+        session_id=uuid4(),
+        version=1,
+        sources={
+            "source": {
+                "plugin": "csv",
+                "options": {"path": BLOB_PATH, "blob_ref": conflicting_blob_ref},
+            }
+        },
+        source=None,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata_=None,
+        is_valid=False,
+        validation_errors=("guided_composition_invalid",),
+        created_at=datetime.now(UTC),
+        derived_from_state_id=None,
+        composer_meta={
+            "guided_session": {
+                "reviewed_sources": {
+                    "11111111-1111-4111-8111-111111111111": {
+                        "name": "source",
+                        "options": {"path": f"blob:{BLOB_REF}"},
+                    }
+                },
+                "pending_source_intents": {},
+            }
+        },
+    )
+
+    with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+        _state_response(record)
 
 
 def test_rejects_public_blob_sentinel_that_differs_from_retained_blob_ref() -> None:

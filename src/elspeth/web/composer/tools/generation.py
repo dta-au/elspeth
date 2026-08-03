@@ -1601,6 +1601,11 @@ class ResolvedProofBlob:
             raise AuditIntegrityError("verified proof blob size differs from its custody metadata")
 
 
+@dataclass(frozen=True, slots=True)
+class UnresolvedClaimedProofBlob:
+    """Nominal marker that a reviewed sentinel's custody claim failed."""
+
+
 class _BlockingDiagnosticPayload(TypedDict):
     code: str
     severity: Literal["blocking"]
@@ -2024,7 +2029,7 @@ def _compute_proof_diagnostics_for_source(
     source_name: str,
     source: SourceSpec,
     blob_id: object,
-    blob_resolver: Callable[[str], ResolvedProofBlob | None],
+    blob_resolver: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None],
 ) -> list[Mapping[str, Any]]:
     """Compute machine-readable proof diagnostics for one blob-backed source.
 
@@ -2072,6 +2077,17 @@ def _compute_proof_diagnostics_for_source(
     diagnostics: list[Mapping[str, Any]] = []
 
     resolved_blob = blob_resolver(str(blob_id))
+    if isinstance(resolved_blob, UnresolvedClaimedProofBlob):
+        return [
+            _blocking_diagnostic(
+                code="source_inspection_failed",
+                message=(
+                    "A guided reviewed source claims blob custody, but the live blob is not an exact ready, session-owned path match."
+                ),
+                suggested_repair="Re-select or re-upload the source blob, then confirm the guided wiring again.",
+                evidence_locator={"source": "blob", "blob_id": str(blob_id)},
+            )
+        ]
     blob = None if resolved_blob is None else resolved_blob.metadata
     # ``blob`` is a BlobToolRecord (TypedDict produced by
     # ``_blob_row_to_tool_dict`` from a validated blobs row). Direct
@@ -2435,7 +2451,7 @@ def compute_proof_diagnostics(
     *,
     session_engine: Engine | None = None,
     session_id: str | None = None,
-    blob_resolver: Callable[[str], ResolvedProofBlob | None] | None = None,
+    blob_resolver: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None] | None = None,
 ) -> list[Mapping[str, Any]]:
     """Inspect every blob-backed source within the authored-source proof cap.
 
@@ -2476,9 +2492,9 @@ def compute_proof_diagnostics(
         effective_resolver = _resolve_from_composer_store
 
     uncached_resolver = effective_resolver
-    resolved_by_blob_id: dict[tuple[str, str], ResolvedProofBlob | None] = {}
+    resolved_by_blob_id: dict[tuple[str, str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None] = {}
 
-    def _memoized_resolver(resolved_blob_id: str) -> ResolvedProofBlob | None:
+    def _memoized_resolver(resolved_blob_id: str) -> ResolvedProofBlob | UnresolvedClaimedProofBlob | None:
         try:
             parsed_blob_id = UUID(resolved_blob_id)
         except ValueError:

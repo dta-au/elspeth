@@ -29,9 +29,10 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.composer.guided_blob_refs import (
     GUIDED_REVIEWED_BLOB_PATH_KEYS,
+    GuidedReviewedBlobBinding,
     validate_guided_reviewed_blob_binding,
-    validate_guided_reviewed_blob_ref,
     validate_guided_reviewed_blob_source_mapping,
+    validate_guided_reviewed_sentinel_source_mapping,
 )
 from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
 from elspeth.web.composer.state import EdgeType
@@ -4023,7 +4024,7 @@ def redact_guided_snapshot_storage_paths(
     pending_out: dict[str, Any] = {}
     rebuilt_sources = dict(sources) if sources is not None else None
     reviewed_bindings: list[tuple[str, frozenset[str]]] = []
-    sentinel_bindings: dict[str, dict[str, str]] = {}
+    sentinel_bindings: dict[str, GuidedReviewedBlobBinding] = {}
     reviewed_names: set[str] = set()
     private_path_projections: dict[str, str] = {}
     changed = False
@@ -4039,25 +4040,15 @@ def redact_guided_snapshot_storage_paths(
         snap_options = snapshot["options"]
         if type(snap_options) is not dict:
             raise ValueError(f"redact_guided_snapshot_storage_paths: guided_session.reviewed_sources[{stable_id!r}].options must be a dict")
-        sentinels: dict[str, str] = {}
-        for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
-            candidate = snap_options.get(key)
-            if type(candidate) is str and candidate.startswith("blob:"):
-                sentinels[key] = candidate
-        if sentinels:
-            sentinel_ids = {validate_guided_reviewed_blob_ref(sentinel.removeprefix("blob:")) for sentinel in sentinels.values()}
-            if len(sentinel_ids) != 1 or (
-                "blob_ref" in snap_options and validate_guided_reviewed_blob_ref(snap_options["blob_ref"]) not in sentinel_ids
-            ):
-                raise AuditIntegrityError("guided reviewed blob sentinel and blob_ref differ")
-            sentinel_bindings[name] = sentinels
+        binding = validate_guided_reviewed_blob_binding(snap_options)
+        if binding is None:
             reviewed_out[stable_id] = snapshot
             continue
-        if "blob_ref" not in snap_options:
+        if binding.is_sentinel:
+            sentinel_bindings[name] = binding
             reviewed_out[stable_id] = snapshot
             continue
 
-        _blob_ref, blob_paths = validate_guided_reviewed_blob_binding(snap_options)
         snap_options_redacted = dict(snap_options)
         for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
             if key in snap_options_redacted:
@@ -4066,7 +4057,7 @@ def redact_guided_snapshot_storage_paths(
         snapshot_redacted["options"] = snap_options_redacted
         reviewed_out[stable_id] = snapshot_redacted
         changed = True
-        reviewed_bindings.append((name, blob_paths))
+        reviewed_bindings.append((name, binding.paths))
 
     if rebuilt_sources is not None and reviewed_bindings:
         live_source_options: dict[str, dict[str, Any]] = {}
@@ -4110,16 +4101,20 @@ def redact_guided_snapshot_storage_paths(
         missing_names = set(sentinel_bindings) - set(rebuilt_sources)
         if missing_names:
             raise AuditIntegrityError("guided blob sentinel source mapping is inconsistent")
-        for source_name, sentinels in sentinel_bindings.items():
+        for source_name, binding in sentinel_bindings.items():
             live_source = rebuilt_sources.get(source_name)
             if type(live_source) is not dict or type(live_source.get("options")) is not dict:
                 raise AuditIntegrityError("guided blob sentinel source mapping is inconsistent")
             live_options = live_source["options"]
+            live_carriers = validate_guided_reviewed_sentinel_source_mapping(
+                binding,
+                source_name=source_name,
+                live_source_options={source_name: live_options},
+            )
+            sentinels = dict(binding.carriers)
             redacted_options = dict(live_options)
-            for key, sentinel in sentinels.items():
-                private_path = live_options.get(key)
-                if type(private_path) is not str:
-                    raise AuditIntegrityError("guided blob sentinel source mapping is inconsistent")
+            for key, private_path in live_carriers:
+                sentinel = sentinels[key]
                 existing_projection = private_path_projections.get(private_path)
                 if existing_projection is not None and existing_projection != sentinel:
                     raise AuditIntegrityError("guided blob sentinel path projection is ambiguous")
