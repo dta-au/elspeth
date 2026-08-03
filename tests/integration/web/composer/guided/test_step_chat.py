@@ -62,6 +62,14 @@ class _RaisingLiteLLMCompletion:
         raise self.exception
 
 
+@dataclass
+class _MetricInstrument:
+    points: list[tuple[int | float, dict[str, str]]] = field(default_factory=list)
+
+    def record(self, value: int | float, attributes: dict[str, str]) -> None:
+        self.points.append((value, dict(attributes)))
+
+
 def _create_session(client: TestClient) -> str:
     resp = client.post("/api/sessions", json={"title": "step-chat-test"})
     assert resp.status_code == 201, resp.json()
@@ -1597,7 +1605,17 @@ class TestGuidedChatWireDiscriminator:
         assert status == 200, body
         assert body["assistant_message_kind"] == "synthetic_failure"
 
-    def test_provider_timeout_is_kind_synthetic_failure(self, composer_test_client: TestClient) -> None:
+    def test_provider_timeout_is_kind_synthetic_failure(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.composer import provider_telemetry
+
+        request_duration = _MetricInstrument()
+        request_calls = _MetricInstrument()
+        monkeypatch.setattr(provider_telemetry, "_REQUEST_DURATION", request_duration)
+        monkeypatch.setattr(provider_telemetry, "_REQUEST_PROVIDER_CALLS", request_calls)
         session_id = _create_session(composer_test_client)
         _seed_guided_session(composer_test_client, session_id)
 
@@ -1613,6 +1631,9 @@ class TestGuidedChatWireDiscriminator:
 
         assert status == 200, body
         assert body["assistant_message_kind"] == "synthetic_failure"
+        attributes = {"surface": "guided", "status": "timed_out"}
+        assert request_duration.points[-1][1] == attributes
+        assert request_calls.points[-1] == (1, attributes)
         # Provider unavailability uses distinct safe copy; the persisted turn
         # test below pins its required machine-readable reason.
         assert "quality check" not in body["assistant_message"]

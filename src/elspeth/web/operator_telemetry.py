@@ -70,6 +70,7 @@ SAFE_CLOUDWATCH_METRIC_ATTRIBUTES: frozenset[str] = frozenset(
         "result",
         "source",
         "status",
+        "surface",
         "to_mode",
     }
 )
