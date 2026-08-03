@@ -79,6 +79,7 @@ from elspeth.web.sessions.protocol import (
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.unit.web.composer.guided.test_propose_pipeline_protocol import _payload as _advisory_proposal_payload
 
 
 def _empty_composition_state() -> CompositionState:
@@ -129,6 +130,111 @@ def _empty_wire_payload(
         "blockers": [],
         "can_confirm": True,
     }
+
+
+def _proposal_ref_for_advisory_payload(
+    payload: Mapping[str, object],
+    *,
+    covered_intent_ids: tuple[str, ...] = (),
+) -> GuidedProposalRef:
+    return GuidedProposalRef(
+        proposal_id=UUID(cast(str, payload["proposal_id"])),
+        draft_hash=cast(str, payload["draft_hash"]),
+        base=AbsentBase(),
+        reviewed_anchor_hash=guided_reviewed_anchor_hash(
+            source_order=(),
+            reviewed_sources={},
+            output_order=(),
+            reviewed_outputs={},
+        ),
+        covered_deferred_intent_ids=covered_intent_ids,
+        creation_event_schema="pipeline_proposal_created.v1",
+    )
+
+
+def test_guided_chat_advisory_authority_binds_exact_durable_turn_payload() -> None:
+    guided_chat = importlib.import_module("elspeth.web.sessions.routes.composer.guided_chat_atomic")
+    chat_solver = importlib.import_module("elspeth.web.composer.guided.chat_solver")
+    payload = _advisory_proposal_payload()
+    prepared = PreparedGuidedJsonPayload(
+        payload_id=guided_json_payload_id("turn", payload),
+        purpose="turn",
+        payload=payload,
+    )
+    covered_intent_id = "11111111-1111-4111-8111-111111111111"
+    active_proposal = _proposal_ref_for_advisory_payload(payload, covered_intent_ids=(covered_intent_id,))
+
+    authority = guided_chat._guided_advisory_graph_authority(
+        step=GuidedStep.STEP_3_TRANSFORMS,
+        guided=SimpleNamespace(active_proposal=active_proposal),
+        current_turn={"type": TurnType.PROPOSE_PIPELINE.value, "step_index": 2, "payload": payload},
+        current_payload=prepared,
+    )
+
+    assert type(authority) is chat_solver.GuidedAdvisoryGraphAuthority
+    assert authority.payload_id == prepared.payload_id
+    assert authority.payload == prepared.payload
+    assert authority.proposal_id == str(active_proposal.proposal_id)
+    assert authority.draft_hash == active_proposal.draft_hash
+    assert authority.covered_deferred_intent_ids == (covered_intent_id,)
+
+
+def test_guided_chat_advisory_authority_binds_exact_confirm_wiring_payload() -> None:
+    guided_chat = importlib.import_module("elspeth.web.sessions.routes.composer.guided_chat_atomic")
+    payload = _empty_wire_payload()
+    prepared = PreparedGuidedJsonPayload(
+        payload_id=guided_json_payload_id("turn", payload),
+        purpose="turn",
+        payload=payload,
+    )
+    active_proposal = _proposal_ref_for_advisory_payload(payload)
+
+    authority = guided_chat._guided_advisory_graph_authority(
+        step=GuidedStep.STEP_4_WIRE,
+        guided=SimpleNamespace(active_proposal=active_proposal),
+        current_turn={"type": TurnType.CONFIRM_WIRING.value, "step_index": 3, "payload": payload},
+        current_payload=prepared,
+    )
+
+    assert authority.turn_type is TurnType.CONFIRM_WIRING
+    assert authority.payload_id == prepared.payload_id
+    assert authority.payload == prepared.payload
+
+
+@pytest.mark.parametrize("mismatch", ["turn_payload", "turn_type", "step_index", "proposal", "draft", "payload_hash"])
+def test_guided_chat_advisory_authority_fails_closed_on_binding_mismatch(mismatch: str) -> None:
+    guided_chat = importlib.import_module("elspeth.web.sessions.routes.composer.guided_chat_atomic")
+    payload = _advisory_proposal_payload()
+    prepared = PreparedGuidedJsonPayload(
+        payload_id=guided_json_payload_id("turn", payload),
+        purpose="turn",
+        payload=payload,
+    )
+    current_turn = {"type": TurnType.PROPOSE_PIPELINE.value, "step_index": 2, "payload": payload}
+    active_proposal = _proposal_ref_for_advisory_payload(payload)
+    if mismatch == "turn_payload":
+        current_turn = {**current_turn, "payload": {**payload, "summary": "changed"}}
+    elif mismatch == "turn_type":
+        current_turn = {**current_turn, "type": TurnType.CONFIRM_WIRING.value}
+    elif mismatch == "step_index":
+        current_turn = {**current_turn, "step_index": 3}
+    elif mismatch == "proposal":
+        active_proposal = replace(active_proposal, proposal_id=UUID("00000000-0000-4000-8000-000000000999"))
+    elif mismatch == "draft":
+        active_proposal = replace(active_proposal, draft_hash="e" * 64)
+    else:
+        # Deliberately corrupt the frozen custody object after construction so
+        # the boundary must exercise its independent hash recomputation rather
+        # than merely reject an inexact stand-in type.
+        object.__setattr__(prepared, "payload", {**payload, "summary": "changed"})
+
+    with pytest.raises(AuditIntegrityError):
+        guided_chat._guided_advisory_graph_authority(
+            step=GuidedStep.STEP_3_TRANSFORMS,
+            guided=SimpleNamespace(active_proposal=active_proposal),
+            current_turn=current_turn,
+            current_payload=prepared,
+        )
 
 
 _MALFORMED_CURRENT_TURNS: tuple[tuple[GuidedStep, TurnType, Mapping[str, object]], ...] = (

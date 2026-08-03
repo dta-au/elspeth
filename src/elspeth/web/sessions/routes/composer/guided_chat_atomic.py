@@ -19,12 +19,13 @@ from elspeth.web.composer.guided._display import plugin_display_label
 from elspeth.web.composer.guided.audit import emit_intent_cancelled
 from elspeth.web.composer.guided.chat_solver import (
     DeferredIntentManagementChatRequest,
+    GuidedAdvisoryGraphAuthority,
     Step1SourceChatResolution,
     resolved_sink_config_error,
 )
 from elspeth.web.composer.guided.emitters import _inspection_matches_source_plugin
 from elspeth.web.composer.guided.errors import InvariantError
-from elspeth.web.composer.guided.protocol import ControlSignal, GuidedStep, Turn, TurnType
+from elspeth.web.composer.guided.protocol import ControlSignal, GuidedStep, Turn, TurnType, validate_current_turn
 from elspeth.web.composer.guided.resolved import SinkResolved
 from elspeth.web.composer.guided.stage_transitions import (
     AnsweredTurn,
@@ -34,6 +35,7 @@ from elspeth.web.composer.guided.stage_transitions import (
     transition_source_plugin_selection,
     transition_source_schema_form,
 )
+from elspeth.web.composer.guided.state_machine import GuidedProposalRef
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_blob_content
 from elspeth.web.sessions._guided_step_chat import (
@@ -281,6 +283,53 @@ def _guided_chat_endpoint_kwargs(settings: Any) -> tuple[str | None, str | None]
     return settings.composer_endpoint_base_url, (api_key.get_secret_value() if api_key is not None else None)
 
 
+def _guided_advisory_graph_authority(
+    *,
+    step: GuidedStep,
+    guided: Any,
+    current_turn: Turn,
+    current_payload: PreparedGuidedJsonPayload,
+) -> GuidedAdvisoryGraphAuthority:
+    """Bind provider context to the exact current proposal/wire CAS record."""
+    expected_turn_type = {
+        GuidedStep.STEP_3_TRANSFORMS: TurnType.PROPOSE_PIPELINE,
+        GuidedStep.STEP_4_WIRE: TurnType.CONFIRM_WIRING,
+    }.get(step)
+    if expected_turn_type is None:
+        raise AuditIntegrityError("guided advisory graph authority escaped Steps 3 and 4")
+    if type(current_payload) is not PreparedGuidedJsonPayload or current_payload.purpose != "turn":
+        raise AuditIntegrityError("guided advisory graph authority requires an exact prepared turn payload")
+    if not isinstance(current_turn, Mapping):
+        raise AuditIntegrityError("guided advisory graph authority current turn is malformed")
+    try:
+        turn_type = validate_current_turn(step, current_turn)
+        turn_payload = current_turn["payload"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AuditIntegrityError("guided advisory graph authority current turn is malformed") from exc
+    if turn_type is not expected_turn_type:
+        raise AuditIntegrityError("guided advisory graph authority turn type does not match the guided step")
+    if not isinstance(turn_payload, Mapping) or guided_json_payload_id("turn", turn_payload) != current_payload.payload_id:
+        raise AuditIntegrityError("guided advisory graph authority turn payload differs from durable custody")
+    if current_payload.payload_id != guided_json_payload_id("turn", current_payload.payload):
+        raise AuditIntegrityError("guided advisory graph authority payload hash differs from durable custody")
+    active_proposal = guided.active_proposal
+    if type(active_proposal) is not GuidedProposalRef:
+        raise AuditIntegrityError("guided advisory graph authority has no exact active proposal binding")
+    proposal_id = str(active_proposal.proposal_id)
+    if current_payload.payload.get("proposal_id") != proposal_id:
+        raise AuditIntegrityError("guided advisory graph authority proposal id differs from active custody")
+    if current_payload.payload.get("draft_hash") != active_proposal.draft_hash:
+        raise AuditIntegrityError("guided advisory graph authority draft hash differs from active custody")
+    return GuidedAdvisoryGraphAuthority(
+        turn_type=turn_type,
+        payload_id=current_payload.payload_id,
+        proposal_id=proposal_id,
+        draft_hash=active_proposal.draft_hash,
+        covered_deferred_intent_ids=active_proposal.covered_deferred_intent_ids,
+        payload=current_payload.payload,
+    )
+
+
 async def run_guided_chat_provider_attempt(
     *,
     session_id: UUID,
@@ -295,6 +344,8 @@ async def run_guided_chat_provider_attempt(
     secret_service: Any,
     recorder: BufferingRecorder,
     progress: Any,
+    current_turn: Turn | None = None,
+    current_payload: PreparedGuidedJsonPayload | None = None,
 ) -> GuidedChatProviderOutcome:
     """Run the only provider-bearing phase, with no compose lock held."""
 
@@ -305,6 +356,16 @@ async def run_guided_chat_provider_attempt(
     sink = _current_sink(guided)
     sink_output_indices = _current_sink_output_indices(guided)
     revision_form = _active_component_revision_kind(guided, step)
+    graph_authority: GuidedAdvisoryGraphAuthority | None = None
+    if step in {GuidedStep.STEP_3_TRANSFORMS, GuidedStep.STEP_4_WIRE}:
+        if current_turn is None or current_payload is None:
+            raise AuditIntegrityError("guided advisory Step 3/4 provider call has no frozen turn authority")
+        graph_authority = _guided_advisory_graph_authority(
+            step=step,
+            guided=guided,
+            current_turn=current_turn,
+            current_payload=current_payload,
+        )
     context_block = build_step_chat_context_block(
         step=step,
         current_source=source,
@@ -313,6 +374,7 @@ async def run_guided_chat_provider_attempt(
         state=state,
         deferred_intents=guided.deferred_intents,
         authoritative_revision_form=revision_form,
+        graph_authority=graph_authority,
     )
     if step is GuidedStep.STEP_1_SOURCE:
         plugin_hint = None
@@ -1102,6 +1164,8 @@ async def post_guided_chat_schema8(
                             secret_service=request.app.state.scoped_secret_resolver,
                             recorder=recorder,
                             progress=progress_sink,
+                            current_turn=frozen.current_turn,
+                            current_payload=frozen.current_payload,
                         )
                         chat_result = provider_outcome.chat
                         source_resolution = provider_outcome.resolution if type(provider_outcome) is Step1SourceResolvedResult else None

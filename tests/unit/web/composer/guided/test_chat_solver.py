@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from copy import deepcopy
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCallStatus
+from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided import chat_solver
 from elspeth.web.composer.guided.chat_solver import (
@@ -48,6 +50,7 @@ from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SinkResolved, SourceResolved
 from elspeth.web.composer.guided.stage_subjects import (
     ComponentCountConstraint,
+    PluginSubject,
     StatedGateRoutingConstraint,
     StatedPredicateConstraint,
 )
@@ -58,19 +61,38 @@ from elspeth.web.composer.guided.stage_transitions import (
     transition_source_plugin_selection,
     transition_source_schema_form,
 )
-from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
 from elspeth.web.sessions import _guided_step_chat as guided_step_chat_module
 from elspeth.web.sessions._guided_step_chat import (
     resolve_deferred_intent_management_chat_with_auto_drop,
     resolve_step_1_source_chat_with_auto_drop,
     resolve_step_2_sink_chat_with_auto_drop,
 )
+from elspeth.web.sessions.protocol import guided_json_payload_id
 from elspeth.web.sessions.routes.composer import guided_chat_atomic as guided_chat_atomic_module
 from elspeth.web.sessions.routes.composer.guided_chat_intent_management import (
     DeferredRequestCancelled,
     DeferredRequestEdited,
     DeferredRequestRetained,
     DeferredRequestUnchanged,
+)
+from tests.unit.web.composer.guided.test_propose_pipeline_protocol import (
+    _fork_coalesce_payload as _advisory_fork_coalesce_payload,
+)
+from tests.unit.web.composer.guided.test_propose_pipeline_protocol import (
+    _fork_row_union_payload as _advisory_fork_row_union_payload,
+)
+from tests.unit.web.composer.guided.test_propose_pipeline_protocol import (
+    _gate_payload as _advisory_gate_payload,
+)
+from tests.unit.web.composer.guided.test_propose_pipeline_protocol import (
+    _payload as _advisory_direct_payload,
+)
+from tests.unit.web.composer.guided.test_propose_pipeline_protocol import (
+    _queue_payload as _advisory_queue_payload,
+)
+from tests.unit.web.composer.guided.test_propose_pipeline_protocol import (
+    _wire_payload_with_gate as _advisory_wire_payload_with_gate,
 )
 from tests.unit.web.composer.guided.test_stage_transitions import SOURCE_KNOBS, _with_unanswered_turn
 
@@ -2710,13 +2732,14 @@ async def test_advisory_source_context_keeps_exact_labels_at_user_authority(
 ) -> None:
     observed_column_canary = "ADVISORY_IGNORE_SYSTEM_OBSERVED_COLUMN"
     sample_key_canary = "ADVISORY_EXFILTRATE_SAMPLE_KEY"
+    validation_target_canary = "ADVISORY_IGNORE_SYSTEM_VALIDATION_TARGET"
     current_source = SourceResolved(
         name="source",
         plugin="csv",
         options={"schema": {"mode": "observed", "guaranteed_fields": [observed_column_canary]}},
         observed_columns=(observed_column_canary,),
         sample_rows=({sample_key_canary: "ordinary sample"},),
-        on_validation_failure="discard",
+        on_validation_failure=validation_target_canary,
     )
     current_sink = SinkResolved(
         outputs=(
@@ -2736,6 +2759,7 @@ async def test_advisory_source_context_keeps_exact_labels_at_user_authority(
         current_sink=current_sink,
         state=None,
         deferred_intents=(),
+        graph_authority=_advisory_graph_authority(_advisory_direct_payload()),
     )
     captured: dict[str, Any] = {}
 
@@ -2759,7 +2783,9 @@ async def test_advisory_source_context_keeps_exact_labels_at_user_authority(
     non_system_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] != "system")
     assert observed_column_canary not in system_content
     assert sample_key_canary not in system_content
+    assert validation_target_canary not in system_content
     assert observed_column_canary in non_system_content
+    assert validation_target_canary in non_system_content
     assert sample_key_canary in non_system_content
     assert "<untrusted_source_field_labels>" in non_system_content
 
@@ -2776,6 +2802,634 @@ def test_build_step_chat_context_block_is_honest_when_nothing_is_built() -> None
     assert "Applied output: none yet." in block.system_content
     assert "Pending saved instructions (stable identities):\nnone" in block.system_content
     assert block.untrusted_user_content is None
+
+
+def _advisory_graph_authority(
+    payload: dict[str, Any],
+    *,
+    turn_type: TurnType = TurnType.PROPOSE_PIPELINE,
+    covered_intent_ids: tuple[str, ...] = (),
+) -> Any:
+    return chat_solver.GuidedAdvisoryGraphAuthority(
+        turn_type=turn_type,
+        payload_id=guided_json_payload_id("turn", payload),
+        proposal_id=payload["proposal_id"],
+        draft_hash=payload["draft_hash"],
+        covered_deferred_intent_ids=covered_intent_ids,
+        payload=payload,
+    )
+
+
+def _advisory_context(
+    payload: dict[str, Any],
+    *,
+    step: GuidedStep = GuidedStep.STEP_3_TRANSFORMS,
+    turn_type: TurnType = TurnType.PROPOSE_PIPELINE,
+    deferred_intents: tuple[Any, ...] = (),
+    covered_intent_ids: tuple[str, ...] = (),
+    state: Any = None,
+) -> Any:
+    return build_step_chat_context_block(
+        step=step,
+        current_source=None,
+        current_sink=None,
+        state=state,
+        deferred_intents=deferred_intents,
+        graph_authority=_advisory_graph_authority(
+            payload,
+            turn_type=turn_type,
+            covered_intent_ids=covered_intent_ids,
+        ),
+    )
+
+
+def _same_plugin_linear_advisory_payload(*, reversed_order: bool) -> dict[str, Any]:
+    payload = _advisory_direct_payload()
+    first_id = payload["nodes"][0]["stable_id"]
+    second_id = "00000000-0000-4000-8000-000000000499"
+    second = deepcopy(payload["nodes"][0])
+    second["stable_id"] = second_id
+    second["label"] = "node-2"
+    payload["nodes"] = [payload["nodes"][0], second]
+    upstream, downstream = (second_id, first_id) if reversed_order else (first_id, second_id)
+    source_id = payload["graph"]["sources"][0]["stable_id"]
+    output_id = payload["outputs"][0]["stable_id"]
+    edge_ids = [f"00000000-0000-4000-8000-{index:012d}" for index in range(700, 707)]
+    payload["graph"]["edges"] = [
+        {
+            "stable_id": edge_ids[0],
+            "from_endpoint": {"kind": "source", "stable_id": source_id},
+            "to_endpoint": {"kind": "node", "stable_id": upstream},
+            "flow": {"kind": "source_success", "branch": None},
+        },
+        {
+            "stable_id": edge_ids[1],
+            "from_endpoint": {"kind": "source", "stable_id": source_id},
+            "to_endpoint": {"kind": "discard"},
+            "flow": {"kind": "source_validation_failure"},
+        },
+        {
+            "stable_id": edge_ids[2],
+            "from_endpoint": {"kind": "node", "stable_id": upstream},
+            "to_endpoint": {"kind": "node", "stable_id": downstream},
+            "flow": {"kind": "node_success", "branch": None},
+        },
+        {
+            "stable_id": edge_ids[3],
+            "from_endpoint": {"kind": "node", "stable_id": upstream},
+            "to_endpoint": {"kind": "discard"},
+            "flow": {"kind": "node_error"},
+        },
+        {
+            "stable_id": edge_ids[4],
+            "from_endpoint": {"kind": "node", "stable_id": downstream},
+            "to_endpoint": {"kind": "output", "stable_id": output_id},
+            "flow": {"kind": "node_success", "branch": None},
+        },
+        {
+            "stable_id": edge_ids[5],
+            "from_endpoint": {"kind": "node", "stable_id": downstream},
+            "to_endpoint": {"kind": "discard"},
+            "flow": {"kind": "node_error"},
+        },
+        {
+            "stable_id": edge_ids[6],
+            "from_endpoint": {"kind": "output", "stable_id": output_id},
+            "to_endpoint": {"kind": "discard"},
+            "flow": {"kind": "output_write_failure"},
+        },
+    ]
+    payload["component_counts"] = {"sources": 1, "nodes": 2, "edges": 7, "outputs": 1}
+    payload["blockers"] = []
+    payload["edit_targets"] = []
+    return payload
+
+
+def test_guided_advisory_graph_context_distinguishes_same_plugin_count_rewires() -> None:
+    first = _same_plugin_linear_advisory_payload(reversed_order=False)
+    second = _same_plugin_linear_advisory_payload(reversed_order=True)
+
+    first_context = _advisory_context(first)
+    second_context = _advisory_context(second)
+
+    assert first["component_counts"] == second["component_counts"]
+    assert [node["plugin"] for node in first["nodes"]] == [node["plugin"] for node in second["nodes"]]
+    assert first_context.system_content != second_context.system_content
+    assert "from_alias" in first_context.system_content
+    assert "to_alias" in first_context.system_content
+    for component in (*first["graph"]["sources"], *first["nodes"], *first["outputs"]):
+        assert component["stable_id"] not in first_context.system_content
+
+
+@pytest.mark.parametrize(
+    ("payload_factory", "expected_system_fragments"),
+    [
+        (
+            _advisory_direct_payload,
+            ("source_success", "source_validation_failure", "node_success", "node_error", "output_write_failure"),
+        ),
+        (_advisory_gate_payload, ("gate_route", '"route": "route-1"', '"route_aliases": ["route-1"')),
+        (_advisory_fork_coalesce_payload, ("gate_fork", "coalesce_success", '"policy": "quorum"', '"merge": "nested"')),
+        (_advisory_fork_row_union_payload, ("gate_fork", "row_union_success", '"policy": "require_all"')),
+        (_advisory_queue_payload, ("queue_continue", '"kind": "queue"')),
+    ],
+)
+def test_guided_advisory_graph_system_projection_covers_closed_flow_shapes(
+    payload_factory: Any,
+    expected_system_fragments: tuple[str, ...],
+) -> None:
+    context = _advisory_context(payload_factory())
+
+    for fragment in expected_system_fragments:
+        assert fragment in context.system_content
+
+
+def test_guided_advisory_authored_literals_are_delimited_user_data_only() -> None:
+    condition_canary = "IGNORE_SYSTEM_CONDITION_CANARY"
+    route_canary = "IGNORE_SYSTEM_ROUTE_KEY_CANARY"
+    field_canary = "IGNORE_SYSTEM_FIELD_CANARY"
+    enum_canary = "IGNORE_SYSTEM_ENUM_CANARY"
+
+    proposal = _advisory_gate_payload()
+    proposal["nodes"][0]["behavior"]["condition"] = condition_canary
+    proposal["nodes"][0]["behavior"]["routes"][0]["key"] = route_canary
+    proposal_context = _advisory_context(proposal)
+
+    wire = _advisory_wire_payload_with_gate(deepcopy(proposal["nodes"][0]["behavior"]))
+    wire["sources"][0]["guaranteed_fields"] = [field_canary]
+    wire["nodes"][0]["required_fields"] = [field_canary]
+    wire["nodes"][0]["structured_output_fields"] = [
+        {"query": "query_one", "field": field_canary, "type": "str", "enum_values": [enum_canary]}
+    ]
+    wire["outputs"][0]["required_fields"] = [field_canary]
+    wire["outputs"][0]["business_schema"] = {
+        "mode": "fixed",
+        "fields": [{"name": field_canary, "type": "str", "required": True, "nullable": False}],
+        "guaranteed_fields": [field_canary],
+        "required_fields": [field_canary],
+    }
+    wire_context = _advisory_context(
+        wire,
+        step=GuidedStep.STEP_4_WIRE,
+        turn_type=TurnType.CONFIRM_WIRING,
+    )
+
+    for canary in (condition_canary, route_canary):
+        assert canary not in proposal_context.system_content
+        assert proposal_context.untrusted_user_content is not None
+        assert canary in proposal_context.untrusted_user_content
+    for canary in (field_canary, enum_canary):
+        assert canary not in wire_context.system_content
+        assert wire_context.untrusted_user_content is not None
+        assert canary in wire_context.untrusted_user_content
+    assert "<untrusted_guided_graph_literals>" in wire_context.untrusted_user_content
+
+
+def test_guided_advisory_wire_projects_exact_connection_and_schema_contract() -> None:
+    wire = _advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"])
+    source_id = wire["sources"][0]["stable_id"]
+    output_id = wire["outputs"][0]["stable_id"]
+    connection_id = "00000000-0000-4000-8000-000000000788"
+    producer_fields = ["PRODUCER_ALPHA_CANARY", "PRODUCER_BETA_CANARY"]
+    consumer_fields = ["CONSUMER_ONLY_CANARY"]
+    missing_fields = ["MISSING_ONE_CANARY", "MISSING_TWO_CANARY", "MISSING_THREE_CANARY"]
+    from_prose = "FROM_PROSE_MUST_BE_OMITTED"
+    to_prose = "TO_PROSE_MUST_BE_OMITTED"
+    wire["connections"] = [
+        {
+            "stable_id": connection_id,
+            "from_endpoint": {"kind": "source", "stable_id": source_id},
+            "to_endpoint": {"kind": "output", "stable_id": output_id},
+            "flow": {"kind": "source_success", "branch": None},
+            "schema_contract": {
+                "from": from_prose,
+                "to": to_prose,
+                "producer_guarantees": producer_fields,
+                "consumer_requires": consumer_fields,
+                "missing_fields": missing_fields,
+                "satisfied": False,
+            },
+        }
+    ]
+
+    context = _advisory_context(
+        wire,
+        step=GuidedStep.STEP_4_WIRE,
+        turn_type=TurnType.CONFIRM_WIRING,
+    )
+
+    assert '"from_alias": "source-1"' in context.system_content
+    assert '"to_alias": "output-1"' in context.system_content
+    assert '"kind": "source_success"' in context.system_content
+    assert '"satisfied": false' in context.system_content
+    assert '"producer_guarantee_count": 2' in context.system_content
+    assert '"consumer_requirement_count": 1' in context.system_content
+    assert '"missing_field_count": 3' in context.system_content
+    assert context.untrusted_user_content is not None
+    for field in (*producer_fields, *consumer_fields, *missing_fields):
+        assert field not in context.system_content
+        assert field in context.untrusted_user_content
+    assert f'"producer_guarantees": {json.dumps(producer_fields)}' in context.untrusted_user_content
+    assert f'"consumer_requires": {json.dumps(consumer_fields)}' in context.untrusted_user_content
+    assert f'"missing_fields": {json.dumps(missing_fields)}' in context.untrusted_user_content
+    assert '"connection_alias": "connection-1"' in context.untrusted_user_content
+    complete_context = context.system_content + context.untrusted_user_content
+    for omitted in (connection_id, source_id, output_id, from_prose, to_prose):
+        assert omitted not in complete_context
+
+
+def test_guided_advisory_uses_frozen_turn_graph_not_stale_composition_edges() -> None:
+    payload = _advisory_fork_coalesce_payload()
+    stale_state = SimpleNamespace(
+        sources={"stale": SimpleNamespace(plugin="stale_source")},
+        nodes=(SimpleNamespace(plugin="stale_transform"),),
+        outputs=(SimpleNamespace(plugin="stale_sink"),),
+        edges=("STALE_EDGE_CANARY",),
+    )
+
+    without_state = _advisory_context(payload, state=None)
+    with_stale_state = _advisory_context(payload, state=stale_state)
+
+    assert with_stale_state == without_state
+    assert "STALE_EDGE_CANARY" not in with_stale_state.system_content
+    assert "stale_transform" not in with_stale_state.system_content
+
+
+def test_guided_advisory_authority_detaches_from_caller_payload_mutation() -> None:
+    payload = _advisory_gate_payload()
+    original_condition = payload["nodes"][0]["behavior"]["condition"]
+    authority = _advisory_graph_authority(payload)
+
+    payload["nodes"][0]["behavior"]["condition"] = "POST_CONSTRUCTION_MUTATION_CANARY"
+    context = build_step_chat_context_block(
+        step=GuidedStep.STEP_3_TRANSFORMS,
+        current_source=None,
+        current_sink=None,
+        state=None,
+        deferred_intents=(),
+        graph_authority=authority,
+    )
+
+    assert context.untrusted_user_content is not None
+    assert original_condition in context.untrusted_user_content
+    assert "POST_CONSTRUCTION_MUTATION_CANARY" not in context.untrusted_user_content
+
+
+def test_guided_advisory_aggregation_splits_closed_policy_from_authored_literals() -> None:
+    payload = _advisory_fork_row_union_payload()
+    aggregation = next(node for node in payload["nodes"] if node["node_type"] == "aggregation")
+    aggregation["behavior"] = {
+        "kind": "aggregation",
+        "trigger_kinds": ["count", "timeout"],
+        "count": "5",
+        "timeout_seconds": 12.5,
+        "output_mode": "transform",
+        "expected_output_count": "2",
+    }
+
+    context = _advisory_context(payload)
+
+    assert '"trigger_kinds": ["count", "timeout"]' in context.system_content
+    assert '"output_mode": "transform"' in context.system_content
+    for literal in ('"count": "5"', '"timeout_seconds": 12.5', '"expected_output_count": "2"'):
+        assert literal not in context.system_content
+        assert context.untrusted_user_content is not None
+        assert literal in context.untrusted_user_content
+
+
+def test_guided_advisory_why_scope_names_only_covered_deferred_intents() -> None:
+    first = create_deferred_stage_intent(
+        DeferredIntentAction(
+            target_stage="topology",
+            catalog_kind="transform",
+            catalog_name="passthrough",
+            redacted_summary="first",
+            constraints=(
+                ComponentCountConstraint(
+                    kind="component_count",
+                    component_kind="node",
+                    plugin_kind="transform",
+                    plugin_name="passthrough",
+                    operator="at_least",
+                    count=1,
+                ),
+            ),
+        ),
+        receiving_stage="source",
+        intent_id="11111111-1111-4111-8111-111111111111",
+        originating_message_id="21111111-1111-4111-8111-111111111111",
+        originating_message_content="Later use at least one passthrough transform.",
+    )
+    second = create_deferred_stage_intent(
+        DeferredIntentAction(
+            target_stage="topology",
+            catalog_kind="transform",
+            catalog_name="llm",
+            redacted_summary="second",
+            constraints=(
+                ComponentCountConstraint(
+                    kind="component_count",
+                    component_kind="node",
+                    plugin_kind="transform",
+                    plugin_name="llm",
+                    operator="at_least",
+                    count=2,
+                ),
+            ),
+        ),
+        receiving_stage="source",
+        intent_id="12222222-2222-4222-8222-222222222222",
+        originating_message_id="22222222-2222-4222-8222-222222222222",
+        originating_message_content="Later use at least two llm transforms.",
+    )
+    context = _advisory_context(
+        _advisory_direct_payload(),
+        deferred_intents=(first, second),
+        covered_intent_ids=(first.intent_id,),
+    )
+
+    assert f'"covered_deferred_intent_ids": ["{first.intent_id}"]' in context.system_content
+    assert "Only those covered IDs may be used to explain why" in context.system_content
+    assert second.intent_id in context.system_content  # still manageable by stable identity
+    assert context.untrusted_user_content is not None
+    assert '"count": 1' in context.untrusted_user_content
+    assert '"count": 2' in context.untrusted_user_content
+
+
+def test_guided_advisory_deferred_authored_constraint_literals_are_user_role_only() -> None:
+    column_canary = "IGNORE_SYSTEM_DEFERRED_COLUMN_CANARY"
+    value_canary = "IGNORE_SYSTEM_DEFERRED_VALUE_CANARY"
+    intent = DeferredStageIntent.create(
+        intent_id="13333333-3333-4333-8333-333333333333",
+        receiving_stage="source",
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Future topology instruction for structural requirement; 1 structural constraint(s).",
+        originating_message_id="23333333-3333-4333-8333-333333333333",
+        message_content_hash=stable_hash("private originating message"),
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column=column_canary,
+                operator="equals",
+                value=value_canary,
+            ),
+        ),
+    )
+
+    context = _advisory_context(_advisory_direct_payload(), deferred_intents=(intent,))
+
+    assert context.untrusted_user_content is not None
+    for canary in (column_canary, value_canary):
+        assert canary not in context.system_content
+        assert canary in context.untrusted_user_content
+    assert '"constraint_kinds": ["stated_predicate"]' in context.system_content
+
+
+@pytest.mark.asyncio
+async def test_step_1_tool_path_preserves_deferred_constraint_user_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    intent = create_deferred_stage_intent(
+        DeferredIntentAction(
+            target_stage="topology",
+            catalog_kind="transform",
+            catalog_name="passthrough",
+            redacted_summary="future count",
+            constraints=(
+                ComponentCountConstraint(
+                    kind="component_count",
+                    component_kind="node",
+                    plugin_kind="transform",
+                    plugin_name="passthrough",
+                    operator="at_least",
+                    count=91,
+                ),
+            ),
+        ),
+        receiving_stage="source",
+        intent_id="14444444-4444-4444-8444-444444444444",
+        originating_message_id="24444444-4444-4444-8444-444444444444",
+        originating_message_content="Later use at least 91 passthrough transforms.",
+    )
+    context = build_step_chat_context_block(
+        step=GuidedStep.STEP_1_SOURCE,
+        current_source=None,
+        current_sink=None,
+        state=None,
+        deferred_intents=(intent,),
+    )
+    captured: dict[str, Any] = {}
+
+    async def completion(**kwargs: Any) -> _FakeLLMResponse:
+        captured.update(kwargs)
+        return _ok_response("The future instruction remains pending.")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", completion)
+
+    await maybe_resolve_step_1_source_chat(
+        model="test/model",
+        user_message="What is still pending?",
+        plugin_hint=None,
+        current_source=None,
+        available_source_plugins=("csv",),
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+        context_block=context,
+    )
+
+    system_content = "\n".join(message["content"] for message in captured["messages"] if message["role"] == "system")
+    user_content = "\n".join(message["content"] for message in captured["messages"] if message["role"] == "user")
+    assert '"count": 91' not in system_content
+    assert '"count": 91' in user_content
+
+
+def test_guided_advisory_no_deferred_context_states_exact_why_omission() -> None:
+    context = _advisory_context(_advisory_direct_payload())
+
+    assert '"covered_deferred_intent_ids": []' in context.system_content
+    assert "No pending instruction is covered, so do not attribute any graph decision to one." in context.system_content
+    assert "Pending saved instructions (stable identities):\nnone" in context.system_content
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        ("bad_hash", "payload hash"),
+        ("bad_proposal", "proposal binding"),
+        ("bad_alias", "current turn payload is invalid"),
+    ],
+)
+def test_guided_advisory_graph_authority_rejects_malformed_binding(mutation: str, expected: str) -> None:
+    payload = _advisory_direct_payload()
+    payload_id = guided_json_payload_id("turn", payload)
+    proposal_id = payload["proposal_id"]
+    if mutation == "bad_hash":
+        payload_id = "0" * 64
+    elif mutation == "bad_proposal":
+        proposal_id = "00000000-0000-4000-8000-000000000999"
+    else:
+        payload["nodes"][0]["label"] = "AUTHOR_CONTROLLED_ALIAS"
+        payload_id = guided_json_payload_id("turn", payload)
+
+    with pytest.raises(InvariantError, match=expected):
+        chat_solver.GuidedAdvisoryGraphAuthority(
+            turn_type=TurnType.PROPOSE_PIPELINE,
+            payload_id=payload_id,
+            proposal_id=proposal_id,
+            draft_hash=payload["draft_hash"],
+            covered_deferred_intent_ids=(),
+            payload=payload,
+        )
+
+
+def test_guided_advisory_context_rejects_stage_turn_and_coverage_mismatch() -> None:
+    proposal = _advisory_direct_payload()
+    wrong_stage_authority = _advisory_graph_authority(proposal)
+    with pytest.raises(InvariantError, match="step and turn type"):
+        build_step_chat_context_block(
+            step=GuidedStep.STEP_4_WIRE,
+            current_source=None,
+            current_sink=None,
+            state=None,
+            deferred_intents=(),
+            graph_authority=wrong_stage_authority,
+        )
+
+    unknown_coverage = _advisory_graph_authority(
+        proposal,
+        covered_intent_ids=("11111111-1111-4111-8111-111111111111",),
+    )
+    with pytest.raises(InvariantError, match="coverage"):
+        build_step_chat_context_block(
+            step=GuidedStep.STEP_3_TRANSFORMS,
+            current_source=None,
+            current_sink=None,
+            state=None,
+            deferred_intents=(),
+            graph_authority=unknown_coverage,
+        )
+
+
+@pytest.mark.parametrize("step", [GuidedStep.STEP_3_TRANSFORMS, GuidedStep.STEP_4_WIRE])
+def test_guided_advisory_context_requires_graph_authority_for_review_steps(step: GuidedStep) -> None:
+    with pytest.raises(InvariantError, match="requires exact frozen graph authority"):
+        build_step_chat_context_block(
+            step=step,
+            current_source=None,
+            current_sink=None,
+            state=None,
+            deferred_intents=(),
+        )
+
+
+@pytest.mark.parametrize("step", [GuidedStep.STEP_1_SOURCE, GuidedStep.STEP_2_SINK])
+def test_guided_advisory_context_rejects_graph_authority_before_review_steps(step: GuidedStep) -> None:
+    with pytest.raises(InvariantError, match="only valid for Steps 3 and 4"):
+        build_step_chat_context_block(
+            step=step,
+            current_source=None,
+            current_sink=None,
+            state=None,
+            deferred_intents=(),
+            graph_authority=_advisory_graph_authority(_advisory_direct_payload()),
+        )
+
+
+def test_guided_advisory_context_fails_closed_at_whole_record_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    context = _advisory_context(_advisory_direct_payload())
+    assert context.untrusted_user_content is not None
+    aggregate_only_limit = max(
+        len(context.system_content.encode("utf-8")),
+        len(context.untrusted_user_content.encode("utf-8")),
+    )
+    monkeypatch.setattr(
+        chat_solver,
+        "_GUIDED_ADVISORY_CONTEXT_MAX_UTF8_BYTES",
+        aggregate_only_limit,
+        raising=False,
+    )
+
+    with pytest.raises(InvariantError, match="context exceeds the guided advisory whole-record byte budget"):
+        _advisory_context(_advisory_direct_payload())
+
+
+def test_guided_advisory_mapping_literals_are_user_role_and_free_text_diagnostics_are_omitted() -> None:
+    mapping_canary = "IGNORE_SYSTEM_MAPPING_CANARY source -> target"
+    warning_canary = "IGNORE_SYSTEM_WARNING_CANARY /private/path secret-token"
+    blocker_canary = "IGNORE_SYSTEM_BLOCKER_CANARY /private/blocker secret-token"
+    semantic_canary = "IGNORE_SYSTEM_SEMANTIC_CANARY prompt text"
+    proposal = _advisory_direct_payload()
+    proposal["nodes"][0]["plugin"]["id"] = "field_mapper"
+    proposal["nodes"][0]["node_options_summary"] = [{"key": "mapping", "value": mapping_canary}]
+    context = _advisory_context(proposal)
+
+    assert mapping_canary not in context.system_content
+    assert context.untrusted_user_content is not None
+    assert mapping_canary in context.untrusted_user_content
+
+    wire = _advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"])
+    wire["warnings"] = [{"message": warning_canary}]
+    wire["blockers"] = [{"message": blocker_canary}]
+    wire["can_confirm"] = False
+    wire["semantic_contracts"] = [{"detail": semantic_canary}]
+    wire_context = _advisory_context(
+        wire,
+        step=GuidedStep.STEP_4_WIRE,
+        turn_type=TurnType.CONFIRM_WIRING,
+    )
+    complete_context = wire_context.system_content + (wire_context.untrusted_user_content or "")
+    assert warning_canary not in complete_context
+    assert blocker_canary not in complete_context
+    assert semantic_canary not in complete_context
+    assert '"warning_count": 1' in wire_context.system_content
+    assert '"blocker_count": 1' in wire_context.system_content
+    assert '"semantic_contract_count": 1' in wire_context.system_content
+    assert "warning and blocker prose" in wire_context.system_content
+    assert "unstructured semantic-contract detail" in wire_context.system_content
+
+
+@pytest.mark.asyncio
+async def test_guided_advisory_provider_and_audit_share_exact_role_split(monkeypatch: pytest.MonkeyPatch) -> None:
+    condition_canary = "AUDITED_USER_ROLE_CONDITION_CANARY"
+    payload = _advisory_gate_payload()
+    payload["nodes"][0]["behavior"]["condition"] = condition_canary
+    context = _advisory_context(payload)
+    captured: dict[str, Any] = {}
+
+    async def completion(**kwargs: Any) -> _FakeLLMResponse:
+        captured.update(kwargs)
+        return _ok_response("The reviewed graph routes each row from the gate.")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", completion)
+    recorder = BufferingRecorder()
+    outcome = await maybe_manage_deferred_intent_chat(
+        request=DeferredIntentManagementChatRequest(
+            model="test-model",
+            step=GuidedStep.STEP_3_TRANSFORMS,
+            user_message="Why is the gate here?",
+            temperature=None,
+            seed=None,
+            timeout_seconds=5,
+            context_block=context,
+        ),
+        recorder=recorder,
+    )
+
+    assert type(outcome) is chat_solver.GuidedChatProseOutcome
+    messages = captured["messages"]
+    assert [message["role"] for message in messages] == ["system", "system", "system", "user", "user"]
+    system_content = "\n".join(message["content"] for message in messages if message["role"] == "system")
+    user_content = "\n".join(message["content"] for message in messages if message["role"] == "user")
+    assert condition_canary not in system_content
+    assert condition_canary in user_content
+    assert recorder.llm_calls[-1].messages_hash == stable_hash(messages)
 
 
 @pytest.mark.asyncio
@@ -2811,6 +3465,10 @@ async def test_management_only_chat_lists_stable_intent_and_offers_no_other_tool
         current_sink=None,
         state=None,
         deferred_intents=(intent,),
+        graph_authority=_advisory_graph_authority(
+            _advisory_wire_payload_with_gate(_advisory_gate_payload()["nodes"][0]["behavior"]),
+            turn_type=TurnType.CONFIRM_WIRING,
+        ),
     )
     selection_token = deferred_intent_management_option(intent).selection_token
     captured: dict[str, Any] = {}
