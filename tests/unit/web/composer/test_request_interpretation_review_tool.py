@@ -33,6 +33,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import structlog
+from jsonschema import Draft202012Validator
 from sqlalchemy import insert
 from sqlalchemy.pool import StaticPool
 
@@ -1248,6 +1249,44 @@ def test_01_tool_registered_in_get_tool_definitions() -> None:
     ]
     assert "Do not ask the user in assistant prose" in tool["description"]
     assert "review surface" in tool["description"]
+
+
+def test_pipeline_decision_tool_schema_closes_only_its_user_term_vocabulary() -> None:
+    definition = next(item for item in get_tool_definitions() if item["name"] == "request_interpretation_review")
+    validator = Draft202012Validator(definition["parameters"])
+    base = {
+        "affected_node_id": "cleanup",
+        "llm_draft": "Review this decision.",
+    }
+
+    assert validator.is_valid(
+        {
+            **base,
+            "kind": "pipeline_decision",
+            "user_term": "drop_raw_html_fields",
+        }
+    )
+    assert not validator.is_valid(
+        {
+            **base,
+            "kind": "pipeline_decision",
+            "user_term": "drop_raw_extracted_fields",
+        }
+    )
+    assert not validator.is_valid(
+        {
+            **base,
+            "kind": "pipeline_decision",
+            "user_term": "required_control_auto_wired",
+        }
+    )
+    assert validator.is_valid(
+        {
+            **base,
+            "kind": "vague_term",
+            "user_term": "customer-specific risk band",
+        }
+    )
 
 
 # --------------------------------------------------------------------------- #

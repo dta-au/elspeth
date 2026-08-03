@@ -78,6 +78,7 @@ from elspeth.web.interpretation_state import (
     SOURCE_AUTHORING_KEY,
     InterpretationRequirement,
     ServerStagedRequiredControlUserTerm,
+    composer_pipeline_decision_user_term_error,
     parse_interpretation_requirements,
     serialize_authoring_review_options,
     strip_authoring_options,
@@ -1904,6 +1905,7 @@ def _resolver_owned_interpretation_requirement_error(
         "have a unique normalized kind/user_term and server-projected ID; remove "
         "duplicate or colliding rows and retry."
     )
+    registration_error: str | None = None
     for index, requirement in enumerate(requirements_value):
         if not isinstance(requirement, Mapping):
             return malformed_error
@@ -1948,9 +1950,16 @@ def _resolver_owned_interpretation_requirement_error(
                 "Only the required-control finalizer may stage this disclosure."
             )
         try:
-            InterpretationKind(kind)
+            parsed_kind = InterpretationKind(kind)
         except ValueError:
             return malformed_error
+        if parsed_kind is InterpretationKind.PIPELINE_DECISION and not server_staged_auto_wire:
+            current_registration_error = composer_pipeline_decision_user_term_error(
+                user_term=user_term,
+                context=f"{tool_name} options.{INTERPRETATION_REQUIREMENTS_KEY}[{index}]",
+            )
+            if registration_error is None:
+                registration_error = current_registration_error
         normalized_user_term = user_term.strip()
         kind_term = (kind, normalized_user_term)
         if kind_term in seen_kind_terms:
@@ -1971,7 +1980,7 @@ def _resolver_owned_interpretation_requirement_error(
             if projected_id in seen_projected_ids:
                 return collision_error
             seen_projected_ids.add(projected_id)
-    return None
+    return registration_error
 
 
 def _canonical_interpretation_requirement_error(

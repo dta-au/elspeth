@@ -3666,7 +3666,10 @@ class CompositionState:
             # term: the resolve-side artifact-hash registry raises on unknown
             # terms, so a novel term mints an unresolvable review event and
             # wedges the session at the run gate.
-            from elspeth.web.interpretation_state import REGISTERED_PIPELINE_DECISION_USER_TERMS
+            from elspeth.web.interpretation_state import (
+                REGISTERED_PIPELINE_DECISION_USER_TERMS,
+                composer_pipeline_decision_user_term_error,
+            )
 
             authored_requirements = node.options.get("interpretation_requirements")
             if isinstance(authored_requirements, (list, tuple)):
@@ -3677,14 +3680,19 @@ class CompositionState:
                         continue
                     term = requirement.get("user_term")
                     if not isinstance(term, str) or term.strip() not in REGISTERED_PIPELINE_DECISION_USER_TERMS:
+                        repair = (
+                            composer_pipeline_decision_user_term_error(
+                                user_term=term,
+                                context=f"Node {node.id!r}",
+                            )
+                            or "The pipeline_decision user_term is not registered."
+                            if isinstance(term, str)
+                            else "The pipeline_decision user_term must be a registered string."
+                        )
                         errors.append(
                             _err(
                                 f"node:{node.id}",
-                                f"Node '{node.id}' declares a pipeline_decision review with unregistered "
-                                f"user_term {term!r}. Registered decision kinds: "
-                                f"{sorted(REGISTERED_PIPELINE_DECISION_USER_TERMS)}. Drop the requirement and "
-                                "record the rationale in metadata.description, or use an "
-                                "llm_prompt_template review for prompt-shaped decisions.",
+                                repair,
                                 "high",
                                 "pipeline_decision_unregistered",
                             )

@@ -32,7 +32,10 @@ from elspeth.web.composer.tools._common import (
     _runtime_owned_llm_option_error,
     _serialize_set_pipeline_arguments,
 )
-from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
+from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
+    ServerStagedRequiredControlUserTerm,
+)
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 _SENSITIVE_SENTINEL: Final[str] = "sk-sensitive-requirement-value"
@@ -737,13 +740,124 @@ def test_runtime_guard_allows_multiple_distinct_authored_requirements() -> None:
         {
             INTERPRETATION_REQUIREMENTS_KEY: [
                 {"kind": "vague_term", "user_term": "alpha", "draft": "first"},
-                {"kind": "pipeline_decision", "user_term": "beta", "draft": "second"},
+                {
+                    "kind": "pipeline_decision",
+                    "user_term": "prompt_injection_shield_recommendation",
+                    "draft": "second",
+                },
             ]
         },
         tool_name="test_tool",
     )
 
     assert error is None
+
+
+def test_runtime_guard_rejects_unregistered_pipeline_decision_with_bounded_repair() -> None:
+    error = _runtime_owned_llm_option_error(
+        "passthrough",
+        {
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "kind": "pipeline_decision",
+                    "user_term": "drop_raw_extracted_fields",
+                    "draft": "Drop extracted document fields.",
+                }
+            ]
+        },
+        tool_name="upsert_node",
+    )
+
+    assert error is not None
+    assert "pipeline_decision user_term is not registered" in error
+    assert "closest registered term: 'drop_raw_html_fields'" in error
+    assert "prompt_injection_shield_recommendation" in error
+    assert "web_scrape_http_identity" in error
+    assert "required_control_auto_wired" not in error
+
+
+def test_runtime_guard_keeps_non_pipeline_user_terms_open() -> None:
+    error = _runtime_owned_llm_option_error(
+        "llm",
+        {
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "kind": "vague_term",
+                    "user_term": "customer-specific risk band",
+                    "draft": "Risk band means the operator's current policy bands.",
+                }
+            ]
+        },
+        tool_name="upsert_node",
+    )
+
+    assert error is None
+
+
+def test_runtime_guard_preserves_nominal_server_staged_required_control_authority() -> None:
+    error = _runtime_owned_llm_option_error(
+        "passthrough",
+        {
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "kind": "pipeline_decision",
+                    "user_term": ServerStagedRequiredControlUserTerm("required_control_auto_wired"),
+                    "draft": "The server inserted the required control.",
+                }
+            ]
+        },
+        tool_name="required_control_finalizer",
+    )
+
+    assert error is None
+
+
+def test_runtime_guard_rejects_plain_required_control_term_as_server_owned() -> None:
+    error = _runtime_owned_llm_option_error(
+        "passthrough",
+        {
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "kind": "pipeline_decision",
+                    "user_term": "required_control_auto_wired",
+                    "draft": "The model claims it inserted the required control.",
+                }
+            ]
+        },
+        tool_name="upsert_node",
+    )
+
+    assert error is not None
+    assert "server-owned user_term 'required_control_auto_wired'" in error
+
+
+@pytest.mark.parametrize(
+    "writer",
+    (
+        "upsert_node",
+        "patch_node_options",
+        "splice_transform",
+        "set_pipeline",
+    ),
+)
+def test_every_node_writer_rejects_unregistered_pipeline_decision_before_publication(writer: str) -> None:
+    catalog = _catalog()
+    requirements = [
+        {
+            "kind": "pipeline_decision",
+            "user_term": "drop_raw_extracted_fields",
+            "draft": "Drop extracted document fields.",
+        }
+    ]
+
+    result, state = _node_writer_result(writer, "passthrough", requirements, catalog=catalog)
+
+    assert result.success is False, (writer, result.to_dict())
+    assert result.updated_state is state
+    assert "pipeline_decision user_term is not registered" in result.data["error"]
+    assert "closest registered term: 'drop_raw_html_fields'" in result.data["error"]
+    assert "required_control_auto_wired" not in result.data["error"]
+    assert state.nodes == result.updated_state.nodes
 
 
 @pytest.mark.parametrize(
@@ -864,7 +978,7 @@ def test_direct_node_writers_preserve_trusted_requirement_id(writer: str) -> Non
     canonical = _canonical_pending_requirement(
         requirement_id=trusted_id,
         kind="pipeline_decision",
-        user_term="trusted_node_decision",
+        user_term="prompt_injection_shield_recommendation",
         draft="Review the node decision.",
     )
     state = _state_with_node(

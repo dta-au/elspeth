@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from difflib import get_close_matches
 from typing import Any, Final, Literal, NotRequired, TypedDict
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
@@ -61,6 +62,13 @@ PROMPT_SHIELD_USER_TERM: Final[str] = "prompt_injection_shield_recommendation"
 # ``web.composer.required_controls.wire_required_controls``.
 REQUIRED_CONTROL_AUTO_WIRED_USER_TERM: Final[str] = "required_control_auto_wired"
 
+# The public composer may author only these pipeline-decision rows.  The full
+# registry above also contains server-staged disclosures, so teaching that set
+# to the model would invite it to forge server authority.
+COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS: Final[frozenset[str]] = REGISTERED_PIPELINE_DECISION_USER_TERMS - {
+    REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+}
+
 
 class ServerStagedRequiredControlUserTerm(str):
     """Nominal in-process authority for a server-staged auto-wire disclosure.
@@ -70,6 +78,27 @@ class ServerStagedRequiredControlUserTerm(str):
     admitted; persisted canonical rows intentionally return to plain JSON
     strings and use the existing internal-revalidation path thereafter.
     """
+
+
+def composer_pipeline_decision_user_term_error(*, user_term: str, context: str) -> str | None:
+    """Return bounded repair guidance for a model-authored decision term.
+
+    The rejected value is Tier-3 text and is deliberately not reflected.  A
+    closest match is selected only from the closed public vocabulary, so the
+    repair remains actionable without leaking or teaching server-only terms.
+    """
+
+    normalized = user_term.strip()
+    if normalized in COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS:
+        return None
+    allowed = sorted(COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS)
+    closest = get_close_matches(normalized, allowed, n=1, cutoff=0.5)
+    closest_guidance = f"; closest registered term: {closest[0]!r}" if closest else ""
+    return (
+        f"{context}: pipeline_decision user_term is not registered for composer authoring. "
+        f"Available registered terms: {allowed}{closest_guidance}. Use one exactly, or remove the "
+        "pipeline_decision requirement and record a novel rationale in metadata.description."
+    )
 
 
 PROMPT_SHIELD_WARNING_DRAFT: Final[str] = (
