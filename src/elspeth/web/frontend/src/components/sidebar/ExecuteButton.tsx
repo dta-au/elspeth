@@ -325,9 +325,10 @@ export function isRunGatingReadinessRow(
  *  (elspeth-088bf83922 T-2). Priority order: an in-flight run takes
  *  precedence (nothing else matters until it finishes); pending
  *  interpretation review is next (it also drives the dedicated
- *  aria-disabled/title/aria-describedby treatment below); structural
- *  validation is the remaining case. Returns null when none apply, i.e.
- *  when `canExecute` is true. Exported for the corresponding test. */
+ *  aria-disabled/title/aria-describedby treatment below); then no validation
+ *  result, structural validation failure, and backend execution-readiness
+ *  refusal. Returns null when none apply, i.e. when `canExecute` is true.
+ *  Exported for the corresponding test. */
 export type RunBlockReason = "running" | "interpretation" | "validation" | "readiness" | "not_validated";
 
 export function primaryRunBlockReason(input: {
@@ -383,7 +384,8 @@ const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
  *     same text so screen readers receive the affordance text (a
  *     `title` attribute alone is not reliably announced).
  *
- * Other not-runnable states (validation failing, already executing/running)
+ * Other not-runnable states (not yet validated, structural validation
+ * failing, backend execution readiness blocked, already executing/running)
  * keep native `disabled` — the WCAG 4.1.2 concern above is specific to the
  * interpretation block, which is the only state that removes reachability
  * from a mouseless/AT user if left natively disabled. They still get a
@@ -402,11 +404,13 @@ const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
  *
  * Gate legibility (elspeth-088bf83922 T-2, option (a)): the audit-readiness
  * panel's rows other than validation/llm_interpretations never block Run —
- * this button previously gave no hint of that distinction. Two small,
- * NON-gating additions (`canExecute` itself is untouched):
- *   - when disabled, a visible one-line reason ("The pipeline is already
- *     running." / the interpretation-pending line / a validation pointer)
- *     renders below the button, driven by `primaryRunBlockReason`;
+ * this button previously gave no hint of that distinction. `canExecute`
+ * explicitly gates on backend execution readiness, interpretation review,
+ * and active-run state; the visible surfaces make those decisions legible:
+ *   - when disabled, a one-line reason for an active run, pending
+ *     interpretation, missing validation, structural validation failure, or
+ *     backend readiness refusal renders below the button, driven by
+ *     `primaryRunBlockReason`;
  *   - when enabled but the audit snapshot has a non-green advisory row
  *     (plugin_trust/provenance/retention/secrets), a single line notes
  *     that advisory checks don't block Run.
