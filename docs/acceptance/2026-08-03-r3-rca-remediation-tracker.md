@@ -1,7 +1,7 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-03T18:39:00+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-03T18:37:00+10:00
+Last refreshed: 2026-08-03T18:53:00+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-03T18:51:00+10:00
 Release baseline: `release/0.7.2@e3804416f`
 Coordination owner: `codex-r3-rca-coordinator`
 
@@ -41,8 +41,8 @@ shell mechanics remains deferred even when it blocks a fresh install.
 | State | Objective 44 | Additional 10 | Meaning |
 |---|---:|---:|---|
 | Closed | 8 | 3 | Tracker says done; closure evidence is still sampled during the completion audit |
-| Verifying | 14 | 2 | Locally fixed; live or requirement-specific acceptance remains |
-| Fixing | 4 | 0 | Owned bug implementation is still in flight |
+| Verifying | 13 | 2 | Locally fixed; live or requirement-specific acceptance remains |
+| Fixing | 5 | 0 | Owned bug implementation is still in flight |
 | In progress | 0 | 1 | A delivery task spanning existing objective defects is in flight |
 | Open | 6 | 4 | Confirmed task/epic work not yet started here |
 | Triage | 9 | 0 | Root cause and reproducibility must be checked against current HEAD before fixing |
@@ -77,15 +77,16 @@ claim custody.
 | `/root/impl_guided_node_custody` | Preserve unchanged node behavior across guided replanning | `.claude/worktrees/guided-node-custody`; `codex/fix-guided-node-custody` | Released after integration | None | Complete; reviewed commit integrated as `b424c08c4` |
 | `/root/impl_gate_row_error_policy` | Per-row gate `on_error` handling | `.claude/worktrees/gate-row-error-policy`; `codex/fix-gate-row-error-policy` | Released after integration | None | Complete through `e3804416f`; 72 backend plus 56 frontend release-checkout regressions passed; live verification remains |
 | `/root/impl_csv_audit_characteristics` | Honest CSV audit characteristics | `.claude/worktrees/csv-audit-characteristics`; `codex/fix-csv-audit-characteristics` | CSV source, characteristic UI wording, exact scenario-corpus oracle, direct tests | None | Complete; behavior `d78fbbed6`, corpus oracle `10179f2c1` |
-| `/root/impl_s3_source_profiles` | Operator-profiled Web S3 source | `.claude/worktrees/s3-source-profiles`; `codex/fix-s3-source-profiles` | Web config/profile/policy/S3 lowering/source seams and direct tests | None | Fourth follow-up has all three security blockers implemented; one apparently pre-existing endpoint-policy test is being dispositioned before commit/re-review |
+| `/root/impl_s3_source_profiles` | Operator-profiled Web S3 source | `.claude/worktrees/s3-source-profiles`; `codex/fix-s3-source-profiles` | Web config/profile/policy/S3 lowering/source seams and direct tests | None | Fourth follow-up held: endpoint-policy precedence regressed and missing audit-safe carrier can bypass binding; fifth correction active |
 | `/root/impl_run_diagnostics_ui` | Surface routed-failure provenance | `.claude/worktrees/run-diagnostics-ui`; `codex/fix-run-diagnostics-ui` | `RunsHistoryDrawer` and direct frontend diagnostics presentation/tests | None | Complete; integrated as `9130e1209` + `0928c6ac6` |
 | `/root/impl_compose_authoring_aids` | Compose context and truthful field-mapping aids | `.claude/worktrees/compose-authoring-aids`; `codex/fix-compose-authoring-aids` | Released after integration | None | Complete; integrated as `2906409e1` + `e1d31f104` |
-| `/root/impl_compose_required_controls` | Finalize deterministic required controls on both freeform publication paths | `.claude/worktrees/compose-required-controls`; `codex/fix-compose-required-controls` | `composer/service.py`, `tool_batch.py`, proposal finalizer seam, direct tests | None | Candidate `2f68a281f` held: incremental explicit approval still inserts controls only after consent, and finalization corrupts `affected_nodes`; surgical follow-up active |
+| `/root/impl_compose_required_controls` | Finalize deterministic required controls on both freeform publication paths | `.claude/worktrees/compose-required-controls`; `codex/fix-compose-required-controls` | `composer/service.py`, `tool_batch.py`, proposal finalizer seam, direct tests | None | Follow-up moves deterministic controls before incremental consent and preserves exact affected nodes; localized gates pass and internal review is active |
 | `/root/audit_provider_projection_obligations` | Re-audit provider-facing projection and hidden-option custody on integrated release | Shared read-only `ca375291c` baseline | None | None | Complete; four P1 residuals reproduced and partitioned into three tracked implementation children |
 | `/root/impl_guided_chat_revision_custody` | Prevent blind source/sink replacement through guided chat | `.claude/worktrees/guided-chat-revision-custody`; `codex/fix-guided-chat-revision-custody` | Released after integration; `guided_chat_atomic.py` handed to terminal-progress lane | None | Complete as `7afa62b6d` + `c4cade0f0`; independent review clean and 10 exact release regressions passed |
 | `/root/rca_compose_request_correlation` | Emit bounded correlation events for structured HTTP errors and Pydantic 422s | `.claude/worktrees/compose-request-correlation`; `codex/fix-compose-request-correlation` | Released after integration | None | Complete through `39c6b14a7`; 32 exact release-handler regressions passed; live CloudWatch lookup remains |
 | `/root/impl_frontend_readiness_axes` | Apply backend readiness axes to every frontend action | `.claude/worktrees/frontend-readiness-axes`; `codex/fix-frontend-readiness-axes` | Released after integration | None | Complete; integrated through `9016ce6a6`, exact release rerun 148 passed, task closed |
-| `/root/impl_guided_plan_terminal_progress` | Settle terminal progress for every guided-plan outcome | `.claude/worktrees/guided-plan-terminal-progress`; `codex/fix-guided-plan-terminal-progress` | progress registry/shared publishers, freeform/guided callers, and direct tests; `guided_chat_atomic.py` now released | None | `9672163d8` held for cleanup primacy, cross-surface generation, post-settlement truth, and restart replay; follow-up active |
+| `/root/impl_guided_plan_terminal_progress` | Settle terminal progress for every guided-plan outcome | `.claude/worktrees/guided-plan-terminal-progress`; `codex/fix-guided-plan-terminal-progress` | progress registry/shared publishers, freeform/guided callers, and direct tests; `guided_chat_atomic.py` now released | None | `9672163d8` + `8c14e5cdd` held: no-winner fence loss still leaves `calling_model` active; third surgical follow-up active |
+| `/root/impl_guided_gate_proof_validation` | Make source-proof diagnostics authoritative during guided confirmation | `.claude/worktrees/guided-gate-proof-validation`; `codex/fix-guided-gate-proof-validation` | `guided.py` confirmation validation plus `_helpers.py` validation-only hunk and direct tests | None | Active from exact `0a27bdf2e` RED; integrates after terminal-progress `_helpers.py` work |
 
 No subagent may mutate AWS or the shared release checkout during this wave.
 Each implementation agent is confined to the explicit worktree/file custody
@@ -133,7 +134,7 @@ Parent workstream state:
 | `elspeth-fa63549a59` | P1 | `closed` | unassigned | Sample closure against retained operator prose and stable-subject edit binding |
 | `elspeth-2ac590c79f` | P1 | `closed` | unassigned | Sample literal/`option_path` carry-forward through durable deferred intent |
 | `elspeth-82d8bea477` | P1 | `closed` | unassigned | Sample threshold vocabulary and topology-stage disposition |
-| `elspeth-fd32c3e6fd` | P1 | `verifying` | `codex-release-0.7.2-integration` | Live observed CSV numeric gate is rejected before run creation |
+| `elspeth-fd32c3e6fd` | P1 | `fixing` | `codex-gate-proof-guided-validation` | Authoritative Web check 25 blocks runs, but guided confirmation still persists a green 24-check result; thread the existing source proof into guided persistence |
 | `elspeth-b326add5be` | P1 | `verifying` | `codex-gate-row-error-policy` | Integrated through `e3804416f`; live mixed good/bad CSV run must route one row per policy without aborting the run |
 | `elspeth-dc07d517cf` | P2 | `closed` | unassigned | Sample clarification intent visibility/claimability at later stages |
 | `elspeth-6795b3ae3a` | P2 | `open` | unassigned | Inventory every provider-facing projection and compare obligations with rendered evidence |
@@ -260,6 +261,12 @@ Append entries; do not rewrite history.
 | 2026-08-03 18:34 | Guided chat revision custody integrated | Independent re-review approved `12bde9290` + `d7c60411c`; integrated as `7afa62b6d` + `c4cade0f0`; 10 exact release regressions passed, task closed, and `guided_chat_atomic.py` released to terminal progress |
 | 2026-08-03 18:36 | Gate row-error policy integrated | Reviewed four-commit chain integrated as `a80ea0259` + `947c242ac` + `65acd35fb` + `e3804416f`; coordinator reran 72 backend and 56 frontend release-checkout tests and advanced the bug to verifying |
 | 2026-08-03 18:38 | Required-controls candidate held | External review of `2f68a281f` reproduced consent after-the-fact control insertion for incremental proposals and corrupted `affected_nodes`; candidate remains isolated and a surgical follow-up is active |
+| 2026-08-03 18:42 | Structural index refreshed | Loomweave run `0021908e-959a-4444-861e-05b034d71f99` completed fresh at exact release `0a27bdf2e` with 70,872 entities and 138,369 edges |
+| 2026-08-03 18:44 | Advisor D4 current-head audit | The older `4baf`/`e4a8` RCA snapshot was stale: release already selects a green preflight independently of advisor reason; four exact regressions passed and no code change was opened |
+| 2026-08-03 18:48 | Advisor D1 current-head audit | All five prior projection-review blockers are fixed; generic field/collision values, shared injection scanning, withheld-value rubric, atomic field-count bounds, and exact sink/triple fixtures passed 12 focused regressions |
+| 2026-08-03 18:49 | Guided terminal-progress handoff held | Independent real-route review found no-winner fence loss raises before terminal publication and leaves `calling_model` active; comment `2207` records the remaining P1 |
+| 2026-08-03 18:50 | S3 fourth handoff held | Coordinator proved the excluded endpoint test passes on release, and review found missing audit-safe carrier bypasses profile binding; comment `2208` records both candidate regressions |
+| 2026-08-03 18:51 | Part 5 item 1 narrowed again | Constraint carry-forward, exact one-sink routing, and check-25 execution admission are fixed, but guided confirmation still persists green after bare 24-check validation; `fd32c3e6fd` returned to fixing and a narrow lane was assigned |
 
 ## Reconciliation findings
 
