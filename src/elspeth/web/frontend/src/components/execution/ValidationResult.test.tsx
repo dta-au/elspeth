@@ -120,6 +120,45 @@ describe("ValidationResultBanner", () => {
     ).toBeNull();
   });
 
+  it("auto-expands a failed completion-only advisor sign-off check", () => {
+    render(
+      <ValidationResultBanner
+        result={makePassResult({
+          checks: [
+            {
+              name: "advisor_signoff",
+              passed: false,
+              detail: "Advisor sign-off is pending for this pipeline.",
+              affected_nodes: [],
+              outcome_code: null,
+            },
+          ],
+          readiness: {
+            authoring_valid: true,
+            execution_ready: true,
+            completion_ready: false,
+            blockers: [
+              {
+                code: "advisor_signoff_blocked",
+                component_id: "pipeline",
+                component_type: "pipeline",
+                detail: "Advisor sign-off is pending for this pipeline.",
+              },
+            ],
+          },
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/Advisor sign-off is pending/)).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /validation passed\. show details\./i }),
+    ).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /collapse validation details/i }),
+    ).toBeNull();
+  });
+
   it("renders failures expanded with per-component errors, unchanged", () => {
     render(
       <ValidationResultBanner

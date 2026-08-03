@@ -95,7 +95,13 @@ export function ValidationResultBanner({
     const advisoryChecks = result.checks.filter(
       (check) => check.passed && ADVISORY_CHECK_NAME_SET.has(check.name),
     );
-    const hasForcedGuidance = warnings.length > 0 || advisoryChecks.length > 0;
+    const failedAdvisorChecks = result.checks.filter(
+      (check) => !check.passed && check.name === "advisor_signoff",
+    );
+    const hasForcedGuidance =
+      warnings.length > 0 ||
+      advisoryChecks.length > 0 ||
+      failedAdvisorChecks.length > 0;
     const showExpanded = hasForcedGuidance || userExpanded;
 
     if (!showExpanded) {

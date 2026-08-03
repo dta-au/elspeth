@@ -30,6 +30,7 @@ from elspeth.web.execution.schemas import (
     ValidationCheck,
     ValidationError,
     ValidationReadiness,
+    ValidationReadinessBlocker,
     ValidationResult,
 )
 
@@ -507,6 +508,51 @@ def test_validation_row_ok_when_no_errors():
         )
     )
     assert _row(snap, "validation").status == "ok"
+
+
+def test_validation_row_warns_when_advisor_completion_is_pending():
+    persisted_detail = "private persisted advisor response"
+    result = ValidationResult(
+        is_valid=True,
+        checks=[
+            ValidationCheck(
+                name="advisor_signoff",
+                passed=False,
+                detail=persisted_detail,
+                affected_nodes=(),
+                outcome_code=None,
+            )
+        ],
+        errors=[],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=True,
+            completion_ready=False,
+            blockers=[
+                ValidationReadinessBlocker(
+                    code="advisor_signoff_blocked",
+                    component_id="pipeline",
+                    component_type="pipeline",
+                    detail=persisted_detail,
+                )
+            ],
+        ),
+    )
+    svc = _make_service(_state(transforms=(("t", "passthrough"),)), result)
+
+    snap = asyncio.run(
+        svc.compute_snapshot(
+            session_id=UUID("11111111-1111-1111-1111-111111111111"),
+            user_id="alice",
+        )
+    )
+
+    row = _row(snap, "validation")
+    assert row.status == "warning"
+    assert row.summary == "Advisor sign-off pending"
+    assert row.detail == "This pipeline can run, but Composer completion is pending advisor sign-off."
+    assert persisted_detail not in (row.detail or "")
+    assert result.readiness.execution_ready is True
 
 
 def test_compute_snapshot_populates_utc_checked_at():

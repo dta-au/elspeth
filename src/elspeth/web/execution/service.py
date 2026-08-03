@@ -87,6 +87,8 @@ from elspeth.web.execution.completion_gates import (
 )
 from elspeth.web.execution.errors import (
     BlobSourcePathMismatchError,
+    CompletionGateIntegrityError,
+    ExecutionReadinessError,
     MalformedBlobRefError,
     PathAllowlistViolationError,
     PipelineValidationError,
@@ -788,7 +790,15 @@ class ExecutionServiceImpl:
 
         # Bridge CompositionStateRecord → CompositionState for generate_yaml().
         # The record stores raw dicts; generate_yaml() needs the typed domain object.
-        composition_state = state_from_record(state_record)
+        authored_state = state_from_record(state_record)
+        try:
+            completion_gates = parse_completion_gates(state_record.composer_meta)
+        except ValueError as exc:
+            raise CompletionGateIntegrityError(
+                session_id=str(session_id),
+                state_id=str(state_record.id),
+            ) from exc
+        composition_state = authored_state
 
         semantic_errors, semantic_contracts = validate_semantic_contracts(composition_state)
         if semantic_errors:
@@ -928,11 +938,14 @@ class ExecutionServiceImpl:
             profile_registry=self._operator_profile_registry,
             catalog=self._catalog,
         )
+        preflight_result = merge_completion_gates(preflight_result, completion_gates, authored_state)
         if not preflight_result.is_valid:
             raise PipelineValidationError(
                 errors=tuple(preflight_result.errors),
                 readiness=preflight_result.readiness,
             )
+        if not preflight_result.readiness.execution_ready:
+            raise ExecutionReadinessError(blockers=tuple(preflight_result.readiness.blockers))
 
         policy_result = validate_plugin_policy(
             composition_state,

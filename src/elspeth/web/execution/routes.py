@@ -44,7 +44,9 @@ from elspeth.web.execution.completion_gates import parse_completion_gates
 from elspeth.web.execution.diagnostics import llm_safe_diagnostics_snapshot, load_run_diagnostics_for_settings
 from elspeth.web.execution.errors import (
     BlobSourcePathMismatchError,
+    CompletionGateIntegrityError,
     ExecuteRequestValidationError,
+    ExecutionReadinessError,
     PipelineValidationError,
     RunSessionIntegrityError,
     SemanticContractViolationError,
@@ -950,6 +952,22 @@ def create_execution_router() -> APIRouter:
                     "message": public_detail,
                 },
             ) from exc
+        except CompletionGateIntegrityError as exc:
+            slog.error(
+                "completion_gate_integrity_failure",
+                session_id=exc.session_id,
+                state_id=exc.state_id,
+            )
+            public_detail = "Persisted completion-gate facts failed integrity validation."
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "error_type": "completion_gate_integrity_failure",
+                    "detail": public_detail,
+                    "kind": "completion_gate_integrity_failure",
+                    "message": public_detail,
+                },
+            ) from exc
         except ExecutionFanoutGuardRequired as exc:
             raise HTTPException(
                 status_code=428,
@@ -1057,6 +1075,16 @@ def create_execution_router() -> APIRouter:
                         }
                         for err in exc.errors
                     ],
+                },
+            ) from exc
+        except ExecutionReadinessError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error_type": "execution_not_ready",
+                    "detail": "Pipeline is not ready for execution.",
+                    "kind": "execution_not_ready",
+                    "blockers": [blocker.model_dump() for blocker in exc.blockers],
                 },
             ) from exc
         except ExecuteRequestValidationError as exc:

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
-from unittest.mock import AsyncMock, create_autospec
+from unittest.mock import AsyncMock, create_autospec, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -763,6 +763,68 @@ class TestExecuteEndpoint:
         assert detail["errors"][0]["component_id"] == "rate"
         assert detail["errors"][0]["message"].startswith("Graph validation failed")
         assert detail["errors"][0]["suggestion"] == "Wire an upstream node that emits 'content'."
+
+    @pytest.mark.asyncio
+    async def test_execute_returns_structured_422_for_execution_readiness_failure(self) -> None:
+        from elspeth.web.execution.errors import ExecutionReadinessError
+        from elspeth.web.execution.schemas import ValidationReadinessBlocker
+
+        blocker = ValidationReadinessBlocker(
+            code="runtime_admission",
+            component_id="pipeline",
+            component_type="pipeline",
+            detail="The selected runtime policy does not admit this pipeline.",
+        )
+        exc = ExecutionReadinessError(blockers=(blocker,))
+        svc = _execution_service()
+        svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
+        app = _create_test_app(execution_service=svc)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == {
+            "error_type": "execution_not_ready",
+            "detail": "Pipeline is not ready for execution.",
+            "kind": "execution_not_ready",
+            "blockers": [
+                {
+                    "code": "runtime_admission",
+                    "component_id": "pipeline",
+                    "component_type": "pipeline",
+                    "detail": "The selected runtime policy does not admit this pipeline.",
+                }
+            ],
+        }
+
+    @pytest.mark.asyncio
+    async def test_execute_returns_safe_500_for_completion_gate_integrity_failure(self) -> None:
+        from elspeth.web.execution.errors import CompletionGateIntegrityError
+
+        session_id = uuid4()
+        state_id = uuid4()
+        exc = CompletionGateIntegrityError(session_id=str(session_id), state_id=str(state_id))
+        svc = _execution_service()
+        svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
+        app = _create_test_app(execution_service=svc)
+
+        with patch("elspeth.web.execution.routes.slog.error") as log_error:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                resp = await client.post(f"/api/sessions/{session_id}/execute")
+
+        assert resp.status_code == 500
+        assert resp.json()["detail"] == {
+            "error_type": "completion_gate_integrity_failure",
+            "detail": "Persisted completion-gate facts failed integrity validation.",
+            "kind": "completion_gate_integrity_failure",
+            "message": "Persisted completion-gate facts failed integrity validation.",
+        }
+        log_error.assert_called_once_with(
+            "completion_gate_integrity_failure",
+            session_id=str(session_id),
+            state_id=str(state_id),
+        )
 
     @pytest.mark.asyncio
     async def test_execute_returns_422_for_unresolved_interpretation_placeholder(self) -> None:

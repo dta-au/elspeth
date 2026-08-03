@@ -284,7 +284,8 @@ export function buildRunEgressSummary(
  * Which audit-readiness rows are load-bearing for `canExecute` below, and
  * which are informational/advisory only (elspeth-088bf83922 finding T-2,
  * option (a) — legibility, NOT new gating). Read together with
- * `canExecute`: `validationResult?.is_valid === true` corresponds to the
+ * `canExecute`: `validationResult?.readiness.execution_ready === true`
+ * corresponds to the backend-owned execution admission reported through the
  * `validation` row; `!isRunBlocked` corresponds to the `llm_interpretations`
  * row (both are driven by the same interpretationEventsStore pending/
  * opted-out state used to compute `isRunBlocked` below). The other four
@@ -323,13 +324,14 @@ export function isRunGatingReadinessRow(id: ReadinessRowId): boolean {
  *  aria-disabled/title/aria-describedby treatment below); structural
  *  validation is the remaining case. Returns null when none apply, i.e.
  *  when `canExecute` is true. Exported for the corresponding test. */
-export type RunBlockReason = "running" | "interpretation" | "validation" | "not_validated";
+export type RunBlockReason = "running" | "interpretation" | "validation" | "readiness" | "not_validated";
 
 export function primaryRunBlockReason(input: {
   isExecuting: boolean;
   progressRunning: boolean;
   isRunBlocked: boolean;
   validationFailing: boolean;
+  executionReadinessBlocked: boolean;
   validationNotRun: boolean;
 }): RunBlockReason | null {
   if (input.isExecuting || input.progressRunning) return "running";
@@ -341,6 +343,7 @@ export function primaryRunBlockReason(input: {
   // anywhere (elspeth-088bf83922 review follow-up).
   if (input.validationNotRun) return "not_validated";
   if (input.validationFailing) return "validation";
+  if (input.executionReadinessBlocked) return "readiness";
   return null;
 }
 
@@ -353,6 +356,7 @@ const RUN_BLOCK_REASON_TEXT: Record<RunBlockReason, string> = {
   running: "The pipeline is already running.",
   interpretation: INTERPRETATION_PENDING_RUN_BLOCK_TITLE,
   validation: "Fix the validation errors shown in the Audit panel before running.",
+  readiness: "The backend has not admitted this pipeline for execution.",
   not_validated: "This pipeline hasn't been validated yet.",
 };
 
@@ -466,7 +470,7 @@ export function ExecuteButton(): JSX.Element | null {
   const isRunBlocked = !optedOut && pendingCount > 0;
 
   const canExecute =
-    validationResult?.is_valid === true &&
+    validationResult?.readiness.execution_ready === true &&
     !isExecuting &&
     progress?.status !== "running" &&
     !isRunBlocked;
@@ -480,7 +484,15 @@ export function ExecuteButton(): JSX.Element | null {
     isRunBlocked,
     validationNotRun: validationResult == null,
     validationFailing: validationResult != null && validationResult.is_valid !== true,
+    executionReadinessBlocked:
+      validationResult != null && validationResult.readiness.execution_ready !== true,
   });
+  const blockReasonText =
+    blockReason === "readiness"
+      ? validationResult?.readiness.blockers[0]?.detail ?? RUN_BLOCK_REASON_TEXT.readiness
+      : blockReason
+        ? RUN_BLOCK_REASON_TEXT[blockReason]
+        : null;
   const advisoryRowsNonGreen =
     auditSnapshot?.rows.some(
       (row) =>
@@ -582,7 +594,7 @@ export function ExecuteButton(): JSX.Element | null {
           className="side-rail-execute-reason"
           data-run-block-reason={blockReason}
         >
-          {RUN_BLOCK_REASON_TEXT[blockReason]}
+          {blockReasonText}
         </p>
       )}
       {/* Run is enabled, but the audit-readiness panel has a non-green

@@ -60,7 +60,7 @@ from elspeth.telemetry.manager import TelemetryManager
 from elspeth.web.blobs.protocol import BlobFinalizationResult, BlobRecord, BlobServiceProtocol
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
-from elspeth.web.execution.errors import PipelineValidationError
+from elspeth.web.execution.errors import CompletionGateIntegrityError, ExecutionReadinessError, PipelineValidationError
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import FrozenRunSettings
 from elspeth.web.execution.schemas import (
@@ -895,6 +895,40 @@ class TestExecutionFlow:
         assert exc_info.value.errors[0].component_id == "rate"
 
     @pytest.mark.asyncio
+    async def test_execute_rejects_backend_execution_readiness_before_run_creation(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """Execution admission follows readiness even when validation is green."""
+        blocker = ValidationReadinessBlocker(
+            code="runtime_admission",
+            component_id="pipeline",
+            component_type="pipeline",
+            detail="The selected runtime policy does not admit this pipeline.",
+        )
+        not_execution_ready = ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=True,
+                execution_ready=False,
+                completion_ready=False,
+                blockers=[blocker],
+            ),
+        )
+
+        with (
+            patch("elspeth.web.execution.validation.validate_pipeline", return_value=not_execution_ready),
+            pytest.raises(ExecutionReadinessError) as exc_info,
+        ):
+            await service.execute(session_id=uuid4())
+
+        assert exc_info.value.blockers == (blocker,)
+        mock_session_service.create_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_execute_rejects_saved_now_disabled_plugin_before_run_or_constructor(
         self,
         service: ExecutionServiceImpl,
@@ -1018,6 +1052,105 @@ class TestExecutionFlow:
             run_id = await service.execute(session_id=uuid4())
         assert isinstance(run_id, UUID)
         mock_session_service.create_run.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_execute_merges_selected_state_fact_against_authored_state(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        """Completion facts bind to the persisted graph, not runtime materialization."""
+        from elspeth.web.composer.state import SourceSpec
+        from elspeth.web.execution.completion_gates import (
+            AdvisorSignoffGateFact,
+            CompletionGateFacts,
+            completion_gate_fingerprint,
+        )
+        from elspeth.web.execution.completion_gates import (
+            merge_completion_gates as real_merge_completion_gates,
+        )
+
+        selected_record = mock_session_service.get_state.return_value
+        session_id = selected_record.session_id
+        authored_state = state_from_record(selected_record)
+        fact = AdvisorSignoffGateFact(
+            detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
+            for_graph=completion_gate_fingerprint(authored_state),
+        )
+        selected_record.composer_meta = {
+            "completion_gates": {
+                "advisor_signoff": {
+                    "status": "blocked",
+                    "detail": fact.detail,
+                    "for_graph": fact.for_graph,
+                }
+            }
+        }
+        runtime_state = authored_state.with_named_source(
+            "runtime_materialized",
+            SourceSpec(
+                plugin="text",
+                on_success="runtime_rows",
+                options={},
+                on_validation_failure="discard",
+            ),
+        )
+        valid = ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=True,
+                execution_ready=True,
+                completion_ready=True,
+                blockers=[],
+            ),
+        )
+
+        with (
+            patch("elspeth.web.execution.service.materialize_state_for_execution", return_value=runtime_state),
+            patch("elspeth.web.execution.validation.validate_pipeline", return_value=valid),
+            patch(
+                "elspeth.web.execution.service.merge_completion_gates",
+                wraps=real_merge_completion_gates,
+            ) as merge,
+            patch.object(service, "_run_pipeline"),
+        ):
+            run_id = await service.execute(session_id=session_id, state_id=selected_record.id)
+
+        assert isinstance(run_id, UUID)
+        merge.assert_called_once_with(
+            valid,
+            CompletionGateFacts(advisor_signoff=fact),
+            authored_state,
+        )
+        mock_session_service.get_current_state.assert_not_awaited()
+        mock_session_service.create_run.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_execute_rejects_corrupt_completion_gate_before_run_creation(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        selected_record = mock_session_service.get_current_state.return_value
+        private_persisted_detail = "private-persisted-advisor-detail"
+        selected_record.composer_meta = {
+            "completion_gates": {
+                "advisor_signoff": {
+                    "status": "blocked",
+                    "detail": private_persisted_detail,
+                    # Required for_graph intentionally absent: Tier-1 corruption.
+                }
+            }
+        }
+
+        with pytest.raises(CompletionGateIntegrityError) as exc_info:
+            await service.execute(session_id=selected_record.session_id)
+
+        assert private_persisted_detail not in str(exc_info.value)
+        assert private_persisted_detail not in repr(exc_info.value)
+        mock_session_service.create_run.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_validate_returns_structured_failure_when_no_current_state(

@@ -18,6 +18,20 @@ import type { InterpretationEvent } from "@/types/interpretation";
 import type { AuditReadinessSnapshot } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 
+const READY_READINESS = {
+  authoring_valid: true,
+  execution_ready: true,
+  completion_ready: true,
+  blockers: [],
+} as const;
+
+const NOT_READY_READINESS = {
+  authoring_valid: false,
+  execution_ready: false,
+  completion_ready: false,
+  blockers: [],
+} as const;
+
 function makeInterpretationEvent(
   overrides: Partial<InterpretationEvent> = {},
 ): InterpretationEvent {
@@ -112,6 +126,7 @@ describe("ExecuteButton", () => {
         checks: [],
         errors: [],
         warnings: [],
+        readiness: READY_READINESS,
       } as never,
       isExecuting: false,
       progress: null,
@@ -138,6 +153,7 @@ describe("ExecuteButton", () => {
           } as never,
         ],
         warnings: [],
+        readiness: NOT_READY_READINESS,
       } as never,
       isExecuting: false,
       progress: null,
@@ -147,6 +163,80 @@ describe("ExecuteButton", () => {
     render(<ExecuteButton />);
 
     expect(screen.getByRole("button", { name: /run pipeline/i })).toBeDisabled();
+  });
+
+  it("disables Run with the backend execution-readiness blocker when validation is green", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: false,
+          completion_ready: false,
+          blockers: [
+            {
+              code: "runtime_admission",
+              component_id: "pipeline",
+              component_type: "pipeline",
+              detail: "The selected runtime policy does not admit this pipeline.",
+            },
+          ],
+        },
+      },
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+
+    expect(screen.getByRole("button", { name: /run pipeline/i })).toBeDisabled();
+    expect(
+      screen.getByText("The selected runtime policy does not admit this pipeline."),
+    ).toHaveAttribute("data-run-block-reason", "readiness");
+  });
+
+  it("keeps Run enabled for a completion-only advisor blocker", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [
+          {
+            name: "advisor_signoff",
+            passed: false,
+            detail: "Advisor sign-off is pending.",
+            affected_nodes: [],
+            outcome_code: null,
+          },
+        ],
+        errors: [],
+        warnings: [],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: true,
+          completion_ready: false,
+          blockers: [
+            {
+              code: "advisor_signoff_blocked",
+              component_id: "pipeline",
+              component_type: "pipeline",
+              detail: "Advisor sign-off is pending.",
+            },
+          ],
+        },
+      },
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+
+    expect(screen.getByRole("button", { name: /run pipeline/i })).not.toBeDisabled();
+    expect(document.querySelector("[data-run-block-reason]")).toBeNull();
   });
 
   it("stays a co-equal plain .btn (never btn-primary) even when runnable (elspeth-0d37694c8c)", () => {
@@ -161,6 +251,7 @@ describe("ExecuteButton", () => {
         checks: [],
         errors: [],
         warnings: [],
+        readiness: READY_READINESS,
       } as never,
       isExecuting: false,
       progress: null,
@@ -190,6 +281,7 @@ describe("ExecuteButton", () => {
         checks: [],
         errors: [],
         warnings: [],
+        readiness: READY_READINESS,
       } as never,
       isExecuting: false,
       progress: null,
@@ -242,6 +334,7 @@ describe("ExecuteButton", () => {
         checks: [],
         errors: [],
         warnings: [],
+        readiness: READY_READINESS,
       } as never,
       isExecuting: false,
       progress: null,
@@ -290,6 +383,7 @@ describe("ExecuteButton", () => {
         checks: [],
         errors: [],
         warnings: [],
+        readiness: READY_READINESS,
       } as never,
       isExecuting: false,
       progress: null,
@@ -313,6 +407,7 @@ describe("ExecuteButton", () => {
         checks: [],
         errors: [],
         warnings: [],
+        readiness: READY_READINESS,
       } as never,
       isExecuting: false,
       progress: null,
@@ -350,6 +445,7 @@ describe("ExecuteButton", () => {
         checks: [],
         errors: [],
         warnings: [],
+        readiness: READY_READINESS,
       } as never,
       isExecuting: false,
       progress: null,
@@ -388,6 +484,7 @@ describe("ExecuteButton", () => {
         checks: [],
         errors: [],
         warnings: [],
+        readiness: READY_READINESS,
       } as never,
       isExecuting: false,
       progress: null,
@@ -432,6 +529,7 @@ describe("ExecuteButton", () => {
         checks: [],
         errors: [],
         warnings: [],
+        readiness: READY_READINESS,
       } as never,
       isExecuting: false,
       progress: null,
@@ -467,6 +565,7 @@ describe("ExecuteButton", () => {
         checks: [],
         errors: [],
         warnings: [],
+        readiness: READY_READINESS,
       } as never,
       isExecuting: false,
       progress: null,
@@ -512,6 +611,7 @@ describe("ExecuteButton", () => {
             checks: [],
             errors: [],
             warnings: [],
+            readiness: READY_READINESS,
           } as never,
         },
       },
@@ -520,7 +620,7 @@ describe("ExecuteButton", () => {
 
   it("shows 'The pipeline is already running.' when isExecuting is true", () => {
     useExecutionStore.setState({
-      validationResult: { is_valid: true, checks: [], errors: [], warnings: [] } as never,
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
       isExecuting: true,
       progress: null,
     } as never);
@@ -542,7 +642,7 @@ describe("ExecuteButton", () => {
     // canExecute's `progress?.status !== "running"` condition covers this
     // window — the reason text must too.
     useExecutionStore.setState({
-      validationResult: { is_valid: true, checks: [], errors: [], warnings: [] } as never,
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
       isExecuting: false,
       progress: { status: "running" } as never,
     } as never);
@@ -562,6 +662,7 @@ describe("ExecuteButton", () => {
         checks: [],
         errors: [{ component_type: "source", component_id: "csv_source", message: "x" } as never],
         warnings: [],
+        readiness: NOT_READY_READINESS,
       } as never,
       isExecuting: false,
       progress: null,
@@ -579,7 +680,7 @@ describe("ExecuteButton", () => {
 
   it("shows the interpretation-pending reason as visible text, in addition to the existing sr-only/title pair", () => {
     useExecutionStore.setState({
-      validationResult: { is_valid: true, checks: [], errors: [], warnings: [] } as never,
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
       isExecuting: false,
       progress: null,
     } as never);
@@ -603,7 +704,7 @@ describe("ExecuteButton", () => {
 
   it("shows no reason paragraph when canExecute is true", () => {
     useExecutionStore.setState({
-      validationResult: { is_valid: true, checks: [], errors: [], warnings: [] } as never,
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
       isExecuting: false,
       progress: null,
     } as never);
@@ -616,7 +717,7 @@ describe("ExecuteButton", () => {
 
   it("shows a one-line advisory note when Run is enabled but a non-gating audit row is non-green", () => {
     useExecutionStore.setState({
-      validationResult: { is_valid: true, checks: [], errors: [], warnings: [] } as never,
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
       isExecuting: false,
       progress: null,
     } as never);
@@ -639,7 +740,7 @@ describe("ExecuteButton", () => {
 
   it("does not show the advisory note when every audit row is green", () => {
     useExecutionStore.setState({
-      validationResult: { is_valid: true, checks: [], errors: [], warnings: [] } as never,
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
       isExecuting: false,
       progress: null,
     } as never);
@@ -661,7 +762,7 @@ describe("ExecuteButton", () => {
 
   it("does not show the advisory note from a stale (composition-version-mismatched) audit snapshot", () => {
     useExecutionStore.setState({
-      validationResult: { is_valid: true, checks: [], errors: [], warnings: [] } as never,
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
       isExecuting: false,
       progress: null,
     } as never);
@@ -692,7 +793,7 @@ describe("ExecuteButton", () => {
     // showing "Advisory checks don't block Run" next to a gating row
     // would be a false, self-contradicting statement.
     useExecutionStore.setState({
-      validationResult: { is_valid: true, checks: [], errors: [], warnings: [] } as never,
+      validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
       isExecuting: false,
       progress: null,
     } as never);
@@ -732,6 +833,7 @@ describe("primaryRunBlockReason", () => {
     progressRunning: false,
     isRunBlocked: false,
     validationFailing: false,
+    executionReadinessBlocked: false,
     validationNotRun: false,
   };
 

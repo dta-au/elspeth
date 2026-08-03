@@ -20,7 +20,7 @@ from elspeth.web.composer.state import ValidationEntry
 from elspeth.web.interpretation_state import InterpretationReviewSite
 
 if TYPE_CHECKING:
-    from elspeth.web.execution.schemas import ValidationError, ValidationReadiness
+    from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationReadinessBlocker
 
 
 class SemanticContractViolationError(ValueError):
@@ -82,6 +82,31 @@ class PipelineValidationError(ValueError):
         self.readiness = readiness
         message = "; ".join(e.message for e in errors)
         super().__init__(f"Pipeline failed pre-run validation: {message}")
+
+
+class ExecutionReadinessError(Exception):
+    """Backend-owned execution readiness refused run admission.
+
+    This is distinct from :class:`PipelineValidationError`: deterministic
+    validation can be green while a runtime admission policy withholds
+    ``execution_ready`` without producing ``ValidationError`` records.
+    """
+
+    def __init__(self, *, blockers: tuple[ValidationReadinessBlocker, ...]) -> None:
+        blockers = tuple(blockers)
+        if not blockers:
+            raise ValueError("ExecutionReadinessError requires at least one readiness blocker")
+        self.blockers = blockers
+        super().__init__("Pipeline is not ready for execution.")
+
+
+class CompletionGateIntegrityError(Exception):
+    """Persisted composer completion-gate facts failed owned-data parsing."""
+
+    def __init__(self, *, session_id: str, state_id: str) -> None:
+        self.session_id = session_id
+        self.state_id = state_id
+        super().__init__("Persisted completion-gate facts failed integrity validation.")
 
 
 class ExecuteRequestValidationError(ValueError):
