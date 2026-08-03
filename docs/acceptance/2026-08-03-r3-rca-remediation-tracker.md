@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-04T02:34:12+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-04T02:34:12+10:00
-Release baseline: `release/0.7.2@0dfa2391cf06`
+Last refreshed: 2026-08-04T03:54:28+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-04T03:54:28+10:00
+Release baseline: `release/0.7.2@1213ab5b4b47`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -36,16 +36,16 @@ evidence are core/demo-aware work even though they involve AWS. Installing,
 updating, or tearing down the environment through IAM, Terraform, runbooks, or
 shell mechanics remains deferred even when it blocks a fresh install.
 
-## Current roll-up — 44 objective items plus 21 discovered/delivery records
+## Current roll-up — 44 objective items plus 22 discovered/delivery records
 
-| State | Objective 44 | Additional 21 | Meaning |
+| State | Objective 44 | Additional 22 | Meaning |
 |---|---:|---:|---|
 | Closed | 9 | 7 | Tracker says done; closure evidence is still sampled during the completion audit |
-| Verifying | 17 | 5 | Locally fixed; live or requirement-specific acceptance remains |
-| Fixing | 1 | 5 | Owned bug implementation is still in flight |
+| Verifying | 17 | 11 | Locally fixed; live or requirement-specific acceptance remains |
+| Fixing | 1 | 1 | Owned bug implementation is still in flight |
 | In progress | 0 | 0 | A delivery task spanning existing objective defects is in flight |
 | Open | 5 | 1 | Confirmed task/epic work not yet started here |
-| Triage | 9 | 3 | Root cause and reproducibility must be checked against current HEAD before fixing |
+| Triage | 9 | 2 | Root cause and reproducibility must be checked against current HEAD before fixing |
 | Proposed | 3 | 0 | Regression-gate features require approval/acceptance design before implementation |
 
 The additional records are newly discovered gate-custody bug
@@ -65,6 +65,9 @@ false-FLAG loop.
 The guided advisory RCA added one P1 authority-split record,
 `elspeth-32a2242510`, after reproducing typed authored gate literals in a
 provider system-role message.
+The advisor contract-honesty RCA also found one independent runtime-validation
+gap, `elspeth-0c73de77d5`, because an unknown JSON sink encoding reaches the
+first write before codec rejection.
 
 Closed-record assignees below are retained Filigree audit history, not active
 claim custody.
@@ -73,20 +76,24 @@ claim custody.
 
 | Agent | Scope | Worktree/branch | File custody | AWS authority | Status |
 |---|---|---|---|---|---|
-| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`); release checkout | This tracker and release integration | Sole mutation custodian | Active; release is durable through `442422d818e2`; guided prose custody and freeform schema evidence are isolated pre-integration candidates |
+| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`); release checkout | This tracker and release integration | Sole mutation custodian | Active; six reviewed demo-critical fixes are durable through release `1213ab5b4`; advisor evidence-scope wording is the next isolated lane |
 | `/root/review_guided_proposal_feedback` | Focused custody, retry, closed-shape, unchanged-target, security, and accessibility review | Read-only `.claude/worktrees/guided-proposal-feedback` | None | None | Complete; approved exact candidate `a5b5c9cee` with no P1/P2 findings |
 | `/root/rca_multiquery_standard_json` | Root-cause the standard-JSON provider-contract omission and audit-trace seam | Shared read-only release baseline | None | None | Complete; confirmed standard mode enforced names, types, and enums absent from both provider and Langfuse messages |
 | `/root/fix_multiquery_standard_json` | TDD implementation of deterministic standard-JSON contract projection | `.claude/worktrees/fix-multiquery-standard-json`; `codex/fix-multiquery-standard-json` | Released after integration | None | Complete exact candidate `f84a2fc37`; integrated as release `4f95c29a1` after two independent approvals |
 | `/root/review_multiquery_standard_json` | Independent provider-message, structured-parity, trace-parity, and fail-closed review | Read-only `.claude/worktrees/fix-multiquery-standard-json` | None | None | Complete; first review blocked empty-system trace drift, then approved amended `f84a2fc37` with no P1/P2 findings |
 | `/root/rca_guided_prose_revision_preservation` | Reproduce and bound whole-proposal prose-amend preservation/custody | Shared read-only release baseline | None | None | Complete; confirmed active proposal is absent from planning and private predecessor semantics have no server custody |
-| `/root/fix_guided_prose_revision_preservation` | Add closed amend/replace authority, preservation, repair, exact message custody, and retry | `.claude/worktrees/guided-prose-revision`; `codex/fix-guided-prose-revision` | Guided revision seams and direct tests only | None | Active in strict TDD; protocol and registered-guidance scope expansions explicitly deconflicted |
+| `/root/fix_guided_prose_revision_preservation` | Add closed amend/replace authority, preservation, repair, exact message custody, and retry | `.claude/worktrees/guided-prose-revision`; `codex/fix-guided-prose-revision` | Released after reviewed integration | None | Complete through release `97bad7128` + `21f55834d` + fixture correction `6a59bcf77`; live acceptance remains |
 | `/root/rca_advisor_residual_obligations` | Recheck END evidence non-injectivity after the advisor projection fix | Shared read-only release baseline | None | None | Complete; original impossible false-FLAG obligation is fixed, leaving a separate product-contract question about calling evidence-scoped CLEAN whole-pipeline sign-off |
 | `/root/rca_freeform_schema_progress` | Reproduce cross-request schema-evidence custody and design bounded rehydration | Shared read-only release baseline | None | None | Complete; exact request-two capture proved progress says satisfied while the full schema is absent and specified current-policy rehydration |
-| `/root/fix_freeform_schema_progress` | Rehydrate bounded whole current-policy schema contracts and base progress on current request evidence | `.claude/worktrees/freeform-schema-progress`; `codex/fix-freeform-schema-progress` | `prompts.py`, `planner_authoring_aids.py`, and dedicated schema carry-forward tests | None | Active in strict TDD; current-policy rehydration, structural projection, injection-metadata stripping, and digest honesty are green; drift, omission bounds, and policy-loss coverage remain |
+| `/root/fix_freeform_schema_progress` | Rehydrate bounded whole current-policy schema contracts and base progress on current request evidence | `.claude/worktrees/freeform-schema-progress`; `codex/fix-freeform-schema-progress` | Released after reviewed integration | None | Complete as release `bb5a81213`; all 48 trained-operator contracts projected without omission and live two-request acceptance remains |
 | `/root/rca_planner_escape_hatch_final_candidate` | Reproduce the final-candidate omission in the one-shot repair escape hatch | Shared read-only release baseline | None | None | Complete; distinct candidates proved the final candidate is absent while only its rejection code survives |
-| `/root/fix_planner_escape_hatch_final_candidate` | Retain the raw provider-authored terminal candidate plus one protocol-closed rejection result for the hatch | `.claude/worktrees/planner-escape-hatch-final-candidate`; `codex/fix-planner-escape-hatch-final-candidate` | `pipeline_planner.py` and direct planner tests only | None | Active in strict TDD; no overlap with guided or schema work |
+| `/root/fix_planner_escape_hatch_final_candidate` | Retain the raw provider-authored terminal candidate plus one protocol-closed rejection result for the hatch | `.claude/worktrees/planner-escape-hatch-final-candidate`; `codex/fix-planner-escape-hatch-final-candidate` | Released after reviewed integration | None | Complete as release `8ba6f97a8`; terminal candidate custody, association scrubbing, and error primacy approved |
 | `/root/rca_guided_advisory_graph_context` | Reconcile Step-3/4 Explain obligations with actual graph evidence and provider role authority | Shared read-only release baseline | None | None | Complete; materially different valid gates had identical contexts and typed authored gate literals were promoted into system role |
-| `/root/fix_guided_advisory_graph_authority` | Bind advisory graph context to the frozen proposal/wire payload and split system-safe structure from authored user-role literals | `.claude/worktrees/guided-advisory-graph-authority`; `codex/fix-guided-advisory-graph-authority` | `chat_solver.py`, guided-chat provider-input threading, and direct tests only | None | Active on combined P1 `32a2242510` and P2 `73c1af1562`; deferred-intent disposition blocks are explicitly excluded |
+| `/root/fix_guided_advisory_graph_authority` | Bind advisory graph context to the frozen proposal/wire payload and split system-safe structure from authored user-role literals | `.claude/worktrees/guided-advisory-graph-authority`; `codex/fix-guided-advisory-graph-authority` | Released after reviewed integration | None | Complete as release `07f966c8a`; exact graph custody and provider-role separation independently approved |
+| `/root/rca_run_diagnostics_safe_classification` | Reproduce equal-length failure-class collapse and isolate the safe evidence boundary | Shared read-only release baseline | None | None | Complete; advisory Explain alone loses cause classification while Landscape/static UI remain correct |
+| `/root/fix_run_diagnostics_safe_classification` | Preserve a closed server-owned failure classification without raw runtime/provider text | `.claude/worktrees/run-diagnostics-safe-classification`; `codex/fix-run-diagnostics-safe-classification` | Released after reviewed integration | None | Complete as release `1213ab5b4`; 37,208-test full gate and 69 release-local diagnostics canaries passed |
+| `/root/rca_advisor_signoff_contract_honesty` | Reconcile bounded END evidence with advertised whole-pipeline certification | Shared read-only release baseline | None | None | Complete; evidence is intentionally non-injective and durable semantics are a completion/share veto, not affirmative certification |
+| `/root/fix_advisor_evidence_scope_wording` | Make skill, progress, terminal, readiness, and repair wording consistently evidence-scoped | `.claude/worktrees/advisor-evidence-scope-wording`; `codex/fix-advisor-evidence-scope-wording` | Wording strings/docstrings and exact tests only | None | Active in strict TDD; projection, verdict, persistence, and execution behavior are excluded |
 | `/root/review_advisor_evidence_scope` | Adversarial review of bounded evidence and actual checkpoint wire instructions | Shared read-only advisor worktree | None | None | Complete; found and drove repair of the shared stuck-composer system-contract conflict, then approved current bytes with no findings |
 | `/root/audit_advisor_demo` | D1-D6 and advisor/F14 completion evidence | Shared read-only baseline | None | None | Completed; no residual local code defect found |
 | `/root/audit_compose_loop` | Six compose-loop RCAs and implementation partitioning | Shared read-only baseline | None | None | Completed; all six remain actionable |
@@ -169,7 +176,7 @@ Parent workstream state:
 | `elspeth-d0d52e2fde` | P2 | `closed` | `codex-release-0.7.2-integration` | Sample the real HTTP/lifecycle regression added with the proof fix |
 | `elspeth-c4734bc69a` | P3 | `verifying` | `codex-r3-rca-coordinator` | Behavior `d78fbbed6` plus corpus `10179f2c1`; combined full-suite gate passed at `6844b684a`, while live catalog acceptance remains |
 | `elspeth-aaa9e3f597` | P2 | `verifying` | `codex-release-0.7.2-integration` | Live guided path retains the decision heading and treats gates as topology, not plugins |
-| `elspeth-1d97fc4b80` | P1 | `fixing` | `codex-r3-rca-coordinator` | Prior hidden-state fix remains; residual proposal revision must use the active candidate and selected gate correction must retain explicit destinations |
+| `elspeth-1d97fc4b80` | P1 | `verifying` | `codex-r3-rca-coordinator` | Integrated through `97bad7128` + `21f55834d` + `6a59bcf77`; live amend/replace must preserve the active candidate, reviewed source/output authority, and exact retry mode |
 | `elspeth-18b39eb829` | P2 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `0928c6ac6`; live run panel must expose the already-recorded Textract node/code/hint without direct DB access |
 
 ## Related core/demo-aware product and system work
@@ -181,6 +188,7 @@ not gate-routing children.
 |---|---:|---|---|---|
 | `elspeth-926ac02d3e` | P1 | `verifying` | `codex-s3-source-profiles` | Integrated through `131a5f584`; run one live operator-profiled S3 read and confirm redacted audit evidence plus endpoint denial |
 | `elspeth-6801b71f71` | P2 | `closed` | `codex-r3-rca-coordinator` | Read-only live DB proof found complete structured failure and DIVERT provenance; UI gap split to `elspeth-18b39eb829` |
+| `elspeth-0c73de77d5` | P2 | `triage` | unassigned | Confirm the exact plugin-config boundary and reject unknown JSON codec names before run admission or the first sink write |
 
 ## Provider-projection audit follow-up
 
@@ -193,13 +201,13 @@ supportability remains last.
 | `elspeth-71b22759cc` | P1 | `verifying` | Freeform planner | Integrated as `368a55ef7`; live two-turn acceptance must preserve the first request's topology and threshold through a referential build |
 | `elspeth-43208ece4c` | P1 | `verifying` | Guided proposal revision | Reviewed candidate `a5b5c9cee` passed 37,054 Python and 2,874 frontend full-suite tests, then integrated as release `8797fce2d`; live node/edge correction acceptance remains |
 | `elspeth-1345480bd7` | P1 | `verifying` | Multi-query standard JSON | Amended candidate `f84a2fc37` passed two independent reviews, provider/trace parity, and fail-closed regressions; integrated as release `4f95c29a1`, with 37,126 release tests passed; live provider acceptance remains |
-| `elspeth-8ef90e59cc` | P2 | `fixing` | Freeform schema progress | Current-policy rehydration is under TDD; only whole evidenced entries may satisfy the current request's schema gap |
-| `elspeth-68a2ff10aa` | P2 | `fixing` | Planner repair escape hatch | Preserve the raw provider-authored terminal candidate and matching closed tool result without exposing private finalizer state |
-| `elspeth-73c1af1562` | P2 | `fixing` | Guided advisory chat | Bind Step-3/4 explanation to the frozen visible proposal/wire graph with exact omissions |
-| `elspeth-32a2242510` | P1 | `fixing` | Guided advisory role authority | Keep typed authored predicates, routes, fields, mappings, and enums out of provider system-role content |
-| `elspeth-b14aa70771` | P2 | `triage` | Run diagnostics | Preserve a safe failure classification through redaction and explanation |
+| `elspeth-8ef90e59cc` | P2 | `verifying` | Freeform schema progress | Integrated as `bb5a81213`; live request two must receive current-policy whole schema evidence or honestly report the gap unsatisfied |
+| `elspeth-68a2ff10aa` | P2 | `verifying` | Planner repair escape hatch | Integrated as `8ba6f97a8`; live exhaustion must expose the final attempted candidate to the hatch without private finalizer associations |
+| `elspeth-73c1af1562` | P2 | `verifying` | Guided advisory chat | Integrated as `07f966c8a`; live Step-3/4 explanations must distinguish materially different same-count graphs from exact frozen authority |
+| `elspeth-32a2242510` | P1 | `verifying` | Guided advisory role authority | Integrated as `07f966c8a`; live adversarial capture must keep authored literals in delimited user content and absent from system authority |
+| `elspeth-b14aa70771` | P2 | `verifying` | Run diagnostics | Integrated as `1213ab5b4`; live Explain must distinguish safe auth/throttle/Textract classifications while provider text remains redacted and audit hashes bind the exact messages |
 | `elspeth-cecfeca77b` | P2 | `verifying` | EARLY advisor | Integrated at `a8c6f091d`; deployed prompt capture must confirm the internal-coherence-only rubric |
-| `elspeth-532dfcb0c7` | P2 | `triage` | Advisor sign-off contract honesty | Preserve evidence-scoped CLEAN or add typed deterministic hidden obligations; do not relabel bounded evidence as whole-pipeline certification |
+| `elspeth-532dfcb0c7` | P2 | `fixing` | Advisor sign-off contract honesty | RCA proved the honest behavior is a graph-bound completion/share advisory veto; make every user/provider/product label evidence-scoped without changing runtime semantics |
 | `elspeth-0502deb48c` | P1 | `triage` | Judge staging | Deferred: site-specific rationale is a release/supportability surface, after demo core |
 
 ## AWS installer — `elspeth-e54343d43b`
@@ -343,6 +351,16 @@ Append entries; do not rewrite history.
 | 2026-08-04 02:04 | Advisor residual separated from D1 | Current-HEAD re-audit proved the impossible false-FLAG obligation remains fixed while evidence-scoped CLEAN is still advertised as whole-pipeline sign-off; new P2 `532dfcb0c7` records that contract-honesty choice without reopening D1 |
 | 2026-08-04 02:18 | Guided custody and schema evidence in TDD | Guided amend/replace now plans from the active proposal, binds exact instruction lineage and retry mode, and is closing route-side hidden-state custody regressions before commit; schema-progress RCA completed and `8ef90e59cc` moved to fixing with isolated current-policy evidence work. No AWS or release mutation occurred |
 | 2026-08-04 02:34 | Next provider-evidence lanes opened | Escape-hatch RCA proved the final rejected candidate is absent and opened isolated `68a2ff10aa` implementation. Guided advisory RCA proved same-count gates collapse to identical contexts and split P1 `32a2242510` because typed authored literals gain system-role authority; combined graph/authority repair now has disjoint custody. No AWS mutation occurred |
+| 2026-08-04 03:10 | Four localized candidates approved | Guided amend/replace `db4c8aaa3`, schema replay `9e84426a0`, escape hatch `ee5dfcc761`, and guided advisory graph/role authority `5c87828ef0` passed independent P1/P2 review plus their localized/static/security gates; none had yet mutated release |
+| 2026-08-04 03:19 | Full gate caught stale revision fixture | First combined run reached 37,122 passed but correctly rejected two shared deterministic-planner no-op successors; production remained fail closed. Fixture correction `227c93ee2` made the planner emit a real retained-authority transform, and the full two-file guided integration neighborhood passed 288 tests |
+| 2026-08-04 03:35 | Combined CI-equivalent gate passed | Exact combined head `25b77901f` completed `pytest tests/` with 37,169 passed, 66 skipped, and one expected trust-tier xfail in 13m19s after 908 Python, 333 frontend, TypeScript, Ruff, ELSPETH lints, and Wardline canaries |
+| 2026-08-04 03:37 | Five demo-critical fixes integrated | Six reviewed commits were cherry-picked durably through release `07f966c8a`; exact release rerun passed 908 Python plus 333 frontend and TypeScript. `1d97fc4b80`, `8ef90e59cc`, `68a2ff10aa`, `73c1af1562`, and `32a2242510` advanced to verifying for live acceptance |
+| 2026-08-04 03:38 | Run-diagnostics implementation lane active | RCA proved only advisory Explain collapses equal-length auth/throttle evidence; Filigree comment `2254` records the closed-classification boundary. Independent review approved the two-file candidate after 39 focused and 60 direct/route tests; no AWS mutation occurred |
+| 2026-08-04 03:40 | Structural index refreshed | Loomweave run `dcb0c3ec-4fc1-48e8-af55-6a5a2b16cfd9` completed fresh at release `07f966c8a` with 71,412 entities and 136,665 edges |
+| 2026-08-04 03:53 | Run-diagnostics full gate passed | Exact combined candidate `3150164c3` completed `pytest tests/` with 37,208 passed, 66 skipped, and one expected trust-tier xfail in 12m53s after 69 exact diagnostics canaries |
+| 2026-08-04 03:54 | Run-diagnostics classification integrated | Reviewed candidate `b36333cce1` integrated as release `1213ab5b4`; exact release diagnostics rerun passed 69 tests and `b14aa70771` advanced to verifying for live Explain/audit-hash acceptance |
+| 2026-08-04 03:54 | Advisor contract-honesty lane opened | Two valid delimiter/encoding graph pairs produced identical advisor messages despite distinct graph fingerprints. `532dfcb0c7` advanced to fixing for wording-only evidence scoping; separate P2 `0c73de77d5` records JSON codec validation deferred to first write |
+| 2026-08-04 03:55 | Structural index refreshed after diagnostics | Loomweave run `f96057b0-f71a-4ff0-9486-ff549914c09e` completed fresh at exact release `1213ab5b4` with 71,427 entities and 136,684 edges |
 
 ## Reconciliation findings
 
