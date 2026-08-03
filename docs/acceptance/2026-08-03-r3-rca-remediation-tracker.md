@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-04T01:22:15+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-04T01:22:15+10:00
-Release baseline: `release/0.7.2@8797fce2d`
+Last refreshed: 2026-08-04T01:52:40+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-04T01:52:40+10:00
+Release baseline: `release/0.7.2@4f95c29a1`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -41,8 +41,8 @@ shell mechanics remains deferred even when it blocks a fresh install.
 | State | Objective 44 | Additional 19 | Meaning |
 |---|---:|---:|---|
 | Closed | 9 | 7 | Tracker says done; closure evidence is still sampled during the completion audit |
-| Verifying | 17 | 4 | Locally fixed; live or requirement-specific acceptance remains |
-| Fixing | 1 | 2 | Owned bug implementation is still in flight |
+| Verifying | 17 | 5 | Locally fixed; live or requirement-specific acceptance remains |
+| Fixing | 1 | 1 | Owned bug implementation is still in flight |
 | In progress | 0 | 0 | A delivery task spanning existing objective defects is in flight |
 | Open | 5 | 1 | Confirmed task/epic work not yet started here |
 | Triage | 9 | 5 | Root cause and reproducibility must be checked against current HEAD before fixing |
@@ -68,11 +68,14 @@ claim custody.
 
 | Agent | Scope | Worktree/branch | File custody | AWS authority | Status |
 |---|---|---|---|---|---|
-| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`); release checkout | This tracker and release integration | Sole mutation custodian | Active; guided proposal feedback is durable as release `8797fce2d` after the 37,054-test full gate; multi-query standard JSON is the active implementation item |
+| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`); release checkout | This tracker and release integration | Sole mutation custodian | Active; guided feedback is durable as `8797fce2d`; multi-query standard JSON is durable as `4f95c29a1` after the 37,126-test release gate; guided prose-amend preservation is next |
 | `/root/review_guided_proposal_feedback` | Focused custody, retry, closed-shape, unchanged-target, security, and accessibility review | Read-only `.claude/worktrees/guided-proposal-feedback` | None | None | Complete; approved exact candidate `a5b5c9cee` with no P1/P2 findings |
-| `/root/rca_multiquery_standard_json` | Root-cause the standard-JSON provider-contract omission and audit-trace seam | Shared read-only release baseline | None | None | Complete; confirmed standard mode enforces names, types, and enums that are absent from both provider and Langfuse messages |
-| `/root/fix_multiquery_standard_json` | TDD implementation of deterministic standard-JSON contract projection | `.claude/worktrees/fix-multiquery-standard-json`; `codex/fix-multiquery-standard-json` | `transform.py` and its direct unit tests only | None | Complete candidate `9f6306257`; 126 owned-module and 238 adjacent tests plus static gates and Wardline passed |
-| `/root/review_multiquery_standard_json` | Independent provider-message, structured-parity, trace-parity, and fail-closed review | Read-only `.claude/worktrees/fix-multiquery-standard-json` | None | None | Active on exact candidate `9f6306257`; no mutation authority |
+| `/root/rca_multiquery_standard_json` | Root-cause the standard-JSON provider-contract omission and audit-trace seam | Shared read-only release baseline | None | None | Complete; confirmed standard mode enforced names, types, and enums absent from both provider and Langfuse messages |
+| `/root/fix_multiquery_standard_json` | TDD implementation of deterministic standard-JSON contract projection | `.claude/worktrees/fix-multiquery-standard-json`; `codex/fix-multiquery-standard-json` | Released after integration | None | Complete exact candidate `f84a2fc37`; integrated as release `4f95c29a1` after two independent approvals |
+| `/root/review_multiquery_standard_json` | Independent provider-message, structured-parity, trace-parity, and fail-closed review | Read-only `.claude/worktrees/fix-multiquery-standard-json` | None | None | Complete; first review blocked empty-system trace drift, then approved amended `f84a2fc37` with no P1/P2 findings |
+| `/root/rca_guided_prose_revision_preservation` | Reproduce and bound whole-proposal prose-amend preservation/custody | Shared read-only release baseline | None | None | Complete; confirmed active proposal is absent from planning and private predecessor semantics have no server custody |
+| `/root/fix_guided_prose_revision_preservation` | Add closed amend/replace authority, preservation, repair, exact message custody, and retry | `.claude/worktrees/guided-prose-revision`; `codex/fix-guided-prose-revision` | Guided revision seams and direct tests only | None | Active in strict TDD; protocol and registered-guidance scope expansions explicitly deconflicted |
+| `/root/rca_advisor_residual_obligations` | Recheck END evidence non-injectivity after the advisor projection fix | Shared read-only release baseline | None | None | Complete; original impossible false-FLAG obligation is fixed, leaving a separate product-contract question about calling evidence-scoped CLEAN whole-pipeline sign-off |
 | `/root/review_advisor_evidence_scope` | Adversarial review of bounded evidence and actual checkpoint wire instructions | Shared read-only advisor worktree | None | None | Complete; found and drove repair of the shared stuck-composer system-contract conflict, then approved current bytes with no findings |
 | `/root/audit_advisor_demo` | D1-D6 and advisor/F14 completion evidence | Shared read-only baseline | None | None | Completed; no residual local code defect found |
 | `/root/audit_compose_loop` | Six compose-loop RCAs and implementation partitioning | Shared read-only baseline | None | None | Completed; all six remain actionable |
@@ -178,7 +181,7 @@ supportability remains last.
 |---|---:|---|---|---|
 | `elspeth-71b22759cc` | P1 | `verifying` | Freeform planner | Integrated as `368a55ef7`; live two-turn acceptance must preserve the first request's topology and threshold through a referential build |
 | `elspeth-43208ece4c` | P1 | `verifying` | Guided proposal revision | Reviewed candidate `a5b5c9cee` passed 37,054 Python and 2,874 frontend full-suite tests, then integrated as release `8797fce2d`; live node/edge correction acceptance remains |
-| `elspeth-1345480bd7` | P1 | `fixing` | Multi-query standard JSON | Candidate `9f6306257` sends the canonical declared field/type/enum contract in standard mode and records the same bytes in Langfuse; focused gates passed and independent review is active |
+| `elspeth-1345480bd7` | P1 | `verifying` | Multi-query standard JSON | Amended candidate `f84a2fc37` passed two independent reviews, provider/trace parity, and fail-closed regressions; integrated as release `4f95c29a1`, with 37,126 release tests passed; live provider acceptance remains |
 | `elspeth-8ef90e59cc` | P2 | `triage` | Freeform schema progress | Keep provider-visible schema evidence aligned with the progress state |
 | `elspeth-68a2ff10aa` | P2 | `triage` | Planner repair escape hatch | Retain the final candidate whose remaining error must be repaired |
 | `elspeth-73c1af1562` | P2 | `triage` | Guided advisory chat | Provide graph structure or narrow the requested explanation |
@@ -321,6 +324,8 @@ Append entries; do not rewrite history.
 | 2026-08-04 01:01 | Guided feedback review blockers repaired | Initial review found unchanged-target rejection was post-loop/terminal and TS still represented target-only node/edge actions. Single replacement commit `5cbd870a1` moves the registered objection into post-validation candidate acceptance before custody, preserves normal repair/repeat/hatch behavior, closes the TS unions, and adds positive node custody; 1,758 Python, 226 service/shared-planner, and 309 frontend tests passed before follow-up review |
 | 2026-08-04 01:21 | Guided proposal feedback integrated | Follow-up review approved exact `a5b5c9cee` with no P1/P2 findings; 37,054 Python and 2,874 frontend full-suite tests passed, the candidate was cherry-picked as release `8797fce2d`, 405 Python plus 292 frontend release regressions and TypeScript passed, and `43208ece4c` advanced to verifying |
 | 2026-08-04 01:22 | Multi-query standard JSON candidate under review | Read-only RCA proved standard mode hid its enforced field/type/enum contract and Langfuse reconstructed the same incomplete message. Narrow candidate `9f6306257` passed 126 owned-module and 238 adjacent tests plus static gates and Wardline; `1345480bd7` advanced to fixing and independent review started |
+| 2026-08-04 01:31 | Multi-query review blocker repaired | First review correctly found that an empty system prompt was omitted from provider messages but retained in Langfuse reconstruction. Amended `f84a2fc37` normalized tracer custody to exact provider bytes; two independent reviews approved success plus all three error branches, pooled/sequential execution, canonical escaping, and unchanged structured/no-output behavior |
+| 2026-08-04 01:52 | Multi-query release gate passed | A coordinator workdir error cherry-picked the reviewed candidate into release before the intended disposable combined gate. The single two-file commit remained isolated as `4f95c29a1`; the CI-equivalent release suite then passed 37,126 with 27 skips and one expected xfail, and `1345480bd7` advanced to verifying |
 
 ## Reconciliation findings
 
