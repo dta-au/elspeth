@@ -23,6 +23,7 @@ from elspeth.web.plugin_policy.coverage import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
 from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry
+from elspeth.web.provider_config_policy import web_aws_s3_endpoint_url_policy_error
 
 PolicyValidationStage = Literal[
     "plugin_enablement",
@@ -42,9 +43,9 @@ class PluginPolicyFinding:
     error_code: str
     message: str
     # Per-finding remediation, set when the producer can diagnose the repair
-    # more precisely than the stage-level default (currently only
-    # ``_control_coverage_finding``, keyed on the coverage reason). ``None``
-    # falls back to the consumer's stage default suggestion.
+    # more precisely than the stage-level default (control-coverage diagnoses
+    # and the endpoint-specific S3 profile denial). ``None`` falls back to the
+    # consumer's stage default suggestion.
     suggestion: str | None = None
 
 
@@ -68,6 +69,23 @@ class _Component:
 
     def __post_init__(self) -> None:
         freeze_fields(self, "options")
+
+
+def _s3_source_endpoint_override_finding(component: _Component) -> PluginPolicyFinding | None:
+    """Keep the endpoint-specific denial ahead of operator-profile lowering."""
+    if component.component_type != "source" or component.plugin_id != PluginId("source", "aws_s3"):
+        return None
+    message = web_aws_s3_endpoint_url_policy_error("aws_s3", component.options)
+    if message is None:
+        return None
+    return PluginPolicyFinding(
+        stage="operator_profile_options",
+        component_id=component.component_id,
+        component_type=component.component_type,
+        error_code="aws_s3_endpoint_url_not_allowed",
+        message=message,
+        suggestion="Remove endpoint_url and use operator-controlled AWS configuration.",
+    )
 
 
 def validate_plugin_policy(
@@ -110,6 +128,9 @@ def validate_plugin_policy(
                 message=f"Plugin '{component.plugin_id}' is not available for this request.",
             )
         )
+
+    if not snapshot.is_trained_operator:
+        findings.extend(finding for component in components if (finding := _s3_source_endpoint_override_finding(component)) is not None)
 
     executable_state = state
     profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()

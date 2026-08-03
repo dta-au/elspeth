@@ -348,6 +348,7 @@ def test_s3_source_profile_constrains_bucket_prefix_region_and_auth() -> None:
             bucket="elspeth-demo-input",
             executable_key="incoming/records/input.csv",
             region_name="ap-southeast-1",
+            endpoint_url=None,
         ),
     )
 

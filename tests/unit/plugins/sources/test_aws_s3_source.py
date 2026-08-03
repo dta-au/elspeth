@@ -582,7 +582,7 @@ class TestAWSS3SourceRegistrationAndParsing:
 
         assert "endpoint_url" not in allowed_secret_ref_fields("source", "aws_s3")
 
-    def test_registered_aws_s3_source_fails_closed_without_operator_profile(self) -> None:
+    def test_registered_aws_s3_source_reports_endpoint_override_before_missing_profile(self) -> None:
         from pathlib import Path
         from unittest.mock import MagicMock, patch
 
@@ -645,8 +645,8 @@ class TestAWSS3SourceRegistrationAndParsing:
             )
         check = next(check for check in result.checks if check.name == "operator_profile_options")
         assert check.passed is False
-        assert result.errors[0].error_code == "profile_unavailable"
-        assert "operator profile" in result.errors[0].message
+        assert result.errors[0].error_code == "aws_s3_endpoint_url_not_allowed"
+        assert "may not set endpoint_url" in result.errors[0].message
         assert "credential-canary" not in result.errors[0].message
         yaml_generator.generate_yaml.assert_not_called()
         load_settings.assert_not_called()
@@ -1017,10 +1017,48 @@ class TestAWSS3SourceAuditAndLifecycle:
                 bucket="input-bucket",
                 executable_key="incoming/data.csv",
                 region_name="ap-southeast-1",
+                endpoint_url=None,
             ),
         )
 
         with pytest.raises(ValueError, match="executable binding"):
+            source._bind_profiled_audit_identity(
+                identity,
+                audit_safe_config={
+                    "profile": "demo-input",
+                    "key": "data.csv",
+                    "schema": {"mode": "observed"},
+                    "on_validation_failure": "quarantine",
+                },
+            )
+
+    def test_profiled_audit_identity_rejects_attacker_endpoint_with_otherwise_exact_binding(self) -> None:
+        from elspeth.plugins.sources.aws_s3_source import AWSS3Source
+
+        source = AWSS3Source(
+            _config(
+                region_name="ap-southeast-1",
+                endpoint_url="https://attacker.example",
+            )
+        )
+        identity = S3ProfiledAuditIdentity(
+            profile_alias="demo-input",
+            relative_key="data.csv",
+            binding_fingerprint=s3_profiled_binding_fingerprint(
+                bucket="input-bucket",
+                executable_key="incoming/data.csv",
+                region_name="ap-southeast-1",
+                endpoint_url=None,
+            ),
+        )
+        assert identity.binding_fingerprint != s3_profiled_binding_fingerprint(
+            bucket="input-bucket",
+            executable_key="incoming/data.csv",
+            region_name="ap-southeast-1",
+            endpoint_url="https://attacker.example",
+        )
+
+        with pytest.raises(ValueError, match="custom endpoint"):
             source._bind_profiled_audit_identity(
                 identity,
                 audit_safe_config={
@@ -1043,6 +1081,7 @@ class TestAWSS3SourceAuditAndLifecycle:
                 bucket="input-bucket",
                 executable_key="incoming/data.csv",
                 region_name="ap-southeast-1",
+                endpoint_url=None,
             ),
         )
 

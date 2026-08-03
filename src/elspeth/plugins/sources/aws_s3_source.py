@@ -837,7 +837,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:7c64a5873af5b027"
+    source_file_hash: str | None = "sha256:99056bdf5f47905a"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -938,10 +938,13 @@ class AWSS3Source(BaseSource):
             raise ValueError("profiled S3 audit-safe config contains a private binding field")
         if safe_config.get("profile") != identity.profile_alias or safe_config.get("key") != identity.relative_key:
             raise ValueError("profiled S3 audit-safe config does not match its nominal identity")
+        if self._endpoint_url is not None:
+            raise ValueError("profiled S3 executable binding includes a custom endpoint")
         actual_binding_fingerprint = s3_profiled_binding_fingerprint(
             bucket=self._bucket,
             executable_key=self._key,
             region_name=self._region_name or "",
+            endpoint_url=self._endpoint_url,
         )
         if not hmac.compare_digest(identity.binding_fingerprint, actual_binding_fingerprint):
             raise ValueError("profiled S3 executable binding does not match its nominal identity")

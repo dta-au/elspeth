@@ -574,10 +574,12 @@ def build_validated_runtime_graph(
     The web wrapper always constructs under preflight mode. Lifecycle methods
     still run normally once the approved bundle reaches the orchestrator.
     """
-    bundle = instantiate_runtime_plugins(settings, plugin_snapshot=plugin_snapshot)
     profiled_s3_source = PluginId("source", "aws_s3") in _profiled_plugin_ids(plugin_snapshot)
-    if audit_safe_settings is not None and profiled_s3_source:
-        authored_sources = _authored_sources(audit_safe_settings)
+    if profiled_s3_source and audit_safe_settings is None:
+        raise ValueError("profiled S3 runtime requires audit-safe settings")
+    bundle = instantiate_runtime_plugins(settings, plugin_snapshot=plugin_snapshot)
+    if profiled_s3_source:
+        authored_sources = _authored_sources(cast(Mapping[str, Any], audit_safe_settings))
         bind_profiled_s3_source_audit_identities(
             bundle,
             authored_options_by_source={name: _authored_options(component) for name, component in authored_sources.items()},

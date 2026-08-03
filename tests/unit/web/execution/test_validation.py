@@ -2253,13 +2253,13 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
 
         assert result.is_valid is False
         assert _check(result, "operator_profile_options").passed is False
-        assert result.errors[0].error_code == "profile_unavailable"
+        assert result.errors[0].error_code == "aws_s3_endpoint_url_not_allowed"
         assert result.errors[0].component_id == "source"
         assert result.errors[0].component_type == "source"
-        assert "not authorable" in result.errors[0].message
+        assert "may not set endpoint_url" in result.errors[0].message
         assert self._ENDPOINT_SENTINEL not in result.errors[0].message
         assert result.readiness.execution_ready is False
-        assert result.readiness.blockers[0].code == "profile_unavailable"
+        assert result.readiness.blockers[0].code == "aws_s3_endpoint_url_not_allowed"
         assert result.readiness.blockers[0].component_id == "source"
         mock_yaml_gen.generate_yaml.assert_not_called()
         mock_load.assert_not_called()
@@ -2297,10 +2297,11 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         mock_load.assert_not_called()
         mock_instantiate.assert_not_called()
 
-    def test_aws_s3_source_requires_a_configured_operator_profile(self) -> None:
+    @pytest.mark.parametrize("source_options", [{}, {"endpoint_url": None}], ids=("omitted", "null-endpoint"))
+    def test_aws_s3_source_requires_a_configured_operator_profile(self, source_options: dict[str, object]) -> None:
         state = _make_state(
             source_plugin="aws_s3",
-            source_options={},
+            source_options=source_options,
             outputs=(_make_output(name="results"),),
         )
         settings = _make_settings()
@@ -2402,7 +2403,8 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
                 session_id="test-session",
             )
 
-        assert "not authorable" in result.errors[0].message
+        assert result.errors[0].error_code == "aws_s3_endpoint_url_not_allowed"
+        assert "may not set endpoint_url" in result.errors[0].message
         serialized_surfaces = (
             result.model_dump_json(),
             repr(result.checks),

@@ -725,6 +725,7 @@ class _S3SourceProfileResolver:
                     bucket=profile.bucket,
                     executable_key=executable_key,
                     region_name=self._region,
+                    endpoint_url=None,
                 ),
             ),
         )

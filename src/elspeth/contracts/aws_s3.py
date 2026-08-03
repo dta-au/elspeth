@@ -38,10 +38,17 @@ S3_PRIVATE_BINDING_OPTION_NAMES = frozenset(
 )
 
 
-def s3_profiled_binding_fingerprint(*, bucket: str, executable_key: str, region_name: str) -> str:
+def s3_profiled_binding_fingerprint(
+    *,
+    bucket: str,
+    executable_key: str,
+    region_name: str,
+    endpoint_url: str | None,
+) -> str:
     """Return the non-reversible identity of one exact operator-owned binding."""
     payload = {
         "bucket": bucket,
+        "endpoint_url": endpoint_url,
         "executable_key": executable_key,
         "region_name": region_name,
     }

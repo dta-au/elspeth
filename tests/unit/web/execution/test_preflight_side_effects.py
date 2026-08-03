@@ -315,6 +315,17 @@ def test_profiled_s3_runtime_uses_private_binding_only_for_boto_call(tmp_path: P
     identity = lowered.profiled_s3_audit_identity
     assert identity is not None
 
+    with (
+        patch.object(execution_preflight, "instantiate_runtime_plugins", wraps=instantiate_runtime_plugins) as instantiate,
+        pytest.raises(ValueError, match="requires audit-safe settings"),
+    ):
+        build_validated_runtime_graph(
+            settings,
+            plugin_snapshot=snapshot,
+            profiled_s3_audit_identities=(("primary", identity),),
+        )
+    instantiate.assert_not_called()
+
     with pytest.raises(KeyError, match="audit identities have no source"):
         build_validated_runtime_graph(
             settings,
@@ -402,6 +413,52 @@ def test_profiled_s3_runtime_uses_private_binding_only_for_boto_call(tmp_path: P
     assert private_bucket not in persisted_projection
     assert private_prefix not in persisted_projection
     assert executable_key not in persisted_projection
+
+
+def test_unprofiled_s3_runtime_without_audit_safe_carrier_retains_raw_cli_identity(tmp_path: Path) -> None:
+    import yaml
+
+    from elspeth.plugins.sources.aws_s3_source import AWSS3Source
+
+    output_path = tmp_path / "outputs" / "raw-s3.csv"
+    output_path.parent.mkdir(exist_ok=True)
+    raw_config = {
+        "sources": {
+            "primary": {
+                "plugin": "aws_s3",
+                "on_success": "output",
+                "options": {
+                    "bucket": "raw-cli-bucket",
+                    "key": "raw/records.csv",
+                    "region_name": "ap-southeast-1",
+                    "endpoint_url": "https://minio.operator.invalid",
+                    "format": "csv",
+                    "schema": {"mode": "observed"},
+                    "on_validation_failure": "discard",
+                },
+            }
+        },
+        "sinks": {
+            "output": {
+                "plugin": "csv",
+                "on_write_failure": "discard",
+                "options": {"path": str(output_path), "schema": {"mode": "observed"}},
+            }
+        },
+    }
+    settings = load_settings_from_yaml_string(yaml.safe_dump(raw_config))
+
+    runtime = build_validated_runtime_graph(
+        settings,
+        plugin_snapshot=PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service()),
+    )
+
+    source = runtime.plugin_bundle.sources["primary"]
+    assert isinstance(source, AWSS3Source)
+    assert source.config["bucket"] == "raw-cli-bucket"
+    assert source.config["key"] == "raw/records.csv"
+    assert source.config["endpoint_url"] == "https://minio.operator.invalid"
+    assert source._audit_object_identity() == {"bucket": "raw-cli-bucket", "key": "raw/records.csv"}
 
 
 def _external_plugin_probe_pipeline_yaml(tmp_path: Path) -> str:
