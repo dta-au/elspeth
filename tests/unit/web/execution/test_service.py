@@ -631,6 +631,37 @@ def _install_ready_proof_blob(
     return blob_service
 
 
+def _install_ready_proof_blobs(
+    service: ExecutionServiceImpl,
+    *,
+    session_id: UUID,
+    bindings: dict[UUID, Path],
+) -> MagicMock:
+    """Install multiple session-owned ready blobs for multi-source proof."""
+    records: dict[UUID, BlobRecord] = {}
+    verified: dict[UUID, tuple[bytes, str, int]] = {}
+    for blob_id, source_path in bindings.items():
+        content = source_path.read_bytes()
+        content_digest = hashlib.sha256(content).hexdigest()
+        records[blob_id] = _blob_record_stub(
+            blob_id=blob_id,
+            session_id=session_id,
+            filename=source_path.name,
+            mime_type="text/csv",
+            size_bytes=len(content),
+            content_hash=content_digest,
+            storage_path=str(source_path),
+            status="ready",
+        )
+        verified[blob_id] = (content[: 8 * 1024], content_digest, len(content))
+
+    blob_service = create_autospec(BlobServiceProtocol, instance=True)
+    blob_service.get_blob.side_effect = records.__getitem__
+    blob_service.read_blob_content_prefix_verified.side_effect = lambda blob_id, *, prefix_bytes: verified[blob_id]
+    service._blob_service = blob_service
+    return blob_service
+
+
 @pytest.fixture
 def mock_session_service() -> MagicMock:
     svc = create_autospec(SessionServiceProtocol, instance=True)
@@ -1503,6 +1534,191 @@ class TestExecutionFlow:
 
 
 class TestAuthoritativeProofDiagnostics:
+    @pytest.mark.asyncio
+    async def test_more_than_256_blob_sources_blocks_instead_of_partially_passing(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.composer.state import SourceSpec
+
+        base = _proof_gate_state(source_path=tmp_path / "source-0.csv", blob_id=uuid4())
+        sources = {
+            f"source_{index}": SourceSpec(
+                plugin="csv",
+                on_success=f"rows_{index}",
+                options={
+                    "path": str(tmp_path / f"source-{index}.csv"),
+                    "blob_ref": str(uuid4()),
+                    "schema": {"mode": "observed"},
+                },
+                on_validation_failure="discard",
+            )
+            for index in range(257)
+        }
+        state = replace(base, sources=sources, nodes=())
+        service._blob_service = None
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=uuid4())
+
+        assert result.is_valid is False
+        assert [error.error_code for error in result.errors] == ["source_inspection_failed"]
+
+    @pytest.mark.asyncio
+    async def test_observed_csv_numeric_gate_after_passthrough_is_rejected(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.composer.state import NodeSpec
+
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "passthrough-amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        direct_state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        gate = direct_state.nodes[0]
+        passthrough = NodeSpec(
+            id="retain_fields",
+            node_type="transform",
+            plugin="passthrough",
+            input="rows",
+            on_success="preserved_rows",
+            on_error=None,
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = replace(
+            direct_state,
+            nodes=(passthrough, replace(gate, input="preserved_rows")),
+        )
+        _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+
+    @pytest.mark.asyncio
+    async def test_second_observed_csv_source_feeding_numeric_gate_is_rejected(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.composer.state import SourceSpec
+
+        session_id = uuid4()
+        safe_blob_id = uuid4()
+        risky_blob_id = uuid4()
+        safe_path = tmp_path / "first-safe.csv"
+        risky_path = tmp_path / "second-risky.csv"
+        safe_path.write_text("label\nready\n", encoding="utf-8")
+        risky_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        risky_state = _proof_gate_state(source_path=risky_path, blob_id=risky_blob_id)
+        risky_source = replace(risky_state.sources["source"], on_success="risky_rows")
+        state = replace(
+            risky_state,
+            sources={
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="safe_rows",
+                    options={
+                        "path": str(safe_path),
+                        "blob_ref": str(safe_blob_id),
+                        "schema": {"mode": "observed"},
+                    },
+                    on_validation_failure="discard",
+                ),
+                "risky": risky_source,
+            },
+            nodes=(replace(risky_state.nodes[0], input="risky_rows"),),
+        )
+        blob_service = _install_ready_proof_blobs(
+            service,
+            session_id=session_id,
+            bindings={safe_blob_id: safe_path, risky_blob_id: risky_path},
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+        assert blob_service.read_blob_content_prefix_verified.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_sources_sharing_blob_evaluate_both_topologies_with_one_verified_read(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "shared-amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        base = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        base_source = base.sources["source"]
+        base_gate = base.nodes[0]
+        state = replace(
+            base,
+            sources={
+                "orders": replace(base_source, on_success="order_rows"),
+                "refunds": replace(base_source, on_success="refund_rows"),
+            },
+            nodes=(
+                replace(base_gate, id="order_gate", input="order_rows"),
+                replace(base_gate, id="refund_gate", input="refund_rows"),
+            ),
+        )
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert [error.component_id for error in result.errors] == ["order_gate", "refund_gate"]
+        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
+            blob_id,
+            prefix_bytes=8 * 1024,
+        )
+
     @pytest.mark.asyncio
     async def test_validate_state_rejects_observed_csv_numeric_gate_after_canonical_core(
         self,

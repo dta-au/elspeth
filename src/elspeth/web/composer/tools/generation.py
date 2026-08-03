@@ -33,7 +33,7 @@ from elspeth.plugins.transforms.llm.model_catalog import (
 )
 from elspeth.web.blobs.protocol import BlobIntegrityError
 from elspeth.web.catalog.protocol import PluginKind
-from elspeth.web.composer._producer_resolver import ProducerResolver, is_source_producer_id
+from elspeth.web.composer._producer_resolver import ProducerResolver, is_source_producer_id, source_producer_id
 from elspeth.web.composer.source_inspection import (
     SourceInspectionFacts,
     derive_extra_column_risk,
@@ -1567,6 +1567,7 @@ _BLOCKING_DIAGNOSTIC_CODES: Final[frozenset[str]] = frozenset(
         "source_inspection_failed",
     }
 )
+_MAX_PROOF_BLOB_SOURCES: Final[int] = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -1778,13 +1779,14 @@ def _row_fields_referenced_by_condition(condition: str) -> tuple[str, ...]:
 
 def _gate_expression_type_diagnostics_for_observed_csv(
     state: CompositionState,
+    source_name: str,
     source: SourceSpec,
     *,
     blob_id: str,
     filename: str,
     content: bytes,
 ) -> list[Mapping[str, Any]]:
-    """Evaluate direct source-fed gates against sampled observed CSV rows.
+    """Evaluate provably field-preserving source-fed gates against sampled rows.
 
     Observed CSV sources emit raw strings because there are no declared field
     types to coerce against. A gate such as ``row['amount'] >= 1000`` is
@@ -1801,17 +1803,25 @@ def _gate_expression_type_diagnostics_for_observed_csv(
         return []
 
     diagnostics: list[Mapping[str, Any]] = []
-    direct_gate_nodes = (
-        node for node in state.nodes if node.node_type == "gate" and node.input == source.on_success and node.condition is not None
-    )
-    for node in direct_gate_nodes:
+    gate_nodes = (node for node in state.nodes if node.node_type == "gate" and node.condition is not None)
+    for node in gate_nodes:
         condition = node.condition
         if condition is None:
             continue
         if _validate_gate_expression(condition) is not None:
             continue
-        parser = ExpressionParser(condition)
         fields = _row_fields_referenced_by_condition(condition)
+        if not fields or not all(
+            _source_field_reaches_connection_without_type_change(
+                state,
+                node.input,
+                source_name=source_name,
+                field_name=field_name,
+            )
+            for field_name in fields
+        ):
+            continue
+        parser = ExpressionParser(condition)
         field = fields[0] if fields else None
         for row_index, row in enumerate(rows):
             try:
@@ -1877,6 +1887,7 @@ def _source_field_reaches_connection_without_type_change(
     state: CompositionState,
     connection_name: str,
     *,
+    source_name: str,
     field_name: str,
 ) -> bool:
     """Return True when a source field flows to a connection unchanged.
@@ -1902,7 +1913,7 @@ def _source_field_reaches_connection_without_type_change(
         if producer is None:
             return False
         if is_source_producer_id(producer.producer_id):
-            return True
+            return producer.producer_id == source_producer_id(source_name)
 
         node = resolver.get_node(producer.producer_id)
         if node is None:
@@ -1921,6 +1932,7 @@ def _source_field_reaches_connection_without_type_change(
 
 def _numeric_aggregation_diagnostics_for_observed_csv(
     state: CompositionState,
+    source_name: str,
     source: SourceSpec,
     *,
     blob_id: str,
@@ -1947,7 +1959,12 @@ def _numeric_aggregation_diagnostics_for_observed_csv(
         value_field = value_field.strip()
         if value_field not in observed_header_set:
             continue
-        if not _source_field_reaches_connection_without_type_change(state, node.input, field_name=value_field):
+        if not _source_field_reaches_connection_without_type_change(
+            state,
+            node.input,
+            source_name=source_name,
+            field_name=value_field,
+        ):
             continue
 
         # ``inferred_types`` is our own Tier-2 derived inspection output. When
@@ -1994,14 +2011,15 @@ def _numeric_aggregation_diagnostics_for_observed_csv(
     return diagnostics
 
 
-def compute_proof_diagnostics(
+def _compute_proof_diagnostics_for_source(
     state: CompositionState,
     *,
-    session_engine: Engine | None = None,
-    session_id: str | None = None,
-    blob_resolver: Callable[[str], ResolvedProofBlob | None] | None = None,
+    source_name: str,
+    source: SourceSpec,
+    blob_id: object,
+    blob_resolver: Callable[[str], ResolvedProofBlob | None],
 ) -> list[Mapping[str, Any]]:
-    """Compute machine-readable proof diagnostics for a composer state.
+    """Compute machine-readable proof diagnostics for one blob-backed source.
 
     Promotes ``preview_pipeline`` from a "state validates" check into a
     "state is plausibly runnable against observed input" proof. Returns a
@@ -2032,8 +2050,8 @@ def compute_proof_diagnostics(
         content is a single URL but no web_scrape node downstream. The
         URL string itself reaches sinks instead of the URL's content.
       * ``gate_expression_type_mismatch_against_source_schema`` — observed
-        CSV source values are still strings, and a direct source-fed gate
-        condition fails when evaluated against sampled rows before runtime.
+        CSV source values are still strings, and a gate reached through a
+        provably field-preserving path fails against sampled rows before runtime.
       * ``aggregation_numeric_value_field_type_mismatch_against_source_schema`` —
         observed CSV strings flow unchanged into a numeric aggregation
         ``value_field`` before runtime can reject the batch.
@@ -2041,47 +2059,10 @@ def compute_proof_diagnostics(
         ``inspect_blob_content`` is mirrored here at ``info`` severity
         so the model sees them in the same array as blocking issues.
 
-    Bounded I/O: at most one blob read per call, bounded by
+    Bounded I/O: exactly one attempted blob resolution per call, bounded by
     ``inspect_blob_content``'s 8 KiB / 100 row caps.
-
-    No-op (returns an empty list) if the source is not blob-backed or
-    if no session-scoped blob resolver is available. Composer callers supply
-    ``session_engine``/``session_id``; authoritative execution supplies an
-    already-custody-checked ``blob_resolver`` so this detector does not own a
-    second persistence implementation.
     """
     diagnostics: list[Mapping[str, Any]] = []
-
-    source = state.sources["source"] if "source" in state.sources else None
-    blob_id: Any | None = None
-    if source is not None and "blob_ref" in source.options:
-        blob_id = source.options["blob_ref"]
-    if blob_id is None:
-        for candidate_source in state.sources.values():
-            if "blob_ref" in candidate_source.options:
-                source = candidate_source
-                blob_id = candidate_source.options["blob_ref"]
-                break
-    if source is None:
-        return diagnostics
-
-    # Only blob-backed sources are inspectable from preview_pipeline; for
-    # path-based sources we have no bytes to peek at. ``source.options`` is
-    # composer/user-authored config re-read from persisted session state —
-    # Tier-3 origin, so the absence of a ``blob_ref`` is recorded as ``None``
-    # (membership form, not ``.get``) and the caller treats None as "not
-    # blob-backed", returning the empty diagnostics list.
-    blob_id = source.options["blob_ref"] if "blob_ref" in source.options else None
-    if blob_id is None or session_id is None:
-        return diagnostics
-
-    if blob_resolver is None:
-        if session_engine is None:
-            return diagnostics
-
-        def blob_resolver(resolved_blob_id: str) -> ResolvedProofBlob | None:
-            metadata = _sync_get_blob(session_engine, resolved_blob_id, session_id)
-            return None if metadata is None else ResolvedProofBlob(metadata=metadata)
 
     resolved_blob = blob_resolver(str(blob_id))
     blob = None if resolved_blob is None else resolved_blob.metadata
@@ -2316,6 +2297,7 @@ def compute_proof_diagnostics(
         diagnostics.extend(
             _gate_expression_type_diagnostics_for_observed_csv(
                 state,
+                source_name,
                 source,
                 blob_id=str(blob_id),
                 filename=blob["filename"],
@@ -2325,6 +2307,7 @@ def compute_proof_diagnostics(
         diagnostics.extend(
             _numeric_aggregation_diagnostics_for_observed_csv(
                 state,
+                source_name,
                 source,
                 blob_id=str(blob_id),
                 inferred_types=facts.inferred_types,
@@ -2422,64 +2405,88 @@ def compute_proof_diagnostics(
             }
         )
 
-    inspected_blob_id = str(blob_id)
-    node_plugins = {(n.plugin or "").lower() for n in state.nodes}
-    if "web_scrape" not in node_plugins:
-        for source_name, candidate_source in state.sources.items():
-            if "blob_ref" not in candidate_source.options:
-                continue
-            candidate_blob_id = str(candidate_source.options["blob_ref"])
-            if candidate_blob_id == inspected_blob_id:
-                continue
-            if candidate_source.plugin != "text":
-                continue
-            candidate_resolved_blob = blob_resolver(candidate_blob_id)
-            candidate_blob = None if candidate_resolved_blob is None else candidate_resolved_blob.metadata
-            if candidate_blob is None or candidate_blob["status"] != "ready":
-                continue
-            assert candidate_resolved_blob is not None
-            if candidate_resolved_blob.verified_prefix is None:
-                candidate_storage_path = Path(candidate_blob["storage_path"])
-                if not candidate_storage_path.exists():
-                    continue
-                candidate_content = candidate_storage_path.read_bytes()
-                _verify_blob_content_integrity(candidate_blob, candidate_content)
-                candidate_total_size_bytes = len(candidate_content)
-            else:
-                candidate_content = candidate_resolved_blob.verified_prefix
-                assert candidate_resolved_blob.total_size_bytes is not None
-                candidate_total_size_bytes = candidate_resolved_blob.total_size_bytes
-            candidate_facts = inspect_blob_content(
-                content=candidate_content,
-                filename=candidate_blob["filename"],
-                mime_type=candidate_blob["mime_type"],
-                content_hash=candidate_blob["content_hash"],
-                total_size_bytes=candidate_total_size_bytes,
-            )
-            if candidate_facts.source_kind != "text" or not candidate_facts.url_candidates:
-                continue
-            diagnostics.append(
-                _blocking_diagnostic(
-                    code="text_source_url_without_web_scrape",
-                    message=(
-                        f"Source blob contains URL(s) {list(candidate_facts.url_candidates)} but no "
-                        "web_scrape transform is wired downstream. The URL string itself will "
-                        "flow to sinks, not the URL's content."
-                    ),
-                    suggested_repair=(
-                        "upsert_node({node_type: 'transform', plugin: 'web_scrape', "
-                        "input: <source on_success>, options: {url_field: '<column>'}}) and route "
-                        "the source on_success to it."
-                    ),
-                    evidence_locator={
-                        "source": "blob",
-                        "source_name": source_name,
-                        "blob_id": candidate_blob_id,
-                        "url_candidates": list(candidate_facts.url_candidates),
-                    },
-                )
-            )
+    return diagnostics
 
+
+def _attribute_proof_diagnostic_to_source(
+    diagnostic: Mapping[str, Any],
+    *,
+    source_name: str,
+) -> Mapping[str, Any]:
+    """Attach the authored source identity to one detector-owned diagnostic."""
+    evidence = diagnostic["evidence_locator"]
+    if not isinstance(evidence, Mapping):
+        raise RuntimeError("proof diagnostic evidence_locator must be a mapping")
+    return {
+        **diagnostic,
+        "evidence_locator": {**evidence, "source_name": source_name},
+    }
+
+
+def compute_proof_diagnostics(
+    state: CompositionState,
+    *,
+    session_engine: Engine | None = None,
+    session_id: str | None = None,
+    blob_resolver: Callable[[str], ResolvedProofBlob | None] | None = None,
+) -> list[Mapping[str, Any]]:
+    """Inspect every blob-backed source within the authored-source proof cap.
+
+    Each source gets an independent custody resolution and bounded 8 KiB
+    inspection. Pipelines above the explicit cap block deterministically rather
+    than silently marking a partially inspected topology as proof-passed.
+    Composer callers supply ``session_engine``/``session_id``; authoritative
+    execution supplies the BlobService-backed ``blob_resolver``.
+    """
+    if session_id is None:
+        return []
+    effective_resolver = blob_resolver
+    if effective_resolver is None:
+        if session_engine is None:
+            return []
+
+        def _resolve_from_composer_store(resolved_blob_id: str) -> ResolvedProofBlob | None:
+            metadata = _sync_get_blob(session_engine, resolved_blob_id, session_id)
+            return None if metadata is None else ResolvedProofBlob(metadata=metadata)
+
+        effective_resolver = _resolve_from_composer_store
+
+    blob_sources: list[tuple[str, SourceSpec, object]] = []
+    for source_name, source in state.sources.items():
+        blob_id = source.options["blob_ref"] if "blob_ref" in source.options else None
+        if blob_id is not None:
+            blob_sources.append((source_name, source, blob_id))
+
+    if len(blob_sources) > _MAX_PROOF_BLOB_SOURCES:
+        return [
+            _blocking_diagnostic(
+                code="source_inspection_failed",
+                message=(
+                    f"Pipeline has {len(blob_sources)} blob-backed sources, exceeding the bounded proof "
+                    f"limit of {_MAX_PROOF_BLOB_SOURCES}; no partial proof was admitted."
+                ),
+                suggested_repair=(
+                    f"Reduce the pipeline to at most {_MAX_PROOF_BLOB_SOURCES} blob-backed sources or partition "
+                    "it into separately validated pipelines, then re-run preview_pipeline."
+                ),
+                evidence_locator={
+                    "source": "pipeline",
+                    "blob_source_count": len(blob_sources),
+                    "max_blob_sources": _MAX_PROOF_BLOB_SOURCES,
+                },
+            )
+        ]
+
+    diagnostics: list[Mapping[str, Any]] = []
+    for source_name, source, blob_id in blob_sources:
+        source_diagnostics = _compute_proof_diagnostics_for_source(
+            state,
+            source_name=source_name,
+            source=source,
+            blob_id=blob_id,
+            blob_resolver=effective_resolver,
+        )
+        diagnostics.extend(_attribute_proof_diagnostic_to_source(diagnostic, source_name=source_name) for diagnostic in source_diagnostics)
     return diagnostics
 
 

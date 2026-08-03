@@ -777,18 +777,26 @@ class ExecutionServiceImpl:
                 expected_paths_by_blob_id[raw_blob_id] = set()
             expected_paths_by_blob_id[raw_blob_id].update(paths)
 
+        resolved_by_blob_id: dict[str, ResolvedProofBlob | None] = {}
+
         def _resolve(blob_id: str) -> ResolvedProofBlob | None:
+            if blob_id in resolved_by_blob_id:
+                return resolved_by_blob_id[blob_id]
             if self._blob_service is None or session_id is None or blob_id not in expected_paths_by_blob_id:
+                resolved_by_blob_id[blob_id] = None
                 return None
             try:
                 parsed_blob_id = UUID(blob_id)
             except ValueError:
+                resolved_by_blob_id[blob_id] = None
                 return None
             if str(parsed_blob_id) != blob_id:
+                resolved_by_blob_id[blob_id] = None
                 return None
             try:
                 record = self._call_async(self._blob_service.get_blob(parsed_blob_id))
             except BlobNotFoundError:
+                resolved_by_blob_id[blob_id] = None
                 return None
             if type(record) is not BlobRecord:
                 raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
@@ -798,6 +806,7 @@ class ExecutionServiceImpl:
                 or record.status != "ready"
                 or expected_paths_by_blob_id[blob_id] != {record.storage_path}
             ):
+                resolved_by_blob_id[blob_id] = None
                 return None
             metadata = cast(
                 BlobToolRecord,
@@ -827,12 +836,14 @@ class ExecutionServiceImpl:
                     prefix_bytes=8 * 1024,
                 )
             )
-            return ResolvedProofBlob(
+            resolved = ResolvedProofBlob(
                 metadata=metadata,
                 verified_prefix=verified_prefix,
                 verified_content_hash=verified_content_hash,
                 total_size_bytes=total_size_bytes,
             )
+            resolved_by_blob_id[blob_id] = resolved
+            return resolved
 
         return _resolve
 
