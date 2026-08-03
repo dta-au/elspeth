@@ -536,6 +536,53 @@ def test_bind_rejects_selected_node_identity_replacement() -> None:
         )
 
 
+def test_bind_rejects_selected_gate_replaced_with_passthrough_transform() -> None:
+    predecessor = _correction_predecessor()
+    candidate = _planner_correction_candidate()
+    selected = candidate["nodes"][0]
+    selected.update(
+        {
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "on_success": "high_value",
+            "on_error": "discard",
+            "condition": None,
+            "routes": None,
+            "options": {},
+        }
+    )
+
+    with pytest.raises(AuditIntegrityError, match="selected predecessor node type or plugin"):
+        bind_guided_reviewed_components(
+            candidate,
+            _guided(),
+            predecessor=predecessor,
+            correction_target=_node_correction_target(
+                "amount_gate",
+                stable_id="66666666-6666-4666-8666-666666666666",
+            ),
+        )
+
+
+def test_bind_rejects_selected_transform_plugin_substitution() -> None:
+    predecessor = _correction_predecessor()
+    candidate = _planner_correction_candidate()
+    selected = candidate["nodes"][1]
+    selected["plugin"] = "passthrough"
+    selected["options"] = {}
+
+    with pytest.raises(AuditIntegrityError, match="selected predecessor node type or plugin"):
+        bind_guided_reviewed_components(
+            candidate,
+            _guided(),
+            predecessor=predecessor,
+            correction_target=_node_correction_target(
+                "summarize_standard",
+                stable_id="55555555-5555-4555-8555-555555555555",
+            ),
+        )
+
+
 def test_bind_does_not_accept_planner_override_of_unselected_withheld_fields() -> None:
     predecessor = _correction_predecessor()
     candidate = _planner_correction_candidate()

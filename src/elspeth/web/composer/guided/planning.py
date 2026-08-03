@@ -900,6 +900,10 @@ def bind_guided_reviewed_components(
             candidate_node = raw_nodes[position]
             if type(candidate_node) is not dict or type(candidate_node.get("options")) is not dict:
                 raise AuditIntegrityError("guided planner selected node options are malformed")
+            if candidate_node.get("node_type") != private_node.get("node_type") or candidate_node.get("plugin") != private_node.get(
+                "plugin"
+            ):
+                raise AuditIntegrityError("guided planner candidate changed selected predecessor node type or plugin")
             private_options = cast(dict[str, Any], deep_thaw(private_node["options"]))
             candidate_options = cast(dict[str, Any], candidate_node["options"])
             for key in public_node_option_keys(cast(str | None, private_node.get("plugin"))):
