@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
+from typing import Literal
 from uuid import UUID
 
 import httpx
@@ -1437,6 +1438,27 @@ def _create_app(
 
     _handler_slog = structlog.get_logger()
 
+    def _log_correlation_warning(
+        event: Literal["http_error_envelope", "http_validation_error_envelope"],
+        *,
+        status_code: int,
+        request_id: str,
+    ) -> None:
+        """Emit bounded lookup evidence without replacing the HTTP response.
+
+        These events are operational logging, the recovery channel of last
+        resort, while the already-classified and redacted HTTP response is the
+        primary outcome. A logging-backend failure therefore cannot be allowed
+        to turn a deterministic 4xx response into an unrelated 500. There is
+        no safe secondary logger to report a failure of the logger itself.
+        """
+        with contextlib.suppress(Exception):
+            _handler_slog.warning(
+                event,
+                status_code=status_code,
+                request_id=request_id,
+            )
+
     def _request_id(request: Request) -> str:
         """Read the correlation id set by RequestIdMiddleware.
 
@@ -1592,7 +1614,7 @@ def _create_app(
         # request body, URL, identity, or exception into this event. Even the
         # response-safe ``loc``/``msg`` fields are unnecessary for finding the
         # user-reported id and would enlarge the log trust surface.
-        _handler_slog.warning(
+        _log_correlation_warning(
             "http_validation_error_envelope",
             status_code=422,
             request_id=request_id,
@@ -1619,9 +1641,12 @@ def _create_app(
     # Rendering itself is still delegated to FastAPI's handler, which owns
     # the bodiless-status (204/304) and ``headers`` behaviour.
     #
-    # Only dict details are touched. A bare ``detail="..."`` string is a
-    # plain-language message, not an envelope; wrapping it would change the
-    # response contract of every string raise site in the app.
+    # Only dict details are touched. The middleware-issued id is authoritative
+    # and overwrites any route-provided body value, which has not crossed the
+    # middleware's grammar/length validation and could otherwise split body,
+    # header, and log correlation. A bare ``detail="..."`` string is a plain-
+    # language message, not an envelope; wrapping it would change the response
+    # contract of every string raise site in the app.
     @app.exception_handler(StarletteHTTPException)
     async def handle_http_exception(request: Request, exc: StarletteHTTPException) -> Response:
         # Starlette narrows ``detail`` to ``str``; FastAPI's subclass widens it
@@ -1635,13 +1660,11 @@ def _create_app(
         # One bounded lookup event for every structured HTTP error envelope.
         # The request id has already crossed the middleware's closed grammar;
         # no envelope fields or other request-derived values belong here.
-        _handler_slog.warning(
+        _log_correlation_warning(
             "http_error_envelope",
             status_code=exc.status_code,
             request_id=request_id,
         )
-        if "request_id" in detail:
-            return await fastapi_http_exception_handler(request, exc)
         correlated = HTTPException(
             status_code=exc.status_code,
             detail={**detail, "request_id": request_id},

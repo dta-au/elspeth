@@ -6,6 +6,7 @@ import errno
 import json
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException, Request
@@ -302,9 +303,10 @@ class TestHTTPExceptionRequestIdEnvelope:
     user could quote back.
 
     The fix is ONE boundary rather than N routes: an app-level
-    ``HTTPException`` handler injects ``request.state.request_id`` into
-    any dict detail that does not already carry one, then delegates to
-    FastAPI's default rendering. String details are untouched — a bare
+    ``HTTPException`` handler writes the authoritative
+    ``request.state.request_id`` into every dict detail, replacing any
+    pre-correlated value, then delegates to FastAPI's default rendering.
+    String details are untouched — a bare
     ``detail="..."`` is a plain-language message, not an envelope, and
     wrapping it would change the client contract of ~200 raise sites.
     """
@@ -396,8 +398,8 @@ class TestHTTPExceptionRequestIdEnvelope:
         assert not [log for log in logs if log["event"] == "http_error_envelope"]
 
     @pytest.mark.asyncio
-    async def test_an_envelope_that_already_carries_a_request_id_is_not_overwritten(self, tmp_path: Path) -> None:
-        """A route that sourced its own id keeps it — the boundary only fills gaps."""
+    async def test_middleware_request_id_overwrites_a_pre_correlated_envelope(self, tmp_path: Path) -> None:
+        """The middleware id is authoritative across body, header, and log."""
         app = create_app(_settings(tmp_path))
         handler = app.exception_handlers[StarletteHTTPException]
 
@@ -407,7 +409,7 @@ class TestHTTPExceptionRequestIdEnvelope:
                 HTTPException(status_code=500, detail={"error_type": "x", "request_id": "req-from-route"}),
             )
 
-        assert json.loads(response.body)["detail"]["request_id"] == "req-from-route"
+        assert json.loads(response.body)["detail"]["request_id"] == "req-from-middleware"
         assert logs == [
             {
                 "event": "http_error_envelope",
@@ -416,6 +418,30 @@ class TestHTTPExceptionRequestIdEnvelope:
                 "status_code": 500,
             }
         ]
+
+    @pytest.mark.asyncio
+    async def test_dict_detail_response_survives_a_warning_sink_failure(self, tmp_path: Path) -> None:
+        """Operational correlation logging cannot replace the primary 422."""
+        with patch("elspeth.web.app.structlog.get_logger") as get_logger:
+            get_logger.return_value.warning.side_effect = RuntimeError("logging backend unavailable")
+            app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+
+        response = await handler(
+            _audit_request("req-log-failure-1"),
+            HTTPException(status_code=422, detail={"error_type": "convergence"}),
+        )
+
+        assert response.status_code == 422
+        assert json.loads(response.body)["detail"] == {
+            "error_type": "convergence",
+            "request_id": "req-log-failure-1",
+        }
+        get_logger.return_value.warning.assert_called_once_with(
+            "http_error_envelope",
+            status_code=422,
+            request_id="req-log-failure-1",
+        )
 
     @pytest.mark.asyncio
     async def test_response_headers_survive_the_rewrap(self, tmp_path: Path) -> None:
@@ -541,6 +567,52 @@ class TestHTTPExceptionRequestIdEnvelope:
             }
         ]
 
+    @pytest.mark.parametrize(
+        "pre_correlated",
+        [
+            pytest.param("different-safe-id", id="mismatch"),
+            pytest.param("unsafe|body-id", id="unsafe-characters"),
+            pytest.param("A" * (MAX_REQUEST_ID_LENGTH + 1), id="oversized"),
+        ],
+    )
+    def test_middleware_id_replaces_pre_correlated_body_id_end_to_end(
+        self,
+        tmp_path: Path,
+        pre_correlated: str,
+    ) -> None:
+        """A route cannot split or poison the bounded request correlation key."""
+        app = create_app(_settings(tmp_path))
+
+        @app.get("/api/_probe/pre-correlated-error")
+        async def _probe_pre_correlated_error() -> None:
+            raise HTTPException(
+                status_code=422,
+                detail={"error_type": "convergence", "request_id": pre_correlated},
+            )
+
+        app.router.routes.insert(0, app.router.routes.pop())
+        client = SyncASGITestClient(app)
+
+        with capture_logs() as logs:
+            response = client.get(
+                "/api/_probe/pre-correlated-error",
+                headers={"X-Request-ID": "middleware-authority"},
+            )
+
+        request_id = response.json()["detail"]["request_id"]
+        assert request_id == "middleware-authority"
+        assert response.headers["X-Request-ID"] == request_id
+        assert pre_correlated not in response.text
+        events = [log for log in logs if log["event"] == "http_error_envelope"]
+        assert events == [
+            {
+                "event": "http_error_envelope",
+                "log_level": "warning",
+                "request_id": request_id,
+                "status_code": 422,
+            }
+        ]
+
 
 @pytest.mark.asyncio
 async def test_run_already_active_error_handler_returns_correlated_409(tmp_path: Path) -> None:
@@ -575,9 +647,10 @@ async def test_every_composer_error_envelope_carries_a_request_id(tmp_path: Path
     remembers to write it a dedicated test.
 
     The two validation handlers are excluded by construction, not by
-    oversight: their 422 bodies are lists of field errors with no
-    ``error_type`` discriminator, and neither is a composer envelope. The
-    ``HTTPException`` boundary is excluded because it is the injector.
+    oversight: their 422 bodies carry a top-level ``request_id`` beside a list
+    of field errors but have no ``error_type`` discriminator, so neither is a
+    composer envelope. The ``HTTPException`` boundary is excluded because it
+    is the injector.
     """
     app = create_app(_settings(tmp_path))
     cases: list[tuple[type[Exception], Exception]] = [

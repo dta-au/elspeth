@@ -2558,6 +2558,34 @@ class TestValidationErrorRedaction:
         for error in body["detail"]:
             assert set(error.keys()) <= self._SAFE_KEYS
 
+    def test_validation_response_survives_a_warning_sink_failure(self, tmp_path: Path) -> None:
+        """Operational correlation logging cannot replace the primary 422."""
+        with patch("elspeth.web.app.structlog.get_logger") as get_logger:
+            get_logger.return_value.warning.side_effect = RuntimeError("logging backend unavailable")
+            app = create_app(_settings(tmp_path))
+
+        from elspeth.web.auth.middleware import get_current_user
+        from elspeth.web.auth.models import UserIdentity
+
+        async def _mock_user() -> UserIdentity:
+            return UserIdentity(user_id="test-user", username="test-user")
+
+        app.dependency_overrides[get_current_user] = _mock_user
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/api/secrets",
+            headers={"X-Request-ID": "trace-validation-log-failure"},
+            json={"name": "API_KEY", "value": {"bad": "type"}},
+        )
+
+        assert resp.status_code == 422
+        assert resp.json()["request_id"] == "trace-validation-log-failure"
+        get_logger.return_value.warning.assert_called_once_with(
+            "http_validation_error_envelope",
+            status_code=422,
+            request_id="trace-validation-log-failure",
+        )
+
     def test_redaction_preserves_error_structure(self, tmp_path) -> None:
         """Redacted errors retain type, loc, msg for client debugging."""
         client = self._authed_client(tmp_path)
