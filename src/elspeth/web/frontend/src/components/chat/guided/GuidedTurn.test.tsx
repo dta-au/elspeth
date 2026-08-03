@@ -382,7 +382,7 @@ describe("GuidedTurn dispatcher — onSubmit forwarding", () => {
     );
 
     await user.type(screen.getByLabelText("What should change?"), "Change the source route.");
-    await user.click(screen.getByRole("button", { name: "Re-plan wiring" }));
+    await user.click(screen.getByRole("button", { name: "Edit component settings" }));
 
     expect(onSubmit).toHaveBeenCalledTimes(1);
     expect(onSubmit).toHaveBeenCalledWith({

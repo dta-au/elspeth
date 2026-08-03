@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
 from elspeth.contracts.errors import AuditIntegrityError
@@ -2753,6 +2753,121 @@ async def post_guided_respond(
                 raise HTTPException(status_code=409, detail="edit_target does not identify a current wire component")
             raise AuditIntegrityError("guided wire correction target changed after reservation")
 
+    async def _rewind_reviewed_component_form(
+        *,
+        state: CompositionState,
+        state_record: CompositionStateRecord,
+        guided: GuidedSession,
+        component_target: ComponentTarget,
+        reviewed_facts: dict[str, object],
+        prepared_response: PreparedGuidedJsonPayload,
+        origin: Literal["proposal_review", "wire_review"],
+        correction_feedback: str | None = None,
+    ) -> GuidedRespondResponse:
+        """Reuse the atomic proposal back-edit seam from either review stage."""
+
+        active = guided.active_proposal
+        if active is None:
+            raise AuditIntegrityError("guided component back-edit lost its active proposal")
+        if origin == "proposal_review":
+            origin_step = GuidedStep.STEP_3_TRANSFORMS
+            origin_turn_type = TurnType.PROPOSE_PIPELINE
+            answered_summary = "Guided pipeline proposal revision requested."
+        else:
+            origin_step = GuidedStep.STEP_4_WIRE
+            origin_turn_type = TurnType.CONFIRM_WIRING
+            answered_summary = "Guided pipeline wiring component edit requested."
+        if guided.step is not origin_step:
+            raise AuditIntegrityError("guided component back-edit origin changed after reservation")
+        target_step = GuidedStep.STEP_1_SOURCE if component_target.kind == "source" else GuidedStep.STEP_2_SINK
+        answered = _replace(
+            guided.history[-1],
+            response_hash=prepared_response.payload_id,
+            summary=answered_summary,
+        )
+        rewound_guided = _replace(
+            guided,
+            step=target_step,
+            history=(*guided.history[:-1], answered),
+            active_proposal=None,
+            active_edit_target=component_target,
+        )
+        rewound_state = _replace(state, guided_session=rewound_guided)
+        edit_turn = _build_get_guided_turn(rewound_state, rewound_guided, catalog=catalog)
+        if edit_turn is None:
+            raise AuditIntegrityError("guided proposal component back-edit did not produce an edit form")
+        edit_turn = _finalize_guided_turn(edit_turn, shield_available=shield_available)
+        rewound_guided, _edit_record, edit_turn_type, prepared_edit = _prepare_server_turn_occurrence(
+            rewound_guided,
+            current_step=target_step,
+            turn=edit_turn,
+            payload_store=payload_store,
+        )
+        if edit_turn_type is not TurnType.SCHEMA_FORM:
+            raise AuditIntegrityError("guided proposal component back-edit must produce a schema form")
+        rewound_state = _replace(state, guided_session=rewound_guided)
+        state_dict = rewound_state.to_dict()
+        rewind_state_data = CompositionStateData(
+            sources=state_dict["sources"],
+            nodes=state_dict["nodes"],
+            edges=state_dict["edges"],
+            outputs=state_dict["outputs"],
+            metadata_=state_dict["metadata"],
+            is_valid=state_record.is_valid,
+            validation_errors=state_record.validation_errors,
+            composer_meta={"guided_session": rewound_guided.to_dict()},
+        )
+        emit_turn_answered(
+            recorder,
+            step=origin_step,
+            turn_type=origin_turn_type,
+            response_hash=prepared_response.payload_id,
+            response_payload_id=prepared_response.payload_id,
+            control_signal=None,
+            composition_version=state.version,
+            actor=user.user_id,
+        )
+        emit_turn_emitted(
+            recorder,
+            step=target_step,
+            turn_type=TurnType.SCHEMA_FORM,
+            payload_hash=prepared_edit.payload_id,
+            payload_payload_id=prepared_edit.payload_id,
+            emitter="server",
+            composition_version=state.version,
+            actor=user.user_id,
+        )
+        rewind_response = GuidedResponseDescriptor(
+            kind="guided_respond",
+            next_turn=GuidedReplayTurn(
+                turn_type=TurnType.SCHEMA_FORM,
+                step_index=0 if component_target.kind == "source" else 1,
+                payload_id=prepared_edit.payload_id,
+            ),
+            assistant_turn_seq=None,
+        )
+        rewound = await service.back_edit_guided_pipeline_proposal(
+            GuidedPipelineProposalBackEditCommand(
+                fence=fence,
+                expected_current_state_id=state_record.id,
+                expected_current_state_version=state_record.version,
+                expected_current_content_hash=composition_content_hash(state),
+                proposal_id=active.proposal_id,
+                draft_hash=active.draft_hash,
+                reviewed_facts=reviewed_facts,
+                edit_target=component_target,
+                state=rewind_state_data,
+                actor="composer_route",
+                response=rewind_response,
+                payloads=(prepared_response, prepared_edit),
+                origin=origin,
+                correction_feedback=correction_feedback,
+                audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
+            ),
+            payload_store=payload_store,
+        )
+        return _response_from_record(rewound.result_state)
+
     async def _preflight_attempt(attempt_stable_id: UUID) -> tuple[SourceInspectionFacts | None, SourceInspectionFacts | None, bool]:
         observed = await service.get_current_state(session_id)
         observed_state = _state_from_record(observed) if observed is not None else _initial_composition_state_with_guided_session()
@@ -2902,7 +3017,8 @@ async def post_guided_respond(
                         status_code=409,
                         detail="Guided wiring still has unresolved retained instructions.",
                     )
-            return None, None, is_correction
+            requires_planner = is_correction and body.edit_target is not None and body.edit_target.kind in {"node", "edge"}
+            return None, None, requires_planner
         if not is_active_exit and observed_guided.step not in {GuidedStep.STEP_1_SOURCE, GuidedStep.STEP_2_SINK}:
             raise _schema8_unsupported_stage(observed_guided.step)
         prospective, current_turn, _prepared_current = _schema8_prospective_occurrence(
@@ -3470,87 +3586,15 @@ async def post_guided_respond(
                                     kind=body.edit_target.kind,
                                     stable_id=body.edit_target.stable_id,
                                 )
-                                target_step = GuidedStep.STEP_1_SOURCE if body.edit_target.kind == "source" else GuidedStep.STEP_2_SINK
-                                rewound_guided = _replace(
-                                    guided,
-                                    step=target_step,
-                                    history=(*guided.history[:-1], answered),
-                                    active_proposal=None,
-                                    active_edit_target=component_target,
+                                return await _rewind_reviewed_component_form(
+                                    state=state,
+                                    state_record=state_record,
+                                    guided=guided,
+                                    component_target=component_target,
+                                    reviewed_facts=reviewed_facts,
+                                    prepared_response=prepared_response,
+                                    origin="proposal_review",
                                 )
-                                rewound_state = _replace(state, guided_session=rewound_guided)
-                                edit_turn = _build_get_guided_turn(rewound_state, rewound_guided, catalog=catalog)
-                                if edit_turn is None:
-                                    raise AuditIntegrityError("guided proposal component back-edit did not produce an edit form")
-                                edit_turn = _finalize_guided_turn(edit_turn, shield_available=shield_available)
-                                rewound_guided, _edit_record, edit_turn_type, prepared_edit = _prepare_server_turn_occurrence(
-                                    rewound_guided,
-                                    current_step=target_step,
-                                    turn=edit_turn,
-                                    payload_store=payload_store,
-                                )
-                                if edit_turn_type is not TurnType.SCHEMA_FORM:
-                                    raise AuditIntegrityError("guided proposal component back-edit must produce a schema form")
-                                rewound_state = _replace(state, guided_session=rewound_guided)
-                                state_dict = rewound_state.to_dict()
-                                rewind_state_data = CompositionStateData(
-                                    sources=state_dict["sources"],
-                                    nodes=state_dict["nodes"],
-                                    edges=state_dict["edges"],
-                                    outputs=state_dict["outputs"],
-                                    metadata_=state_dict["metadata"],
-                                    is_valid=state_record.is_valid,
-                                    validation_errors=state_record.validation_errors,
-                                    composer_meta={"guided_session": rewound_guided.to_dict()},
-                                )
-                                emit_turn_answered(
-                                    recorder,
-                                    step=GuidedStep.STEP_3_TRANSFORMS,
-                                    turn_type=TurnType.PROPOSE_PIPELINE,
-                                    response_hash=prepared_response.payload_id,
-                                    response_payload_id=prepared_response.payload_id,
-                                    control_signal=None,
-                                    composition_version=state.version,
-                                    actor=user.user_id,
-                                )
-                                emit_turn_emitted(
-                                    recorder,
-                                    step=target_step,
-                                    turn_type=TurnType.SCHEMA_FORM,
-                                    payload_hash=prepared_edit.payload_id,
-                                    payload_payload_id=prepared_edit.payload_id,
-                                    emitter="server",
-                                    composition_version=state.version,
-                                    actor=user.user_id,
-                                )
-                                rewind_response = GuidedResponseDescriptor(
-                                    kind="guided_respond",
-                                    next_turn=GuidedReplayTurn(
-                                        turn_type=TurnType.SCHEMA_FORM,
-                                        step_index=0 if body.edit_target.kind == "source" else 1,
-                                        payload_id=prepared_edit.payload_id,
-                                    ),
-                                    assistant_turn_seq=None,
-                                )
-                                rewound = await service.back_edit_guided_pipeline_proposal(
-                                    GuidedPipelineProposalBackEditCommand(
-                                        fence=fence,
-                                        expected_current_state_id=state_record.id,
-                                        expected_current_state_version=state_record.version,
-                                        expected_current_content_hash=composition_content_hash(state),
-                                        proposal_id=guided.active_proposal.proposal_id,
-                                        draft_hash=guided.active_proposal.draft_hash,
-                                        reviewed_facts=reviewed_facts,
-                                        edit_target=component_target,
-                                        state=rewind_state_data,
-                                        actor="composer_route",
-                                        response=rewind_response,
-                                        payloads=(prepared_response, prepared_edit),
-                                        audit_evidence=GuidedAuditEvidence(invocations=recorder.invocations),
-                                    ),
-                                    payload_store=payload_store,
-                                )
-                                return _response_from_record(rewound.result_state)
 
                             planning_guided = _replace(
                                 guided,
@@ -4002,17 +4046,34 @@ async def post_guided_respond(
                                 "kind": edit_target.kind,
                                 "stable_id": edit_target.stable_id,
                             }
-                            response_payload = {
-                                "action": "correct_wiring",
+                            is_form_rewind = edit_target.kind in {"source", "output"}
+                            wire_response_payload: dict[str, object] = {
+                                "action": "edit_reviewed_component" if is_form_rewind else "correct_wiring",
                                 "proposal_id": str(authority.row.id),
                                 "draft_hash": authority.proposal.draft_hash,
                                 "edit_target": target,
                             }
+                            if is_form_rewind:
+                                wire_response_payload["correction_feedback"] = body.correction_feedback
                             prepared_response = prepare_guided_json_payload(
                                 payload_store,
                                 purpose="turn_response",
-                                payload=response_payload,
+                                payload=wire_response_payload,
                             )
+                            if is_form_rewind:
+                                return await _rewind_reviewed_component_form(
+                                    state=state,
+                                    state_record=state_record,
+                                    guided=guided,
+                                    component_target=ComponentTarget(
+                                        kind=edit_target.kind,
+                                        stable_id=edit_target.stable_id,
+                                    ),
+                                    reviewed_facts=reviewed_facts,
+                                    prepared_response=prepared_response,
+                                    origin="wire_review",
+                                    correction_feedback=body.correction_feedback,
+                                )
                             answered = _replace(
                                 guided.history[-1],
                                 response_hash=prepared_response.payload_id,

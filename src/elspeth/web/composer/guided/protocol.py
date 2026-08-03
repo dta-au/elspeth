@@ -847,6 +847,20 @@ def node_options_summary(plugin: str | None, options: Mapping[str, Any]) -> list
     return summary
 
 
+def public_node_option_keys(plugin: str | None) -> frozenset[str]:
+    """Return the exact option-key authority exposed for one node plugin.
+
+    The review projection is deliberately lossy display text, so callers must
+    never reconstruct private options from it.  This closed key set is the
+    only authority a selected-node correction may use when overlaying a
+    provider candidate onto the server-held predecessor.
+    """
+
+    if plugin is not None and type(plugin) is not str:
+        raise TypeError("plugin must be an exact string or None")
+    return frozenset(_NODE_OPTION_SUMMARY_ALLOWLIST.get(plugin or "", ()))
+
+
 def _node_options_summary_error(value: object, path: str, *, plugin: str | None) -> str | None:
     """Reject any option pair outside the plugin's server-owned allowlist."""
 

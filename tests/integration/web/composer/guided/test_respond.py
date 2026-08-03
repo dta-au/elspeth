@@ -61,7 +61,7 @@ from elspeth.web.sessions.models import (
     guided_operations_table,
     proposal_events_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationClaimed
+from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationClaimed, GuidedPipelineProposalBackEditCommand
 from elspeth.web.sessions.routes import create_session_router
 from elspeth.web.sessions.routes._helpers import _SessionComposeLockRegistry
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -1929,6 +1929,111 @@ class TestStep2IntraStep:
         assert reviewed_after["plugin"] == reviewed_before["plugin"]
         assert reviewed_after[policy_key] == reviewed_before[policy_key]
 
+    @pytest.mark.parametrize("target_kind", ("source", "output"))
+    def test_wire_source_output_correction_rewinds_to_authoritative_form_without_planning(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        target_kind: str,
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename=f"wire-{target_kind}-rewind.jsonl")
+        old_proposal = staged["next_turn"]["payload"]
+        reviewed = _review_wiring(composer_test_client, session_id)
+        wire_turn = reviewed["next_turn"]
+        wire_payload = wire_turn["payload"]
+        collection = "sources" if target_kind == "source" else "outputs"
+        component = wire_payload[collection][0]
+        target = {"kind": target_kind, "stable_id": component["stable_id"]}
+        before = _full_guided_session(reviewed)
+        planner_calls = 0
+        back_edit_commands: list[GuidedPipelineProposalBackEditCommand] = []
+        session_service = composer_test_client.app.state.session_service
+        original_back_edit = session_service.back_edit_guided_pipeline_proposal
+
+        async def forbidden_planner(**_kwargs: object) -> object:
+            nonlocal planner_calls
+            planner_calls += 1
+            raise AssertionError("wire source/output back-edit must not call the planner")
+
+        async def capture_back_edit(command: GuidedPipelineProposalBackEditCommand, *, payload_store: Any = None) -> object:
+            back_edit_commands.append(command)
+            return await original_back_edit(command, payload_store=payload_store)
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            forbidden_planner,
+        )
+        monkeypatch.setattr(session_service, "back_edit_guided_pipeline_proposal", capture_back_edit)
+        request_payload = {
+            "operation_id": str(uuid4()),
+            "turn_token": wire_turn["turn_token"],
+            "proposal_id": wire_payload["proposal_id"],
+            "draft_hash": wire_payload["draft_hash"],
+            "edit_target": target,
+            "correction_feedback": f"Change the selected {target_kind} settings.",
+        }
+
+        revised = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+
+        assert revised.status_code == 200, revised.json()
+        body = revised.json()
+        assert planner_calls == 0
+        assert len(back_edit_commands) == 1
+        back_edit_command = back_edit_commands[0]
+        assert back_edit_command.origin == "wire_review"
+        assert back_edit_command.correction_feedback == request_payload["correction_feedback"]
+        prepared_response = next(payload for payload in back_edit_command.payloads if payload.purpose == "turn_response")
+        response_payload = prepared_response.payload
+        assert response_payload["action"] == "edit_reviewed_component"
+        assert response_payload["correction_feedback"] == request_payload["correction_feedback"]
+        audit_invocations = back_edit_command.audit_evidence.invocations
+        assert [invocation.tool_name for invocation in audit_invocations] == [
+            "guided_turn_answered",
+            "guided_turn_emitted",
+        ]
+        answered_audit = json.loads(audit_invocations[0].arguments_canonical)
+        assert answered_audit["step_index"] == "step_4_wire"
+        assert answered_audit["turn_type"] == "confirm_wiring"
+        assert answered_audit["response_payload_id"] == prepared_response.payload_id
+        edit_turn = body["next_turn"]
+        assert edit_turn["type"] == "schema_form"
+        assert edit_turn["step_index"] == (0 if target_kind == "source" else 1)
+        reviewed_key = "reviewed_sources" if target_kind == "source" else "reviewed_outputs"
+        assert edit_turn["payload"]["plugin"] == before[reviewed_key][component["stable_id"]]["plugin"]
+        guided = _full_guided_session(body)
+        assert guided["active_proposal"] is None
+        assert guided["active_edit_target"] == target
+        assert guided["reviewed_sources"] == before["reviewed_sources"]
+        assert guided["reviewed_outputs"] == before["reviewed_outputs"]
+
+        replayed = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json=request_payload,
+        )
+        assert replayed.status_code == 200, replayed.json()
+        assert replayed.json() == body
+        assert len(back_edit_commands) == 1
+        proposals = {
+            str(proposal.id): proposal
+            for proposal in asyncio.run(composer_test_client.app.state.session_service.list_composition_proposals(UUID(session_id)))
+        }
+        assert proposals[old_proposal["proposal_id"]].status == "rejected"
+        events = asyncio.run(composer_test_client.app.state.session_service.list_proposal_events(UUID(session_id)))
+        proposal_events = [event for event in events if str(event.proposal_id) == old_proposal["proposal_id"]]
+        assert [event.event_type for event in proposal_events] == ["proposal.created", "proposal.rejected"]
+        assert proposal_events[-1].payload["reason_code"] == "superseded"
+
+        stale = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={**request_payload, "operation_id": str(uuid4())},
+        )
+        assert stale.status_code == 409, stale.json()
+
     def test_revision_rejects_non_null_edited_values_without_mutation(
         self,
         composer_test_client: TestClient,
@@ -2267,7 +2372,10 @@ class TestStep2IntraStep:
             "turn_token": wire_turn["turn_token"],
             "proposal_id": wire_payload["proposal_id"],
             "draft_hash": wire_payload["draft_hash"],
-            "edit_target": wire_payload["connections"][0]["from_endpoint"],
+            "edit_target": {
+                "kind": "edge",
+                "stable_id": wire_payload["connections"][0]["stable_id"],
+            },
             "correction_feedback": feedback,
         }
 
@@ -2338,7 +2446,10 @@ class TestStep2IntraStep:
                 "turn_token": wire_turn["turn_token"],
                 "proposal_id": wire_payload["proposal_id"],
                 "draft_hash": wire_payload["draft_hash"],
-                "edit_target": wire_payload["connections"][0]["from_endpoint"],
+                "edit_target": {
+                    "kind": "edge",
+                    "stable_id": wire_payload["connections"][0]["stable_id"],
+                },
                 "correction_feedback": feedback,
             },
         )
@@ -3616,7 +3727,10 @@ class TestStep2IntraStep:
                 "turn_token": turn["turn_token"],
                 "proposal_id": proposal_payload["proposal_id"],
                 "draft_hash": proposal_payload["draft_hash"],
-                "edit_target": turn["payload"]["connections"][0]["from_endpoint"],
+                "edit_target": {
+                    "kind": "edge",
+                    "stable_id": turn["payload"]["connections"][0]["stable_id"],
+                },
                 "correction_feedback": "Route this source through a corrected topology.",
             },
         }
@@ -5538,7 +5652,10 @@ class TestStep2IntraStep:
                 "turn_token": turn["turn_token"],
                 "proposal_id": turn["payload"]["proposal_id"],
                 "draft_hash": turn["payload"]["draft_hash"],
-                "edit_target": turn["payload"]["connections"][0]["from_endpoint"],
+                "edit_target": {
+                    "kind": "edge",
+                    "stable_id": turn["payload"]["connections"][0]["stable_id"],
+                },
                 "correction_feedback": "Route this source through a corrected topology.",
             },
         )

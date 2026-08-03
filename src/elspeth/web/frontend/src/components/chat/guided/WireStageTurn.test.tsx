@@ -105,6 +105,23 @@ describe("WireStageTurn", () => {
     expect(onCorrect).toHaveBeenCalledWith({ kind: "node", stable_id: NODE_ID }, "Add the reviewed mapping.");
   });
 
+  it("names source and output edits as form-directed while retaining node and edge replanning", async () => {
+    render(<WireStageTurn data={canonicalData()} onConfirm={vi.fn()} confirmDisabled={false} onCorrect={vi.fn()} />);
+
+    expect(screen.getByRole("heading", { name: "Edit reviewed component" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit component settings" })).toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByLabelText("Component"), OUTPUT_ID);
+    expect(screen.getByRole("button", { name: "Edit component settings" })).toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByLabelText("Component"), NODE_ID);
+    expect(screen.getByRole("heading", { name: "Request a wiring correction" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Re-plan wiring" })).toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByLabelText("Component"), EDGE_ID);
+    expect(screen.getByRole("button", { name: "Re-plan wiring" })).toBeInTheDocument();
+  });
+
   it("summarises route status once and renders per-route chips, not trailing prose", () => {
     // canonicalData: one satisfied contract (connected) + one null contract
     // (not yet checked). The per-line "— not yet checked" dangling clause was

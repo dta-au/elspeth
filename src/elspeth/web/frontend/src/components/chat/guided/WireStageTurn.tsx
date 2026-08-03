@@ -316,6 +316,11 @@ export function WireStageTurn({
   ];
   const [correctionTarget, setCorrectionTarget] = useState(correctionTargets[0]?.target.stable_id ?? "");
   const [correctionFeedback, setCorrectionFeedback] = useState("");
+  const selectedCorrectionKind = correctionTargets.find(
+    (item) => item.target.stable_id === correctionTarget,
+  )?.target.kind;
+  const isFormDirectedCorrection =
+    selectedCorrectionKind === "source" || selectedCorrectionKind === "output";
 
   const acknowledgements = pendingAcknowledgements ?? [];
   const blockingValidationIssues = validationIssues ?? [];
@@ -537,7 +542,7 @@ export function WireStageTurn({
               textarea). Explicit for/id association + the schema form's field
               classes; keep the accessible names verbatim ("Component" /
               "What should change?"). */}
-          <h4>Request a wiring correction</h4>
+          <h4>{isFormDirectedCorrection ? "Edit reviewed component" : "Request a wiring correction"}</h4>
           <div className="guided-schema-field-row">
             <label className="guided-schema-label" htmlFor={correctionSelectId}>
               Component
@@ -570,7 +575,7 @@ export function WireStageTurn({
           </div>
           <div className="wire-stage__correction-actions">
             <button type="submit" className="guided-turn-secondary" disabled={correctionFeedback.trim().length === 0}>
-              Re-plan wiring
+              {isFormDirectedCorrection ? "Edit component settings" : "Re-plan wiring"}
             </button>
           </div>
         </form>

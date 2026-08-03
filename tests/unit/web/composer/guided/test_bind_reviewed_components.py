@@ -400,7 +400,8 @@ def _correction_predecessor() -> CompositionState:
                 on_error="discard",
                 options={
                     "mapping": {"amount": "amount", "tier": "'high'"},
-                    "schema": {"mode": "observed"},
+                    "select_only": False,
+                    "schema": {"mode": "observed", "required_fields": ["amount"]},
                 },
                 condition=None,
                 routes=None,
@@ -424,17 +425,24 @@ def _correction_predecessor() -> CompositionState:
     )
 
 
-def _format_node_correction_target() -> GuidedCorrectionTarget:
+def _node_correction_target(owner_key: str, *, stable_id: str) -> GuidedCorrectionTarget:
     return GuidedCorrectionTarget(
         requested=ComponentTarget(
             kind="node",
-            stable_id="44444444-4444-4444-8444-444444444444",
+            stable_id=stable_id,
         ),
         owner_kind="node",
-        owner_key="format_high_value",
-        authority_key="format_high_value",
-        public_target={"kind": "node", "stable_id": "44444444-4444-4444-8444-444444444444"},
+        owner_key=owner_key,
+        authority_key=owner_key,
+        public_target={"kind": "node", "stable_id": stable_id},
         before_fingerprint="0" * 64,
+    )
+
+
+def _format_node_correction_target() -> GuidedCorrectionTarget:
+    return _node_correction_target(
+        "format_high_value",
+        stable_id="44444444-4444-4444-8444-444444444444",
     )
 
 
@@ -455,7 +463,9 @@ def _planner_correction_candidate() -> dict[str, object]:
     selected = pipeline["nodes"][2]
     selected["options"] = {
         "mapping": {"amount": "amount", "tier": "'priority'"},
-        "schema": {"mode": "observed"},
+        "select_only": True,
+        "schema": {"mode": "fixed", "fields": [{"name": "attacker", "type": "str", "required": True}]},
+        "required_input_fields": ["attacker"],
     }
     return pipeline
 
@@ -473,6 +483,57 @@ def test_bind_replans_selected_node_while_restoring_unselected_node_authority() 
     assert bound["nodes"][0] == predecessor.to_dict()["nodes"][0]
     assert bound["nodes"][1] == predecessor.to_dict()["nodes"][1]
     assert bound["nodes"][2]["options"]["mapping"]["tier"] == "'priority'"
+
+
+def test_bind_selected_field_mapper_admits_only_public_option_edits() -> None:
+    predecessor = _correction_predecessor()
+
+    bound = bind_guided_reviewed_components(
+        _planner_correction_candidate(),
+        _guided(),
+        predecessor=predecessor,
+        correction_target=_format_node_correction_target(),
+    )
+
+    assert bound["nodes"][2]["options"] == {
+        "mapping": {"amount": "amount", "tier": "'priority'"},
+        "select_only": True,
+        "schema": {"mode": "observed", "required_fields": ["amount"]},
+    }
+
+
+def test_bind_selected_llm_preserves_withheld_profile_prompt_schema_and_options() -> None:
+    predecessor = _correction_predecessor()
+    candidate = _planner_correction_candidate()
+    selected = candidate["nodes"][1]
+    selected["input"] = "revised_high_value_rows"
+
+    bound = bind_guided_reviewed_components(
+        candidate,
+        _guided(),
+        predecessor=predecessor,
+        correction_target=_node_correction_target(
+            "summarize_standard",
+            stable_id="55555555-5555-4555-8555-555555555555",
+        ),
+    )
+
+    assert bound["nodes"][1]["input"] == "revised_high_value_rows"
+    assert bound["nodes"][1]["options"] == predecessor.to_dict()["nodes"][1]["options"]
+
+
+def test_bind_rejects_selected_node_identity_replacement() -> None:
+    predecessor = _correction_predecessor()
+    candidate = _planner_correction_candidate()
+    candidate["nodes"][2]["id"] = "replacement_mapper"
+
+    with pytest.raises(AuditIntegrityError, match="selected predecessor node identity"):
+        bind_guided_reviewed_components(
+            candidate,
+            _guided(),
+            predecessor=predecessor,
+            correction_target=_format_node_correction_target(),
+        )
 
 
 def test_bind_does_not_accept_planner_override_of_unselected_withheld_fields() -> None:

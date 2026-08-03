@@ -265,7 +265,10 @@ def test_wire_correction_persists_feedback_once_and_immutably_supersedes(
     )
     assert reviewed.status_code == 200, reviewed.json()
     wire_turn = reviewed.json()["next_turn"]
-    target = wire_turn["payload"]["connections"][0]["from_endpoint"]
+    target = {
+        "kind": "edge",
+        "stable_id": wire_turn["payload"]["connections"][0]["stable_id"],
+    }
     operation_id = str(uuid4())
     correction_request = {
         "operation_id": operation_id,
@@ -547,7 +550,10 @@ def test_independent_workers_serialize_revert_vs_wire_action_with_exact_publicat
             "turn_token": wire_turn["turn_token"],
             "proposal_id": proposal["proposal_id"],
             "draft_hash": proposal["draft_hash"],
-            "edit_target": wire_turn["payload"]["connections"][0]["from_endpoint"],
+            "edit_target": {
+                "kind": "edge",
+                "stable_id": wire_turn["payload"]["connections"][0]["stable_id"],
+            },
             "correction_feedback": correction_feedback,
         }
         original_wire = service.stage_guided_pipeline_proposal

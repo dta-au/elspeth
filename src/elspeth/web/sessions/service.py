@@ -10864,12 +10864,14 @@ class SessionServiceImpl:
         payloads_by_purpose = {payload.purpose: payload for payload in command.payloads}
         response_payload = payloads_by_purpose["turn_response"]
         turn_payload = payloads_by_purpose["turn"]
-        expected_response_payload = {
-            "action": "revise",
+        expected_response_payload: dict[str, object] = {
+            "action": "revise" if command.origin == "proposal_review" else "edit_reviewed_component",
             "proposal_id": str(command.proposal_id),
             "draft_hash": command.draft_hash,
             "edit_target": command.edit_target.to_dict(),
         }
+        if command.origin == "wire_review":
+            expected_response_payload["correction_feedback"] = command.correction_feedback
         if deep_thaw(response_payload.payload) != expected_response_payload:
             raise AuditIntegrityError("guided back-edit response payload differs from its exact authority")
         next_turn = command.response.next_turn
@@ -10947,7 +10949,10 @@ class SessionServiceImpl:
                 _verify_pipeline_lifecycle_authority(conn, service=self, authority=authority)
                 if authority.row.status != "pending" or authority.proposal.draft_hash != command.draft_hash:
                     raise AuditIntegrityError("guided back-edit does not name the active pending draft")
-                if type(authority.proposal.base) is not PresentBase or authority.proposal.base.state_id != current_record.id:
+                allowed_base_state_ids = {current_record.id}
+                if command.origin == "wire_review" and current_record.derived_from_state_id is not None:
+                    allowed_base_state_ids.add(current_record.derived_from_state_id)
+                if type(authority.proposal.base) is not PresentBase or authority.proposal.base.state_id not in allowed_base_state_ids:
                     raise AuditIntegrityError("guided back-edit proposal base differs from current checkpoint")
                 if authority.proposal.base.composition_content_hash != current_content_hash:
                     raise AuditIntegrityError("guided back-edit proposal base content hash changed")
@@ -10987,15 +10992,17 @@ class SessionServiceImpl:
                     expected_prefill["on_write_failure"] = output_target.on_write_failure
                 if turn_payload_json["plugin"] != expected_plugin or deep_thaw(turn_payload_json["prefilled"]) != expected_prefill:
                     raise AuditIntegrityError("guided back-edit form differs from server-held reviewed custody")
+                origin_step = GuidedStep.STEP_3_TRANSFORMS if command.origin == "proposal_review" else GuidedStep.STEP_4_WIRE
+                origin_turn_type = TurnType.PROPOSE_PIPELINE if command.origin == "proposal_review" else TurnType.CONFIRM_WIRING
                 if (
-                    guided.step is not GuidedStep.STEP_3_TRANSFORMS
+                    guided.step is not origin_step
                     or not guided.history
-                    or guided.history[-1].step is not GuidedStep.STEP_3_TRANSFORMS
-                    or guided.history[-1].turn_type is not TurnType.PROPOSE_PIPELINE
+                    or guided.history[-1].step is not origin_step
+                    or guided.history[-1].turn_type is not origin_turn_type
                     or guided.history[-1].response_hash is not None
                     or any(record.response_hash is None for record in guided.history[:-1])
                 ):
-                    raise AuditIntegrityError("guided back-edit has no exact active proposal occurrence")
+                    raise AuditIntegrityError("guided back-edit has no exact active review occurrence")
 
                 metadata = deep_thaw(command.state.composer_meta)
                 if type(metadata) is not dict or set(metadata) != {"guided_session"}:
@@ -11007,7 +11014,11 @@ class SessionServiceImpl:
                 answered = replace(
                     guided.history[-1],
                     response_hash=response_payload.payload_id,
-                    summary="Guided pipeline proposal revision requested.",
+                    summary=(
+                        "Guided pipeline proposal revision requested."
+                        if command.origin == "proposal_review"
+                        else "Guided pipeline wiring component edit requested."
+                    ),
                 )
                 emitted = TurnRecord(
                     step=target_step,

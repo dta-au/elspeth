@@ -29,6 +29,7 @@ from elspeth.web.composer.guided.protocol import (
     node_options_summary,
     proposal_component_label,
     proposal_structural_label,
+    public_node_option_keys,
     validate_payload,
     validate_proposal_catalog_refs,
 )
@@ -883,16 +884,30 @@ def bind_guided_reviewed_components(
         predecessor_nodes = predecessor.to_dict()["nodes"]
         for private_node in predecessor_nodes:
             private_node_id = private_node["id"]
-            if private_node_id == selected_node_id:
-                continue
             positions = [
                 index
                 for index, candidate_node in enumerate(raw_nodes)
                 if type(candidate_node) is dict and candidate_node.get("id") == private_node_id
             ]
             if len(positions) != 1:
-                raise AuditIntegrityError("guided planner candidate changed an unselected predecessor node identity")
-            raw_nodes[positions[0]] = private_node
+                selected = private_node_id == selected_node_id
+                qualifier = "selected" if selected else "unselected"
+                raise AuditIntegrityError(f"guided planner candidate changed a {qualifier} predecessor node identity")
+            position = positions[0]
+            if private_node_id != selected_node_id:
+                raw_nodes[position] = private_node
+                continue
+            candidate_node = raw_nodes[position]
+            if type(candidate_node) is not dict or type(candidate_node.get("options")) is not dict:
+                raise AuditIntegrityError("guided planner selected node options are malformed")
+            private_options = cast(dict[str, Any], deep_thaw(private_node["options"]))
+            candidate_options = cast(dict[str, Any], candidate_node["options"])
+            for key in public_node_option_keys(cast(str | None, private_node.get("plugin"))):
+                if key in candidate_options:
+                    private_options[key] = deep_thaw(candidate_options[key])
+                else:
+                    private_options.pop(key, None)
+            candidate_node["options"] = private_options
     return cast(GuidedBoundPipeline, bound)
 
 

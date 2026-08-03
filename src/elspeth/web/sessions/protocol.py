@@ -2040,6 +2040,8 @@ class GuidedPipelineProposalBackEditCommand:
     actor: str
     response: GuidedResponseDescriptor
     payloads: tuple[PreparedGuidedJsonPayload, ...]
+    origin: Literal["proposal_review", "wire_review"]
+    correction_feedback: str | None = None
     audit_evidence: GuidedAuditEvidence = GuidedAuditEvidence()
 
     def __post_init__(self) -> None:
@@ -2077,6 +2079,13 @@ class GuidedPipelineProposalBackEditCommand:
             raise AuditIntegrityError("guided back-edit payload purposes are malformed")
         if type(self.audit_evidence) is not GuidedAuditEvidence:
             raise AuditIntegrityError("guided back-edit audit evidence must be exact")
+        if self.origin not in {"proposal_review", "wire_review"}:
+            raise AuditIntegrityError("guided back-edit origin is outside the closed vocabulary")
+        if self.origin == "proposal_review":
+            if self.correction_feedback is not None:
+                raise AuditIntegrityError("guided proposal-review back-edit must not carry correction feedback")
+        elif type(self.correction_feedback) is not str or not self.correction_feedback.strip():
+            raise AuditIntegrityError("guided wire-review back-edit requires non-empty correction feedback")
         freeze_fields(self, "reviewed_facts", "payloads")
 
 
