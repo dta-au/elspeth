@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-03T23:05:52+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-03T23:05:52+10:00
-Release baseline: `release/0.7.2@a8c6f091d`
+Last refreshed: 2026-08-04T00:07:22+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-04T00:07:22+10:00
+Release baseline: `release/0.7.2@368a55ef7`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -41,11 +41,11 @@ shell mechanics remains deferred even when it blocks a fresh install.
 | State | Objective 44 | Additional 19 | Meaning |
 |---|---:|---:|---|
 | Closed | 9 | 7 | Tracker says done; closure evidence is still sampled during the completion audit |
-| Verifying | 17 | 2 | Locally fixed; live or requirement-specific acceptance remains |
+| Verifying | 17 | 3 | Locally fixed; live or requirement-specific acceptance remains |
 | Fixing | 1 | 1 | Owned bug implementation is still in flight |
 | In progress | 0 | 0 | A delivery task spanning existing objective defects is in flight |
 | Open | 5 | 1 | Confirmed task/epic work not yet started here |
-| Triage | 9 | 8 | Root cause and reproducibility must be checked against current HEAD before fixing |
+| Triage | 9 | 7 | Root cause and reproducibility must be checked against current HEAD before fixing |
 | Proposed | 3 | 0 | Regression-gate features require approval/acceptance design before implementation |
 
 The additional records are newly discovered gate-custody bug
@@ -68,7 +68,7 @@ claim custody.
 
 | Agent | Scope | Worktree/branch | File custody | AWS authority | Status |
 |---|---|---|---|---|---|
-| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`) | This tracker; next isolated lane is empty-state freeform history custody | Sole mutation custodian | Active; advisor evidence contract integrated at `a8c6f091d` after independent approval and a 36,986-test full-suite pass; empty-state freeform history loss is next |
+| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`) | This tracker; next isolated lane selected after current Filigree reconciliation | Sole mutation custodian | Active; empty-state freeform history custody integrated as `368a55ef7` after independent approval, a 37,039-test full-suite pass, and 32 release-checkout regressions; live two-turn verification remains |
 | `/root/review_advisor_evidence_scope` | Adversarial review of bounded evidence and actual checkpoint wire instructions | Shared read-only advisor worktree | None | None | Complete; found and drove repair of the shared stuck-composer system-contract conflict, then approved current bytes with no findings |
 | `/root/audit_advisor_demo` | D1-D6 and advisor/F14 completion evidence | Shared read-only baseline | None | None | Completed; no residual local code defect found |
 | `/root/audit_compose_loop` | Six compose-loop RCAs and implementation partitioning | Shared read-only baseline | None | None | Completed; all six remain actionable |
@@ -172,7 +172,7 @@ supportability remains last.
 
 | ID | Priority | Live state | Surface | Next proof/action |
 |---|---:|---|---|---|
-| `elspeth-71b22759cc` | P1 | `triage` | Freeform planner | Preserve the earlier request when the latest empty-state turn is referential |
+| `elspeth-71b22759cc` | P1 | `verifying` | Freeform planner | Integrated as `368a55ef7`; live two-turn acceptance must preserve the first request's topology and threshold through a referential build |
 | `elspeth-43208ece4c` | P1 | `triage` | Guided proposal revision | Collect the requested node/edge change instead of requiring an arbitrary mutation |
 | `elspeth-1345480bd7` | P1 | `triage` | Multi-query standard JSON | Send field names/types/enums before enforcing the output contract |
 | `elspeth-8ef90e59cc` | P2 | `triage` | Freeform schema progress | Keep provider-visible schema evidence aligned with the progress state |
