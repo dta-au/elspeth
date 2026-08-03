@@ -675,15 +675,25 @@ export function ChatPanel({
     (s) => s.composerTimeoutUnavailable,
   );
   const guidedSelfHealNotice = useSessionStore((s) => s.guidedSelfHealNotice);
-  const [guidedRevisionMode, setGuidedRevisionMode] = useState<GuidedRevisionMode>("amend");
   const isProposalRevisionComposer =
     guidedSession?.step === "step_3_transforms" &&
     guidedNextTurn?.type === "propose_pipeline";
   const proposalRevisionIdentity = isProposalRevisionComposer
     ? `${activeSessionId ?? ""}:${guidedNextTurn.payload.proposal_id}:${guidedNextTurn.payload.draft_hash}`
     : null;
+  const [guidedRevisionSelection, setGuidedRevisionSelection] = useState<{
+    identity: string | null;
+    mode: GuidedRevisionMode;
+  }>({ identity: proposalRevisionIdentity, mode: "amend" });
+  const guidedRevisionMode =
+    guidedRevisionSelection.identity === proposalRevisionIdentity
+      ? guidedRevisionSelection.mode
+      : "amend";
   useEffect(() => {
-    setGuidedRevisionMode("amend");
+    setGuidedRevisionSelection({
+      identity: proposalRevisionIdentity,
+      mode: "amend",
+    });
   }, [proposalRevisionIdentity]);
   // Whether the CURRENT chat has any work — gates the mode-switch confirmation
   // (ModeSwitchButton). Freeform work = messages or a non-empty composition;
@@ -2068,9 +2078,10 @@ export function ChatPanel({
                 <select
                   value={guidedRevisionMode}
                   disabled={guidedResponsePending || guidedChatPending}
-                  onChange={(event) => setGuidedRevisionMode(
-                    event.target.value as GuidedRevisionMode,
-                  )}
+                  onChange={(event) => setGuidedRevisionSelection({
+                    identity: proposalRevisionIdentity,
+                    mode: event.target.value as GuidedRevisionMode,
+                  })}
                 >
                   <option value="amend">Amend current proposal — preserve existing steps</option>
                   <option value="replace">Replace proposal — steps may be removed</option>
@@ -2080,8 +2091,21 @@ export function ChatPanel({
             <ChatInput
               onSend={(content) => {
                 if (isProposalRevisionComposer && !isTutorial) {
-                  const selectedMode = guidedRevisionMode;
-                  setGuidedRevisionMode("amend");
+                  const liveState = useSessionStore.getState();
+                  const liveTurn = liveState.guidedNextTurn;
+                  const liveProposalRevisionIdentity =
+                    liveState.guidedSession?.step === "step_3_transforms" &&
+                    liveTurn?.type === "propose_pipeline"
+                      ? `${liveState.activeSessionId ?? ""}:${liveTurn.payload.proposal_id}:${liveTurn.payload.draft_hash}`
+                      : null;
+                  const selectedMode =
+                    guidedRevisionSelection.identity === liveProposalRevisionIdentity
+                      ? guidedRevisionSelection.mode
+                      : "amend";
+                  setGuidedRevisionSelection({
+                    identity: liveProposalRevisionIdentity,
+                    mode: "amend",
+                  });
                   void sendGuidedChat(content, selectedMode);
                   return;
                 }

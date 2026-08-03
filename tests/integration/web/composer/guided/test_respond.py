@@ -4768,18 +4768,84 @@ class TestStep2IntraStep:
         user's current budget.  A rejected fresh operation must remain
         retryable with the same operation ID once capacity is available.
         """
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.core.canonical import stable_hash
+        from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
+        from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface
+
         session_id = _create_session(composer_test_client)
         staged = self._stage_proposal(composer_test_client, session_id, filename="rate-admission.jsonl")
         turn = staged["next_turn"]
         payload = turn["payload"]
         app = composer_test_client.app
-        original = app.state.composer_service.plan_guided_pipeline
         planner_calls = 0
 
-        async def counting_planner(**kwargs: Any):
+        async def counting_planner(
+            *,
+            guided,
+            current_state,
+            base,
+            supersedes_draft_hash,
+            revision_authority,
+            **_kwargs: Any,
+        ):
             nonlocal planner_calls
             planner_calls += 1
-            return await original(**kwargs)
+            assert revision_authority is not None
+            assert revision_authority.mode == "amend"
+            assert revision_authority.predecessor == current_state
+
+            pipeline = deep_thaw(current_state.to_dict())
+            pipeline.pop("version")
+            pipeline["outputs"] = [
+                {"sink_name": output["name"], **{key: value for key, value in output.items() if key != "name"}}
+                for output in pipeline["outputs"]
+            ]
+            source = pipeline["sources"][guided.reviewed_sources[guided.source_order[0]].name]
+            predecessor_success = source["on_success"]
+            insertion_input = "rate_admission_passthrough_rows"
+            source["on_success"] = insertion_input
+            pipeline["nodes"].insert(
+                0,
+                {
+                    "id": "requested_rate_admission_passthrough",
+                    "node_type": "transform",
+                    "plugin": "passthrough",
+                    "input": insertion_input,
+                    "on_success": predecessor_success,
+                    "on_error": "discard",
+                    "options": {"schema": {"mode": "observed"}},
+                },
+            )
+            pipeline["edges"] = []
+            proposal = PipelineProposal.create(
+                pipeline=pipeline,
+                base=base,
+                reviewed_facts=guided_private_reviewed_facts(guided),
+                surface=PlannerSurface.GUIDED_STAGED,
+                repair_count=0,
+                skill_hash=stable_hash("rate-admission-passthrough-test-planner"),
+                covered_deferred_intent_ids=(),
+                supersedes_draft_hash=supersedes_draft_hash,
+            )
+            source_plugin = guided.reviewed_sources[guided.source_order[0]].plugin
+            sink_plugin = guided.reviewed_outputs[guided.output_order[0]].plugin
+            return (
+                PipelinePlanResult(
+                    proposal=proposal,
+                    tool_call_id="rate-admission-passthrough",
+                    custody_result="not_required",
+                    model_identifier="rate-admission-test-planner",
+                    model_version="v1",
+                    provider="test",
+                ),
+                {
+                    "source": frozenset({source_plugin}),
+                    "transform": frozenset({"passthrough"}),
+                    "sink": frozenset({sink_plugin}),
+                },
+            )
 
         monkeypatch.setattr(app.state.composer_service, "plan_guided_pipeline", counting_planner)
         request_payload = {
