@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-03T17:11:21+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-03T17:11:00+10:00
-Release baseline: `release/0.7.2@b424c08c4`
+Last refreshed: 2026-08-03T17:34:00+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-03T17:33:00+10:00
+Release baseline: `release/0.7.2@ca375291c`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -36,22 +36,24 @@ evidence are core/demo-aware work even though they involve AWS. Installing,
 updating, or tearing down the environment through IAM, Terraform, runbooks, or
 shell mechanics remains deferred even when it blocks a fresh install.
 
-## Current roll-up — 44 objective items plus 4 discovered/delivery records
+## Current roll-up — 44 objective items plus 7 discovered/delivery records
 
-| State | Objective 44 | Additional 4 | Meaning |
+| State | Objective 44 | Additional 7 | Meaning |
 |---|---:|---:|---|
 | Closed | 8 | 1 | Tracker says done; closure evidence is still sampled during the completion audit |
 | Verifying | 12 | 2 | Locally fixed; live or requirement-specific acceptance remains |
 | Fixing | 4 | 0 | Owned bug implementation is still in flight |
-| In progress | 0 | 0 | A delivery task spanning existing objective defects is in flight |
-| Open | 4 | 1 | Confirmed task/epic work not yet started here |
+| In progress | 0 | 1 | A delivery task spanning existing objective defects is in flight |
+| Open | 4 | 3 | Confirmed task/epic work not yet started here |
 | Triage | 13 | 0 | Root cause and reproducibility must be checked against current HEAD before fixing |
 | Proposed | 3 | 0 | Regression-gate features require approval/acceptance design before implementation |
 
 The additional records are newly discovered gate-custody bug
-`elspeth-1d97fc4b80`, run-diagnostics UI bug `elspeth-18b39eb829`, and
-non-overlapping compose delivery task `elspeth-73c7a4df36`, plus deferred
-evidence-supportability task `elspeth-01c627b420`. They are tracked without
+`elspeth-1d97fc4b80`, run-diagnostics UI bug `elspeth-18b39eb829`,
+non-overlapping compose delivery task `elspeth-73c7a4df36`, deferred
+evidence-supportability task `elspeth-01c627b420`, and three implementation
+children of the systemic provider-projection audit: `elspeth-dca1e81c58`,
+`elspeth-3526685369`, and `elspeth-eacfec09a6`. They are tracked without
 changing the supplied objective's 44-item arithmetic.
 
 Closed-record assignees below are retained Filigree audit history, not active
@@ -70,12 +72,14 @@ claim custody.
 | `/root/design_demo_acceptance` | Cross-issue live demo acceptance matrix | Shared read-only baseline | None | None | Completed; 12-step deployment matrix produced |
 | `/root/review_text_tracker` | Tracker accuracy and completeness review | Shared read-only baseline | None | None | Completed; corrections incorporated |
 | `/root/impl_guided_node_custody` | Preserve unchanged node behavior across guided replanning | `.claude/worktrees/guided-node-custody`; `codex/fix-guided-node-custody` | Released after integration | None | Complete; reviewed commit integrated as `b424c08c4` |
-| `/root/impl_gate_row_error_policy` | Per-row gate `on_error` handling | `.claude/worktrees/gate-row-error-policy`; `codex/fix-gate-row-error-policy` | gate config/executor/traversal/source-iteration seams and direct tests | None | Active; adding honest `GATE_ERROR_DISCARDED` terminal provenance before handoff |
+| `/root/impl_gate_row_error_policy` | Per-row gate `on_error` handling | `.claude/worktrees/gate-row-error-policy`; `codex/fix-gate-row-error-policy` | gate config/executor/traversal/source-iteration seams and direct tests | None | Active; first candidate `48a6f33fb` rejected in review, nine corrections assigned for a second localized handoff |
 | `/root/impl_csv_audit_characteristics` | Honest CSV audit characteristics | `.claude/worktrees/csv-audit-characteristics`; `codex/fix-csv-audit-characteristics` | CSV source, characteristic UI wording, exact scenario-corpus oracle, direct tests | None | Complete; behavior `d78fbbed6`, corpus oracle `10179f2c1` |
-| `/root/impl_s3_source_profiles` | Operator-profiled Web S3 source | `.claude/worktrees/s3-source-profiles`; `codex/fix-s3-source-profiles` | Web config/profile/policy/S3 lowering/source seams and direct tests | None | Active; two bounded review subagents |
+| `/root/impl_s3_source_profiles` | Operator-profiled Web S3 source | `.claude/worktrees/s3-source-profiles`; `codex/fix-s3-source-profiles` | Web config/profile/policy/S3 lowering/source seams and direct tests | None | Active; first candidate `190292009` rejected in review, four bounded corrections assigned for a second localized handoff |
 | `/root/impl_run_diagnostics_ui` | Surface routed-failure provenance | `.claude/worktrees/run-diagnostics-ui`; `codex/fix-run-diagnostics-ui` | `RunsHistoryDrawer` and direct frontend diagnostics presentation/tests | None | Complete; integrated as `9130e1209` + `0928c6ac6` |
 | `/root/impl_compose_authoring_aids` | Compose context and truthful field-mapping aids | `.claude/worktrees/compose-authoring-aids`; `codex/fix-compose-authoring-aids` | Released after integration | None | Complete; integrated as `2906409e1` + `e1d31f104` |
-| `/root/impl_compose_required_controls` | Finalize deterministic required controls on both freeform publication paths | `.claude/worktrees/compose-required-controls`; `codex/fix-compose-required-controls` | `composer/service.py`, `tool_batch.py`, `required_controls.py`, direct tests | None | Active from exact baseline `b424c08c4`; localized handoff required before full suite |
+| `/root/impl_compose_required_controls` | Finalize deterministic required controls on both freeform publication paths | `.claude/worktrees/compose-required-controls`; `codex/fix-compose-required-controls` | `composer/service.py`, `tool_batch.py`, `required_controls.py`, direct tests | None | Active from exact baseline `b424c08c4`; RED proves both explicit approval and auto-commit publish uncovered Textract to LLM paths |
+| `/root/audit_provider_projection_obligations` | Re-audit provider-facing projection and hidden-option custody on integrated release | Shared read-only `ca375291c` baseline | None | None | Complete; four P1 residuals reproduced and partitioned into three tracked implementation children |
+| `/root/impl_guided_chat_revision_custody` | Prevent blind source/sink replacement through guided chat | `.claude/worktrees/guided-chat-revision-custody`; `codex/fix-guided-chat-revision-custody` | `guided/chat_solver.py`, `guided_chat_atomic.py`, direct tests | None | Active; systematic-debugging/TDD lane from exact `ca375291c` baseline |
 
 No subagent may mutate AWS or the shared release checkout during this wave.
 Each implementation agent is confined to the explicit worktree/file custody
@@ -122,9 +126,12 @@ Parent workstream state:
 | `elspeth-2ac590c79f` | P1 | `closed` | unassigned | Sample literal/`option_path` carry-forward through durable deferred intent |
 | `elspeth-82d8bea477` | P1 | `closed` | unassigned | Sample threshold vocabulary and topology-stage disposition |
 | `elspeth-fd32c3e6fd` | P1 | `verifying` | `codex-release-0.7.2-integration` | Live observed CSV numeric gate is rejected before run creation |
-| `elspeth-b326add5be` | P1 | `fixing` | `codex-gate-row-error-policy` | RED proves `GateSettings.on_error` is absent; add fail-fast-by-default and auditable per-row diversion |
+| `elspeth-b326add5be` | P1 | `fixing` | `codex-gate-row-error-policy` | Candidate `48a6f33fb` held: remove row-derived audit text and close telemetry, repair, outcome-contract, CSV, summary, authoring, and barrier-warning gaps |
 | `elspeth-dc07d517cf` | P2 | `closed` | unassigned | Sample clarification intent visibility/claimability at later stages |
 | `elspeth-6795b3ae3a` | P2 | `open` | unassigned | Inventory every provider-facing projection and compare obligations with rendered evidence |
+| `elspeth-dca1e81c58` | P1 | `open` | unassigned | Preserve selected-node hidden state and reuse schema-form rewind for wire-stage source/output edits after S3 releases `guided.py` custody |
+| `elspeth-3526685369` | P1 | `in_progress` | `codex-guided-chat-revision-custody` | Make source/sink chat corrections advisory or public-patch-only so withheld settings cannot be replaced |
+| `elspeth-eacfec09a6` | P1 | `open` | unassigned | Unify advisor evidence and injection candidates after the active required-controls `service.py` lane releases custody |
 | `elspeth-d0d52e2fde` | P2 | `closed` | `codex-release-0.7.2-integration` | Sample the real HTTP/lifecycle regression added with the proof fix |
 | `elspeth-c4734bc69a` | P3 | `verifying` | `codex-r3-rca-coordinator` | Behavior `d78fbbed6` plus corpus `10179f2c1`; live catalog acceptance and combined full-suite gate remain |
 | `elspeth-aaa9e3f597` | P2 | `verifying` | `codex-release-0.7.2-integration` | Live guided path retains the decision heading and treats gates as topology, not plugins |
@@ -138,7 +145,7 @@ not gate-routing children.
 
 | ID | Priority | Live state | Filigree assignee | Next proof/action |
 |---|---:|---|---|---|
-| `elspeth-926ac02d3e` | P1 | `fixing` | `codex-s3-source-profiles` | Add an operator-profiled Web S3 source with fixed bucket/prefix/region and safe relative-key lowering |
+| `elspeth-926ac02d3e` | P1 | `fixing` | `codex-s3-source-profiles` | Candidate `190292009` held: correct Web guidance and selection refusal, map malformed Unicode keys, and enforce a lowerable prefix bound |
 | `elspeth-6801b71f71` | P2 | `closed` | `codex-r3-rca-coordinator` | Read-only live DB proof found complete structured failure and DIVERT provenance; UI gap split to `elspeth-18b39eb829` |
 
 ## AWS installer — `elspeth-e54343d43b`
@@ -221,6 +228,11 @@ Append entries; do not rewrite history.
 | 2026-08-03 17:06 | Compose authoring aids integrated | Reviewed both handoffs and rejected the first stale plugin identity; integrated behavior as `2906409e1` and honest FieldMapper source identity as `e1d31f104`; 176 integrated tests passed; delivery task closed and `ecd8594b63` advanced to verifying |
 | 2026-08-03 17:08 | Guided node custody integrated | Independent review approved `9b8882cfe`; integrated as `b424c08c4`; five new regressions passed on release and `1d97fc4b80` advanced to verifying |
 | 2026-08-03 17:11 | Required-controls lane assigned | `981130d70a` confirmed fixing at exact release baseline `b424c08c4`; dedicated worktree/file custody excludes the active S3 tools surface and requires localized handoff before the combined full-suite gate |
+| 2026-08-03 17:18 | Structural index refreshed after core integrations | Loomweave run `fd361568-996f-4d8d-a52d-9d1bd01edb53` completed; index is fresh at exact release SHA `ca375291c` with 70,776 entities and 141,110 edges |
+| 2026-08-03 17:24 | Gate row-error localized handoff held | Candidate `48a6f33fb` passed 1,889 affected tests and repository gates, but independent review found nine P1/P2 gaps; Filigree comment `2163` records Changes requested and the issue remains fixing |
+| 2026-08-03 17:26 | Required-controls RED established | Both explicit approval and auto-commit publish valid Textract-to-LLM proposals without the required prompt-shield/content-safety nodes; production correction is in progress |
+| 2026-08-03 17:33 | S3 source localized handoff held | Candidate `190292009` passed 1,895 targeted tests and repository gates, but independent review found four Important gaps; Filigree comments `2164`/`2165` record the verdict and stale-turn nuance; the issue remains fixing |
+| 2026-08-03 17:35 | Provider-projection audit partitioned | Original D1 and typed gate carry-forward are fixed, but four P1 residuals were reproduced; created child tasks `dca1e81c58`, `3526685369`, and `eacfec09a6`, started the non-overlapping guided-chat lane, and held `guided.py`/`service.py` lanes for current owners |
 
 ## Reconciliation findings
 
