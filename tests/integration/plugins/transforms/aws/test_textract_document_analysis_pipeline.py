@@ -130,6 +130,25 @@ class _FakeTextractSDK:
         self.closed = True
 
 
+class _FakeS3SDK:
+    def __init__(self) -> None:
+        self.head_bucket_requests: list[dict[str, Any]] = []
+        self.closed = False
+
+    def head_bucket(self, **kwargs: Any) -> Mapping[str, object]:
+        self.head_bucket_requests.append(kwargs)
+        return {
+            "BucketRegion": "ap-southeast-2",
+            "ResponseMetadata": {
+                "HTTPStatusCode": 200,
+                "RetryAttempts": 0,
+            },
+        }
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _settings_document(tmp_path: Path) -> tuple[Path, Path]:
     input_path = tmp_path / "documents.csv"
     output_path = tmp_path / "results.jsonl"
@@ -203,16 +222,26 @@ def test_textract_pipeline_uses_real_runtime_and_durable_audit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings_path, output_path = _settings_document(tmp_path)
-    sdk = _FakeTextractSDK()
-    builder_arguments: dict[str, object] = {}
+    textract_sdk = _FakeTextractSDK()
+    s3_sdk = _FakeS3SDK()
+    textract_builder_arguments: dict[str, object] = {}
+    s3_builder_arguments: dict[str, object] = {}
 
-    def build_sdk(**kwargs: object) -> _FakeTextractSDK:
-        builder_arguments.update(kwargs)
-        return sdk
+    def build_textract_sdk(**kwargs: object) -> _FakeTextractSDK:
+        textract_builder_arguments.update(kwargs)
+        return textract_sdk
+
+    def build_s3_sdk(**kwargs: object) -> _FakeS3SDK:
+        s3_builder_arguments.update(kwargs)
+        return s3_sdk
 
     monkeypatch.setattr(
         "elspeth.plugins.transforms.aws.textract_document_analysis.build_textract_sdk_client",
-        build_sdk,
+        build_textract_sdk,
+    )
+    monkeypatch.setattr(
+        "elspeth.plugins.transforms.aws.textract_document_analysis.build_s3_head_bucket_sdk_client",
+        build_s3_sdk,
     )
     settings = load_settings(settings_path)
     bundle = instantiate_plugins_from_config(settings)
@@ -246,15 +275,19 @@ def test_textract_pipeline_uses_real_runtime_and_durable_audit(
 
     assert result.rows_processed == 1
     assert result.rows_succeeded == 1
-    assert builder_arguments == {
+    expected_builder_arguments = {
         "region": "ap-southeast-2",
         "aws_access_key_id": None,
         "aws_secret_access_key": None,
         "aws_session_token": None,
     }
-    assert sdk.closed is True
-    assert len(sdk.start_requests) == 1
-    assert sdk.get_requests == [
+    assert textract_builder_arguments == expected_builder_arguments
+    assert s3_builder_arguments == expected_builder_arguments
+    assert textract_sdk.closed is True
+    assert s3_sdk.closed is True
+    assert s3_sdk.head_bucket_requests == [{"Bucket": "documents"}]
+    assert len(textract_sdk.start_requests) == 1
+    assert textract_sdk.get_requests == [
         {"JobId": "job-integration", "MaxResults": 1000},
         {"JobId": "job-integration", "MaxResults": 1000},
         {"JobId": "job-integration", "MaxResults": 1000, "NextToken": _RAW_NEXT_TOKEN},
@@ -285,8 +318,16 @@ def test_textract_pipeline_uses_real_runtime_and_durable_audit(
     token = read.query.get_tokens(row.row_id)[0]
     transform_node_id = graph.get_transform_id_map()[0]
     state = next(state for state in read.query.get_node_states_for_token(token.token_id) if state.node_id == transform_node_id)
+    assert state.success_reason_json is not None
+    assert json.loads(state.success_reason_json)["metadata"]["bucket_region_verification"] == {
+        "configured_region": "ap-southeast-2",
+        "observed_region": "ap-southeast-2",
+        "proof_source": "response_field",
+        "http_status": 200,
+        "cache_status": "live",
+    }
     calls = read.query.get_calls(state.state_id)
-    assert [call.call_index for call in calls] == [0, 1, 2, 3]
+    assert [call.call_index for call in calls] == [0, 1, 2, 3, 4]
     assert all(call.call_type is CallType.HTTP and call.status is CallStatus.SUCCESS for call in calls)
 
     retained_payloads: list[object] = []
@@ -297,6 +338,22 @@ def test_textract_pipeline_uses_real_runtime_and_durable_audit(
         assert response.state is CallDataState.AVAILABLE
         assert response.data is not None
         retained_payloads.append(deep_thaw(response.data))
+    assert retained_payloads[:2] == [
+        {
+            "operation": "head_bucket_region",
+            "configured_region": "ap-southeast-2",
+            "bucket": "documents",
+        },
+        {
+            "operation": "head_bucket_region",
+            "status": "verified",
+            "observed_region": "ap-southeast-2",
+            "proof_source": "response_field",
+            "provider_code": None,
+            "http_status": 200,
+            "attempts": 1,
+        },
+    ]
     retained = json.dumps(retained_payloads, sort_keys=True)
     assert _RAW_NEXT_TOKEN not in retained
     assert "provider-private-header" not in retained
