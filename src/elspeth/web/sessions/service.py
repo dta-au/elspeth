@@ -5835,13 +5835,28 @@ class SessionServiceImpl:
         """Atomically create one canonical pipeline row + bound event."""
         if type(plan) is not PipelinePlanResult:
             raise TypeError("plan must be an exact PipelinePlanResult")
-        expected_redacted_arguments = redact_tool_call_arguments(
-            "set_pipeline",
-            deep_thaw(plan.proposal.pipeline),
-            telemetry=NoopRedactionTelemetry(),
+
+        def _without_intercepted_inline_defaults(value: Any) -> Any:
+            if type(value) is not dict:
+                return value
+            source = value.get("source")
+            if type(source) is not dict or source.get("inline_blob", object()) is not None:
+                return value
+            safe_source = dict(source)
+            del safe_source["inline_blob"]
+            return {**value, "source": safe_source}
+
+        expected_redacted_arguments = _without_intercepted_inline_defaults(
+            redact_tool_call_arguments(
+                "set_pipeline",
+                deep_thaw(plan.proposal.pipeline),
+                telemetry=NoopRedactionTelemetry(),
+            )
         )
-        if deep_thaw(arguments_redacted_json) != expected_redacted_arguments:
+        normalized_redacted_arguments = _without_intercepted_inline_defaults(deep_thaw(arguments_redacted_json))
+        if normalized_redacted_arguments != expected_redacted_arguments:
             raise AuditIntegrityError("pipeline proposal redacted arguments do not match the manifest projection")
+        arguments_redacted_json = normalized_redacted_arguments
         proposal = plan.proposal
         if proposal.surface in {PlannerSurface.FREEFORM, PlannerSurface.GUIDED_FULL} and proposal.reviewed_anchor_hash != stable_hash(
             {"schema": "guided.reviewed-anchors.v1", "facts": {}}

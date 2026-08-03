@@ -36,9 +36,10 @@ rejection.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Final, Literal, cast
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.plugin_capabilities import ControlMode, ControlRole, PluginCapability
 from elspeth.plugins.infrastructure.manager import PluginNotFoundError, get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -70,7 +71,10 @@ from elspeth.web.composer.state import (
 # "" -> 'discard' fold (elspeth-bcd7051143); deep-importing tools._common is
 # the established cross-package pattern (pipeline_planner, pipeline_commit,
 # guided.emitters do the same).
-from elspeth.web.composer.tools._common import canonicalize_source_validation_failure
+from elspeth.web.composer.tools._common import (
+    _canonicalize_authored_interpretation_requirements,
+    canonicalize_source_validation_failure,
+)
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     REQUIRED_CONTROL_AUTO_WIRED_USER_TERM,
@@ -807,4 +811,82 @@ def wire_required_controls(
     return working_candidate
 
 
-__all__ = ["wire_required_controls"]
+def wire_required_controls_state(
+    state: CompositionState,
+    snapshot: PluginAvailabilitySnapshot,
+    catalog: PolicyCatalogView,
+) -> CompositionState:
+    """Splice controls into an owned state without a public-authoring round trip.
+
+    Incremental composer tools already produced and validated ``state`` at the
+    point this helper runs. Re-serializing that owned state through public
+    ``set_pipeline`` v1 is both unnecessary and incomplete: named blob-backed
+    sources intentionally have no public scalar binding in that schema. This
+    projection changes only the topology fields the candidate finalizer owns,
+    canonicalizes only the nominal disclosures it inserted, and reconstructs
+    an exact owned ``CompositionState``. Any impossible projection failure is
+    an internal integrity failure, never permission to publish the uncovered
+    input state.
+    """
+    candidate = state.to_dict()
+    candidate["outputs"] = [
+        {
+            **{key: value for key, value in output.items() if key != "name"},
+            "sink_name": output["name"],
+        }
+        for output in candidate["outputs"]
+    ]
+    finalized = wire_required_controls(candidate, snapshot, catalog)
+    if finalized is candidate:
+        return state
+    if type(finalized) is not dict:
+        raise AuditIntegrityError("Required-control state finalization must return an exact candidate mapping")
+
+    restored = dict(finalized)
+    raw_outputs = restored.get("outputs")
+    if type(raw_outputs) is not list:
+        raise AuditIntegrityError("Required-control state finalization produced malformed outputs")
+    restored_outputs: list[dict[str, Any]] = []
+    for output in raw_outputs:
+        if type(output) is not dict or type(output.get("sink_name")) is not str:
+            raise AuditIntegrityError("Required-control state finalization produced a malformed output")
+        restored_output = {key: value for key, value in output.items() if key != "sink_name"}
+        restored_output["name"] = output["sink_name"]
+        restored_outputs.append(restored_output)
+    restored["outputs"] = restored_outputs
+
+    raw_nodes = restored.get("nodes")
+    if type(raw_nodes) is not list:
+        raise AuditIntegrityError("Required-control state finalization produced malformed nodes")
+    restored_nodes: list[dict[str, Any]] = []
+    for node in raw_nodes:
+        if type(node) is not dict:
+            raise AuditIntegrityError("Required-control state finalization produced a malformed node")
+        options = node.get("options")
+        requirements = options.get(INTERPRETATION_REQUIREMENTS_KEY) if type(options) is dict else None
+        server_staged = type(requirements) is list and any(
+            type(requirement) is dict and type(requirement.get("user_term")) is ServerStagedRequiredControlUserTerm
+            for requirement in requirements
+        )
+        if not server_staged:
+            restored_nodes.append(node)
+            continue
+        if type(node.get("id")) is not str or type(options) is not dict:
+            raise AuditIntegrityError("Required-control state finalization produced malformed disclosure ownership")
+        canonical_node = dict(node)
+        canonical_node["options"] = _canonicalize_authored_interpretation_requirements(
+            options,
+            component_id=node["id"],
+        )
+        restored_nodes.append(canonical_node)
+    restored["nodes"] = restored_nodes
+    restored["version"] = state.version
+
+    try:
+        finalized_state = CompositionState.from_dict(restored)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AuditIntegrityError("Required-control state finalization produced an invalid owned state") from exc
+    return replace(finalized_state, guided_session=state.guided_session)
+
+
+__all__ = ["wire_required_controls", "wire_required_controls_state"]

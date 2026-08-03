@@ -49,6 +49,7 @@ from elspeth.web.composer.audit import (
     finish_success,
     rebind_dispatch_arguments,
 )
+from elspeth.web.composer.authority_hashing import composer_authority_hash
 from elspeth.web.composer.bounded_json import JsonBoundaryError, bounded_json_loads
 from elspeth.web.composer.discovery_cache import (
     CachedDiscoveryPayload as _CachedDiscoveryPayload,
@@ -77,6 +78,14 @@ from elspeth.web.composer.pipeline_custody import (
     inline_custody_audit_projection,
     prepare_pipeline_custody,
 )
+from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+from elspeth.web.composer.pipeline_proposal import (
+    AbsentBase,
+    PipelineProposal,
+    PlannerSurface,
+    PresentBase,
+    composition_content_hash,
+)
 from elspeth.web.composer.progress import (
     emit_progress,
     tool_batch_progress_event,
@@ -91,6 +100,7 @@ from elspeth.web.composer.protocol import (
     ComposerServiceError,
     ToolArgumentError,
 )
+from elspeth.web.composer.required_controls import wire_required_controls, wire_required_controls_state
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tool_error_payloads import (
     INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
@@ -115,6 +125,7 @@ from elspeth.web.composer.tools import (
     normalize_tool_result_validation,
 )
 from elspeth.web.composer.tools._common import _failure_result
+from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
@@ -310,14 +321,133 @@ def _replace_llm_tool_call_arguments(
 
 
 def _remove_inline_blob_redaction_defaults(value: Any) -> Any:
-    """Remove schema defaults that would recreate intercepted custody fields."""
-    if type(value) is dict:
-        return {
-            key: _remove_inline_blob_redaction_defaults(item) for key, item in value.items() if not (key == "inline_blob" and item is None)
-        }
-    if type(value) is list:
-        return [_remove_inline_blob_redaction_defaults(item) for item in value]
-    return value
+    """Remove only the legacy source custody field's schema-default null."""
+    if type(value) is not dict:
+        return value
+    source = value.get("source")
+    if type(source) is not dict or source.get("inline_blob", object()) is not None:
+        return value
+    safe_source = dict(source)
+    del safe_source["inline_blob"]
+    return {**value, "source": safe_source}
+
+
+@dataclass(frozen=True, slots=True)
+class _SetPipelineFinalization:
+    """Pure candidate-finalization outcome before custody or publication."""
+
+    arguments: Mapping[str, Any]
+    context: ToolContext
+    candidate: Any
+    changed: bool
+
+
+async def _finalize_complete_set_pipeline_candidate(
+    arguments: Mapping[str, Any],
+    state: CompositionState,
+    context: ToolContext,
+    *,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    policy_catalog: PolicyCatalogView,
+) -> _SetPipelineFinalization:
+    """Auto-wire only an already-acceptable atomic set_pipeline draft."""
+    candidate = await run_sync_in_worker(
+        build_set_pipeline_candidate,
+        arguments,
+        state,
+        context,
+    )
+    if not candidate.acceptable:
+        return _SetPipelineFinalization(arguments, context, candidate, False)
+
+    finalized = await run_sync_in_worker(
+        wire_required_controls,
+        arguments,
+        plugin_snapshot,
+        policy_catalog,
+    )
+    if finalized is arguments:
+        return _SetPipelineFinalization(arguments, context, candidate, False)
+
+    detached = deep_thaw(finalized)
+    if type(detached) is not dict:
+        raise AuditIntegrityError("Required-control finalization must return an exact argument mapping")
+    compact_arguments = cast(dict[str, Any], detached)
+
+    # First admit the nominal server-staged compact disclosure. This preserves
+    # the public-boundary rejection of a provider-authored plain-string copy of
+    # the reserved term.
+    compact_candidate = await run_sync_in_worker(
+        build_set_pipeline_candidate,
+        compact_arguments,
+        state,
+        context,
+    )
+    if not compact_candidate.acceptable:
+        raise AuditIntegrityError("Required-control finalization produced an unacceptable compact candidate")
+
+    canonical_arguments = canonicalize_authored_node_review_requirements(
+        compact_arguments,
+        current_state=state,
+    )
+    audit_arguments = inline_custody_audit_projection(canonical_arguments)
+    internal_context = replace(
+        context,
+        tool_arguments_hash=composer_authority_hash(audit_arguments),
+        _interpretation_requirements_are_internal=True,
+    )
+    canonical_candidate = await run_sync_in_worker(
+        build_set_pipeline_candidate,
+        canonical_arguments,
+        state,
+        internal_context,
+    )
+    if not canonical_candidate.acceptable:
+        raise AuditIntegrityError("Required-control finalization produced an unacceptable set_pipeline candidate")
+    return _SetPipelineFinalization(
+        canonical_arguments,
+        internal_context,
+        canonical_candidate,
+        True,
+    )
+
+
+async def _finalize_completed_incremental_mutation(
+    result: ToolResult,
+    prior_state: CompositionState,
+    *,
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    policy_catalog: PolicyCatalogView,
+) -> ToolResult:
+    """Wire controls when one incremental mutation makes the graph valid.
+
+    The mutation has already completed in memory, but its audit success and P4
+    state publication have not happened yet. Invalid/half-built results remain
+    untouched; owned state is finalized directly so public set_pipeline schema
+    limitations cannot become a fail-open path.
+    """
+    if not result.success or result.updated_state.version <= prior_state.version or not result.validation.is_valid:
+        return result
+    finalized_state = await run_sync_in_worker(
+        wire_required_controls_state,
+        result.updated_state,
+        plugin_snapshot,
+        policy_catalog,
+    )
+    if finalized_state is result.updated_state:
+        return result
+    finalized_validation = await run_sync_in_worker(
+        policy_catalog.validate_composition_state,
+        finalized_state,
+    )
+    if not finalized_validation.validation.is_valid:
+        raise AuditIntegrityError("Required-control state finalization produced an invalid composition")
+    return replace(
+        result,
+        updated_state=finalized_validation.authored_state,
+        validation=finalized_validation.validation,
+        affected_nodes=tuple(node.id for node in finalized_validation.authored_state.nodes),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -824,7 +954,12 @@ async def run_tool_batch(
 
         prevalidated_unapplied_result: ToolResult | None = None
         preproposal_exception: BaseException | None = None
-        if (
+        candidate_prior_validation: ValidationSummary | None = None
+        candidate_context: ToolContext | None = None
+        candidate: Any = None
+        pipeline_custody_result: Literal["not_required", "ready"] = "not_required"
+        interpretation_requirements_are_internal = False
+        explicit_approval_required = (
             turn_sessions_service is not None
             and turn_session_uuid is not None
             and turn_preferences is not None
@@ -834,7 +969,69 @@ async def run_tool_batch(
             # later composition proposal may reference. Destructive blob-only
             # writes such as update_blob/delete_blob still require approval.
             and (not is_blob_store_only_mutation_tool(tool_name) or is_approval_required_blob_store_only_mutation_tool(tool_name))
-        ):
+        )
+
+        # The freeform compose loop is a second authoring surface beside the
+        # shared planner. Its atomic set_pipeline call is the equivalent
+        # terminal candidate seam: validate the provider draft first, then
+        # splice deployment-REQUIRED controls exactly once before proposal
+        # custody or auto-commit. Incomplete/invalid drafts remain byte-exact
+        # and continue through the ordinary repair path; in particular, the
+        # server never launders a provider-authored reserved disclosure into
+        # an internal one merely by attempting finalization.
+        if tool_name == "set_pipeline" and not explicit_approval_required:
+            try:
+                candidate_prior_validation = (
+                    last_validation if last_validation is not None else ctx.policy_catalog.validate_composition_state(state).validation
+                )
+                candidate_context = ToolContext(
+                    catalog=ctx.policy_catalog,
+                    plugin_snapshot=ctx.plugin_snapshot,
+                    data_dir=ctx.service._data_dir,
+                    require_data_dir_for_paths=True,
+                    session_engine=ctx.service._session_engine,
+                    session_id=session_id,
+                    secret_service=ctx.service._secret_service,
+                    user_id=user_id,
+                    current_validation=candidate_prior_validation,
+                    max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
+                    user_message_id=user_message_id,
+                    user_message_content=user_message_content,
+                    composer_model_identifier=ctx.service._model,
+                    composer_model_version=safe_response_model(response) or ctx.service._model,
+                    composer_provider=ctx.service._availability.provider or "unknown",
+                    composer_skill_hash=ctx.service._composer_skill_hash,
+                    tool_arguments_hash=audit.binding_arguments_hash,
+                )
+                finalization = await _finalize_complete_set_pipeline_candidate(
+                    arguments,
+                    state,
+                    candidate_context,
+                    plugin_snapshot=ctx.plugin_snapshot,
+                    policy_catalog=ctx.policy_catalog,
+                )
+                arguments = cast(dict[str, Any], finalization.arguments)
+                candidate_context = finalization.context
+                candidate = finalization.candidate
+                if finalization.changed:
+                    audit_arguments = cast(dict[str, Any], inline_custody_audit_projection(arguments))
+                    audit = rebind_dispatch_arguments(audit, audit_arguments)
+                    decoded_args_by_call_id[tool_call.id] = audit_arguments
+                    _replace_llm_tool_call_arguments(
+                        llm_messages,
+                        tool_call_id=tool_call.id,
+                        arguments=audit_arguments,
+                    )
+                    interpretation_requirements_are_internal = True
+            except BaseException as exc:
+                # Re-raise exactly once from inside dispatch_with_audit so the
+                # established ARG_ERROR / PLUGIN_CRASH authority records the
+                # failure without any proposal, blob, or state publication.
+                preproposal_exception = exc
+
+        if explicit_approval_required:
+            assert turn_sessions_service is not None
+            assert turn_session_uuid is not None
             if proposals_this_turn >= _MAX_PENDING_PROPOSALS_PER_TURN:
                 raise ComposerServiceError(
                     f"Composer produced too many pending tool proposals in one turn ({_MAX_PENDING_PROPOSALS_PER_TURN} maximum)."
@@ -870,154 +1067,171 @@ async def run_tool_batch(
             except PydanticValidationError:
                 redacted_arguments = None
 
-            candidate_prior_validation: ValidationSummary | None = None
             if redacted_arguments is not None and tool_name == "set_pipeline":
-                try:
-                    candidate_prior_validation = (
-                        last_validation if last_validation is not None else ctx.policy_catalog.validate_composition_state(state).validation
-                    )
-                    candidate_context = ToolContext(
-                        catalog=ctx.policy_catalog,
-                        plugin_snapshot=ctx.plugin_snapshot,
-                        data_dir=ctx.service._data_dir,
-                        require_data_dir_for_paths=True,
-                        session_engine=ctx.service._session_engine,
-                        session_id=session_id,
-                        secret_service=ctx.service._secret_service,
-                        user_id=user_id,
-                        current_validation=candidate_prior_validation,
-                        max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
-                        user_message_id=user_message_id,
-                        user_message_content=user_message_content,
-                        composer_model_identifier=ctx.service._model,
-                        composer_model_version=safe_response_model(response) or ctx.service._model,
-                        composer_provider=ctx.service._availability.provider or "unknown",
-                        composer_skill_hash=ctx.service._composer_skill_hash,
-                        tool_arguments_hash=audit.binding_arguments_hash,
-                    )
-                    candidate = await run_sync_in_worker(
-                        build_set_pipeline_candidate,
-                        arguments,
-                        state,
-                        candidate_context,
-                    )
-                    finalized_candidate_result = finalize_tool_result(
-                        candidate.result,
-                        tool_name=tool_name,
-                        catalog=ctx.policy_catalog,
-                        context=candidate_context,
-                        prior_validation=candidate_prior_validation,
-                    )
-                    proposal_acceptable = candidate.acceptable
-                    if proposal_acceptable and candidate.prepared_inline_blob is not None:
-                        if session_id is None or ctx.service._session_engine is None:
-                            raise AuditIntegrityError("Inline proposal custody requires session context")
-                        custody = prepare_pipeline_custody(
-                            arguments,
-                            candidate.prepared_inline_blob,
-                            session_id=session_id,
-                        )
-
-                        # From this point forward every authority-bearing and
-                        # externally visible copy uses only source.blob_id.
-                        # This happens before custody I/O so a reservation
-                        # failure cannot leave raw content in the dispatch
-                        # audit, persisted turn manifest, or next LLM request.
-                        arguments = cast(dict[str, Any], deep_thaw(custody.arguments))
-                        audit = rebind_dispatch_arguments(audit, arguments)
-                        decoded_args_by_call_id[tool_call.id] = arguments
-                        _replace_llm_tool_call_arguments(
-                            llm_messages,
-                            tool_call_id=tool_call.id,
-                            arguments=arguments,
-                        )
-                        safe_candidate_context = replace(
-                            candidate_context,
-                            tool_arguments_hash=audit.binding_arguments_hash,
-                        )
-                        custody_outcome = await _try_finalize_proposal_custody(
-                            custody,
-                            engine=ctx.service._session_engine,
-                            data_dir=ctx.service._data_dir,
-                            max_storage_per_session=ctx.service._settings.max_blob_storage_per_session_bytes,
-                        )
-                        if custody_outcome == "quota_exceeded":
-                            proposal_acceptable = False
-                            finalized_candidate_result = finalize_tool_result(
-                                _failure_result(
-                                    state,
-                                    "Session blob quota exceeded while reserving inline proposal custody.",
-                                    error_code="BLOB_QUOTA_EXCEEDED",
-                                ),
-                                tool_name=tool_name,
-                                catalog=ctx.policy_catalog,
-                                context=safe_candidate_context,
-                                prior_validation=candidate_prior_validation,
-                            )
-                        else:
-                            candidate = await run_sync_in_worker(
-                                build_set_pipeline_candidate,
-                                arguments,
-                                state,
-                                safe_candidate_context,
-                            )
-                            finalized_candidate_result = finalize_tool_result(
-                                candidate.result,
-                                tool_name=tool_name,
-                                catalog=ctx.policy_catalog,
-                                context=safe_candidate_context,
-                                prior_validation=candidate_prior_validation,
-                            )
-                            proposal_acceptable = candidate.acceptable
-
-                        # Re-run the manifest against the final safe shape;
-                        # neither proposal summary nor public arguments may be
-                        # derived from the original inline-content payload.
-                        redacted_arguments = cast(
-                            dict[str, Any],
-                            _remove_inline_blob_redaction_defaults(
-                                redact_tool_call_arguments(
-                                    tool_name,
-                                    arguments,
-                                    telemetry=ctx.service._redaction_telemetry,
-                                )
-                            ),
-                        )
-                except BaseException as exc:
-                    # Candidate construction and finalization are one-time
-                    # pre-proposal work. Re-raise the exact exception from
-                    # inside ``dispatch_with_audit`` below so its existing
-                    # ARG_ERROR / PLUGIN_CRASH classification remains the
-                    # single authority without rerunning either operation.
-                    preproposal_exception = exc
+                if preproposal_exception is not None:
                     redacted_arguments = None
                 else:
-                    if not proposal_acceptable:
-                        if isinstance(finalized_candidate_result.data, Mapping):
-                            feedback_data = dict(finalized_candidate_result.data)
-                        elif finalized_candidate_result.data is None:
-                            feedback_data = {}
-                        else:
-                            feedback_data = {"candidate_data": finalized_candidate_result.data}
-                        feedback_data.update(
-                            {
-                                "status": "PREVALIDATION_REJECTED",
-                                "applied": False,
-                                "applied_version": state.version,
-                                "candidate_version": finalized_candidate_result.updated_state.version,
-                                "message": (
-                                    "The candidate pipeline failed prevalidation, was not applied, and was not "
-                                    "submitted for approval. Repair the reported validation errors and retry."
+                    try:
+                        candidate_prior_validation = (
+                            last_validation
+                            if last_validation is not None
+                            else ctx.policy_catalog.validate_composition_state(state).validation
+                        )
+                        candidate_context = ToolContext(
+                            catalog=ctx.policy_catalog,
+                            plugin_snapshot=ctx.plugin_snapshot,
+                            data_dir=ctx.service._data_dir,
+                            require_data_dir_for_paths=True,
+                            session_engine=ctx.service._session_engine,
+                            session_id=session_id,
+                            secret_service=ctx.service._secret_service,
+                            user_id=user_id,
+                            current_validation=candidate_prior_validation,
+                            max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
+                            user_message_id=user_message_id,
+                            user_message_content=user_message_content,
+                            composer_model_identifier=ctx.service._model,
+                            composer_model_version=safe_response_model(response) or ctx.service._model,
+                            composer_provider=ctx.service._availability.provider or "unknown",
+                            composer_skill_hash=ctx.service._composer_skill_hash,
+                            tool_arguments_hash=audit.binding_arguments_hash,
+                        )
+                        finalization = await _finalize_complete_set_pipeline_candidate(
+                            arguments,
+                            state,
+                            candidate_context,
+                            plugin_snapshot=ctx.plugin_snapshot,
+                            policy_catalog=ctx.policy_catalog,
+                        )
+                        arguments = cast(dict[str, Any], finalization.arguments)
+                        candidate_context = finalization.context
+                        candidate = finalization.candidate
+                        if finalization.changed:
+                            audit_arguments = cast(dict[str, Any], inline_custody_audit_projection(arguments))
+                            audit = rebind_dispatch_arguments(audit, audit_arguments)
+                            decoded_args_by_call_id[tool_call.id] = audit_arguments
+                            _replace_llm_tool_call_arguments(
+                                llm_messages,
+                                tool_call_id=tool_call.id,
+                                arguments=audit_arguments,
+                            )
+                            interpretation_requirements_are_internal = True
+                            redacted_arguments = redact_tool_call_arguments(
+                                tool_name,
+                                arguments,
+                                telemetry=ctx.service._redaction_telemetry,
+                            )
+                        finalized_candidate_result = finalize_tool_result(
+                            candidate.result,
+                            tool_name=tool_name,
+                            catalog=ctx.policy_catalog,
+                            context=candidate_context,
+                            prior_validation=candidate_prior_validation,
+                        )
+                        proposal_acceptable = candidate.acceptable
+                        if proposal_acceptable and candidate.prepared_inline_blob is not None:
+                            if session_id is None or ctx.service._session_engine is None:
+                                raise AuditIntegrityError("Inline proposal custody requires session context")
+                            custody = prepare_pipeline_custody(
+                                arguments,
+                                candidate.prepared_inline_blob,
+                                session_id=session_id,
+                            )
+
+                            # From this point forward every authority-bearing
+                            # and externally visible copy uses source.blob_id.
+                            arguments = cast(dict[str, Any], deep_thaw(custody.arguments))
+                            audit = rebind_dispatch_arguments(audit, arguments)
+                            decoded_args_by_call_id[tool_call.id] = arguments
+                            _replace_llm_tool_call_arguments(
+                                llm_messages,
+                                tool_call_id=tool_call.id,
+                                arguments=arguments,
+                            )
+                            safe_candidate_context = replace(
+                                candidate_context,
+                                tool_arguments_hash=audit.binding_arguments_hash,
+                            )
+                            custody_outcome = await _try_finalize_proposal_custody(
+                                custody,
+                                engine=ctx.service._session_engine,
+                                data_dir=ctx.service._data_dir,
+                                max_storage_per_session=ctx.service._settings.max_blob_storage_per_session_bytes,
+                            )
+                            if custody_outcome == "quota_exceeded":
+                                proposal_acceptable = False
+                                finalized_candidate_result = finalize_tool_result(
+                                    _failure_result(
+                                        state,
+                                        "Session blob quota exceeded while reserving inline proposal custody.",
+                                        error_code="BLOB_QUOTA_EXCEEDED",
+                                    ),
+                                    tool_name=tool_name,
+                                    catalog=ctx.policy_catalog,
+                                    context=safe_candidate_context,
+                                    prior_validation=candidate_prior_validation,
+                                )
+                            else:
+                                pipeline_custody_result = "ready"
+                                candidate = await run_sync_in_worker(
+                                    build_set_pipeline_candidate,
+                                    arguments,
+                                    state,
+                                    safe_candidate_context,
+                                )
+                                finalized_candidate_result = finalize_tool_result(
+                                    candidate.result,
+                                    tool_name=tool_name,
+                                    catalog=ctx.policy_catalog,
+                                    context=safe_candidate_context,
+                                    prior_validation=candidate_prior_validation,
+                                )
+                                proposal_acceptable = candidate.acceptable
+
+                            # Re-run the manifest against the final safe shape.
+                            redacted_arguments = cast(
+                                dict[str, Any],
+                                _remove_inline_blob_redaction_defaults(
+                                    redact_tool_call_arguments(
+                                        tool_name,
+                                        arguments,
+                                        telemetry=ctx.service._redaction_telemetry,
+                                    )
                                 ),
-                            }
-                        )
-                        prevalidated_unapplied_result = replace(
-                            finalized_candidate_result,
-                            data=feedback_data,
-                        )
-                        # Skip proposal creation, then route the rejected result
-                        # through the canonical dispatch/outcome path below.
+                            )
+                    except BaseException as exc:
+                        # Candidate finalization is one-time pre-proposal work.
+                        # Re-raise it inside dispatch_with_audit below without
+                        # rerunning the operation.
+                        preproposal_exception = exc
                         redacted_arguments = None
+                    else:
+                        if not proposal_acceptable:
+                            if isinstance(finalized_candidate_result.data, Mapping):
+                                feedback_data = dict(finalized_candidate_result.data)
+                            elif finalized_candidate_result.data is None:
+                                feedback_data = {}
+                            else:
+                                feedback_data = {"candidate_data": finalized_candidate_result.data}
+                            feedback_data.update(
+                                {
+                                    "status": "PREVALIDATION_REJECTED",
+                                    "applied": False,
+                                    "applied_version": state.version,
+                                    "candidate_version": finalized_candidate_result.updated_state.version,
+                                    "message": (
+                                        "The candidate pipeline failed prevalidation, was not applied, and was not "
+                                        "submitted for approval. Repair the reported validation errors and retry."
+                                    ),
+                                }
+                            )
+                            prevalidated_unapplied_result = replace(
+                                finalized_candidate_result,
+                                data=feedback_data,
+                            )
+                            # Route the rejected result through canonical
+                            # dispatch/outcome without proposal publication.
+                            redacted_arguments = None
 
             if redacted_arguments is not None:
                 proposal_summary = build_tool_proposal_summary(
@@ -1025,24 +1239,64 @@ async def run_tool_batch(
                     arguments=arguments,
                     redacted_arguments=redacted_arguments,
                 )
-                proposal = await turn_sessions_service.create_composition_proposal(
-                    session_id=turn_session_uuid,
-                    tool_call_id=tool_call.id,
-                    tool_name=tool_name,
-                    summary=proposal_summary.summary,
-                    rationale=proposal_summary.rationale,
-                    affects=proposal_summary.affects,
-                    arguments_json=arguments,
-                    arguments_redacted_json=proposal_summary.arguments_redacted_json,
-                    base_state_id=UUID(current_state_id) if current_state_id is not None else None,
-                    actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
-                    user_message_id=UUID(user_message_id) if user_message_id is not None else None,
-                    composer_model_identifier=ctx.service._model,
-                    composer_model_version=safe_response_model(response) or ctx.service._model,
-                    composer_provider=ctx.service._availability.provider or "unknown",
-                    composer_skill_hash=ctx.service._composer_skill_hash,
-                    tool_arguments_hash=audit.binding_arguments_hash,
-                )
+                if tool_name == "set_pipeline":
+                    proposal_base = (
+                        PresentBase(
+                            state_id=UUID(current_state_id),
+                            composition_content_hash=composition_content_hash(state),
+                        )
+                        if current_state_id is not None
+                        else AbsentBase()
+                    )
+                    pipeline_proposal = PipelineProposal.create(
+                        pipeline=arguments,
+                        base=proposal_base,
+                        reviewed_facts={},
+                        surface=PlannerSurface.FREEFORM,
+                        repair_count=0,
+                        skill_hash=ctx.service._composer_skill_hash,
+                        covered_deferred_intent_ids=(),
+                        supersedes_draft_hash=None,
+                    )
+                    proposal = await turn_sessions_service.create_pipeline_composition_proposal(
+                        session_id=turn_session_uuid,
+                        plan=PipelinePlanResult(
+                            proposal=pipeline_proposal,
+                            tool_call_id=tool_call.id,
+                            custody_result=pipeline_custody_result,
+                            model_identifier=ctx.service._model,
+                            model_version=safe_response_model(response) or ctx.service._model,
+                            provider=ctx.service._availability.provider or "unknown",
+                        ),
+                        summary=proposal_summary.summary,
+                        rationale=proposal_summary.rationale,
+                        affects=proposal_summary.affects,
+                        arguments_redacted_json=proposal_summary.arguments_redacted_json,
+                        actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+                        user_message_id=UUID(user_message_id) if user_message_id is not None else None,
+                        composer_model_identifier=ctx.service._model,
+                        composer_model_version=safe_response_model(response) or ctx.service._model,
+                        composer_provider=ctx.service._availability.provider or "unknown",
+                    )
+                else:
+                    proposal = await turn_sessions_service.create_composition_proposal(
+                        session_id=turn_session_uuid,
+                        tool_call_id=tool_call.id,
+                        tool_name=tool_name,
+                        summary=proposal_summary.summary,
+                        rationale=proposal_summary.rationale,
+                        affects=proposal_summary.affects,
+                        arguments_json=arguments,
+                        arguments_redacted_json=proposal_summary.arguments_redacted_json,
+                        base_state_id=UUID(current_state_id) if current_state_id is not None else None,
+                        actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
+                        user_message_id=UUID(user_message_id) if user_message_id is not None else None,
+                        composer_model_identifier=ctx.service._model,
+                        composer_model_version=safe_response_model(response) or ctx.service._model,
+                        composer_provider=ctx.service._availability.provider or "unknown",
+                        composer_skill_hash=ctx.service._composer_skill_hash,
+                        tool_arguments_hash=audit.binding_arguments_hash,
+                    )
                 proposals_this_turn += 1
                 proposal_payload = {
                     "success": True,
@@ -1584,6 +1838,7 @@ async def run_tool_batch(
             _composer_provider: str = ctx.service._availability.provider or "unknown",
             _composer_skill_hash: str = ctx.service._composer_skill_hash,
             _tool_arguments_hash: str = audit.binding_arguments_hash,
+            _interpretation_requirements_are_internal: bool = interpretation_requirements_are_internal,
             _prevalidated_unapplied_result: ToolResult | None = prevalidated_unapplied_result,
             _preproposal_exception: BaseException | None = preproposal_exception,
         ) -> Any:
@@ -1591,7 +1846,7 @@ async def run_tool_batch(
                 raise _preproposal_exception
             if _prevalidated_unapplied_result is not None:
                 return _prevalidated_unapplied_result
-            return await run_sync_in_worker(
+            dispatched_result = await run_sync_in_worker(
                 execute_tool,
                 _tool_name,
                 _arguments,
@@ -1616,7 +1871,22 @@ async def run_tool_batch(
                 validate_arguments=True,
                 require_data_dir_for_paths=True,
                 raise_schema_argument_errors=True,
+                _interpretation_requirements_are_internal=_interpretation_requirements_are_internal,
             )
+            if (
+                _tool_name != "set_pipeline"
+                and is_mutation_tool(_tool_name)
+                and dispatched_result.success
+                and dispatched_result.updated_state.version > _state.version
+                and dispatched_result.validation.is_valid
+            ):
+                dispatched_result = await _finalize_completed_incremental_mutation(
+                    dispatched_result,
+                    _state,
+                    plugin_snapshot=ctx.plugin_snapshot,
+                    policy_catalog=ctx.policy_catalog,
+                )
+            return dispatched_result
 
         # ``_arg_error_payload`` is a module-level helper (F2 — testable
         # without spinning up the full compose loop). The nested

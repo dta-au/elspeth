@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.required_controls import wire_required_controls_state
 from elspeth.web.composer.tools import is_approval_required_blob_store_only_mutation_tool
 
 from .._helpers import (
@@ -231,6 +235,32 @@ async def accept_composition_proposal(
             )
         )
         cancellation_deferred = cancellation_deferred or was_cancelled
+        if result.success and result.updated_state.version > current_state.version and result.validation.is_valid:
+            finalized_state, was_cancelled = await _await_with_deferred_cancellation(
+                run_sync_in_worker(
+                    wire_required_controls_state,
+                    result.updated_state,
+                    plugin_snapshot,
+                    policy_catalog,
+                )
+            )
+            cancellation_deferred = cancellation_deferred or was_cancelled
+            if finalized_state is not result.updated_state:
+                finalized_validation, was_cancelled = await _await_with_deferred_cancellation(
+                    run_sync_in_worker(
+                        policy_catalog.validate_composition_state,
+                        finalized_state,
+                    )
+                )
+                cancellation_deferred = cancellation_deferred or was_cancelled
+                if not finalized_validation.validation.is_valid:
+                    raise AuditIntegrityError("Required-control proposal finalization produced an invalid composition")
+                result = replace(
+                    result,
+                    updated_state=finalized_validation.authored_state,
+                    validation=finalized_validation.validation,
+                    affected_nodes=tuple(node.id for node in finalized_validation.authored_state.nodes),
+                )
         if result.updated_state.version == current_state.version:
             # The tool ran but did not advance composition state. The route
             # used to return a single uninformative 409 here regardless of

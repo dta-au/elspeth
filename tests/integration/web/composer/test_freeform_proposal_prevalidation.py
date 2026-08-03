@@ -520,13 +520,13 @@ async def test_inline_proposal_gap_retry_reuses_one_custody_blob_and_quota_charg
     captured_safe_arguments: list[dict[str, Any]] = []
 
     async def _interrupt_before_proposal(**kwargs: Any) -> Any:
-        captured_safe_arguments.append(deepcopy(kwargs["arguments_json"]))
+        captured_safe_arguments.append(deepcopy(deep_thaw(kwargs["plan"].proposal.pipeline)))
         raise RuntimeError("simulated interruption before proposal creation")
 
     first_llm = _ScriptedLLM(_tool_turn("call_gap", "set_pipeline", arguments))
     with (
         patch.object(harness.service, "_call_llm", new=first_llm),
-        patch.object(harness.sessions, "create_composition_proposal", new=_interrupt_before_proposal),
+        patch.object(harness.sessions, "create_pipeline_composition_proposal", new=_interrupt_before_proposal),
         pytest.raises(RuntimeError, match="simulated interruption before proposal creation"),
     ):
         await harness.service.compose(
@@ -568,8 +568,10 @@ async def test_inline_proposal_gap_retry_reuses_one_custody_blob_and_quota_charg
     proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
     assert len(proposals) == 1
     retry_arguments = deep_thaw(proposals[0].arguments_json)
+    retry_redacted_arguments = deep_thaw(proposals[0].arguments_redacted_json)
     assert retry_arguments["source"]["blob_id"] == first_blob.id
     assert "inline_blob" not in retry_arguments["source"]
+    assert "inline_blob" not in retry_redacted_arguments["source"]
     assert raw_content not in json.dumps(retry_arguments)
     assert _count_rows(harness.engine, blobs_table) == 1
     with harness.engine.connect() as conn:
