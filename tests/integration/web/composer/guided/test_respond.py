@@ -42,6 +42,14 @@ from elspeth.web.composer.guided.protocol import (
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.progress import ComposerProgressRegistry
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.yaml_generator import reattach_guided_blob_refs_for_public_export
+from elspeth.web.execution.schemas import (
+    ValidationCheck,
+    ValidationError,
+    ValidationReadiness,
+    ValidationReadinessBlocker,
+    ValidationResult,
+)
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.sessions.converters import state_from_record
 from elspeth.web.sessions.models import (
@@ -3844,6 +3852,92 @@ class TestStep2IntraStep:
             assert storage_path not in replayed.text
             assert storage_path not in json.dumps(restored)
             assert all(storage_path not in repr(event.payload) for event in events)
+
+    def test_confirm_wiring_persists_authoritative_proof_failure_instead_of_prepared_green_result(
+        self,
+        composer_test_client: TestClient,
+    ) -> None:
+        """Guided confirmation must use the same proof-enriched gate as execution."""
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(
+            composer_test_client,
+            session_id,
+            filename="proof-rejected.jsonl",
+            blob_content="amount\n250.00\n750.00\n",
+        )
+        assert staged["next_turn"]["type"] == "propose_pipeline"
+        reviewed = _review_wiring(composer_test_client, session_id)
+        assert reviewed["next_turn"]["type"] == "confirm_wiring"
+
+        class _ProofRejectingExecutionService:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str | None, UUID | None]] = []
+                self.proof_source_options: Mapping[str, object] | None = None
+                self.reviewed_source_options: Mapping[str, object] | None = None
+
+            async def validate_state(
+                self,
+                state,
+                *,
+                user_id: str | None = None,
+                session_id: UUID | None = None,
+                completion_gates=None,
+            ) -> ValidationResult:
+                del completion_gates
+                self.calls.append((user_id, session_id))
+                proof_state = reattach_guided_blob_refs_for_public_export(state)
+                source = next(iter(proof_state.sources.values()))
+                self.proof_source_options = source.options
+                if state.guided_session is not None:
+                    self.reviewed_source_options = next(iter(state.guided_session.reviewed_sources.values())).options
+                return ValidationResult(
+                    is_valid=False,
+                    checks=[
+                        ValidationCheck(
+                            name="proof_diagnostics",
+                            passed=False,
+                            detail="Bounded source proof found 1 blocking diagnostic(s).",
+                            affected_nodes=("amount_gate",),
+                            outcome_code=None,
+                        )
+                    ],
+                    errors=[
+                        ValidationError(
+                            component_id="amount_gate",
+                            component_type="gate",
+                            message="Observed CSV strings cannot be compared to a numeric threshold.",
+                            suggestion="Declare amount as a numeric field.",
+                            error_code="gate_expression_type_mismatch_against_source_schema",
+                        )
+                    ],
+                    readiness=ValidationReadiness(
+                        authoring_valid=False,
+                        execution_ready=False,
+                        completion_ready=False,
+                        blockers=[
+                            ValidationReadinessBlocker(
+                                code="gate_expression_type_mismatch_against_source_schema",
+                                component_id="amount_gate",
+                                component_type="gate",
+                                detail="Bounded source proof blocked execution.",
+                            )
+                        ],
+                    ),
+                )
+
+        proof_authority = _ProofRejectingExecutionService()
+        composer_test_client.app.state.execution_service = proof_authority
+
+        accepted = _confirm_wiring(composer_test_client, session_id)
+
+        assert proof_authority.calls == [("alice", UUID(session_id))]
+        assert proof_authority.reviewed_source_options is not None
+        assert str(proof_authority.reviewed_source_options["path"]).startswith("blob:")
+        assert proof_authority.proof_source_options is not None
+        assert "blob_ref" in proof_authority.proof_source_options
+        assert accepted["terminal"]["kind"] == "completed"
+        assert accepted["composition_state"]["is_valid"] is False
+        assert accepted["composition_state"]["validation_errors"] == ["guided_composition_invalid"]
 
     def test_respond_planner_call_threads_a_live_progress_sink(
         self,

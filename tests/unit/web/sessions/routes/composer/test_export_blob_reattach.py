@@ -92,7 +92,85 @@ def test_reattaches_blob_ref_when_reviewed_snapshot_uses_public_blob_sentinel() 
         "schema": {"mode": "observed"},
         "blob_ref": BLOB_REF,
     }
+    public_options = generate_public_pipeline_dict(out)["sources"]["source"]["options"]
+    assert "path" not in public_options
+    assert "blob_ref" not in public_options
+    assert BLOB_REF not in repr(public_options)
     assert "blob_ref" not in state.sources["source"].options
+
+
+def test_reattaches_blob_ref_from_guided_native_sentinel_without_duplicate_identity_key() -> None:
+    state = _state(
+        source_options={"path": BLOB_PATH, "schema": {"mode": "observed"}},
+        guided_session=_guided_with_snapshot(blob_ref=None, path=f"blob:{BLOB_REF}"),
+    )
+
+    out = _reattach_guided_blob_refs(state)
+
+    assert out.sources["source"].options == {
+        "path": BLOB_PATH,
+        "schema": {"mode": "observed"},
+        "blob_ref": BLOB_REF,
+    }
+
+
+@pytest.mark.parametrize(
+    "sentinel",
+    (
+        "blob:",
+        "blob:not-a-uuid",
+        "blob:ABC12300-0000-4000-8000-000000000000",
+    ),
+)
+def test_rejects_malformed_guided_native_blob_sentinel_without_duplicate_identity_key(
+    sentinel: str,
+) -> None:
+    state = _state(
+        source_options={"path": BLOB_PATH},
+        guided_session=_guided_with_snapshot(blob_ref=None, path=sentinel),
+    )
+
+    with pytest.raises(AuditIntegrityError, match="canonical UUID"):
+        _reattach_guided_blob_refs(state)
+
+
+def test_rejects_guided_native_blob_sentinel_for_absent_live_source_name() -> None:
+    state = _state(
+        source_options={"path": BLOB_PATH},
+        guided_session=_guided_with_snapshot(
+            blob_ref=None,
+            path=f"blob:{BLOB_REF}",
+            name="foreign_source",
+        ),
+    )
+
+    with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+        _reattach_guided_blob_refs(state)
+
+
+def test_rejects_guided_native_blob_sentinel_mixed_with_private_path_carrier() -> None:
+    guided = _guided_with_snapshot(blob_ref=None, path=f"blob:{BLOB_REF}")
+    stable_id = guided.source_order[0]
+    snapshot = guided.reviewed_sources[stable_id]
+    guided = replace(
+        guided,
+        reviewed_sources={
+            stable_id: replace(
+                snapshot,
+                options={
+                    **snapshot.options,
+                    "file": BLOB_PATH,
+                },
+            )
+        },
+    )
+    state = _state(
+        source_options={"path": BLOB_PATH, "file": BLOB_PATH},
+        guided_session=guided,
+    )
+
+    with pytest.raises(AuditIntegrityError, match="mixes public sentinels and private paths"):
+        _reattach_guided_blob_refs(state)
 
 
 def test_rejects_public_blob_sentinel_that_differs_from_retained_blob_ref() -> None:

@@ -348,19 +348,34 @@ def reattach_guided_blob_refs_for_public_export(state: CompositionState) -> Comp
             raise AuditIntegrityError("guided reviewed source names must be unique")
         reviewed_names.add(source_name)
         snapshot_options = snapshot.options
+        sentinel_paths = frozenset(
+            value
+            for key in GUIDED_REVIEWED_BLOB_PATH_KEYS
+            if key in snapshot_options and type(value := snapshot_options[key]) is str and value.startswith("blob:")
+        )
+        if sentinel_paths:
+            sentinel_path_carriers: set[str] = set()
+            for key in GUIDED_REVIEWED_BLOB_PATH_KEYS:
+                if key not in snapshot_options:
+                    continue
+                value = snapshot_options[key]
+                if type(value) is not str or not value or "\x00" in value:
+                    raise AuditIntegrityError("guided reviewed blob source path carrier must be an exact non-empty string without NUL")
+                sentinel_path_carriers.add(value)
+            if sentinel_paths != frozenset(sentinel_path_carriers):
+                raise AuditIntegrityError("guided reviewed blob source mixes public sentinels and private paths")
+            sentinel_ids = {validate_guided_reviewed_blob_ref(sentinel.removeprefix("blob:")) for sentinel in sentinel_paths}
+            if len(sentinel_ids) != 1:
+                raise AuditIntegrityError("guided reviewed blob sentinel and blob_ref differ")
+            blob_ref = next(iter(sentinel_ids))
+            if "blob_ref" in snapshot_options and validate_guided_reviewed_blob_ref(snapshot_options["blob_ref"]) != blob_ref:
+                raise AuditIntegrityError("guided reviewed blob sentinel and blob_ref differ")
+            sentinel_bindings.append((source_name, blob_ref))
+            continue
         if "blob_ref" not in snapshot_options:
             continue
         blob_ref, blob_backed_paths = validate_guided_reviewed_blob_binding(snapshot_options)
-        sentinel_paths = frozenset(path for path in blob_backed_paths if path.startswith("blob:"))
-        if sentinel_paths:
-            if sentinel_paths != blob_backed_paths:
-                raise AuditIntegrityError("guided reviewed blob source mixes public sentinels and private paths")
-            sentinel_ids = {validate_guided_reviewed_blob_ref(sentinel.removeprefix("blob:")) for sentinel in sentinel_paths}
-            if sentinel_ids != {blob_ref}:
-                raise AuditIntegrityError("guided reviewed blob sentinel and blob_ref differ")
-            sentinel_bindings.append((source_name, blob_ref))
-        else:
-            reviewed_bindings.append((source_name, blob_backed_paths, blob_ref))
+        reviewed_bindings.append((source_name, blob_backed_paths, blob_ref))
 
     if not reviewed_bindings and not sentinel_bindings:
         return state

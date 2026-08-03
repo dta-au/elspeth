@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 import structlog
@@ -32,18 +33,52 @@ from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface
 from elspeth.web.composer.progress import ComposerProgressRegistry
+from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.middleware.rate_limit import ComposerRateLimiter
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
 from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.routes import create_session_router
+from elspeth.web.sessions.routes._helpers import _runtime_preflight_for_state
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
+
+
+class _GuidedTestExecutionService:
+    """Exercise the route's production validation protocol in the minimal app."""
+
+    def __init__(self, app: FastAPI) -> None:
+        self._app = app
+
+    async def validate_state(
+        self,
+        state: CompositionState,
+        *,
+        user_id: str | None = None,
+        session_id: UUID | None = None,
+        completion_gates: object | None = None,
+    ) -> ValidationResult:
+        del completion_gates
+        if user_id is None or session_id is None:
+            raise AssertionError("guided confirmation validation requires principal and session custody")
+        app_state = self._app.state
+        snapshot = app_state.plugin_snapshot_factory(UserIdentity(user_id=user_id, username=user_id))
+        return await _runtime_preflight_for_state(
+            state,
+            settings=app_state.settings,
+            secret_service=app_state.scoped_secret_resolver,
+            user_id=user_id,
+            session_id=session_id,
+            plugin_snapshot=snapshot,
+            profile_registry=app_state.operator_profile_registry,
+            catalog=app_state.catalog_service,
+        )
 
 
 @pytest.fixture
@@ -303,6 +338,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
         )
 
     app.state.plugin_snapshot_factory = lambda user: _principal_snapshot(user.user_id)
+    app.state.execution_service = _GuidedTestExecutionService(app)
 
     # Session service — profile-aware, mirroring production create_app()
     # wiring: the guided proposal settlement independently re-derives wire
@@ -377,6 +413,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
             )
 
         restarted_app.state.plugin_snapshot_factory = lambda user: _restarted_principal_snapshot(user.user_id)
+        restarted_app.state.execution_service = _GuidedTestExecutionService(restarted_app)
         restarted_app.state.session_service = SessionServiceImpl(
             restarted_engine,
             telemetry=build_sessions_telemetry(),

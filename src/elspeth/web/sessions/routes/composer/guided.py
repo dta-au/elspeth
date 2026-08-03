@@ -4405,6 +4405,14 @@ async def post_guided_respond(
                         )
                         from .._helpers import _state_data_from_composer_state
 
+                        authoritative_preflight, _ = await _await_with_deferred_cancellation(
+                            request.app.state.execution_service.validate_state(
+                                accepted_state,
+                                user_id=user.user_id,
+                                session_id=session_id,
+                            ),
+                            state=cancellation_state,
+                        )
                         (state_data, _validation), _ = await _await_with_deferred_cancellation(
                             _state_data_from_composer_state(
                                 accepted_state,
@@ -4415,7 +4423,7 @@ async def post_guided_respond(
                                 plugin_snapshot=plugin_snapshot,
                                 profile_registry=request.app.state.operator_profile_registry,
                                 catalog=request.app.state.catalog_service,
-                                runtime_preflight=prepared.result.runtime_preflight,
+                                runtime_preflight=authoritative_preflight,
                                 preflight_exception_policy="raise",
                                 initial_version=state.version,
                                 telemetry_source="convergence",
