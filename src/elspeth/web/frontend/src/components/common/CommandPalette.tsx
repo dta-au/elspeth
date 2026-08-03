@@ -106,7 +106,7 @@ export function CommandPalette({
       shortcut: "Ctrl+E",
       enabled:
         runAdmissionAvailable &&
-        validationResult?.readiness.execution_ready === true &&
+        validationResult?.readiness?.execution_ready === true &&
         !isExecuting &&
         progress?.status !== "running" &&
         !!activeSessionId,

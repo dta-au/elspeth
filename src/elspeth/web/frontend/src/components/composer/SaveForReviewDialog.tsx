@@ -47,7 +47,7 @@ export function SaveForReviewDialog(): JSX.Element | null {
   const openAndMark = useShareableReviewStore((s) => s.openAndMark);
   const validationResult = useExecutionStore((s) => s.validationResult);
   const completionReady =
-    validationResult?.readiness.completion_ready === true;
+    validationResult?.readiness?.completion_ready === true;
 
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const copyTimeoutRef = useRef<number | null>(null);
@@ -158,7 +158,7 @@ export function SaveForReviewDialog(): JSX.Element | null {
                 aria-disabled={!completionReady || undefined}
                 title={
                   !completionReady
-                    ? validationResult?.readiness.blockers[0]?.detail ??
+                    ? validationResult?.readiness?.blockers[0]?.detail ??
                       "Resolve completion blockers before trying again."
                     : undefined
                 }

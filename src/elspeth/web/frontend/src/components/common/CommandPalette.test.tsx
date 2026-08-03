@@ -8,8 +8,14 @@ import {
   REQUEST_RUN_EVENT,
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
+import {
+  EXECUTION_BLOCKED_VALIDATION_READINESS,
+  makeValidationResult,
+  READY_VALIDATION_READINESS,
+} from "@/test/composerFixtures";
 import { resetStore } from "@/test/store-helpers";
 import type { GuidedSession } from "@/types/guided";
+import type { ValidationResult } from "@/types/index";
 
 vi.mock("@/api/client", () => ({
   fetchSessions: vi.fn(),
@@ -31,12 +37,7 @@ vi.mock("@/api/client", () => ({
 
 const executionStoreState = vi.hoisted(() => ({
   execute: vi.fn(),
-  validationResult: null as null | {
-    is_valid: boolean;
-    readiness: {
-      execution_ready: boolean;
-    };
-  },
+  validationResult: null as ValidationResult | null,
   isExecuting: false,
   progress: null as null | { status: string },
 }));
@@ -203,10 +204,27 @@ describe("CommandPalette guided-mode commands", () => {
 
   it("withholds Execute when structural validity passes but execution readiness is false", () => {
     useSessionStore.setState({ activeSessionId: "session-1" });
+    executionStoreState.validationResult = makeValidationResult({
+      readiness: EXECUTION_BLOCKED_VALIDATION_READINESS,
+    });
+
+    render(
+      <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+    );
+
+    expect(screen.queryByText("Execute Pipeline")).not.toBeInTheDocument();
+  });
+
+  it("withholds Execute when a malformed validation response omits readiness", () => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    // Deliberately model untrusted wire data that violates the mandatory
+    // TypeScript contract. Ordinary fixtures must use makeValidationResult.
     executionStoreState.validationResult = {
       is_valid: true,
-      readiness: { execution_ready: false },
-    };
+      checks: [],
+      errors: [],
+      warnings: [],
+    } as unknown as ValidationResult;
 
     render(
       <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
@@ -217,10 +235,9 @@ describe("CommandPalette guided-mode commands", () => {
 
   it("withholds Execute when the run-admission owner is not mounted", () => {
     useSessionStore.setState({ activeSessionId: "session-1" });
-    executionStoreState.validationResult = {
-      is_valid: true,
-      readiness: { execution_ready: true },
-    };
+    executionStoreState.validationResult = makeValidationResult({
+      readiness: READY_VALIDATION_READINESS,
+    });
 
     render(
       <CommandPalette
@@ -238,10 +255,9 @@ describe("CommandPalette guided-mode commands", () => {
     const onClose = vi.fn();
     window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
     useSessionStore.setState({ activeSessionId: "session-1" });
-    executionStoreState.validationResult = {
-      is_valid: true,
-      readiness: { execution_ready: true },
-    };
+    executionStoreState.validationResult = makeValidationResult({
+      readiness: READY_VALIDATION_READINESS,
+    });
 
     render(
       <CommandPalette
@@ -263,10 +279,9 @@ describe("CommandPalette guided-mode commands", () => {
     ["a run is active", false, { status: "running" }],
   ])("withholds Execute while %s", (_label, isExecuting, progress) => {
     useSessionStore.setState({ activeSessionId: "session-1" });
-    executionStoreState.validationResult = {
-      is_valid: true,
-      readiness: { execution_ready: true },
-    };
+    executionStoreState.validationResult = makeValidationResult({
+      readiness: READY_VALIDATION_READINESS,
+    });
     executionStoreState.isExecuting = isExecuting;
     executionStoreState.progress = progress;
 

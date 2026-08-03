@@ -13,7 +13,11 @@ import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore
 import { useAuditReadinessStore } from "@/stores/auditReadinessStore";
 import { usePluginCatalogStore } from "@/stores/pluginCatalogStore";
 import { resetStore } from "@/test/store-helpers";
-import type { CompositionState, PluginSummary } from "@/types/index";
+import type {
+  CompositionState,
+  PluginSummary,
+  ValidationResult,
+} from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 import type { AuditReadinessSnapshot } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
@@ -198,6 +202,26 @@ describe("ExecuteButton", () => {
     expect(
       screen.getByText("The selected runtime policy does not admit this pipeline."),
     ).toHaveAttribute("data-run-block-reason", "readiness");
+  });
+
+  it("disables Run when a malformed validation response omits readiness", () => {
+    useExecutionStore.setState({
+      // Deliberately model untrusted wire data that violates the mandatory
+      // TypeScript contract. The action must fail closed instead of crashing.
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+      } as unknown as ValidationResult,
+      isExecuting: false,
+      progress: null,
+    });
+    useSessionStore.setState({ activeSessionId: "sess-1" });
+
+    render(<ExecuteButton />);
+
+    expect(screen.getByRole("button", { name: /run pipeline/i })).toBeDisabled();
   });
 
   it("keeps Run enabled for a completion-only advisor blocker", () => {

@@ -4,6 +4,11 @@ import { axe, toHaveNoViolations } from "jest-axe";
 import { SaveForReviewDialog } from "./SaveForReviewDialog";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 import { useExecutionStore } from "@/stores/executionStore";
+import {
+  COMPLETION_BLOCKED_VALIDATION_READINESS,
+  makeValidationResult,
+} from "@/test/composerFixtures";
+import type { ValidationResult } from "@/types/index";
 import * as api from "@/api/shareableReviews";
 
 expect.extend(toHaveNoViolations);
@@ -32,18 +37,7 @@ describe("SaveForReviewDialog", () => {
   beforeEach(() => {
     useShareableReviewStore.getState().reset();
     useExecutionStore.setState({
-      validationResult: {
-        is_valid: true,
-        checks: [],
-        errors: [],
-        warnings: [],
-        readiness: {
-          authoring_valid: true,
-          execution_ready: true,
-          completion_ready: true,
-          blockers: [],
-        },
-      } as never,
+      validationResult: makeValidationResult(),
     });
   });
 
@@ -141,18 +135,9 @@ describe("SaveForReviewDialog", () => {
 
     act(() => {
       useExecutionStore.setState({
-        validationResult: {
-          is_valid: true,
-          checks: [],
-          errors: [],
-          warnings: [],
-          readiness: {
-            authoring_valid: true,
-            execution_ready: true,
-            completion_ready: false,
-            blockers: [],
-          },
-        } as never,
+        validationResult: makeValidationResult({
+          readiness: COMPLETION_BLOCKED_VALIDATION_READINESS,
+        }),
       });
     });
 
@@ -161,6 +146,27 @@ describe("SaveForReviewDialog", () => {
     expect(retry).toBeDisabled();
     fireEvent.click(retry);
     expect(apiSpy).toHaveBeenCalledTimes(callsBeforeBlockedRetry);
+  });
+
+  it("disables Retry when a malformed validation response omits readiness", () => {
+    useExecutionStore.setState({
+      // Deliberately model untrusted wire data that violates the mandatory
+      // TypeScript contract. Ordinary fixtures use makeValidationResult.
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+      } as unknown as ValidationResult,
+    });
+    useShareableReviewStore.setState({
+      dialogOpen: true,
+      error: "composition validation failed",
+    } as never);
+
+    render(<SaveForReviewDialog />);
+
+    expect(screen.getByTestId("save-for-review-retry")).toBeDisabled();
   });
 
   it("shows the share URL and prepends location.origin on success", () => {

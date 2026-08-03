@@ -285,7 +285,7 @@ export function buildRunEgressSummary(
  * Which audit-readiness rows are load-bearing for `canExecute` below, and
  * which are informational/advisory only (elspeth-088bf83922 finding T-2,
  * option (a) — legibility, NOT new gating). Read together with
- * `canExecute`: `validationResult?.readiness.execution_ready === true`
+ * `canExecute`: `validationResult?.readiness?.execution_ready === true`
  * corresponds to the backend-owned execution admission reported through the
  * `validation` row; `!isRunBlocked` corresponds to the `llm_interpretations`
  * row (both are driven by the same interpretationEventsStore pending/
@@ -475,7 +475,7 @@ export function ExecuteButton(): JSX.Element | null {
 
   const canExecute =
     activeSessionId !== null &&
-    validationResult?.readiness.execution_ready === true &&
+    validationResult?.readiness?.execution_ready === true &&
     !isExecuting &&
     progress?.status !== "running" &&
     !isRunBlocked;
@@ -490,11 +490,13 @@ export function ExecuteButton(): JSX.Element | null {
     validationNotRun: validationResult == null,
     validationFailing: validationResult != null && validationResult.is_valid !== true,
     executionReadinessBlocked:
-      validationResult != null && validationResult.readiness.execution_ready !== true,
+      validationResult != null &&
+      validationResult.readiness?.execution_ready !== true,
   });
   const blockReasonText =
     blockReason === "readiness"
-      ? validationResult?.readiness.blockers[0]?.detail ?? RUN_BLOCK_REASON_TEXT.readiness
+      ? validationResult?.readiness?.blockers[0]?.detail ??
+        RUN_BLOCK_REASON_TEXT.readiness
       : blockReason
         ? RUN_BLOCK_REASON_TEXT[blockReason]
         : null;

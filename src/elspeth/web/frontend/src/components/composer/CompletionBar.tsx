@@ -35,10 +35,10 @@ export function CompletionBar(): JSX.Element | null {
   // Completion readiness mirrors the backend's mark-time gate. A null result
   // is not ready because the user has not run validation yet.
   const isCompletionReady =
-    validationResult?.readiness.completion_ready === true;
+    validationResult?.readiness?.completion_ready === true;
   const saveDisabled = !isCompletionReady || inFlight;
   const completionBlockedTitle =
-    validationResult?.readiness.blockers[0]?.detail ??
+    validationResult?.readiness?.blockers[0]?.detail ??
     SAVE_FOR_REVIEW_DISABLED_TITLE;
 
   return (

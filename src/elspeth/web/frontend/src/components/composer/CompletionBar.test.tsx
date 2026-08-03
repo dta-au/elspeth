@@ -6,8 +6,14 @@ import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
+import {
+  COMPLETION_BLOCKED_VALIDATION_READINESS,
+  INVALID_VALIDATION_READINESS,
+  makeComposition,
+  makeValidationResult,
+} from "@/test/composerFixtures";
 import { resetStore } from "@/test/store-helpers";
-import type { ValidationReadiness, ValidationResult } from "@/types/index";
+import type { ValidationResult } from "@/types/index";
 
 // The Export-YAML dialog body renders YamlView, which pulls in session state
 // and YAML rendering machinery irrelevant to the assertions in this file.
@@ -21,69 +27,27 @@ vi.mock("@/components/inspector/YamlView", () => ({
   ),
 }));
 
-const READY_READINESS = {
-  authoring_valid: true,
-  execution_ready: true,
-  completion_ready: true,
-  blockers: [],
-} satisfies ValidationReadiness;
-
-const BLOCKED_READINESS = {
-  authoring_valid: false,
-  execution_ready: false,
-  completion_ready: false,
-  blockers: [
-    {
-      code: "validation_error",
-      component_id: "node1",
-      component_type: "transform",
-      detail: "The transform did not pass validation.",
-    },
-  ],
-} satisfies ValidationReadiness;
-
-const COMPLETION_BLOCKED_READINESS = {
-  authoring_valid: true,
-  execution_ready: true,
-  completion_ready: false,
-  blockers: [
-    {
-      code: "advisor_signoff_required",
-      component_id: null,
-      component_type: null,
-      detail: "Advisor sign-off is required before sharing for review.",
-    },
-  ],
-} satisfies ValidationReadiness;
-
 function _validValidation(): ValidationResult {
-  return {
-    is_valid: true,
-    checks: [],
-    errors: [],
-    readiness: READY_READINESS,
-  };
+  return makeValidationResult();
 }
 
 // Minimal composition with content: the Export-YAML button gates on
 // pipeline content (elspeth-bff8043d33), NOT on validation state, so
 // validation-axis tests must hold content constant.
 function _nonEmptyComposition() {
-  return {
+  return makeComposition(1, {
     id: "state-1",
-    version: 1,
     sources: { source: { plugin: "csv", options: {} } },
     nodes: [],
     edges: [],
     outputs: [],
     metadata: { name: null, description: null },
-  } as never;
+  });
 }
 
 function _invalidValidation(): ValidationResult {
-  return {
+  return makeValidationResult({
     is_valid: false,
-    checks: [],
     errors: [
       {
         component_id: "node1",
@@ -92,8 +56,8 @@ function _invalidValidation(): ValidationResult {
         suggestion: null,
       },
     ],
-    readiness: BLOCKED_READINESS,
-  };
+    readiness: INVALID_VALIDATION_READINESS,
+  });
 }
 
 describe("CompletionBar", () => {
@@ -101,13 +65,13 @@ describe("CompletionBar", () => {
     useSessionStore.setState({
       activeSessionId: null,
       compositionState: null,
-    } as never);
+    });
     useExecutionStore.setState({
       validationResult: null,
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
     useShareableReviewStore.getState().reset();
     resetStore(useInterpretationEventsStore);
   });
@@ -118,13 +82,13 @@ describe("CompletionBar", () => {
   });
 
   it("renders three co-equal buttons when a session is active and validation passes", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
     render(<CompletionBar />);
     expect(screen.getByTestId("completion-bar")).toBeInTheDocument();
     expect(screen.getByTestId("completion-bar-save-for-review")).toBeInTheDocument();
@@ -133,7 +97,7 @@ describe("CompletionBar", () => {
   });
 
   it("disables Save for review when validation has not run", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" });
     // validationResult: null — no validation has been run.
     render(<CompletionBar />);
     const button = screen.getByTestId("completion-bar-save-for-review") as HTMLButtonElement;
@@ -142,26 +106,51 @@ describe("CompletionBar", () => {
   });
 
   it("disables Save for review when validation is invalid", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _invalidValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
     render(<CompletionBar />);
     const button = screen.getByTestId("completion-bar-save-for-review") as HTMLButtonElement;
     expect(button.disabled).toBe(true);
   });
 
+  it("disables Save for review when a malformed validation response omits readiness", () => {
+    useSessionStore.setState({ activeSessionId: "sess-1" });
+    useExecutionStore.setState({
+      // Deliberately model untrusted wire data that violates the mandatory
+      // TypeScript contract. Ordinary fixtures remain fully typed.
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+      } as unknown as ValidationResult,
+      isExecuting: false,
+      progress: null,
+    });
+
+    render(<CompletionBar />);
+
+    expect(screen.getByTestId("completion-bar-save-for-review")).toBeDisabled();
+    expect(
+      screen
+        .getByTestId("completion-bar-run-pipeline")
+        .querySelector("button"),
+    ).toBeDisabled();
+  });
+
   it("enables Save for review when validation is valid", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
     render(<CompletionBar />);
     const button = screen.getByTestId("completion-bar-save-for-review") as HTMLButtonElement;
     expect(button.disabled).toBe(false);
@@ -169,16 +158,16 @@ describe("CompletionBar", () => {
 
   it("blocks Save on completion readiness while leaving Run admitted", () => {
     const openAndMark = vi.fn();
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: {
         ..._validValidation(),
-        readiness: COMPLETION_BLOCKED_READINESS,
+        readiness: COMPLETION_BLOCKED_VALIDATION_READINESS,
       },
       isExecuting: false,
       progress: null,
-    } as never);
-    useShareableReviewStore.setState({ openAndMark } as never);
+    });
+    useShareableReviewStore.setState({ openAndMark });
 
     render(<CompletionBar />);
     const save = screen.getByTestId(
@@ -199,15 +188,15 @@ describe("CompletionBar", () => {
   });
 
   it("clicking Save for review invokes openAndMark with the active session id", () => {
-    useSessionStore.setState({ activeSessionId: "sess-XYZ" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-XYZ" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
     const openAndMarkSpy = vi.fn();
-    useShareableReviewStore.setState({ openAndMark: openAndMarkSpy } as never);
+    useShareableReviewStore.setState({ openAndMark: openAndMarkSpy });
 
     render(<CompletionBar />);
     fireEvent.click(screen.getByTestId("completion-bar-save-for-review"));
@@ -215,14 +204,14 @@ describe("CompletionBar", () => {
   });
 
   it("disables Save for review while a mark request is in flight", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
-    useShareableReviewStore.setState({ inFlight: true } as never);
+    });
+    useShareableReviewStore.setState({ inFlight: true });
     render(<CompletionBar />);
     const button = screen.getByTestId("completion-bar-save-for-review") as HTMLButtonElement;
     expect(button.disabled).toBe(true);
@@ -238,7 +227,7 @@ describe("CompletionBar", () => {
     useSessionStore.setState({
       activeSessionId: "sess-1",
       compositionState: _nonEmptyComposition(),
-    } as never);
+    });
     // beforeEach already sets validationResult: null.
     const { unmount } = render(<CompletionBar />);
     const exportContainer = screen.getByTestId("completion-bar-export-yaml");
@@ -255,7 +244,7 @@ describe("CompletionBar", () => {
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
     render(<CompletionBar />);
     const exportContainerInvalid = screen.getByTestId("completion-bar-export-yaml");
     const exportButtonInvalid = exportContainerInvalid.querySelector("button") as HTMLButtonElement;
@@ -268,7 +257,7 @@ describe("CompletionBar", () => {
   // verbs must agree — Export-YAML is disabled with a stated reason instead
   // of opening a near-empty modal.
   it("Export-YAML button is disabled with a reason on an empty pipeline", () => {
-    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" });
     // beforeEach leaves compositionState null (no pipeline yet).
     render(<CompletionBar />);
     const exportContainer = screen.getByTestId("completion-bar-export-yaml");
@@ -285,14 +274,14 @@ describe("CompletionBar", () => {
   // opens it and confirming fires `execute(activeSessionId)`.
   it("clicking Run-pipeline calls executionStore.execute with the active session id after the egress disclosure (plan 19b:231, AC 6)", () => {
     const executeSpy = vi.fn();
-    useSessionStore.setState({ activeSessionId: "sess-RUN" } as never);
+    useSessionStore.setState({ activeSessionId: "sess-RUN" });
     useExecutionStore.setState({
       validationResult: _validValidation(),
       isExecuting: false,
       progress: null,
       execute: executeSpy,
       runDisclosureAckBySession: {},
-    } as never);
+    });
 
     render(<CompletionBar />);
     const runContainer = screen.getByTestId("completion-bar-run-pipeline");
@@ -321,13 +310,13 @@ describe("CompletionBar", () => {
     useSessionStore.setState({
       activeSessionId: "sess-1",
       compositionState: _nonEmptyComposition(),
-    } as never);
+    });
     useExecutionStore.setState({
       validationResult: _validValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
-    } as never);
+    });
 
     render(
       <>

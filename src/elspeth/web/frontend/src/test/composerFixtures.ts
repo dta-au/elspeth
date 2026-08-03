@@ -1,4 +1,84 @@
-import type { CompositionState } from "../types/api";
+import type {
+  CompositionState,
+  ValidationError,
+  ValidationReadiness,
+  ValidationResult,
+} from "../types/index";
+
+export const READY_VALIDATION_READINESS = {
+  authoring_valid: true,
+  execution_ready: true,
+  completion_ready: true,
+  blockers: [],
+} satisfies ValidationReadiness;
+
+export const EXECUTION_BLOCKED_VALIDATION_READINESS = {
+  authoring_valid: true,
+  execution_ready: false,
+  completion_ready: false,
+  blockers: [
+    {
+      code: "runtime_admission",
+      component_id: "pipeline",
+      component_type: "pipeline",
+      detail: "The selected runtime policy does not admit this pipeline.",
+    },
+  ],
+} satisfies ValidationReadiness;
+
+export const COMPLETION_BLOCKED_VALIDATION_READINESS = {
+  authoring_valid: true,
+  execution_ready: true,
+  completion_ready: false,
+  blockers: [
+    {
+      code: "advisor_signoff_required",
+      component_id: null,
+      component_type: null,
+      detail: "Advisor sign-off is required before sharing for review.",
+    },
+  ],
+} satisfies ValidationReadiness;
+
+export const INVALID_VALIDATION_READINESS = {
+  authoring_valid: false,
+  execution_ready: false,
+  completion_ready: false,
+  blockers: [
+    {
+      code: "validation_error",
+      component_id: "node1",
+      component_type: "transform",
+      detail: "The transform did not pass validation.",
+    },
+  ],
+} satisfies ValidationReadiness;
+
+interface ValidationResultOverrides {
+  is_valid?: boolean;
+  errors?: ValidationError[];
+  readiness?: ValidationReadiness;
+}
+
+/**
+ * Canonical typed validation fixture.
+ *
+ * Readiness is mandatory in the backend response contract. Tests that need
+ * malformed wire data must cast that value explicitly at the individual
+ * boundary instead of weakening every ordinary fixture with `as never`.
+ */
+export function makeValidationResult(
+  overrides: ValidationResultOverrides = {},
+): ValidationResult {
+  return {
+    is_valid: true,
+    checks: [],
+    errors: [],
+    warnings: [],
+    readiness: READY_VALIDATION_READINESS,
+    ...overrides,
+  };
+}
 
 export const compositionStateAuthorityFields = {
   session_id: "session-1",

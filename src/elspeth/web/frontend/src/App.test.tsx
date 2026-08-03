@@ -18,13 +18,19 @@ import type {
   Session,
   SystemStatus,
   UserProfile,
+  ValidationResult,
 } from "./types/index";
 import {
   COMPOSE_CLIENT_GRACE_MS,
   getComposeTimeoutMs,
   resetComposeTimeoutForTests,
 } from "@/config/composer";
-import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import {
+  compositionStateAuthorityFields,
+  EXECUTION_BLOCKED_VALIDATION_READINESS,
+  makeValidationResult,
+  READY_VALIDATION_READINESS,
+} from "@/test/composerFixtures";
 
 // ── Sub-component stubs ──────────────────────────────────────────────────────
 // App renders many heavy children (Layout, ChatPanel, …).
@@ -478,7 +484,7 @@ describe("App banner roles", () => {
     window.removeEventListener(OPEN_YAML_MODAL_EVENT, onOpenYaml);
   });
 
-  it("routes Ctrl+E through the run-intent owner and does not execute when backend execution readiness is false", async () => {
+  it("does not dispatch Ctrl+E when backend execution readiness is false", async () => {
     const execute = vi.fn();
     const onRequestRun = vi.fn();
     window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
@@ -486,30 +492,48 @@ describe("App banner roles", () => {
       activeSessionId: "session-1",
       compositionState: makeState(1),
     });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
     useExecutionStore.setState({
+      validationResult: makeValidationResult({
+        readiness: EXECUTION_BLOCKED_VALIDATION_READINESS,
+      }),
+      isExecuting: false,
+      progress: null,
+      execute,
+    });
+    fireEvent.keyDown(document, { key: "e", ctrlKey: true });
+
+    expect(onRequestRun).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
+  });
+
+  it("does not dispatch Ctrl+E when a malformed validation response omits readiness", async () => {
+    const onRequestRun = vi.fn();
+    window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(1),
+    });
+
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    useExecutionStore.setState({
+      // Deliberately model untrusted wire data that violates the mandatory
+      // TypeScript contract. Ordinary fixtures use makeValidationResult.
       validationResult: {
         is_valid: true,
         checks: [],
         errors: [],
         warnings: [],
-        readiness: {
-          authoring_valid: true,
-          execution_ready: false,
-          completion_ready: false,
-          blockers: [],
-        },
-      } as never,
+      } as unknown as ValidationResult,
       isExecuting: false,
       progress: null,
-      execute,
-    } as never);
-
-    render(<App />);
-    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    });
     fireEvent.keyDown(document, { key: "e", ctrlKey: true });
 
-    expect(onRequestRun).toHaveBeenCalledTimes(1);
-    expect(execute).not.toHaveBeenCalled();
+    expect(onRequestRun).not.toHaveBeenCalled();
     window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
   });
 
@@ -521,27 +545,17 @@ describe("App banner roles", () => {
       activeSessionId: "session-1",
       compositionState: makeState(1),
     });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
     useExecutionStore.setState({
-      validationResult: {
-        is_valid: true,
-        checks: [],
-        errors: [],
-        warnings: [],
-        readiness: {
-          authoring_valid: true,
-          execution_ready: true,
-          completion_ready: true,
-          blockers: [],
-        },
-      } as never,
+      validationResult: makeValidationResult({
+        readiness: READY_VALIDATION_READINESS,
+      }),
       isExecuting: false,
       progress: null,
       execute,
       runDisclosureAckBySession: {},
-    } as never);
-
-    render(<App />);
-    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    });
     fireEvent.keyDown(document, { key: "e", metaKey: true });
 
     expect(onRequestRun).toHaveBeenCalledTimes(1);
@@ -566,26 +580,16 @@ describe("App banner roles", () => {
       } as unknown as import("./types/guided").GuidedSession,
       guidedNextTurn: null,
     });
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
     useExecutionStore.setState({
-      validationResult: {
-        is_valid: true,
-        checks: [],
-        errors: [],
-        warnings: [],
-        readiness: {
-          authoring_valid: true,
-          execution_ready: true,
-          completion_ready: true,
-          blockers: [],
-        },
-      } as never,
+      validationResult: makeValidationResult({
+        readiness: READY_VALIDATION_READINESS,
+      }),
       isExecuting: false,
       progress: null,
       execute,
-    } as never);
-
-    render(<App />);
-    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    });
     fireEvent.keyDown(document, { key: "e", ctrlKey: true });
 
     expect(onRequestRun).not.toHaveBeenCalled();

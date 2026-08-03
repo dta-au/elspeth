@@ -396,7 +396,12 @@ function App() {
         runAdmissionAvailable
       ) {
         e.preventDefault();
-        window.dispatchEvent(new CustomEvent(REQUEST_RUN_EVENT));
+        const executionReady =
+          useExecutionStore.getState().validationResult?.readiness
+            ?.execution_ready === true;
+        if (executionReady) {
+          window.dispatchEvent(new CustomEvent(REQUEST_RUN_EVENT));
+        }
         return;
       }
 
