@@ -22,6 +22,7 @@ from collections.abc import Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 from uuid import UUID
@@ -112,6 +113,8 @@ from elspeth.web.execution.preflight import (
 from elspeth.web.execution.progress import BroadcastResult, ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService, FrozenRunSettings, StateAccessError, YamlGenerator
 from elspeth.web.execution.schemas import (
+    CHECK_PROOF_DIAGNOSTICS,
+    VALIDATION_CHECK_NAMES,
     CancelledData,
     CompletedData,
     FailedData,
@@ -146,6 +149,7 @@ from elspeth.web.sessions.telemetry import _SessionsTelemetry
 if TYPE_CHECKING:
     from elspeth.core.landscape.database import LandscapeDB
     from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.tools.generation import ResolvedProofBlob
 
 slog = structlog.get_logger()
 _meter = metrics.get_meter(__name__)
@@ -157,6 +161,128 @@ _BLOB_INLINE_AUDIT_ROW_TIER1_VIOLATION_TOTAL = _meter.create_counter(
     name="composer.blob_inline.audit_row_tier1_violation_total",
     description="resolved inline blob ref produced no audit row; SLO threshold = 0",
 )
+
+_MAX_AUTHORITATIVE_PROOF_DIAGNOSTICS = 16
+_MAX_AUTHORITATIVE_PROOF_TEXT_CHARS = 1000
+
+
+def _bounded_proof_text(value: object, *, field_name: str) -> str:
+    """Validate and bound one detector-owned, client-visible proof string."""
+    if type(value) is not str or not value:
+        raise RuntimeError(f"proof diagnostic {field_name} must be a non-empty exact string")
+    return value[:_MAX_AUTHORITATIVE_PROOF_TEXT_CHARS]
+
+
+def _proof_component_type(code: str) -> str:
+    if code == "gate_expression_type_mismatch_against_source_schema":
+        return "gate"
+    if code == "aggregation_numeric_value_field_type_mismatch_against_source_schema":
+        return "aggregation"
+    return "source"
+
+
+def _insert_proof_check(
+    checks: Sequence[ValidationCheck],
+    proof_check: ValidationCheck,
+) -> list[ValidationCheck]:
+    """Insert the authoritative proof at its registered canonical rank."""
+    if any(check.name == CHECK_PROOF_DIAGNOSTICS for check in checks):
+        raise RuntimeError("authoritative preflight received a duplicate proof_diagnostics check")
+    result = [check.model_copy(deep=True) for check in checks]
+    proof_rank = VALIDATION_CHECK_NAMES.index(CHECK_PROOF_DIAGNOSTICS)
+    for index, check in enumerate(result):
+        if VALIDATION_CHECK_NAMES.index(check.name) > proof_rank:
+            result.insert(index, proof_check)
+            break
+    else:
+        result.append(proof_check)
+    return result
+
+
+def _merge_authoritative_proof_diagnostics(
+    result: ValidationResult,
+    diagnostics: Sequence[Mapping[str, Any]],
+) -> ValidationResult:
+    """Append the real proof check and fail readiness on sampled blockers."""
+    if not result.is_valid:
+        return result
+
+    blocking = [diagnostic for diagnostic in diagnostics if diagnostic["severity"] == "blocking"]
+    bounded_blocking = blocking[:_MAX_AUTHORITATIVE_PROOF_DIAGNOSTICS]
+    affected_nodes: list[str] = []
+    errors: list[ValidationError] = []
+    blockers: list[ValidationReadinessBlocker] = []
+    for diagnostic in bounded_blocking:
+        code = _bounded_proof_text(diagnostic["code"], field_name="code")
+        message = _bounded_proof_text(diagnostic["message"], field_name="message")
+        repair = diagnostic["suggested_repair"]
+        suggestion = None if repair is None else _bounded_proof_text(repair, field_name="suggested_repair")
+        evidence = diagnostic["evidence_locator"]
+        if not isinstance(evidence, Mapping):
+            raise RuntimeError("proof diagnostic evidence_locator must be a mapping")
+        raw_node_id = evidence["node_id"] if "node_id" in evidence else None
+        node_id = raw_node_id if type(raw_node_id) is str and raw_node_id else None
+        if node_id is not None and node_id not in affected_nodes:
+            affected_nodes.append(node_id)
+        component_type = _proof_component_type(code)
+        errors.append(
+            ValidationError(
+                component_id=node_id,
+                component_type=component_type,
+                message=message,
+                suggestion=suggestion,
+                error_code=code,
+            )
+        )
+        blockers.append(
+            ValidationReadinessBlocker(
+                code=code,
+                component_id=node_id,
+                component_type=component_type,
+                detail=f"Bounded source proof blocked execution: {code}.",
+            )
+        )
+
+    proof_check = ValidationCheck(
+        name=CHECK_PROOF_DIAGNOSTICS,
+        passed=not blocking,
+        detail=(
+            "Bounded source proof found no blocking diagnostics."
+            if not blocking
+            else f"Bounded source proof found {len(blocking)} blocking diagnostic(s)."
+        ),
+        affected_nodes=tuple(affected_nodes),
+        outcome_code=None,
+    )
+    checks = _insert_proof_check(result.checks, proof_check)
+    if not blocking:
+        return result.model_copy(update={"checks": checks})
+
+    if len(blocking) > len(bounded_blocking):
+        blockers.append(
+            ValidationReadinessBlocker(
+                code="proof_diagnostics",
+                component_id=None,
+                component_type="pipeline",
+                detail=(
+                    "Additional bounded source proof diagnostics were withheld after "
+                    f"the {_MAX_AUTHORITATIVE_PROOF_DIAGNOSTICS}-diagnostic response cap."
+                ),
+            )
+        )
+    return result.model_copy(
+        update={
+            "is_valid": False,
+            "checks": checks,
+            "errors": [*result.errors, *errors],
+            "readiness": ValidationReadiness(
+                authoring_valid=False,
+                execution_ready=False,
+                completion_ready=False,
+                blockers=[*result.readiness.blockers, *blockers],
+            ),
+        }
+    )
 
 
 def _build_web_plugin_policy_evidence(
@@ -616,6 +742,178 @@ class ExecutionServiceImpl:
             user_id = "trained-operator"
         return self._plugin_snapshot_factory(user_id)
 
+    def _authoritative_proof_blob_resolver(
+        self,
+        state: CompositionState,
+        *,
+        session_id: UUID | None,
+    ) -> Callable[[str], ResolvedProofBlob | None]:
+        """Resolve only exact, session-owned, ready blob bindings for proof."""
+        from elspeth.web.composer.tools.blobs import BlobToolRecord
+        from elspeth.web.composer.tools.generation import ResolvedProofBlob
+        from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
+
+        expected_paths_by_blob_id: dict[str, set[str]] = {}
+        for source in state.sources.values():
+            if "blob_ref" not in source.options:
+                continue
+            raw_blob_id = source.options["blob_ref"]
+            if type(raw_blob_id) is not str:
+                continue
+            try:
+                parsed_blob_id = UUID(raw_blob_id)
+            except ValueError:
+                continue
+            if str(parsed_blob_id) != raw_blob_id:
+                continue
+            paths = {
+                value
+                for key in SOURCE_LOCAL_PATH_OPTION_KEYS
+                if type(value := source.options[key] if key in source.options else None) is str
+            }
+            if not paths:
+                continue
+            if raw_blob_id not in expected_paths_by_blob_id:
+                expected_paths_by_blob_id[raw_blob_id] = set()
+            expected_paths_by_blob_id[raw_blob_id].update(paths)
+
+        def _resolve(blob_id: str) -> ResolvedProofBlob | None:
+            if self._blob_service is None or session_id is None or blob_id not in expected_paths_by_blob_id:
+                return None
+            try:
+                parsed_blob_id = UUID(blob_id)
+            except ValueError:
+                return None
+            if str(parsed_blob_id) != blob_id:
+                return None
+            try:
+                record = self._call_async(self._blob_service.get_blob(parsed_blob_id))
+            except BlobNotFoundError:
+                return None
+            if type(record) is not BlobRecord:
+                raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
+            if (
+                record.id != parsed_blob_id
+                or record.session_id != session_id
+                or record.status != "ready"
+                or expected_paths_by_blob_id[blob_id] != {record.storage_path}
+            ):
+                return None
+            metadata = cast(
+                BlobToolRecord,
+                {
+                    "id": str(record.id),
+                    "session_id": str(record.session_id),
+                    "filename": record.filename,
+                    "mime_type": record.mime_type,
+                    "size_bytes": record.size_bytes,
+                    "content_hash": record.content_hash,
+                    "storage_path": record.storage_path,
+                    "created_by": record.created_by,
+                    "source_description": record.source_description,
+                    "status": record.status,
+                    "creation_modality": record.creation_modality.value,
+                    "created_from_message_id": record.created_from_message_id,
+                    "creating_model_identifier": record.creating_model_identifier,
+                    "creating_model_version": record.creating_model_version,
+                    "creating_provider": record.creating_provider,
+                    "creating_composer_skill_hash": record.creating_composer_skill_hash,
+                    "creating_arguments_hash": record.creating_arguments_hash,
+                },
+            )
+            verified_prefix, verified_content_hash, total_size_bytes = self._call_async(
+                self._blob_service.read_blob_content_prefix_verified(
+                    parsed_blob_id,
+                    prefix_bytes=8 * 1024,
+                )
+            )
+            return ResolvedProofBlob(
+                metadata=metadata,
+                verified_prefix=verified_prefix,
+                verified_content_hash=verified_content_hash,
+                total_size_bytes=total_size_bytes,
+            )
+
+        return _resolve
+
+    def _authoritative_state_preflight_sync(
+        self,
+        state: CompositionState,
+        *,
+        plugin_snapshot: PluginAvailabilitySnapshot,
+        user_id: str | None,
+        session_id: UUID | None,
+    ) -> ValidationResult:
+        """Run the canonical 24 checks and bounded source proof in one worker."""
+        from elspeth.web.composer.tools.generation import compute_proof_diagnostics
+        from elspeth.web.composer.yaml_generator import reattach_guided_blob_refs_for_public_export
+        from elspeth.web.execution.validation import validate_pipeline
+
+        def _blob_get_metadata(blob_id: UUID) -> BlobRecord | None:
+            if self._blob_service is None:
+                return None
+            try:
+                record = self._call_async(self._blob_service.get_blob(blob_id))
+            except BlobNotFoundError:
+                return None
+            if type(record) is not BlobRecord:
+                raise TypeError("BlobServiceProtocol.get_blob() must return an exact BlobRecord")
+            if session_id is not None and record.session_id != session_id:
+                return None
+            return record
+
+        result = validate_pipeline(
+            state,
+            self._settings,
+            self._yaml_generator,
+            secret_service=self._secret_service,
+            user_id=user_id,
+            blob_get_metadata=_blob_get_metadata,
+            session_id=str(session_id) if session_id is not None else None,
+            plugin_snapshot=plugin_snapshot,
+            profile_registry=self._operator_profile_registry,
+            catalog=self._catalog,
+        )
+        if not result.is_valid:
+            return result
+
+        proof_state = reattach_guided_blob_refs_for_public_export(state)
+        diagnostics = compute_proof_diagnostics(
+            proof_state,
+            session_id=str(session_id) if session_id is not None else None,
+            blob_resolver=self._authoritative_proof_blob_resolver(
+                proof_state,
+                session_id=session_id,
+            ),
+        )
+        return _merge_authoritative_proof_diagnostics(result, diagnostics)
+
+    async def _authoritative_state_preflight(
+        self,
+        state: CompositionState,
+        *,
+        plugin_snapshot: PluginAvailabilitySnapshot,
+        user_id: str | None,
+        session_id: UUID | None,
+        completion_gates: CompletionGateFacts | None,
+        completion_gate_state: CompositionState | None = None,
+    ) -> ValidationResult:
+        """Authoritative shared validation used by both validate and execute."""
+        result = cast(
+            ValidationResult,
+            await run_sync_in_worker(
+                partial(
+                    self._authoritative_state_preflight_sync,
+                    state,
+                    plugin_snapshot=plugin_snapshot,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+            ),
+        )
+        fingerprint_state = state if completion_gate_state is None else completion_gate_state
+        return merge_completion_gates(result, completion_gates, fingerprint_state)
+
     def _require_current_binding_generation(self, frozen: FrozenRunSettings, *, user_id: str | None) -> None:
         """Refuse a queued run when its credential/profile binding has rotated."""
         current = self._plugin_snapshot_for_user(user_id, operation="queued execution revalidation")
@@ -917,28 +1215,23 @@ class ExecutionServiceImpl:
         # Previously execute() created a run and let an invalid pipeline fail OPAQUELY
         # at run-init (status=failed, rows_processed=0, error="Pipeline execution failed
         # (GraphValidationError)"); the tutorial path bypassed validation entirely. Run
-        # the SAME dry-run validate_pipeline the /validate endpoint uses, BEFORE create_run,
+        # the SAME authoritative state preflight the /validate endpoint uses, BEFORE create_run,
         # and reject with a structured PipelineValidationError when invalid. This catches
         # the Mechanism-A classes (Graph/ValueSource/generic plugin-config) at the server
         # boundary and closes the tutorial bypass; SchemaConfigModeViolation (post-emission
         # row check) and the Chroma-SSRF plugin check (deferred network I/O) remain
-        # runtime-only by design. Local import mirrors the /validate path (W18 load-order).
-        from elspeth.web.execution.validation import validate_pipeline
+        # runtime-only by design.
 
         plugin_snapshot = self._plugin_snapshot_for_user(user_id, operation="execution")
 
-        preflight_result = validate_pipeline(
+        preflight_result = await self._authoritative_state_preflight(
             composition_state,
-            self._settings,
-            self._yaml_generator,
-            secret_service=self._secret_service,
-            user_id=user_id,
-            session_id=str(session_id),
             plugin_snapshot=plugin_snapshot,
-            profile_registry=self._operator_profile_registry,
-            catalog=self._catalog,
+            user_id=user_id,
+            session_id=session_id,
+            completion_gates=completion_gates,
+            completion_gate_state=authored_state,
         )
-        preflight_result = merge_completion_gates(preflight_result, completion_gates, authored_state)
         if not preflight_result.is_valid:
             raise PipelineValidationError(
                 errors=tuple(preflight_result.errors),
@@ -1310,42 +1603,14 @@ class ExecutionServiceImpl:
         ``completion_ready`` accordingly. ``None`` — no record at hand, or no
         envelope ever written — leaves the recompute untouched.
         """
-        from functools import partial
-
-        from elspeth.web.execution.validation import validate_pipeline
-
         plugin_snapshot = self._plugin_snapshot_for_user(user_id, operation="validation")
-
-        def _blob_get_metadata(blob_id: UUID) -> BlobRecord | None:
-            if self._blob_service is None:
-                return None
-            try:
-                record = self._call_async(self._blob_service.get_blob(blob_id))
-            except BlobNotFoundError:
-                return None
-            if session_id is not None and record.session_id != session_id:
-                return None
-            return record
-
-        result = cast(
-            ValidationResult,
-            await run_sync_in_worker(
-                partial(
-                    validate_pipeline,
-                    state,
-                    self._settings,
-                    self._yaml_generator,
-                    secret_service=self._secret_service,
-                    user_id=user_id,
-                    blob_get_metadata=_blob_get_metadata,
-                    session_id=str(session_id) if session_id is not None else None,
-                    plugin_snapshot=plugin_snapshot,
-                    profile_registry=self._operator_profile_registry,
-                    catalog=self._catalog,
-                ),
-            ),
+        return await self._authoritative_state_preflight(
+            state,
+            plugin_snapshot=plugin_snapshot,
+            user_id=user_id,
+            session_id=session_id,
+            completion_gates=completion_gates,
         )
-        return merge_completion_gates(result, completion_gates, state)
 
     async def verify_run_ownership(self, user: UserIdentity, run_id: str) -> bool:
         """Verify that a run belongs to the authenticated user's session.

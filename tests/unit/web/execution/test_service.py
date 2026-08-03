@@ -64,11 +64,13 @@ from elspeth.web.execution.errors import CompletionGateIntegrityError, Execution
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import FrozenRunSettings
 from elspeth.web.execution.schemas import (
+    CHECK_OUTCOME_SECRET_REFS_NO_REFS,
     RunAccounting,
     RunAccountingIntegrity,
     RunAccountingRouting,
     RunAccountingSource,
     RunAccountingTokens,
+    ValidationCheck,
     ValidationError,
     ValidationReadiness,
     ValidationReadinessBlocker,
@@ -280,7 +282,28 @@ def _plugin_bundle_stub() -> SimpleNamespace:
 
 
 def _blob_service_stub() -> Any:
-    return create_autospec(BlobServiceProtocol, instance=True, spec_set=True)
+    blob_service = create_autospec(BlobServiceProtocol, instance=True, spec_set=True)
+    content = b"amount\n"
+    blob_service.read_blob_content_prefix_verified.return_value = (
+        content,
+        hashlib.sha256(content).hexdigest(),
+        len(content),
+    )
+    return blob_service
+
+
+def _ready_csv_blob_for_execution(*, blob_ref: str, session_id: UUID, storage_path: str) -> BlobRecord:
+    content = b"amount\n"
+    return _blob_record_stub(
+        blob_id=UUID(blob_ref),
+        session_id=session_id,
+        filename=Path(storage_path).name,
+        mime_type="text/csv",
+        size_bytes=len(content),
+        content_hash=hashlib.sha256(content).hexdigest(),
+        storage_path=storage_path,
+        status="ready",
+    )
 
 
 def _execution_graph_stub() -> Any:
@@ -497,6 +520,115 @@ def _composition_state_record(
         derived_from_state_id=None,
         composer_meta=None,
     )
+
+
+def _successful_core_validation_result() -> ValidationResult:
+    """The real validator's successful 24-check prefix, without advisories."""
+    from elspeth.web.execution._validation_ledger import CORE_VALIDATION_CHECK_NAMES
+
+    return ValidationResult(
+        is_valid=True,
+        checks=[
+            ValidationCheck(
+                name=name,
+                passed=True,
+                detail=f"{name} passed",
+                affected_nodes=(),
+                outcome_code=CHECK_OUTCOME_SECRET_REFS_NO_REFS if name == "secret_refs" else None,
+            )
+            for name in CORE_VALIDATION_CHECK_NAMES
+        ],
+        errors=[],
+        readiness=ValidationReadiness(
+            authoring_valid=True,
+            execution_ready=True,
+            completion_ready=True,
+            blockers=[],
+        ),
+    )
+
+
+def _proof_gate_state(
+    *,
+    source_path: Path | None,
+    blob_id: UUID | None,
+    schema_mode: str = "observed",
+    condition: str = "row['amount'] > 500",
+) -> Any:
+    """Direct CSV -> gate state exercising the observed-row proof."""
+    from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+
+    source_options: dict[str, Any] = {"schema": {"mode": schema_mode}}
+    if schema_mode in {"fixed", "flexible"}:
+        source_options["schema"]["fields"] = ["amount: float"]
+    if source_path is not None:
+        source_options["path"] = str(source_path)
+    if blob_id is not None:
+        source_options["blob_ref"] = str(blob_id)
+    return CompositionState(
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options=source_options,
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="amount_gate",
+                node_type="gate",
+                plugin=None,
+                input="rows",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition=condition,
+                routes={"true": "high_value", "false": "standard"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(name="high_value", plugin="json", options={}, on_write_failure="discard"),
+            OutputSpec(name="standard", plugin="json", options={}, on_write_failure="discard"),
+        ),
+        metadata=PipelineMetadata(name="Proof gate"),
+        version=1,
+    )
+
+
+def _install_ready_proof_blob(
+    service: ExecutionServiceImpl,
+    *,
+    session_id: UUID,
+    blob_id: UUID,
+    source_path: Path,
+) -> MagicMock:
+    """Install the session-owned ready blob record the proof resolver must use."""
+    content = source_path.read_bytes()
+    content_digest = hashlib.sha256(content).hexdigest()
+    blob_service = create_autospec(BlobServiceProtocol, instance=True)
+    blob_service.get_blob.return_value = _blob_record_stub(
+        blob_id=blob_id,
+        session_id=session_id,
+        filename=source_path.name,
+        mime_type="text/csv",
+        size_bytes=source_path.stat().st_size,
+        content_hash=content_digest,
+        storage_path=str(source_path),
+        status="ready",
+    )
+    blob_service.read_blob_content_prefix_verified.return_value = (
+        content[: 8 * 1024],
+        content_digest,
+        len(content),
+    )
+    service._blob_service = blob_service
+    return blob_service
 
 
 @pytest.fixture
@@ -1146,11 +1278,12 @@ class TestExecutionFlow:
             run_id = await service.execute(session_id=session_id, state_id=selected_record.id)
 
         assert isinstance(run_id, UUID)
-        merge.assert_called_once_with(
-            valid,
-            CompletionGateFacts(advisor_signoff=fact),
-            authored_state,
-        )
+        merge.assert_called_once()
+        proof_result, merged_facts, fingerprint_state = merge.call_args.args
+        assert proof_result.checks[-1].name == "proof_diagnostics"
+        assert proof_result.checks[-1].passed is True
+        assert merged_facts == CompletionGateFacts(advisor_signoff=fact)
+        assert fingerprint_state == authored_state
         mock_session_service.get_current_state.assert_not_awaited()
         mock_session_service.create_run.assert_awaited_once()
 
@@ -1240,8 +1373,6 @@ class TestExecutionFlow:
         mock_session_service: MagicMock,
     ) -> None:
         """validate_state() keeps sync validation off the event loop."""
-        from elspeth.web.execution.validation import validate_pipeline
-
         state = state_from_record(mock_session_service.get_current_state.return_value)
         expected = ValidationResult(
             is_valid=True,
@@ -1263,16 +1394,12 @@ class TestExecutionFlow:
         run_worker.assert_awaited_once()
         worker_call = run_worker.await_args.args[0]
         assert isinstance(worker_call, partial)
-        assert worker_call.func is validate_pipeline
-        assert worker_call.args == (
-            state,
-            service._settings,
-            service._yaml_generator,
-        )
+        assert worker_call.func == service._authoritative_state_preflight_sync
+        assert worker_call.args == (state,)
         assert worker_call.keywords is not None
-        assert worker_call.keywords["secret_service"] is service._secret_service
         assert worker_call.keywords["user_id"] == "alice"
-        assert callable(worker_call.keywords["blob_get_metadata"])
+        assert worker_call.keywords["session_id"] is not None
+        assert worker_call.keywords["plugin_snapshot"] is not None
 
     @pytest.mark.asyncio
     async def test_validate_state_merges_persisted_completion_gate(
@@ -1289,17 +1416,6 @@ class TestExecutionFlow:
         from elspeth.web.execution.schemas import ADVISOR_SIGNOFF_BLOCKED_CODE
 
         state = state_from_record(mock_session_service.get_current_state.return_value)
-        recomputed = ValidationResult(
-            is_valid=True,
-            checks=[],
-            errors=[],
-            readiness=ValidationReadiness(
-                authoring_valid=True,
-                execution_ready=True,
-                completion_ready=True,
-                blockers=[],
-            ),
-        )
         facts = CompletionGateFacts(
             advisor_signoff=AdvisorSignoffGateFact(
                 detail="The advisor sign-off could not be obtained; the pipeline cannot complete.",
@@ -1307,8 +1423,10 @@ class TestExecutionFlow:
             )
         )
 
-        with patch("elspeth.web.execution.service.run_sync_in_worker", new_callable=AsyncMock) as run_worker:
-            run_worker.return_value = recomputed
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
             result = await service.validate_state(state, user_id="alice", session_id=uuid4(), completion_gates=facts)
 
         assert result.is_valid is True
@@ -1316,6 +1434,8 @@ class TestExecutionFlow:
         assert result.readiness.execution_ready is True
         assert result.readiness.completion_ready is False
         assert [blocker.code for blocker in result.readiness.blockers] == [ADVISOR_SIGNOFF_BLOCKED_CODE]
+        assert len(result.checks) == 26
+        assert [check.name for check in result.checks[24:]] == ["advisor_signoff", "proof_diagnostics"]
 
     @pytest.mark.asyncio
     async def test_validate_passes_record_completion_gates_to_validate_state(
@@ -1380,6 +1500,316 @@ class TestExecutionFlow:
         status = await service.get_status(run_id)
         assert status.status == "running"
         assert status.accounting is None
+
+
+class TestAuthoritativeProofDiagnostics:
+    @pytest.mark.asyncio
+    async def test_validate_state_rejects_observed_csv_numeric_gate_after_canonical_core(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+
+        assert [check.name for check in result.checks[:24]] == [check.name for check in _successful_core_validation_result().checks]
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+        assert result.is_valid is False
+        assert result.readiness.authoring_valid is False
+        assert result.readiness.execution_ready is False
+        assert result.readiness.completion_ready is False
+
+    @pytest.mark.asyncio
+    async def test_authoritative_proof_uses_verified_prefix_without_direct_path_read(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "verified-prefix.csv"
+        source_path.write_text("amount\n250.00\n", encoding="utf-8")
+        state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with (
+            patch(
+                "elspeth.web.execution.validation.validate_pipeline",
+                return_value=_successful_core_validation_result(),
+            ),
+            patch.object(Path, "read_bytes", side_effect=AssertionError("proof must use verified prefix API")),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        blob_service.read_blob_content_prefix_verified.assert_awaited_once_with(
+            blob_id,
+            prefix_bytes=8 * 1024,
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_rejects_observed_csv_numeric_gate_before_create_run(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        mock_settings: _WebSettingsStub,
+        tmp_path: Path,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_dir = tmp_path / "blobs" / str(session_id)
+        source_dir.mkdir(parents=True)
+        source_path = source_dir / "amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        state_dict = state.to_dict()
+        state_record = mock_session_service.get_current_state.return_value
+        state_record.session_id = session_id
+        state_record.source = state_dict["sources"]["source"]
+        state_record.sources = state_dict["sources"]
+        state_record.nodes = state_dict["nodes"]
+        state_record.edges = state_dict["edges"]
+        state_record.outputs = state_dict["outputs"]
+        mock_settings.data_dir = tmp_path
+        _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+        snapshot_calls = 0
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+
+        def _snapshot_for_user(_user_id: str) -> PluginAvailabilitySnapshot:
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            return snapshot
+
+        service._plugin_snapshot_factory = _snapshot_for_user
+
+        with (
+            patch(
+                "elspeth.web.execution.validation.validate_pipeline",
+                return_value=_successful_core_validation_result(),
+            ),
+            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), ())),
+            pytest.raises(PipelineValidationError) as exc_info,
+        ):
+            await service.execute(session_id=session_id, user_id="alice")
+
+        assert exc_info.value.errors[0].error_code == "gate_expression_type_mismatch_against_source_schema"
+        assert snapshot_calls == 1
+        mock_session_service.create_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_guided_reviewed_source_binding_is_inspected_without_live_blob_ref(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.composer.guided.resolved import SourceResolved
+        from elspeth.web.composer.guided.state_machine import GuidedSession
+
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "guided-amounts.csv"
+        source_path.write_text("amount\n250.00\n", encoding="utf-8")
+        live_state = _proof_gate_state(source_path=source_path, blob_id=None)
+        stable_id = str(uuid4())
+        guided = replace(
+            GuidedSession.initial(),
+            source_order=(stable_id,),
+            reviewed_sources={
+                stable_id: SourceResolved(
+                    name="source",
+                    plugin="csv",
+                    options={
+                        "path": str(source_path),
+                        "blob_ref": str(blob_id),
+                        "schema": {"mode": "observed"},
+                    },
+                    observed_columns=("amount",),
+                    sample_rows=(),
+                    on_validation_failure="discard",
+                )
+            },
+        )
+        state = replace(live_state, guided_session=guided)
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.errors[0].error_code == "gate_expression_type_mismatch_against_source_schema"
+        blob_service.get_blob.assert_awaited_once_with(blob_id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("schema_mode", ["fixed", "flexible"])
+    async def test_explicit_numeric_source_schema_passes_proof(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+        schema_mode: str,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / f"{schema_mode}-amounts.csv"
+        source_path.write_text("amount\n250.00\n", encoding="utf-8")
+        state = _proof_gate_state(
+            source_path=source_path,
+            blob_id=blob_id,
+            schema_mode=schema_mode,
+        )
+        _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is True
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is True
+        assert result.errors == []
+
+    @pytest.mark.asyncio
+    async def test_observed_string_comparison_passes_proof(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "regions.csv"
+        source_path.write_text("region\nNSW\nVIC\n", encoding="utf-8")
+        state = _proof_gate_state(
+            source_path=source_path,
+            blob_id=blob_id,
+            condition="row['region'] == 'NSW'",
+        )
+        _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is True
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is True
+
+    @pytest.mark.asyncio
+    async def test_uninspectable_blob_source_abstains_with_passing_proof_check(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        state = _proof_gate_state(
+            source_path=tmp_path / "not-authoritatively-resolved.csv",
+            blob_id=uuid4(),
+        )
+        service._blob_service = None
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=uuid4())
+
+        assert result.is_valid is True
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is True
+        assert result.errors == []
+
+    @pytest.mark.asyncio
+    async def test_ambiguous_blob_path_binding_abstains_without_reading_bytes(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "canonical.csv"
+        source_path.write_text("amount\n250.00\n", encoding="utf-8")
+        base = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        source = base.sources["source"]
+        state = replace(
+            base,
+            sources={
+                "source": replace(
+                    source,
+                    options={
+                        **source.options,
+                        "file": str(tmp_path / "conflicting.csv"),
+                    },
+                )
+            },
+        )
+        blob_service = _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is True
+        assert result.checks[24].name == "proof_diagnostics"
+        assert result.checks[24].passed is True
+        blob_service.read_blob_content_prefix_verified.assert_not_awaited()
 
 
 def _text_source(path: Path, on_success: str) -> Any:
@@ -4417,7 +4847,11 @@ class TestCancelMechanism:
         mock_session_service.create_run.return_value = _run_record_stub(id=run_id)
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
 
         async def tracking_link(*args: Any, **kwargs: Any) -> None:
             # At the time blob linkage runs, the event MUST already exist
@@ -4456,7 +4890,11 @@ class TestCancelMechanism:
         mock_session_service.create_run.return_value = _run_record_stub(id=run_id)
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
         blob_service.link_blob_to_run.side_effect = RuntimeError("blob storage unavailable")
         cast(Any, service)._blob_service = blob_service
 
@@ -5580,7 +6018,11 @@ class TestBlobRefPreValidation:
 
         blob_service = _blob_service_stub()
         # get_blob returns a record matching the executing session
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
         cast(Any, service)._blob_service = blob_service
 
         # path must equal blob.storage_path to satisfy the Tier 1 read
@@ -5654,12 +6096,10 @@ class TestBlobRefPreValidation:
         mock_session_service.create_run.return_value = _run_record_stub(id=run_id)
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.side_effect = lambda blob_id: SimpleNamespace(
+        blob_service.get_blob.side_effect = lambda blob_id: _ready_csv_blob_for_execution(
+            blob_ref=str(blob_id),
             session_id=session_id,
-            storage_path={
-                orders_blob: orders_path,
-                refunds_blob: refunds_path,
-            }[str(blob_id)],
+            storage_path={orders_blob: orders_path, refunds_blob: refunds_path}[str(blob_id)],
         )
         cast(Any, service)._blob_service = blob_service
 
@@ -5726,7 +6166,11 @@ class TestBlobOwnership:
 
         blob_service = _blob_service_stub()
         # Blob belongs to other_session_id, not executing_session_id
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=other_session_id)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=other_session_id,
+            storage_path=f"/tmp/data/blobs/{other_session_id}/{blob_ref}_input.csv",
+        )
         cast(Any, service)._blob_service = blob_service
 
         state = mock_session_service.get_current_state.return_value
@@ -5760,7 +6204,8 @@ class TestBlobOwnership:
         refunds_path = f"/tmp/data/blobs/{executing_session_id}/{refunds_blob}_refunds.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.side_effect = lambda blob_id: SimpleNamespace(
+        blob_service.get_blob.side_effect = lambda blob_id: _ready_csv_blob_for_execution(
+            blob_ref=str(blob_id),
             session_id=executing_session_id if str(blob_id) == orders_blob else other_session_id,
             storage_path=orders_path if str(blob_id) == orders_blob else refunds_path,
         )
@@ -5801,7 +6246,11 @@ class TestBlobOwnership:
         canonical_path = f"/tmp/data/blobs/{session_id}/{blob_ref}_input.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
         cast(Any, service)._blob_service = blob_service
 
         # path must equal blob.storage_path to satisfy the Tier 1 read
@@ -5871,7 +6320,11 @@ class TestBlobSourcePathReadGuard:
         diverging_path = f"/tmp/data/blobs/{session_id}/{blob_ref}_OTHER.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
         cast(Any, service)._blob_service = blob_service
 
         state = mock_session_service.get_current_state.return_value
@@ -5918,7 +6371,11 @@ class TestBlobSourcePathReadGuard:
         canonical_path = f"/tmp/data/blobs/{session_id}/{blob_ref}_input.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
         cast(Any, service)._blob_service = blob_service
 
         state = mock_session_service.get_current_state.return_value
@@ -5951,7 +6408,11 @@ class TestBlobSourcePathReadGuard:
         diverging_path = f"/tmp/data/blobs/{session_id}/{blob_ref}_OTHER.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.return_value = SimpleNamespace(session_id=session_id, storage_path=canonical_path)
+        blob_service.get_blob.return_value = _ready_csv_blob_for_execution(
+            blob_ref=blob_ref,
+            session_id=session_id,
+            storage_path=canonical_path,
+        )
         cast(Any, service)._blob_service = blob_service
 
         state = mock_session_service.get_current_state.return_value
@@ -5990,7 +6451,8 @@ class TestBlobSourcePathReadGuard:
         refunds_diverging_path = f"/tmp/data/blobs/{session_id}/{refunds_blob}_OTHER.csv"
 
         blob_service = _blob_service_stub()
-        blob_service.get_blob.side_effect = lambda blob_id: SimpleNamespace(
+        blob_service.get_blob.side_effect = lambda blob_id: _ready_csv_blob_for_execution(
+            blob_ref=str(blob_id),
             session_id=session_id,
             storage_path=orders_path if str(blob_id) == orders_blob else refunds_canonical_path,
         )

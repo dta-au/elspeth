@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import ast
 import csv
+import hmac
 import io
 import re
 from collections import Counter
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal, TypedDict
 
 from opentelemetry import metrics
 from sqlalchemy import Engine
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.schema import get_aggregation_contract_options, get_raw_schema_config
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -28,6 +31,7 @@ from elspeth.plugins.transforms.llm.model_catalog import (
     OPENROUTER_LITELLM_PREFIX,
     read_litellm_model_list,
 )
+from elspeth.web.blobs.protocol import BlobIntegrityError
 from elspeth.web.catalog.protocol import PluginKind
 from elspeth.web.composer._producer_resolver import ProducerResolver, is_source_producer_id
 from elspeth.web.composer.source_inspection import (
@@ -56,6 +60,7 @@ from elspeth.web.composer.tools._common import (
     diff_states,
 )
 from elspeth.web.composer.tools.blobs import (
+    BlobToolRecord,
     _sync_get_blob,
     _verify_blob_content_integrity,
 )
@@ -1564,6 +1569,44 @@ _BLOCKING_DIAGNOSTIC_CODES: Final[frozenset[str]] = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedProofBlob:
+    """One custody-resolved blob and optional verified bounded content."""
+
+    metadata: BlobToolRecord
+    verified_prefix: bytes | None = None
+    verified_content_hash: str | None = None
+    total_size_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        supplied = (
+            self.verified_prefix is not None,
+            self.verified_content_hash is not None,
+            self.total_size_bytes is not None,
+        )
+        if any(supplied) and not all(supplied):
+            raise TypeError("verified proof bytes, content hash, and total size must be supplied together")
+        if not any(supplied):
+            return
+        if type(self.verified_prefix) is not bytes or len(self.verified_prefix) > 8 * 1024:
+            raise TypeError("verified proof prefix must be exact bytes bounded to 8192 bytes")
+        if type(self.verified_content_hash) is not str:
+            raise TypeError("verified proof content hash must be an exact string")
+        if type(self.total_size_bytes) is not int or self.total_size_bytes < len(self.verified_prefix):
+            raise TypeError("verified proof total size must be an exact int no smaller than the prefix")
+        stored_hash = self.metadata["content_hash"]
+        if stored_hash is None:
+            raise AuditIntegrityError("ready proof blob has null content_hash")
+        if not hmac.compare_digest(stored_hash, self.verified_content_hash):
+            raise BlobIntegrityError(
+                self.metadata["id"],
+                expected=stored_hash,
+                actual=self.verified_content_hash,
+            )
+        if self.metadata["size_bytes"] != self.total_size_bytes:
+            raise AuditIntegrityError("verified proof blob size differs from its custody metadata")
+
+
 class _BlockingDiagnosticPayload(TypedDict):
     code: str
     severity: Literal["blocking"]
@@ -1956,6 +1999,7 @@ def compute_proof_diagnostics(
     *,
     session_engine: Engine | None = None,
     session_id: str | None = None,
+    blob_resolver: Callable[[str], ResolvedProofBlob | None] | None = None,
 ) -> list[Mapping[str, Any]]:
     """Compute machine-readable proof diagnostics for a composer state.
 
@@ -2001,7 +2045,10 @@ def compute_proof_diagnostics(
     ``inspect_blob_content``'s 8 KiB / 100 row caps.
 
     No-op (returns an empty list) if the source is not blob-backed or
-    if session context is absent.
+    if no session-scoped blob resolver is available. Composer callers supply
+    ``session_engine``/``session_id``; authoritative execution supplies an
+    already-custody-checked ``blob_resolver`` so this detector does not own a
+    second persistence implementation.
     """
     diagnostics: list[Mapping[str, Any]] = []
 
@@ -2025,49 +2072,58 @@ def compute_proof_diagnostics(
     # (membership form, not ``.get``) and the caller treats None as "not
     # blob-backed", returning the empty diagnostics list.
     blob_id = source.options["blob_ref"] if "blob_ref" in source.options else None
-    if blob_id is None or session_engine is None or session_id is None:
+    if blob_id is None or session_id is None:
         return diagnostics
 
-    blob = _sync_get_blob(session_engine, str(blob_id), session_id)
+    if blob_resolver is None:
+        if session_engine is None:
+            return diagnostics
+
+        def blob_resolver(resolved_blob_id: str) -> ResolvedProofBlob | None:
+            metadata = _sync_get_blob(session_engine, resolved_blob_id, session_id)
+            return None if metadata is None else ResolvedProofBlob(metadata=metadata)
+
+    resolved_blob = blob_resolver(str(blob_id))
+    blob = None if resolved_blob is None else resolved_blob.metadata
     # ``blob`` is a BlobToolRecord (TypedDict produced by
     # ``_blob_row_to_tool_dict`` from a validated blobs row). Direct
     # subscript access is mandatory — a missing key is a Tier-1
     # contract violation in our own dict shape, not external data.
     if blob is None or blob["status"] != "ready":
         return diagnostics
+    assert resolved_blob is not None
 
-    storage_path = Path(blob["storage_path"])
-    if not storage_path.exists():
-        diagnostics.append(
-            _blocking_diagnostic(
-                code="source_inspection_failed",
-                message=(f"Source blob '{blob_id}' storage file is missing — pipeline cannot run until the blob is re-uploaded."),
-                suggested_repair="create_blob with the original content and re-wire via set_source_from_blob",
-                evidence_locator={"source": "blob", "blob_id": str(blob_id)},
+    if resolved_blob.verified_prefix is None:
+        storage_path = Path(blob["storage_path"])
+        if not storage_path.exists():
+            diagnostics.append(
+                _blocking_diagnostic(
+                    code="source_inspection_failed",
+                    message=(f"Source blob '{blob_id}' storage file is missing — pipeline cannot run until the blob is re-uploaded."),
+                    suggested_repair="create_blob with the original content and re-wire via set_source_from_blob",
+                    evidence_locator={"source": "blob", "blob_id": str(blob_id)},
+                )
             )
-        )
-        return diagnostics
+            return diagnostics
 
-    # Tier 1 (our data, our file): an OSError between exists() and
-    # read_bytes() is a real anomaly (concurrent delete, fs corruption,
-    # permission revocation). Per CLAUDE.md offensive-programming
-    # policy, let it propagate so the operator sees an informative
-    # exception rather than a synthesised soft-degraded diagnostic
-    # that could let downstream act on absent bytes.
-    content = storage_path.read_bytes()
-
-    # Tier 1 integrity verification — same shared helper as the two
-    # other composer-tool blob readers. Without this, the proof step
-    # would feed unverified bytes into ``inspect_blob_content`` and
-    # repair-loop, undermining the audit trail's "decisions made on
-    # verified inputs" invariant.
-    _verify_blob_content_integrity(blob, content)
+        # Existing Composer-engine behavior: read and verify the complete local
+        # file. Authoritative validate/execute callers instead supply the
+        # BlobService's already-verified 8 KiB prefix to avoid full-file memory
+        # use and a metadata/path TOCTOU seam.
+        content = storage_path.read_bytes()
+        _verify_blob_content_integrity(blob, content)
+        total_size_bytes = len(content)
+    else:
+        content = resolved_blob.verified_prefix
+        assert resolved_blob.total_size_bytes is not None
+        total_size_bytes = resolved_blob.total_size_bytes
 
     facts = inspect_blob_content(
         content=content,
         filename=blob["filename"],
         mime_type=blob["mime_type"],
         content_hash=blob["content_hash"],
+        total_size_bytes=total_size_bytes,
     )
     if source.plugin == "csv":
         # ``source.options`` is composer/user-authored config re-read from
@@ -2368,7 +2424,7 @@ def compute_proof_diagnostics(
 
     inspected_blob_id = str(blob_id)
     node_plugins = {(n.plugin or "").lower() for n in state.nodes}
-    if "web_scrape" not in node_plugins and session_engine is not None and session_id is not None:
+    if "web_scrape" not in node_plugins:
         for source_name, candidate_source in state.sources.items():
             if "blob_ref" not in candidate_source.options:
                 continue
@@ -2377,19 +2433,28 @@ def compute_proof_diagnostics(
                 continue
             if candidate_source.plugin != "text":
                 continue
-            candidate_blob = _sync_get_blob(session_engine, candidate_blob_id, session_id)
+            candidate_resolved_blob = blob_resolver(candidate_blob_id)
+            candidate_blob = None if candidate_resolved_blob is None else candidate_resolved_blob.metadata
             if candidate_blob is None or candidate_blob["status"] != "ready":
                 continue
-            candidate_storage_path = Path(candidate_blob["storage_path"])
-            if not candidate_storage_path.exists():
-                continue
-            candidate_content = candidate_storage_path.read_bytes()
-            _verify_blob_content_integrity(candidate_blob, candidate_content)
+            assert candidate_resolved_blob is not None
+            if candidate_resolved_blob.verified_prefix is None:
+                candidate_storage_path = Path(candidate_blob["storage_path"])
+                if not candidate_storage_path.exists():
+                    continue
+                candidate_content = candidate_storage_path.read_bytes()
+                _verify_blob_content_integrity(candidate_blob, candidate_content)
+                candidate_total_size_bytes = len(candidate_content)
+            else:
+                candidate_content = candidate_resolved_blob.verified_prefix
+                assert candidate_resolved_blob.total_size_bytes is not None
+                candidate_total_size_bytes = candidate_resolved_blob.total_size_bytes
             candidate_facts = inspect_blob_content(
                 content=candidate_content,
                 filename=candidate_blob["filename"],
                 mime_type=candidate_blob["mime_type"],
                 content_hash=candidate_blob["content_hash"],
+                total_size_bytes=candidate_total_size_bytes,
             )
             if candidate_facts.source_kind != "text" or not candidate_facts.url_candidates:
                 continue
