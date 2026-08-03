@@ -513,8 +513,6 @@ async def prepare_pipeline_proposal_commit(
     if invocation.tool_call_id != authority.row.tool_call_id or invocation.authority_arguments_hash != authority.row.tool_arguments_hash:
         raise AuditIntegrityError("pipeline commit dispatch audit does not bind exact proposal arguments")
     executor_hash = composition_content_hash(result.updated_state)
-    if proposed_content_hash is not None and executor_hash != proposed_content_hash:
-        raise AuditIntegrityError("owned composition-state executor differs from the exact proposed content")
     invocation = _bind_executor_content_hash(invocation, executor_content_hash=executor_hash)
     binding = PipelineDispatchAuditBinding.from_invocation(invocation)
     if not result.success or not result.validation.is_valid:

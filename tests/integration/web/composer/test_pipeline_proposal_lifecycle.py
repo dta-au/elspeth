@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import threading
 import time
 from dataclasses import replace
@@ -30,7 +31,14 @@ from elspeth.web.composer.pipeline_commit import (
     prepare_pipeline_proposal_commit,
 )
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal, PlannerSurface, PresentBase
+from elspeth.web.composer.pipeline_proposal import (
+    AbsentBase,
+    PipelineProposal,
+    PlannerSurface,
+    PresentBase,
+    owned_composition_state_authority,
+    owned_composition_state_review_arguments,
+)
 from elspeth.web.composer.redaction import redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
@@ -191,6 +199,50 @@ def _runnable_plan(tmp_path, session_id: UUID) -> PipelinePlanResult:
             supersedes_draft_hash=None,
         ),
         tool_call_id="planner-terminal-call",
+        custody_result="not_required",
+        model_identifier="planner-model",
+        model_version="planner-model-v1",
+        provider="test",
+    )
+
+
+def _runnable_owned_state_plan(tmp_path, session_id: UUID) -> PipelinePlanResult:
+    public = _runnable_pipeline(tmp_path, session_id)
+    source = public["source"]
+    outputs = public["outputs"]
+    assert type(source) is dict
+    assert type(outputs) is list
+    state = CompositionState.from_dict(
+        {
+            "version": 2,
+            "sources": {"source": source},
+            "nodes": public["nodes"],
+            "edges": public["edges"],
+            "outputs": [
+                {
+                    "name": output["sink_name"],
+                    "plugin": output["plugin"],
+                    "options": output["options"],
+                    "on_write_failure": output["on_write_failure"],
+                }
+                for output in outputs
+            ],
+            "metadata": {"name": "Owned pipeline", "description": "Lossless private authority"},
+        }
+    )
+    authority = owned_composition_state_authority(state)
+    return PipelinePlanResult(
+        proposal=PipelineProposal.create(
+            pipeline=authority,
+            base=AbsentBase(),
+            reviewed_facts={},
+            surface=PlannerSurface.FREEFORM,
+            repair_count=0,
+            skill_hash=stable_hash("skill"),
+            covered_deferred_intent_ids=(),
+            supersedes_draft_hash=None,
+        ),
+        tool_call_id="owned-terminal-call",
         custody_result="not_required",
         model_identifier="planner-model",
         model_version="planner-model-v1",
@@ -2111,3 +2163,113 @@ async def test_prepare_pipeline_commit_detects_candidate_executor_mismatch_after
 
     assert len(recorder.invocations) == 1
     assert await service.get_current_state(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_owned_pipeline_executor_mismatch_binds_hash_and_supports_recovery_rejection(
+    service: SessionServiceImpl,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = uuid4()
+    _insert_session(service, session_id)
+    plan = _runnable_owned_state_plan(tmp_path, session_id)
+    review_arguments = owned_composition_state_review_arguments(plan.proposal.pipeline)
+    row = await service.create_pipeline_composition_proposal(
+        session_id=session_id,
+        plan=plan,
+        summary="Replace the pipeline.",
+        rationale="Requested by the operator.",
+        affects=("graph",),
+        arguments_redacted_json=redact_tool_call_arguments(
+            "set_pipeline",
+            review_arguments,
+            telemetry=NoopRedactionTelemetry(),
+        ),
+        actor="composer-web:user:alice",
+        composer_model_identifier="planner-model",
+        composer_model_version="planner-model-v1",
+        composer_provider="provider",
+    )
+    authority = await service.get_authoritative_pipeline_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        reviewed_facts={},
+    )
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    recorder = BufferingRecorder()
+    current = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+
+    import elspeth.web.composer.pipeline_commit as commit_module
+
+    original_execute = commit_module.execute_tool
+
+    def mismatching_execute(*args, **kwargs):
+        result = original_execute(*args, **kwargs)
+        return replace(result, updated_state=replace(result.updated_state, metadata=PipelineMetadata(name="mismatch")))
+
+    monkeypatch.setattr(commit_module, "execute_tool", mismatching_execute)
+    with pytest.raises(PipelineCommitMismatchError) as exc_info:
+        await prepare_pipeline_proposal_commit(
+            authority=authority,
+            reviewed_facts={},
+            current_state=current,
+            current_state_id=None,
+            policy_catalog=policy,
+            plugin_snapshot=snapshot,
+            config=PipelineCommitConfig(
+                data_dir=str(tmp_path),
+                session_engine=service._engine,
+                secret_service=None,
+                user_id="alice",
+                user_message_content=None,
+                max_blob_storage_per_session_bytes=1_000_000,
+                runtime_preflight=None,
+                timeout_seconds=5.0,
+            ),
+            recorder=recorder,
+            actor="user:alice",
+            settlement_surface="generic",
+        )
+
+    mismatch = exc_info.value
+    assert mismatch.invocation is not None
+    assert mismatch.dispatch is not None
+    result_payload = json.loads(mismatch.invocation.result_canonical or "null")
+    assert result_payload["pipeline_content_hash_schema"] == "composer.pipeline-dispatch-result.v1"
+    executor_content_hash = result_payload["pipeline_content_hash"]
+    assert type(executor_content_hash) is str and len(executor_content_hash) == 64
+    assert mismatch.dispatch.result_hash == stable_hash(result_payload)
+
+    bindings = await _persist_tool_invocations(
+        service,
+        session_id,
+        (mismatch.invocation,),
+        None,
+        plugin_crash_pending=False,
+    )
+    assert len(bindings) == 1
+    persisted_binding = bindings[0]
+    assert persisted_binding.tool_call_id == mismatch.dispatch.tool_call_id
+    assert persisted_binding.status is ComposerToolStatus.SUCCESS
+    recovery = await service.get_pipeline_dispatch_recovery(authority=authority)
+    assert recovery is not None
+    assert recovery.binding == persisted_binding
+    assert recovery.executor_content_hash == executor_content_hash
+
+    rejected = await service.reject_pipeline_composition_proposal(
+        session_id=session_id,
+        proposal_id=row.id,
+        draft_hash=plan.proposal.draft_hash,
+        reviewed_facts={},
+        reason="candidate_executor_mismatch",
+        dispatch=recovery.binding,
+        actor="system:pipeline-commit",
+    )
+    assert rejected.status == "rejected"
+    assert await service.get_current_state(session_id) is None
+    terminal = (await service.list_proposal_events(session_id))[-1].payload
+    assert terminal["reason_code"] == "candidate_executor_mismatch"
+    assert terminal["dispatch"] == recovery.binding.to_dict()
