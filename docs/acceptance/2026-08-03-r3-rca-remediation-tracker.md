@@ -1,7 +1,7 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-03T19:24:00+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-03T19:23:00+10:00
+Last refreshed: 2026-08-03T19:38:00+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-03T19:38:00+10:00
 Release baseline: `release/0.7.2@278593c09`
 Coordination owner: `codex-r3-rca-coordinator`
 
@@ -86,7 +86,7 @@ claim custody.
 | `/root/rca_compose_request_correlation` | Emit bounded correlation events for structured HTTP errors and Pydantic 422s | `.claude/worktrees/compose-request-correlation`; `codex/fix-compose-request-correlation` | Released after integration | None | Complete through `39c6b14a7`; 32 exact release-handler regressions passed; live CloudWatch lookup remains |
 | `/root/impl_frontend_readiness_axes` | Apply backend readiness axes to every frontend action | `.claude/worktrees/frontend-readiness-axes`; `codex/fix-frontend-readiness-axes` | Released after integration | None | Complete; integrated through `9016ce6a6`, exact release rerun 148 passed, task closed |
 | `/root/impl_guided_plan_terminal_progress` | Settle terminal progress for every guided-plan outcome | `.claude/worktrees/guided-plan-terminal-progress`; `codex/fix-guided-plan-terminal-progress` | Released after integration | None | Complete through `859c2a642`; independent adversarial review clean, 87 progress/guided-plan plus 10 chat-custody release tests passed, task closed |
-| `/root/impl_guided_gate_proof_validation` | Make source-proof diagnostics authoritative during guided confirmation | `.claude/worktrees/guided-gate-proof-validation`; `codex/fix-guided-gate-proof-validation` | Guided confirmation plus reviewed-source custody/redaction seams and direct tests | None | Candidate `b4fb70270` held: mixed carriers can leak private paths and rejected blob custody can incorrectly abstain to a green proof; real positive/negative ExecutionService regressions are RED/in progress |
+| `/root/impl_guided_gate_proof_validation` | Make source-proof diagnostics authoritative during guided confirmation | `.claude/worktrees/guided-gate-proof-validation`; `codex/fix-guided-gate-proof-validation` | Guided confirmation plus reviewed-source custody/redaction seams and direct tests | None | Clean chain `b4fb70270` + `7fee879dc` closes prior P1s, but final review held it because `EXITED_TO_FREEFORM` history still acts as current sentinel authority; one narrow follow-up remains |
 | `/root/impl_advisor_surface_deadline` | Close successful re-review leakage and bind checkpoints to the compose deadline | `.claude/worktrees/advisor-surface-deadline`; `codex/fix-advisor-surface-deadline` | Advisor service/turn-audit/no-tool surfaces and direct tests; explicitly excludes `tool_batch.py` until released | None | Real FLAG-to-repair-to-CLEAN transcript leakage and four-call deadline overrun are RED; production implementation is active |
 
 No subagent may mutate AWS or the shared release checkout during this wave.
@@ -273,6 +273,8 @@ Append entries; do not rewrite history.
 | 2026-08-03 19:15 | Advisor residuals re-audited | D2 convergence and D5 execution/completion policy hold, while real-loop reproduction confirmed successful FLAG-to-repair-to-CLEAN prose leakage and four unbounded END-checkpoint calls; D3 returned to fixing and deadline task started |
 | 2026-08-03 19:19 | Guided proof localized handoff held | Candidate `b4fb70270` passed reported focused gates but review reproduced mixed-carrier private-path disclosure and a wrong-session/path blob sentinel collapsing to green proof abstention; stronger real ExecutionService regressions assigned |
 | 2026-08-03 19:23 | Required-controls blob proposal seam GREEN | Exact named one-source and two-source explicit proposals now retain canonical private state and controls while public/audit projections omit blob IDs and paths; lower-level tamper/nonpublication coverage remains before review |
+| 2026-08-03 19:28 | Structural index refreshed | Loomweave run `a86ff356-bc5d-4b0e-8f54-5ce99f5204a1` completed fresh at exact release `d3fb24c89` with 71,034 entities and 137,904 edges |
+| 2026-08-03 19:38 | Graceful pause checkpoint | All reviewed completed fixes remain durable on release; required-controls and advisor lanes stopped safely as staged/dirty uncommitted work; guided chain stayed isolated after final review found exited-to-freeform history still acting as current blob authority; durable handover brief added |
 
 ## Reconciliation findings
 
