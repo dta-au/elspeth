@@ -22,6 +22,8 @@ from unittest.mock import MagicMock
 
 import pytest
 import structlog
+from opentelemetry.metrics import Counter
+from structlog.typing import FilteringBoundLogger
 
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
@@ -110,8 +112,8 @@ def make_recorder() -> BufferingRecorder:
 def test_advisor_checkpoint_telemetry_counter_uses_only_phase_and_verdict(monkeypatch) -> None:
     from elspeth.web.composer import advisor_checkpoint_telemetry as telemetry
 
-    counter = MagicMock()
-    logger = MagicMock()
+    counter = MagicMock(spec_set=Counter)
+    logger = MagicMock(spec_set=FilteringBoundLogger)
     monkeypatch.setattr(telemetry, "_ADVISOR_CHECKPOINT_PASSES_COUNTER", counter)
     monkeypatch.setattr(telemetry, "slog", logger)
 
@@ -425,8 +427,8 @@ async def test_run_advisor_checkpoint_telemetry_failure_does_not_replace_complet
     service = make_service()
     findings = "FLAGGED: TELEMETRY_FAILURE_FINDINGS_CANARY"
     service._call_advisor_with_audit = _AsyncRecorder(return_value=(findings, {}))
-    logger = MagicMock()
-    counter = MagicMock()
+    logger = MagicMock(spec_set=FilteringBoundLogger)
+    counter = MagicMock(spec_set=Counter)
     monkeypatch.setattr(telemetry, "slog", logger)
     monkeypatch.setattr(telemetry, "_ADVISOR_CHECKPOINT_PASSES_COUNTER", counter)
     if failing_sink == "logger":

@@ -20,6 +20,7 @@ import pytest
 
 from elspeth.contracts.freeze import deep_freeze
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, ControlMode, PluginCapability
+from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSecretRequirement, PluginSummary
@@ -37,14 +38,16 @@ from elspeth.web.composer.prompts import (
     build_messages as _build_messages,
 )
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
+from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
+from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
 from elspeth.web.plugin_policy.models import (
     PluginAvailability,
     PluginAvailabilitySnapshot,
     PluginId,
     PluginUnavailableReason,
 )
-from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 
 EXPECTED_REDACTED_BLOB_SOURCE_PATH = "<redacted-blob-source-path>"
 
@@ -332,6 +335,29 @@ class TestBuildContextString:
 
     def test_context_exposes_only_opaque_bedrock_profile_inventory(self) -> None:
         prompt_id = PluginId("transform", "aws_bedrock_prompt_shield")
+        settings = WebSettings.model_validate(
+            {
+                "composer_max_composition_turns": 4,
+                "composer_max_discovery_turns": 4,
+                "composer_timeout_seconds": 60,
+                "composer_rate_limit_per_minute": 20,
+                "secret_key": "0123456789abcdef0123456789abcdef",
+                "shareable_link_signing_key": b"abcdef0123456789abcdef0123456789",
+                "plugin_allowlist": (str(prompt_id),),
+                "bedrock_guardrail_profiles": (
+                    {
+                        "alias": "prompt-default",
+                        "plugin": prompt_id.name,
+                        "guardrail_identifier": "privateguardrail",
+                        "guardrail_version": "87654321",
+                        "region": "af-south-1",
+                    },
+                ),
+            }
+        )
+        runtime = RuntimeWebPluginConfig.from_settings(settings)
+        policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime)
+        profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
         snapshot = PluginAvailabilitySnapshot.create(
             policy_hash="bedrock-policy",
             principal_scope="local:alice",
@@ -344,7 +370,7 @@ class TestBuildContextString:
             binding_generation_fingerprint="bedrock-binding",
         )
         catalog = create_catalog_service()
-        view = PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry))
+        view = PolicyCatalogView(catalog, snapshot, profiles)
 
         context = _build_context_string(
             _empty_state(),
@@ -356,17 +382,16 @@ class TestBuildContextString:
 
         assert policy["usable_profile_aliases"] == {"transform:aws_bedrock_prompt_shield": ["prompt-default"]}
         assert policy["selected_profile_aliases"] == {"transform:aws_bedrock_prompt_shield": "prompt-default"}
-        rendered = json.dumps(policy, sort_keys=True)
         for private in (
-            "private-guardrail-marker",
-            "private-version-marker",
-            "private-region-marker",
+            "privateguardrail",
+            "87654321",
+            "af-south-1",
             "AWS_SECRET_ACCESS_KEY",
             "arn:aws:iam::123456789012:role/private-role",
             "https://private-endpoint.invalid",
             "local_requirement_unavailable",
         ):
-            assert private not in rendered
+            assert private not in context
 
     def test_context_includes_discovery_time_composer_hints(self) -> None:
         """The LLM sees JIT hints even when it does not call list_* first."""
