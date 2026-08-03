@@ -33,6 +33,7 @@ from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.errors import FrameworkBugError, RuntimePreflightFailedError
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.plugin_assistance import PluginAssistance, PluginAssistanceExample
 from elspeth.contracts.plugin_capabilities import CapabilityDeclaration, PluginCapability, WebConfigAuthority
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
@@ -568,36 +569,53 @@ class MultiQueryStrategy:
                 retryable=False,
             )
 
+        # Build the provider response constraint and exact prompt sent for this
+        # query. Structured mode sends the schema through the API-native
+        # response_format contract. Standard JSON mode guarantees only a JSON
+        # object at the API boundary, so the declared field contract must also
+        # be present in the prompt before runtime validation can reasonably
+        # enforce it. Canonical JSON keeps field names and enum values escaped
+        # and deterministic rather than interpolating them as free-form prose.
+        response_format: dict[str, Any] | None = None
+        provider_prompt = rendered.prompt
+        if spec.output_fields:
+            properties = {field.suffix: field.to_json_schema() for field in spec.output_fields}
+            output_schema = {
+                "type": "object",
+                "properties": properties,
+                "required": list(properties),
+            }
+            if spec.response_format == ResponseFormat.STRUCTURED:
+                response_format = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": f"{spec.name}_output",
+                        "schema": output_schema,
+                    },
+                }
+            else:
+                response_format = {"type": "json_object"}
+                provider_prompt = (
+                    f"{rendered.prompt}\n\n"
+                    "Return exactly one JSON object matching this required output contract (JSON Schema):\n"
+                    f"{canonical_json(output_schema)}"
+                )
+
         # Build messages
         messages: list[dict[str, str]] = []
         if self.system_prompt:
             messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": rendered.prompt})
+        messages.append({"role": "user", "content": provider_prompt})
+        # Langfuse reconstructs the outbound messages from these separate
+        # values. Match the provider's truthy inclusion rule so an explicitly
+        # empty system prompt is omitted from both records.
+        tracer_system_prompt = self.system_prompt or None
 
         if _shutdown_event_is_set(shutdown_event):
             return _shutdown_requested_result(query_name=spec.name, query_index=query_idx)
 
         # Execute query
         query_max_tokens = spec.max_tokens or self.max_tokens
-
-        # Build response_format for structured output requests
-        response_format: dict[str, Any] | None = None
-        if spec.output_fields:
-            if spec.response_format == ResponseFormat.STRUCTURED:
-                properties = {f.suffix: f.to_json_schema() for f in spec.output_fields}
-                response_format = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": f"{spec.name}_output",
-                        "schema": {
-                            "type": "object",
-                            "properties": properties,
-                            "required": list(properties),
-                        },
-                    },
-                }
-            else:
-                response_format = {"type": "json_object"}
 
         trace_parent = LLMAuditParent.for_row(state_id=state_id, token_id=token_id)
         start_time = time.monotonic()
@@ -615,12 +633,12 @@ class MultiQueryStrategy:
             tracer.record_error(
                 parent=trace_parent,
                 query_name=spec.name,
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
                 extra_metadata=None,
-                system_prompt=self.system_prompt,
+                system_prompt=tracer_system_prompt,
             )
             return TransformResult.error(
                 {
@@ -636,12 +654,12 @@ class MultiQueryStrategy:
             tracer.record_error(
                 parent=trace_parent,
                 query_name=spec.name,
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=str(e),
                 model=self.model,
                 latency_ms=latency_ms,
                 extra_metadata=None,
-                system_prompt=self.system_prompt,
+                system_prompt=tracer_system_prompt,
             )
             if e.retryable:
                 raise  # Pool catches with AIMD; sequential catches and returns error
@@ -667,12 +685,12 @@ class MultiQueryStrategy:
             tracer.record_error(
                 parent=trace_parent,
                 query_name=spec.name,
-                prompt=rendered.prompt,
+                prompt=provider_prompt,
                 error_message=finish_reason_error.error_message,
                 model=self.model,
                 latency_ms=latency_ms,
                 extra_metadata=None,
-                system_prompt=self.system_prompt,
+                system_prompt=tracer_system_prompt,
             )
             return finish_reason_error.result
 
@@ -682,13 +700,13 @@ class MultiQueryStrategy:
         tracer.record_success(
             parent=trace_parent,
             query_name=spec.name,
-            prompt=rendered.prompt,
+            prompt=provider_prompt,
             response_content=content,
             model=result.model,
             usage=result.usage,
             latency_ms=latency_ms,
             extra_metadata=None,
-            system_prompt=self.system_prompt,
+            system_prompt=tracer_system_prompt,
         )
 
         # Build partial output for this query
@@ -1132,7 +1150,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:2162a412737490ac"
+    source_file_hash: str | None = "sha256:57af6147b08f4655"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True

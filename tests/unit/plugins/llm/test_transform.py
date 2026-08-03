@@ -1644,6 +1644,7 @@ class TestResponseFormatPassthrough:
 
         config = _make_config(
             prompt_template="Evaluate: {{ row.text_content }}",
+            system_prompt="",
             queries={
                 "q1": {
                     "input_fields": {"text_content": "text"},
@@ -1667,9 +1668,165 @@ class TestResponseFormatPassthrough:
         transform._process_row(_make_row(), _make_ctx())
 
         # Verify response_format was passed to provider
+        call_messages = mock_provider.execute_query.call_args.args[0]
         call_kwargs = mock_provider.execute_query.call_args.kwargs
-        assert "response_format" in call_kwargs
-        assert call_kwargs["response_format"]["type"] == "json_schema"
+        assert call_messages == [{"role": "user", "content": "Evaluate: hello"}]
+        assert call_kwargs["response_format"] == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "q1_output",
+                "schema": {
+                    "type": "object",
+                    "properties": {"score": {"type": "integer"}},
+                    "required": ["score"],
+                },
+            },
+        }
+
+    @pytest.mark.parametrize("pool_size", [1, 4])
+    @pytest.mark.parametrize("system_prompt", [None, "", "Follow the authored rubric exactly."])
+    def test_standard_response_format_sends_declared_contract_and_traces_exact_messages(
+        self,
+        pool_size: int,
+        system_prompt: str | None,
+    ) -> None:
+        """Standard JSON must send every required field/type/enum in both execution modes."""
+        from elspeth.plugins.transforms.llm.langfuse import LangfuseTracer
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            prompt_template="Evaluate: {{ row.text_content }}",
+            queries={
+                "quality": {
+                    "input_fields": {"text_content": "text"},
+                    "response_format": "standard",
+                    "output_fields": [
+                        {"suffix": "score", "type": "integer"},
+                        {"suffix": "label", "type": "enum", "values": ["pass", "fail"]},
+                    ],
+                },
+            },
+            pool_size=pool_size,
+            **({"system_prompt": system_prompt} if system_prompt is not None else {}),
+        )
+        transform = LLMTransform(config)
+        mock_provider = Mock(spec=LLMProvider)
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 42, "label": "pass"}',
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+        mock_tracer = Mock(spec=LangfuseTracer)
+        transform._provider = mock_provider
+        transform._tracer = mock_tracer
+
+        try:
+            result = transform._process_row(_make_row(), _make_ctx())
+        finally:
+            if transform._query_executor is not None:
+                transform._query_executor.shutdown(wait=True)
+
+        contract_json = (
+            '{"properties":{"label":{"enum":["pass","fail"],"type":"string"},'
+            '"score":{"type":"integer"}},"required":["score","label"],"type":"object"}'
+        )
+        augmented_prompt = (
+            f"Evaluate: hello\n\nReturn exactly one JSON object matching this required output contract (JSON Schema):\n{contract_json}"
+        )
+        expected_messages = []
+        if system_prompt:
+            expected_messages.append({"role": "system", "content": system_prompt})
+        expected_messages.append({"role": "user", "content": augmented_prompt})
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert result.row["quality_score"] == 42
+        assert result.row["quality_label"] == "pass"
+        assert mock_provider.execute_query.call_args.args[0] == expected_messages
+        assert mock_provider.execute_query.call_args.kwargs["response_format"] == {"type": "json_object"}
+
+        trace_kwargs = mock_tracer.record_success.call_args.kwargs
+        traced_messages = []
+        if trace_kwargs["system_prompt"] is not None:
+            traced_messages.append({"role": "system", "content": trace_kwargs["system_prompt"]})
+        traced_messages.append({"role": "user", "content": trace_kwargs["prompt"]})
+        assert traced_messages == expected_messages
+
+    @pytest.mark.parametrize("system_prompt", ["", "Follow the authored rubric exactly."])
+    @pytest.mark.parametrize(
+        ("provider_outcome", "expected_reason"),
+        [
+            pytest.param(
+                ContextLengthError("request exceeds provider context"),
+                "context_length_exceeded",
+                id="context-length-error",
+            ),
+            pytest.param(
+                ContentPolicyError("provider rejected the request"),
+                "multi_query_failed",
+                id="llm-client-error",
+            ),
+            pytest.param(
+                LLMQueryResult(
+                    content="partial response",
+                    usage=TokenUsage.known(10, 5),
+                    model="gpt-4o",
+                    finish_reason=FinishReason.LENGTH,
+                ),
+                "response_truncated",
+                id="finish-reason-error",
+            ),
+        ],
+    )
+    def test_standard_response_format_error_trace_uses_augmented_prompt_without_leaking_it_to_result(
+        self,
+        system_prompt: str,
+        provider_outcome: LLMQueryResult | Exception,
+        expected_reason: str,
+    ) -> None:
+        """Provider failures trace the outbound contract, while row errors stay bounded."""
+        from elspeth.plugins.transforms.llm.langfuse import LangfuseTracer
+        from elspeth.plugins.transforms.llm.transform import LLMTransform
+
+        config = _make_config(
+            prompt_template="Evaluate: {{ row.text_content }}",
+            system_prompt=system_prompt,
+            queries={
+                "quality": {
+                    "input_fields": {"text_content": "text"},
+                    "response_format": "standard",
+                    "output_fields": [
+                        {"suffix": "score", "type": "integer"},
+                        {"suffix": "label", "type": "enum", "values": ["pass", "fail"]},
+                    ],
+                },
+            },
+        )
+        transform = LLMTransform(config)
+        mock_provider = Mock(spec=LLMProvider)
+        if isinstance(provider_outcome, Exception):
+            mock_provider.execute_query.side_effect = provider_outcome
+        else:
+            mock_provider.execute_query.return_value = provider_outcome
+        mock_tracer = Mock(spec=LangfuseTracer)
+        transform._provider = mock_provider
+        transform._tracer = mock_tracer
+
+        result = transform._process_row(_make_row(), _make_ctx())
+
+        provider_messages = mock_provider.execute_query.call_args.args[0]
+        trace_kwargs = mock_tracer.record_error.call_args.kwargs
+        traced_messages = []
+        if trace_kwargs["system_prompt"] is not None:
+            traced_messages.append({"role": "system", "content": trace_kwargs["system_prompt"]})
+        traced_messages.append({"role": "user", "content": trace_kwargs["prompt"]})
+        assert traced_messages == provider_messages
+        assert "required output contract" in trace_kwargs["prompt"]
+        assert result.status == "error"
+        assert result.reason is not None
+        assert result.reason["reason"] == expected_reason
+        assert "required output contract" not in str(result.reason)
 
     def test_standard_response_format_passes_json_object(self) -> None:
         """When response_format=standard with output_fields, use json_object mode."""
@@ -1709,6 +1866,7 @@ class TestResponseFormatPassthrough:
 
         config = _make_config(
             prompt_template="Classify: {{ row.text_content }}",
+            system_prompt="",
             queries={
                 "q1": {"input_fields": {"text_content": "text"}},
             },
@@ -1725,7 +1883,9 @@ class TestResponseFormatPassthrough:
 
         transform._process_row(_make_row(), _make_ctx())
 
+        call_messages = mock_provider.execute_query.call_args.args[0]
         call_kwargs = mock_provider.execute_query.call_args.kwargs
+        assert call_messages == [{"role": "user", "content": "Classify: hello"}]
         # No response_format constraint when output_fields is None
         assert call_kwargs.get("response_format") is None
 
