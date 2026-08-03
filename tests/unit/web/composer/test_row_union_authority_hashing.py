@@ -230,6 +230,46 @@ def test_set_pipeline_redacted_storage_preserves_tool_shape_and_rebinds_authorit
     assert binding.arguments_hash == composer_authority_hash(redacted)
 
 
+def test_persisted_set_pipeline_binding_normalizes_legacy_absent_inline_blob_default() -> None:
+    """Validated legacy null-bearing rows rebind to the current semantic hash."""
+    pipeline = {
+        "source": {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {"path": "input.csv", "schema": {"mode": "observed"}},
+            "on_validation_failure": "discard",
+        },
+        "nodes": [],
+        "edges": [],
+        "outputs": [],
+    }
+    audit = begin_dispatch("call-legacy-inline-default", "set_pipeline", pipeline, version_before=1, actor="test")
+    invocation = finish_success(audit, result_payload=_dispatch_result(), version_after=2)
+    _content, envelope = redacted_tool_invocation_content_and_envelope(invocation)
+    persisted = envelope["invocation"]
+    assert type(persisted) is dict
+
+    normalized_redacted = redact_tool_call_arguments(
+        "set_pipeline",
+        pipeline,
+        telemetry=NoopRedactionTelemetry(),
+    )
+    legacy_redacted = json.loads(canonical_json(normalized_redacted))
+    legacy_redacted["source"]["inline_blob"] = None
+    legacy_canonical = canonical_json(legacy_redacted)
+    legacy_authority_canonical = canonical_json(project_composer_authority_payload(legacy_redacted))
+    persisted["arguments_canonical"] = legacy_canonical
+    persisted["arguments_hash"] = hashlib.sha256(legacy_canonical.encode()).hexdigest()
+    persisted["authority_arguments_canonical"] = legacy_authority_canonical
+    persisted["authority_arguments_hash"] = hashlib.sha256(legacy_authority_canonical.encode()).hexdigest()
+
+    binding = PipelineDispatchAuditBinding.from_persisted_envelope(envelope)
+
+    assert "inline_blob" not in normalized_redacted["source"]
+    assert binding.arguments_hash == composer_authority_hash(normalized_redacted)
+    assert binding.arguments_hash != composer_authority_hash(legacy_redacted)
+
+
 def test_persisted_set_pipeline_binding_rejects_recomputed_authority_member_tampering() -> None:
     pipeline = _pipeline(("a", "c", "b"))
     audit = begin_dispatch("call-tampered", "set_pipeline", pipeline, version_before=1, actor="test")

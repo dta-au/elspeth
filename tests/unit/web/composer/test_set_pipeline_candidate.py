@@ -1725,7 +1725,7 @@ def _semantic_failure_cases(tmp_path: Path) -> list[tuple[str, dict[str, Any], T
             "Node 'classify': set_pipeline options.interpretation_requirements[0] includes resolver-owned status "
             "'resolved'. Composer tool input may stage pending review requirements only; resolved review metadata may "
             "only be written by resolve_interpretation_event.",
-            None,
+            "interpretation_requirements_invalid",
         ),
     ]
 
@@ -1946,7 +1946,7 @@ def test_inline_blob_canonical_b_failure_precedes_blob_persistence(tmp_path: Pat
                 "schema": {"mode": "observed"},
                 INTERPRETATION_REQUIREMENTS_KEY: [
                     {
-                        "kind": "pipeline_decision",
+                        "kind": "vague_term",
                         "user_term": "inline_source_data",
                         "draft": "sk-sensitive-inline-review",
                     }

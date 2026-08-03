@@ -55,7 +55,7 @@ from elspeth.web.composer.pipeline_proposal import (
     owned_composition_state_review_arguments,
     reviewed_anchor_hash,
 )
-from elspeth.web.composer.redaction import redact_tool_call_arguments
+from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments, redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 
 # Phase 8 cohort-emit helper (Sub-task 7e — B3 cohort b1). The opt-out
@@ -5838,30 +5838,18 @@ class SessionServiceImpl:
         if type(plan) is not PipelinePlanResult:
             raise TypeError("plan must be an exact PipelinePlanResult")
 
-        def _without_intercepted_inline_defaults(value: Any) -> Any:
-            if type(value) is not dict:
-                return value
-            source = value.get("source")
-            if type(source) is not dict or source.get("inline_blob", object()) is not None:
-                return value
-            safe_source = dict(source)
-            del safe_source["inline_blob"]
-            return {**value, "source": safe_source}
-
         private_pipeline_arguments = deep_thaw(plan.proposal.pipeline)
         review_arguments = (
             owned_composition_state_review_arguments(private_pipeline_arguments)
             if is_owned_composition_state_authority(private_pipeline_arguments)
             else private_pipeline_arguments
         )
-        expected_redacted_arguments = _without_intercepted_inline_defaults(
-            redact_tool_call_arguments(
-                "set_pipeline",
-                cast(dict[str, Any], review_arguments),
-                telemetry=NoopRedactionTelemetry(),
-            )
+        expected_redacted_arguments = redact_tool_call_arguments(
+            "set_pipeline",
+            cast(dict[str, Any], review_arguments),
+            telemetry=NoopRedactionTelemetry(),
         )
-        normalized_redacted_arguments = _without_intercepted_inline_defaults(deep_thaw(arguments_redacted_json))
+        normalized_redacted_arguments = normalize_set_pipeline_redacted_arguments(deep_thaw(arguments_redacted_json))
         if normalized_redacted_arguments != expected_redacted_arguments:
             raise AuditIntegrityError("pipeline proposal redacted arguments do not match the manifest projection")
         arguments_redacted_json = normalized_redacted_arguments

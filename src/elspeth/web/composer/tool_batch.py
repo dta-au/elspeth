@@ -326,18 +326,6 @@ def _replace_llm_tool_call_arguments(
     raise AuditIntegrityError("Assistant tool call was not present in the active LLM transcript")
 
 
-def _remove_inline_blob_redaction_defaults(value: Any) -> Any:
-    """Remove only the legacy source custody field's schema-default null."""
-    if type(value) is not dict:
-        return value
-    source = value.get("source")
-    if type(source) is not dict or source.get("inline_blob", object()) is not None:
-        return value
-    safe_source = dict(source)
-    del safe_source["inline_blob"]
-    return {**value, "source": safe_source}
-
-
 @dataclass(frozen=True, slots=True)
 class _SetPipelineFinalization:
     """Pure candidate-finalization outcome before custody or publication."""
@@ -1205,15 +1193,10 @@ async def run_tool_batch(
                                 proposal_acceptable = candidate.acceptable
 
                             # Re-run the manifest against the final safe shape.
-                            redacted_arguments = cast(
-                                dict[str, Any],
-                                _remove_inline_blob_redaction_defaults(
-                                    redact_tool_call_arguments(
-                                        tool_name,
-                                        arguments,
-                                        telemetry=ctx.service._redaction_telemetry,
-                                    )
-                                ),
+                            redacted_arguments = redact_tool_call_arguments(
+                                tool_name,
+                                arguments,
+                                telemetry=ctx.service._redaction_telemetry,
                             )
                     except BaseException as exc:
                         # Candidate finalization is one-time pre-proposal work.
@@ -1299,15 +1282,10 @@ async def run_tool_batch(
                             proposal_arguments = owned_composition_state_authority(finalized_validation.authored_state)
                             proposal_summary_arguments = owned_composition_state_review_arguments(proposal_arguments)
                             proposal_tool_name = "set_pipeline"
-                            proposal_redacted_arguments = cast(
-                                dict[str, Any],
-                                _remove_inline_blob_redaction_defaults(
-                                    redact_tool_call_arguments(
-                                        proposal_tool_name,
-                                        cast(dict[str, Any], proposal_summary_arguments),
-                                        telemetry=ctx.service._redaction_telemetry,
-                                    )
-                                ),
+                            proposal_redacted_arguments = redact_tool_call_arguments(
+                                proposal_tool_name,
+                                cast(dict[str, Any], proposal_summary_arguments),
+                                telemetry=ctx.service._redaction_telemetry,
                             )
                 except ToolArgumentError:
                     # Preserve the established explicit-approval contract for

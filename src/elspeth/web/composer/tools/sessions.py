@@ -583,7 +583,11 @@ def build_set_pipeline_candidate(
                 )
             )
             if review_metadata_error is not None:
-                return _failure_result(state, f"Source '{source_name}': {review_metadata_error}")
+                return _failure_result(
+                    state,
+                    f"Source '{source_name}': {review_metadata_error}",
+                    error_code="interpretation_requirements_invalid",
+                )
             if not reviewed_source and not interpretation_requirements_are_internal:
                 src_options = dict(
                     _canonicalize_authored_interpretation_requirements(
@@ -682,7 +686,11 @@ def build_set_pipeline_candidate(
             )
         )
         if review_metadata_error is not None:
-            return _failure_result(state, review_metadata_error)
+            return _failure_result(
+                state,
+                review_metadata_error,
+                error_code="interpretation_requirements_invalid",
+            )
         if not interpretation_requirements_are_internal:
             legacy_src_options = _canonicalize_authored_interpretation_requirements(
                 legacy_src_options,
@@ -852,11 +860,7 @@ def build_set_pipeline_candidate(
             component_id=node_id,
         )
         if runtime_owned_error is not None:
-            error_code = (
-                "interpretation_requirements_invalid"
-                if f"options.{INTERPRETATION_REQUIREMENTS_KEY} must be a list of review entry objects" in runtime_owned_error
-                else None
-            )
+            error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in node_options else None
             return _failure_result(
                 state,
                 f"Node '{node_id}': {runtime_owned_error}",

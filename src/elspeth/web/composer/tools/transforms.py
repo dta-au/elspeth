@@ -60,6 +60,7 @@ from elspeth.web.composer.tools.declarations import (
     ToolKind,
 )
 from elspeth.web.interpretation_state import (
+    INTERPRETATION_REQUIREMENTS_KEY,
     composition_review_contract_error,
     reconcile_authoritative_reviews,
     serialize_authoring_review_options,
@@ -547,7 +548,8 @@ def _execute_upsert_node(
         component_id=node_id,
     )
     if runtime_owned_error is not None:
-        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}")
+        error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in node_options else None
+        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code)
     node_options = _canonicalize_authored_interpretation_requirements(
         node_options,
         component_id=node_id,
@@ -1297,7 +1299,8 @@ def _execute_patch_node_options(
         component_id=node_id,
     )
     if runtime_owned_error is not None:
-        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}")
+        error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in patch else None
+        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code)
     patch = _canonicalize_authored_interpretation_requirements(
         patch,
         component_id=node_id,
@@ -1477,7 +1480,8 @@ def _prepare_transform_candidate(
         component_id=node_id,
     )
     if runtime_owned_error is not None:
-        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}")
+        error_code = "interpretation_requirements_invalid" if INTERPRETATION_REQUIREMENTS_KEY in options else None
+        return _failure_result(state, f"Node '{node_id}': {runtime_owned_error}", error_code=error_code)
     options = _canonicalize_authored_interpretation_requirements(
         options,
         component_id=node_id,

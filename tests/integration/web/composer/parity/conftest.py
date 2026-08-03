@@ -75,7 +75,10 @@ from elspeth.web.sessions.telemetry import build_sessions_telemetry
 # the deferred-intent negatives in ``test_repair_and_deferral.py`` can request it
 # (guided/'s conftest is a sibling scope and not inherited here). Importing it in
 # the test module instead would shadow the fixture parameter and trip ruff F811.
-from tests.integration.web.composer.guided.conftest import composer_test_client  # noqa: F401
+from tests.integration.web.composer.guided.conftest import (  # noqa: F401
+    _GuidedTestExecutionService,
+    composer_test_client,
+)
 
 # --------------------------------------------------------------------------- #
 # Deterministic completion double (lifted from test_pipeline_planner.py)       #
@@ -810,6 +813,7 @@ def parity_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ParityEnv:
     app.state.plugin_snapshot_factory = lambda user: build_snapshot(user.user_id)
     app.state.composer_recorder = BufferingRecorder()
     app.state.composer_progress_registry = ComposerProgressRegistry()
+    app.state.execution_service = _GuidedTestExecutionService(app)
     app.include_router(create_session_router())
 
     try:

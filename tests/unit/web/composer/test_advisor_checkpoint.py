@@ -30,6 +30,7 @@ from structlog.typing import FilteringBoundLogger
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.advisor_checkpoint_telemetry import record_advisor_checkpoint_pass
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.protocol import ComposerConvergenceError
@@ -1547,7 +1548,7 @@ async def test_end_gate_starts_no_advisor_attempt_after_compose_deadline(
     service = make_service()
     service._call_advisor_with_audit = _AsyncRecorder(return_value=("CLEAN", {}))
     recorder = make_recorder()
-    checkpoint_telemetry = MagicMock()
+    checkpoint_telemetry = MagicMock(spec=record_advisor_checkpoint_pass)
     monkeypatch.setattr("elspeth.web.composer.service.record_advisor_checkpoint_pass", checkpoint_telemetry)
 
     with pytest.raises(ComposerConvergenceError) as exc_info:
@@ -1580,7 +1581,10 @@ async def test_checkpoint_deadline_preserves_malformed_attempt_before_retry_expi
         await asyncio.sleep(0.01)
         raise ValueError("malformed provider response")
 
-    service._call_advisor_with_audit = AsyncMock(side_effect=malformed_after_deadline)
+    service._call_advisor_with_audit = AsyncMock(
+        spec=service._call_advisor_with_audit,
+        side_effect=malformed_after_deadline,
+    )
 
     verdict = await service._run_advisor_checkpoint(
         phase="end",
@@ -1605,7 +1609,10 @@ async def test_checkpoint_deadline_preserves_unparseable_attempt_before_retry_ex
         await asyncio.sleep(0.01)
         return "This reply states no verdict.", {}
 
-    service._call_advisor_with_audit = AsyncMock(side_effect=unparseable_after_deadline)
+    service._call_advisor_with_audit = AsyncMock(
+        spec=service._call_advisor_with_audit,
+        side_effect=unparseable_after_deadline,
+    )
 
     verdict = await service._run_advisor_checkpoint(
         phase="end",

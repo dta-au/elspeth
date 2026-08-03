@@ -2283,6 +2283,23 @@ def _redact_via_policy(
     return redacted
 
 
+def normalize_set_pipeline_redacted_arguments(value: Any) -> Any:
+    """Remove the legacy custody field's schema-default null.
+
+    Pydantic materializes ``source.inline_blob=None`` while proposal custody
+    treats an omitted field as absent. Both spellings mean no inline blob, so
+    their persisted redacted authority projection must be identical.
+    """
+    if type(value) is not dict:
+        return value
+    source = value.get("source")
+    if type(source) is not dict or source.get("inline_blob", object()) is not None:
+        return value
+    normalized_source = dict(source)
+    del normalized_source["inline_blob"]
+    return {**value, "source": normalized_source}
+
+
 def redact_tool_call_arguments(
     tool_name: str,
     arguments: dict[str, Any],
@@ -2350,7 +2367,8 @@ def redact_tool_call_arguments(
         # validation success.
         telemetry.manifest_dispatch(tool_name=tool_name, shape="type_driven")
         validated = entry.argument_model.model_validate(arguments)
-        return _redact_via_schema(tool_name, validated, entry.argument_model, telemetry=telemetry)
+        redacted = _redact_via_schema(tool_name, validated, entry.argument_model, telemetry=telemetry)
+        return normalize_set_pipeline_redacted_arguments(redacted) if tool_name == "set_pipeline" else redacted
     # Declarative branch (entry.policy is not None — ToolRedaction.__post_init__
     # guarantees exactly one of {argument_model, policy} is set).
     telemetry.manifest_dispatch(tool_name=tool_name, shape="declarative")

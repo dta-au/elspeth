@@ -91,6 +91,7 @@ EXPECTED_BUILTIN_IDENTITIES = frozenset(
 DOCUMENTED_HIDDEN_IDENTITIES = frozenset({"source:null"})
 OPERATOR_PROFILED_IDENTITIES = frozenset(
     {
+        "source:aws_s3",
         "source:llm",
         "transform:llm",
         "transform:aws_bedrock_prompt_shield",
@@ -98,7 +99,12 @@ OPERATOR_PROFILED_IDENTITIES = frozenset(
         "transform:aws_textract_document_analysis",
     }
 )
-RAW_TRAINED_OPERATOR_PROFILED_IDENTITIES = frozenset({"transform:aws_textract_document_analysis"})
+RAW_TRAINED_OPERATOR_PROFILED_IDENTITIES = frozenset(
+    {
+        "source:aws_s3",
+        "transform:aws_textract_document_analysis",
+    }
+)
 WEB_PROFILE_EXAMPLE_IDENTITIES = OPERATOR_PROFILED_IDENTITIES - RAW_TRAINED_OPERATOR_PROFILED_IDENTITIES
 REFERENCE_FIELDS = (
     "usage_when_to_use",

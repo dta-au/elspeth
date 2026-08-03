@@ -957,5 +957,5 @@ def test_unknown_pipeline_decision_user_term_fails_closed() -> None:
     assert not result.success
     assert result.updated_state is previous
     assert result.updated_state.version == previous.version
-    assert result.data["error_code"] == "review_reconciliation_failed"
+    assert result.data["error_code"] == "interpretation_requirements_invalid"
     assert "unknown-decision" not in result.data["error"]

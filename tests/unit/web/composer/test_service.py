@@ -30,6 +30,7 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.core.canonical import canonical_json
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
+from elspeth.web.composer.advisor_checkpoint_telemetry import record_advisor_checkpoint_pass
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.profile import EMPTY_PROFILE, TUTORIAL_PROFILE
 from elspeth.web.composer.guided.prompts import load_step_planner_skill
@@ -3208,7 +3209,7 @@ class TestComposeTimeout:
         )
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         progress_events: list[ComposerProgressEvent] = []
-        checkpoint_telemetry = MagicMock()
+        checkpoint_telemetry = MagicMock(spec=record_advisor_checkpoint_pass)
         monkeypatch.setattr("elspeth.web.composer.service.record_advisor_checkpoint_pass", checkpoint_telemetry)
 
         async def terminal_response_after_deadline(*_args: object, **_kwargs: object) -> Any:
@@ -3251,7 +3252,7 @@ class TestComposeTimeout:
             settings=_make_settings(composer_timeout_seconds=0.005),
         )
         service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
-        checkpoint_telemetry = MagicMock()
+        checkpoint_telemetry = MagicMock(spec=record_advisor_checkpoint_pass)
         monkeypatch.setattr("elspeth.web.composer.service.record_advisor_checkpoint_pass", checkpoint_telemetry)
         source_arguments = {
             "plugin": "csv",

@@ -495,9 +495,8 @@ def validate_aws_s3_source_policy(
     """Require profile-derived authority for every Web-authored S3 source."""
     profiled_source = False
     if not plugin_snapshot.is_trained_operator:
-        aliases_by_plugin = dict(plugin_snapshot.usable_profile_aliases)
         source_id = PluginId("source", "aws_s3")
-        operator_profile_available = source_id in plugin_snapshot.available and bool(aliases_by_plugin.get(source_id))
+        operator_profile_available = source_id in plugin_snapshot.available
         for source_name, source in materialized.authored.policy.state.sources.items():
             policy_error = web_aws_s3_source_policy_error(
                 source.plugin,

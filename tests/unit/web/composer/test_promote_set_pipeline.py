@@ -1169,6 +1169,33 @@ def test_set_pipeline_metadata_matches_set_metadata_redaction_contract() -> None
     assert _CANARY_METADATA_DESCRIPTION not in serialized
 
 
+def test_set_pipeline_redaction_does_not_reintroduce_absent_inline_blob_default() -> None:
+    """Absent and explicit-null legacy custody fields have one audit shape.
+
+    ``PipelineProposal`` validation materializes ``source.inline_blob=None``
+    while the provider-authored proposal may omit the field. The redacted
+    authority hash must not change merely because that schema default crossed
+    the proposal replay boundary.
+    """
+    omitted = _minimal_valid_args()
+    explicit_null = _minimal_valid_args()
+    explicit_null["source"]["inline_blob"] = None
+
+    omitted_redaction = redact_tool_call_arguments(
+        "set_pipeline",
+        omitted,
+        telemetry=NoopRedactionTelemetry(),
+    )
+    explicit_null_redaction = redact_tool_call_arguments(
+        "set_pipeline",
+        explicit_null,
+        telemetry=NoopRedactionTelemetry(),
+    )
+
+    assert omitted_redaction == explicit_null_redaction
+    assert "inline_blob" not in omitted_redaction["source"]
+
+
 def test_redaction_substitutes_source_options_via_summarizer() -> None:
     """``source.options`` is replaced by the canonical-JSON shape summary
     (:func:`_summarize_set_source_options`).

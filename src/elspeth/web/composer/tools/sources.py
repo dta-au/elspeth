@@ -550,7 +550,11 @@ def _execute_set_source(
         source=True,
     )
     if review_metadata_error is not None:
-        return _failure_result(state, review_metadata_error)
+        return _failure_result(
+            state,
+            review_metadata_error,
+            error_code="interpretation_requirements_invalid",
+        )
     options = _canonicalize_authored_interpretation_requirements(
         options,
         component_id=_source_component_id(source_name),
@@ -692,7 +696,11 @@ def _execute_set_source_from_blob(
         source=True,
     )
     if review_metadata_error is not None:
-        return _failure_result(state, review_metadata_error)
+        return _failure_result(
+            state,
+            review_metadata_error,
+            error_code="interpretation_requirements_invalid",
+        )
     caller_options = _canonicalize_authored_interpretation_requirements(
         validated.options,
         component_id=_source_component_id(source_name),
@@ -1072,7 +1080,11 @@ def _execute_patch_source_options(
         source=True,
     )
     if review_metadata_error is not None:
-        return _failure_result(state, review_metadata_error)
+        return _failure_result(
+            state,
+            review_metadata_error,
+            error_code="interpretation_requirements_invalid",
+        )
     patch = _canonicalize_authored_interpretation_requirements(
         patch,
         component_id=_source_component_id(source_name),

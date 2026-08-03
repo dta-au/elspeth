@@ -216,7 +216,7 @@ def _pipeline_node_strategy() -> st.SearchStrategy[_PipelineNodeModel]:
         input=st.text(),
         plugin=st.one_of(st.none(), st.text()),
         on_success=st.one_of(st.none(), st.text()),
-        on_error=st.one_of(st.none(), st.text()),
+        on_error=st.one_of(st.none(), st.text(min_size=1)),
         options=_OPTIONS_STRATEGY,
         condition=st.one_of(st.none(), st.text()),
         # F3: ``routes`` is now ``dict[str, str]`` (route-label → sink/connection

@@ -1949,11 +1949,16 @@ def test_route_adapter_dispatches_all_six_schema8_stage_transitions(
         "_schema8_schema_authority",
         lambda **_kwargs: guided_route.SchemaFormAuthority(knobs={"fields": []}, model_validated_options={}),
     )
+
+    class _AvailableCatalog:
+        def unavailable_reason(self, _plugin_id: object) -> None:
+            return None
+
     updated, _payload = guided_route._schema8_transition(
         guided,
         turn,
         request_model,
-        catalog=object(),  # Authority is replaced above; no catalog access occurs.
+        catalog=_AvailableCatalog(),
         new_stable_id=server_stable_id,
     )
 

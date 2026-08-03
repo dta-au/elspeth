@@ -792,7 +792,7 @@ class TestSetSourceFromBlobMode:
                     "schema": {"mode": "observed"},
                     INTERPRETATION_REQUIREMENTS_KEY: [
                         {
-                            "kind": "pipeline_decision",
+                            "kind": "vague_term",
                             "user_term": "inline_source_data",
                             "draft": "sk-sensitive-source-review",
                         }

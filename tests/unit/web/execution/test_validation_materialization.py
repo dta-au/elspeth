@@ -133,10 +133,11 @@ def _materialized(policy_state: CompositionState, *, materialized_state: Composi
 
 def _web_snapshot() -> PluginAvailabilitySnapshot:
     unrestricted = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+    source_id = PluginId("source", "aws_s3")
     return PluginAvailabilitySnapshot.create(
         policy_hash="materialization-phase-test",
         principal_scope="local:alice",
-        available=unrestricted.available,
+        available=frozenset(plugin_id for plugin_id in unrestricted.available if plugin_id != source_id),
         unavailable=(),
         selected=unrestricted.selected,
         usable_profile_aliases=(),

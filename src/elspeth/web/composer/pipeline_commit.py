@@ -42,6 +42,7 @@ from elspeth.web.composer.pipeline_proposal import (
     owned_composition_state_execution_arguments,
     restore_owned_composition_state_authority,
 )
+from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments
 from elspeth.web.composer.reviewed_source_authority import (
     resolve_owned_composition_source_authority,
     resolve_reviewed_source_authority,
@@ -80,7 +81,7 @@ def _validate_pipeline_authority_binding(
     arguments_hash: str,
     authority_arguments_canonical: object,
     authority_arguments_hash: object,
-) -> str:
+) -> tuple[str, dict[str, JsonValue]]:
     _validate_exact_canonical_json(arguments_canonical)
     if hashlib.sha256(arguments_canonical.encode("utf-8")).hexdigest() != arguments_hash:
         raise AuditIntegrityError("pipeline dispatch generic arguments hash is malformed")
@@ -97,7 +98,7 @@ def _validate_pipeline_authority_binding(
         raise AuditIntegrityError("pipeline dispatch authority projection differs from generic arguments")
     if primitive_canonical_json(project_composer_authority_payload(restored)) != authority_arguments_canonical:
         raise AuditIntegrityError("pipeline dispatch authority projection is not reversible")
-    return authority_arguments_hash
+    return authority_arguments_hash, restored
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +128,7 @@ class PipelineDispatchAuditBinding:
             raise TypeError("invocation must be an exact ComposerToolInvocation")
         if invocation.result_canonical is None or invocation.result_hash is None:
             raise AuditIntegrityError("successful pipeline dispatch is missing result_hash")
-        arguments_hash = _validate_pipeline_authority_binding(
+        arguments_hash, _restored_arguments = _validate_pipeline_authority_binding(
             arguments_canonical=invocation.arguments_canonical,
             arguments_hash=invocation.arguments_hash,
             authority_arguments_canonical=invocation.authority_arguments_canonical,
@@ -165,7 +166,7 @@ class PipelineDispatchAuditBinding:
         if type(raw_status) is not str or type(tool_call_id) is not str or type(tool_name) is not str:
             raise AuditIntegrityError("persisted pipeline dispatch scalar fields are malformed")
         try:
-            validated_authority_hash = _validate_pipeline_authority_binding(
+            stored_authority_hash, restored_arguments = _validate_pipeline_authority_binding(
                 arguments_canonical=arguments_canonical,
                 arguments_hash=arguments_hash,
                 authority_arguments_canonical=authority_arguments_canonical,
@@ -178,11 +179,17 @@ class PipelineDispatchAuditBinding:
             raise AuditIntegrityError("persisted pipeline dispatch payload is malformed") from exc
         if invocation.get("result_hash") != result_hash:
             raise AuditIntegrityError("persisted pipeline dispatch canonical hashes are malformed")
+        normalized_arguments = normalize_set_pipeline_redacted_arguments(restored_arguments)
+        if type(normalized_arguments) is not dict:
+            raise AuditIntegrityError("persisted pipeline dispatch arguments are malformed")
+        semantic_arguments_hash = (
+            stored_authority_hash if normalized_arguments is restored_arguments else composer_authority_hash(normalized_arguments)
+        )
         return cls(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             status=status,
-            arguments_hash=validated_authority_hash,
+            arguments_hash=semantic_arguments_hash,
             result_hash=result_hash,
         )
 
