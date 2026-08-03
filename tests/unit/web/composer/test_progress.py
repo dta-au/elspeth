@@ -18,6 +18,7 @@ from elspeth.web.composer.progress import (
     client_cancelled_progress_event,
     convergence_progress_event,
 )
+from elspeth.web.sessions.routes._helpers import _composer_progress_sink
 
 
 class TestComposerProgressEvent:
@@ -171,6 +172,54 @@ class TestConvergenceProgressEvent:
 
 
 class TestComposerProgressRegistry:
+    @pytest.mark.parametrize(
+        ("older_request_id", "newer_request_id"),
+        (
+            ("freeform-older", "guided-newer"),
+            ("guided-older", "freeform-newer"),
+        ),
+    )
+    @pytest.mark.asyncio
+    async def test_shared_route_sink_rejects_late_cross_surface_publishers_in_either_direction(
+        self,
+        older_request_id: str,
+        newer_request_id: str,
+    ) -> None:
+        """Freeform and guided surfaces participate in one latest-request domain."""
+        registry = ComposerProgressRegistry()
+        older = _composer_progress_sink(
+            registry,
+            session_id="session-1",
+            request_id=older_request_id,
+            user_id="user-1",
+        )
+        newer = _composer_progress_sink(
+            registry,
+            session_id="session-1",
+            request_id=newer_request_id,
+            user_id="user-1",
+        )
+
+        await newer(
+            ComposerProgressEvent(
+                phase="calling_model",
+                headline="The newer composer request is active.",
+                evidence=("The newer request owns progress custody.",),
+            )
+        )
+        await older(
+            ComposerProgressEvent(
+                phase="failed",
+                headline="The older composer request settled late.",
+                evidence=("The superseded request must not regain custody.",),
+                reason="provider_unavailable",
+            )
+        )
+
+        latest = await registry.get_latest("session-1")
+        assert latest.request_id == newer_request_id
+        assert latest.phase == "calling_model"
+
     @pytest.mark.asyncio
     async def test_returns_idle_snapshot_when_session_has_no_progress(self) -> None:
         registry = ComposerProgressRegistry()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import replace
 from uuid import UUID, uuid4
 
@@ -32,6 +33,7 @@ from elspeth.web.sessions.protocol import (
     GuidedDeclinedResult,
     GuidedFullPipelineDeclineCommand,
     GuidedFullPipelineProposalStageCommand,
+    GuidedOperationFailed,
     GuidedOperationFailureCode,
     GuidedOperationFailureCommand,
     GuidedOperationFenceLostError,
@@ -50,16 +52,19 @@ from .._helpers import (
     SessionServiceProtocol,
     UserIdentity,
     _cancel_on_client_disconnect,
+    _failure_log_request_id,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
     _is_client_disconnect_cancel,
     _request_plugin_policy_context,
+    _safe_frame_strings,
     _state_from_record,
     _track_compose_inflight,
     _verify_session_ownership,
     get_current_user,
     get_rate_limiter,
     planner_failure_is_policy_blocked,
+    slog,
 )
 from ..guided_operations import (
     GuidedOperationExpired,
@@ -132,6 +137,25 @@ def _guided_full_failed_progress_event(failure_code: GuidedOperationFailureCode)
         likely_next=likely_next,
         reason="provider_unavailable" if provider_failure else "service_setup_failed",
     )
+
+
+def _note_guided_full_secondary_failure(
+    *,
+    request: Request,
+    primary_failure_code: str,
+    secondary: BaseException,
+    site: str,
+) -> None:
+    """Record bounded cleanup diagnostics without replacing the primary outcome."""
+    with contextlib.suppress(Exception):
+        slog.error(
+            "guided.plan_failure_settlement_secondary_failure",
+            primary_failure_code=primary_failure_code,
+            secondary_exc_class=type(secondary).__name__,
+            site=site,
+            frames=_safe_frame_strings(secondary),
+            request_id=_failure_log_request_id(request),
+        )
 
 
 def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
@@ -268,6 +292,14 @@ async def post_guided_plan(
     if reserved is None:  # pragma: no cover - reserve defaults to true
         raise AuditIntegrityError("guided-full operation was not reserved")
     if not isinstance(reserved, GuidedOperationLease):
+        await _get_composer_progress_registry(request).publish_replay_if_unclaimed(
+            session_id=str(session_id),
+            request_id=body.operation_id,
+            user_id=user.user_id,
+            event=_guided_full_complete_progress_event(
+                declined=type(reserved) is GuidedPlanDeclinedResponse,
+            ),
+        )
         return reserved
 
     recorder = BufferingRecorder()
@@ -441,7 +473,33 @@ async def post_guided_plan(
         return joined
     except asyncio.CancelledError as exc:
         if exc.__dict__.get(_GUIDED_ATOMIC_SETTLEMENT_COMPLETED) is True:
-            await _await_with_deferred_cancellation(progress(client_cancelled_progress_event()))
+            try:
+                (joined, _cancelled_during_replay) = await _await_with_deferred_cancellation(
+                    reserve_or_replay_guided_operation(
+                        service=service,
+                        session_id=session_id,
+                        kind="guided_plan",
+                        request=body,
+                        replay=replay,
+                        reserve_if_absent=False,
+                        takeover_expired=False,
+                    )
+                )
+            except Exception as replay_exc:
+                _note_guided_full_secondary_failure(
+                    request=request,
+                    primary_failure_code="durable_complete",
+                    secondary=replay_exc,
+                    site="completed_cancellation_replay",
+                )
+                joined = None
+            await _await_with_deferred_cancellation(
+                progress(
+                    _guided_full_complete_progress_event(
+                        declined=type(joined) is GuidedPlanDeclinedResponse,
+                    )
+                )
+            )
             raise
         settlement_failure = exc.__dict__.get(_GUIDED_ATOMIC_SETTLEMENT_FAILURE)
         caller_task = asyncio.current_task()
@@ -454,6 +512,8 @@ async def post_guided_plan(
             if disconnected or caller_cancelled
             else "operation_failed"
         )
+        failed: GuidedOperationFailed | None = None
+        joined_winner: CompositionProposalResponse | GuidedPlanDeclinedResponse | None = None
         try:
             (failed, _cancelled_during_failure_settlement) = await _await_with_deferred_cancellation(
                 service.fail_guided_operation_with_audit(
@@ -470,9 +530,48 @@ async def post_guided_plan(
                 )
             )
         except GuidedOperationFenceLostError as fence_lost:
-            raise exc from fence_lost
+            try:
+                (joined, _cancelled_during_winner_lookup) = await _await_with_deferred_cancellation(
+                    reserve_or_replay_guided_operation(
+                        service=service,
+                        session_id=session_id,
+                        kind="guided_plan",
+                        request=body,
+                        replay=replay,
+                        reserve_if_absent=False,
+                        takeover_expired=False,
+                    )
+                )
+            except Exception as lookup_exc:
+                _note_guided_full_secondary_failure(
+                    request=request,
+                    primary_failure_code=cancel_failure_code,
+                    secondary=lookup_exc,
+                    site="fence_lost_winner_lookup",
+                )
+            else:
+                if joined is None or isinstance(joined, (GuidedOperationLease, GuidedOperationExpired)):
+                    _note_guided_full_secondary_failure(
+                        request=request,
+                        primary_failure_code=cancel_failure_code,
+                        secondary=fence_lost,
+                        site="fence_lost_no_winner",
+                    )
+                else:
+                    joined_winner = joined
+        except Exception as cleanup_exc:
+            _note_guided_full_secondary_failure(
+                request=request,
+                primary_failure_code=cancel_failure_code,
+                secondary=cleanup_exc,
+                site="failure_settlement",
+            )
         terminal_event = (
-            client_cancelled_progress_event()
+            _guided_full_complete_progress_event(
+                declined=type(joined_winner) is GuidedPlanDeclinedResponse,
+            )
+            if joined_winner is not None
+            else client_cancelled_progress_event()
             if cancel_failure_code == "request_cancelled"
             else _guided_full_failed_progress_event(cancel_failure_code)
         )
@@ -486,7 +585,9 @@ async def post_guided_plan(
             ) from exc
         if caller_cancelled:
             raise
-        raise_guided_operation_failure(failed)
+        if joined_winner is not None:
+            return joined_winner
+        raise_guided_operation_failure(failed or GuidedOperationFailed(failure_code=cancel_failure_code))
     except Exception as exc:
         failure_code = _guided_full_failure_code(exc)
         try:
@@ -502,24 +603,50 @@ async def post_guided_plan(
                     ),
                 )
             )
-        except GuidedOperationFenceLostError:
-            joined = await reserve_or_replay_guided_operation(
-                service=service,
-                session_id=session_id,
-                kind="guided_plan",
-                request=body,
-                replay=replay,
-                reserve_if_absent=False,
-                takeover_expired=False,
-            )
+        except GuidedOperationFenceLostError as fence_lost:
+            try:
+                joined = await reserve_or_replay_guided_operation(
+                    service=service,
+                    session_id=session_id,
+                    kind="guided_plan",
+                    request=body,
+                    replay=replay,
+                    reserve_if_absent=False,
+                    takeover_expired=False,
+                )
+            except Exception as lookup_exc:
+                _note_guided_full_secondary_failure(
+                    request=request,
+                    primary_failure_code=failure_code,
+                    secondary=lookup_exc,
+                    site="fence_lost_winner_lookup",
+                )
+                await progress(_guided_full_failed_progress_event(failure_code))
+                raise_guided_operation_failure(GuidedOperationFailed(failure_code=failure_code))
             if joined is None or isinstance(joined, (GuidedOperationLease, GuidedOperationExpired)):
-                raise AuditIntegrityError("guided-full failure lost its fence without a winner") from exc
+                _note_guided_full_secondary_failure(
+                    request=request,
+                    primary_failure_code=failure_code,
+                    secondary=fence_lost,
+                    site="fence_lost_no_winner",
+                )
+                await progress(_guided_full_failed_progress_event(failure_code))
+                raise_guided_operation_failure(GuidedOperationFailed(failure_code=failure_code))
             await progress(
                 _guided_full_complete_progress_event(
                     declined=type(joined) is GuidedPlanDeclinedResponse,
                 )
             )
             return joined
+        except Exception as cleanup_exc:
+            _note_guided_full_secondary_failure(
+                request=request,
+                primary_failure_code=failure_code,
+                secondary=cleanup_exc,
+                site="failure_settlement",
+            )
+            await progress(_guided_full_failed_progress_event(failure_code))
+            raise_guided_operation_failure(GuidedOperationFailed(failure_code=failure_code))
         await progress(_guided_full_failed_progress_event(failure_code))
         raise_guided_operation_failure(failed)
 

@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Response
 from sqlalchemy import event, func, select, text
 
 from elspeth.contracts.blobs import BlobIntegrityError, BlobStateError
@@ -28,7 +28,11 @@ from elspeth.web.sessions.models import (
     guided_operations_table,
     proposal_events_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData, GuidedOperationCompleted
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    GuidedOperationCompleted,
+    GuidedOperationFenceLostError,
+)
 from elspeth.web.sessions.routes._helpers import (
     _composition_proposal_response,
     _state_from_record,
@@ -37,6 +41,7 @@ from elspeth.web.sessions.routes.composer import guided_plan as guided_plan_rout
 from elspeth.web.sessions.routes.composer.guided_plan import (
     _guided_full_failure_code,
 )
+from elspeth.web.sessions.routes.guided_operations import reserve_or_replay_guided_operation
 from elspeth.web.sessions.schemas import CompositionProposalResponse
 from elspeth.web.sessions.service import _composition_state_data_content_hash
 
@@ -176,6 +181,81 @@ def test_guided_full_completed_replay_is_exact_after_proposal_terminal_settlemen
 
     assert replay.status_code == 200, replay.text
     assert replay.json() == payload
+
+
+def test_guided_full_completed_replay_after_restart_restores_terminal_progress(
+    composer_test_client,
+) -> None:
+    session = composer_test_client.post("/api/sessions", json={"title": "guided restart replay progress"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000077"
+    body = {"operation_id": operation_id, "intent": "Persist and replay this exact proposal."}
+    first = composer_test_client.post(f"/api/sessions/{session['id']}/guided/plan", json=body)
+    assert first.status_code == 200, first.text
+
+    restarted = composer_test_client.app.state.restart_test_client()
+    replay = restarted.post(f"/api/sessions/{session['id']}/guided/plan", json=body)
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == first.json()
+    _assert_guided_plan_terminal_progress(
+        restarted,
+        session=session,
+        operation_id=operation_id,
+        phase="complete",
+        reason="composer_complete",
+    )
+
+
+def test_guided_full_completed_replay_cannot_overwrite_a_newer_active_operation(
+    composer_test_client,
+) -> None:
+    original_planner = composer_test_client.app.state.composer_service
+    session = composer_test_client.post("/api/sessions", json={"title": "guided replay progress custody"}).json()
+    older_operation_id = "00000000-0000-4000-8000-000000000078"
+    older_body = {"operation_id": older_operation_id, "intent": "Build the already completed proposal."}
+    completed = composer_test_client.post(f"/api/sessions/{session['id']}/guided/plan", json=older_body)
+    assert completed.status_code == 200, completed.text
+
+    class _BlockingNewerPlanner:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def plan_guided_full_pipeline(self, **kwargs):
+            await kwargs["progress"](
+                ComposerProgressEvent(
+                    phase="calling_model",
+                    headline="The newer guided operation is active.",
+                    evidence=("The exact newer request owns progress custody.",),
+                )
+            )
+            self.started.set()
+            await self.release.wait()
+            return await original_planner.plan_guided_full_pipeline(**kwargs)
+
+    planner = _BlockingNewerPlanner()
+    composer_test_client.app.state.composer_service = planner
+    newer_operation_id = "00000000-0000-4000-8000-000000000079"
+
+    async def replay_during_newer_operation() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            newer_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": newer_operation_id, "intent": "Build the newer active proposal."},
+                )
+            )
+            await asyncio.wait_for(planner.started.wait(), timeout=3)
+            replay = await client.post(f"/api/sessions/{session['id']}/guided/plan", json=older_body)
+            assert replay.status_code == 200, replay.text
+            latest = await composer_test_client.app.state.composer_progress_registry.get_latest(session["id"])
+            assert latest.request_id == newer_operation_id
+            assert latest.phase == "calling_model"
+            planner.release.set()
+            newer = await asyncio.wait_for(newer_task, timeout=3)
+            assert newer.status_code == 200, newer.text
+
+    asyncio.run(replay_during_newer_operation())
 
 
 def test_guided_full_reserved_setup_failure_terminalizes_the_exact_operation(
@@ -377,6 +457,102 @@ def test_guided_full_failure_atomically_retains_sanitized_audit_without_a_checkp
     assert secret not in str(audit_rows[0])
     assert operation["status"] == "failed"
     assert operation["failure_code"] == "provider_unavailable"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="provider_unavailable",
+    )
+
+
+def test_guided_full_failure_cleanup_error_preserves_the_primary_provider_outcome(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    class _PrimaryFailurePlanner:
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            raise PipelinePlannerError("safe primary failure", code="PROVIDER_ERROR")
+
+    secondary_secret = "secondary-cleanup-secret-must-not-be-logged"  # secret-scan: allow-this-line
+
+    async def fail_cleanup(_command):
+        raise RuntimeError(secondary_secret)
+
+    composer_test_client.app.state.composer_service = _PrimaryFailurePlanner()
+    monkeypatch.setattr(
+        composer_test_client.app.state.session_service,
+        "fail_guided_operation_with_audit",
+        fail_cleanup,
+    )
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cleanup primacy"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000074"
+
+    with capture_logs() as logs:
+        response = composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={"operation_id": operation_id, "intent": "Preserve the provider failure."},
+        )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["failure_code"] == "provider_unavailable"
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["primary_failure_code"] == "provider_unavailable"
+    assert secondary_events[0]["secondary_exc_class"] == "RuntimeError"
+    assert secondary_secret not in str(secondary_events)
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="provider_unavailable",
+    )
+
+
+def test_guided_full_no_winner_after_failure_fence_loss_preserves_primary_outcome(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    class _PrimaryFailurePlanner:
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            raise PipelinePlannerError("safe primary failure", code="PROVIDER_ERROR")
+
+    real_reserve = reserve_or_replay_guided_operation
+
+    async def lose_failure_fence(command):
+        raise GuidedOperationFenceLostError(command.fence)
+
+    async def no_winner_lookup(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            return None
+        return await real_reserve(**kwargs)
+
+    composer_test_client.app.state.composer_service = _PrimaryFailurePlanner()
+    monkeypatch.setattr(
+        composer_test_client.app.state.session_service,
+        "fail_guided_operation_with_audit",
+        lose_failure_fence,
+    )
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", no_winner_lookup)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided no failure winner"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000075"
+
+    with capture_logs() as logs:
+        response = composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={"operation_id": operation_id, "intent": "Preserve the primary failure without a winner."},
+        )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["failure_code"] == "provider_unavailable"
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["site"] == "fence_lost_no_winner"
     _assert_guided_plan_terminal_progress(
         composer_test_client,
         session=session,
@@ -933,6 +1109,132 @@ def test_guided_full_cancel_after_atomic_settlement_still_publishes_terminal_pro
         composer_test_client,
         session=session,
         operation_id=operation_id,
+        phase="complete",
+        reason="composer_complete",
+    )
+
+
+def test_guided_full_cancellation_cleanup_error_preserves_cancelled_error_and_progress(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    secondary_secret = "cancel-cleanup-secret-must-not-be-logged"  # secret-scan: allow-this-line
+
+    class _BlockingPlanner:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            self.started.set()
+            await asyncio.Event().wait()
+
+    async def fail_cleanup(_command):
+        raise RuntimeError(secondary_secret)
+
+    planner = _BlockingPlanner()
+    composer_test_client.app.state.composer_service = planner
+    monkeypatch.setattr(
+        composer_test_client.app.state.session_service,
+        "fail_guided_operation_with_audit",
+        fail_cleanup,
+    )
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cancel cleanup"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000076"
+
+    async def cancel_request() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Cancel while preserving the primary outcome."},
+                )
+            )
+            await asyncio.wait_for(planner.started.wait(), timeout=3)
+            request_task.cancel("primary caller cancellation")
+            with pytest.raises(asyncio.CancelledError, match="primary caller cancellation"):
+                await request_task
+
+    with capture_logs() as logs:
+        asyncio.run(cancel_request())
+
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["primary_failure_code"] == "request_cancelled"
+    assert secondary_events[0]["secondary_exc_class"] == "RuntimeError"
+    assert secondary_secret not in str(secondary_events)
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="cancelled",
+        reason="client_cancelled",
+    )
+
+
+def test_guided_full_cancellation_fence_loss_checks_for_a_winner_before_preserving_cancellation(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    class _BlockingPlanner:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def plan_guided_full_pipeline(self, **_kwargs):
+            self.started.set()
+            await asyncio.Event().wait()
+
+    planner = _BlockingPlanner()
+    real_reserve = reserve_or_replay_guided_operation
+    winner_lookups = 0
+
+    async def lose_failure_fence(command):
+        raise GuidedOperationFenceLostError(command.fence)
+
+    async def no_winner_lookup(**kwargs):
+        nonlocal winner_lookups
+        if kwargs.get("reserve_if_absent") is False:
+            winner_lookups += 1
+            return None
+        return await real_reserve(**kwargs)
+
+    composer_test_client.app.state.composer_service = planner
+    monkeypatch.setattr(
+        composer_test_client.app.state.session_service,
+        "fail_guided_operation_with_audit",
+        lose_failure_fence,
+    )
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", no_winner_lookup)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cancel no winner"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000080"
+
+    async def cancel_request() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Cancel after the failure fence is lost."},
+                )
+            )
+            await asyncio.wait_for(planner.started.wait(), timeout=3)
+            request_task.cancel("primary cancellation survives fence loss")
+            with pytest.raises(asyncio.CancelledError, match="primary cancellation survives fence loss"):
+                await request_task
+
+    with capture_logs() as logs:
+        asyncio.run(cancel_request())
+
+    assert winner_lookups == 1
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["site"] == "fence_lost_no_winner"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
         phase="cancelled",
         reason="client_cancelled",
     )
@@ -966,7 +1268,7 @@ def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
     body = {"operation_id": operation_id, "intent": "One exact winner."}
     engine = composer_test_client.app.state.session_engine
 
-    async def race():
+    async def race() -> tuple[Response, Response]:
         async with AsyncClient(
             transport=ASGITransport(app=composer_test_client.app),
             base_url="http://test",

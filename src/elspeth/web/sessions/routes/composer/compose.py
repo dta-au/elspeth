@@ -134,10 +134,7 @@ async def recompose(
             user_id=str(user.user_id),
         )
         await _publish_progress(
-            progress_registry,
-            session_id=str(session.id),
-            request_id=request_id,
-            user_id=str(user.user_id),
+            progress_sink,
             event=ComposerProgressEvent(
                 phase="starting",
                 headline="I'm rereading your request and current pipeline.",
@@ -189,10 +186,7 @@ async def recompose(
                 # above — recompose mirrors send_message exactly so the two
                 # routes cannot drift on failure UX.
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session.id),
-                    request_id=request_id,
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=convergence_progress_event(budget_exhausted=exc.budget_exhausted),
                 )
                 response_body = await _handle_convergence_error(
@@ -222,10 +216,7 @@ async def recompose(
                     exc_class=type(exc).__name__,
                 )
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session.id),
-                    request_id=request_id,
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="failed",
                         headline="The composer model is not available.",
@@ -252,10 +243,7 @@ async def recompose(
                     exc_class=type(exc).__name__,
                 )
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session.id),
-                    request_id=request_id,
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="failed",
                         headline="The composer model is temporarily unavailable.",
@@ -282,10 +270,7 @@ async def recompose(
                     exc_class=type(exc).__name__,
                 )
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session.id),
-                    request_id=request_id,
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="failed",
                         headline="The composer model rejected this retry.",
@@ -324,10 +309,7 @@ async def recompose(
                     catalog=request.app.state.catalog_service,
                 )
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session.id),
-                    request_id=request_id,
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="failed",
                         headline="The composer could not safely finish this retry.",
@@ -351,10 +333,7 @@ async def recompose(
                     exception_class=rpf_exc.exc_class,
                 )
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session.id),
-                    request_id=request_id,
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="failed",
                         headline="The composer could not safely finish this retry.",
@@ -386,10 +365,7 @@ async def recompose(
                 # writes the durable disposition row and MUST NOT re-persist the
                 # already-durable planner LLM-call audit evidence.
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session.id),
-                    request_id=request_id,
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="failed",
                         headline="The composer could not build a pipeline for this retry.",
@@ -407,10 +383,7 @@ async def recompose(
                 raise HTTPException(status_code=status_code, detail=planner_response_body) from exc
             except ComposerServiceError as exc:
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session.id),
-                    request_id=request_id,
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="failed",
                         headline="The composer could not finish this retry.",
@@ -491,10 +464,7 @@ async def recompose(
                 assistant_msg = route_settlement.settlement.transition_message
             elif result.state.version != state.version:
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session.id),
-                    request_id=request_id,
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="validating",
                         headline="The composer has updated the pipeline and is validating the result.",
@@ -526,10 +496,7 @@ async def recompose(
                         llm_calls=result.llm_calls,
                     )
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=request_id,
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer could not safely validate the pipeline update.",
@@ -553,10 +520,7 @@ async def recompose(
                     )
                     raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session.id),
-                    request_id=request_id,
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="saving",
                         headline="ELSPETH is saving the pipeline update.",
@@ -645,10 +609,7 @@ async def recompose(
                     plugin_crash_pending=False,
                 )
             await _publish_progress(
-                progress_registry,
-                session_id=str(session.id),
-                request_id=request_id,
-                user_id=str(user.user_id),
+                progress_sink,
                 event=ComposerProgressEvent(
                     phase="complete",
                     headline="The composer has updated the pipeline."
@@ -707,10 +668,7 @@ async def recompose(
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.shield(
                     _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=request_id,
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=client_cancelled_progress_event(),
                     )
                 )

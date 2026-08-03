@@ -970,10 +970,7 @@ async def post_guided_chat_schema8(
                     user_id=str(user.user_id),
                 )
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session_id),
-                    request_id=body.operation_id,
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="starting",
                         headline="I'm reading your message for this guided turn.",
@@ -1684,10 +1681,7 @@ async def post_guided_chat_schema8(
                         chat_turns=recorder.chat_turns,
                     )
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session_id),
-                        request_id=body.operation_id,
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="saving",
                             headline="I'm saving this guided turn.",
@@ -1728,10 +1722,7 @@ async def post_guided_chat_schema8(
                     response = response_from_record(settlement.result_state)
 
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session_id),
-                    request_id=body.operation_id,
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="complete",
                         headline="ELSPETH finished responding to this guided message.",
@@ -1763,10 +1754,7 @@ async def post_guided_chat_schema8(
                     with contextlib.suppress(Exception):
                         await asyncio.shield(
                             _publish_progress(
-                                progress_registry,
-                                session_id=str(session_id),
-                                request_id=body.operation_id,
-                                user_id=str(user.user_id),
+                                progress_sink,
                                 event=client_cancelled_progress_event(),
                             )
                         )

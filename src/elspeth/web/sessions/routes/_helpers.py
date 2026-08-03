@@ -326,31 +326,19 @@ def _composer_progress_sink(
     composer request.
     """
 
-    async def _publish(event: ComposerProgressEvent) -> None:
-        await registry.publish(
-            session_id=session_id,
-            request_id=request_id,
-            user_id=user_id,
-            event=event,
-        )
-
-    return _publish
-
-
-async def _publish_progress(
-    registry: ComposerProgressRegistry,
-    *,
-    session_id: str,
-    request_id: str | None,
-    user_id: str,
-    event: ComposerProgressEvent,
-) -> None:
-    await registry.publish(
+    return registry.bind_request(
         session_id=session_id,
         request_id=request_id,
         user_id=user_id,
-        event=event,
     )
+
+
+async def _publish_progress(
+    progress: ComposerProgressSink,
+    *,
+    event: ComposerProgressEvent,
+) -> None:
+    await progress(event)
 
 
 def _session_response(session: SessionRecord) -> SessionResponse:

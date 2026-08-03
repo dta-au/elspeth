@@ -125,11 +125,38 @@ class ComposerProgressRegistry:
                 event=event,
             )
 
-    def bind_request(
+    async def publish_replay_if_unclaimed(
         self,
         *,
         session_id: str,
         request_id: str,
+        user_id: str,
+        event: ComposerProgressEvent,
+    ) -> ComposerProgressSnapshot | None:
+        """Publish a restart replay only when no live/newer request owns the session.
+
+        Completed guided operations can be replayed after an app restart, when
+        the in-memory registry is empty and owes the caller a terminal
+        snapshot. A replay of an older operation in a live process must not
+        displace a newer request that already claimed or published progress.
+        """
+        with self._lock:
+            if session_id in self._request_generations or session_id in self._snapshots:
+                return None
+            self._next_request_generation += 1
+            self._request_generations[session_id] = self._next_request_generation
+            return self._publish_locked(
+                session_id=session_id,
+                request_id=request_id,
+                user_id=user_id,
+                event=event,
+            )
+
+    def bind_request(
+        self,
+        *,
+        session_id: str,
+        request_id: str | None,
         user_id: str,
     ) -> ComposerProgressSink:
         """Claim latest-request progress custody and return its guarded sink.

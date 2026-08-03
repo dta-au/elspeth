@@ -216,10 +216,7 @@ def register_message_routes(router: APIRouter) -> None:
                 user_id=str(user.user_id),
             )
             await _publish_progress(
-                progress_registry,
-                session_id=str(session.id),
-                request_id=str(user_msg.id),
-                user_id=str(user.user_id),
+                progress_sink,
                 event=ComposerProgressEvent(
                     phase="starting",
                     headline="I'm reading your request and current pipeline.",
@@ -344,10 +341,7 @@ def register_message_routes(router: APIRouter) -> None:
                     # dispatch the three failure modes would collapse into a single
                     # generic event — the original bug filed as elspeth-5030f7373d.
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=convergence_progress_event(budget_exhausted=exc.budget_exhausted),
                     )
                     response_body = await _handle_convergence_error(
@@ -386,10 +380,7 @@ def register_message_routes(router: APIRouter) -> None:
                         exc_class=type(exc).__name__,
                     )
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer model is not available.",
@@ -421,10 +412,7 @@ def register_message_routes(router: APIRouter) -> None:
                         exc_class=type(exc).__name__,
                     )
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer model is temporarily unavailable.",
@@ -451,10 +439,7 @@ def register_message_routes(router: APIRouter) -> None:
                         exc_class=type(exc).__name__,
                     )
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer model rejected this request.",
@@ -516,10 +501,7 @@ def register_message_routes(router: APIRouter) -> None:
                         catalog=request.app.state.catalog_service,
                     )
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer could not safely finish this request.",
@@ -561,10 +543,7 @@ def register_message_routes(router: APIRouter) -> None:
                         exception_class=rpf_exc.exc_class,
                     )
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer could not safely finish this request.",
@@ -600,10 +579,7 @@ def register_message_routes(router: APIRouter) -> None:
                     # (llm_calls_durable), so _handle_planner_failure MUST NOT — and
                     # does not — persist it again.
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer could not build a pipeline for this request.",
@@ -621,10 +597,7 @@ def register_message_routes(router: APIRouter) -> None:
                     raise HTTPException(status_code=status_code, detail=planner_response_body) from exc
                 except ComposerServiceError as exc:
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="failed",
                             headline="The composer could not finish this request.",
@@ -723,10 +696,7 @@ def register_message_routes(router: APIRouter) -> None:
                     assistant_msg = route_settlement.settlement.transition_message
                 elif result.state.version != state.version:
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="validating",
                             headline="The composer has updated the pipeline and is validating the result.",
@@ -762,10 +732,7 @@ def register_message_routes(router: APIRouter) -> None:
                         # a validation/persistence-stage failure rather than
                         # a compose-stage failure.
                         await _publish_progress(
-                            progress_registry,
-                            session_id=str(session.id),
-                            request_id=str(user_msg.id),
-                            user_id=str(user.user_id),
+                            progress_sink,
                             event=ComposerProgressEvent(
                                 phase="failed",
                                 headline="The composer could not safely validate the pipeline update.",
@@ -789,10 +756,7 @@ def register_message_routes(router: APIRouter) -> None:
                         )
                         raise HTTPException(status_code=500, detail=response_body) from rpf_exc.original_exc
                     await _publish_progress(
-                        progress_registry,
-                        session_id=str(session.id),
-                        request_id=str(user_msg.id),
-                        user_id=str(user.user_id),
+                        progress_sink,
                         event=ComposerProgressEvent(
                             phase="saving",
                             headline="ELSPETH is saving the pipeline update.",
@@ -884,10 +848,7 @@ def register_message_routes(router: APIRouter) -> None:
                         plugin_crash_pending=False,
                     )
                 await _publish_progress(
-                    progress_registry,
-                    session_id=str(session.id),
-                    request_id=str(user_msg.id),
-                    user_id=str(user.user_id),
+                    progress_sink,
                     event=ComposerProgressEvent(
                         phase="complete",
                         headline="The composer has updated the pipeline."
@@ -970,10 +931,7 @@ def register_message_routes(router: APIRouter) -> None:
                     # ``raise`` two lines below restores the cancel chain.
                     await asyncio.shield(
                         _publish_progress(
-                            progress_registry,
-                            session_id=str(session.id),
-                            request_id=str(user_msg.id),
-                            user_id=str(user.user_id),
+                            progress_sink,
                             event=client_cancelled_progress_event(),
                         )
                     )
