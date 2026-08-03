@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-04T01:52:40+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-04T01:52:40+10:00
-Release baseline: `release/0.7.2@4f95c29a1`
+Last refreshed: 2026-08-04T02:04:29+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-04T02:04:29+10:00
+Release baseline: `release/0.7.2@b8ce2e46f`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -36,16 +36,16 @@ evidence are core/demo-aware work even though they involve AWS. Installing,
 updating, or tearing down the environment through IAM, Terraform, runbooks, or
 shell mechanics remains deferred even when it blocks a fresh install.
 
-## Current roll-up — 44 objective items plus 19 discovered/delivery records
+## Current roll-up — 44 objective items plus 20 discovered/delivery records
 
-| State | Objective 44 | Additional 19 | Meaning |
+| State | Objective 44 | Additional 20 | Meaning |
 |---|---:|---:|---|
 | Closed | 9 | 7 | Tracker says done; closure evidence is still sampled during the completion audit |
 | Verifying | 17 | 5 | Locally fixed; live or requirement-specific acceptance remains |
 | Fixing | 1 | 1 | Owned bug implementation is still in flight |
 | In progress | 0 | 0 | A delivery task spanning existing objective defects is in flight |
 | Open | 5 | 1 | Confirmed task/epic work not yet started here |
-| Triage | 9 | 5 | Root cause and reproducibility must be checked against current HEAD before fixing |
+| Triage | 9 | 6 | Root cause and reproducibility must be checked against current HEAD before fixing |
 | Proposed | 3 | 0 | Regression-gate features require approval/acceptance design before implementation |
 
 The additional records are newly discovered gate-custody bug
@@ -59,7 +59,9 @@ are also tracked: frontend readiness parity `elspeth-4c699cb5d0`, shared
 advisor deadline custody `elspeth-57232f6f3c`, and guided-plan terminal
 progress `elspeth-4e6f2a59e4`. The completed exhaustive provider-projection
 audit added nine precisely scoped implementation records; they are listed in
-the dedicated follow-up table below.
+the dedicated follow-up table below. Current-HEAD advisor re-audit added one
+contract-honesty split, `elspeth-532dfcb0c7`, without reopening the fixed D1
+false-FLAG loop.
 
 Closed-record assignees below are retained Filigree audit history, not active
 claim custody.
@@ -76,6 +78,7 @@ claim custody.
 | `/root/rca_guided_prose_revision_preservation` | Reproduce and bound whole-proposal prose-amend preservation/custody | Shared read-only release baseline | None | None | Complete; confirmed active proposal is absent from planning and private predecessor semantics have no server custody |
 | `/root/fix_guided_prose_revision_preservation` | Add closed amend/replace authority, preservation, repair, exact message custody, and retry | `.claude/worktrees/guided-prose-revision`; `codex/fix-guided-prose-revision` | Guided revision seams and direct tests only | None | Active in strict TDD; protocol and registered-guidance scope expansions explicitly deconflicted |
 | `/root/rca_advisor_residual_obligations` | Recheck END evidence non-injectivity after the advisor projection fix | Shared read-only release baseline | None | None | Complete; original impossible false-FLAG obligation is fixed, leaving a separate product-contract question about calling evidence-scoped CLEAN whole-pipeline sign-off |
+| `/root/rca_freeform_schema_progress` | Reproduce cross-request schema-evidence custody and design bounded rehydration | Shared read-only release baseline | None | None | Active read-only; request-two provider capture confirms progress says satisfied while exact schema evidence is absent |
 | `/root/review_advisor_evidence_scope` | Adversarial review of bounded evidence and actual checkpoint wire instructions | Shared read-only advisor worktree | None | None | Complete; found and drove repair of the shared stuck-composer system-contract conflict, then approved current bytes with no findings |
 | `/root/audit_advisor_demo` | D1-D6 and advisor/F14 completion evidence | Shared read-only baseline | None | None | Completed; no residual local code defect found |
 | `/root/audit_compose_loop` | Six compose-loop RCAs and implementation partitioning | Shared read-only baseline | None | None | Completed; all six remain actionable |
@@ -187,6 +190,7 @@ supportability remains last.
 | `elspeth-73c1af1562` | P2 | `triage` | Guided advisory chat | Provide graph structure or narrow the requested explanation |
 | `elspeth-b14aa70771` | P2 | `triage` | Run diagnostics | Preserve a safe failure classification through redaction and explanation |
 | `elspeth-cecfeca77b` | P2 | `verifying` | EARLY advisor | Integrated at `a8c6f091d`; deployed prompt capture must confirm the internal-coherence-only rubric |
+| `elspeth-532dfcb0c7` | P2 | `triage` | Advisor sign-off contract honesty | Preserve evidence-scoped CLEAN or add typed deterministic hidden obligations; do not relabel bounded evidence as whole-pipeline certification |
 | `elspeth-0502deb48c` | P1 | `triage` | Judge staging | Deferred: site-specific rationale is a release/supportability surface, after demo core |
 
 ## AWS installer — `elspeth-e54343d43b`
@@ -326,6 +330,8 @@ Append entries; do not rewrite history.
 | 2026-08-04 01:22 | Multi-query standard JSON candidate under review | Read-only RCA proved standard mode hid its enforced field/type/enum contract and Langfuse reconstructed the same incomplete message. Narrow candidate `9f6306257` passed 126 owned-module and 238 adjacent tests plus static gates and Wardline; `1345480bd7` advanced to fixing and independent review started |
 | 2026-08-04 01:31 | Multi-query review blocker repaired | First review correctly found that an empty system prompt was omitted from provider messages but retained in Langfuse reconstruction. Amended `f84a2fc37` normalized tracer custody to exact provider bytes; two independent reviews approved success plus all three error branches, pooled/sequential execution, canonical escaping, and unchanged structured/no-output behavior |
 | 2026-08-04 01:52 | Multi-query release gate passed | A coordinator workdir error cherry-picked the reviewed candidate into release before the intended disposable combined gate. The single two-file commit remained isolated as `4f95c29a1`; the CI-equivalent release suite then passed 37,126 with 27 skips and one expected xfail, and `1345480bd7` advanced to verifying |
+| 2026-08-04 01:56 | Structural index refreshed | Loomweave incremental run `7254b3ce-4155-4fb6-a390-ff10a60518c0` completed fresh at exact release `b8ce2e46f` with 71,239 entities and 136,472 edges |
+| 2026-08-04 02:04 | Advisor residual separated from D1 | Current-HEAD re-audit proved the impossible false-FLAG obligation remains fixed while evidence-scoped CLEAN is still advertised as whole-pipeline sign-off; new P2 `532dfcb0c7` records that contract-honesty choice without reopening D1 |
 
 ## Reconciliation findings
 
