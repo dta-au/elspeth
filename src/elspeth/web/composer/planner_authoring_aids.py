@@ -30,6 +30,7 @@ from copy import deepcopy
 from threading import Lock
 from typing import Any, Final, NotRequired, Required, TypedDict
 
+from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind, PluginSummary
@@ -74,6 +75,38 @@ class _DiscoveryDigest(TypedDict):
     sources: list[_PluginDigestEntry]
     transforms: list[_PluginDigestEntry]
     sinks: list[_PluginDigestEntry]
+
+
+class _SchemaContractEvidenceEntry(TypedDict):
+    """One whole, current, policy-visible plugin contract."""
+
+    plugin_id: str
+    policy_hash: str
+    snapshot_hash: str
+    schema_hash: str
+    json_schema: dict[str, object]
+    knob_schema: dict[str, object]
+
+
+class _SchemaContractEvidenceOmission(TypedDict):
+    """Closed reason that a tracked or referenced contract is not present."""
+
+    plugin_id: str
+    reason: str
+
+
+class _SchemaContractEvidence(TypedDict):
+    """Bounded current-request schema evidence rendered for the planner."""
+
+    policy_hash: str
+    snapshot_hash: str
+    max_entries: int
+    max_omissions: int
+    max_canonical_bytes: int
+    canonical_bytes_used: int
+    schemas: list[_SchemaContractEvidenceEntry]
+    omitted: list[_SchemaContractEvidenceOmission]
+    omissions_withheld_count: int
 
 
 class _ExemplarSource(TypedDict, total=False):
@@ -782,6 +815,350 @@ def _visible_plugin_names(
     return {kind: frozenset(plugin.name for plugin in plugins) for kind, plugins in summaries.items()}
 
 
+# The evidence rides in one dynamic prompt message, so it must be bounded even
+# when a deployment installs many rich plugins. Entries are indivisible: a
+# contract that does not fit is reported as omitted, never sliced into a shape
+# that could be mistaken for the plugin's whole option contract.
+_SCHEMA_EVIDENCE_MAX_ENTRIES: Final[int] = 8
+_SCHEMA_EVIDENCE_MAX_OMISSIONS: Final[int] = 16
+_SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES: Final[int] = 96 * 1024
+
+_JSON_SCHEMA_PROSE_KEYS: Final[frozenset[str]] = frozenset(
+    {"$comment", "title", "description", "examples", "example", "composer_description", "composer_placeholder"}
+)
+_JSON_SCHEMA_SCALAR_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "$schema",
+        "$id",
+        "$ref",
+        "$anchor",
+        "$dynamicRef",
+        "$dynamicAnchor",
+        "$vocabulary",
+        "type",
+        "const",
+        "enum",
+        "default",
+        "pattern",
+        "format",
+        "contentEncoding",
+        "contentMediaType",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "nullable",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+        "minContains",
+        "maxContains",
+    }
+)
+_JSON_SCHEMA_MAP_KEYS: Final[frozenset[str]] = frozenset({"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"})
+_JSON_SCHEMA_SINGLE_SCHEMA_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "items",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "propertyNames",
+        "additionalProperties",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+        "contentSchema",
+    }
+)
+_JSON_SCHEMA_SCHEMA_LIST_KEYS: Final[frozenset[str]] = frozenset({"allOf", "anyOf", "oneOf", "prefixItems"})
+
+
+class _SchemaContractProjectionUnsupported(ValueError):
+    """A schema carries semantics this bounded projection cannot preserve."""
+
+
+def _contract_discriminator(raw: object) -> dict[str, object]:
+    if not isinstance(raw, dict) or set(raw) - {"propertyName", "mapping"}:
+        raise _SchemaContractProjectionUnsupported
+    projected: dict[str, object] = {}
+    property_name = raw.get("propertyName")
+    if property_name is not None:
+        if not isinstance(property_name, str):
+            raise _SchemaContractProjectionUnsupported
+        projected["propertyName"] = property_name
+    mapping = raw.get("mapping")
+    if mapping is not None:
+        if not isinstance(mapping, dict) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in mapping.items()):
+            raise _SchemaContractProjectionUnsupported
+        projected["mapping"] = deepcopy(mapping)
+    return projected
+
+
+def _contract_json_schema(raw: object) -> dict[str, object] | bool:
+    """Project all known JSON Schema semantics while excluding only prose."""
+    if isinstance(raw, bool):
+        return raw
+    if not isinstance(raw, dict):
+        raise _SchemaContractProjectionUnsupported
+    raw_properties = raw.get("properties")
+    hidden_properties: set[str] = set()
+    if isinstance(raw_properties, dict):
+        hidden_properties = {
+            name
+            for name, schema in raw_properties.items()
+            if isinstance(name, str) and isinstance(schema, dict) and schema.get("composer_hidden") is True
+        }
+    projected: dict[str, object] = {}
+    for key, value in raw.items():
+        if key in _JSON_SCHEMA_PROSE_KEYS or key == "composer_required_when":
+            continue
+        if key == "composer_hidden":
+            if not isinstance(value, bool) or value:
+                raise _SchemaContractProjectionUnsupported
+            continue
+        if key == "required":
+            if not isinstance(value, list) or any(not isinstance(name, str) for name in value):
+                raise _SchemaContractProjectionUnsupported
+            projected[key] = [name for name in value if name not in hidden_properties]
+        elif key == "dependentRequired":
+            if not isinstance(value, dict):
+                raise _SchemaContractProjectionUnsupported
+            dependent: dict[str, list[str]] = {}
+            for name, required_names in value.items():
+                if (
+                    not isinstance(name, str)
+                    or not isinstance(required_names, list)
+                    or any(not isinstance(required_name, str) for required_name in required_names)
+                ):
+                    raise _SchemaContractProjectionUnsupported
+                if name not in hidden_properties:
+                    dependent[name] = [required_name for required_name in required_names if required_name not in hidden_properties]
+            projected[key] = dependent
+        elif key in _JSON_SCHEMA_SCALAR_KEYS:
+            projected[key] = deepcopy(value)
+        elif key in _JSON_SCHEMA_MAP_KEYS and isinstance(value, dict):
+            if any(not isinstance(name, str) for name in value):
+                raise _SchemaContractProjectionUnsupported
+            projected[key] = {
+                name: _contract_json_schema(schema)
+                for name, schema in value.items()
+                if not (key == "properties" and name in hidden_properties)
+            }
+        elif key in _JSON_SCHEMA_SINGLE_SCHEMA_KEYS:
+            projected[key] = _contract_json_schema(value)
+        elif key in _JSON_SCHEMA_SCHEMA_LIST_KEYS and isinstance(value, list):
+            projected[key] = [_contract_json_schema(branch) for branch in value]
+        elif key == "discriminator":
+            projected[key] = _contract_discriminator(value)
+        else:
+            raise _SchemaContractProjectionUnsupported
+    return projected
+
+
+def _contract_knob_schema(raw: object) -> dict[str, object]:
+    """Project the one-knob schema to executable field facts, excluding UI prose."""
+    if not isinstance(raw, dict) or set(raw) != {"fields"}:
+        raise _SchemaContractProjectionUnsupported
+    raw_fields = raw.get("fields")
+    if not isinstance(raw_fields, list):
+        raise _SchemaContractProjectionUnsupported
+    fields: list[dict[str, object]] = []
+    prose_keys = {"label", "description", "placeholder", "tier"}
+    scalar_key_order = ("name", "kind", "type", "required", "nullable", "default", "enum", "choices", "item_kind")
+    structural_keys = set(scalar_key_order) | {"visible_when", "required_when", "item_schema", "items"}
+    for raw_field in raw_fields:
+        if not isinstance(raw_field, dict):
+            raise _SchemaContractProjectionUnsupported
+        if set(raw_field) - prose_keys - structural_keys:
+            raise _SchemaContractProjectionUnsupported
+        if not isinstance(raw_field.get("name"), str) or not isinstance(raw_field.get("required"), bool):
+            raise _SchemaContractProjectionUnsupported
+        if not isinstance(raw_field.get("kind") or raw_field.get("type"), str):
+            raise _SchemaContractProjectionUnsupported
+        if "kind" in raw_field and not isinstance(raw_field["kind"], str):
+            raise _SchemaContractProjectionUnsupported
+        if "type" in raw_field and not isinstance(raw_field["type"], str):
+            raise _SchemaContractProjectionUnsupported
+        if "nullable" in raw_field and not isinstance(raw_field["nullable"], bool):
+            raise _SchemaContractProjectionUnsupported
+        for enum_key in ("enum", "choices"):
+            if enum_key in raw_field and (
+                not isinstance(raw_field[enum_key], list) or any(not isinstance(choice, str) for choice in raw_field[enum_key])
+            ):
+                raise _SchemaContractProjectionUnsupported
+        if "enum" in raw_field and "choices" in raw_field and raw_field["enum"] != raw_field["choices"]:
+            raise _SchemaContractProjectionUnsupported
+        if "item_kind" in raw_field and not isinstance(raw_field["item_kind"], str):
+            raise _SchemaContractProjectionUnsupported
+        field: dict[str, object] = {key: deepcopy(raw_field[key]) for key in scalar_key_order if key in raw_field}
+        if "choices" in field and "enum" not in field:
+            field["enum"] = field.pop("choices")
+        else:
+            field.pop("choices", None)
+        for predicate_key in ("visible_when", "required_when"):
+            if predicate_key not in raw_field:
+                continue
+            predicate = raw_field[predicate_key]
+            if not isinstance(predicate, dict) or set(predicate) != {"field", "equals"} or not isinstance(predicate["field"], str):
+                raise _SchemaContractProjectionUnsupported
+            field[predicate_key] = {"field": predicate["field"], "equals": deepcopy(predicate["equals"])}
+        if "item_schema" in raw_field:
+            field["item_schema"] = _contract_knob_schema(raw_field["item_schema"])
+        if "items" in raw_field:
+            items = raw_field["items"]
+            field["items"] = _contract_json_schema(items)
+        fields.append(field)
+    return {"fields": fields}
+
+
+def _schema_pair_label(pair: tuple[str, str]) -> str:
+    return f"{pair[0]}/{pair[1]}"
+
+
+def _schema_evidence_envelope(
+    *,
+    policy_hash: str,
+    snapshot_hash: str,
+    schemas: list[_SchemaContractEvidenceEntry],
+    omitted: list[_SchemaContractEvidenceOmission],
+    omissions_withheld_count: int,
+) -> _SchemaContractEvidence:
+    """Build an envelope whose byte count includes every emitted field."""
+    evidence: _SchemaContractEvidence = {
+        "policy_hash": policy_hash,
+        "snapshot_hash": snapshot_hash,
+        "max_entries": _SCHEMA_EVIDENCE_MAX_ENTRIES,
+        "max_omissions": _SCHEMA_EVIDENCE_MAX_OMISSIONS,
+        "max_canonical_bytes": _SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES,
+        "canonical_bytes_used": 0,
+        "schemas": schemas,
+        "omitted": omitted,
+        "omissions_withheld_count": omissions_withheld_count,
+    }
+    while True:
+        rendered_size = len(canonical_json(evidence).encode("utf-8"))
+        if evidence["canonical_bytes_used"] == rendered_size:
+            return evidence
+        evidence["canonical_bytes_used"] = rendered_size
+
+
+def build_schema_contract_evidence(
+    catalog: PolicyCatalogView,
+    *,
+    schemas_loaded: frozenset[tuple[str, str]],
+    referenced: set[tuple[str, str]],
+) -> tuple[_SchemaContractEvidence, frozenset[tuple[str, str]]]:
+    """Rehydrate whole current contracts for previously discovered identities.
+
+    ``schemas_loaded`` is historical identity evidence only. Schema bytes are
+    always fetched again through the current request's ``PolicyCatalogView``;
+    policy rotation, profile projection, schema drift, and unavailability can
+    therefore never inherit stale bytes from an earlier tool result.
+    """
+    snapshot = catalog.snapshot
+    available = frozenset((plugin_id.kind, plugin_id.name) for plugin_id in snapshot.available)
+    loaded_pairs = frozenset(pair for pair in schemas_loaded if pair[0] in {"source", "transform", "sink"})
+    ordered_loaded = sorted(loaded_pairs, key=lambda pair: (pair not in referenced, pair[0], pair[1]))
+    # Reserve the digit width of the worst-case withheld count while admitting
+    # schemas. Final omission details are admitted separately below, but even
+    # if none fit, growing ``omissions_withheld_count`` must not push an
+    # otherwise boundary-sized final envelope over the byte cap.
+    omission_count_upper_bound = len(referenced - loaded_pairs) + len(ordered_loaded)
+    omission_candidates: list[_SchemaContractEvidenceOmission] = [
+        {"plugin_id": _schema_pair_label(pair), "reason": "not_loaded_this_session"} for pair in sorted(referenced - loaded_pairs)
+    ]
+    entries: list[_SchemaContractEvidenceEntry] = []
+    evidenced: set[tuple[str, str]] = set()
+
+    for pair in ordered_loaded:
+        label = _schema_pair_label(pair)
+        if pair not in available:
+            # A historical success is not authority to redisclose an identity
+            # hidden by the current policy. A referenced identity is already
+            # present in current_state, so naming its closed omission adds no
+            # new disclosure and keeps the gap actionable.
+            if pair in referenced:
+                omission_candidates.append({"plugin_id": label, "reason": "unavailable_in_current_policy"})
+            continue
+        if len(entries) >= _SCHEMA_EVIDENCE_MAX_ENTRIES:
+            omission_candidates.append({"plugin_id": label, "reason": "entry_budget_exceeded"})
+            continue
+        kind = pair[0]
+        try:
+            schema = catalog.get_schema(kind, pair[1])
+        except ValueError:
+            omission_candidates.append({"plugin_id": label, "reason": "schema_unavailable"})
+            continue
+        if schema.plugin_type != kind or schema.name != pair[1]:
+            omission_candidates.append({"plugin_id": label, "reason": "schema_identity_mismatch"})
+            continue
+        try:
+            json_schema = _contract_json_schema(schema.json_schema)
+            knob_schema = _contract_knob_schema(schema.knob_schema)
+        except _SchemaContractProjectionUnsupported:
+            omission_candidates.append({"plugin_id": label, "reason": "schema_projection_unsupported"})
+            continue
+        if isinstance(json_schema, bool):
+            omission_candidates.append({"plugin_id": label, "reason": "schema_projection_unsupported"})
+            continue
+        contract = {"json_schema": json_schema, "knob_schema": knob_schema}
+        entry: _SchemaContractEvidenceEntry = {
+            "plugin_id": label,
+            "policy_hash": snapshot.policy_hash,
+            "snapshot_hash": snapshot.snapshot_hash,
+            "schema_hash": stable_hash(contract),
+            "json_schema": json_schema,
+            "knob_schema": knob_schema,
+        }
+        prospective = _schema_evidence_envelope(
+            policy_hash=snapshot.policy_hash,
+            snapshot_hash=snapshot.snapshot_hash,
+            schemas=[*entries, entry],
+            omitted=[],
+            omissions_withheld_count=omission_count_upper_bound,
+        )
+        if prospective["canonical_bytes_used"] > _SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES:
+            omission_candidates.append({"plugin_id": label, "reason": "canonical_byte_budget_exceeded"})
+            continue
+        entries.append(entry)
+        evidenced.add(pair)
+
+    omitted: list[_SchemaContractEvidenceOmission] = []
+    for omission in omission_candidates:
+        if len(omitted) >= _SCHEMA_EVIDENCE_MAX_OMISSIONS:
+            break
+        prospective_omitted = [*omitted, omission]
+        prospective = _schema_evidence_envelope(
+            policy_hash=snapshot.policy_hash,
+            snapshot_hash=snapshot.snapshot_hash,
+            schemas=entries,
+            omitted=prospective_omitted,
+            omissions_withheld_count=len(omission_candidates) - len(prospective_omitted),
+        )
+        if prospective["canonical_bytes_used"] <= _SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES:
+            omitted.append(omission)
+
+    evidence = _schema_evidence_envelope(
+        policy_hash=snapshot.policy_hash,
+        snapshot_hash=snapshot.snapshot_hash,
+        schemas=entries,
+        omitted=omitted,
+        omissions_withheld_count=len(omission_candidates) - len(omitted),
+    )
+    if evidence["canonical_bytes_used"] > _SCHEMA_EVIDENCE_MAX_CANONICAL_BYTES:
+        raise RuntimeError("schema_contract_evidence_budget_invariant")
+    return evidence, frozenset(evidenced)
+
+
 def _digest_entries(plugins: list[PluginSummary]) -> list[_PluginDigestEntry]:
     return [
         {
@@ -804,9 +1181,9 @@ def discovery_digest(
     Targets ``planner_code=DISCOVERY_CYCLE`` churn: a significant share of
     planner calls were ``list_*``/``get_plugin_schema`` rounds re-learning the
     same catalog every session. Each entry carries the plugin's name, one-line
-    purpose, required knobs, and its ``composer_hints`` verbatim — the hints
-    are the designated live channel for web-policy facts that plugin schemas
-    cannot express.
+    purpose, required-knob names, and its ``composer_hints`` verbatim. This is
+    selection and coaching metadata, not the plugin's option contract; types,
+    optional knobs, defaults, enums, and conditional rules remain schema facts.
     """
     if summaries is None:
         summaries = _plugin_summaries(catalog)
@@ -839,9 +1216,13 @@ def discovery_digest(
 
 _DISCOVERY_DIGEST_GUIDANCE: Final[str] = (
     "This digest is rendered from the live policy-visible catalog at prompt "
-    "build and is current for this deployment: you rarely need "
-    "list_sources/list_transforms/list_sinks or get_plugin_schema calls — "
-    "plan directly from it. Model identifiers still come only from "
+    "build and is current for this deployment. For plugin selection, plan directly from it; "
+    "it is selection and hints only, "
+    "not a full option contract: required-option names are incomplete without "
+    "types, optional knobs, defaults, enums, and conditional rules. Author "
+    "options only from schema_contract_evidence for this request or a current "
+    "get_plugin_schema result. You rarely need list_sources/list_transforms/"
+    "list_sinks calls. Model identifiers still come only from "
     "list_models. A list_models result is a session snapshot and can become "
     "stale, so refresh it before binding a literal model; blob/secret "
     "discovery is unchanged. Use "
@@ -1521,6 +1902,7 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
 __all__ = [
     "PLACEHOLDER_BLOB_ID",
     "build_planner_authoring_aids",
+    "build_schema_contract_evidence",
     "discovery_digest",
     "fork_coalesce_exemplar_args",
     "fork_row_union_exemplar_args",

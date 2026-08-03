@@ -51,7 +51,21 @@ class _StubCatalog:
         ]
 
     def get_schema(self, plugin_type: PluginKind, name: str) -> PluginSchemaInfo:
-        raise ValueError(f"Not implemented for stub: {plugin_type}/{name}")
+        visible = {
+            ("source", "csv"),
+            ("transform", "web_scrape"),
+            ("transform", "openrouter_llm"),
+            ("sink", "json"),
+        }
+        if (plugin_type, name) not in visible:
+            raise ValueError(f"Not implemented for stub: {plugin_type}/{name}")
+        return PluginSchemaInfo(
+            name=name,
+            plugin_type=plugin_type,
+            description=f"{name} schema",
+            json_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            knob_schema={"fields": []},
+        )
 
 
 def _stub_catalog() -> CatalogService:
@@ -163,6 +177,7 @@ class TestSchemasGapTelemetry:
         loaded = frozenset({("source", "csv")})
         progress = _composer_progress(build_context_string(_three_plugin_state(), _stub_catalog(), schemas_loaded=loaded))
         assert progress["schemas_loaded_this_session"] == ["source/csv"]
+        assert progress["schemas_evidenced_this_request"] == ["source/csv"]
         assert progress["schemas_referenced_by_state"] == [
             "sink/json",
             "source/csv",
@@ -181,6 +196,11 @@ class TestSchemasGapTelemetry:
         )
         progress = _composer_progress(build_context_string(_three_plugin_state(), _stub_catalog(), schemas_loaded=loaded))
         assert progress["schemas_gap"] == []
+        assert progress["schemas_evidenced_this_request"] == [
+            "sink/json",
+            "source/csv",
+            "transform/web_scrape",
+        ]
         assert progress["schema_inventory_precondition"] == "satisfied for current referenced state"
 
     def test_extra_loaded_pairs_do_not_affect_referenced_or_gap(self) -> None:

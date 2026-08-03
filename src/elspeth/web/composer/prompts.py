@@ -20,7 +20,7 @@ from elspeth.web.composer.capability_skill import render_with_pipeline_capabilit
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.prompts import build_mode_transition_system_prompt
 from elspeth.web.composer.guided.state_machine import TerminalKind
-from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
+from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids, build_schema_contract_evidence
 from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY, ComposerHistoryMessage
 from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.skills import load_deployment_skill, load_skill_with_hash
@@ -177,10 +177,12 @@ def build_context_string(
             ``ComposerServiceImpl._schemas_loaded_for_session``. Surfaces
             in ``composer_progress`` as
             ``schemas_loaded_this_session`` (sorted list of
-            ``"<kind>/<plugin>"``), and is differenced against the set of
-            plugins currently named in state to compute
-            ``schemas_referenced_by_state`` and ``schemas_gap``. Defaults
-            to the ``_SCHEMAS_LOADED_UNSET`` sentinel rather than
+            ``"<kind>/<plugin>"``). These are historical identities, not
+            current schema bytes. Each identity is rehydrated through
+            ``catalog`` on every request into ``schema_contract_evidence``;
+            ``schemas_evidenced_this_request`` records the whole contracts
+            that fit, and ``schemas_gap`` is referenced minus evidenced.
+            Defaults to the ``_SCHEMAS_LOADED_UNSET`` sentinel rather than
             ``frozenset()`` so a service-side regression that stops
             threading the tracker is observable: an explicit empty
             frozenset means "I tracked, and nothing has loaded", while
@@ -226,9 +228,11 @@ def build_context_string(
     # model never preloaded any schema). Surface three derived views so
     # the model can see at a glance which schemas it has already
     # introspected and which it still needs to read before constructing a
-    # config. ``schemas_loaded_this_session`` is service-tracked;
-    # ``schemas_referenced_by_state`` is computed from state; ``schemas_gap``
-    # is the difference (referenced minus loaded). An empty pipeline has no
+    # config. ``schemas_loaded_this_session`` is service-tracked identity
+    # history; ``schemas_referenced_by_state`` is computed from state;
+    # ``schemas_evidenced_this_request`` contains identities whose whole
+    # current policy-visible contract fits this request; ``schemas_gap`` is
+    # referenced minus evidenced. An empty pipeline has no
     # referenced plugins yet, so ``schema_inventory_precondition`` carries the
     # first-authoring rule that planned plugin schemas must still be discovered
     # before the first mutation.
@@ -248,13 +252,25 @@ def build_context_string(
 
     if schemas_loaded is _SCHEMAS_LOADED_UNSET:
         schemas_loaded_view: list[str] = [_SCHEMAS_LOADED_UNSET_MARKER]
+        schema_contract_evidence, _evidenced = build_schema_contract_evidence(
+            catalog,
+            schemas_loaded=frozenset(),
+            referenced=set(),
+        )
+        schemas_evidenced_view: list[str] = []
         schemas_gap_view: list[str] = [_SCHEMAS_GAP_UNSET_MARKER]
         schema_inventory_precondition = "tracker missing; discover planned plugin schemas before mutation"
     else:
         allowed_pairs = frozenset((plugin_id.kind, plugin_id.name) for plugin_id in plugin_snapshot.available)
         visible_loaded = schemas_loaded & allowed_pairs
         schemas_loaded_view = _format_pairs(visible_loaded)
-        schemas_gap = referenced - visible_loaded
+        schema_contract_evidence, evidenced = build_schema_contract_evidence(
+            catalog,
+            schemas_loaded=schemas_loaded,
+            referenced=referenced,
+        )
+        schemas_evidenced_view = _format_pairs(evidenced)
+        schemas_gap = referenced - evidenced
         schemas_gap_view = _format_pairs(schemas_gap)
         if not state_exists:
             schema_inventory_precondition = "discover planned plugin schemas before first mutation"
@@ -268,6 +284,7 @@ def build_context_string(
         "composer_progress": {
             "state_exists": state_exists,
             "schemas_loaded_this_session": schemas_loaded_view,
+            "schemas_evidenced_this_request": schemas_evidenced_view,
             "schemas_referenced_by_state": _format_pairs(referenced),
             "schemas_gap": schemas_gap_view,
             "schema_inventory_precondition": schema_inventory_precondition,
@@ -282,6 +299,7 @@ def build_context_string(
             "transforms": composer_hint_map(transform_plugins),
             "sinks": composer_hint_map(sink_plugins),
         },
+        "schema_contract_evidence": schema_contract_evidence,
         "plugin_policy": {
             "snapshot_hash": plugin_snapshot.snapshot_hash,
             "available_ids": sorted(map(str, plugin_snapshot.available)),
