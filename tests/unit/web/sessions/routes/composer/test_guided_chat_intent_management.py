@@ -7,7 +7,7 @@ from uuid import UUID
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.guided.deferred_intents import DeferredIntentAction
-from elspeth.web.composer.guided.stage_subjects import ComponentCountConstraint
+from elspeth.web.composer.guided.stage_subjects import ComponentCountConstraint, StageName
 from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
@@ -40,9 +40,9 @@ def _catalog(*, available: frozenset[PluginId]) -> PolicyCatalogView:
     return PolicyCatalogView(create_catalog_service(), snapshot, profiles=None)  # type: ignore[arg-type]
 
 
-def _action(catalog_name: str) -> DeferredIntentAction:
+def _action(catalog_name: str, *, target_stage: StageName = "topology") -> DeferredIntentAction:
     return DeferredIntentAction(
-        target_stage="topology",
+        target_stage=target_stage,
         catalog_kind="transform",
         catalog_name=catalog_name,
         redacted_summary="Retain a weaker model-authored topology requirement.",
@@ -95,6 +95,28 @@ def test_unmentioned_unavailable_model_catalog_identity_precedes_weaker_routing_
     assert intent.constraints == ()
     assert intent.catalog_kind is None
     assert intent.catalog_name is None
+
+
+def test_unmentioned_unavailable_identity_cannot_bypass_same_stage_rejection() -> None:
+    result = _apply(
+        _action("numeric_route", target_stage="source"),
+        catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+    )
+
+    assert type(result) is DeferredRequestUnchanged
+    assert result.chat.error_class == "DeferredIntentRejected"
+    assert result.guided.deferred_intents == ()
+
+
+def test_unmentioned_unavailable_identity_cannot_bypass_responsible_stage_rejection() -> None:
+    result = _apply(
+        _action("numeric_route", target_stage="output"),
+        catalog=_catalog(available=frozenset({PluginId("transform", "passthrough")})),
+    )
+
+    assert type(result) is DeferredRequestUnchanged
+    assert result.chat.error_class == "DeferredIntentRejected"
+    assert result.guided.deferred_intents == ()
 
 
 def test_unmentioned_available_catalog_identity_still_reaches_routing_validation() -> None:

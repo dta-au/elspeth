@@ -1154,22 +1154,17 @@ def _validate_option_value_constraint(
     return None
 
 
-def validate_deferred_intent_action(
+def validate_deferred_intent_structure(
     action: DeferredIntentAction,
     *,
     receiving_stage: StageName,
-    catalog: PolicyCatalogView,
-    guided: GuidedSession,
-    originating_message_content: str | None = None,
-) -> DeferredIntentValidation:
-    """Validate a typed suggestion against live stage and policy authority."""
+) -> DeferredIntentRejected | None:
+    """Reject an action whose target or responsible stage is structurally invalid."""
 
     if type(action) is not DeferredIntentAction:
         raise TypeError("action must be an exact DeferredIntentAction")
     if receiving_stage not in _STAGE_ORDINAL:
         raise InvariantError("receiving_stage is unsupported")
-    if type(guided) is not GuidedSession:
-        raise TypeError("guided must be an exact GuidedSession")
     if _STAGE_ORDINAL[action.target_stage] <= _STAGE_ORDINAL[receiving_stage]:
         return DeferredIntentRejected(reason="target_not_later")
 
@@ -1181,6 +1176,24 @@ def validate_deferred_intent_action(
         responsible_stage = max(responsible_stages, key=_STAGE_ORDINAL.__getitem__)
         if action.target_stage != responsible_stage:
             return DeferredIntentRejected(reason="wrong_responsible_stage")
+    return None
+
+
+def validate_deferred_intent_action(
+    action: DeferredIntentAction,
+    *,
+    receiving_stage: StageName,
+    catalog: PolicyCatalogView,
+    guided: GuidedSession,
+    originating_message_content: str | None = None,
+) -> DeferredIntentValidation:
+    """Validate a typed suggestion against live stage and policy authority."""
+
+    structural_rejection = validate_deferred_intent_structure(action, receiving_stage=receiving_stage)
+    if type(guided) is not GuidedSession:
+        raise TypeError("guided must be an exact GuidedSession")
+    if structural_rejection is not None:
+        return structural_rejection
 
     stated_requirement = (
         _message_requires_stated_constraint(originating_message_content) if type(originating_message_content) is str else None

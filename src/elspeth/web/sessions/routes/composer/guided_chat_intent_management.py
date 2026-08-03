@@ -25,6 +25,7 @@ from elspeth.web.composer.guided.deferred_intents import (
     create_deferred_clarification_intent,
     create_deferred_stage_intent,
     validate_deferred_intent_action,
+    validate_deferred_intent_structure,
 )
 from elspeth.web.composer.guided.intent_management import (
     DeferredIntentManagementAmbiguous,
@@ -390,6 +391,19 @@ def apply_deferred_request(
     chat: StepChatResult,
 ) -> DeferredRequestApplication:
     if deferred_action is not None:
+        structural_rejection = validate_deferred_intent_structure(
+            deferred_action,
+            receiving_stage=_guided_stage_name(authority.guided.step),
+        )
+        if structural_rejection is not None:
+            return DeferredRequestUnchanged(
+                guided=authority.guided,
+                chat=_deferred_disposition_chat(
+                    structural_rejection,
+                    catalog=authority.catalog,
+                    latency_ms=chat.latency_ms,
+                ),
+            )
         if _has_unmentioned_unavailable_action_identity(
             deferred_action,
             catalog=authority.catalog,
