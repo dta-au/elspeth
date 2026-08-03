@@ -801,6 +801,78 @@ def test_canonical_web_validation_maps_non_utf8_s3_key_to_closed_profile_finding
     yaml_generator.generate_yaml.assert_not_called()
 
 
+def test_canonical_web_validation_binds_real_profiled_s3_bundle_from_authored_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from elspeth.plugins.sources.aws_s3_source import AWSS3Source
+    from elspeth.web.composer import yaml_generator as production_yaml_generator
+
+    profiles, snapshot = _s3_source_profile_policy_context()
+    state = CompositionState(
+        source=SourceSpec(
+            plugin="aws_s3",
+            on_success="primary",
+            options={
+                "profile": "demo-input",
+                "key": "records/input.csv",
+                "format": "csv",
+                "schema": {"mode": "observed"},
+                SOURCE_AUTHORING_KEY: {
+                    "modality": "verbatim",
+                    "content_hash": "a" * 64,
+                    "review_event_id": None,
+                    "resolved_kind": None,
+                },
+            },
+            on_validation_failure="discard",
+        ),
+        nodes=(),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="primary",
+                plugin="csv",
+                options={"path": "outputs/validated.csv", "schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    instantiated_bundles: list[Any] = []
+    real_instantiate = validation_module.instantiate_runtime_plugins
+
+    def capture_real_bundle(runtime_settings: Any, *, plugin_snapshot: PluginAvailabilitySnapshot) -> Any:
+        bundle = real_instantiate(runtime_settings, plugin_snapshot=plugin_snapshot)
+        instantiated_bundles.append(bundle)
+        return bundle
+
+    monkeypatch.setattr(validation_module, "instantiate_runtime_plugins", capture_real_bundle)
+
+    result = validation_module.validate_pipeline(
+        state,
+        _make_settings(str(tmp_path)),
+        production_yaml_generator,
+        plugin_snapshot=snapshot,
+        profile_registry=profiles,
+        catalog=create_catalog_service(),
+        session_id="test-session",
+    )
+
+    assert result.is_valid is True
+    assert len(instantiated_bundles) == 1
+    source = instantiated_bundles[0].sources["source"]
+    assert isinstance(source, AWSS3Source)
+    assert source.config == {
+        "profile": "demo-input",
+        "key": "records/input.csv",
+        "format": "csv",
+        "schema": {"mode": "observed"},
+    }
+    assert "operator-private-bucket-marker" not in repr(source.config)
+
+
 def _bedrock_prompt_policy_context() -> tuple[OperatorProfileRegistry, PluginAvailabilitySnapshot]:
     from elspeth.web.dependencies import create_catalog_service
 
@@ -1096,6 +1168,7 @@ def test_canonical_web_validation_lowers_profiled_s3_source_before_runtime_const
             "elspeth.web.execution.validation.instantiate_runtime_plugins",
             return_value=_FakeRuntimeBundle(),
         ) as instantiate_plugins,
+        patch("elspeth.web.execution.preflight.bind_profiled_s3_source_audit_identities"),
         patch("elspeth.web.execution.validation.build_runtime_graph", return_value=graph),
         patch(
             "elspeth.web.execution.validation.assemble_and_validate_pipeline_config",

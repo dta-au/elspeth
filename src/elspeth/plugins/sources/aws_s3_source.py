@@ -6,6 +6,7 @@ import codecs
 import csv
 import enum
 import hashlib
+import hmac
 import io
 import json
 import math
@@ -23,7 +24,12 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from elspeth.contracts import CallStatus, CallType, Determinism, PluginSchema, SourceRow
-from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentity
+from elspeth.contracts.aws_s3 import (
+    S3_PRIVATE_BINDING_OPTION_NAMES,
+    S3_PROFILED_AUDIT_SAFE_OPTION_NAMES,
+    S3ProfiledAuditIdentity,
+    s3_profiled_binding_fingerprint,
+)
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
 from elspeth.contracts.identifiers import validate_field_names
@@ -59,18 +65,6 @@ _MAX_ENDPOINT_CHARS = 2048
 _MAX_REGION_CHARS = 64
 _MAX_JSON_DEPTH = 64
 _SAFE_ERROR_TYPE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
-_PROFILED_AUDIT_PRIVATE_CONFIG_FIELDS = frozenset(
-    {
-        "bucket",
-        "prefix",
-        "region",
-        "region_name",
-        "endpoint_url",
-        "aws_access_key_id",
-        "aws_secret_access_key",
-        "aws_session_token",
-    }
-)
 
 
 class _RowSentinel(enum.Enum):
@@ -843,7 +837,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e002343c06326e8f"
+    source_file_hash: str | None = "sha256:7c64a5873af5b027"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -938,12 +932,19 @@ class AWSS3Source(BaseSource):
         if type(audit_safe_config) is not dict:
             raise TypeError("profiled S3 audit-safe config must be an exact dict")
         safe_config = cast(dict[str, object], audit_safe_config)
-        if set(safe_config) & _PROFILED_AUDIT_PRIVATE_CONFIG_FIELDS:
+        if set(safe_config) & S3_PRIVATE_BINDING_OPTION_NAMES:
+            raise ValueError("profiled S3 audit-safe config contains a private binding field")
+        if set(safe_config) - S3_PROFILED_AUDIT_SAFE_OPTION_NAMES:
             raise ValueError("profiled S3 audit-safe config contains a private binding field")
         if safe_config.get("profile") != identity.profile_alias or safe_config.get("key") != identity.relative_key:
             raise ValueError("profiled S3 audit-safe config does not match its nominal identity")
-        if self._key != identity.relative_key and not self._key.endswith(f"/{identity.relative_key}"):
-            raise ValueError("profiled S3 executable key does not match its nominal identity")
+        actual_binding_fingerprint = s3_profiled_binding_fingerprint(
+            bucket=self._bucket,
+            executable_key=self._key,
+            region_name=self._region_name or "",
+        )
+        if not hmac.compare_digest(identity.binding_fingerprint, actual_binding_fingerprint):
+            raise ValueError("profiled S3 executable binding does not match its nominal identity")
         self._profiled_audit_identity = identity
         self.config = dict(safe_config)
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from uuid import UUID
 
+from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer.state import CompositionState
@@ -30,6 +31,7 @@ class FrozenRunSettings:
     plugin_snapshot: PluginAvailabilitySnapshot
     executable_config: Mapping[str, Any]
     audit_safe_config: Mapping[str, Any]
+    profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
 
     def __post_init__(self) -> None:
         freeze_fields(self, "executable_config", "audit_safe_config")

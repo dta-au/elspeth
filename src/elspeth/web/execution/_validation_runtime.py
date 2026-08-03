@@ -46,6 +46,7 @@ from elspeth.web.execution.schemas import (
     ValidationError,
     ValidationWarning,
 )
+from elspeth.web.interpretation_state import strip_authoring_options
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 if TYPE_CHECKING:
@@ -221,9 +222,11 @@ def validate_runtime_plugins(
         bind_profiled_s3_source_audit_identities(
             bundle,
             authored_options_by_source={
-                name: deep_thaw(source.options) for name, source in loaded.materialized.authored.policy.state.sources.items()
+                name: deep_thaw(strip_authoring_options(source.options))
+                for name, source in loaded.materialized.authored.policy.authored_state.sources.items()
             },
             plugin_snapshot=plugin_snapshot,
+            profiled_s3_audit_identities=loaded.materialized.authored.policy.profiled_s3_audit_identities,
         )
     except ValueSourceValidationError as exc:
         errors = tuple(

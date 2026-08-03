@@ -8,6 +8,7 @@ from typing import Literal
 
 from jsonschema import Draft202012Validator
 
+from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities, S3ProfiledAuditIdentity
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, WebConfigAuthority
 from elspeth.web.catalog.protocol import CatalogService
@@ -51,6 +52,7 @@ class PluginPolicyFinding:
 class PluginPolicyValidationResult:
     executable_state: CompositionState = field(repr=False)
     findings: tuple[PluginPolicyFinding, ...]
+    profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
 
     def findings_for(self, stage: PolicyValidationStage) -> tuple[PluginPolicyFinding, ...]:
         return tuple(finding for finding in self.findings if finding.stage == stage)
@@ -110,8 +112,9 @@ def validate_plugin_policy(
         )
 
     executable_state = state
+    profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
     if not findings and not snapshot.is_trained_operator:
-        executable_state, profile_findings = _lower_profiled_components(
+        executable_state, profile_findings, profiled_s3_audit_identities = _lower_profiled_components(
             state,
             snapshot=snapshot,
             profile_registry=profile_registry,
@@ -139,7 +142,11 @@ def validate_plugin_policy(
         for coverage in control_coverage_findings(state, capability):
             findings.append(_control_coverage_finding(coverage))
 
-    return PluginPolicyValidationResult(executable_state=executable_state, findings=tuple(findings))
+    return PluginPolicyValidationResult(
+        executable_state=executable_state,
+        findings=tuple(findings),
+        profiled_s3_audit_identities=profiled_s3_audit_identities,
+    )
 
 
 # Per-diagnosis remediation for coverage findings, keyed on the finding's
@@ -355,10 +362,11 @@ def _lower_profiled_components(
     snapshot: PluginAvailabilitySnapshot,
     profile_registry: OperatorProfileRegistry | None,
     catalog: CatalogService,
-) -> tuple[CompositionState, tuple[PluginPolicyFinding, ...]]:
+) -> tuple[CompositionState, tuple[PluginPolicyFinding, ...], S3ProfiledAuditIdentities]:
     aliases_by_plugin = dict(snapshot.usable_profile_aliases)
     components = _components(state)
     lowered_options: dict[tuple[str, str], dict[str, object]] = {}
+    s3_audit_identities_by_component: dict[str, S3ProfiledAuditIdentity] = {}
     findings: list[PluginPolicyFinding] = []
     lowering_registry = profile_registry
     lowering_catalog = catalog
@@ -494,13 +502,17 @@ def _lower_profiled_components(
                     )
                 )
                 continue
+        if lowered.profiled_s3_audit_identity is not None:
+            if component.component_type != "source" or plugin_id != PluginId("source", "aws_s3"):
+                raise TypeError("profile resolver returned an S3 audit identity for a non-S3 source")
+            s3_audit_identities_by_component[component.component_id] = lowered.profiled_s3_audit_identity
         lowered_options[(component.component_type, component.component_id)] = {
             **executable_options,
             **authoring_metadata,
         }
 
     if findings:
-        return state, _normalized_profile_findings(findings)
+        return state, _normalized_profile_findings(findings), ()
 
     sources: dict[str, SourceSpec] = {}
     for source_name, source in state.sources.items():
@@ -515,10 +527,12 @@ def _lower_profiled_components(
     for output in state.outputs:
         options = lowered_options.get(("sink", output.name))
         outputs.append(output if options is None else replace(output, options=options))
-    return (
-        replace(state, sources=sources, nodes=tuple(nodes), outputs=tuple(outputs)),
-        (),
+    profiled_s3_audit_identities = tuple(
+        (source_name, identity)
+        for source_name in sources
+        if (identity := s3_audit_identities_by_component.get("source" if source_name == "source" else f"source:{source_name}")) is not None
     )
+    return replace(state, sources=sources, nodes=tuple(nodes), outputs=tuple(outputs)), (), profiled_s3_audit_identities
 
 
 def _profile_unavailable_finding(

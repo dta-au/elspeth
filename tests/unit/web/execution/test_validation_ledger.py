@@ -133,7 +133,10 @@ def _record_all_core_passes(ledger: ValidationLedger) -> None:
 @pytest.mark.parametrize(
     ("carrier_type", "field_names"),
     [
-        (PolicyLoweredState, ("state", "operator_resolved_model_node_ids")),
+        (
+            PolicyLoweredState,
+            ("authored_state", "state", "profiled_s3_audit_identities", "operator_resolved_model_node_ids"),
+        ),
         (SecretValidatedState, ("policy", "all_secret_refs", "env_ref_names")),
         (AuthoredValidatedState, ("policy", "all_secret_refs", "env_ref_names", "semantic_contracts")),
         (InterpretationValidatedState, ("authored", "materialized_state")),

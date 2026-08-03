@@ -89,7 +89,12 @@ def _materialized(
     policy_state = policy_state or _state()
     return MaterializedYaml(
         authored=AuthoredValidatedState(
-            policy=PolicyLoweredState(state=policy_state, operator_resolved_model_node_ids=frozenset()),
+            policy=PolicyLoweredState(
+                authored_state=policy_state,
+                state=policy_state,
+                profiled_s3_audit_identities=(),
+                operator_resolved_model_node_ids=frozenset(),
+            ),
             all_secret_refs=(),
             env_ref_names=frozenset(),
             semantic_contracts=(_contract(),),

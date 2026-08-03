@@ -7,6 +7,12 @@ import pytest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
+from elspeth.contracts.aws_s3 import (
+    S3_PRIVATE_BINDING_OPTION_NAMES,
+    S3_PROFILED_AUDIT_SAFE_OPTION_NAMES,
+    S3ProfiledAuditIdentity,
+    s3_profiled_binding_fingerprint,
+)
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.engine.orchestrator.preflight import check_config_value_sources
@@ -335,6 +341,15 @@ def test_s3_source_profile_constrains_bucket_prefix_region_and_auth() -> None:
         "schema": {"mode": "observed"},
         "on_validation_failure": "discard",
     }
+    assert lowered.profiled_s3_audit_identity == S3ProfiledAuditIdentity(
+        profile_alias="demo-input",
+        relative_key="records/input.csv",
+        binding_fingerprint=s3_profiled_binding_fingerprint(
+            bucket="elspeth-demo-input",
+            executable_key="incoming/records/input.csv",
+            region_name="ap-southeast-1",
+        ),
+    )
 
 
 @pytest.mark.parametrize(
@@ -415,9 +430,8 @@ def test_s3_source_public_schema_rejects_unsafe_relative_key(key: str) -> None:
     assert errors
 
 
-@pytest.mark.parametrize(
-    "private_name",
-    [
+_EXPECTED_S3_PRIVATE_BINDING_OPTION_NAMES = frozenset(
+    {
         "bucket",
         "prefix",
         "region",
@@ -433,8 +447,26 @@ def test_s3_source_public_schema_rejects_unsafe_relative_key(key: str) -> None:
         "access_key",
         "secret_key",
         "session_token",
-    ],
+    }
 )
+
+
+def test_s3_profile_option_contract_is_closed_and_complete() -> None:
+    assert S3_PRIVATE_BINDING_OPTION_NAMES == _EXPECTED_S3_PRIVATE_BINDING_OPTION_NAMES
+    assert {
+        "profile",
+        "key",
+        "format",
+        "csv_options",
+        "json_options",
+        "columns",
+        "field_mapping",
+        "schema",
+        "on_validation_failure",
+    } == S3_PROFILED_AUDIT_SAFE_OPTION_NAMES
+
+
+@pytest.mark.parametrize("private_name", sorted(_EXPECTED_S3_PRIVATE_BINDING_OPTION_NAMES))
 def test_s3_source_profile_rejects_every_operator_private_option(private_name: str) -> None:
     settings = _settings(
         deployment_aws_region="ap-southeast-1",

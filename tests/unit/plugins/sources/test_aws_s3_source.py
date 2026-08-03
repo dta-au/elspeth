@@ -9,6 +9,11 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.aws_s3 import (
+    S3_PRIVATE_BINDING_OPTION_NAMES,
+    S3ProfiledAuditIdentity,
+    s3_profiled_binding_fingerprint,
+)
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 
 
@@ -985,6 +990,71 @@ class TestAWSS3SourceAuditAndLifecycle:
                     "key": "records/input.csv",
                     "schema": {"mode": "observed"},
                     "on_validation_failure": "quarantine",
+                },
+            )
+
+    @pytest.mark.parametrize(
+        "runtime_override",
+        [
+            {"bucket": "wrong-private-bucket"},
+            {"key": "other-prefix/data.csv"},
+            {"key": "nested/incoming/data.csv"},
+            {"region_name": "us-east-1"},
+        ],
+        ids=("bucket", "prefix", "nested-suffix", "region"),
+    )
+    def test_profiled_audit_identity_rejects_each_runtime_binding_mismatch(
+        self,
+        runtime_override: dict[str, str],
+    ) -> None:
+        from elspeth.plugins.sources.aws_s3_source import AWSS3Source
+
+        source = AWSS3Source(_config(**{"region_name": "ap-southeast-1", **runtime_override}))
+        identity = S3ProfiledAuditIdentity(
+            profile_alias="demo-input",
+            relative_key="data.csv",
+            binding_fingerprint=s3_profiled_binding_fingerprint(
+                bucket="input-bucket",
+                executable_key="incoming/data.csv",
+                region_name="ap-southeast-1",
+            ),
+        )
+
+        with pytest.raises(ValueError, match="executable binding"):
+            source._bind_profiled_audit_identity(
+                identity,
+                audit_safe_config={
+                    "profile": "demo-input",
+                    "key": "data.csv",
+                    "schema": {"mode": "observed"},
+                    "on_validation_failure": "quarantine",
+                },
+            )
+
+    @pytest.mark.parametrize("private_name", sorted(S3_PRIVATE_BINDING_OPTION_NAMES))
+    def test_profiled_audit_identity_rejects_every_private_option_alias(self, private_name: str) -> None:
+        from elspeth.plugins.sources.aws_s3_source import AWSS3Source
+
+        source = AWSS3Source(_config(region_name="ap-southeast-1"))
+        identity = S3ProfiledAuditIdentity(
+            profile_alias="demo-input",
+            relative_key="data.csv",
+            binding_fingerprint=s3_profiled_binding_fingerprint(
+                bucket="input-bucket",
+                executable_key="incoming/data.csv",
+                region_name="ap-southeast-1",
+            ),
+        )
+
+        with pytest.raises(ValueError, match="private binding field"):
+            source._bind_profiled_audit_identity(
+                identity,
+                audit_safe_config={
+                    "profile": "demo-input",
+                    "key": "data.csv",
+                    "schema": {"mode": "observed"},
+                    "on_validation_failure": "quarantine",
+                    private_name: "attacker-controlled",
                 },
             )
 

@@ -15,6 +15,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from elspeth.contracts.aws_s3 import (
+    S3_PRIVATE_BINDING_OPTION_NAMES,
+    S3_PROFILED_AUTHOR_OPTION_NAMES,
+    S3ProfiledAuditIdentity,
+    s3_profiled_binding_fingerprint,
+)
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
@@ -155,6 +161,7 @@ class LocalRequirementResult:
 class LoweredPluginConfig:
     executable_options: Mapping[str, object] = field(repr=False)
     audit_safe_options: Mapping[str, object]
+    profiled_s3_audit_identity: S3ProfiledAuditIdentity | None = None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "executable_options", "audit_safe_options")
@@ -581,37 +588,6 @@ class _BedrockGuardrailProfileResolver:
             raise ValueError("profile_unavailable") from None
 
 
-_S3_SOURCE_PUBLIC_OPTIONS = (
-    "key",
-    "format",
-    "csv_options",
-    "json_options",
-    "columns",
-    "field_mapping",
-    "schema",
-    "on_validation_failure",
-)
-_S3_SOURCE_PRIVATE_OPTIONS = frozenset(
-    {
-        "bucket",
-        "prefix",
-        "region",
-        "region_name",
-        "auth_mode",
-        "endpoint",
-        "endpoint_url",
-        "credential",
-        "credentials",
-        "aws_access_key_id",
-        "aws_secret_access_key",
-        "aws_session_token",
-        "access_key",
-        "secret_key",
-        "session_token",
-    }
-)
-
-
 class _S3SourceProfileResolver:
     def __init__(self, profiles: tuple[AWSS3SourceProfileSettings, ...], *, region: str) -> None:
         if not profiles or not is_well_formed_aws_region(region):
@@ -632,7 +608,7 @@ class _S3SourceProfileResolver:
                 "description": "Operator-approved S3 source profile alias",
             }
         }
-        for name in _S3_SOURCE_PUBLIC_OPTIONS:
+        for name in S3_PROFILED_AUTHOR_OPTION_NAMES:
             raw_schema = raw_properties.get(name)
             if not isinstance(raw_schema, dict):
                 raise ValueError("malformed_profile_schema")
@@ -649,7 +625,7 @@ class _S3SourceProfileResolver:
         raw_required = full_schema.json_schema.get("required", ())
         required = [
             "profile",
-            *(name for name in raw_required if isinstance(name, str) and name in _S3_SOURCE_PUBLIC_OPTIONS),
+            *(name for name in raw_required if isinstance(name, str) and name in S3_PROFILED_AUTHOR_OPTION_NAMES),
         ]
         public_json_schema: dict[str, Any] = {
             "type": "object",
@@ -688,7 +664,7 @@ class _S3SourceProfileResolver:
                 "description": "Operator-approved S3 source profile alias",
             }
         ]
-        for name in _S3_SOURCE_PUBLIC_OPTIONS:
+        for name in S3_PROFILED_AUTHOR_OPTION_NAMES:
             try:
                 field_projection = deepcopy(canonical_fields[name])
             except KeyError as exc:
@@ -719,9 +695,9 @@ class _S3SourceProfileResolver:
             profile = self._profiles[alias]
         except KeyError:
             raise ValueError("profile_unavailable") from None
-        if set(safe_options) & _S3_SOURCE_PRIVATE_OPTIONS:
+        if set(safe_options) & S3_PRIVATE_BINDING_OPTION_NAMES:
             raise ValueError("private_profile_option")
-        if set(safe_options) - set(_S3_SOURCE_PUBLIC_OPTIONS):
+        if set(safe_options) - set(S3_PROFILED_AUTHOR_OPTION_NAMES):
             raise ValueError("private_profile_option")
         relative_key = safe_options.get("key")
         if type(relative_key) is not str:
@@ -742,6 +718,15 @@ class _S3SourceProfileResolver:
         return LoweredPluginConfig(
             executable_options=MappingProxyType(executable),
             audit_safe_options=MappingProxyType({"profile": alias, **safe_options}),
+            profiled_s3_audit_identity=S3ProfiledAuditIdentity(
+                profile_alias=alias,
+                relative_key=relative_key,
+                binding_fingerprint=s3_profiled_binding_fingerprint(
+                    bucket=profile.bucket,
+                    executable_key=executable_key,
+                    region_name=self._region,
+                ),
+            ),
         )
 
     def profile_availability(

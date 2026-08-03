@@ -13,6 +13,7 @@ from typing import Any, cast
 import yaml
 
 from elspeth.contracts import SinkProtocol
+from elspeth.contracts.aws_s3 import S3_PROFILED_AUDIT_SAFE_OPTION_NAMES, S3ProfiledAuditIdentities
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -299,16 +300,22 @@ def bind_profiled_s3_source_audit_identities(
     *,
     authored_options_by_source: Mapping[str, object],
     plugin_snapshot: PluginAvailabilitySnapshot,
+    profiled_s3_audit_identities: S3ProfiledAuditIdentities,
 ) -> None:
     """Bind nominal safe evidence identities to Web-profiled S3 sources."""
     source_id = PluginId("source", "aws_s3")
     if source_id not in _profiled_plugin_ids(plugin_snapshot):
+        if profiled_s3_audit_identities:
+            raise ValueError("profiled S3 audit identities require a matching frozen plugin profile")
         return
 
-    from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentity
     from elspeth.plugins.sources.aws_s3_source import AWSS3Source
 
     allowed_aliases = dict(plugin_snapshot.usable_profile_aliases)[source_id]
+    identities_by_source = dict(profiled_s3_audit_identities)
+    if len(identities_by_source) != len(profiled_s3_audit_identities):
+        raise ValueError("profiled S3 audit identities contain duplicate source names")
+    bound_source_names: set[str] = set()
     for source_name, source in bundle.sources.items():
         if source.name != "aws_s3":
             continue
@@ -322,16 +329,27 @@ def bind_profiled_s3_source_audit_identities(
         if type(raw_options) is not dict:
             raise TypeError(f"audit-safe options for source {source_name!r} must be an exact dict")
         options = cast(dict[str, object], raw_options)
+        if set(options) - S3_PROFILED_AUDIT_SAFE_OPTION_NAMES:
+            raise ValueError(f"audit-safe options for source {source_name!r} contain a private binding field")
         alias = options.get("profile")
         relative_key = options.get("key")
         if type(alias) is not str or alias not in allowed_aliases:
             raise ValueError(f"audit-safe options for source {source_name!r} do not select an available profile")
         if type(relative_key) is not str:
             raise ValueError(f"audit-safe options for source {source_name!r} do not carry an exact relative key")
+        try:
+            identity = identities_by_source[source_name]
+        except KeyError:
+            raise KeyError(f"profiled S3 audit identities have no source named {source_name!r}") from None
+        if identity.profile_alias != alias or identity.relative_key != relative_key:
+            raise ValueError(f"audit-safe options for source {source_name!r} do not match their nominal identity")
         runtime_source._bind_profiled_audit_identity(
-            S3ProfiledAuditIdentity(profile_alias=alias, relative_key=relative_key),
+            identity,
             audit_safe_config=options,
         )
+        bound_source_names.add(source_name)
+    if bound_source_names != set(identities_by_source):
+        raise ValueError("profiled S3 audit identities do not match the runtime S3 source set")
 
 
 def _required_component_mapping(
@@ -549,6 +567,7 @@ def build_validated_runtime_graph(
     *,
     plugin_snapshot: PluginAvailabilitySnapshot,
     audit_safe_settings: Mapping[str, Any] | None = None,
+    profiled_s3_audit_identities: S3ProfiledAuditIdentities = (),
 ) -> RuntimeGraphBundle:
     """Instantiate runtime plugins, build the graph, and run both runtime graph checks.
 
@@ -556,12 +575,14 @@ def build_validated_runtime_graph(
     still run normally once the approved bundle reaches the orchestrator.
     """
     bundle = instantiate_runtime_plugins(settings, plugin_snapshot=plugin_snapshot)
-    if audit_safe_settings is not None:
+    profiled_s3_source = PluginId("source", "aws_s3") in _profiled_plugin_ids(plugin_snapshot)
+    if audit_safe_settings is not None and profiled_s3_source:
         authored_sources = _authored_sources(audit_safe_settings)
         bind_profiled_s3_source_audit_identities(
             bundle,
             authored_options_by_source={name: _authored_options(component) for name, component in authored_sources.items()},
             plugin_snapshot=plugin_snapshot,
+            profiled_s3_audit_identities=profiled_s3_audit_identities,
         )
     if audit_safe_settings is None:
         graph = build_runtime_graph(settings, bundle)

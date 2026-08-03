@@ -110,7 +110,12 @@ def _web_snapshot() -> PluginAvailabilitySnapshot:
 
 
 def _policy(state: CompositionState) -> PolicyLoweredState:
-    return PolicyLoweredState(state=state, operator_resolved_model_node_ids=frozenset())
+    return PolicyLoweredState(
+        authored_state=state,
+        state=state,
+        profiled_s3_audit_identities=(),
+        operator_resolved_model_node_ids=frozenset(),
+    )
 
 
 def _authored(state: CompositionState, *, contracts: tuple[SemanticEdgeContractResponse, ...] = ()) -> AuthoredValidatedState:

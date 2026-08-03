@@ -34,6 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts.audit import SecretResolutionInput
+from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.cli import ProgressEvent
 from elspeth.contracts.enums import NodeStateStatus, RunStatus
 from elspeth.contracts.errors import GracefulShutdownError
@@ -1418,6 +1419,7 @@ class ExecutionServiceImpl:
             plugin_snapshot=plugin_snapshot,
             executable_config=cast(dict[str, Any], executable_config),
             audit_safe_config=cast(dict[str, Any], audit_safe_config),
+            profiled_s3_audit_identities=policy_result.profiled_s3_audit_identities,
         )
 
         # B9 fix: create_run() generates its own UUID internally and returns
@@ -1725,6 +1727,7 @@ class ExecutionServiceImpl:
                 )
                 return None
 
+            profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
             if frozen_run_settings is None:
                 if not self._trained_operator_mode:
                     raise RuntimeError("Web execution requires frozen request policy settings")
@@ -1735,6 +1738,7 @@ class ExecutionServiceImpl:
                 plugin_snapshot = frozen_run_settings.plugin_snapshot
                 executable_config = cast(dict[str, Any], deep_thaw(frozen_run_settings.executable_config))
                 audit_safe_config = cast(dict[str, Any], deep_thaw(frozen_run_settings.audit_safe_config))
+                profiled_s3_audit_identities = frozen_run_settings.profiled_s3_audit_identities
 
             raw_eligibility_config = executable_config
             if raw_eligibility_config is None:
@@ -1947,6 +1951,7 @@ class ExecutionServiceImpl:
                 settings,
                 plugin_snapshot=plugin_snapshot,
                 audit_safe_settings=audit_safe_config,
+                profiled_s3_audit_identities=profiled_s3_audit_identities,
             )
             bundle = runtime_graph.plugin_bundle
             graph = runtime_graph.graph

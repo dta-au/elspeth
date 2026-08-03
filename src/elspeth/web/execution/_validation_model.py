@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Never
 
+from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.secrets import SecretScope
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import (
@@ -119,7 +120,9 @@ class PhaseFailure:
 class PolicyLoweredState:
     """Composer state after plugin policy has lowered operator-owned options."""
 
+    authored_state: CompositionState
     state: CompositionState
+    profiled_s3_audit_identities: S3ProfiledAuditIdentities
     operator_resolved_model_node_ids: frozenset[str]
 
 

@@ -312,11 +312,21 @@ def test_profiled_s3_runtime_uses_private_binding_only_for_boto_call(tmp_path: P
     }
     settings = load_settings_from_yaml_string(yaml.safe_dump(executable_config))
     snapshot = _snapshot_with_profiles((PluginId("source", "aws_s3"), profile_alias))
+    identity = lowered.profiled_s3_audit_identity
+    assert identity is not None
+
+    with pytest.raises(KeyError, match="audit identities have no source"):
+        build_validated_runtime_graph(
+            settings,
+            plugin_snapshot=snapshot,
+            audit_safe_settings=audit_safe_config,
+        )
 
     runtime = build_validated_runtime_graph(
         settings,
         plugin_snapshot=snapshot,
         audit_safe_settings=audit_safe_config,
+        profiled_s3_audit_identities=(("primary", identity),),
     )
     source = runtime.plugin_bundle.sources["primary"]
     assert isinstance(source, AWSS3Source)
