@@ -1251,7 +1251,10 @@ def test_01_tool_registered_in_get_tool_definitions() -> None:
     assert "review surface" in tool["description"]
 
 
-def test_pipeline_decision_tool_schema_closes_only_its_user_term_vocabulary() -> None:
+def test_pipeline_decision_tool_schema_advertises_public_vocabulary_through_supported_provider_adapters() -> None:
+    from litellm.litellm_core_utils.prompt_templates.factory import _bedrock_tools_pt
+    from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+
     definition = next(item for item in get_tool_definitions() if item["name"] == "request_interpretation_review")
     validator = Draft202012Validator(definition["parameters"])
     base = {
@@ -1266,18 +1269,14 @@ def test_pipeline_decision_tool_schema_closes_only_its_user_term_vocabulary() ->
             "user_term": "drop_raw_html_fields",
         }
     )
-    assert not validator.is_valid(
+    # Provider adapters discard root conditional schemas. The server-owned
+    # admission boundary closes this vocabulary; the surviving property prose
+    # makes its public values discoverable to every supported model provider.
+    assert validator.is_valid(
         {
             **base,
             "kind": "pipeline_decision",
             "user_term": "drop_raw_extracted_fields",
-        }
-    )
-    assert not validator.is_valid(
-        {
-            **base,
-            "kind": "pipeline_decision",
-            "user_term": "required_control_auto_wired",
         }
     )
     assert validator.is_valid(
@@ -1287,6 +1286,27 @@ def test_pipeline_decision_tool_schema_closes_only_its_user_term_vocabulary() ->
             "user_term": "customer-specific risk band",
         }
     )
+
+    expected_public_terms = {
+        "drop_raw_html_fields",
+        "prompt_injection_shield_recommendation",
+        "web_scrape_http_identity",
+    }
+    raw_description = definition["parameters"]["properties"]["user_term"]["description"]
+    wrapped_definition: Any = {"type": "function", "function": definition}
+    anthropic_tool: Any
+    anthropic_tool, _ = AnthropicConfig()._map_tool_helper(wrapped_definition)
+    anthropic_description = anthropic_tool["input_schema"]["properties"]["user_term"]["description"]
+    bedrock_tools: Any = _bedrock_tools_pt(
+        [wrapped_definition],
+        model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+    )
+    bedrock_tool: Any = bedrock_tools[0]
+    bedrock_description = bedrock_tool["toolSpec"]["inputSchema"]["json"]["properties"]["user_term"]["description"]
+
+    for description in (raw_description, anthropic_description, bedrock_description):
+        assert all(term in description for term in expected_public_terms)
+        assert "required_control_auto_wired" not in description
 
 
 # --------------------------------------------------------------------------- #

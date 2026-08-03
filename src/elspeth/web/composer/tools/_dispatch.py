@@ -64,7 +64,6 @@ from elspeth.web.composer.tools.sessions import (
     _SESSION_AWARE_TOOL_HANDLERS,
     ADVISOR_TRIGGER_VALUES,
 )
-from elspeth.web.interpretation_state import COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 
 __all__ = [
@@ -235,21 +234,6 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
             "type": "object",
             "additionalProperties": False,
             "required": ["affected_node_id", "kind", "user_term", "llm_draft"],
-            "allOf": [
-                {
-                    "if": {
-                        "properties": {"kind": {"const": "pipeline_decision"}},
-                        "required": ["kind"],
-                    },
-                    "then": {
-                        "properties": {
-                            "user_term": {
-                                "enum": sorted(COMPOSER_AUTHORED_PIPELINE_DECISION_USER_TERMS),
-                            }
-                        }
-                    },
-                }
-            ],
             "properties": {
                 "affected_node_id": {
                     "type": "string",
@@ -263,8 +247,9 @@ _REQUEST_INTERPRETATION_REVIEW_DEFINITION: Final[Mapping[str, Any]] = _validate_
                 "user_term": {
                     "type": "string",
                     "description": (
-                        "Stable user-facing label for the assumption being reviewed. For kind='pipeline_decision', "
-                        "this is a closed value selected from the conditional enum; never mint a decision term."
+                        "Stable user-facing label for the assumption being reviewed; for kind='pipeline_decision', "
+                        "copy exactly one of drop_raw_html_fields, prompt_injection_shield_recommendation, or "
+                        "web_scrape_http_identity and never mint a decision term."
                     ),
                 },
                 "llm_draft": {
