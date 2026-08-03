@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-03T16:53:00+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-03T16:51:29+10:00
-Release baseline: `release/0.7.2@10179f2c1`
+Last refreshed: 2026-08-03T16:57:00+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-03T16:56:03+10:00
+Release baseline: `release/0.7.2@0928c6ac6`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -41,8 +41,8 @@ shell mechanics remains deferred even when it blocks a fresh install.
 | State | Objective 44 | Additional 4 | Meaning |
 |---|---:|---:|---|
 | Closed | 8 | 0 | Tracker says done; closure evidence is still sampled during the completion audit |
-| Verifying | 11 | 0 | Locally fixed; live or requirement-specific acceptance remains |
-| Fixing | 3 | 2 | Owned bug implementation is still in flight |
+| Verifying | 11 | 1 | Locally fixed; live or requirement-specific acceptance remains |
+| Fixing | 3 | 1 | Owned bug implementation is still in flight |
 | In progress | 0 | 1 | A delivery task spanning existing objective defects is in flight |
 | Open | 4 | 1 | Confirmed task/epic work not yet started here |
 | Triage | 15 | 0 | Root cause and reproducibility must be checked against current HEAD before fixing |
@@ -73,7 +73,7 @@ claim custody.
 | `/root/impl_gate_row_error_policy` | Per-row gate `on_error` handling | `.claude/worktrees/gate-row-error-policy`; `codex/fix-gate-row-error-policy` | gate config/executor/traversal/source-iteration seams and direct tests | None | RED captured at missing `GateSettings.on_error`; active |
 | `/root/impl_csv_audit_characteristics` | Honest CSV audit characteristics | `.claude/worktrees/csv-audit-characteristics`; `codex/fix-csv-audit-characteristics` | CSV source, characteristic UI wording, exact scenario-corpus oracle, direct tests | None | Complete; behavior `d78fbbed6`, corpus oracle `10179f2c1` |
 | `/root/impl_s3_source_profiles` | Operator-profiled Web S3 source | `.claude/worktrees/s3-source-profiles`; `codex/fix-s3-source-profiles` | Web config/profile/policy/S3 lowering/source seams and direct tests | None | Active; two bounded review subagents |
-| `/root/impl_run_diagnostics_ui` | Surface routed-failure provenance | `.claude/worktrees/run-diagnostics-ui`; `codex/fix-run-diagnostics-ui` | `RunsHistoryDrawer` and direct frontend diagnostics presentation/tests | None | Active |
+| `/root/impl_run_diagnostics_ui` | Surface routed-failure provenance | `.claude/worktrees/run-diagnostics-ui`; `codex/fix-run-diagnostics-ui` | `RunsHistoryDrawer` and direct frontend diagnostics presentation/tests | None | Complete; integrated as `9130e1209` + `0928c6ac6` |
 | `/root/impl_compose_authoring_aids` | Compose context and truthful field-mapping aids | `.claude/worktrees/compose-authoring-aids`; `codex/fix-compose-authoring-aids` | `prompts.py`, `planner_authoring_aids.py`, `field_mapper.py`, direct tests | None | Active |
 
 No subagent may mutate AWS or the shared release checkout during this wave.
@@ -86,7 +86,7 @@ Parent workstream state:
 |---|---|---|
 | `elspeth-7ffd77deca` — advisor gate | `verifying` | Run the merged D1-D6 acceptance matrix on one deployed candidate |
 | `elspeth-7da4e52344` — compose loop | `fixing` | Integrate the no-collision aids lane, then sequence the shared `service.py` and tool-boundary lanes |
-| `elspeth-e7ff15ac0b` — gate routing | `open` | Reconcile five closed, three verifying, and four residual/discovered children |
+| `elspeth-e7ff15ac0b` — gate routing | `open` | Reconcile five closed, four verifying, and three residual/discovered children |
 | `elspeth-e54343d43b` — AWS installer | `open` | Hold implementation until demo-aware product/system work is accepted; only deconflict existing owners in the meantime |
 
 ## Advisor gate — `elspeth-7ffd77deca`
@@ -128,7 +128,7 @@ Parent workstream state:
 | `elspeth-c4734bc69a` | P3 | `verifying` | `codex-r3-rca-coordinator` | Behavior `d78fbbed6` plus corpus `10179f2c1`; live catalog acceptance and combined full-suite gate remain |
 | `elspeth-aaa9e3f597` | P2 | `verifying` | `codex-release-0.7.2-integration` | Live guided path retains the decision heading and treats gates as topology, not plugins |
 | `elspeth-1d97fc4b80` | P1 | `fixing` | `codex-guided-node-custody` | Preserve server-custodied unchanged node behavior/options during unrelated guided corrections |
-| `elspeth-18b39eb829` | P2 | `fixing` | `codex-run-diagnostics-ui` | Surface scrubbed failed-state reason, provider code, node, and actionable hint in expanded run diagnostics |
+| `elspeth-18b39eb829` | P2 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `0928c6ac6`; live run panel must expose the already-recorded Textract node/code/hint without direct DB access |
 
 ## Related core/demo-aware product and system work
 
@@ -216,6 +216,7 @@ Append entries; do not rewrite history.
 | 2026-08-03 16:44 | Ignored evidence risk tracked | Filed deferred supportability task `elspeth-01c627b420`; read-only audit found 89 acceptance-related issues citing paths absent from fresh clones |
 | 2026-08-03 16:51 | CSV corpus obligation closed | Reviewed and integrated oracle commit `9197657ae` as `10179f2c1`; corpus contract 435 and full production path 158 passed; coordinator reran the formerly failing case plus CSV metadata (7 passed) |
 | 2026-08-03 16:52 | Guided custody scope completed | Step-3 proposal revisions now bind against the authoritative proposal candidate as well as Step-4 wire corrections; independent review and repository gates remain |
+| 2026-08-03 16:56 | Run-diagnostics UI integrated | Reviewed implementation `940c8b1c2` and boundary hardening `63a691d5c`, integrated as `9130e1209` + `0928c6ac6`; coordinator reran 26 drawer tests on the release branch |
 
 ## Reconciliation findings
 
