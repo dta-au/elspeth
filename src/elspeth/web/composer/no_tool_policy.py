@@ -96,14 +96,14 @@ _MAX_INTENT_CLASSIFICATION_CHARS: Final = 4_096
 _MUTATION_ACTION_PATTERN: Final = (
     r"(?:set\s+(?:this|it)\s+up|set\s+up|setup|build|create|make|wire|add|update|modify|change|run|execute|process|route|split|save)"
 )
-_CONTROLLED_OBJECT_GRAMMAR: Final = (
-    r"(?:(?:a|an|the|this)\s+)?"
+_CONTROLLED_OBJECT_BODY_GRAMMAR: Final = (
     r"(?:"
     r"[a-z0-9_.-]+\s+to\s+[a-z0-9_.-]+\s+pipeline|"
     r"(?:(?:requested|csv|jsonl?|parquet)\s+)?(?:pipeline|composition|workflow|automation)|"
     r"source|input(?:\s+rows?)?|output|node|edge|transform|filter|sink|rows?"
     r")"
 )
+_CONTROLLED_OBJECT_GRAMMAR: Final = rf"(?:(?:a|an|the|this)\s+)?{_CONTROLLED_OBJECT_BODY_GRAMMAR}"
 _CONTROLLED_COMPLEMENT_GRAMMAR: Final = (
     r"(?:"
     r"\s+now|"
@@ -144,6 +144,16 @@ _COMPLETE_EXPLICIT_REQUEST_PATTERNS: Final = (
     _SINGLE_CLAUSE_IMPERATIVE_PATTERN,
     _SINGLE_CLAUSE_POLITE_REQUEST_PATTERN,
     *_NARROW_COMPLETE_REQUEST_PATTERNS,
+)
+_REFERENTIAL_EXPLICIT_MUTATION_SIGNAL: Final = re.compile(
+    rf"\b(?:{_MUTATION_ACTION_PATTERN})\b\s+(?:the\s+)?requested\s+"
+    r"(?:pipeline|composition|workflow|automation)\b"
+    rf"|\b(?:{_MUTATION_ACTION_PATTERN})\b\s+(?:this|that)\s+{_CONTROLLED_OBJECT_BODY_GRAMMAR}\b"
+    rf"|\b(?:{_MUTATION_ACTION_PATTERN})\b\s+the\s+(?:pipeline|composition|workflow|automation)\b"
+    r"|\b(?:build|create|make|wire|run|execute)\s+it\b"
+    r"|\bjust\s+build\s+the\s+whole\s+thing\b"
+    r"|\Abuild!\Z",
+    re.IGNORECASE,
 )
 _MULTI_CLAUSE_REQUEST_LEAD_GRAMMAR: Final = (
     rf"{_POSITIVE_LEAD_GRAMMAR}"
@@ -567,6 +577,27 @@ def classify_pipeline_mutation_intent(message: str) -> PipelineMutationIntentDec
     if multi_clause_request or any(pattern.fullmatch(unquoted) is not None for pattern in _COMPLETE_EXPLICIT_REQUEST_PATTERNS):
         return PipelineMutationIntentDecision.EXPLICIT_MUTATION
     return PipelineMutationIntentDecision.AMBIGUOUS
+
+
+def is_referential_pipeline_mutation_intent(message: str) -> bool:
+    """Return whether an admitted mutation request depends on prior prose.
+
+    Mutation authority remains wholly owned by
+    :func:`classify_pipeline_mutation_intent`. This second decision reuses that
+    closed grammar, then identifies only deictic request shapes whose current
+    text cannot specify the requested topology by itself. Complete registered
+    recipes are self-contained even if their inline data happens to contain a
+    matching phrase.
+    """
+    if classify_pipeline_mutation_intent(message) is not PipelineMutationIntentDecision.EXPLICIT_MUTATION:
+        return False
+    if _matches_complete_registered_recipe_request(message):
+        return False
+    unquoted_text, quotes_balanced, _quoted_material_seen = _strip_quoted_text(message)
+    if not quotes_balanced:
+        return False
+    normalized = " ".join(unquoted_text.split())
+    return _REFERENTIAL_EXPLICIT_MUTATION_SIGNAL.search(normalized) is not None
 
 
 def _tool_failure_detail(payload: Mapping[str, Any]) -> str:

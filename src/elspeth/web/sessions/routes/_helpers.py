@@ -105,6 +105,7 @@ from elspeth.web.composer.progress import (
 )
 from elspeth.web.composer.protocol import (
     ComposerConvergenceError,
+    ComposerHistoryMessage,
     ComposerPluginCrashError,
     ComposerRuntimePreflightError,
     ComposerService,
@@ -1215,7 +1216,7 @@ def _composer_conversation_tool_or_llm_audit_messages(messages: Sequence[ChatMes
     ]
 
 
-def _composer_chat_history(messages: Sequence[ChatMessageRecord]) -> list[dict[str, str]]:
+def _composer_chat_history(messages: Sequence[ChatMessageRecord]) -> list[ComposerHistoryMessage]:
     """Convert persisted session messages to LLM chat history.
 
     ``raw_content`` is attribution/audit data and feeds the LLM-context
@@ -1228,13 +1229,15 @@ def _composer_chat_history(messages: Sequence[ChatMessageRecord]) -> list[dict[s
 
     Provider-visible composer control rows are persisted as ``role="audit"``
     with a closed envelope; they are decoded back to their exact provider role
-    here. Composer tool-call audit rows are persisted as ``role="tool"`` messages so
+    here. Exact human-user rows receive a route-owned internal authorship
+    marker; ``prompts.build_messages`` strips it before provider dispatch.
+    Composer tool-call audit rows are persisted as ``role="tool"`` messages so
     the session record retains the dispatch trail. They are not prior LLM
     dialogue turns: replaying them without the in-loop assistant tool-call
     request that produced them creates orphan OpenAI tool messages. Keep them
     in storage, but exclude them from prompt history and normal chat responses.
     """
-    history: list[dict[str, str]] = []
+    history: list[ComposerHistoryMessage] = []
     for message in messages:
         control = replay_composer_control_message(
             stored_role=message.role,
@@ -1243,9 +1246,12 @@ def _composer_chat_history(messages: Sequence[ChatMessageRecord]) -> list[dict[s
             tool_calls=message.tool_calls,
         )
         if control is not None:
-            history.append(control)
+            history.append(ComposerHistoryMessage(role=control["role"], content=control["content"]))
         elif not _is_composer_audit_tool_message(message):
-            history.append({"role": message.role, "content": _composer_history_content(message)})
+            history_message = ComposerHistoryMessage(role=message.role, content=_composer_history_content(message))
+            if message.role == "user" and message.writer_principal in {"route_user_message", "session_fork"}:
+                history_message["_elspeth_user_authored"] = True
+            history.append(history_message)
     return history
 
 

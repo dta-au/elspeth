@@ -5129,7 +5129,7 @@ class TestMessageRoutes:
         assert [call["message"] for call in composer.calls] == ["First", "Second"]
         assert composer.calls[0]["chat_messages"] == []
         assert composer.calls[1]["chat_messages"] == [
-            {"role": "user", "content": "First"},
+            {"role": "user", "content": "First", "_elspeth_user_authored": True},
             {"role": "assistant", "content": "Reply to first"},
         ]
 
@@ -11843,9 +11843,48 @@ def test_composer_chat_history_skips_audit_tool_messages() -> None:
     history = _composer_chat_history([user_message, tool_audit_message, assistant_message])
 
     assert history == [
-        {"role": "user", "content": "Build a CSV pipeline."},
+        {"role": "user", "content": "Build a CSV pipeline.", "_elspeth_user_authored": True},
         {"role": "assistant", "content": "I updated the pipeline."},
     ]
+
+
+def test_composer_chat_history_marks_edited_fork_user_but_not_fork_system_row() -> None:
+    from elspeth.web.composer.service import _freeform_planner_conversation_context
+    from elspeth.web.sessions.routes import _composer_chat_history
+
+    session_id = uuid.uuid4()
+    fork_system_message = ChatMessageRecord(
+        id=uuid.uuid4(),
+        session_id=session_id,
+        role="system",
+        content="Conversation forked from an earlier point.",
+        tool_calls=None,
+        created_at=datetime.now(UTC),
+        writer_principal="session_fork",
+    )
+    edited_fork_user_message = ChatMessageRecord(
+        id=uuid.uuid4(),
+        session_id=session_id,
+        role="user",
+        content="Route rows with amount > 500 to high_value.",
+        tool_calls=None,
+        created_at=datetime.now(UTC),
+        writer_principal="session_fork",
+    )
+
+    history = _composer_chat_history([fork_system_message, edited_fork_user_message])
+    context = _freeform_planner_conversation_context("Build the requested pipeline.", history)
+
+    assert history == [
+        {"role": "system", "content": "Conversation forked from an earlier point."},
+        {
+            "role": "user",
+            "content": "Route rows with amount > 500 to high_value.",
+            "_elspeth_user_authored": True,
+        },
+    ]
+    assert context is not None
+    assert [request.content for request in context.prior_user_requests] == ["Route rows with amount > 500 to high_value."]
 
 
 def test_composer_chat_history_skips_llm_call_audit_and_unknown_audit_kinds() -> None:
@@ -11892,7 +11931,7 @@ def test_composer_chat_history_skips_llm_call_audit_and_unknown_audit_kinds() ->
     history = _composer_chat_history([user_message, llm_audit_message, unknown_audit_message, assistant_message])
 
     assert history == [
-        {"role": "user", "content": "Build a CSV pipeline."},
+        {"role": "user", "content": "Build a CSV pipeline.", "_elspeth_user_authored": True},
         {"role": "assistant", "content": "I updated the pipeline."},
     ]
 

@@ -40,6 +40,7 @@ from elspeth.web.composer.guided.state_machine import GuidedSession
 from elspeth.web.composer.pipeline_planner import PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase
 from elspeth.web.composer.protocol import (
+    COMPOSER_HISTORY_USER_AUTHORED_KEY,
     ComposerConvergenceError,
     ComposerPluginCrashError,
     ComposerResult,
@@ -54,6 +55,7 @@ from elspeth.web.composer.service import (
     ComposerAvailability,
     ComposerServiceImpl,
     _compose_preflight_repair_message,
+    _freeform_planner_conversation_context,
 )
 from elspeth.web.composer.state import (
     CompositionState,
@@ -566,6 +568,85 @@ def _composer_to_thread_uses_test_worker(monkeypatch: pytest.MonkeyPatch) -> Non
         return None
 
     monkeypatch.setattr("asyncio.to_thread", test_to_thread)
+
+
+def test_freeform_planner_context_is_bounded_with_explicit_omission_custody() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": f"request-{index}",
+            COMPOSER_HISTORY_USER_AUTHORED_KEY: True,
+        }
+        for index in range(10)
+    ]
+
+    context = _freeform_planner_conversation_context("Build the requested pipeline.", messages)
+
+    assert context is not None
+    assert [(request.history_index, request.content) for request in context.prior_user_requests] == [
+        (0, "request-0"),
+        (3, "request-3"),
+        (4, "request-4"),
+        (5, "request-5"),
+        (6, "request-6"),
+        (7, "request-7"),
+        (8, "request-8"),
+        (9, "request-9"),
+    ]
+    assert context.additional_prior_user_requests_omitted == 2
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Build the requested pipeline.",
+        "Could you build the requested pipeline?",
+        "Can you please build the requested workflow?",
+        "I want you to build the requested pipeline.",
+        "Let's build the requested pipeline.",
+        "Build!",
+        "Build this pipeline.",
+        "Update this pipeline.",
+        "Change this workflow.",
+        "Run this pipeline.",
+        "Build the pipeline.",
+        "Change this node.",
+        "Route this input.",
+        "Save this output.",
+    ],
+)
+def test_freeform_planner_context_reaches_every_admitted_referential_form(message: str) -> None:
+    context = _freeform_planner_conversation_context(
+        message,
+        [
+            {
+                "role": "user",
+                "content": "Route rows with amount > 500 to high_value.",
+                COMPOSER_HISTORY_USER_AUTHORED_KEY: True,
+            }
+        ],
+    )
+
+    assert context is not None
+    assert [request.content for request in context.prior_user_requests] == ["Route rows with amount > 500 to high_value."]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Build a CSV to JSONL pipeline.",
+        "Build a pipeline that routes every row to both sinks.",
+        "Fan every row out to both sinks.",
+        "Remove the threshold and build a JSONL pipeline.",
+    ],
+)
+def test_freeform_planner_context_does_not_override_self_contained_current_intent(message: str) -> None:
+    context = _freeform_planner_conversation_context(
+        message,
+        [{"role": "user", "content": "Route rows with amount > 500 to high_value."}],
+    )
+
+    assert context is None
 
 
 class TestComposerTextOnlyResponse:

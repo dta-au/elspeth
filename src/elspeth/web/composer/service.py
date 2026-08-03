@@ -110,10 +110,12 @@ from elspeth.web.composer.pipeline_planner import (
     PipelinePlannerError,
     PipelinePlanResult,
     PlannerBudgetPolicy,
+    PlannerConversationContext,
     PlannerCustodyConfig,
     PlannerDeclined,
     PlannerModelConfig,
     PlannerOriginatingMessage,
+    PlannerPriorUserRequest,
     PlannerRequestLifecycle,
     plan_pipeline,
     prepare_pipeline_plan,
@@ -128,7 +130,9 @@ from elspeth.web.composer.progress import (
 from elspeth.web.composer.prompts import build_messages, build_run_diagnostics_messages, render_system_prompt
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
+    COMPOSER_HISTORY_USER_AUTHORED_KEY,
     ComposerConvergenceError,
+    ComposerHistoryMessage,
     ComposerPluginCrashError,
     ComposerResult,
     ComposerRuntimePreflightError,
@@ -350,6 +354,7 @@ _no_mutation_empty_state_validation = _no_tool_policy.no_mutation_empty_state_va
 _pre_state_interpretation_review_repair_message = _no_tool_policy.pre_state_interpretation_review_repair_message
 _state_is_structurally_empty = _no_tool_policy.state_is_structurally_empty
 _classify_pipeline_mutation_intent = _no_tool_policy.classify_pipeline_mutation_intent
+_is_referential_pipeline_mutation_intent = _no_tool_policy.is_referential_pipeline_mutation_intent
 _PipelineMutationIntentDecision = _no_tool_policy.PipelineMutationIntentDecision
 _arg_error_payload = _tool_error_payloads.arg_error_payload
 _INVALID_TOOL_ARGUMENTS_REDACTION_STATUS = _tool_error_payloads.INVALID_TOOL_ARGUMENTS_REDACTION_STATUS
@@ -999,7 +1004,55 @@ class _ProofRepairOutcome:
 # return a non-runnable result — preventing both indefinite spin and fail-open
 # finalization when a model refuses to apply the suggested repair.
 _MAX_REPAIR_TURNS: Final[int] = 2
+_FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS: Final[int] = 8
 _TRAINED_OPERATOR_COMPOSITION_ROOT = object()
+
+
+def _freeform_planner_conversation_context(
+    message: str,
+    messages: list[ComposerHistoryMessage],
+) -> PlannerConversationContext | None:
+    """Project bounded, authoritative earlier user requests for the planner.
+
+    Empty-state planning receives the current message separately as its
+    custody-bearing ``PlannerOriginatingMessage``. This projection carries
+    only preceding user-authored requests needed to resolve a referential turn;
+    assistant prose is model synthesis, not intent authority, and is excluded.
+    The first request plus the seven most recent requests survive long
+    histories, with an explicit omission count. The planner's existing exact
+    request-byte budget remains the final provider-call bound.
+    """
+    if not _is_referential_pipeline_mutation_intent(message):
+        return None
+
+    prior_requests: list[PlannerPriorUserRequest] = []
+    for history_index, history_message in enumerate(messages):
+        if type(history_message) is not dict:
+            raise InvariantError("composer chat history entries must be exact dictionaries")
+        authorship = history_message.get(COMPOSER_HISTORY_USER_AUTHORED_KEY)
+        if authorship is None:
+            continue
+        if authorship is not True or history_message.get("role") != "user":
+            raise InvariantError("composer user-authorship marker is malformed")
+        content = history_message.get("content")
+        if type(content) is not str or not content.strip():
+            raise InvariantError("composer user chat history content must be a non-empty exact string")
+        prior_requests.append(PlannerPriorUserRequest(history_index=history_index, content=content))
+
+    if not prior_requests:
+        return None
+    if len(prior_requests) <= _FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS:
+        retained = tuple(prior_requests)
+        omitted = 0
+    else:
+        tail_count = _FREEFORM_PLANNER_PRIOR_USER_REQUEST_MAX_ITEMS - 1
+        retained = (prior_requests[0], *prior_requests[-tail_count:])
+        omitted = len(prior_requests) - len(retained)
+    return PlannerConversationContext(
+        prior_user_requests=retained,
+        additional_prior_user_requests_omitted=omitted,
+    )
+
 
 # Task 6 Step 3 (elspeth-bff8fe6864, belt-and-braces): once a genuine repair
 # tool call lands following a FLAGGED END advisor pass, elide the injected
@@ -2448,7 +2501,7 @@ class ComposerServiceImpl:
     async def compose(
         self,
         message: str,
-        messages: list[dict[str, Any]],
+        messages: list[ComposerHistoryMessage],
         state: CompositionState,
         session_id: str | None = None,
         current_state_id: str | None = None,
@@ -2461,8 +2514,9 @@ class ComposerServiceImpl:
 
         Args:
             message: The user's chat message.
-            messages: Chat history as plain dicts (pre-converted from
-                ChatMessageRecord by route handler; seam contract B).
+            messages: Chat history pre-converted from ChatMessageRecord by the
+                route handler (seam contract B), including its internal marker
+                on exact persisted human-user rows.
             state: The current CompositionState.
             current_state_id: Database id of ``state`` when it came from a
                 persisted session row. Used as the stale-state guard for
@@ -2500,6 +2554,7 @@ class ComposerServiceImpl:
             ):
                 return await self._plan_and_stage_empty_pipeline(
                     message=message,
+                    messages=messages,
                     state=state,
                     session_id=session_id,
                     current_state_id=current_state_id,
@@ -3183,6 +3238,7 @@ class ComposerServiceImpl:
         self,
         *,
         message: str,
+        messages: list[ComposerHistoryMessage],
         state: CompositionState,
         session_id: str,
         current_state_id: str | None,
@@ -3292,6 +3348,7 @@ class ComposerServiceImpl:
             try:
                 plan = await plan_pipeline(
                     intent=message,
+                    conversation_context=_freeform_planner_conversation_context(message, messages),
                     current_state=state,
                     provider_current_state=state.to_dict(),
                     reviewed_facts={},
@@ -4522,7 +4579,7 @@ class ComposerServiceImpl:
     async def _compose_loop(
         self,
         message: str,
-        messages: list[dict[str, Any]],
+        messages: list[ComposerHistoryMessage],
         state: CompositionState,
         session_id: str | None = None,
         initial_current_state_id: str | None = None,
@@ -5118,7 +5175,7 @@ class ComposerServiceImpl:
 
     def _build_messages(
         self,
-        chat_history: list[dict[str, Any]],
+        chat_history: list[ComposerHistoryMessage],
         state: CompositionState,
         user_message: str,
         guided_terminal: TerminalState | None = None,

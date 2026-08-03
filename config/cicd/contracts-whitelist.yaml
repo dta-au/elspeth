@@ -952,13 +952,9 @@ allowed_dict_patterns:
   - "src/elspeth/web/secrets/user_store.py:_pg_upsert:values"
   - "src/elspeth/web/secrets/user_store.py:_mysql_upsert:values"
 
-  # WEB COMPOSER — Service, protocol, prompts (LLM message lists)
-  # LiteLLM message format is list[dict[str, Any]] by API contract.
-  # Chat history arrives as plain dicts from the route handler (seam contract B).
-  - "src/elspeth/web/composer/protocol.py:ComposerService.compose:messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl.compose:messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._compose_loop:messages (list)"
-  - "src/elspeth/web/composer/service.py:ComposerServiceImpl._build_messages:chat_history (list)"
+  # WEB COMPOSER — provider-bound LLM message lists. In-process persisted
+  # history uses ComposerHistoryMessage; only the outbound provider shapes
+  # remain dynamic because LiteLLM defines them as list[dict[str, Any]].
   - "src/elspeth/web/composer/llm_response_parsing.py:build_llm_call_record:messages (list)"
   # Late-binding capture of the per-tool-call arguments inside the
   # dispatch_with_audit closure. The loop-local `arguments` is a Tier-3
@@ -992,7 +988,6 @@ allowed_dict_patterns:
   # The `tools` parameter is typed `list | None`, so the contracts check
   # treats it as a separate shape; only `messages (list)` is whitelisted here.
   - "src/elspeth/web/composer/llm_response_parsing.py:apply_anthropic_cache_markers:messages (list)"
-  - "src/elspeth/web/composer/prompts.py:build_messages:chat_history (list)"
   - "src/elspeth/web/composer/prompts.py:build_messages:return (list)"
 
   # WEB BLOB/SESSION PIPELINE ADAPTERS — canonical runtime/YAML dict shape.

@@ -21,6 +21,7 @@ from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.prompts import build_mode_transition_system_prompt
 from elspeth.web.composer.guided.state_machine import TerminalKind
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
+from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY, ComposerHistoryMessage
 from elspeth.web.composer.redaction import redact_source_storage_path
 from elspeth.web.composer.skills import load_deployment_skill, load_skill_with_hash
 from elspeth.web.composer.state import CompositionState
@@ -302,7 +303,7 @@ def build_context_string(
 
 
 def build_messages(
-    chat_history: list[dict[str, Any]],
+    chat_history: list[ComposerHistoryMessage],
     state: CompositionState,
     user_message: str,
     catalog: PolicyCatalogView,
@@ -338,7 +339,9 @@ def build_messages(
     flip; this function is pure (no state mutation).
 
     Args:
-        chat_history: Chat history as plain dicts (role/content keys).
+        chat_history: Chat history as dicts with role/content keys and an
+            optional route-owned internal authorship marker. The marker is
+            removed before any provider message is built.
         state: Current CompositionState.
         user_message: The user's current message.
         catalog: CatalogService for context injection.
@@ -419,7 +422,10 @@ def build_messages(
 
     # 3. Chat history
     if chat_history:
-        messages.extend(chat_history)
+        messages.extend(
+            {key: value for key, value in history_message.items() if key != COMPOSER_HISTORY_USER_AUTHORED_KEY}
+            for history_message in chat_history
+        )
 
     # 4. Current user message
     messages.append({"role": "user", "content": user_message})

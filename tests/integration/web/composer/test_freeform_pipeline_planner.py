@@ -23,7 +23,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
-from elspeth.web.composer.protocol import ComposerResult
+from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY, ComposerResult
 from elspeth.web.composer.recipe_intent_routing import FreeformRecipeIntentMatch, InlineRecipeBlob
 from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
@@ -120,6 +120,54 @@ def _terminal_response(data_dir: Path, session_id: str) -> _Response:
                             function=_Function(
                                 name="emit_pipeline_proposal",
                                 arguments=json.dumps({"pipeline": _pipeline(data_dir, session_id)}),
+                            ),
+                        )
+                    ],
+                )
+            )
+        ],
+        usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": 0.01},
+    )
+
+
+def _routing_terminal_response(data_dir: Path, session_id: str, *, condition: str) -> _Response:
+    pipeline = _pipeline(data_dir, session_id)
+    pipeline["nodes"] = [
+        {
+            "id": "route_amount",
+            "node_type": "gate",
+            "input": "rows",
+            "condition": condition,
+            "routes": ({"true": "fork", "false": "fork"} if condition == "True" else {"true": "high_value", "false": "standard"}),
+            **({"fork_to": ["high_value", "standard"]} if condition == "True" else {}),
+        }
+    ]
+    pipeline["outputs"] = [
+        {
+            "sink_name": sink_name,
+            "plugin": "json",
+            "options": {
+                "path": str(data_dir / "outputs" / session_id / f"{sink_name}.jsonl"),
+                "schema": {"mode": "observed"},
+                "format": "jsonl",
+                "mode": "write",
+                "collision_policy": "auto_increment",
+            },
+            "on_write_failure": "discard",
+        }
+        for sink_name in ("high_value", "standard")
+    ]
+    return _Response(
+        choices=[
+            _Choice(
+                message=_Message(
+                    content=None,
+                    tool_calls=[
+                        _ToolCall(
+                            id=f"freeform-routing-{condition}",
+                            function=_Function(
+                                name="emit_pipeline_proposal",
+                                arguments=json.dumps({"pipeline": pipeline}),
                             ),
                         )
                     ],
@@ -239,6 +287,68 @@ async def test_empty_build_stages_one_canonical_pipeline_proposal_for_both_trust
     assert any(role == "audit" and calls and calls[0].get("_kind") == "llm_call_audit" for role, calls in audit_rows)
     assert len(requests) == 1
     assert requests[0]["max_tokens"] == settings.composer_planner_max_completion_tokens
+
+
+@pytest.mark.asyncio
+async def test_referential_empty_build_projects_authoritative_prior_user_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A referential build turn must not erase the request it refers to."""
+    message = "Build the requested pipeline."
+    _engine, sessions, session, user_message, composer = await _recipe_composer_context(
+        tmp_path,
+        monkeypatch,
+        message=message,
+    )
+    original_request = (
+        "Read transactions.csv, route rows where amount > 500 to high_value, route every other row to standard, and write both as JSONL."
+    )
+    refinement = "Keep an audit trace field in both outputs."
+    requests: list[dict[str, Any]] = []
+    responses = [
+        _routing_terminal_response(tmp_path, str(session.id), condition="True"),
+        _routing_terminal_response(tmp_path, str(session.id), condition="row['amount'] > 500"),
+    ]
+
+    async def completion(**kwargs: Any) -> _Response:
+        requests.append(kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
+
+    await composer.compose(
+        message,
+        [
+            {"role": "user", "content": original_request, COMPOSER_HISTORY_USER_AUTHORED_KEY: True},
+            {"role": "assistant", "content": "I can prepare that pipeline."},
+            {"role": "user", "content": refinement, COMPOSER_HISTORY_USER_AUTHORED_KEY: True},
+            {"role": "assistant", "content": "Understood."},
+        ],
+        _empty_state(),
+        session_id=str(session.id),
+        user_id="planner-user",
+        user_message_id=str(user_message.id),
+    )
+
+    assert len(requests) == 2
+    provider_user_message = requests[0]["messages"][1]["content"]
+    provider_payload = json.loads(provider_user_message)
+    assert provider_payload["intent"] == message
+    assert provider_payload["conversation_context"] == {
+        "prior_user_requests": [
+            {"history_index": 0, "content": original_request},
+            {"history_index": 2, "content": refinement},
+        ],
+        "additional_prior_user_requests_omitted": 0,
+    }
+    assert "I can prepare that pipeline." not in provider_user_message
+    assert "Understood." not in provider_user_message
+    repair_feedback = json.loads(requests[1]["messages"][-1]["content"])
+    assert [error["error_code"] for error in repair_feedback["validation"]["errors"]] == ["gate_condition_ignores_stated_threshold"]
+    proposals = await sessions.list_composition_proposals(session.id, status="pending")
+    assert len(proposals) == 1
+    assert deep_thaw(proposals[0].arguments_json)["nodes"][0]["condition"] == "row['amount'] > 500"
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, final
+from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, NotRequired, Protocol, TypedDict, final
 from uuid import UUID
 
 if TYPE_CHECKING:
@@ -34,6 +34,17 @@ from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import ValidationResult
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+# Route-owned provenance marker carried only inside Composer's in-process chat
+# history. ``prompts.build_messages`` removes it before provider dispatch.
+COMPOSER_HISTORY_USER_AUTHORED_KEY: Final[str] = "_elspeth_user_authored"
+
+
+class ComposerHistoryMessage(TypedDict):
+    """One in-process history row with optional persisted human authority."""
+
+    role: str
+    content: str
+    _elspeth_user_authored: NotRequired[Literal[True]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1160,7 +1171,7 @@ class ComposerService(Protocol):
     async def compose(
         self,
         message: str,
-        messages: list[dict[str, Any]],
+        messages: list[ComposerHistoryMessage],
         state: CompositionState,
         session_id: str | None = None,
         current_state_id: str | None = None,
@@ -1173,7 +1184,9 @@ class ComposerService(Protocol):
 
         Args:
             message: The user's chat message.
-            messages: Chat history as plain dicts (role/content keys).
+            messages: Chat history as dicts with role/content keys. Exact
+                persisted human-user rows also carry the route-owned internal
+                authorship marker; provider message construction strips it.
                 The route handler fetches ChatMessageRecord from
                 session_service.get_messages(), converts each to a dict,
                 and passes the result here. ComposerService may depend on

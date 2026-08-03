@@ -38,6 +38,7 @@ from elspeth.web.composer.prompts import (
 from elspeth.web.composer.prompts import (
     build_messages as _build_messages,
 )
+from elspeth.web.composer.protocol import COMPOSER_HISTORY_USER_AUTHORED_KEY
 from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
@@ -215,6 +216,22 @@ class TestBuildMessages:
         assert messages[3]["content"] == "previous answer"
         assert messages[-1]["role"] == "user"
         assert messages[-1]["content"] == "new question"
+
+    def test_internal_history_authorship_marker_never_reaches_provider_messages(self) -> None:
+        state = _empty_state()
+        catalog = _stub_catalog()
+        history = [
+            {
+                "role": "user",
+                "content": "Build the requested pipeline.",
+                COMPOSER_HISTORY_USER_AUTHORED_KEY: True,
+            }
+        ]
+
+        messages = build_messages(history, state, "continue", catalog)
+
+        assert messages[2] == {"role": "user", "content": "Build the requested pipeline."}
+        assert all(COMPOSER_HISTORY_USER_AUTHORED_KEY not in message for message in messages)
 
     def test_empty_history_produces_system_context_and_user_only(self) -> None:
         state = _empty_state()

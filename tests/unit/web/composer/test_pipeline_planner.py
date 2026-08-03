@@ -43,10 +43,12 @@ from elspeth.web.composer.pipeline_planner import (
     PLANNER_DISCOVERY_TOOL_NAMES,
     PipelinePlannerError,
     PlannerBudgetPolicy,
+    PlannerConversationContext,
     PlannerCustodyConfig,
     PlannerDeclined,
     PlannerModelConfig,
     PlannerOriginatingMessage,
+    PlannerPriorUserRequest,
     PlannerRequestLifecycle,
     _allowlisted_candidate_feedback,
     _feedback_error_codes,
@@ -602,6 +604,7 @@ async def _plan(
     supersedes_draft_hash: str | None = None,
     candidate_finalizer: Any = None,
     unproducible_output_fields: tuple[str, ...] = (),
+    conversation_context: PlannerConversationContext | None = None,
 ) -> Any:
     # Candidate validation needs the real plugin contracts.  ``tool_context``
     # remains in the test signature so the standard composer fixture proves
@@ -625,6 +628,7 @@ async def _plan(
         supersedes_draft_hash=supersedes_draft_hash,
         surface=surface,
         profile=profile or ("tutorial" if surface is PlannerSurface.TUTORIAL_PROFILE else "ordinary"),
+        conversation_context=conversation_context,
         policy_catalog=policy_catalog,
         plugin_snapshot=plugin_snapshot,
         originating_message=originating_message or _origin(),
@@ -5513,6 +5517,137 @@ async def test_constant_gate_against_a_stated_threshold_gets_one_coded_nudge_the
     # The comparison the operator stated, verbatim — without it the planner
     # cannot author the condition it dropped.
     assert "amount > 500" in error["detail"]
+
+
+@pytest.mark.asyncio
+async def test_referential_freeform_threshold_gets_the_same_coded_nudge(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A referential build retains the latest earlier user routing rule."""
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Build the requested pipeline.",
+        conversation_context=PlannerConversationContext(
+            prior_user_requests=(
+                PlannerPriorUserRequest(
+                    history_index=0,
+                    content="Route rows with amount > 500 to high_value and every other row to standard.",
+                ),
+            )
+        ),
+    )
+
+    assert proposal.proposal.repair_count == 1
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    assert [error["error_code"] for error in feedback["validation"]["errors"]] == ["gate_condition_ignores_stated_threshold"]
+    assert "amount > 500" in feedback["validation"]["errors"][0]["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "superseding_request",
+    [
+        "Actually remove the threshold and fan every row out to both sinks.",
+        "Remove the routing threshold amount > 500.",
+        "Do not route rows with amount > 500; fan every row out to both sinks.",
+        "Actually route every row to archive.",
+        "Send all rows to standard.",
+        "Route all records to quarantine.",
+        "Actually make the threshold 750.",
+        "Change the condition to use 750.",
+    ],
+)
+async def test_referential_freeform_does_not_resurrect_a_superseded_threshold(
+    tmp_path: Path,
+    tool_context: ToolContext,
+    superseding_request: str,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Build the requested pipeline.",
+        conversation_context=PlannerConversationContext(
+            prior_user_requests=(
+                PlannerPriorUserRequest(
+                    history_index=0,
+                    content="Route rows with amount > 500 to high_value and every other row to standard.",
+                ),
+                PlannerPriorUserRequest(
+                    history_index=2,
+                    content=superseding_request,
+                ),
+            )
+        ),
+    )
+
+    assert proposal.proposal.repair_count == 0
+    assert len(completion.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_current_negated_threshold_does_not_trigger_stale_positive_enforcement(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Do not route rows with amount > 500; fan every row out to both sinks.",
+    )
+
+    assert proposal.proposal.repair_count == 0
+    assert len(completion.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_threshold_enforcement_does_not_cross_an_explicit_history_omission_gap(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline_with_constant_gate(tmp_path)})),
+    )
+    context = PlannerConversationContext(
+        prior_user_requests=(
+            PlannerPriorUserRequest(
+                history_index=0,
+                content="Route rows with amount > 500 to high_value and every other row to standard.",
+            ),
+            *tuple(
+                PlannerPriorUserRequest(history_index=index, content=f"Keep audit field {index} in the output.") for index in range(3, 10)
+            ),
+        ),
+        additional_prior_user_requests_omitted=2,
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        intent="Build the requested pipeline.",
+        conversation_context=context,
+    )
+
+    assert proposal.proposal.repair_count == 0
+    assert len(completion.requests) == 1
 
 
 @pytest.mark.asyncio

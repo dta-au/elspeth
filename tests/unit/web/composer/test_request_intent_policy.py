@@ -11,6 +11,7 @@ import pytest
 from elspeth.web.composer.no_tool_policy import (
     PipelineMutationIntentDecision,
     classify_pipeline_mutation_intent,
+    is_referential_pipeline_mutation_intent,
 )
 
 _REGISTERED_RECIPE_PREAMBLE = (
@@ -400,6 +401,35 @@ def test_user_request_requires_explicit_positive_mutation_intent(
     expected: PipelineMutationIntentDecision,
 ) -> None:
     assert classify_pipeline_mutation_intent(message) is expected
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_referential"),
+    [
+        ("Build the requested pipeline.", True),
+        ("Could you build the requested pipeline?", True),
+        ("Can you please build the requested workflow?", True),
+        ("I want you to build the requested pipeline.", True),
+        ("Let's build the requested pipeline.", True),
+        ("How does this work? Now build it.", True),
+        ("Just build the whole thing.", True),
+        ("Build!", True),
+        ("Build this pipeline.", True),
+        ("Update this pipeline.", True),
+        ("Change this workflow.", True),
+        ("Run this pipeline.", True),
+        ("Build the pipeline.", True),
+        ("Change this node.", True),
+        ("Route this input.", True),
+        ("Save this output.", True),
+        ("Build a CSV to JSONL pipeline.", False),
+        ("Build a pipeline that routes every row to both sinks.", False),
+        ("Split the rows by country.", False),
+    ],
+)
+def test_explicit_mutation_referential_context_decision(message: str, expected_referential: bool) -> None:
+    assert classify_pipeline_mutation_intent(message) is PipelineMutationIntentDecision.EXPLICIT_MUTATION
+    assert is_referential_pipeline_mutation_intent(message) is expected_referential
 
 
 @pytest.mark.parametrize("message", _COMPLETE_MULTI_CLAUSE_REQUESTS)

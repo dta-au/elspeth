@@ -100,6 +100,66 @@ class _Completion(Protocol):
     async def __call__(self, **kwargs: Any) -> Any: ...
 
 
+class PlannerPriorUserRequestDict(TypedDict):
+    """Provider projection of one authoritative earlier user request."""
+
+    history_index: int
+    content: str
+
+
+class PlannerConversationContextDict(TypedDict):
+    """Bounded earlier-user context supplied to a referential planner turn."""
+
+    prior_user_requests: list[PlannerPriorUserRequestDict]
+    additional_prior_user_requests_omitted: int
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerPriorUserRequest:
+    """One user-authored history entry retained for planner intent custody."""
+
+    history_index: int
+    content: str
+
+    def __post_init__(self) -> None:
+        if type(self.history_index) is not int or self.history_index < 0:
+            raise ValueError("history_index must be a non-negative exact integer")
+        if type(self.content) is not str or not self.content.strip():
+            raise ValueError("content must be a non-empty exact string")
+
+    def to_dict(self) -> PlannerPriorUserRequestDict:
+        return PlannerPriorUserRequestDict(history_index=self.history_index, content=self.content)
+
+
+@dataclass(frozen=True, slots=True)
+class PlannerConversationContext:
+    """Owned, bounded context for resolving a referential current request."""
+
+    prior_user_requests: tuple[PlannerPriorUserRequest, ...]
+    additional_prior_user_requests_omitted: int = 0
+
+    def __post_init__(self) -> None:
+        if type(self.prior_user_requests) is not tuple or any(
+            type(request) is not PlannerPriorUserRequest for request in self.prior_user_requests
+        ):
+            raise TypeError("prior_user_requests must be an exact PlannerPriorUserRequest tuple")
+        if not self.prior_user_requests:
+            raise ValueError("prior_user_requests must not be empty")
+        history_indices = tuple(request.history_index for request in self.prior_user_requests)
+        if history_indices != tuple(sorted(set(history_indices))):
+            raise ValueError("prior_user_requests history_index values must be unique and increasing")
+        if type(self.additional_prior_user_requests_omitted) is not int or self.additional_prior_user_requests_omitted < 0:
+            raise ValueError("additional_prior_user_requests_omitted must be a non-negative exact integer")
+        if self.additional_prior_user_requests_omitted > 0 and len(self.prior_user_requests) < 2:
+            raise ValueError("omitted prior requests require both an anchor and a retained recent request")
+
+    def to_dict(self) -> PlannerConversationContextDict:
+        return PlannerConversationContextDict(
+            prior_user_requests=[request.to_dict() for request in self.prior_user_requests],
+            additional_prior_user_requests_omitted=self.additional_prior_user_requests_omitted,
+        )
+
+
 class PipelinePlannerError(RuntimeError):
     """Leak-safe failure raised when the bounded planner cannot continue.
 
@@ -789,6 +849,16 @@ _STATED_THRESHOLD_PATTERN: Final[re.Pattern[str]] = re.compile(
     rf"|{_THRESHOLD_WORDING}\s+{_THRESHOLD_QUANTITY}",
     re.IGNORECASE,
 )
+_ROUTING_THRESHOLD_REVOCATION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:remove|drop|delete|disable|omit|stop\s+using)\s+(?:the\s+)?(?:routing\s+)?(?:threshold|condition|gate|filter)\b"
+    r"|\bwithout\s+(?:a\s+|the\s+)?(?:routing\s+)?(?:threshold|condition|gate|filter)\b"
+    r"|\bno\s+(?:routing\s+)?(?:threshold|condition|gate|filter)\b"
+    r"|\b(?:do\s+not|don(?:'|\N{RIGHT SINGLE QUOTATION MARK})t)\s+(?:use|apply|keep)\s+"
+    r"(?:the\s+)?(?:routing\s+)?(?:threshold|condition|gate|filter)\b"
+    r"|\b(?:do\s+not|don(?:'|\N{RIGHT SINGLE QUOTATION MARK})t)\s+(?:route|send|split|divert|separate)\b"
+    r"|\b(?:fan(?:\s+out)?|route|send)\s+(?:every|all)\s+rows?\s+(?:to\s+)?(?:both|all|every)\s+(?:the\s+)?sinks?\b",
+    re.IGNORECASE,
+)
 
 
 # Routing intent. A comparison alone is not enough: "summarise each row in
@@ -798,6 +868,10 @@ _STATED_THRESHOLD_PATTERN: Final[re.Pattern[str]] = re.compile(
 # turning a right answer into a wrong one. Both halves must hold.
 _ROUTING_INTENT_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"\b(?:route|routes|routed|routing|send|sends|sent|go to|goes to|split|splits|gate|divert|diverts|separate|separates)\b",
+    re.IGNORECASE,
+)
+_ROUTING_CONTROL_REFERENCE_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:routing\s+)?(?:threshold|gate|condition|filter)\b",
     re.IGNORECASE,
 )
 # Clause boundaries. "Split the rows into two sinks AND keep at most 100 rows"
@@ -840,6 +914,52 @@ def _stated_threshold_in(instruction: str) -> str | None:
         match = _STATED_THRESHOLD_PATTERN.search(clause)
         if match is not None:
             return match.group(0).strip()
+    return None
+
+
+def _stated_threshold_for_planner_request(
+    intent: str,
+    conversation_context: PlannerConversationContext | None,
+) -> str | None:
+    """Resolve the latest authoritative routing threshold for this request.
+
+    The current user message has precedence.  A referential freeform turn may
+    otherwise inherit the latest retained earlier user request, while guided
+    surfaces cannot provide ``conversation_context`` and therefore preserve
+    their stage-local intent boundary.
+    """
+    if _ROUTING_THRESHOLD_REVOCATION_PATTERN.search(intent) is not None:
+        return None
+    current_threshold = _stated_threshold_in(intent)
+    if current_threshold is not None:
+        return current_threshold
+    if _ROUTING_INTENT_PATTERN.search(intent) is not None or _ROUTING_CONTROL_REFERENCE_PATTERN.search(intent) is not None:
+        return None
+    if conversation_context is None:
+        return None
+    retained_requests = conversation_context.prior_user_requests
+    if conversation_context.additional_prior_user_requests_omitted > 0:
+        # The service retains the first request as a provider-visible anchor,
+        # followed by recent tail entries. The omission gap between them may
+        # hide a correction or revocation, so deterministic enforcement must
+        # never scan across that gap back to the anchor.
+        retained_requests = retained_requests[1:]
+    for prior_request in reversed(retained_requests):
+        if _ROUTING_THRESHOLD_REVOCATION_PATTERN.search(prior_request.content) is not None:
+            return None
+        prior_threshold = _stated_threshold_in(prior_request.content)
+        if prior_threshold is not None:
+            return prior_threshold
+        # A newer routing instruction with no safely recognized comparison is
+        # a supersession barrier. Searching past it would revive an older rule
+        # that may have been replaced by an unconditional route or by syntax
+        # the deliberately conservative detector cannot prove. A missed nudge
+        # is safe; enforcing a stale threshold is not.
+        if (
+            _ROUTING_INTENT_PATTERN.search(prior_request.content) is not None
+            or _ROUTING_CONTROL_REFERENCE_PATTERN.search(prior_request.content) is not None
+        ):
+            return None
     return None
 
 
@@ -1696,6 +1816,7 @@ async def plan_pipeline(
     supersedes_draft_hash: str | None,
     surface: PlannerSurface,
     profile: str,
+    conversation_context: PlannerConversationContext | None = None,
     policy_catalog: PolicyCatalogView,
     plugin_snapshot: PluginAvailabilitySnapshot,
     originating_message: PlannerOriginatingMessage,
@@ -1718,6 +1839,10 @@ async def plan_pipeline(
         raise ValueError("repair_budget must be a non-negative exact integer")
     if profile not in {"ordinary", "tutorial"}:
         raise ValueError("profile must be 'ordinary' or 'tutorial'")
+    if conversation_context is not None and type(conversation_context) is not PlannerConversationContext:
+        raise TypeError("conversation_context must be an exact PlannerConversationContext or None")
+    if conversation_context is not None and surface is not PlannerSurface.FREEFORM:
+        raise ValueError("conversation_context is available only to the freeform planner surface")
     if policy_catalog.snapshot is not plugin_snapshot:
         raise ValueError("plugin_snapshot_catalog_mismatch")
     canonical_json(provider_current_state)
@@ -1765,6 +1890,7 @@ async def plan_pipeline(
                 supersedes_draft_hash=supersedes_draft_hash,
                 surface=surface,
                 profile=profile,
+                conversation_context=conversation_context,
                 policy_catalog=policy_catalog,
                 plugin_snapshot=plugin_snapshot,
                 originating_message=originating_message,
@@ -1818,6 +1944,7 @@ async def _plan_pipeline_inner(
     supersedes_draft_hash: str | None,
     surface: PlannerSurface,
     profile: str,
+    conversation_context: PlannerConversationContext | None,
     policy_catalog: PolicyCatalogView,
     plugin_snapshot: PluginAvailabilitySnapshot,
     originating_message: PlannerOriginatingMessage,
@@ -1881,22 +2008,24 @@ async def _plan_pipeline_inner(
         ),
     )
     tools = planner_tool_definitions()
+    provider_request: dict[str, Any] = {
+        "intent": intent,
+        "current_state": provider_current_state,
+        "reviewed_facts": reviewed_planner_context,
+        "authoring_aids": authoring_aids,
+        "instruction": (
+            "Use read-only discovery as needed, then call emit_pipeline_proposal exactly once "
+            "with one complete canonical set_pipeline argument object."
+        ),
+    }
+    if conversation_context is not None:
+        provider_request["conversation_context"] = conversation_context.to_dict()
+
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": rendered_skill},
         {
             "role": "user",
-            "content": canonical_json(
-                {
-                    "intent": intent,
-                    "current_state": provider_current_state,
-                    "reviewed_facts": reviewed_planner_context,
-                    "authoring_aids": authoring_aids,
-                    "instruction": (
-                        "Use read-only discovery as needed, then call emit_pipeline_proposal exactly once "
-                        "with one complete canonical set_pipeline argument object."
-                    ),
-                }
-            ),
+            "content": canonical_json(provider_request),
         },
     ]
     total_calls = 0
@@ -1907,8 +2036,9 @@ async def _plan_pipeline_inner(
     prose_nudges = 0
     nodeless_nudge_given = False
     threshold_nudge_given = False
-    # Computed once: the instruction is fixed for the whole planning request.
-    stated_threshold = _stated_threshold_in(intent)
+    # Computed once: the current instruction and bounded earlier-user context
+    # are fixed for the whole planning request.
+    stated_threshold = _stated_threshold_for_planner_request(intent, conversation_context)
     seen_discovery: set[tuple[str, str]] = set()
     seen_discovery_round = 0
     # (component, code) fingerprints of every candidate rejection so far in

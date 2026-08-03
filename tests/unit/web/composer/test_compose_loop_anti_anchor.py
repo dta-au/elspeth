@@ -24,7 +24,11 @@ from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.control_messages import anti_anchor_control_envelope, replay_composer_control_message
 from elspeth.web.composer.protocol import ToolArgumentError
-from elspeth.web.composer.service import ComposerAvailability, ComposerServiceImpl
+from elspeth.web.composer.service import (
+    ComposerAvailability,
+    ComposerServiceImpl,
+    _freeform_planner_conversation_context,
+)
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.routes._helpers import _composer_chat_history
@@ -248,6 +252,32 @@ async def test_anti_anchor_hint_is_durable_before_fourth_call_and_replays_once(t
         await service.compose("Build something", [], state, session_id=str(session.id))
 
     assert call_count == 4
+
+
+@pytest.mark.asyncio
+async def test_replayed_anti_anchor_user_role_is_not_misattributed_to_the_human(tmp_path: Path) -> None:
+    sessions = build_test_sessions_service(data_dir=tmp_path)
+    session = await sessions.create_session("anti-anchor-user", "History custody", "local")
+    await sessions.add_message(
+        session.id,
+        "user",
+        "Route rows with amount > 500 to high_value.",
+        writer_principal="route_user_message",
+    )
+    control_content = "[ELSPETH-SYSTEM-HINT] Choose a structurally different repair."
+    await sessions.add_message(
+        session.id,
+        "audit",
+        control_content,
+        tool_calls=[anti_anchor_control_envelope(control_content)],
+        writer_principal="compose_loop",
+    )
+
+    replayed = _composer_chat_history(await sessions.get_messages(session.id, limit=None))
+    context = _freeform_planner_conversation_context("Build the requested pipeline.", replayed)
+
+    assert context is not None
+    assert [request.content for request in context.prior_user_requests] == ["Route rows with amount > 500 to high_value."]
 
 
 @pytest.mark.parametrize("tamper", ("content", "stored_role", "writer_principal", "provider_role"))
