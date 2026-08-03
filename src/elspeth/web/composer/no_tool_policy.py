@@ -75,7 +75,8 @@ _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE = (
 # wrapper — carries no interpolated diagnostic, so the whole suffix is fixed
 # operator-authored prose.
 _ADVISOR_SIGNOFF_PENDING_NOTICE: Final = (
-    "Advisor sign-off could not be completed — built and validated; final sign-off pending. Retry to complete."
+    "Advisor sign-off did not pass after the available review attempts. "
+    "Completion is withheld. Review the pipeline and retry advisor sign-off."
 )
 _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_NOTICE
 

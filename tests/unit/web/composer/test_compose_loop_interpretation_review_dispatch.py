@@ -2787,8 +2787,8 @@ async def test_end_advisor_gate_reaches_prompt_template_pipeline_p5_budget_exhau
 # ---------------------------------------------------------------------------
 # Advisor-blocked terminal return must ALSO surface PT (+ run the orphan gate).
 #
-# The three advisor-blocked terminal returns (P2 unavailable, P2 exhausted,
-# P5 unavailable/exhausted) bypass the shared finalize tail that auto-surfaces
+# The advisor-blocked terminal returns (P2/P5 unavailable or final-FLAG)
+# bypass the shared finalize tail that auto-surfaces
 # the llm_prompt_template review and runs the unfiltered orphan gate. A tool
 # turn that (re-)drafts an LLM node's prompt_template stages a pending PT
 # requirement but no pending EVENT; if the END advisor then blocks/is
@@ -2889,15 +2889,15 @@ async def test_advisor_unavailable_terminal_return_surfaces_prompt_template(
 
 
 @pytest.mark.asyncio
-async def test_advisor_exhausted_terminal_return_surfaces_prompt_template(
+async def test_advisor_final_flag_terminal_return_surfaces_prompt_template(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
 ) -> None:
-    """P2 advisor-EXHAUSTED (blocking on last pass) blocked return surfaces PT.
+    """P2 final-FLAG (blocking on last pass) return surfaces PT.
 
     Variant of the unavailable case: the advisor FLAGS the pipeline
     (``blocking=True``) on the last budgeted pass, driving the
-    ``reason="exhausted"`` blocked return. That return must also surface the
+    ``reason="flagged_final_pass"`` return. That return must also surface the
     resolvable pending PT event so the persisted runnable state is resolvable.
     """
 
@@ -2932,7 +2932,7 @@ async def test_advisor_exhausted_terminal_return_surfaces_prompt_template(
         repair_turns_used=0,
         persisted_assistant_message_id=None,
         persisted_tool_call_turn=False,
-        # Force last-pass so (used + 1) >= max_passes -> the "exhausted" return.
+        # Force last-pass so (used + 1) >= max_passes -> the final-FLAG return.
         advisor_checkpoint_passes_used=composer._settings.composer_advisor_checkpoint_max_passes - 1,
     )
 

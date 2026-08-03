@@ -54,6 +54,19 @@ class _ToolBatchCancellationRequested(Exception):
 
 
 @dataclass(frozen=True, slots=True)
+class _AdvisorReviewState:
+    """Bounded END-checkpoint context carried across compose-loop iterations."""
+
+    completed_passes: int = 0
+    previous_findings: tuple[str, ...] = ()
+    previous_evidence_hash: str | None = None
+    successful_mutating_actions: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        freeze_fields(self, "previous_findings", "successful_mutating_actions")
+
+
+@dataclass(frozen=True, slots=True)
 class _ToolOutcome:
     """Result of one tool call within a compose turn.
 
@@ -139,7 +152,7 @@ class _TerminateOutcome:
     # flagged advisor repair-continue (or a fail-closed end-gate return)
     # increments this, never the repair counter; the driver folds it into
     # ``advisor_checkpoint_passes_used``.
-    advisor_passes_delta: int = 0  # 0 or 1
+    advisor_passes_delta: int = 0  # bounded non-negative delta; retries may consume more than one
     # Set only when this "continue" was produced by a FLAGGED END advisor
     # pass: the index of the synthetic advisor sign-off message just
     # appended to ``llm_messages``. The driver elides it once a genuine
@@ -147,6 +160,7 @@ class _TerminateOutcome:
     # eventual CLEAN finalize turn cannot anchor on advisor text the real
     # user never saw.
     advisor_injection_index: int | None = None
+    advisor_review_state: _AdvisorReviewState | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,4 +266,4 @@ class _ClassifyOutcome:
     # END-gate advisor budget (the P5 last-chance gate). Folded into the
     # driver's ``advisor_checkpoint_passes_used`` after P5, mirroring the
     # P2 ``_TerminateOutcome.advisor_passes_delta`` field.
-    advisor_passes_delta: int = 0  # 0 or 1
+    advisor_passes_delta: int = 0  # bounded non-negative delta; retries may consume more than one

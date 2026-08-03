@@ -95,6 +95,8 @@ from tests.unit.web.composer._helpers import (
     _stub_advisor_end_gate_clean,  # noqa: F401  (autouse end-gate CLEAN stub)
 )
 
+_REAL_RUN_ADVISOR_CHECKPOINT = ComposerServiceImpl._run_advisor_checkpoint
+
 
 def test_service_rejects_uninferrable_advisor_provider() -> None:
     settings = _make_settings(composer_advisor_model="custom-model-without-provider")
@@ -1503,6 +1505,97 @@ class TestComposerMultiTurnToolCalls:
         assert captured_messages[2][: len(turn2_minus_advisor)] == turn2_minus_advisor
 
     @pytest.mark.asyncio
+    async def test_advisor_rereview_carries_prior_finding_mutation_and_current_evidence(self) -> None:
+        catalog = _mock_catalog()
+        service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=_make_settings())
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "input.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        llm_responses = [
+            _make_llm_response(content="Looks ready."),
+            _make_llm_response(tool_calls=[{"id": "repair-1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}]),
+            _make_llm_response(content="Ready after repair."),
+        ]
+        passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        prior_finding = "FLAGGED: sink omits rating"
+        service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
+
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=llm_responses),
+            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(
+                service,
+                "_call_advisor_with_audit",
+                new_callable=AsyncMock,
+                side_effect=[(prior_finding, {}), ("CLEAN", {})],
+            ) as advisor_call,
+        ):
+            result = await service.compose("Review this pipeline", [], state)
+
+        assert result.runtime_preflight is None or result.runtime_preflight.is_valid
+        first_arguments = advisor_call.await_args_list[0].args[0]
+        second_arguments = advisor_call.await_args_list[1].args[0]
+        assert first_arguments["recent_errors"] == []
+        assert first_arguments["attempted_actions"] == []
+        assert any(prior_finding in item for item in second_arguments["recent_errors"])
+        assert any("set_metadata" in item for item in second_arguments["attempted_actions"])
+        assert "review pass 2" in second_arguments["problem_summary"].lower()
+        assert "assess the current evidence independently" in second_arguments["problem_summary"].lower()
+        assert "Pipeline: Repaired" in second_arguments["schema_excerpt"]
+
+    @pytest.mark.asyncio
+    async def test_advisor_rereview_without_mutation_is_explicit_not_a_blind_replay(self) -> None:
+        service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "input.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
+
+        with (
+            patch.object(
+                service,
+                "_call_llm",
+                new_callable=AsyncMock,
+                side_effect=[_make_llm_response(content="Looks ready."), _make_llm_response(content="Still ready.")],
+            ),
+            patch.object(service, "_runtime_preflight", return_value=ValidationResult(is_valid=True, checks=[], errors=[])),
+            patch.object(
+                service,
+                "_call_advisor_with_audit",
+                new_callable=AsyncMock,
+                side_effect=[("FLAGGED: missing output", {}), ("CLEAN", {})],
+            ) as advisor_call,
+        ):
+            result = await service.compose("Review this pipeline", [], state)
+
+        assert result.runtime_preflight is None or result.runtime_preflight.is_valid
+        second_arguments = advisor_call.await_args_list[1].args[0]
+        assert any("FLAGGED: missing output" in item for item in second_arguments["recent_errors"])
+        assert second_arguments["attempted_actions"] == ["No successful pipeline mutation occurred since the prior advisor pass."]
+        assert "current evidence identity" in second_arguments["problem_summary"].lower()
+        assert "prior evidence identity" in second_arguments["problem_summary"].lower()
+
+    @pytest.mark.asyncio
     async def test_flagged_discovery_only_tool_call_does_not_elide_advisor_message(self) -> None:
         """R2-F12 Step 3 non-regression (review finding 1): a discovery-only
         tool call (list_sources — no mutation) following a FLAGGED advisor
@@ -1577,14 +1670,8 @@ class TestComposerMultiTurnToolCalls:
         assert not any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[3])
 
     @pytest.mark.asyncio
-    async def test_flagged_still_flagged_after_elided_repair_blocks_on_fresh_findings(self) -> None:
-        """R2-F12 Step 3 non-regression: eliding the pass-1 advisor message
-        after a repair attempt must not make the SECOND (last-pass) advisor
-        round stale or inaccurate. The advisor gate re-evaluates ``state``
-        directly (never ``llm_messages``), so the fail-closed blocked result
-        must carry pass 2's fresh findings — not pass 1's, and not nothing —
-        even though pass 1's injected message was already elided from
-        context by the time pass 2's no-tool reply was generated."""
+    async def test_irrelevant_mutation_does_not_clear_a_fresh_final_flag(self) -> None:
+        """A real but irrelevant mutation cannot mint advisor clearance."""
         catalog = _mock_catalog()
         settings = _make_settings()  # composer_advisor_checkpoint_max_passes default 2
         service = ComposerServiceImpl.for_trained_operator(catalog=catalog, settings=settings)
@@ -1634,20 +1721,21 @@ class TestComposerMultiTurnToolCalls:
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state)
 
-        # Fails closed — not finalized as a runnable success.
+        # Completion remains withheld, while the already-green runtime shape
+        # stays truthful about authoring and execution readiness.
         assert result.runtime_preflight is not None
-        assert result.runtime_preflight.is_valid is False
-        # Carries pass 2's FRESH findings...
-        assert "PASS_TWO_STILL_BROKEN" in result.message
-        # ...never pass 1's — proving the blocked surface is not stale even
-        # though pass 1's injected message was elided one turn earlier.
+        assert result.runtime_preflight.is_valid is True
+        assert result.runtime_preflight.readiness.authoring_valid is True
+        assert result.runtime_preflight.readiness.execution_ready is True
+        assert result.runtime_preflight.readiness.completion_ready is False
+        # Neither pass's raw advisor prose reaches the public result.
+        assert "PASS_TWO_STILL_BROKEN" not in result.message
         assert "PASS_ONE_SINK_ISSUE" not in result.message
+        assert "PASS_TWO_STILL_BROKEN" not in result.runtime_preflight.model_dump_json()
+        assert "PASS_ONE_SINK_ISSUE" not in result.runtime_preflight.model_dump_json()
 
-        # Freshness alone is structural (the advisor re-evaluates ``state``
-        # regardless of ``llm_messages``) and would hold even if the drain
-        # never fired — assert the drain actually fired too (review finding
-        # 4): turn 2 (the repair call) saw the pass-1 injection, turn 3 (the
-        # last-pass call that produces the blocked result) must not.
+        # The composer saw pass 1 only long enough to make the mutation; the
+        # public/final turn no longer anchors on or exposes that exchange.
         assert len(captured_messages) == 3
         assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[1])
         assert not any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[2])
