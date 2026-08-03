@@ -168,6 +168,14 @@ def _assert_canonical_check_order(result: ValidationResult) -> None:
     assert ranks == sorted(ranks)
 
 
+def test_stale_graph_completion_advisory_detail_is_evidence_scoped() -> None:
+    assert ADVISOR_SIGNOFF_PENDING_DETAIL == (
+        "The evidence-scoped completion advisory review has not covered this pipeline version. "
+        "Composer completion remains withheld. Re-run the composer to obtain a current review."
+    )
+    assert "sign-off" not in ADVISOR_SIGNOFF_PENDING_DETAIL
+
+
 _BLOCKED_DETAIL = "The advisor sign-off could not be obtained; the pipeline cannot complete."
 
 

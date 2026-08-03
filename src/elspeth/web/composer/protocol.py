@@ -1284,23 +1284,23 @@ class ComposerService(Protocol):
         progress: ComposerProgressSink | None = None,
         user_message: str | None = None,
     ) -> AdvisorCheckpointVerdict:
-        """Run the deterministic END advisor sign-off checkpoint (phase='end').
+        """Run the deterministic END evidence-scoped completion advisory checkpoint.
 
         Public façade over the private ``_run_advisor_checkpoint(phase='end')``
         so the guided STEP_4_WIRE dispatcher — which holds a ``ComposerService``
-        handle but not the impl's private methods — can request the whole-
-        pipeline structural sign-off. Non-raising: a sustained provider failure
-        yields ``ok=False`` (unavailable); a FLAGGED sign-off yields
+        handle but not the impl's private methods — can request an
+        evidence-scoped completion advisory verdict. Non-raising: a sustained
+        provider failure yields ``ok=False`` (unavailable); a FLAGGED review yields
         ``blocking=True``; CLEAN yields ``ok=True, blocking=False``. The caller
         (the wire branch) maps the verdict to terminal/redirect per D13.
 
         ``recorder`` threads the advisor call's audit sidecar; ``progress``
         (when set) receives a ``calling_model`` event before the call.
         ``user_message`` (R2-F8a, elspeth-583c2a0792) is the originating user
-        chat turn, forwarded so the advisor can verify the pipeline against
-        the user's own explicit constraints (schema mode, field names/types,
-        named plugins/values); optional, bounded, and rendered inside the
-        existing untrusted fence.
+        chat turn, forwarded so the advisor can compare the supplied pipeline
+        evidence with explicit constraints visible in the bounded excerpt
+        (schema mode, field names/types, named plugins/values); optional and
+        rendered inside the existing untrusted fence.
         """
         ...
 

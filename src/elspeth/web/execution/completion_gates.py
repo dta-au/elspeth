@@ -1,6 +1,6 @@
 """Durable composer completion-gate facts.
 
-A completion gate (advisor sign-off first, R2-F14) is an event that happened
+A completion gate (evidence-scoped completion advisory first, R2-F14) is an event that happened
 during a compose turn — an LLM ruled, or failed to — not a property of the
 pipeline graph, so readiness recomputes cannot rediscover it. This module
 owns the persistence envelope for those facts inside ``composer_meta`` and
@@ -44,10 +44,10 @@ _FINGERPRINT_SCHEMA: Final[str] = "elspeth.completion_gate_graph.v1"
 # Wording for a gate fact carried forward (by ``merge_composer_meta_updates``)
 # onto a graph the advisor never reviewed. The verdict is not repeated — the
 # advisor's ruling is never attributed to content it did not see — but
-# completion stays withheld until a compose turn obtains a fresh sign-off.
+# completion stays withheld until a compose turn obtains a current review.
 ADVISOR_SIGNOFF_PENDING_DETAIL: Final[str] = (
-    "The advisor has not reviewed this version of the pipeline; advisor "
-    "sign-off has not been obtained. Re-run the composer to obtain sign-off."
+    "The evidence-scoped completion advisory review has not covered this pipeline version. "
+    "Composer completion remains withheld. Re-run the composer to obtain a current review."
 )
 
 

@@ -549,8 +549,8 @@ def test_validation_row_warns_when_advisor_completion_is_pending():
 
     row = _row(snap, "validation")
     assert row.status == "warning"
-    assert row.summary == "Advisor sign-off pending"
-    assert row.detail == "This pipeline can run, but Composer completion is pending advisor sign-off."
+    assert row.summary == "Completion advisory review pending"
+    assert row.detail == ("This pipeline can run, but Composer completion is withheld until the evidence-scoped advisor review clears.")
     assert persisted_detail not in (row.detail or "")
     assert result.readiness.execution_ready is True
 

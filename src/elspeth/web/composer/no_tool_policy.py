@@ -68,15 +68,15 @@ _PREFLIGHT_INVALID_NONEMPTY_FINALIZE_SUFFIX_BARE = (
 )
 
 # R2-F14 (elspeth-5403f346c0): the advisor end gate used to borrow
-# ``_PREFLIGHT_NOTICE_HEADER`` for a sign-off that never rendered, telling the
+# ``_PREFLIGHT_NOTICE_HEADER`` for a completion review that never rendered, telling the
 # user "Runtime preflight failed" on a build whose preflight had just PASSED
 # (green side rail, contradictory note). This notice is the honest alternative:
 # it states what actually happened and what to do, and — unlike the preflight
 # wrapper — carries no interpolated diagnostic, so the whole suffix is fixed
 # operator-authored prose.
 _ADVISOR_SIGNOFF_PENDING_NOTICE: Final = (
-    "Advisor sign-off did not pass after the available review attempts. "
-    "Completion is withheld. Review the pipeline and retry advisor sign-off."
+    "Completion advisory review did not clear after the available attempts. "
+    "Composer completion is withheld. Review the pipeline and retry the evidence-scoped advisor review."
 )
 _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_NOTICE
 

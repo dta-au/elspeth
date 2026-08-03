@@ -15,6 +15,7 @@ from elspeth.contracts.composer_progress import (
 )
 from elspeth.web.composer.progress import (
     ComposerProgressRegistry,
+    advisor_checkpoint_progress_event,
     client_cancelled_progress_event,
     convergence_progress_event,
 )
@@ -141,6 +142,16 @@ class TestConvergenceProgressEvent:
         assert "timed out" in event.headline.lower()
         assert event.likely_next is not None
         assert "wall-clock" in event.likely_next.lower()
+
+    def test_end_advisor_progress_is_evidence_scoped_without_approval_claim(self) -> None:
+        event = advisor_checkpoint_progress_event("end")
+
+        assert event.headline == "I'm asking the advisor model to review the completion evidence."
+        assert event.likely_next == ("The advisor may flag a blocker visible in the supplied evidence before the composer finalizes.")
+        assert event.evidence == ("A second, model-distinct advisor is reviewing the bounded completion evidence.",)
+        rendered = " ".join((event.headline, event.likely_next))
+        assert "sign off" not in rendered
+        assert "approve" not in rendered
 
     def test_composition_budget_emits_distinct_event(self) -> None:
         event = convergence_progress_event(budget_exhausted="composition")

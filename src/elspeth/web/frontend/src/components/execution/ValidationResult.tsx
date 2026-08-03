@@ -28,6 +28,13 @@ const ADVISORY_CHECK_NAME_SET: ReadonlySet<string> = new Set(
   VALIDATION_ADVISORY_CHECK_NAMES,
 );
 
+function validationCheckDisplayName(name: string): string {
+  // ``advisor_signoff`` is the stable persistence/wire key. Its UI label must
+  // describe the evidence-scoped completion advisory without implying a
+  // whole-pipeline approval certificate.
+  return name === "advisor_signoff" ? "Completion advisory review" : name;
+}
+
 interface ValidationResultProps {
   result: ValidationResultType;
   /** Nodes from CompositionState for mapping component_id to display name */
@@ -160,7 +167,7 @@ export function ValidationResultBanner({
                 <span aria-hidden="true">
                   {check.passed ? "\u2713" : "\u2717"}
                 </span>{" "}
-                {check.name}: {check.detail}
+                {validationCheckDisplayName(check.name)}: {check.detail}
               </li>
             ))}
           </ul>

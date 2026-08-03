@@ -537,7 +537,7 @@ class ReadinessService:
         # that the llm_interpretations row scopes its event lookup to.
         composition_state_id: UUID = record.id
         state: CompositionState = self._state_from_record(record)
-        # Persisted composer completion-gate facts (advisor sign-off, R2-F14)
+        # Persisted composer completion-gate facts (completion advisory review, R2-F14)
         # ride the record's composer_meta; the graph recompute below cannot
         # rediscover them, so they are threaded into validate_state and merged
         # into the readiness this snapshot reports.
@@ -635,8 +635,8 @@ def _build_validation_row(result: ValidationResult) -> ReadinessRow:
             id="validation",
             label="Validation",
             status="warning",
-            summary="Advisor sign-off pending",
-            detail="This pipeline can run, but Composer completion is pending advisor sign-off.",
+            summary="Completion advisory review pending",
+            detail="This pipeline can run, but Composer completion is withheld until the evidence-scoped advisor review clears.",
             component_ids=(),
         )
     if result.is_valid:

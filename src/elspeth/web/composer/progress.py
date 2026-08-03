@@ -412,18 +412,20 @@ def advisor_checkpoint_progress_event(checkpoint: str) -> ComposerProgressEvent:
     otherwise the snapshot stays frozen on its previous phase while the
     (slower, frontier) advisor model runs, which is indistinguishable from a
     stall to a poller or a watching user. ``checkpoint`` is "early" (plan
-    review) or "end" (sign-off).
+    review) or "end" (evidence-scoped completion review).
     """
     if checkpoint == "early":
         headline = "I'm asking the advisor model to review the plan."
+        evidence = "A second, model-distinct advisor is reviewing the pipeline."
         likely_next = "The advisor may suggest changes before the composer continues."
     else:
-        headline = "I'm asking the advisor model to sign off on the pipeline."
-        likely_next = "The advisor may approve the pipeline or flag changes before finalizing."
+        headline = "I'm asking the advisor model to review the completion evidence."
+        evidence = "A second, model-distinct advisor is reviewing the bounded completion evidence."
+        likely_next = "The advisor may flag a blocker visible in the supplied evidence before the composer finalizes."
     return ComposerProgressEvent(
         phase="calling_model",
         headline=headline,
-        evidence=("A second, model-distinct advisor is reviewing the pipeline.",),
+        evidence=(evidence,),
         likely_next=likely_next,
     )
 

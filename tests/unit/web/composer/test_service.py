@@ -1752,10 +1752,10 @@ class TestComposerMultiTurnToolCalls:
         assert result.message == "The pipeline is configured and ready."
         assert len(captured_messages) == 3
         # Turn 2 (the repair call) saw the injected advisor findings.
-        assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[1])
+        assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[1])
         # Turn 3 (the finalize call) must NOT — the elision boundary. The
         # repair's own tool-call/tool-result messages must survive.
-        assert not any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[2])
+        assert not any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[2])
         assert any(m.get("role") == "tool" for m in captured_messages[2])
         # Surgical removal, not an accidental match on the wrong entry: turn
         # 3's list is turn 2's list with exactly the one advisor message
@@ -1765,7 +1765,7 @@ class TestComposerMultiTurnToolCalls:
         # Every message present in turn 2's context OTHER than the advisor
         # injection survives verbatim (by identity) into turn 3's context —
         # the drain removed exactly one entry and touched nothing else.
-        turn2_minus_advisor = [m for m in captured_messages[1] if "Advisor sign-off" not in (m.get("content") or "")]
+        turn2_minus_advisor = [m for m in captured_messages[1] if "Completion advisory review" not in (m.get("content") or "")]
         assert captured_messages[2][: len(turn2_minus_advisor)] == turn2_minus_advisor
 
     @pytest.mark.asyncio
@@ -2036,13 +2036,13 @@ class TestComposerMultiTurnToolCalls:
         assert result.message == "The pipeline is configured and ready."
         assert len(captured_messages) == 4
         # Turn 2 (discovery-only) still sees it — not drained by a non-mutating turn.
-        assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[1])
+        assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[1])
         # Turn 3 (the mutating repair call) STILL sees it — the discovery
         # turn must not have consumed it early.
-        assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[2])
+        assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[2])
         # Turn 4 (the finalize call, after the mutating repair) must NOT —
         # drained only once a real mutation landed.
-        assert not any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[3])
+        assert not any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[3])
 
     @pytest.mark.asyncio
     async def test_irrelevant_mutation_does_not_clear_a_fresh_final_flag(self) -> None:
@@ -2112,8 +2112,8 @@ class TestComposerMultiTurnToolCalls:
         # The composer saw pass 1 only long enough to make the mutation; the
         # public/final turn no longer anchors on or exposes that exchange.
         assert len(captured_messages) == 3
-        assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[1])
-        assert not any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[2])
+        assert any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[1])
+        assert not any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[2])
 
 
 class TestComposerConvergence:

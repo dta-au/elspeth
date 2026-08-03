@@ -7,6 +7,7 @@ import pytest
 from elspeth.web.composer.no_tool_policy import (
     AssistantTextSegment,
     TrustedSystemNoticeSegment,
+    compose_advisor_signoff_pending_message,
     compose_empty_state_message,
     compose_preflight_failure_message,
     visible_message_segments,
@@ -93,6 +94,18 @@ def test_exact_canonical_empty_model_notice_retains_trusted_chrome() -> None:
             "retry with the plan it described above."
         ),
     )
+
+
+def test_completion_advisory_notice_is_evidence_scoped_trusted_copy() -> None:
+    content = compose_advisor_signoff_pending_message("")
+
+    assert visible_message_segments(content=content, raw_content="") == (
+        TrustedSystemNoticeSegment(
+            "Completion advisory review did not clear after the available attempts. "
+            "Composer completion is withheld. Review the pipeline and retry the evidence-scoped advisor review."
+        ),
+    )
+    assert "sign-off" not in content
 
 
 def test_empty_model_notice_with_dynamic_blocker_trusts_only_fixed_wrapper() -> None:

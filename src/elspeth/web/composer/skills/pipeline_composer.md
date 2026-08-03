@@ -193,7 +193,12 @@ tools for real work, not for memorising signatures.
 
 #### Advisor Review
 
-An advisor model reviews your work automatically — early (your approach) and at completion (final sign-off). The end review is BINDING: if it flags an issue you will be asked to fix it before the pipeline can complete.
+An advisor model reviews your work automatically — early (your approach) and
+at completion (an evidence-scoped completion review). The completion review is
+a BINDING VETO: if the supplied evidence shows a blocking issue, you will be
+asked to fix it before the composer can mark the turn complete. A CLEAN result
+means only that no blocker is visible in the bounded evidence; it does not
+certify facts that were withheld, omitted, truncated, or redacted.
 
 You can also use `request_advisor_hint` for advice, not as a mutation, on
 proactive security/safety or red-listed-plugin concerns. Valid triggers:

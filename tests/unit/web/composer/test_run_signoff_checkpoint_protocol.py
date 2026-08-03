@@ -17,3 +17,13 @@ def test_protocol_declares_run_signoff_checkpoint() -> None:
     assert params["progress"].kind is inspect.Parameter.KEYWORD_ONLY
     assert params["progress"].default is None
     assert inspect.iscoroutinefunction(ComposerService.run_signoff_checkpoint)
+
+
+def test_protocol_describes_evidence_scoped_completion_advisory() -> None:
+    doc = inspect.getdoc(ComposerService.run_signoff_checkpoint)
+
+    assert doc is not None
+    assert "evidence-scoped completion advisory verdict" in doc
+    assert "whole-pipeline" not in doc
+    assert "structural sign-off" not in doc
+    assert "verify the pipeline" not in doc

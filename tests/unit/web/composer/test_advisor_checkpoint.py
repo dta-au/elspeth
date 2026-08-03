@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -77,6 +78,26 @@ def test_terminal_no_tool_paths_delegate_end_advisor_policy() -> None:
     assert _self_method_calls("_try_terminate_no_tools", "_run_advisor_checkpoint") == 0
     assert _self_method_calls("_classify_and_budget_turn", "_run_advisor_checkpoint") == 0
     assert _self_method_calls("_evaluate_terminal_no_tool_advisor_gate", "_run_advisor_checkpoint") == 1
+
+
+def test_service_describes_evidence_scoped_completion_advisory() -> None:
+    doc = inspect.getdoc(ComposerServiceImpl.run_signoff_checkpoint)
+
+    assert doc is not None
+    normalized = " ".join(doc.split())
+    assert "evidence-scoped completion advisory verdict" in normalized
+    assert "whole-pipeline" not in normalized
+    assert "sign-off" not in normalized
+
+
+def test_terminal_gate_docstring_scopes_user_constraint_comparison_to_supplied_evidence() -> None:
+    doc = inspect.getdoc(ComposerServiceImpl._evaluate_terminal_no_tool_advisor_gate)
+
+    assert doc is not None
+    normalized = " ".join(doc.split())
+    assert "compare the supplied pipeline evidence" in normalized
+    assert "verify the pipeline" not in normalized
+    assert "signed off" not in normalized
 
 
 def _mock_catalog() -> MagicMock:
@@ -534,6 +555,11 @@ async def test_checkpoint_wire_uses_verdict_contract_not_stuck_hint_contract(
     assert "Advisor checkpoint mode" in system_message
     assert "A correct pipeline requires no invented repair" in system_message
     assert "If no blocking defect is visible, start with CLEAN and do not manufacture a hint" in system_message
+    assert "evidence-scoped completion review" in system_message
+    assert "final sign-off" not in system_message
+    assert "sign off on the pipeline" not in system_message
+    assert "approve the pipeline" not in system_message
+    assert "whole-pipeline sign-off" not in system_message
     assert "another LLM (a pipeline composer) that is stuck" not in system_message
     assert "Return ONE concrete actionable hint" not in system_message
 
@@ -1961,7 +1987,11 @@ async def test_end_gate_flagged_with_budget_repairs(make_service, clean_runnable
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0, llm_messages=llm_messages)
     assert outcome.action == "continue"
     assert outcome.advisor_passes_delta == 1
-    assert any("FLAGGED" in m["content"] for m in llm_messages)
+    repair_message = next(m["content"] for m in llm_messages if m["role"] == "user")
+    assert "[Completion advisory review — BLOCKING." in repair_message
+    assert "visible in the supplied evidence" in repair_message
+    assert "Advisor sign-off" not in repair_message
+    assert "FLAGGED" in repair_message
 
 
 @pytest.mark.asyncio
@@ -2199,6 +2229,32 @@ def test_advisor_blocked_result_replaces_echoed_assistant_prose_with_fixed_notic
     )
     assert canary not in public_blob
     assert "Repair:" not in public_blob
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_scope"),
+    [
+        ("flagged_final_pass", "Completion advisory review did not clear"),
+        ("flagged_no_repair", "Completion advisory review did not clear"),
+        ("unavailable", "evidence-scoped completion advisory review could not be obtained"),
+        ("malformed", "evidence-scoped completion advisory review could not be obtained"),
+    ],
+)
+def test_advisor_completion_blocker_copy_does_not_claim_whole_pipeline_approval(
+    reason: str,
+    expected_scope: str,
+) -> None:
+    from elspeth.web.composer.service import _advisor_signoff_blocked_wording
+
+    detail, suggestion = _advisor_signoff_blocked_wording(
+        reason=reason,
+        findings="advisor provider result",
+    )
+
+    rendered = f"{detail} {suggestion}"
+    assert expected_scope in detail
+    assert "sign-off" not in rendered
+    assert "approve" not in rendered
 
 
 @pytest.mark.asyncio
@@ -2528,6 +2584,8 @@ async def test_end_checkpoint_blocks_user_message_advisor_injection_before_provi
     assert verdict.blocking is True
     assert verdict.findings_text.startswith("FLAGGED:")
     assert "user's message" in verdict.findings_text
+    assert "completion advisory review" in verdict.findings_text
+    assert "sign-off" not in verdict.findings_text
     service._call_advisor_with_audit.assert_not_awaited()
 
 

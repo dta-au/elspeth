@@ -120,7 +120,7 @@ describe("ValidationResultBanner", () => {
     ).toBeNull();
   });
 
-  it("auto-expands a failed completion-only advisor sign-off check", () => {
+  it("auto-expands a failed completion advisory check without exposing its compatibility key", () => {
     render(
       <ValidationResultBanner
         result={makePassResult({
@@ -128,7 +128,8 @@ describe("ValidationResultBanner", () => {
             {
               name: "advisor_signoff",
               passed: false,
-              detail: "Advisor sign-off is pending for this pipeline.",
+              detail:
+                "The evidence-scoped completion advisory review has not covered this pipeline version.",
               affected_nodes: [],
               outcome_code: null,
             },
@@ -142,7 +143,8 @@ describe("ValidationResultBanner", () => {
                 code: "advisor_signoff_blocked",
                 component_id: "pipeline",
                 component_type: "pipeline",
-                detail: "Advisor sign-off is pending for this pipeline.",
+                detail:
+                  "The evidence-scoped completion advisory review has not covered this pipeline version.",
               },
             ],
           },
@@ -150,7 +152,10 @@ describe("ValidationResultBanner", () => {
       />,
     );
 
-    expect(screen.getByText(/Advisor sign-off is pending/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Completion advisory review: The evidence-scoped/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/advisor_signoff:/)).toBeNull();
     expect(
       screen.queryByRole("button", { name: /validation passed\. show details\./i }),
     ).toBeNull();
