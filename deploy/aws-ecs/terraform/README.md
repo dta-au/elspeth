@@ -725,30 +725,45 @@ the matching bucket-level resource.
 
 ### Composer wall-clock budget
 
-The module pins `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` to `120` in
-`modules/scenario/locals.tf`. That is enough for the acceptance soak's
-single-source-and-sink request, but a real multi-node authoring turn (a dozen
-or more tool calls, each with validation and a runtime preflight) routinely
-runs past it. When the budget elapses the composer returns a discriminated
-`422` (`reason: convergence_wall_clock_timeout`); the pipeline built so far is
-saved as a new composition-state version and the next turn resumes from it, so
+The module pins `ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS` to `240` in
+`modules/scenario/locals.tf`. The value is deliberately not a variable: the
+safe range is fixed by this module's own ALB, so an operator-supplied value
+would be an invitation to exceed it.
+
+`120` was the earlier pin, sized for the acceptance soak's
+single-source-and-sink request. A real multi-node authoring turn (a dozen or
+more tool calls, each with validation and a runtime preflight) routinely runs
+past it — at the measured ~20s per turn a 120s clock funded roughly 6 turns,
+so the module's own 12+8 turn budget was unreachable at any observed turn
+cost. When the budget elapses the composer returns a discriminated `422`
+(`reason: convergence_wall_clock_timeout`); the pipeline built so far is saved
+as a new composition-state version and the next turn resumes from it, so
 nothing is lost — but the author pays a wasted turn.
 
-For deployments where operators author multi-node pipelines, raise the value in
-`modules/scenario/locals.tf` to `240`:
+`240` is the most this deployment can honestly offer without an infrastructure
+change, and it sits exactly at the boundary of two independent limits:
 
-```hcl
-{ name = "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS", value = "240" },
-```
+- `270` is the application's hard ceiling —
+  `WebSettings._validate_composer_timeout_transport_headroom` rejects anything
+  above `composer_transport_idle_ceiling_seconds` (300s) minus
+  `composer_transport_headroom_seconds` (30s), so the backend's own timeout
+  always fires before a browser or proxy aborts the connection.
+- The ALB's `idle_timeout` is `300` (`modules/scenario/network.tf`), and
+  `240` plus the 30s headroom is `270` — 30s clear of it.
 
-`270` is the hard ceiling — `WebSettings._validate_composer_timeout_transport_headroom`
-rejects anything above `composer_transport_idle_ceiling_seconds` (300s) minus
-`composer_transport_headroom_seconds` (30s), so the backend's own timeout always
-fires before a browser or proxy aborts the connection. The SPA derives its
-client abort ceiling from whatever value you set (via
-`GET /api/system/status`), so no frontend change is needed. Do not raise it
-above `240` without also confirming the ALB and any intermediary idle timeouts
-exceed the new value plus its headroom.
+The SPA derives its client abort ceiling from whatever value is set (via
+`GET /api/system/status`), so no frontend change is needed. Raising the pin
+above `240` requires raising the ALB `idle_timeout` **and**
+`ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS` first, in that order;
+the ordering matters because the app guard is what keeps the backend failing
+before the transport does. `tests/unit/deployment/test_aws_ecs_terraform_package.py`
+enforces the chain, so an unaccompanied raise fails CI rather than in
+production.
+
+Note that the turn budget is a ceiling on turns, not a quota the wall clock
+promises to fund; no deployment surface in this repository sizes its clock to
+fund every configured turn, and the composer is expected to converge well
+inside both.
 
 Aurora creates one administrative database first, then the database bootstrap
 task creates independent `elspeth_session` and `elspeth_landscape` databases.

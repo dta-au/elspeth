@@ -16,6 +16,7 @@ import pytest
 import yaml
 
 from elspeth.web._aws_ecs_acceptance import scenario_inventory, task_definition
+from elspeth.web.config import WebSettings
 from elspeth.web.provider_config_policy import web_aws_s3_source_policy_error
 
 
@@ -2052,4 +2053,52 @@ def test_dashboard_metrics_preserve_one_row_per_metric() -> None:
     assert row_builder is not None, "dashboard metric rows are no longer built per identity dimension list"
     assert row_builder.group("joiner") != "flatten", (
         "dashboard metric rows must not be recursively flattened; join one level with concat(...) instead"
+    )
+
+
+def test_composer_wall_clock_fits_under_the_app_guard_and_the_alb() -> None:
+    """The composer wall clock must fail before the transport does.
+
+    Three files have to agree and none of them can see the others:
+    `locals.tf` sets the backend's own timeout, `network.tf` sets the ALB
+    idle timeout, and `WebSettings` supplies the ceiling/headroom the boot
+    guard enforces. The pin was raised from 120s to 240s
+    (elspeth-f159d2394b) because at the measured ~20s per authoring turn a
+    120s clock funded ~6 turns against a 12+8 turn budget. That raise moved
+    the value from "huge margin" to "exactly at the boundary", so the
+    relationship now needs a gate: 240 + 30 headroom is 270, which is both
+    the app ceiling and 30s clear of the ALB's 300s idle timeout.
+
+    Raising the pin further without raising the ALB idle timeout would let
+    the load balancer abort the connection before the backend's own timeout
+    fired, replacing the discriminated 422 (which persists the partial
+    pipeline) with an opaque 504 (which does not). That is a live-only
+    failure, so it is caught here rather than in production.
+    """
+    ceiling = WebSettings.model_fields["composer_transport_idle_ceiling_seconds"].default
+    headroom = WebSettings.model_fields["composer_transport_headroom_seconds"].default
+
+    timeout_match = re.search(
+        r'\{\s*name\s*=\s*"ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS",\s*value\s*=\s*"(?P<seconds>[\d.]+)"\s*\}',
+        _text("modules/scenario/locals.tf"),
+    )
+    assert timeout_match is not None, "the scenario module no longer pins ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS"
+    timeout_seconds = float(timeout_match.group("seconds"))
+
+    idle_match = re.search(
+        r"idle_timeout\s*=\s*(?P<seconds>\d+)",
+        _text("modules/scenario/network.tf"),
+    )
+    assert idle_match is not None, "the scenario ALB no longer declares an explicit idle_timeout"
+    alb_idle_seconds = float(idle_match.group("seconds"))
+
+    assert timeout_seconds <= ceiling - headroom, (
+        f"composer timeout {timeout_seconds}s exceeds the WebSettings guard "
+        f"({ceiling}s ceiling - {headroom}s headroom); the web task would refuse to boot"
+    )
+    assert timeout_seconds + headroom <= alb_idle_seconds, (
+        f"composer timeout {timeout_seconds}s plus {headroom}s headroom exceeds the ALB "
+        f"idle_timeout {alb_idle_seconds}s; the ALB would abort with a 504 before the "
+        f"composer returned its 422 and the partial pipeline would be lost. Raise "
+        f"idle_timeout in modules/scenario/network.tf first."
     )
