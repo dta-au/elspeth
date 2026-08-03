@@ -2112,9 +2112,65 @@ class TestGateExecutor:
             reason={
                 "condition": "row['nonexistent_field'] > 0",
                 "error_type": "ExpressionEvaluationError",
-                "error": "Key 'nonexistent_field' not found in PipelineRow",
+                "error": "gate expression evaluation failed: missing key",
             },
         )
+
+    @pytest.mark.parametrize(
+        ("condition", "row", "row_derived_text", "classification"),
+        [
+            (
+                "row[row['selector']]",
+                {"value": "x", "selector": "customer-private-field-7f31"},
+                "customer-private-field-7f31",
+                "gate expression evaluation failed: missing key",
+            ),
+            (
+                "row['items'][row['index']] > 0",
+                {"value": "x", "items": [1], "index": 918273},
+                "918273",
+                "gate expression evaluation failed: index out of range",
+            ),
+        ],
+    )
+    def test_config_gate_handled_error_evidence_never_persists_row_derived_key_or_index(
+        self,
+        condition: str,
+        row: dict[str, Any],
+        row_derived_text: str,
+        classification: str,
+    ) -> None:
+        """Handled row failures carry only closed, bounded classifications."""
+        factory = _make_factory()
+        executor = GateExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            error_edge_ids={NodeID("cg_1"): "edge_gate_error"},
+        )
+        config = GateSettings(
+            name="my_gate",
+            input="in_conn",
+            condition=condition,
+            routes={"true": "next_conn", "false": "error_sink"},
+            on_error="gate_errors",
+        )
+
+        outcome = executor.execute_config_gate(
+            config,
+            "cg_1",
+            _make_token(data=row, contract=_make_contract()),
+            make_context(),
+        )
+
+        assert outcome.error is not None
+        assert outcome.error.message == classification
+        failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        assert failed_kwargs["error"].exception == classification
+        routing_reason = factory.execution.record_routing_event.call_args.kwargs["reason"]
+        assert routing_reason["error"] == classification
+        persisted_evidence = repr((outcome.error, failed_kwargs["error"], routing_reason))
+        assert row_derived_text not in persisted_evidence
 
     def test_config_gate_error_route_without_divert_edge_fails_closed(self) -> None:
         """Missing structural audit evidence must not silently route the row."""

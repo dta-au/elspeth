@@ -1367,6 +1367,7 @@ gates:
     routes:
       "true": next_step_in   # Connection name for downstream node
       "false": discard       # Virtual terminal discard; records gate_discarded
+    on_error: discard         # Optional row-scoped expression-error policy
 
   - name: amount_threshold
     input: validated
@@ -1382,6 +1383,7 @@ gates:
 | `input` | string | **Yes** | Connection name to receive data from |
 | `condition` | string | **Yes** | Expression to evaluate (see [Expression Syntax](#expression-syntax)) |
 | `routes` | object | **Yes** | Maps evaluation results to destinations |
+| `on_error` | string | No | Sink name for row-scoped expression-evaluation failures, or `discard`; omission preserves fail-fast execution |
 | `fork_to` | list | No | Branch paths for fork operations |
 
 ### Route Destinations
@@ -1395,6 +1397,26 @@ gates:
 
 All route destinations must be explicit connection names, sink names, `fork`, or the virtual `discard` target. There is no implicit "forward to next step" — every routing decision must name its destination.
 
+### Expression Evaluation Failures
+
+Gate `on_error` applies only after a valid condition reaches row-scoped runtime
+evaluation. Invalid syntax and forbidden expression constructs fail config
+validation before any rows are processed.
+
+- A named sink records the gate node state as failed, records an audited
+  `DIVERT` routing event, and terminates the row as
+  `(failure, on_error_routed)` with `sink_name` and `error_hash`.
+- `on_error: discard` records the failed gate state and terminates the row as
+  `(failure, gate_error_discarded)` with `error_hash`. The row reaches no sink,
+  so no routing event is fabricated.
+- If `on_error` is omitted, the evaluation error propagates and the run fails
+  fast.
+
+Configured policies are per-row: unaffected source rows continue. Do not
+confuse a route destination of `discard`, which is an intentional successful
+decision recorded as `(success, gate_discarded)`, with `on_error: discard`,
+which records a failed evaluation.
+
 ### Boolean Conditions
 
 Boolean expressions (comparisons, `and`/`or`) must use `"true"`/`"false"` as route labels:
@@ -1407,6 +1429,7 @@ gates:
     routes:
       "true": high_values
       "false": output
+    on_error: discard
 
 # WRONG - boolean condition with non-boolean labels
 gates:
@@ -2586,6 +2609,7 @@ gates:
     routes:
       "true": high_values
       "false": output
+    on_error: discard
 
 # Audit trail
 landscape:

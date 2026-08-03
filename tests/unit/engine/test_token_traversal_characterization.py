@@ -309,6 +309,47 @@ class TestProcessSingleTokenOrchestration:
         assert recorded[0]["error_hash"] is not None
         assert emitted == [(TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED)]
 
+    def test_gate_error_discard_telemetry_failure_does_not_replace_handled_row_result(self) -> None:
+        """Telemetry is best-effort after the durable gate-error outcome exists."""
+        _db, factory = _make_factory()
+        processor = _make_processor(factory)
+        token = make_token_info(row_id="row-1", token_id="tok-1", data={"amount": "bad"})
+        failure = FailureInfo(exception_type="ExpressionEvaluationError", message="gate expression evaluation failed")
+        gate_outcome = GateOutcome(
+            result=GateResult(
+                row={"amount": "bad"},
+                action=RoutingAction.route(
+                    "__error_threshold__",
+                    mode=RoutingMode.DIVERT,
+                    reason={
+                        "condition": "row['amount'] > 500",
+                        "error_type": "ExpressionEvaluationError",
+                        "error": "gate expression evaluation failed",
+                    },
+                ),
+                contract=_make_contract(),
+            ),
+            updated_token=token,
+            discarded=True,
+            error=failure,
+        )
+        recorded: list[dict[str, object]] = []
+        processor._data_flow.record_token_outcome = lambda **kwargs: recorded.append(kwargs)  # type: ignore[method-assign, assignment]
+
+        def _telemetry_failure(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("telemetry exporter unavailable")
+
+        processor._emit_token_completed = _telemetry_failure  # type: ignore[method-assign]
+
+        terminal = processor._token_traversal.handle_gate_error_outcome(gate_outcome, token, [])
+
+        assert isinstance(terminal.result, RowResult)
+        assert (terminal.result.outcome, terminal.result.path) == (
+            TerminalOutcome.FAILURE,
+            TerminalPath.GATE_ERROR_DISCARDED,
+        )
+        assert recorded[0]["path"] == TerminalPath.GATE_ERROR_DISCARDED
+
     def test_gate_jump_to_node_absent_from_step_map_raises(self) -> None:
         """A gate jump to a node not in the DAG step map is an invariant violation."""
         _db, factory = _make_factory()

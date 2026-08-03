@@ -1570,7 +1570,14 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                             ),
                             "examples": ["fetched_text", "scored_rows", "lines_out"],
                         },
-                        "on_error": {"type": ["string", "null"]},
+                        "on_error": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "Node-level error policy for transform, aggregation, or gate nodes: use 'discard' or a declared "
+                                "sink name. For a gate this handles row expression-evaluation errors; omit it to preserve "
+                                "fail-fast behavior. Gate on_error is authored on the node, never as an edge."
+                            ),
+                        },
                         "options": {"type": "object"},
                         "condition": {"type": ["string", "null"]},
                         "routes": {
@@ -1640,7 +1647,11 @@ _SET_PIPELINE_DECLARATION = ToolDeclaration(
                     },
                     "required": ["id", "from_node", "to_node", "edge_type"],
                 },
-                "description": "Array of edge specs: [{id, from_node, to_node, edge_type}]",
+                "description": (
+                    "Array of edge specs: [{id, from_node, to_node, edge_type}]. edge_type='on_error' is supported for "
+                    "transform/aggregation sink wiring only; configure a gate's evaluation-error policy with the node's "
+                    "on_error field."
+                ),
             },
             "outputs": {
                 "type": "array",

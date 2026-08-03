@@ -2756,6 +2756,7 @@ class TestResultsEndpoint:
                 "total": 3,
                 "validation_errors": 1,
                 "transform_errors": 1,
+                "gate_errors": 0,
                 "sink_discards": 1,
                 "stages": [],
             }

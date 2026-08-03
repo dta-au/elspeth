@@ -21,25 +21,25 @@ if TYPE_CHECKING:
     from elspeth.core.dag.graph import ExecutionGraph
 
 
-def find_divert_transforms_in_chain(
+def find_divert_nodes_in_chain(
     graph: ExecutionGraph,
     start_node: NodeID,
-    divert_transforms: set[NodeID],
+    divert_nodes: set[NodeID],
     *,
     stop_nodes: frozenset[NodeID] = frozenset(),
 ) -> set[NodeID]:
-    """Find DIVERT transforms by walking backwards from a node.
+    """Find DIVERT-capable processing nodes by walking backwards from a node.
 
     Walks backwards through MOVE edges from the start node, collecting
-    any transforms that have DIVERT edges. Intermediate routing gates are
-    part of supported branch topology, so the walk crosses GATE nodes and
+    transforms or gates that have DIVERT edges. Intermediate routing gates are
+    part of supported branch topology, so the walk crosses and inspects GATE nodes and
     stops only when the chain leaves the branch-processing path or reaches
     a caller-declared boundary in ``stop_nodes``.
 
     Args:
         graph: The execution graph to walk
         start_node: The node to start walking backwards from
-        divert_transforms: Pre-computed set of transforms with DIVERT edges
+        divert_nodes: Pre-computed set of transforms/gates with DIVERT edges
         stop_nodes: Walk boundary. A stop node is never collected or
             crossed — the walk ends BEFORE examining it. Both barrier
             callers pass their barrier's originating fork gate(s) here
@@ -47,7 +47,7 @@ def find_divert_transforms_in_chain(
             the default empty set leaves the walk unbounded.
 
     Returns:
-        Set of transform node IDs in the chain that have DIVERT edges.
+        Set of processing-node IDs in the chain that have DIVERT edges.
     """
     found: set[NodeID] = set()
     current = start_node
@@ -58,10 +58,10 @@ def find_divert_transforms_in_chain(
             break
         visited.add(current)
         current_info = graph.get_node_info(current)
-        if current_info.node_type == NodeType.TRANSFORM:
-            if current in divert_transforms:
+        if current_info.node_type in {NodeType.TRANSFORM, NodeType.GATE}:
+            if current in divert_nodes:
                 found.add(current)
-        elif current_info.node_type != NodeType.GATE:
+        else:
             break
 
         # Walk backwards via MOVE edge (skip DIVERT edges to stay on main chain)
@@ -88,11 +88,11 @@ def warn_divert_coalesce_interactions(
 
     Emits two types of warnings:
 
-    1. ``DIVERT_COALESCE_REQUIRE_ALL``: A transform with on_error routing
+    1. ``DIVERT_COALESCE_REQUIRE_ALL``: A transform or gate with on_error routing
        feeds a ``require_all`` coalesce. Diverted rows cause other branches
        to wait indefinitely until end-of-source flush.
 
-    2. ``DIVERT_COALESCE_EXCLUSIVE_FIELDS``: A transform with on_error routing
+    2. ``DIVERT_COALESCE_EXCLUSIVE_FIELDS``: A transform or gate with on_error routing
        is in a branch that carries fields not guaranteed by any other branch.
        If a row is diverted, those fields are silently lost from the merged
        output — the audit trail won't record what fields were expected but
@@ -102,7 +102,7 @@ def warn_divert_coalesce_interactions(
     but likely to cause operational or audit surprises.
 
     Algorithm:
-      1. Pre-compute set of transform node IDs that have outgoing DIVERT edges.
+      1. Pre-compute transform/gate node IDs that have outgoing DIVERT edges.
       2. For each ``require_all`` coalesce, warn about DIVERT timing issues.
       3. For ALL coalesces with DIVERT-bearing branches, check for exclusive
          fields that would be lost if the branch is diverted.
@@ -118,15 +118,15 @@ def warn_divert_coalesce_interactions(
 
     log = structlog.get_logger()
 
-    # Step 1: pre-compute transforms with DIVERT edges (exit early if none)
-    divert_transforms: set[NodeID] = set()
+    # Step 1: pre-compute processing nodes with DIVERT edges (exit early if none)
+    divert_nodes: set[NodeID] = set()
     for edge in graph.get_edges():
         if edge.mode == RoutingMode.DIVERT:
             from_info = graph.get_node_info(edge.from_node)
-            if from_info.node_type == NodeType.TRANSFORM:
-                divert_transforms.add(edge.from_node)
+            if from_info.node_type in {NodeType.TRANSFORM, NodeType.GATE}:
+                divert_nodes.add(edge.from_node)
 
-    if not divert_transforms:
+    if not divert_nodes:
         return []
 
     # Fork gates by node id, with the branch names their fork_to declares.
@@ -165,8 +165,8 @@ def warn_divert_coalesce_interactions(
             gate_nid for gate_nid, forked_branches in fork_gate_branches.items() if forked_branches & coalesce_branch_names
         )
 
-        # Track incoming edges and whether their chains have DIVERT transforms
-        # Maps: from_node → (edge_label, edge_mode, divert_transforms_in_chain)
+        # Track incoming edges and whether their chains have DIVERT nodes
+        # Maps: from_node → (edge_label, edge_mode, divert_nodes_in_chain)
         incoming_divert_map: dict[NodeID, tuple[str, RoutingMode, set[NodeID]]] = {}
 
         for from_id, _to_id, _key, data in graph._graph.in_edges(coalesce_nid, keys=True, data=True):
@@ -178,12 +178,12 @@ def warn_divert_coalesce_interactions(
             if edge_mode == RoutingMode.COPY:
                 continue
 
-            # Transform branch: walk backwards to find DIVERT transforms
+            # Processing branch: walk backwards to find DIVERT nodes
             if edge_mode == RoutingMode.MOVE:
-                chain_diverts = find_divert_transforms_in_chain(
+                chain_diverts = find_divert_nodes_in_chain(
                     graph,
                     from_nid,
-                    divert_transforms,
+                    divert_nodes,
                     stop_nodes=origin_fork_gates,
                 )
                 if chain_diverts:
@@ -195,22 +195,22 @@ def warn_divert_coalesce_interactions(
         # Step 2a: DIVERT_COALESCE_REQUIRE_ALL for require_all policy
         if coal_config.policy == "require_all":
             for _from_nid, (_edge_label, _mode, chain_diverts) in incoming_divert_map.items():
-                for transform_nid in chain_diverts:
+                for divert_nid in chain_diverts:
                     warning = GraphValidationWarning(
                         code="DIVERT_COALESCE_REQUIRE_ALL",
                         message=(
-                            f"Transform '{transform_nid}' has on_error routing (DIVERT edge) "
+                            f"Processing node '{divert_nid}' has on_error routing (DIVERT edge) "
                             f"and feeds require_all coalesce '{coalesce_nid}'. "
                             f"Rows diverted on error will never reach the coalesce, "
                             f"causing other branches to wait until end-of-source flush."
                         ),
-                        node_ids=(str(transform_nid), str(coalesce_nid)),
+                        node_ids=(str(divert_nid), str(coalesce_nid)),
                     )
                     warnings.append(warning)
                     log.warning(
                         "divert_coalesce_interaction",
                         code=warning.code,
-                        transform=str(transform_nid),
+                        divert_node=str(divert_nid),
                         coalesce=str(coalesce_nid),
                         message=warning.message,
                     )
@@ -275,13 +275,13 @@ def warn_divert_coalesce_interactions(
                 continue  # No exclusive fields — loss is covered by other branches
 
             # Emit warning for exclusive field loss
-            transform_str = ", ".join(str(t) for t in sorted(chain_diverts))
+            divert_node_str = ", ".join(str(node_id) for node_id in sorted(chain_diverts))
             fields_str = ", ".join(sorted(exclusive_fields))
             warning = GraphValidationWarning(
                 code="DIVERT_COALESCE_EXCLUSIVE_FIELDS",
                 message=(
-                    f"Branch '{matched_branch}' has transforms with on_error routing "
-                    f"({transform_str}) and carries fields exclusive to this branch: "
+                    f"Branch '{matched_branch}' has processing nodes with on_error routing "
+                    f"({divert_node_str}) and carries fields exclusive to this branch: "
                     f"[{fields_str}]. If a row is diverted, these fields will be "
                     f"silently absent from the coalesce '{coalesce_nid}' merged output. "
                     f"The audit trail won't record which fields were expected but missing."
@@ -295,7 +295,7 @@ def warn_divert_coalesce_interactions(
                 branch=matched_branch,
                 coalesce=str(coalesce_nid),
                 exclusive_fields=sorted(exclusive_fields),
-                divert_transforms=[str(t) for t in chain_diverts],
+                divert_nodes=[str(node_id) for node_id in chain_diverts],
                 message=warning.message,
             )
 

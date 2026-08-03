@@ -239,6 +239,15 @@ class TestDivertCoalesceWarning:
         warnings = graph.warn_divert_coalesce_interactions(configs)
         assert warnings == [], [w.message for w in warnings]
 
+    def test_origin_fork_gate_divert_emits_no_require_all_warning(self) -> None:
+        """The originating fork gate is the scan boundary, including its own on_error."""
+        graph, configs = _build_graph_with_divert(divert_on=None)
+        graph.add_edge("gate", "error_sink", label="__error_gate__", mode=RoutingMode.DIVERT)
+
+        warnings = graph.warn_divert_coalesce_interactions(configs)
+
+        assert warnings == [], [w.message for w in warnings]
+
     def test_pre_fork_divert_not_collected_alongside_branch_local_divert(self) -> None:
         """The boundary must not mask genuine in-branch diverts — or name pre-fork ones.
 
@@ -410,6 +419,7 @@ class TestDivertCoalesceExclusiveFields:
         policy: str = "best_effort",
         merge: str = "union",
         pre_fork_divert: bool = False,
+        branch_gate: bool = False,
     ) -> tuple[ExecutionGraph, dict[NodeID, CoalesceSettings]]:
         """Build a graph with explicit schema configs on transforms.
 
@@ -462,7 +472,12 @@ class TestDivertCoalesceExclusiveFields:
             config={},
             output_schema_config=schema_a,
         )
-        graph.add_edge("gate", "t_a", label="path_a", mode=RoutingMode.MOVE)
+        if branch_gate:
+            graph.add_node("inner_gate", node_type=NodeType.GATE, plugin_name="route-gate", config={})
+            graph.add_edge("gate", "inner_gate", label="path_a", mode=RoutingMode.MOVE)
+            graph.add_edge("inner_gate", "t_a", label="approved", mode=RoutingMode.MOVE)
+        else:
+            graph.add_edge("gate", "t_a", label="path_a", mode=RoutingMode.MOVE)
 
         # Transform B with schema
         schema_b = _make_schema(branch_b_fields)
@@ -605,6 +620,23 @@ class TestDivertCoalesceExclusiveFields:
         codes = {w.code for w in warnings}
         assert "DIVERT_COALESCE_REQUIRE_ALL" in codes
         assert "DIVERT_COALESCE_EXCLUSIVE_FIELDS" in codes
+
+    def test_intermediate_gate_divert_gets_require_all_and_exclusive_field_warnings(self) -> None:
+        graph, configs = self._build_graph_with_schemas(
+            branch_a_fields=("shared", "only_a"),
+            branch_b_fields=("shared",),
+            divert_on="inner_gate",
+            policy="require_all",
+            branch_gate=True,
+        )
+
+        warnings = graph.warn_divert_coalesce_interactions(configs)
+
+        assert {warning.code for warning in warnings} == {
+            "DIVERT_COALESCE_REQUIRE_ALL",
+            "DIVERT_COALESCE_EXCLUSIVE_FIELDS",
+        }
+        assert all("inner_gate" in warning.message for warning in warnings)
 
     def test_divert_upstream_of_the_fork_emits_no_exclusive_fields_warning(self) -> None:
         """A pre-fork DIVERT loses the whole row, not a branch (elspeth-321f335ff2).

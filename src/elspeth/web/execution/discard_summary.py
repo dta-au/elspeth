@@ -5,12 +5,16 @@ from __future__ import annotations
 from collections.abc import Iterable
 from pathlib import Path
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.engine.url import make_url
 
+from elspeth.contracts import NodeStateStatus, NodeType
 from elspeth.contracts.audit import DISCARD_SINK_NAME
+from elspeth.contracts.enums import TerminalPath
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import (
+    node_states_table,
+    nodes_table,
     token_outcomes_table,
     transform_errors_table,
     validation_errors_table,
@@ -62,6 +66,7 @@ def load_discard_summaries_from_db(
         run_id: {
             "validation_errors": 0,
             "transform_errors": 0,
+            "gate_errors": 0,
             "sink_discards": 0,
         }
         for run_id in run_ids
@@ -113,6 +118,46 @@ def load_discard_summaries_from_db(
                 )
             )
 
+        gate_error_query = (
+            select(
+                token_outcomes_table.c.run_id,
+                node_states_table.c.node_id,
+                func.count(func.distinct(token_outcomes_table.c.token_id)).label("count"),
+            )
+            .select_from(
+                token_outcomes_table.join(
+                    node_states_table,
+                    and_(
+                        token_outcomes_table.c.run_id == node_states_table.c.run_id,
+                        token_outcomes_table.c.token_id == node_states_table.c.token_id,
+                    ),
+                ).join(
+                    nodes_table,
+                    and_(
+                        node_states_table.c.run_id == nodes_table.c.run_id,
+                        node_states_table.c.node_id == nodes_table.c.node_id,
+                    ),
+                )
+            )
+            .where(token_outcomes_table.c.run_id.in_(run_ids))
+            .where(token_outcomes_table.c.path == TerminalPath.GATE_ERROR_DISCARDED)
+            .where(token_outcomes_table.c.completed == 1)
+            .where(node_states_table.c.status == NodeStateStatus.FAILED)
+            .where(nodes_table.c.node_type == NodeType.GATE)
+            .group_by(token_outcomes_table.c.run_id, node_states_table.c.node_id)
+            .order_by(token_outcomes_table.c.run_id.asc(), node_states_table.c.node_id.asc())
+        )
+        for run_id, node_id, count in conn.execute(gate_error_query):
+            count_value = int(count)
+            counts[run_id]["gate_errors"] += count_value
+            stages[run_id].append(
+                DiscardStageSummary(
+                    stage="gate_evaluation",
+                    node_id=node_id,
+                    count=count_value,
+                )
+            )
+
         sink_query = (
             select(token_outcomes_table.c.run_id, func.count().label("count"))
             .where(token_outcomes_table.c.run_id.in_(run_ids))
@@ -133,7 +178,7 @@ def load_discard_summaries_from_db(
 
     summaries: dict[str, DiscardSummary] = {}
     for run_id, run_counts in counts.items():
-        total = run_counts["validation_errors"] + run_counts["transform_errors"] + run_counts["sink_discards"]
+        total = run_counts["validation_errors"] + run_counts["transform_errors"] + run_counts["gate_errors"] + run_counts["sink_discards"]
         if total > 0:
             summaries[run_id] = DiscardSummary(total=total, stages=tuple(stages[run_id]), **run_counts)
     return summaries

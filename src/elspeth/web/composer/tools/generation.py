@@ -712,6 +712,14 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "and node input connections (note it shows the saved state, not a rejected candidate).",
     ),
     (
+        r"gate_on_error_unknown_sink",
+        "A gate's node-level on_error policy may only be 'discard' or an existing sink name. The rejection's "
+        "'connectivity' facts carry the offending value as 'dangling_on_error' and the candidate's sink names as "
+        "'declared_sinks'.",
+        "Use upsert_node to set the gate's on_error='discard', or copy one of the connectivity facts' declared_sinks "
+        "exactly. Gate evaluation-error routing is configured on the gate node; do not add an on_error edge.",
+    ),
+    (
         r"transform_on_error_unknown_sink|references unknown sink",
         "An on_error destination may only be 'discard' or an existing sink name. The rejection's 'connectivity' facts, when present, "
         "carry the offending value as 'dangling_on_error' and the candidate's sink names as 'declared_sinks'.",
@@ -973,6 +981,7 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     "transform_missing_on_error",
     "transform_on_success_dangling",
     "transform_on_error_unknown_sink",
+    "gate_on_error_unknown_sink",
     "aggregation_on_success_dangling",
     "source_on_success_dangling",
     "gate_missing_condition",

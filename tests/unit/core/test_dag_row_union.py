@@ -908,6 +908,11 @@ _MID_GATE = """
       'false': output
 """
 
+_MID_GATE_DIVERT = _MID_GATE.replace(
+    '    condition: "True"',
+    '    on_error: errors\n    condition: "True"',
+)
+
 _MID_GATE_BRANCH_TRANSFORMS = """
 transforms:
   - name: tag_control
@@ -1114,6 +1119,46 @@ coalesce:
         assert "tag_control" in warning.message
         assert "polish_control" not in warning.message
         assert any("tag_control" in nid for nid in warning.node_ids)
+
+    def test_intermediate_gate_divert_warns_whole_group_loss(self, tmp_path: Path) -> None:
+        branch_transforms = _MID_GATE_BRANCH_TRANSFORMS.replace(
+            "    on_error: errors",
+            "    on_error: discard",
+            1,
+        )
+        graph = _build_graph(
+            _yaml(
+                tmp_path,
+                row_unions=_CHAIN_UNION,
+                branch_transforms=branch_transforms,
+                tail="",
+                extra_gates=_MID_GATE_DIVERT,
+                extra_sinks=_error_sink(tmp_path),
+            )
+        )
+
+        matching = [warning for warning in graph.validation_warnings if warning.code == "DIVERT_ROW_UNION_GROUP_LOSS"]
+
+        assert len(matching) == 1, [warning.message for warning in matching]
+        assert "mid_gate" in matching[0].message
+        assert any("mid_gate" in node_id for node_id in matching[0].node_ids)
+
+    def test_origin_fork_gate_divert_emits_no_group_loss_warning(self, tmp_path: Path) -> None:
+        yaml_text = _yaml(
+            tmp_path,
+            row_unions=_CHAIN_UNION,
+            branch_transforms=_chain_branch_transforms(control_on_error="discard", treatment_on_error="discard"),
+            tail="",
+            extra_sinks=_error_sink(tmp_path),
+        ).replace(
+            "    input: routed\n    condition:",
+            "    input: routed\n    on_error: errors\n    condition:",
+            1,
+        )
+
+        graph = _build_graph(yaml_text)
+
+        assert [warning for warning in graph.validation_warnings if warning.code == "DIVERT_ROW_UNION_GROUP_LOSS"] == []
 
 
 # ===== BRANCH-INTERNAL AGGREGATION GUARD =====

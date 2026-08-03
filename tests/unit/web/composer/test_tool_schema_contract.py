@@ -139,6 +139,28 @@ def test_provider_schemas_explicitly_describe_row_union_routing_fields() -> None
         SetPipelineArgumentsModel.model_validate(unsupported)
 
 
+def test_provider_schemas_advertise_gate_error_policy_as_node_level_authoring() -> None:
+    definitions = get_tool_definitions()
+    upsert = next(definition for definition in definitions if definition["name"] == "upsert_node")
+    upsert_edge = next(definition for definition in definitions if definition["name"] == "upsert_edge")
+    set_pipeline = _registered_set_pipeline_schema()
+    pipeline_node = set_pipeline["properties"]["nodes"]["items"]
+
+    for properties in (upsert["parameters"]["properties"], pipeline_node["properties"]):
+        description = properties["on_error"]["description"]
+        lowered = description.lower()
+        assert "gate" in lowered
+        assert "node-level" in lowered
+        assert "discard" in lowered
+        assert "sink" in lowered
+        assert "fail-fast" in lowered
+
+    edge_description = upsert_edge["description"]
+    assert "transform/aggregation" in edge_description
+    assert "gate" in edge_description
+    assert "upsert_node" in edge_description
+
+
 def test_canonical_schema_accessor_returns_isolated_registered_copies() -> None:
     spec = importlib.util.find_spec("elspeth.web.composer.tools.schema_contract")
     assert spec is not None

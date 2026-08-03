@@ -2302,6 +2302,100 @@ class TestUpsertEdge:
         node = next(n for n in r3.updated_state.nodes if n.id == "t1")
         assert node.on_error == "err_out"
 
+    def test_gate_on_error_edge_is_rejected_with_node_level_repair(self) -> None:
+        state = (
+            _empty_state()
+            .with_node(
+                NodeSpec(
+                    id="threshold",
+                    node_type="gate",
+                    plugin=None,
+                    input="rows",
+                    on_success=None,
+                    on_error=None,
+                    options={},
+                    condition="row['amount'] > 500",
+                    routes={"true": "main", "false": "main"},
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+            .with_output(OutputSpec(name="gate_errors", plugin="json", options={}, on_write_failure="discard"))
+        )
+
+        result = execute_tool(
+            "upsert_edge",
+            {
+                "id": "e_gate_error",
+                "from_node": "threshold",
+                "to_node": "gate_errors",
+                "edge_type": "on_error",
+            },
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.nodes[0].on_error is None
+        assert "upsert_node" in result.data["error"]
+        assert "on_error" in result.data["error"]
+        assert "route_true" not in result.data["error"]
+        assert "fork" not in result.data["error"]
+
+    def test_gate_on_error_edge_to_processing_node_is_also_rejected_atomically(self) -> None:
+        gate = NodeSpec(
+            id="threshold",
+            node_type="gate",
+            plugin=None,
+            input="rows",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="row['amount'] > 500",
+            routes={"true": "review_rows", "false": "review_rows"},
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        review = NodeSpec(
+            id="review",
+            node_type="transform",
+            plugin="passthrough",
+            input="review_rows",
+            on_success="main",
+            on_error="discard",
+            options={"schema": {"mode": "observed"}},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = _empty_state().with_node(gate).with_node(review)
+
+        result = execute_tool(
+            "upsert_edge",
+            {
+                "id": "e_gate_error_visual",
+                "from_node": "threshold",
+                "to_node": "review",
+                "edge_type": "on_error",
+            },
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert result.updated_state.edges == state.edges
+        assert "upsert_node" in result.data["error"]
+        assert "on_error" in result.data["error"]
+
     def test_upsert_edge_adds_llm_failure_sink_on_error_without_rebuilding_pipeline(self) -> None:
         """An existing LLM node can be routed to a failure sink via upsert_edge."""
         state = _empty_state()
@@ -7541,6 +7635,37 @@ class TestPatchNodeOptions:
         assert "edge_type='on_error'" in result.data["error"]
         assert "Extra inputs are not permitted" not in result.data["error"]
 
+    def test_patch_gate_options_rejects_on_error_with_node_level_guidance(self) -> None:
+        state = _empty_state().with_node(
+            NodeSpec(
+                id="threshold",
+                node_type="gate",
+                plugin=None,
+                input="rows",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="row['amount'] > 500",
+                routes={"true": "main", "false": "main"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+        )
+
+        result = execute_tool(
+            "patch_node_options",
+            {"node_id": "threshold", "patch": {"on_error": "gate_errors"}},
+            state,
+            _mock_catalog(),
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert "upsert_node" in result.data["error"]
+        assert "upsert_edge" not in result.data["error"]
+
     def test_patch_node_options_unknown_node_fails(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
@@ -10843,6 +10968,16 @@ class TestExplainValidationCode:
         assert resolved is not None
         _explanation, fix = resolved
         assert "policy=" in fix and "merge=" in fix
+
+    def test_gate_on_error_unknown_sink_teaches_node_level_policy(self) -> None:
+        from elspeth.web.composer.tools.generation import explain_validation_code
+
+        resolved = explain_validation_code("gate_on_error_unknown_sink")
+        assert resolved is not None
+        explanation, fix = resolved
+        assert "gate" in explanation.lower()
+        assert "upsert_node" in fix
+        assert "discard" in fix
 
     def test_pipeline_decision_unregistered_lists_registered_kinds(self) -> None:
         from elspeth.web.composer.tools.generation import explain_validation_code
@@ -16326,7 +16461,7 @@ class TestStructuralNodeTypeProbedAsPlugin:
         ("name", "expected_fragments"),
         [
             ("coalesce", ("node_type", "branches", "policy", "queries")),
-            ("gate", ("node_type", "fork_to", "routes")),
+            ("gate", ("node_type", "fork_to", "routes", "on_error", "discard", "sink", "node-level")),
             (
                 "row_union",
                 ("node_type", "branches", "input", "on_success", "require_all", "N-to-N", "timeout_seconds"),
@@ -16401,3 +16536,16 @@ class TestExplainDanglingDestinations:
         fix = result.data["suggested_fix"]
         assert "sink_name" in fix
         assert "input" in fix
+
+    def test_explains_gate_on_error_unknown_sink_as_node_level_policy(self) -> None:
+        result = execute_tool(
+            "explain_validation_error",
+            {"error_text": "gate_on_error_unknown_sink"},
+            _empty_state(),
+            _mock_catalog(),
+        )
+
+        assert result.success is True
+        assert "gate" in result.data["explanation"].lower()
+        assert "upsert_node" in result.data["suggested_fix"]
+        assert "discard" in result.data["suggested_fix"]

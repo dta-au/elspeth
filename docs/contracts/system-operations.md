@@ -1,7 +1,7 @@
 # ELSPETH System Operations Contract
 
-> **Status:** FINAL (v1.2)
-> **Last Updated:** 2026-02-13
+> **Status:** FINAL (v1.3)
+> **Last Updated:** 2026-08-03
 > **Authority:** This document is the master reference for all engine-level system operations.
 > **Companion:** [Plugin Protocol Contract](plugin-protocol.md) covers Source, Transform, and Sink plugins.
 
@@ -56,7 +56,7 @@ class RoutingKind(StrEnum):
 class RoutingMode(StrEnum):
     MOVE = "move"      # Token exits current path, goes to destination only
     COPY = "copy"      # Token clones to destination AND continues (fork only)
-    DIVERT = "divert"  # Token diverted to error/quarantine sink (structural)
+    DIVERT = "divert"  # Source quarantine or transform/config-gate on_error (structural)
 ```
 
 ### RoutingAction
@@ -83,7 +83,7 @@ class RoutingAction:
 | Kind | Destinations | Mode | Constraint |
 |------|-------------|------|------------|
 | `CONTINUE` | Empty | `MOVE` (COPY forbidden) | No destination needed |
-| `ROUTE` | Exactly one | `MOVE` (COPY forbidden) | Use `fork_to_paths` for multi-destination |
+| `ROUTE` | Exactly one | `MOVE` or `DIVERT` (COPY forbidden) | Use `fork_to_paths` for multi-destination |
 | `FORK_TO_PATHS` | One or more | `COPY` only | Path names must be unique, list must not be empty |
 
 ### RoutingReason (Audit Metadata)
@@ -96,6 +96,12 @@ class ConfigGateReason(TypedDict):
     condition: str      # The expression evaluated
     result: str         # The route label produced
 
+# Config-gate row-error routing
+class ConfigGateErrorReason(TypedDict):
+    condition: str      # The expression that failed at row evaluation
+    error_type: str     # Exception class name (ExpressionEvaluationError)
+    error: str          # Closed, bounded failure classification
+
 # Transform error routing
 class TransformErrorReason(TypedDict):
     reason: str         # Error category string
@@ -104,8 +110,17 @@ class TransformErrorReason(TypedDict):
 class SourceQuarantineReason(TypedDict):
     quarantine_error: str   # Description of the validation failure
 
+class SinkDiversionReason(TypedDict):
+    diversion_reason: str   # Why the sink diverted the row
+
 # Discriminated union — field presence distinguishes variants
-RoutingReason = ConfigGateReason | TransformErrorReason | SourceQuarantineReason
+RoutingReason = (
+    ConfigGateReason
+    | ConfigGateErrorReason
+    | TransformErrorReason
+    | SourceQuarantineReason
+    | SinkDiversionReason
+)
 ```
 
 ### Multi-Source Fan-In Policy
@@ -146,6 +161,7 @@ gates:
     routes:
       "true": continue          # Continue to next node
       "false": review_sink      # Route to named sink
+    on_error: gate_errors        # Optional row-expression failure sink or "discard"
 
   - name: tier_router
     condition: "row['amount'] > 2500 and 'premium' or (row['amount'] > 1000 and 'high' or 'normal')"
@@ -180,6 +196,11 @@ Route resolution:
     → "fork": create child tokens (see Fork section)
     → "discard": token stops with audited gate_discarded terminal outcome
     → sink_name: token routed to sink
+
+Expression evaluation failure:
+    → named on_error sink: failed gate state, DIVERT event, on_error_routed
+    → on_error "discard": failed gate state, gate_error_discarded
+    → on_error omitted: exception propagates and the run fails fast
 ```
 
 #### Expression Language Reference
@@ -222,7 +243,7 @@ An expression like `"__import__('os').system('rm -rf /')"` is rejected at config
 |------------|------|----------|
 | `ExpressionSyntaxError` | Expression is not valid Python syntax | Pipeline fails at config validation (before any rows) |
 | `ExpressionSecurityError` | Forbidden construct in expression | Pipeline fails at config validation (before any rows) |
-| `ExpressionEvaluationError` | Runtime error (KeyError, ZeroDivisionError, TypeError) | Node state recorded as FAILED, exception propagates to orchestrator which fails the run (row data caused the error in OUR expression — this is a config bug) |
+| `ExpressionEvaluationError` | Runtime row error (missing field, invalid arithmetic, incompatible types) | If `on_error` names a sink, record a failed gate state and DIVERT only that row; if it is `discard`, record `(failure, gate_error_discarded)`; if omitted, propagate and fail fast |
 
 ### Gate Execution Contract
 
@@ -230,17 +251,22 @@ An expression like `"__import__('os').system('rm -rf /')"` is rejected at config
 2. **Execute gate** — expression evaluation
 3. **Populate audit fields** — output hash, duration
 4. **Process routing** — based on `RoutingAction.kind`
-5. **Complete node state** — always `COMPLETED` for successful execution
+5. **Complete node state** — `COMPLETED` for a routing decision; `FAILED` for a handled expression-evaluation error
 6. **Record routing event(s)** — one per destination, with edge ID and mode
 
-**Terminal state derivation:** Gate node states are always `COMPLETED`. The token's terminal state (`ROUTED`, `FORKED`) is derived from the routing events, not stored in `node_states.status`.
+**Terminal state derivation:** Successful gate decisions use `COMPLETED` node
+states. A handled expression-evaluation error uses a `FAILED` node state and
+producer-declared terminal evidence: a named sink produces
+`(failure, on_error_routed)`, while error-policy discard produces
+`(failure, gate_error_discarded)`. An intentional route target of `discard`
+remains `(success, gate_discarded)`.
 
 ### Gate Audit Trail
 
 | Record | Contents |
 |--------|----------|
-| `node_states` | `state_id`, `token_id`, `node_id`, `status=COMPLETED`, `input_hash`, `output_hash`, `duration_ms` |
-| `routing_events` | `state_id`, `run_id`, `edge_id`, `mode` (MOVE/COPY), `reason` (condition text or plugin metadata) |
+| `node_states` | `state_id`, `token_id`, `node_id`, `status` (`COMPLETED` or handled-error `FAILED`), input/output evidence, duration, and structured error when failed |
+| `routing_events` | `state_id`, `run_id`, `edge_id`, `mode` (`MOVE`, `COPY`, or named-error `DIVERT`), structured reason; error-policy discard reaches no edge and records no routing event |
 | Row modifications | If gate modified the row: `input_hash ≠ output_hash`, delta traceable |
 
 ---
@@ -818,6 +844,7 @@ class TokenInfo:
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 1.3 | 2026-08-03 | Added row-scoped config-gate expression-error routing, failed-state audit semantics, and `gate_error_discarded` terminal provenance. |
 | 1.2 | 2026-02-13 | RC-3 alignment — Removed plugin gate references (GateProtocol, BaseGate, PluginGateReason, GateResult, GateOutcome). Gate plugins were removed from the codebase on 2026-02-11. All gates are config-driven via GateSettings + ExpressionParser. |
 | 1.1 | 2026-02-08 | Accuracy pass — Fixed RoutingReason union type (added TransformErrorReason, SourceQuarantineReason), corrected terminal states diagram (QUARANTINED/COALESCED/EXPANDED as independent states), fixed FORK_TO_PATHS minimum, added ExpressionSyntaxError, expanded fork_token() signature, added MANUAL trigger type, expanded expression language/forbidden constructs |
 | 1.0 | 2026-02-08 | Initial contract — Gates (config + plugin), Forks, Coalesces, Aggregation, Token identity, Routing primitives |

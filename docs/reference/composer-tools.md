@@ -229,7 +229,7 @@ row unions, or queues.
 | `input` | string | **Yes** | Input connection name (must match an upstream `on_success`) |
 | `plugin` | string | No | Plugin name. Required for transforms and aggregations. Null for gates, coalesces, row unions, and queues. |
 | `on_success` | string | No | Output connection name. Required for transforms and row unions. Null for gates and queues. |
-| `on_error` | string | No | Error output — a sink name or `"discard"` |
+| `on_error` | string | No | Row-error output — a sink name or `"discard"`; for gates this handles expression-evaluation failures, and omission preserves fail-fast execution |
 | `options` | object | No | Plugin-specific configuration |
 | `condition` | string | No | Gate expression (gates only) |
 | `routes` | object | No | Gate route mapping to a sink name, downstream connection name, `"fork"`, or virtual `"discard"` target, e.g. `{"true": "sink_name", "false": "discard"}` (gates only) |
@@ -246,7 +246,7 @@ row unions, or queues.
 | Type | Required fields | Key behaviour |
 |------|----------------|---------------|
 | `transform` | `plugin`, `on_success` | Processes rows, emits to `on_success` |
-| `gate` | `condition`, `routes` | Evaluates condition, routes by result |
+| `gate` | `condition`, `routes` | Evaluates condition, routes by result; optional `on_error` handles row-scoped evaluation failures |
 | `aggregation` | `plugin` | Batches rows until trigger fires |
 | `coalesce` | `branches`, `policy` | Waits according to `policy`, then merges correlated branch payloads according to `merge` |
 | `row_union` | `branches`, `on_success` | A plugin-free, fixed `require_all` N-to-N barrier that releases every original row unchanged in declared branch order |
@@ -292,7 +292,7 @@ Add or update a connection between nodes.
 | Type | Meaning |
 |------|---------|
 | `on_success` | Normal data flow from one node to the next |
-| `on_error` | Error routing (rows that fail processing) |
+| `on_error` | Error-sink edge for transform/aggregation processing failures. Gate expression-evaluation failures use the gate node's `on_error` field; Composer rejects an `on_error` edge from a gate. |
 | `route_true` | Gate route when condition evaluates to `True` |
 | `route_false` | Gate route when condition evaluates to `False` |
 | `fork` | Gate fork to parallel paths |

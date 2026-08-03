@@ -1,6 +1,6 @@
 # Outcome Path Map
 
-Current as of 2026-05-20.
+Current as of 2026-08-03.
 
 Use this map to locate the producer responsible for a token outcome gap. The
 exact line numbers change often; treat the file/function names as the stable
@@ -11,7 +11,8 @@ orientation and verify against source before editing.
 | `(success, default_flow)` | Token reached a normal sink successfully. | Sink/orchestrator completion path in `src/elspeth/engine/`. |
 | `(success, gate_routed)` | Gate routed the token to a named sink. | Gate/row processing path in `src/elspeth/engine/processor.py`. |
 | `(success, gate_discarded)` | Gate route target intentionally discarded the token. | Gate/row processing path in `src/elspeth/engine/processor.py`. |
-| `(failure, on_error_routed)` | Transform failed and `on_error` routed the token to an error sink. | Transform error handling in `src/elspeth/engine/processor.py`. |
+| `(failure, gate_error_discarded)` | Config-gate expression evaluation failed and configured `on_error: discard` stopped that row without a sink. | Gate error terminalization in `src/elspeth/engine/token_traversal.py`. |
+| `(failure, on_error_routed)` | Transform processing or config-gate expression evaluation failed and `on_error` routed the token to an error sink. | Transform and gate executors plus error handling in `src/elspeth/engine/token_traversal.py`. |
 | `(success, filter_dropped)` | A filter-style transform intentionally dropped the row. | Transform result handling in `src/elspeth/engine/processor.py`. |
 | `(success, coalesced)` | Branch token was consumed by a coalesce operation. | Coalesce handling in `src/elspeth/engine/coalesce_executor.py` and processor recovery branches. |
 | `(failure, unrouted)` | A token could not be routed to a valid destination. | Routing failure handling in `src/elspeth/engine/processor.py`. |

@@ -661,7 +661,7 @@ del _event_type_literal, _mapping_keys, _literal_values
 class DiscardStageSummary(_StrictResponse):
     """Per-stage contribution to a virtual discard sink summary."""
 
-    stage: Literal["source_validation", "transform_validation", "sink_discard"]
+    stage: Literal["source_validation", "transform_validation", "gate_evaluation", "sink_discard"]
     node_id: str | None
     count: int = Field(ge=1)
 
@@ -669,9 +669,11 @@ class DiscardStageSummary(_StrictResponse):
 class DiscardSummary(_StrictResponse):
     """Counts routed to the virtual ``discard`` sink.
 
-    The backing records live in three audit surfaces:
+    The backing records live in four audit surfaces:
     ``validation_errors.destination='discard'``,
-    ``transform_errors.destination='discard'``, and terminal
+    ``transform_errors.destination='discard'``, terminal
+    ``token_outcomes.path='gate_error_discarded'`` rows attributed to their
+    failed gate node states, and terminal
     ``token_outcomes.sink_name='__discard__'`` rows for sink-write
     diversions.  ``total`` is stored explicitly in the response so clients
     can render the visible virtual sink without duplicating the arithmetic.
@@ -684,22 +686,25 @@ class DiscardSummary(_StrictResponse):
     validation_errors: int = Field(ge=0)
     transform_errors: int = Field(ge=0)
     sink_discards: int = Field(ge=0)
+    gate_errors: int = Field(default=0, ge=0)
     stages: tuple[DiscardStageSummary, ...] = Field(default_factory=tuple)
 
     @model_validator(mode="after")
     def _check_total(self) -> Self:
-        expected = self.validation_errors + self.transform_errors + self.sink_discards
+        expected = self.validation_errors + self.transform_errors + self.gate_errors + self.sink_discards
         if self.total != expected:
             raise ValueError(
                 f"Discard summary total mismatch: total={self.total} "
                 f"!= validation_errors({self.validation_errors}) "
                 f"+ transform_errors({self.transform_errors}) "
+                f"+ gate_errors({self.gate_errors}) "
                 f"+ sink_discards({self.sink_discards}) = {expected}"
             )
         if self.stages:
             stage_totals = {
                 "source_validation": 0,
                 "transform_validation": 0,
+                "gate_evaluation": 0,
                 "sink_discard": 0,
             }
             for stage in self.stages:
@@ -713,6 +718,10 @@ class DiscardSummary(_StrictResponse):
                 raise ValueError(
                     "Discard transform_validation stage count mismatch: "
                     f"{stage_totals['transform_validation']} != transform_errors({self.transform_errors})"
+                )
+            if stage_totals["gate_evaluation"] != self.gate_errors:
+                raise ValueError(
+                    f"Discard gate_evaluation stage count mismatch: {stage_totals['gate_evaluation']} != gate_errors({self.gate_errors})"
                 )
             if stage_totals["sink_discard"] != self.sink_discards:
                 raise ValueError(

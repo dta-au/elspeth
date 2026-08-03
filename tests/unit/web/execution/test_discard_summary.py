@@ -2,7 +2,7 @@
 
 from datetime import UTC, datetime
 
-from elspeth.contracts import NodeType
+from elspeth.contracts import ExecutionError, NodeStateStatus, NodeType
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.core.landscape.schema import transform_errors_table, validation_errors_table
@@ -37,6 +37,61 @@ def test_discard_summary_counts_completed_discard_path() -> None:
         {
             "stage": "sink_discard",
             "node_id": None,
+            "count": 1,
+        }
+    ]
+
+
+def test_discard_summary_counts_gate_evaluation_error_discard_by_gate_node() -> None:
+    setup = make_recorder_with_run(run_id="gate-error-discard-summary-run", source_node_id="source-0")
+    gate_id = register_test_node(
+        setup.data_flow,
+        setup.run_id,
+        "threshold",
+        node_type=NodeType.GATE,
+        plugin_name="config_gate",
+    )
+    row = setup.data_flow.create_row(
+        run_id=setup.run_id,
+        source_node_id=setup.source_node_id,
+        row_index=0,
+        data={"amount": "250.00"},
+        source_row_index=0,
+        ingest_sequence=0,
+    )
+    token = setup.data_flow.create_token(row.row_id)
+    node_state = setup.execution.begin_node_state(
+        token.token_id,
+        gate_id,
+        setup.run_id,
+        0,
+        {"amount": "250.00"},
+    )
+    setup.execution.complete_node_state(
+        node_state.state_id,
+        NodeStateStatus.FAILED,
+        duration_ms=1.0,
+        error=ExecutionError(
+            exception="gate expression evaluation failed: incompatible runtime types",
+            exception_type="ExpressionEvaluationError",
+        ),
+    )
+    setup.data_flow.record_token_outcome(
+        ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
+        outcome=TerminalOutcome.FAILURE,
+        path=TerminalPath.GATE_ERROR_DISCARDED,
+        error_hash="b" * 64,
+    )
+
+    summary = load_discard_summaries_from_db(setup.db, [setup.run_id])[setup.run_id]
+
+    assert summary.total == 1
+    assert summary.gate_errors == 1
+    assert summary.sink_discards == 0
+    assert [stage.model_dump() for stage in summary.stages] == [
+        {
+            "stage": "gate_evaluation",
+            "node_id": "threshold",
             "count": 1,
         }
     ]

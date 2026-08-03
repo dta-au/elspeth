@@ -53,6 +53,24 @@ slog = structlog.get_logger(__name__)
 _GATE_VALUE_PREVIEW_CHARS = 80
 
 
+def _classify_handled_gate_evaluation_error(exc: ExpressionEvaluationError) -> str:
+    """Return bounded failure evidence without copying row-derived exception text."""
+    cause_type = type(exc.__cause__)
+    if cause_type is KeyError:
+        return "gate expression evaluation failed: missing key"
+    if cause_type is IndexError:
+        return "gate expression evaluation failed: index out of range"
+    if cause_type is TypeError:
+        return "gate expression evaluation failed: incompatible runtime types"
+    if cause_type is ZeroDivisionError:
+        return "gate expression evaluation failed: division by zero"
+    if cause_type is OverflowError:
+        return "gate expression evaluation failed: arithmetic overflow"
+    if cause_type is ValueError:
+        return "gate expression evaluation failed: invalid runtime value"
+    return "gate expression evaluation failed"
+
+
 def _describe_untrusted_gate_value(value: Any) -> str:
     """Return bounded metadata for row-derived gate expression results."""
     if isinstance(value, str):
@@ -310,7 +328,7 @@ class GateExecutor:
                     if on_error is None:
                         raise
 
-                    error_message = scrub_text_for_audit(str(exc))
+                    error_message = _classify_handled_gate_evaluation_error(exc)
                     failure = FailureInfo(
                         exception_type=type(exc).__name__,
                         message=error_message,

@@ -125,6 +125,7 @@ describe("InlineRunResults", () => {
             total: 2,
             validation_errors: 2,
             transform_errors: 0,
+            gate_errors: 0,
             sink_discards: 0,
             stages: [
               {
@@ -159,6 +160,7 @@ describe("InlineRunResults", () => {
             total: 1,
             validation_errors: 0,
             transform_errors: 1,
+            gate_errors: 0,
             sink_discards: 0,
             stages: [
               {
@@ -177,6 +179,41 @@ describe("InlineRunResults", () => {
     const warning = screen.getByRole("alert");
     expect(warning).toHaveTextContent(/1 row discarded at transform validation/i);
     expect(warning).toHaveTextContent(/normalize_url/i);
+  });
+
+  it("warns with the gate node when expression evaluation discards rows", () => {
+    useExecutionStore.setState({
+      activeRunId: null,
+      progress: null,
+      runs: [
+        {
+          id: "run-gate-error-discard",
+          session_id: "sess-1",
+          status: "completed_with_failures",
+          discard_summary: {
+            total: 1,
+            validation_errors: 0,
+            transform_errors: 0,
+            gate_errors: 1,
+            sink_discards: 0,
+            stages: [
+              {
+                stage: "gate_evaluation",
+                node_id: "threshold",
+                count: 1,
+              },
+            ],
+          },
+        } as never,
+      ],
+    } as never);
+
+    render(<InlineRunResults />);
+
+    const warning = screen.getByRole("alert");
+    expect(warning).toHaveTextContent(/1 row discarded at gate evaluation/i);
+    expect(warning).toHaveTextContent(/threshold/i);
+    expect(warning).toHaveTextContent(/incompatible runtime types/i);
   });
 
   it("does not warn for an empty run with zero discard rows", () => {

@@ -2978,6 +2978,50 @@ def test_allowlisted_candidate_feedback_carries_route_destination_facts() -> Non
     assert "repeat_notice" not in feedback
 
 
+def test_gate_on_error_repair_feedback_carries_sink_connectivity_and_guidance() -> None:
+    """A bad gate policy is repairable without exposing the raw validator message."""
+    base = _dangling_destination_state()
+    state = replace(
+        base,
+        sources={"source": replace(base.sources["source"], on_success="rows")},
+        nodes=(
+            NodeSpec(
+                id="threshold",
+                node_type="gate",
+                plugin=None,
+                input="rows",
+                on_success=None,
+                on_error="private_error_sink_canary",
+                options={},
+                condition="row['amount'] > 500",
+                routes={"true": "cleaned", "false": "cleaned"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+    )
+    result = ToolResult(
+        success=False,
+        updated_state=state,
+        validation=state.validate(),
+        affected_nodes=(),
+    )
+
+    feedback = _allowlisted_candidate_feedback(result)
+
+    entry = next(item for item in feedback["validation"]["errors"] if item["error_code"] == "gate_on_error_unknown_sink")
+    assert entry["connectivity"] == {
+        "dangling_on_error": "private_error_sink_canary",
+        "declared_sinks": ["cleaned"],
+    }
+    assert "gate" in entry["explanation"].lower()
+    assert "upsert_node" in entry["suggested_fix"]
+    assert "private_error_sink_canary" not in entry.get("explanation", "")
+    assert "private_error_sink_canary" not in entry.get("suggested_fix", "")
+
+
 def test_route_destination_feedback_rejects_missing_internal_fact(monkeypatch: pytest.MonkeyPatch) -> None:
     """A destination-dangling code with no matching fact fails loud, not silent."""
     import elspeth.web.composer.pipeline_planner as planner_module

@@ -1,6 +1,6 @@
 # Audit Sweep: Token Outcome Gaps
 
-Current as of 2026-05-20.
+Current as of 2026-08-03.
 
 Run these read-only checks after a run reaches a terminal run status. The checks
 target the ADR-019 two-axis token outcome model.
@@ -64,6 +64,7 @@ WHERE run_id = :run_id
       ('success', 'default_flow'),
       ('success', 'gate_routed'),
       ('success', 'gate_discarded'),
+      ('failure', 'gate_error_discarded'),
       ('failure', 'on_error_routed'),
       ('success', 'filter_dropped'),
       ('success', 'coalesced'),
@@ -88,7 +89,7 @@ WHERE run_id = :run_id
     (path IN ('default_flow', 'gate_routed') AND sink_name IS NULL)
     OR (path = 'on_error_routed' AND (sink_name IS NULL OR error_hash IS NULL))
     OR (path = 'coalesced' AND join_group_id IS NULL)
-    OR (path IN ('unrouted', 'quarantined_at_source') AND error_hash IS NULL)
+    OR (path IN ('gate_error_discarded', 'unrouted', 'quarantined_at_source') AND error_hash IS NULL)
     OR (path = 'sink_fallback_to_failsink' AND (sink_name IS NULL OR error_hash IS NULL))
     OR (path = 'sink_discarded' AND (sink_name IS NULL OR error_hash IS NULL OR sink_name <> '__discard__'))
     OR (path = 'fork_parent' AND fork_group_id IS NULL)

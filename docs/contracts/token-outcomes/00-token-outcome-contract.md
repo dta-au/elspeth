@@ -1,6 +1,6 @@
 # Token Outcome Contract
 
-Current as of 2026-05-20.
+Current as of 2026-08-03.
 
 This is the durable contract for token outcome records in Landscape. The
 authoritative implementation lives in:
@@ -26,6 +26,7 @@ authoritative implementation lives in:
 | 1 | `success` | `default_flow` | `sink_name` |
 | 1 | `success` | `gate_routed` | `sink_name` |
 | 1 | `success` | `gate_discarded` | none |
+| 1 | `failure` | `gate_error_discarded` | `error_hash` |
 | 1 | `failure` | `on_error_routed` | `sink_name`, `error_hash` |
 | 1 | `success` | `filter_dropped` | none |
 | 1 | `success` | `coalesced` | `join_group_id` |

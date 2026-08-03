@@ -548,7 +548,11 @@ export type PipelineStatus = "valid" | "valid-with-warnings" | "invalid";
 
 /** Counts routed to the virtual discard sink. */
 export interface DiscardStageSummary {
-  stage: "source_validation" | "transform_validation" | "sink_discard";
+  stage:
+    | "source_validation"
+    | "transform_validation"
+    | "gate_evaluation"
+    | "sink_discard";
   node_id: string | null;
   count: number;
 }
@@ -557,6 +561,7 @@ export interface DiscardSummary {
   total: number;
   validation_errors: number;
   transform_errors: number;
+  gate_errors: number;
   sink_discards: number;
   stages?: DiscardStageSummary[];
 }

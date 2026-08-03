@@ -565,11 +565,17 @@ class TokenTraversalEngine:
                 path=TerminalPath.GATE_ERROR_DISCARDED,
                 error_hash=error_hash,
             )
-            self._processor._emit_token_completed(
-                current_token,
-                outcome=TerminalOutcome.FAILURE,
-                path=TerminalPath.GATE_ERROR_DISCARDED,
-            )
+            with best_effort(
+                "TokenCompleted telemetry after gate-error discard audit",
+                run_id=self._processor._run_id,
+                token_id=current_token.token_id,
+                failure_type=failure.exception_type,
+            ):
+                self._processor._emit_token_completed(
+                    current_token,
+                    outcome=TerminalOutcome.FAILURE,
+                    path=TerminalPath.GATE_ERROR_DISCARDED,
+                )
             sibling_results = self._processor._notify_barrier_of_lost_branch(
                 current_token,
                 f"gate_error_discarded:{failure.exception_type}",

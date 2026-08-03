@@ -3,7 +3,7 @@
 Build-time audit warnings for DIVERT (on_error routing) edges inside the
 branch chains that feed a row_union barrier. Sibling of
 ``coalesce_warnings`` (same shape, same reuse of
-``find_divert_transforms_in_chain``); ExecutionGraph keeps a thin delegator
+``find_divert_nodes_in_chain``); ExecutionGraph keeps a thin delegator
 so builder-side callers stay symmetric with the coalesce path.
 
 row_union is require_all by definition with no partial release, so a DIVERT
@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from elspeth.contracts import RoutingMode
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.types import NodeID
-from elspeth.core.dag.coalesce_warnings import find_divert_transforms_in_chain
+from elspeth.core.dag.coalesce_warnings import find_divert_nodes_in_chain
 from elspeth.core.dag.models import GraphValidationWarning
 
 if TYPE_CHECKING:
@@ -34,7 +34,7 @@ def warn_divert_row_union_interactions(
 
     Emits one warning code:
 
-    ``DIVERT_ROW_UNION_GROUP_LOSS``: a transform with on_error routing sits in
+    ``DIVERT_ROW_UNION_GROUP_LOSS``: a transform or gate with on_error routing sits in
     a branch chain feeding a row_union. A diverted row never arrives at the
     barrier, and row_union's v1 arrival policy is require_all with no partial
     release — so the whole correlated group fails closed and the rows the
@@ -60,13 +60,16 @@ def warn_divert_row_union_interactions(
 
     log = structlog.get_logger()
 
-    # Pre-compute transforms with DIVERT edges (exit early if none).
-    divert_transforms: set[NodeID] = set()
+    # Pre-compute processing nodes with DIVERT edges (exit early if none).
+    divert_nodes: set[NodeID] = set()
     for edge in graph.get_edges():
-        if edge.mode == RoutingMode.DIVERT and graph.get_node_info(edge.from_node).node_type == NodeType.TRANSFORM:
-            divert_transforms.add(edge.from_node)
+        if edge.mode == RoutingMode.DIVERT and graph.get_node_info(edge.from_node).node_type in {
+            NodeType.TRANSFORM,
+            NodeType.GATE,
+        }:
+            divert_nodes.add(edge.from_node)
 
-    if not divert_transforms:
+    if not divert_nodes:
         return []
 
     # Fork gates by node id, with the branch names their fork_to declares.
@@ -109,20 +112,20 @@ def warn_divert_row_union_interactions(
             if edge.mode != RoutingMode.MOVE:
                 continue
 
-            chain_diverts = find_divert_transforms_in_chain(
+            chain_diverts = find_divert_nodes_in_chain(
                 graph,
                 edge.from_node,
-                divert_transforms,
+                divert_nodes,
                 stop_nodes=origin_fork_gates,
             )
             if not chain_diverts:
                 continue
 
-            transform_str = ", ".join(str(t) for t in sorted(chain_diverts))
+            divert_node_str = ", ".join(str(node_id) for node_id in sorted(chain_diverts))
             warning = GraphValidationWarning(
                 code="DIVERT_ROW_UNION_GROUP_LOSS",
                 message=(
-                    f"Transform '{transform_str}' has on_error routing (DIVERT edge) in a branch "
+                    f"Processing node '{divert_node_str}' has on_error routing (DIVERT edge) in a branch "
                     f"feeding row_union '{union_nid}'. row_union requires every declared branch "
                     f"({declared_branches}) and never releases a partial group, so a diverted row "
                     f"fails the WHOLE group closed: the rows the sibling branches produced "
@@ -136,7 +139,7 @@ def warn_divert_row_union_interactions(
                 "divert_row_union_group_loss",
                 code=warning.code,
                 row_union=str(union_nid),
-                divert_transforms=[str(t) for t in sorted(chain_diverts)],
+                divert_nodes=[str(node_id) for node_id in sorted(chain_diverts)],
                 declared_branches=list(union_config.branches),
                 message=warning.message,
             )

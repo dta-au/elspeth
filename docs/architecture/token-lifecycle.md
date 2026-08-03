@@ -1,6 +1,6 @@
 # Token Lifecycle Architecture
 
-Current as of 2026-05-20.
+Current as of 2026-08-03.
 
 Tokens are row instances moving through the pipeline DAG. A source row has a
 stable `row_id`; one or more tokens may represent that row as it forks, expands,
@@ -45,6 +45,7 @@ The current legal terminal path set includes:
 - `default_flow`
 - `gate_routed`
 - `gate_discarded`
+- `gate_error_discarded`
 - `on_error_routed`
 - `filter_dropped`
 - `coalesced`
@@ -65,7 +66,10 @@ Common token paths:
 - Source row creates the initial token.
 - A transform may continue the same token, drop/filter it, fail it, or produce
   child tokens.
-- A gate may continue default flow, route to a sink, discard, or fork.
+- A gate may continue default flow, route to a sink, intentionally discard, or
+  fork. A row-scoped expression-evaluation failure may instead divert to a
+  configured error sink or terminate as `gate_error_discarded`; omission of the
+  gate's `on_error` policy preserves fail-fast execution.
 - A batch/coalesce path may mark a token transient while creating or waiting for
   downstream tokens.
 - A sink records success or failure through a producer-declared terminal path.

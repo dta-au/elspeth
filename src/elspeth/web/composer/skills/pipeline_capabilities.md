@@ -59,9 +59,11 @@ environment interpolation.
 
 Pipelines have one or more named sources, zero or more structural/processing
 nodes, explicit connections, and one or more named outputs. Connection strings
-are the routing contract: a producer's `on_success`, `on_error`, `routes`, or
-`fork_to` value must match a downstream node's `input` or an output's
-`sink_name`. Node ids identify components; they are not implicit connections.
+are the routing contract: a producer's `on_success`, `routes`, or `fork_to`
+value must match a downstream node's `input` or an output's `sink_name`.
+Error policies are narrower: transform/aggregation/gate `on_error` may be
+`discard` or an output `sink_name`, never a downstream processing input. Node
+ids identify components; they are not implicit connections.
 
 - [capability-node:transform] A `transform` applies a policy-visible plugin.
   It can preserve, add, rename, parse, expand, or otherwise shape row fields as
@@ -72,6 +74,10 @@ are the routing contract: a producer's `on_success`, `on_error`, `routes`, or
   by subscripting the row namespace — `row['field']`; a bare field name is
   not in scope and is rejected. `get_expression_grammar` is the full grammar
   authority.
+  Gate expression-evaluation failures use the optional node-level `on_error`
+  policy: set it to `discard` or a declared sink name. Omit it to preserve
+  fail-fast behavior. Gate `on_error` is authored on the gate node, never as an
+  `on_error` edge.
   Gate semantics are the user's, never invented: use the user's stated
   thresholds and comparison values VERBATIM in `condition`; never invent a
   category literal the user or a reviewed schema fact did not state; never

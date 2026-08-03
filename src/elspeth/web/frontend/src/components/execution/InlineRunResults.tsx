@@ -87,6 +87,15 @@ function transformValidationFallbackStage(summary: DiscardSummary): DiscardStage
   };
 }
 
+function gateEvaluationFallbackStage(summary: DiscardSummary): DiscardStageSummary | null {
+  if (summary.gate_errors <= 0) return null;
+  return {
+    stage: "gate_evaluation",
+    node_id: null,
+    count: summary.gate_errors,
+  };
+}
+
 function sinkDiscardFallbackStage(summary: DiscardSummary): DiscardStageSummary | null {
   if (summary.sink_discards <= 0) return null;
   return {
@@ -101,9 +110,11 @@ function primaryDiscardStage(summary: DiscardSummary): DiscardStageSummary | nul
   return (
     stages.find((stage) => stage.stage === "source_validation") ??
     stages.find((stage) => stage.stage === "transform_validation") ??
+    stages.find((stage) => stage.stage === "gate_evaluation") ??
     stages.find((stage) => stage.stage === "sink_discard") ??
     sourceValidationFallbackStage(summary) ??
     transformValidationFallbackStage(summary) ??
+    gateEvaluationFallbackStage(summary) ??
     sinkDiscardFallbackStage(summary)
   );
 }
@@ -114,6 +125,8 @@ function discardStageLabel(stage: DiscardStageSummary): string {
       return "source validation";
     case "transform_validation":
       return "transform validation";
+    case "gate_evaluation":
+      return "gate evaluation";
     case "sink_discard":
       return "sink discard handling";
   }
@@ -125,6 +138,8 @@ function discardCauseText(stage: DiscardStageSummary): string {
       return "Common causes: source schema declares fields the input data does not contain; CSV header mismatch; on_validation_failure: \"discard\" is dropping rows.";
     case "transform_validation":
       return "Common causes: transform output did not match its declared schema; error routing sends invalid rows to discard; upstream fields changed shape.";
+    case "gate_evaluation":
+      return "Common causes: a gate expression compared incompatible runtime types or accessed a missing key; on_error: \"discard\" handled the failed row.";
     case "sink_discard":
       return "Common causes: sink write failure handling routed rows to discard before an output artifact was produced.";
   }

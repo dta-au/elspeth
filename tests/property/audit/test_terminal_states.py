@@ -526,5 +526,5 @@ class TestTerminalPairEnumProperties:
         assert TerminalPath.BUFFERED.value == "buffered"
 
     def test_terminal_paths_count(self) -> None:
-        """Property: There are exactly 13 terminal paths plus BUFFERED."""
-        assert len(TerminalPath) == 14
+        """Property: There are exactly 14 terminal paths plus BUFFERED."""
+        assert len(TerminalPath) == 15

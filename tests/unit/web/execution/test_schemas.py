@@ -127,21 +127,23 @@ class TestDiscardSummary:
 
     def test_accepts_matching_total(self) -> None:
         summary = DiscardSummary(
-            total=6,
+            total=10,
             validation_errors=1,
             transform_errors=2,
             sink_discards=3,
+            gate_errors=4,
         )
 
-        assert summary.total == 6
+        assert summary.total == 10
 
     def test_rejects_mismatched_total(self) -> None:
         with pytest.raises(pydantic.ValidationError, match="Discard summary total mismatch"):
             DiscardSummary(
-                total=5,
+                total=9,
                 validation_errors=1,
                 transform_errors=2,
                 sink_discards=3,
+                gate_errors=4,
             )
 
 

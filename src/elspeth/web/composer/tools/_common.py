@@ -1494,7 +1494,9 @@ _STRUCTURAL_NODE_TYPE_GUIDANCE: Final[dict[str, str]] = {
     "gate": (
         "'gate' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a node "
         "with node_type='gate', plugin=null, a `condition` row expression and routes={'true': ..., "
-        "'false': ...}; route to 'fork' with fork_to=[...] to fan a row out to several branches."
+        "'false': ...}; route to 'fork' with fork_to=[...] to fan a row out to several branches. "
+        "Its optional node-level `on_error` handles expression-evaluation errors: set it to 'discard' or a declared sink; "
+        "omit it for fail-fast behavior. Do not represent gate on_error as an edge."
     ),
     "row_union": (
         "'row_union' is not a plugin — it is a built-in node_type that needs no plugin. Wire it as a "

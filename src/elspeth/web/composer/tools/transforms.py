@@ -211,7 +211,14 @@ _UPSERT_NODE_DECLARATION_JSON_SCHEMA: dict[str, Any] = {
             ),
             "examples": ["fetched_text", "scored_rows", "lines_out"],
         },
-        "on_error": {"type": ["string", "null"], "description": "Error output connection (transform/aggregation only)."},
+        "on_error": {
+            "type": ["string", "null"],
+            "description": (
+                "Node-level error policy for transform, aggregation, or gate nodes: use 'discard' or a declared sink name. "
+                "For a gate this handles row expression-evaluation errors; omit it to preserve fail-fast behavior. "
+                "Gate on_error is authored here, never as an edge."
+            ),
+        },
         "options": {"type": "object", "description": "Plugin-specific config (transform/aggregation only)."},
         "condition": {"type": ["string", "null"], "description": "Boolean expression (gate only). Evaluated per row."},
         "routes": {
@@ -324,7 +331,7 @@ _UPSERT_NODE_DECLARATION = ToolDeclaration(
         "Add or update a pipeline node. "
         "Fields are node_type-dependent: "
         "transform/aggregation use plugin+options; "
-        "gate uses condition+routes (or fork_to); "
+        "gate uses condition+routes (or fork_to) and optional node-level on_error; "
         "coalesce uses branches+policy+merge; "
         "row_union is a plugin-free require_all N-to-N barrier: provide at least "
         "two ordered branches, set input to the first branch connection, set "
@@ -356,8 +363,10 @@ _UPSERT_EDGE_DECLARATION = ToolDeclaration(
     kind=ToolKind.MUTATION,
     description=(
         "Add or update a connection between nodes. When the edge targets a sink, "
-        "this also updates the source/node routing field used by runtime "
-        "(on_success, on_error, gate routes, or fork destinations)."
+        "this also updates the source/node routing field used by runtime. "
+        "edge_type='on_error' sink wiring is supported for transform/aggregation nodes only; "
+        "a gate's expression-error policy is node-level and must be set with upsert_node.on_error. "
+        "Gate success routing uses route_true, route_false, or fork."
     ),
     json_schema={
         "type": "object",
@@ -1079,6 +1088,14 @@ def _execute_upsert_edge(
     to_node = validated.to_node
     edge_type = validated.edge_type
 
+    origin_node = next((node for node in state.nodes if node.id == from_node), None)
+    if edge_type == "on_error" and origin_node is not None and origin_node.node_type == "gate":
+        return _failure_result(
+            state,
+            f"Gate '{from_node}' evaluation-error routing is node-level: use upsert_node with on_error="
+            f"'{to_node}' (or 'discard'). upsert_edge(edge_type='on_error') is unsupported for gates.",
+        )
+
     edge = EdgeSpec(
         id=validated.id,
         from_node=from_node,
@@ -1109,8 +1126,6 @@ def _execute_upsert_edge(
                     if node.on_success != to_node:
                         new_state = new_state.with_node(replace(node, on_success=to_node))
                 elif edge_type == "on_error":
-                    if node.node_type == "gate":
-                        return _failure_result(state, f"Gate '{from_node}' sink edges must use route_true, route_false, or fork.")
                     if node.on_error != to_node:
                         new_state = new_state.with_node(replace(node, on_error=to_node))
                 elif edge_type in ("route_true", "route_false"):
@@ -1197,7 +1212,7 @@ def _execute_set_metadata(
     return _mutation_result(new_state, ())
 
 
-def _node_routing_option_patch_error(patch: Mapping[str, Any]) -> str | None:
+def _node_routing_option_patch_error(patch: Mapping[str, Any], *, node_type: NodeType) -> str | None:
     """Return guidance when plugin-option patches contain node routing fields."""
     if not (_NODE_ROUTING_OPTION_PATCH_KEYS & patch.keys()):
         return None
@@ -1205,6 +1220,11 @@ def _node_routing_option_patch_error(patch: Mapping[str, Any]) -> str | None:
         if key not in patch:
             continue
         if key == "on_error":
+            if node_type == "gate":
+                return (
+                    "on_error is a node-level gate error policy, not a plugin option. "
+                    "Use upsert_node with on_error as a sibling of options; set it to 'discard' or a declared sink name."
+                )
             return (
                 "on_error is a node-level routing field, not a plugin option. "
                 "Use upsert_edge with edge_type='on_error' when routing failures to an existing sink, "
@@ -1266,7 +1286,7 @@ def _execute_patch_node_options(
     current = next((n for n in state.nodes if n.id == node_id), None)
     if current is None:
         return _failure_result(state, f"Node '{node_id}' not found.")
-    routing_patch_error = _node_routing_option_patch_error(patch)
+    routing_patch_error = _node_routing_option_patch_error(patch, node_type=current.node_type)
     if routing_patch_error is not None:
         return _failure_result(state, routing_patch_error)
     runtime_owned_error = _runtime_owned_llm_option_error(
@@ -1399,7 +1419,7 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
     "Keys in the patch overwrite existing keys. "
     "Keys set to null are deleted. Missing keys are unchanged. "
     "Do not use this for node routing fields such as on_success/on_error/input/routes; "
-    "use upsert_edge or upsert_node for routing edits.",
+    "use upsert_edge or upsert_node for routing edits. Gate on_error is node-level and must use upsert_node.",
     json_schema={
         "type": "object",
         "properties": {
@@ -1412,7 +1432,8 @@ _PATCH_NODE_OPTIONS_DECLARATION = ToolDeclaration(
                 "description": (
                     "Merge-patch to apply to plugin options only. "
                     "Node-level routing fields such as on_success, on_error, input, routes, "
-                    "and fork_to are siblings of options; edit them with upsert_edge or upsert_node."
+                    "and fork_to are siblings of options; edit them with upsert_edge or upsert_node. "
+                    "For a gate, edit on_error only with upsert_node."
                 ),
             },
         },

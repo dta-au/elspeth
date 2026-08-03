@@ -159,9 +159,10 @@ class RoutingMode(StrEnum):
     COPY: Token clones to destination AND continues on current path
     DIVERT: Token is diverted from normal flow to error/quarantine sink.
             Like MOVE, but semantically distinct: represents failure handling,
-            not intentional routing. Used for source quarantine and transform
-            on_error edges. These are structural markers in the DAG — rows
-            reach these sinks via exception handling, not by traversing the edge.
+            not intentional routing. Used for source quarantine, transform
+            on_error, and config-gate on_error edges. These are structural
+            markers in the DAG — rows reach these sinks via exception handling,
+            not by traversing the edge.
 
     Stored in the database.
     """

@@ -187,6 +187,17 @@ def test_capability_coverage_is_exactly_derived_from_canonical_authorities() -> 
     assert "timeout_seconds" in actual_fields["node"]
 
 
+def test_gate_capability_documents_node_level_error_policy_and_fail_fast_omission() -> None:
+    core = load_pipeline_capability_core()
+    gate_section = core.split("[capability-node:gate]", 1)[1].split("[capability-node:aggregation]", 1)[0]
+
+    assert "node-level" in gate_section
+    assert "on_error" in gate_section
+    assert "discard" in gate_section
+    assert "sink" in gate_section
+    assert "fail-fast" in gate_section
+
+
 def test_capability_field_extraction_detects_new_structural_field() -> None:
     schema = canonical_set_pipeline_schema()
     schema["properties"]["future_topology"] = {"type": "object"}

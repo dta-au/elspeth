@@ -1251,6 +1251,7 @@ describe("executionStore progress events advance live accounting", () => {
           total: 2,
           validation_errors: 2,
           transform_errors: 0,
+          gate_errors: 0,
           sink_discards: 0,
           stages: [
             {
