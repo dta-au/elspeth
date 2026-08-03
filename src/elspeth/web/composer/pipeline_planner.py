@@ -797,7 +797,9 @@ def _prose_reply_notice() -> str:
 def _escape_hatch_notice() -> str:
     return (
         "The planning budget is exhausted; this is the escape hatch. You are a senior advisor model "
-        "seeing the full conversation above as one freeform puzzle. You have exactly one turn: either "
+        "reviewing the retained transcript above as one freeform puzzle. Only protocol-complete turns are retained above; "
+        "truncated responses and tool calls rejected before execution by discovery guards or discovery/composition budgets are omitted. "
+        "You have exactly one turn: either "
         "call emit_pipeline_proposal once with a complete, valid pipeline that satisfies the request, "
         "or reply in plain text honestly explaining why the request cannot be built with the available "
         "plugins. Do not call any other tool. If you decline, your FIRST sentence must state the cause "
@@ -1214,7 +1216,12 @@ _REPEAT_NOTICE = (
 )
 
 
-def _allowlisted_candidate_feedback(result: ToolResult, *, repeated_fingerprint: bool = False) -> dict[str, Any]:
+def _allowlisted_candidate_feedback(
+    result: ToolResult,
+    *,
+    repeated_fingerprint: bool = False,
+    withhold_candidate_facts: bool = False,
+) -> dict[str, Any]:
     """Project only structured validation fields already safe for tool output.
 
     Raw validation messages are withheld — they can quote plugin names, option
@@ -1245,8 +1252,9 @@ def _allowlisted_candidate_feedback(result: ToolResult, *, repeated_fingerprint:
     destination_facts: dict[str, RouteDestinationFactDict] | None = None
     for entry in _rejection_entries(result):
         code = entry.error_code or "validation_error"
+        component = "pipeline" if withhold_candidate_facts else entry.component
         projected: dict[str, Any] = {
-            "component": entry.component,
+            "component": component,
             "severity": entry.severity,
             "error_code": code,
             "error_class": "ValidationError",
@@ -1254,14 +1262,22 @@ def _allowlisted_candidate_feedback(result: ToolResult, *, repeated_fingerprint:
         guidance = explain_validation_code(code)
         if guidance is not None:
             projected["explanation"], projected["suggested_fix"] = guidance
-        if code in ("plugin_options_invalid", "gate_condition_ignores_stated_threshold", _UNPRODUCIBLE_OUTPUT_FIELDS_CODE):
+        if (
+            code
+            in (
+                "plugin_options_invalid",
+                "gate_condition_ignores_stated_threshold",
+                _UNPRODUCIBLE_OUTPUT_FIELDS_CODE,
+            )
+            and not withhold_candidate_facts
+        ):
             # Same custody judgment for all three: the message quotes only
             # content the planner itself already holds verbatim — the options
             # of the candidate it just authored, the comparison span from the
             # instruction its own prompt was built from, or the reviewed output
             # field names already in its ``reviewed_planner_context``.
             projected["detail"] = entry.message
-        if code in _ROUTE_DESTINATION_FACT_CODES:
+        if code in _ROUTE_DESTINATION_FACT_CODES and not withhold_candidate_facts:
             # Instance wiring facts derived from the REJECTED candidate state
             # the result carries — the dangling value and the exact valid
             # destinations (sink names / consumable connections) the planner
@@ -1274,7 +1290,7 @@ def _allowlisted_candidate_feedback(result: ToolResult, *, repeated_fingerprint:
             if destination_facts is None:
                 destination_facts = route_destination_facts(result.updated_state)
             projected["connectivity"] = destination_facts[entry.component]
-        if code == "coalesce_branch_unreachable":
+        if code == "coalesce_branch_unreachable" and not withhold_candidate_facts:
             # Instance wiring facts derived from the REJECTED state the result
             # carries — same redaction class as the contract facts below (node
             # ids + connection names the planner itself authored). Without
@@ -1286,7 +1302,7 @@ def _allowlisted_candidate_feedback(result: ToolResult, *, repeated_fingerprint:
             if reachability_facts is None:
                 reachability_facts = coalesce_reachability_facts(result.updated_state)
             projected["connectivity"] = reachability_facts[entry.component.removeprefix("node:")]
-        if entry.contract is not None:
+        if entry.contract is not None and not withhold_candidate_facts:
             # Structured contract facts: producer/consumer component ids and
             # schema FIELD NAMES from validated contract config — pipeline
             # metadata the session owner authored, never user row content
@@ -1296,7 +1312,7 @@ def _allowlisted_candidate_feedback(result: ToolResult, *, repeated_fingerprint:
             # fields are missing. This stays inside the message-redaction
             # boundary this allowlist protects.
             projected["contract"] = entry.contract.to_dict()
-        if entry.row_union_schema is not None:
+        if entry.row_union_schema is not None and not withhold_candidate_facts:
             # Structured row-union branch declarations: branch aliases,
             # schema modes, field names, and declared field properties from
             # the REJECTED candidate the planner authored. These are the
@@ -2395,25 +2411,32 @@ async def _plan_pipeline_inner(
     def _hatch_available() -> bool:
         return model_config.escape_hatch_model is not None and not hatch_spent
 
-    def _engage_escape_hatch(error: PipelinePlannerError, *, rejection_feedback: Mapping[str, Any] | None = None) -> None:
-        # The over-budget attempt is dropped from the conversation so no
-        # assistant tool_calls message dangles without its tool results.
-        # When the exhaustion was a candidate rejection, the advisor would
-        # otherwise never learn WHY the final candidate failed (the dropped
-        # attempt takes its feedback with it) — so the same allowlisted,
-        # message-stripped envelope the repair turn would have received rides
-        # inside the hatch notice. Closed codes and candidate-authored names
-        # only; no new disclosure surface.
+    def _engage_escape_hatch(error: PipelinePlannerError) -> None:
         nonlocal hatch_error, hatch_turn_next, hatch_spent
         hatch_error = error
         hatch_turn_next = True
         hatch_spent = True
-        content = _escape_hatch_notice()
-        if rejection_feedback is not None:
-            content += "\n\nFor context: the final candidate (dropped from the conversation above) was rejected with:\n" + canonical_json(
-                rejection_feedback
-            )
-        messages.append({"role": "user", "content": content})
+        messages.append({"role": "user", "content": _escape_hatch_notice()})
+
+    def _retain_terminal_rejection(
+        *,
+        provider_message: Any,
+        parsed_calls: tuple[_ParsedToolCall, ...],
+        terminal_call: _ParsedToolCall,
+        feedback: Mapping[str, Any],
+    ) -> None:
+        # A rejected terminal proposal was evaluated and its safe result is
+        # known, so retain the exact provider-authored tool call together with
+        # that allowlisted result. This closes the tool protocol without
+        # projecting any candidate-finalizer authority back to the advisor.
+        messages.append(_assistant_tool_calls_message(provider_message, parsed_calls))
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": terminal_call.call_id,
+                "content": canonical_json(feedback),
+            }
+        )
 
     while True:
         is_hatch_turn = hatch_turn_next
@@ -2454,6 +2477,9 @@ async def _plan_pipeline_inner(
                 messages.append({"role": "user", "content": _prose_reply_notice()})
                 continue
             if exc.code != "RESPONSE_TRUNCATED":
+                if is_hatch_turn:
+                    assert hatch_error is not None
+                    raise hatch_error from None
                 raise
             trail.begin_attempt()
             if is_hatch_turn:
@@ -2473,6 +2499,11 @@ async def _plan_pipeline_inner(
             trail.log_attempt("repair", "truncated", led_to="repair")
             messages.append({"role": "user", "content": _truncated_response_notice()})
             continue
+        except Exception:
+            if is_hatch_turn:
+                assert hatch_error is not None
+                raise hatch_error from None
+            raise
         trail.begin_attempt()
         # Phase of a terminal-tool turn: the first candidate is "candidate",
         # every post-rejection retry is "repair"; the advisor turn is "hatch".
@@ -2488,6 +2519,9 @@ async def _plan_pipeline_inner(
             trail.log_attempt(
                 attempt_phase, "budget_exhausted", planner_code="TOOL_CALLS_EXHAUSTED", led_to="terminal", tool_calls=len(calls)
             )
+            if is_hatch_turn:
+                assert hatch_error is not None
+                raise hatch_error from None
             raise PipelinePlannerError("planner per-turn tool call budget exhausted", code="TOOL_CALLS_EXHAUSTED")
 
         terminal_calls = tuple(call for call in calls if call.name == _TERMINAL_TOOL_NAME)
@@ -2543,6 +2577,9 @@ async def _plan_pipeline_inner(
                     try:
                         finalizer_result = candidate_finalizer(pipeline)
                     except AuditIntegrityError as exc:
+                        if is_hatch_turn:
+                            assert hatch_error is not None
+                            raise hatch_error from None
                         if not str(exc).startswith(_CANDIDATE_SHAPE_INTEGRITY_PREFIX):
                             # Not a candidate-shape complaint: a genuine
                             # integrity breach stays terminal.
@@ -2554,8 +2591,16 @@ async def _plan_pipeline_inner(
                         # ``sources`` map, an invented component name) reaches
                         # here and gets the canonical schema complaint.
                         terminal_feedback = _canonical_schema_feedback()
+                    except Exception:
+                        if is_hatch_turn:
+                            assert hatch_error is not None
+                            raise hatch_error from None
+                        raise
                     else:
                         if type(finalizer_result) is not dict:
+                            if is_hatch_turn:
+                                assert hatch_error is not None
+                                raise hatch_error from None
                             raise AuditIntegrityError("pipeline candidate finalizer must return an exact dict")
                         finalized_pipeline = finalizer_result
             if terminal_feedback is not None:
@@ -2581,7 +2626,13 @@ async def _plan_pipeline_inner(
                             led_to="hatch",
                             repeated_fingerprint=repeated_terminal_fingerprint,
                         )
-                        _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=terminal_feedback)
+                        _retain_terminal_rejection(
+                            provider_message=message,
+                            parsed_calls=calls,
+                            terminal_call=call,
+                            feedback=terminal_feedback,
+                        )
+                        _engage_escape_hatch(_rejection_exhausted())
                         continue
                     trail.log_attempt(
                         attempt_phase,
@@ -2732,7 +2783,14 @@ async def _plan_pipeline_inner(
                         trail.log_attempt(
                             attempt_phase, "deferred_claim", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
                         )
-                        _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=_deferred_intent_claim_feedback())
+                        deferred_feedback = _deferred_intent_claim_feedback()
+                        _retain_terminal_rejection(
+                            provider_message=message,
+                            parsed_calls=calls,
+                            terminal_call=call,
+                            feedback=deferred_feedback,
+                        )
+                        _engage_escape_hatch(_rejection_exhausted())
                         continue
                     trail.log_attempt(
                         attempt_phase, "deferred_claim", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
@@ -2760,7 +2818,14 @@ async def _plan_pipeline_inner(
                         trail.log_attempt(
                             attempt_phase, "arg_error", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="hatch"
                         )
-                        _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=_allowlisted_argument_feedback(exc))
+                        argument_feedback = _allowlisted_argument_feedback(exc)
+                        _retain_terminal_rejection(
+                            provider_message=message,
+                            parsed_calls=calls,
+                            terminal_call=call,
+                            feedback=argument_feedback,
+                        )
+                        _engage_escape_hatch(_rejection_exhausted())
                         continue
                     trail.log_attempt(
                         attempt_phase, "arg_error", codes=last_rejection_codes, planner_code="REPAIR_EXHAUSTED", led_to="terminal"
@@ -2777,11 +2842,17 @@ async def _plan_pipeline_inner(
                 )
                 continue
             except _PipelineCandidateRejected as exc:
+                assert finalized_pipeline is not None
+                assert pipeline is not None
                 last_rejection_codes = _candidate_rejection_codes(exc.result)
                 rejection_fingerprint = _rejection_fingerprint(exc.result)
                 repeated_fingerprint = rejection_fingerprint in seen_rejection_fingerprints
                 seen_rejection_fingerprints.add(rejection_fingerprint)
-                candidate_feedback = _allowlisted_candidate_feedback(exc.result, repeated_fingerprint=repeated_fingerprint)
+                candidate_feedback = _allowlisted_candidate_feedback(
+                    exc.result,
+                    repeated_fingerprint=repeated_fingerprint,
+                    withhold_candidate_facts=canonical_json(finalized_pipeline) != canonical_json(pipeline),
+                )
                 if os.environ.get("ELSPETH_PLANNER_REJECTION_DETAIL_LOG") == "1":
                     # Operator-opted diagnostic seam. Validator messages are never
                     # logged: even an opt-in diagnostic must not persist authored
@@ -2816,7 +2887,13 @@ async def _plan_pipeline_inner(
                             led_to="hatch",
                             repeated_fingerprint=repeated_fingerprint,
                         )
-                        _engage_escape_hatch(_rejection_exhausted(), rejection_feedback=candidate_feedback)
+                        _retain_terminal_rejection(
+                            provider_message=message,
+                            parsed_calls=calls,
+                            terminal_call=call,
+                            feedback=candidate_feedback,
+                        )
+                        _engage_escape_hatch(_rejection_exhausted())
                         continue
                     trail.log_attempt(
                         attempt_phase,
@@ -2843,6 +2920,11 @@ async def _plan_pipeline_inner(
                     }
                 )
                 continue
+            except Exception:
+                if is_hatch_turn:
+                    assert hatch_error is not None
+                    raise hatch_error from None
+                raise
             trail.log_attempt(attempt_phase, "accepted", led_to="done", tool_calls=len(calls))
             return accepted_plan
 
