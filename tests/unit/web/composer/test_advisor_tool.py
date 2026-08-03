@@ -887,8 +887,12 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
     assert advisor_await is not None
     advisor_timeout = advisor_await.kwargs["timeout"]
     assert advisor_timeout == 5.0
-    assert len(exc_info.value.tool_invocations) == 1
-    assert "COMPOSE_TIMEOUT" in _result_canonical(exc_info.value.tool_invocations[0])
+    assert [inv.tool_call_id for inv in exc_info.value.tool_invocations] == [
+        "call_metadata",
+        "call_sources",
+        "call_deadline",
+    ]
+    assert "COMPOSE_TIMEOUT" in _result_canonical(exc_info.value.tool_invocations[-1])
 
 
 @pytest.mark.asyncio
@@ -921,7 +925,11 @@ async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound
     assert exc_info.value.max_turns == 2
     assert mock_advisor.await_count == 0
     assert tuple(tracker._failures) == initial_failures
-    assert len(exc_info.value.tool_invocations) == 1
+    assert [inv.tool_call_id for inv in exc_info.value.tool_invocations] == [
+        "call_sources",
+        "call_transforms",
+        "call_zero_remaining",
+    ]
     invocations = [inv for inv in exc_info.value.tool_invocations if inv.tool_name == "request_advisor_hint"]
     assert len(invocations) == 1
     payload = json.loads(_result_canonical(invocations[0]))

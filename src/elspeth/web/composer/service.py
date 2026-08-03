@@ -4978,7 +4978,11 @@ class ComposerServiceImpl:
                     budget_exhausted="timeout",
                     state=state,
                     initial_version=initial_version,
-                    tool_invocations=(() if persisted_tool_call_turn else recorder.invocations[-current_invocation_count:]),
+                    # A successful P4 made the request's accumulated trail
+                    # durable, so the route must not replay it. Without a
+                    # persistence target, none of the prior turns is durable:
+                    # preserve the recorder's complete in-memory trail.
+                    tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
                     llm_calls=recorder.llm_calls,
                     failed_turn=failed_turn,
                 )
