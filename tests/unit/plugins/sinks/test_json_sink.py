@@ -76,6 +76,57 @@ class TestJSONSink:
                 }
             )
 
+    def test_unknown_encoding_is_rejected_before_sink_construction(self, tmp_path: Path) -> None:
+        """An unavailable codec must fail owned config validation, before publication."""
+        from elspeth.plugins.sinks.json_sink import JSONSink, JSONSinkConfig
+
+        config = {
+            "path": str(tmp_path / "sensitive-output-name.json"),
+            "schema": DYNAMIC_SCHEMA,
+            "encoding": "definitely-not-a-real-codec",
+        }
+
+        with pytest.raises(PluginConfigError, match=r"encoding: Value error, unknown encoding") as config_error:
+            JSONSinkConfig.from_dict(config, plugin_name="json")
+        with pytest.raises(PluginConfigError, match=r"encoding: Value error, unknown encoding") as sink_error:
+            JSONSink(config)
+
+        assert "sensitive-output-name" not in str(config_error.value)
+        assert str(sink_error.value) == str(config_error.value)
+
+    @pytest.mark.parametrize("encoding", ["utf-8", "utf-16", "utf8"])
+    def test_available_text_encoding_is_accepted(self, tmp_path: Path, encoding: str) -> None:
+        """Standard, non-default, and normalized alias spellings remain valid."""
+        from elspeth.plugins.sinks.json_sink import JSONSink, JSONSinkConfig
+
+        config = {
+            "path": str(tmp_path / "output.json"),
+            "schema": DYNAMIC_SCHEMA,
+            "encoding": encoding,
+        }
+
+        validated = JSONSinkConfig.from_dict(config, plugin_name="json")
+        sink = JSONSink(config)
+
+        assert validated.encoding == encoding
+        assert sink._encoding == encoding
+
+    @pytest.mark.parametrize("encoding", [None, True, 65001, b"utf-8"])
+    def test_encoding_requires_an_exact_string(self, tmp_path: Path, encoding: object) -> None:
+        """Codec validation must not coerce null, booleans, numbers, or bytes."""
+        from elspeth.plugins.sinks.json_sink import JSONSinkConfig
+
+        config = {
+            "path": str(tmp_path / "sensitive-output-name.json"),
+            "schema": DYNAMIC_SCHEMA,
+            "encoding": encoding,
+        }
+
+        with pytest.raises(PluginConfigError, match=r"encoding: Input should be a valid string") as error:
+            JSONSinkConfig.from_dict(config, plugin_name="json")
+
+        assert "sensitive-output-name" not in str(error.value)
+
     def test_has_plugin_version(self) -> None:
         """JSONSink has plugin_version attribute."""
         from elspeth.plugins.sinks.json_sink import JSONSink

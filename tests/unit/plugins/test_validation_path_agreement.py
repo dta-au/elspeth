@@ -464,6 +464,16 @@ _SINK_REJECTION_CASES = [
         "does not support.*append",
         id="json_sink-json-format-append",
     ),
+    pytest.param(
+        "json",
+        {
+            "path": "/tmp/output.json",
+            "schema": _make_observed_schema(),
+            "encoding": "definitely-not-a-real-codec",
+        },
+        "unknown encoding",
+        id="json_sink-invalid-encoding",
+    ),
     # ── csv sink ──────────────────────────────────────────────────────────
     pytest.param(
         "csv",

@@ -12,7 +12,7 @@ from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from elspeth.contracts import CallType, Determinism, PluginSchema
 from elspeth.contracts.diversion import SinkWriteResult
@@ -102,11 +102,24 @@ class JSONSinkConfig(SinkPathConfig):
         description="Output JSON format. When omitted, the sink auto-detects JSONL from a .jsonl filename and JSON otherwise.",
     )
     indent: int | None = Field(default=None, description="Indentation level for JSON array output; null writes compact JSON.")
-    encoding: str = Field(default="utf-8", description="Text encoding used when writing JSON output.")
+    encoding: str = Field(
+        default="utf-8",
+        strict=True,
+        description="Text encoding used when writing JSON output.",
+    )
     mode: Literal["write", "append"] = Field(
         default="write",
         description="Whether to create/replace the JSON output file or append JSONL rows.",
     )
+
+    @field_validator("encoding")
+    @classmethod
+    def _validate_encoding(cls, value: str) -> str:
+        try:
+            codecs.lookup(value)
+        except LookupError as exc:
+            raise ValueError("unknown encoding for JSON sink") from exc
+        return value
 
     @model_validator(mode="after")
     def _validate_mode_format_compatibility(self) -> "JSONSinkConfig":
