@@ -13,11 +13,13 @@ from elspeth.contracts.blobs import (
     BlobIntegrityError,
     BlobQuotaExceededError,
 )
+from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, PipelinePlannerError, PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
+from elspeth.web.composer.progress import client_cancelled_progress_event
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import ComposerServiceError
 from elspeth.web.composer.redaction import redact_tool_call_arguments
@@ -48,7 +50,6 @@ from .._helpers import (
     SessionServiceProtocol,
     UserIdentity,
     _cancel_on_client_disconnect,
-    _composer_progress_sink,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
     _is_client_disconnect_cancel,
@@ -82,6 +83,55 @@ router = APIRouter()
 # Mirrors the freeform surface's identical fallback in
 # ComposerServiceImpl.compose (service.py, PlannerDeclined handler).
 _EMPTY_DECLINE_FALLBACK = "I could not find a way to build this pipeline with the available components."
+
+
+def _guided_full_complete_progress_event(*, declined: bool = False) -> ComposerProgressEvent:
+    if declined:
+        return ComposerProgressEvent(
+            phase="complete",
+            headline="The guided planner finished without proposing a pipeline.",
+            evidence=("The guided decline was saved as an assistant response.",),
+            likely_next="Review the reply and revise the request if you want to try again.",
+            reason="composer_complete",
+        )
+    return ComposerProgressEvent(
+        phase="complete",
+        headline="The guided pipeline proposal is ready for review.",
+        evidence=("The proposal and its audit evidence were settled atomically.",),
+        likely_next="Review the proposed pipeline before accepting it.",
+        reason="composer_complete",
+    )
+
+
+def _guided_full_failed_progress_event(failure_code: GuidedOperationFailureCode) -> ComposerProgressEvent:
+    provider_failure = failure_code in {
+        "invalid_provider_response",
+        "provider_timeout",
+        "provider_unavailable",
+    }
+    if failure_code == "policy_blocked":
+        likely_next = "Change the policy-blocked pipeline component before submitting a new guided request."
+    elif failure_code == "quota_exceeded":
+        likely_next = "Remove stored session data or ask an operator to raise the configured storage quota."
+    elif failure_code == "stale_conflict":
+        likely_next = "Refresh the current session state before submitting a new guided request."
+    elif failure_code in {"custody_error", "integrity_error"}:
+        likely_next = "Restore the authoritative input or session state before retrying the guided request."
+    elif provider_failure:
+        likely_next = "Retry when the composer provider is available, or revise the request if the response remains unusable."
+    else:
+        likely_next = "Review the error response before retrying the guided request."
+    return ComposerProgressEvent(
+        phase="failed",
+        headline=(
+            "The guided planner could not produce a usable pipeline proposal."
+            if provider_failure
+            else "The guided pipeline request could not be completed."
+        ),
+        evidence=("The guided operation was settled with a safe failure classification.",),
+        likely_next=likely_next,
+        reason="provider_unavailable" if provider_failure else "service_setup_failed",
+    )
 
 
 def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
@@ -221,15 +271,14 @@ async def post_guided_plan(
         return reserved
 
     recorder = BufferingRecorder()
+    progress = _get_composer_progress_registry(request).bind_request(
+        session_id=str(session_id),
+        request_id=body.operation_id,
+        user_id=user.user_id,
+    )
     try:
         catalog, plugin_snapshot = _request_plugin_policy_context(request, user)
         compose_lock = await _get_session_compose_lock_registry(request).get_lock(str(session_id))
-        progress = _composer_progress_sink(
-            _get_composer_progress_registry(request),
-            session_id=str(session_id),
-            request_id=body.operation_id,
-            user_id=user.user_id,
-        )
         async with compose_lock:
             observed_record = await service.get_current_state(session_id)
             observed_state = (
@@ -323,7 +372,9 @@ async def post_guided_plan(
                         )
                     )
                 )
-            return project_guided_full_decline(decline_settlement.decline_message)
+            decline_response = project_guided_full_decline(decline_settlement.decline_message)
+            await progress(_guided_full_complete_progress_event(declined=True))
+            return decline_response
 
         plan, _catalog_ids = outcome
         redacted = redact_tool_call_arguments(
@@ -367,7 +418,9 @@ async def post_guided_plan(
                     )
                 )
             )
-        return project_composition_proposal(settlement.proposal)
+        proposal_response = project_composition_proposal(settlement.proposal)
+        await progress(_guided_full_complete_progress_event())
+        return proposal_response
     except (GuidedOperationFenceLostError, BlobGuidedOperationFenceLostError) as exc:
         joined = await reserve_or_replay_guided_operation(
             service=service,
@@ -380,9 +433,15 @@ async def post_guided_plan(
         )
         if joined is None or isinstance(joined, (GuidedOperationLease, GuidedOperationExpired)):
             raise AuditIntegrityError("guided-full fence was lost without a replayable winner") from exc
+        await progress(
+            _guided_full_complete_progress_event(
+                declined=type(joined) is GuidedPlanDeclinedResponse,
+            )
+        )
         return joined
     except asyncio.CancelledError as exc:
         if exc.__dict__.get(_GUIDED_ATOMIC_SETTLEMENT_COMPLETED) is True:
+            await _await_with_deferred_cancellation(progress(client_cancelled_progress_event()))
             raise
         settlement_failure = exc.__dict__.get(_GUIDED_ATOMIC_SETTLEMENT_FAILURE)
         caller_task = asyncio.current_task()
@@ -412,6 +471,12 @@ async def post_guided_plan(
             )
         except GuidedOperationFenceLostError as fence_lost:
             raise exc from fence_lost
+        terminal_event = (
+            client_cancelled_progress_event()
+            if cancel_failure_code == "request_cancelled"
+            else _guided_full_failed_progress_event(cancel_failure_code)
+        )
+        await _await_with_deferred_cancellation(progress(terminal_event))
         if settlement_failure is not None:
             raise exc from settlement_failure
         if disconnected:
@@ -449,7 +514,13 @@ async def post_guided_plan(
             )
             if joined is None or isinstance(joined, (GuidedOperationLease, GuidedOperationExpired)):
                 raise AuditIntegrityError("guided-full failure lost its fence without a winner") from exc
+            await progress(
+                _guided_full_complete_progress_event(
+                    declined=type(joined) is GuidedPlanDeclinedResponse,
+                )
+            )
             return joined
+        await progress(_guided_full_failed_progress_event(failure_code))
         raise_guided_operation_failure(failed)
 
 

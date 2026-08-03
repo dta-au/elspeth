@@ -326,6 +326,62 @@ class TestComposerProgressRegistry:
         assert snapshot.updated_at <= datetime.now(UTC)
 
     @pytest.mark.asyncio
+    async def test_clear_revokes_a_bound_request_sink(self) -> None:
+        registry = ComposerProgressRegistry()
+        progress = registry.bind_request(
+            session_id="session-1",
+            request_id="operation-1",
+            user_id="user-1",
+        )
+        await progress(
+            ComposerProgressEvent(
+                phase="calling_model",
+                headline="The guided planner is active.",
+                evidence=("A bounded request is running.",),
+            )
+        )
+
+        await registry.clear("session-1")
+        await progress(
+            ComposerProgressEvent(
+                phase="failed",
+                headline="A late operation attempted to publish.",
+                evidence=("The cleared request sink completed late.",),
+                reason="service_setup_failed",
+            )
+        )
+
+        assert (await registry.get_latest("session-1")).phase == "idle"
+        assert await registry.list_active(user_id="user-1") == ()
+
+        replacement = registry.bind_request(
+            session_id="session-1",
+            request_id="operation-2",
+            user_id="user-2",
+        )
+        await replacement(
+            ComposerProgressEvent(
+                phase="calling_model",
+                headline="A replacement guided planner is active.",
+                evidence=("A new bounded request owns the session.",),
+            )
+        )
+        await progress(
+            ComposerProgressEvent(
+                phase="failed",
+                headline="The archived operation completed too late.",
+                evidence=("The old request sink no longer has custody.",),
+                reason="service_setup_failed",
+            )
+        )
+
+        latest = await registry.get_latest("session-1")
+        assert latest.request_id == "operation-2"
+        assert latest.phase == "calling_model"
+        assert await registry.list_active(user_id="user-1") == ()
+        assert [snapshot.request_id for snapshot in await registry.list_active(user_id="user-2")] == ["operation-2"]
+
+    @pytest.mark.asyncio
     async def test_list_active_returns_only_non_terminal_phases(self) -> None:
         """list_active is the cross-session enumeration primitive used by /_active."""
         registry = ComposerProgressRegistry()

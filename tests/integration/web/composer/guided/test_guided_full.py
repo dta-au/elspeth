@@ -13,6 +13,7 @@ from sqlalchemy import event, func, select, text
 
 from elspeth.contracts.blobs import BlobIntegrityError, BlobStateError
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.composer_progress import ComposerProgressEvent
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.composer.pipeline_planner import PipelinePlannerError
@@ -65,6 +66,26 @@ def _record_failed_llm_call(recorder, *, status: ComposerLLMCallStatus, secret: 
     )
 
 
+def _assert_guided_plan_terminal_progress(
+    composer_test_client,
+    *,
+    session: dict[str, object],
+    operation_id: str,
+    phase: str,
+    reason: str,
+) -> None:
+    registry = composer_test_client.app.state.composer_progress_registry
+    session_id = str(session["id"])
+    snapshot = asyncio.run(registry.get_latest(session_id))
+
+    assert snapshot.request_id == operation_id
+    assert snapshot.phase == phase
+    assert snapshot.reason == reason
+    assert snapshot.inflight_requests == 0
+    active = asyncio.run(registry.list_active(user_id=str(session["user_id"])))
+    assert all(candidate.session_id != session_id for candidate in active)
+
+
 def test_guided_full_stages_one_atomic_replayable_cohort(composer_test_client) -> None:
     session = composer_test_client.post("/api/sessions", json={"title": "guided full"}).json()
     response = composer_test_client.post(
@@ -114,6 +135,13 @@ def test_guided_full_stages_one_atomic_replayable_cohort(composer_test_client) -
         assert operation.proposal_id == payload["id"]
         assert operation.result_state_id == payload["base_state_id"]
         assert operation.originating_message_id is not None
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id="00000000-0000-4000-8000-000000000001",
+        phase="complete",
+        reason="composer_complete",
+    )
 
 
 @pytest.mark.parametrize("reason", ("operator_rejected", "superseded"))
@@ -173,6 +201,13 @@ def test_guided_full_reserved_setup_failure_terminalizes_the_exact_operation(
         )
     assert operation["status"] == "failed"
     assert operation["failure_code"] == "operation_failed"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="service_setup_failed",
+    )
 
 
 def test_guided_full_provider_owned_cancelled_error_is_operation_failed(
@@ -199,6 +234,13 @@ def test_guided_full_provider_owned_cancelled_error_is_operation_failed(
         )
     assert operation["status"] == "failed"
     assert operation["failure_code"] == "operation_failed"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="service_setup_failed",
+    )
 
 
 def test_guided_full_escape_hatch_decline_is_an_ordinary_assistant_message_not_a_failure(
@@ -285,6 +327,13 @@ def test_guided_full_escape_hatch_decline_is_an_ordinary_assistant_message_not_a
             conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
         )
     assert replay_operation.result_message_id == decline_message_id
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="complete",
+        reason="composer_complete",
+    )
 
 
 def test_guided_full_failure_atomically_retains_sanitized_audit_without_a_checkpoint(
@@ -328,6 +377,13 @@ def test_guided_full_failure_atomically_retains_sanitized_audit_without_a_checkp
     assert secret not in str(audit_rows[0])
     assert operation["status"] == "failed"
     assert operation["failure_code"] == "provider_unavailable"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="provider_unavailable",
+    )
 
 
 def test_guided_full_preserves_an_existing_canonical_state_as_the_checkpoint_base(
@@ -820,6 +876,66 @@ def test_guided_full_cancel_before_staging_leaves_no_partial_cohort(composer_tes
     assert audit_rows[0].tool_calls[0]["_kind"] == "llm_call_audit"
     assert audit_rows[0].tool_calls[0]["call"]["error_message"] is None
     assert secret not in str(audit_rows[0])
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="cancelled",
+        reason="client_cancelled",
+    )
+
+
+def test_guided_full_cancel_after_atomic_settlement_still_publishes_terminal_progress(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = composer_test_client.app.state.session_service
+    real_stage = service.stage_guided_full_pipeline_proposal
+    settlement_committed = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def committed_then_paused(command):
+        result = await real_stage(command)
+        settlement_committed.set()
+        await release_settlement.wait()
+        return result
+
+    monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", committed_then_paused)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided settled cancellation"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000073"
+
+    async def cancel_after_commit() -> None:
+        async with AsyncClient(
+            transport=ASGITransport(app=composer_test_client.app),
+            base_url="http://test",
+        ) as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Settle before cancellation is observed."},
+                )
+            )
+            await asyncio.wait_for(settlement_committed.wait(), timeout=3)
+            request_task.cancel()
+            await asyncio.sleep(0)
+            release_settlement.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+
+    asyncio.run(cancel_after_commit())
+
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+    assert operation["status"] == "completed"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="cancelled",
+        reason="client_cancelled",
+    )
 
 
 def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
@@ -891,3 +1007,75 @@ def test_guided_full_takeover_fences_stale_worker_and_joins_one_winner(
         )
     assert operation["status"] == "completed"
     assert operation["attempt"] == 2
+
+
+def test_late_older_guided_plan_progress_cannot_overwrite_the_newer_operation(
+    composer_test_client,
+) -> None:
+    original_planner = composer_test_client.app.state.composer_service
+
+    class _OrderedPlanner:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def plan_guided_full_pipeline(self, **kwargs):
+            self.calls += 1
+            call = self.calls
+            await kwargs["progress"](
+                ComposerProgressEvent(
+                    phase="calling_model",
+                    headline="The guided planner is preparing a proposal.",
+                    evidence=("A bounded test provider call is active.",),
+                )
+            )
+            if call == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            return await original_planner.plan_guided_full_pipeline(**kwargs)
+
+    planner = _OrderedPlanner()
+    composer_test_client.app.state.composer_service = planner
+    session = composer_test_client.post("/api/sessions", json={"title": "guided progress custody"}).json()
+    older_operation_id = "00000000-0000-4000-8000-000000000071"
+    newer_operation_id = "00000000-0000-4000-8000-000000000072"
+
+    async def race() -> tuple[int, int]:
+        async with AsyncClient(
+            transport=ASGITransport(app=composer_test_client.app),
+            base_url="http://test",
+        ) as client:
+            older = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": older_operation_id, "intent": "Build the older proposal."},
+                )
+            )
+            await asyncio.wait_for(planner.first_started.wait(), timeout=3)
+            newer = await asyncio.wait_for(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": newer_operation_id, "intent": "Build the newer proposal."},
+                ),
+                timeout=3,
+            )
+            latest_after_newer = await composer_test_client.app.state.composer_progress_registry.get_latest(session["id"])
+            assert latest_after_newer.request_id == newer_operation_id
+            assert latest_after_newer.phase == "complete"
+
+            planner.release_first.set()
+            older_response = await asyncio.wait_for(older, timeout=3)
+            return older_response.status_code, newer.status_code
+
+    older_status, newer_status = asyncio.run(race())
+
+    assert newer_status == 200
+    assert older_status != 200
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=newer_operation_id,
+        phase="complete",
+        reason="composer_complete",
+    )

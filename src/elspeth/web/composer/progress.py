@@ -79,6 +79,8 @@ class ComposerProgressRegistry:
         self._snapshots: dict[str, ComposerProgressSnapshot] = {}
         self._user_index: dict[str, str] = {}
         self._inflight: dict[str, int] = {}
+        self._request_generations: dict[str, int] = {}
+        self._next_request_generation = 0
         self._lock = threading.Lock()
 
     def begin_request(self, session_id: str) -> None:
@@ -116,20 +118,70 @@ class ComposerProgressRegistry:
         returned to the SPA.
         """
         with self._lock:
-            updated_at = self._next_timestamp(session_id)
-            snapshot = ComposerProgressSnapshot(
+            return self._publish_locked(
                 session_id=session_id,
                 request_id=request_id,
-                phase=event.phase,
-                headline=event.headline,
-                evidence=event.evidence,
-                likely_next=event.likely_next,
-                reason=event.reason,
-                updated_at=updated_at,
+                user_id=user_id,
+                event=event,
             )
-            self._snapshots[session_id] = snapshot
-            self._user_index[session_id] = user_id
-            return snapshot
+
+    def bind_request(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+        user_id: str,
+    ) -> ComposerProgressSink:
+        """Claim latest-request progress custody and return its guarded sink.
+
+        A guided full-plan releases the per-session compose lock while its
+        provider call runs, so two distinct operations can overlap. The newer
+        operation must remain the progress owner even if the older operation
+        settles later. The captured generation makes every late publication
+        from that superseded operation a no-op without retaining an unbounded
+        set of historical request ids.
+        """
+        with self._lock:
+            self._next_request_generation += 1
+            generation = self._next_request_generation
+            self._request_generations[session_id] = generation
+
+        async def _publish(event: ComposerProgressEvent) -> None:
+            with self._lock:
+                if self._request_generations.get(session_id) != generation:
+                    return
+                self._publish_locked(
+                    session_id=session_id,
+                    request_id=request_id,
+                    user_id=user_id,
+                    event=event,
+                )
+
+        return _publish
+
+    def _publish_locked(
+        self,
+        *,
+        session_id: str,
+        request_id: str | None,
+        user_id: str,
+        event: ComposerProgressEvent,
+    ) -> ComposerProgressSnapshot:
+        """Store one snapshot while ``self._lock`` is held."""
+        updated_at = self._next_timestamp(session_id)
+        snapshot = ComposerProgressSnapshot(
+            session_id=session_id,
+            request_id=request_id,
+            phase=event.phase,
+            headline=event.headline,
+            evidence=event.evidence,
+            likely_next=event.likely_next,
+            reason=event.reason,
+            updated_at=updated_at,
+        )
+        self._snapshots[session_id] = snapshot
+        self._user_index[session_id] = user_id
+        return snapshot
 
     async def get_latest(self, session_id: str) -> ComposerProgressSnapshot:
         """Return latest progress or a neutral idle snapshot.
@@ -196,6 +248,8 @@ class ComposerProgressRegistry:
                 del self._snapshots[session_id]
             if session_id in self._user_index:
                 del self._user_index[session_id]
+            if session_id in self._request_generations:
+                del self._request_generations[session_id]
 
     def _next_timestamp(self, session_id: str) -> datetime:
         now = datetime.now(UTC)
