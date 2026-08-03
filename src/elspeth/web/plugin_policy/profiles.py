@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
 from elspeth.contracts.freeze import freeze_fields
+from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS, CredentialScope, RuntimeLLMProfile, lower_llm_profile_options
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
@@ -746,6 +747,26 @@ class OperatorProfileRegistry:
                 "    schema: {mode: observed}"
             )
         return full_summary.model_copy(update=updates)
+
+    def public_assistance(
+        self,
+        plugin_id: PluginId,
+        full_assistance: PluginAssistance,
+    ) -> PluginAssistance:
+        """Project plugin guidance through the same operator-profile authority."""
+        resolver = self._resolvers.get(plugin_id)
+        if not isinstance(resolver, _TextractDeploymentProfileResolver):
+            return full_assistance
+        return PluginAssistance(
+            plugin_name=full_assistance.plugin_name,
+            issue_code=full_assistance.issue_code,
+            summary="Analyze S3-backed documents asynchronously through the deployment-owned Amazon Textract profile.",
+            composer_hints=(
+                "Set profile to deployment; the server owns the Amazon Textract runtime binding.",
+                "Provide bucket_field and key_field, choose feature_types, and map at least one output field.",
+                "The S3 bucket location is verified against the deployment before document analysis starts.",
+            ),
+        )
 
     def lower_options(
         self,

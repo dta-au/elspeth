@@ -425,6 +425,17 @@ class RowErrorEntry(TypedDict):
     error: NotRequired[str | dict[str, Any]]
 
 
+class BucketRegionVerificationEvidence(TypedDict):
+    """Safe per-row proof that an S3 bucket region was verified."""
+
+    configured_region: str
+    observed_region: str
+    proof_source: Literal["response_field", "response_header", "error_header"]
+    http_status: int
+    cache_status: Literal["live", "cached"]
+    provider_code: NotRequired[str]
+
+
 class UsageStats(TypedDict, total=False):
     """LLM token usage statistics.
 
@@ -688,6 +699,7 @@ class TransformErrorReason(TypedDict):
     code: NotRequired[str]
     configured_region: NotRequired[str]
     observed_region: NotRequired[str]
+    bucket_region_verification: NotRequired[BucketRegionVerificationEvidence]
     url: NotRequired[str]
     blob_ref: NotRequired[str]
     encoding: NotRequired[str]

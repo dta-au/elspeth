@@ -7,6 +7,9 @@ from pydantic import SecretBytes
 
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
+from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.composer.tools._common import ToolContext
+from elspeth.web.composer.tools.generation import _execute_get_plugin_assistance
 from elspeth.web.config import WebSettings
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.availability import build_plugin_snapshot
@@ -132,6 +135,51 @@ def test_trained_operator_textract_summary_retains_explicit_raw_config() -> None
     assert summary.example_use is not None
     assert "region: ap-southeast-2" in summary.example_use
     assert "auth_mode: default_chain" in summary.example_use
+
+
+def test_textract_web_assistance_uses_only_deployment_profile_guidance() -> None:
+    view = _build_view(
+        plugin_allowlist=("transform:aws_textract_document_analysis",),
+        deployment_aws_region="ap-southeast-1",
+    )
+    result = _execute_get_plugin_assistance(
+        {"plugin_type": "transform", "plugin_name": "aws_textract_document_analysis"},
+        CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+        ToolContext(catalog=view, plugin_snapshot=view.snapshot),
+    )
+
+    assert result.success is True
+    payload = result.to_dict()["data"]
+    guidance = " ".join((payload["summary"], *payload["composer_hints"]))
+    assert "profile" in guidance.casefold()
+    assert "deployment" in guidance.casefold()
+    for private_name in (
+        "region",
+        "auth_mode",
+        "secret_ref",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    ):
+        assert private_name not in guidance
+
+
+def test_trained_operator_textract_assistance_retains_raw_configuration_guidance() -> None:
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    trained = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+    result = _execute_get_plugin_assistance(
+        {"plugin_type": "transform", "plugin_name": "aws_textract_document_analysis"},
+        CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+        ToolContext(catalog=trained, plugin_snapshot=snapshot),
+    )
+
+    assert result.success is True
+    payload = result.to_dict()["data"]
+    guidance = " ".join((payload["summary"], *payload["composer_hints"]))
+    assert "default chain" in guidance
+    assert "ELSPETH secret refs" in guidance
+    assert "explicit AWS credentials" in guidance
 
 
 def test_hidden_schema_uses_sanitized_closed_error(view: PolicyCatalogView) -> None:

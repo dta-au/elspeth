@@ -121,6 +121,8 @@ def test_head_bucket_accepts_only_semantic_region_proofs(response: object, sourc
     assert execution.calls[0]["status"] is CallStatus.SUCCESS
     assert execution.calls[0]["response_data"].to_dict()["observed_region"] == "ap-southeast-2"
     assert events[0].provider == "aws-s3"
+    assert events[0].response_payload.to_dict()["configured_region"] == "ap-southeast-2"
+    assert events[0].response_payload.to_dict()["observed_region"] == "ap-southeast-2"
     if source == "error_header":
         assert execution.calls[0]["response_data"].to_dict()["provider_code"] == expected_code
         assert events[0].response_payload.to_dict()["provider_code"] == expected_code
@@ -167,6 +169,8 @@ def test_head_bucket_rejects_unverified_region_without_retaining_provider_messag
     assert exc_info.value.retryable is retryable
     assert execution.calls[0]["status"] is CallStatus.ERROR
     assert execution.order == ["audit", "telemetry"]
+    assert events[0].response_payload.to_dict()["configured_region"] == "ap-southeast-2"
+    assert events[0].response_payload.to_dict()["observed_region"] is None
     assert "private-documents" not in repr(events[0])
     assert "private provider body" not in repr(execution.calls)
 

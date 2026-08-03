@@ -13,6 +13,7 @@ from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.plugins.transforms.aws.textract_bucket_region import (
+    BucketRegionProof,
     BucketRegionUnverifiedError,
     BucketRegionVerification,
 )
@@ -407,6 +408,26 @@ def test_process_raises_use_accept() -> None:
         transform.process(_row(), object())  # type: ignore[arg-type]
 
 
+def test_close_discards_bucket_region_cache_before_restart() -> None:
+    transform = AWSTextractDocumentAnalysis(_config())
+    original = transform._bucket_region_coordinator
+    proof = BucketRegionProof(
+        region="ap-southeast-2",
+        source="response_header",
+        http_status=200,
+    )
+    assert original.verify("docs", lambda: proof).cache_status == "live"
+
+    transform.close()
+
+    refreshed = transform._bucket_region_coordinator
+    assert refreshed is not original
+    live_calls: list[str] = []
+    verification = refreshed.verify("docs", lambda: live_calls.append("called") or proof)
+    assert verification.cache_status == "live"
+    assert live_calls == ["called"]
+
+
 def test_request_token_is_stable_and_request_sensitive() -> None:
     transform = AWSTextractDocumentAnalysis(_config())
     base = transform._client_request_token(
@@ -518,7 +539,8 @@ def test_bucket_region_mismatch_stops_before_request_token_or_textract() -> None
             region="us-east-1",
             source="error_header",
             http_status=403,
-            cache_status="live",
+            cache_status="cached",
+            provider_code="PermanentRedirect",
         )
     )
     transform._bucket_region_coordinator = coordinator  # type: ignore[assignment]
@@ -531,9 +553,77 @@ def test_bucket_region_mismatch_stops_before_request_token_or_textract() -> None
         "reason": "bucket_region_mismatch",
         "configured_region": "ap-southeast-2",
         "observed_region": "us-east-1",
+        "bucket_region_verification": {
+            "configured_region": "ap-southeast-2",
+            "observed_region": "us-east-1",
+            "proof_source": "error_header",
+            "http_status": 403,
+            "cache_status": "cached",
+            "provider_code": "PermanentRedirect",
+        },
     }
     assert result.retryable is False
     assert client.start_calls == []
+
+
+def test_cached_bucket_region_verification_survives_submit_error() -> None:
+    client = FakeTextractClient(
+        pages=[],
+        start=TextractServiceError(code="ThrottlingException", retryable=True),
+    )
+    transform = _transform_for_client(client)
+    transform._bucket_region_coordinator = FakeBucketRegionCoordinator(  # type: ignore[assignment]
+        BucketRegionVerification(
+            region="ap-southeast-2",
+            source="response_header",
+            http_status=200,
+            cache_status="cached",
+        )
+    )
+
+    result = _run(transform)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "submit_failed"
+    assert result.reason["bucket_region_verification"] == {
+        "configured_region": "ap-southeast-2",
+        "observed_region": "ap-southeast-2",
+        "proof_source": "response_header",
+        "http_status": 200,
+        "cache_status": "cached",
+    }
+
+
+def test_cached_bucket_region_verification_survives_poll_error_with_safe_provider_code() -> None:
+    client = FakeTextractClient(
+        pages=[TextractServiceError(code="AccessDeniedException", retryable=False)],
+    )
+    transform = _transform_for_client(client)
+    transform._bucket_region_coordinator = FakeBucketRegionCoordinator(  # type: ignore[assignment]
+        BucketRegionVerification(
+            region="ap-southeast-2",
+            source="error_header",
+            http_status=403,
+            cache_status="cached",
+            provider_code="AccessDenied",
+        )
+    )
+
+    result = _run(transform)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "poll_failed"
+    evidence = result.reason["bucket_region_verification"]
+    assert evidence == {
+        "configured_region": "ap-southeast-2",
+        "observed_region": "ap-southeast-2",
+        "proof_source": "error_header",
+        "http_status": 403,
+        "cache_status": "cached",
+        "provider_code": "AccessDenied",
+    }
+    assert len(evidence["provider_code"]) <= 128
+    assert "\n" not in evidence["provider_code"]
 
 
 def test_semantic_403_region_proof_is_safe_success_metadata() -> None:

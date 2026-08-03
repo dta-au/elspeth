@@ -208,12 +208,15 @@ class HeadBucketClient(AuditedClientBase):
         http_status: int | None,
         proof_source: BucketRegionProofSource | None,
         provider_code: str | None,
+        observed_region: str | None,
     ) -> None:
         telemetry_request = RawCallPayload({"operation": "head_bucket_region", "configured_region": self._region})
         telemetry_response = RawCallPayload(
             {
                 "operation": "head_bucket_region",
                 "status": response_status,
+                "configured_region": self._region,
+                "observed_region": observed_region,
                 "attempts": attempts,
                 "http_status": http_status,
                 "proof_source": proof_source,
@@ -287,6 +290,7 @@ class HeadBucketClient(AuditedClientBase):
             http_status = proof.http_status
             proof_source = proof.source
             provider_code = proof.provider_code
+            observed_region = proof.region
         else:
             assert terminal_error is not None
             status = CallStatus.ERROR
@@ -305,6 +309,7 @@ class HeadBucketClient(AuditedClientBase):
             )
             proof_source = None
             provider_code = terminal_error.code
+            observed_region = None
         self._record_call(
             call_index=call_index,
             call_type=CallType.HTTP,
@@ -322,6 +327,7 @@ class HeadBucketClient(AuditedClientBase):
             http_status=http_status,
             proof_source=proof_source,
             provider_code=provider_code,
+            observed_region=observed_region,
         )
         if terminal_error is not None and proof is None:
             raise terminal_error

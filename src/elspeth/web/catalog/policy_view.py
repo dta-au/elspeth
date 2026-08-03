@@ -12,6 +12,7 @@ from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginI
 from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry
 
 if TYPE_CHECKING:
+    from elspeth.contracts.plugin_assistance import PluginAssistance
     from elspeth.web.composer.state import CompositionState
     from elspeth.web.plugin_policy.validation import PluginPolicyValidationResult, ProfileAwareValidationResult
 
@@ -172,6 +173,22 @@ class PolicyCatalogView:
             self._full.get_schema(plugin_type, name),
             available_aliases=aliases,
         )
+
+    def project_agent_assistance(
+        self,
+        plugin_type: PluginKind,
+        name: str,
+        assistance: PluginAssistance,
+    ) -> PluginAssistance:
+        """Project raw plugin guidance through request-scoped profile policy."""
+        plugin_id = PluginId(plugin_type, name)
+        self._require_available(plugin_id)
+        if self._profiles is None:
+            return assistance
+        aliases = dict(self.snapshot.usable_profile_aliases).get(plugin_id, ())
+        if not aliases:
+            return assistance
+        return self._profiles.public_assistance(plugin_id, assistance)
 
     def lower_operator_profile_options(
         self,

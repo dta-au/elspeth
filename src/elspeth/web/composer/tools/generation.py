@@ -1285,6 +1285,8 @@ def _execute_get_plugin_assistance(
         return _failure_result(state, str(exc))
 
     assistance = plugin_cls.get_agent_assistance(issue_code=issue_code)
+    if assistance is not None:
+        assistance = context.catalog.project_agent_assistance(plugin_type, plugin_name, assistance)
 
     if assistance is None:
         payload: dict[str, Any] = {

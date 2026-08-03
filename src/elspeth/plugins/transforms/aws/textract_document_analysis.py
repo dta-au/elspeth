@@ -19,7 +19,12 @@ from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
-from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory, TransformErrorReason
+from elspeth.contracts.errors import (
+    BucketRegionVerificationEvidence,
+    FrameworkBugError,
+    TransformErrorCategory,
+    TransformErrorReason,
+)
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
@@ -316,7 +321,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:49ca338c7607169b"
+    source_file_hash: str | None = "sha256:cc0d5b8beb151b01"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -488,6 +493,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._shutdown.set()
         if self._batch_initialized:
             self.shutdown_batch_processing()
+        self._bucket_region_coordinator = BucketRegionCoordinator()
         with self._row_clients_lock:
             self._row_clients.clear()
         sdk_client = self._sdk_client
@@ -627,6 +633,28 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 {"reason": "bucket_region_unverified", "error_type": error.code},
                 retryable=error.retryable,
             )
+        result = self._process_verified_document(
+            row,
+            state_id=state_id,
+            token_id=token_id,
+            bucket=bucket,
+            key=key,
+            version=version,
+            verification=verification,
+        )
+        return self._with_bucket_region_verification(result, verification)
+
+    def _process_verified_document(
+        self,
+        row: PipelineRow,
+        *,
+        state_id: str,
+        token_id: str,
+        bucket: str,
+        key: str,
+        version: str | None,
+        verification: BucketRegionVerification,
+    ) -> TransformResult:
         if verification.region != self._region:
             return TransformResult.error(
                 {
@@ -690,7 +718,37 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             else:
                 validation_reason = "malformed_response"
             return TransformResult.error({"reason": validation_reason, "error_type": "result_validation"}, retryable=False)
-        return self._build_enriched_result(row, receipt, normalized, verification=verification)
+        return self._build_enriched_result(row, receipt, normalized)
+
+    def _bucket_region_verification_evidence(
+        self,
+        verification: BucketRegionVerification,
+    ) -> BucketRegionVerificationEvidence:
+        evidence = BucketRegionVerificationEvidence(
+            configured_region=self._region,
+            observed_region=verification.region,
+            proof_source=verification.source,
+            http_status=verification.http_status,
+            cache_status=verification.cache_status,
+        )
+        if verification.provider_code is not None:
+            evidence["provider_code"] = verification.provider_code
+        return evidence
+
+    def _with_bucket_region_verification(
+        self,
+        result: TransformResult,
+        verification: BucketRegionVerification,
+    ) -> TransformResult:
+        evidence = self._bucket_region_verification_evidence(verification)
+        if result.status == "error":
+            assert result.reason is not None
+            result.reason["bucket_region_verification"] = evidence
+            return result
+        assert result.success_reason is not None
+        metadata = result.success_reason.setdefault("metadata", {})
+        metadata["bucket_region_verification"] = evidence
+        return result
 
     def _verify_bucket_region_live(self, bucket: str, *, state_id: str, token_id: str) -> BucketRegionProof:
         if self._recorder is None or self._s3_sdk_client is None or not self._run_id:
@@ -791,8 +849,6 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         row: PipelineRow,
         receipt: StartAnalysisReceipt,
         normalized: NormalizedTextractResult,
-        *,
-        verification: BucketRegionVerification,
     ) -> TransformResult:
         output = row.to_dict()
         if self._text_field is not None:
@@ -820,15 +876,6 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         metadata = normalized.metadata
         warnings = metadata["warnings"]
         warning_count = len(warnings) if isinstance(warnings, list | tuple) else 0
-        bucket_region_metadata: dict[str, object] = {
-            "configured_region": self._region,
-            "observed_region": verification.region,
-            "proof_source": verification.source,
-            "http_status": verification.http_status,
-            "cache_status": verification.cache_status,
-        }
-        if verification.provider_code is not None:
-            bucket_region_metadata["provider_code"] = verification.provider_code
         return TransformResult.success(
             PipelineRow(output, output_contract),
             success_reason={
@@ -842,7 +889,6 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                     "warning_count": warning_count,
                     "feature_types": list(self._feature_types),
                     "result_status": "succeeded",
-                    "bucket_region_verification": bucket_region_metadata,
                 },
             },
         )
