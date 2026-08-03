@@ -36,8 +36,9 @@ import { useBlobStore } from "./blobStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { useSessionStore } from "./sessionStore";
 
-
 const MAX_RECENT_ERRORS = 50;
+const STALE_FANOUT_READINESS_ERROR =
+  "This pipeline is no longer ready to run. Validate it again before executing.";
 
 interface ExecutionState {
   runs: Run[];
@@ -468,6 +469,15 @@ export const useExecutionStore = create<ExecutionState>((set, get) => ({
     const pendingGuard = get().pendingFanoutGuard;
     const pendingSessionId = get().pendingFanoutSessionId;
     if (!pendingGuard || !pendingSessionId) {
+      return null;
+    }
+    if (get().validationResult?.readiness?.execution_ready !== true) {
+      set({
+        isExecuting: false,
+        pendingFanoutGuard: null,
+        pendingFanoutSessionId: null,
+        error: STALE_FANOUT_READINESS_ERROR,
+      });
       return null;
     }
     return get().execute(pendingSessionId, {

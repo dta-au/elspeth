@@ -3,6 +3,10 @@ import { useExecutionStore } from "./executionStore";
 import { useInterpretationEventsStore } from "./interpretationEventsStore";
 import { useSessionStore } from "./sessionStore";
 import { connectToRun } from "@/api/websocket";
+import {
+  EXECUTION_BLOCKED_VALIDATION_READINESS,
+  makeValidationResult,
+} from "@/test/composerFixtures";
 import { resetStore } from "@/test/store-helpers";
 import type { Run, RunAccounting, RunDiagnostics, RunEvent, ValidationResult } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
@@ -591,6 +595,7 @@ describe("executionStore fanout guard", () => {
       })
       .mockResolvedValueOnce({ run_id: "run-1" });
 
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
     await useExecutionStore.getState().execute("session-1");
     const runId = await useExecutionStore.getState().confirmFanoutExecution();
 
@@ -607,6 +612,67 @@ describe("executionStore fanout guard", () => {
     expect(state.pendingFanoutGuard).toBeNull();
     expect(state.pendingFanoutSessionId).toBeNull();
     expect(state.activeRunId).toBe("run-1");
+  });
+
+  it("settles a stale fanout guard without executing when live readiness is false", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      status: 428,
+      detail: guard.summary,
+      error_type: "execution_fanout_ack_required",
+      fanout_guard: guard,
+    });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    useExecutionStore.getState().setValidationResult(
+      makeValidationResult({
+        readiness: EXECUTION_BLOCKED_VALIDATION_READINESS,
+      }),
+    );
+
+    const runId = await useExecutionStore.getState().confirmFanoutExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    expect(executePipeline).toHaveBeenCalledTimes(1);
+    expect(state.pendingFanoutGuard).toBeNull();
+    expect(state.pendingFanoutSessionId).toBeNull();
+    expect(state.isExecuting).toBe(false);
+    expect(state.error).toBe(
+      "This pipeline is no longer ready to run. Validate it again before executing.",
+    );
+  });
+
+  it("settles a stale fanout guard without executing when readiness is missing", async () => {
+    const { executePipeline } = await import("@/api/client");
+    (executePipeline as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      status: 428,
+      detail: guard.summary,
+      error_type: "execution_fanout_ack_required",
+      fanout_guard: guard,
+    });
+
+    useExecutionStore.setState({ validationResult: makeValidationResult() });
+    await useExecutionStore.getState().execute("session-1");
+    useExecutionStore.getState().setValidationResult({
+      is_valid: true,
+      checks: [],
+      errors: [],
+      warnings: [],
+    } as unknown as ValidationResult);
+
+    const runId = await useExecutionStore.getState().confirmFanoutExecution();
+
+    const state = useExecutionStore.getState();
+    expect(runId).toBeNull();
+    expect(executePipeline).toHaveBeenCalledTimes(1);
+    expect(state.pendingFanoutGuard).toBeNull();
+    expect(state.pendingFanoutSessionId).toBeNull();
+    expect(state.isExecuting).toBe(false);
+    expect(state.error).toBe(
+      "This pipeline is no longer ready to run. Validate it again before executing.",
+    );
   });
 });
 
