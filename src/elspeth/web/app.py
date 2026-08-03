@@ -37,6 +37,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import Response as StarletteResponse
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts import RunStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.secrets import (
@@ -1448,16 +1449,22 @@ def _create_app(
 
         These events are operational logging, the recovery channel of last
         resort, while the already-classified and redacted HTTP response is the
-        primary outcome. A logging-backend failure therefore cannot be allowed
-        to turn a deterministic 4xx response into an unrelated 500. There is
-        no safe secondary logger to report a failure of the logger itself.
+        primary outcome. An ordinary logging-backend failure therefore cannot
+        be allowed to turn a deterministic 4xx response into an unrelated 500.
+        Registered Tier-1 framework/audit failures remain fail-closed and
+        escape, matching the canonical engine best-effort boundary. There is no
+        safe secondary logger to report an ordinary failure of the logger.
         """
-        with contextlib.suppress(Exception):
+        try:
             _handler_slog.warning(
                 event,
                 status_code=status_code,
                 request_id=request_id,
             )
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception:
+            return
 
     def _request_id(request: Request) -> str:
         """Read the correlation id set by RequestIdMiddleware.

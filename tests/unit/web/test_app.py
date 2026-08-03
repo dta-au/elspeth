@@ -19,6 +19,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from pydantic import SecretBytes, ValidationError
 from sqlalchemy import create_engine, inspect
 from sqlalchemy.engine import Engine
@@ -30,6 +31,7 @@ from structlog.testing import capture_logs
 import elspeth.web.app as app_module
 import elspeth.web.deployment_contract as deployment_contract_module
 from elspeth.contracts import RunStatus
+from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.core.landscape.database import LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
@@ -2585,6 +2587,38 @@ class TestValidationErrorRedaction:
             status_code=422,
             request_id="trace-validation-log-failure",
         )
+
+    @pytest.mark.asyncio
+    async def test_validation_tier_one_warning_failure_escapes(self, tmp_path: Path) -> None:
+        """Registered Tier-1 failures outrank even the primary validation response."""
+        with patch("elspeth.web.app.structlog.get_logger") as get_logger:
+            get_logger.return_value.warning.side_effect = FrameworkBugError("logger invariant failed")
+            app = create_app(_settings(tmp_path))
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/secrets",
+                "headers": [],
+                "query_string": b"",
+            }
+        )
+        request.state.request_id = "trace-validation-tier-one"
+        validation_error = RequestValidationError(
+            [
+                {
+                    "type": "string_type",
+                    "loc": ("body", "value"),
+                    "msg": "Input should be a valid string",
+                    "input": {"sensitive": "canary"},
+                }
+            ]
+        )
+        handler = app.exception_handlers[RequestValidationError]
+
+        with pytest.raises(FrameworkBugError, match="logger invariant failed"):
+            await handler(request, validation_error)
 
     def test_redaction_preserves_error_structure(self, tmp_path) -> None:
         """Redacted errors retain type, loc, msg for client debugging."""

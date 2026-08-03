@@ -16,7 +16,7 @@ from sqlalchemy.exc import OperationalError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from structlog.testing import capture_logs
 
-from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
+from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata, FrameworkBugError
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.app import create_app
 from elspeth.web.config import WebSettings
@@ -442,6 +442,20 @@ class TestHTTPExceptionRequestIdEnvelope:
             status_code=422,
             request_id="req-log-failure-1",
         )
+
+    @pytest.mark.asyncio
+    async def test_dict_detail_tier_one_warning_failure_escapes(self, tmp_path: Path) -> None:
+        """Registered Tier-1 failures outrank even the primary HTTP response."""
+        with patch("elspeth.web.app.structlog.get_logger") as get_logger:
+            get_logger.return_value.warning.side_effect = FrameworkBugError("logger invariant failed")
+            app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+
+        with pytest.raises(FrameworkBugError, match="logger invariant failed"):
+            await handler(
+                _audit_request("req-log-tier-one-1"),
+                HTTPException(status_code=422, detail={"error_type": "convergence"}),
+            )
 
     @pytest.mark.asyncio
     async def test_response_headers_survive_the_rewrap(self, tmp_path: Path) -> None:
