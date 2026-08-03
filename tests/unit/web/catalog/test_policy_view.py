@@ -37,6 +37,7 @@ def _build_view(
     *,
     principal_scope: str = "local:alice",
     plugin_allowlist: tuple[str, ...] = (),
+    deployment_aws_region: str | None = None,
 ) -> PolicyCatalogView:
     settings = WebSettings(
         composer_max_composition_turns=4,
@@ -45,6 +46,7 @@ def _build_view(
         composer_rate_limit_per_minute=20,
         shareable_link_signing_key=SecretBytes(b"0123456789abcdef0123456789abcdef"),
         plugin_allowlist=plugin_allowlist,
+        deployment_aws_region=deployment_aws_region,
         llm_profiles={
             "task-role": {
                 "provider": "bedrock",
@@ -82,6 +84,54 @@ def test_public_llm_schema_contains_only_usable_alias(view: PolicyCatalogView) -
     rendered = view.get_schema("transform", "llm").model_dump_json()
     assert '"task-role"' in rendered
     assert '"api_key"' not in rendered
+
+
+def test_profiled_list_summary_is_projected_from_public_schema(view: PolicyCatalogView) -> None:
+    llm = next(item for item in view.list_transforms() if item.name == "llm")
+
+    assert "profile" in {field.name for field in llm.config_fields}
+    assert not {field.name for field in llm.config_fields} & {"provider", "model", "api_key", "region_name"}
+    assert llm.secret_requirements == ()
+
+
+def test_textract_web_summary_schema_and_digest_use_deployment_profile() -> None:
+    from elspeth.web.composer.planner_authoring_aids import discovery_digest
+
+    view = _build_view(
+        plugin_allowlist=("transform:aws_textract_document_analysis",),
+        deployment_aws_region="ap-southeast-1",
+    )
+
+    summary = next(item for item in view.list_transforms() if item.name == "aws_textract_document_analysis")
+    field_names = {field.name for field in summary.config_fields}
+    assert "profile" in field_names
+    assert not field_names & {"region", "auth_mode", "aws_access_key_id", "aws_secret_access_key", "aws_session_token"}
+    assert summary.example_use is not None
+    assert "profile: deployment" in summary.example_use
+    assert "region:" not in summary.example_use
+    assert "auth_mode" not in summary.example_use
+    rendered_hints = " ".join(summary.composer_hints)
+    assert "profile" in rendered_hints
+    assert "credentials" not in rendered_hints.casefold()
+
+    schema = view.get_schema("transform", "aws_textract_document_analysis")
+    assert schema.json_schema["properties"]["profile"]["enum"] == ["deployment"]
+    digest_entry = next(item for item in discovery_digest(view)["transforms"] if item["name"] == "aws_textract_document_analysis")
+    assert digest_entry["profile_aliases"] == ["deployment"]
+    assert "profile" in digest_entry["required_options"]
+    assert not set(digest_entry["required_options"]) & {"region", "auth_mode"}
+
+
+def test_trained_operator_textract_summary_retains_explicit_raw_config() -> None:
+    catalog = create_catalog_service()
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    trained = PolicyCatalogView.for_trained_operator(catalog, snapshot)
+
+    summary = next(item for item in trained.list_transforms() if item.name == "aws_textract_document_analysis")
+    assert {"region", "auth_mode"} <= {field.name for field in summary.config_fields}
+    assert summary.example_use is not None
+    assert "region: ap-southeast-2" in summary.example_use
+    assert "auth_mode: default_chain" in summary.example_use
 
 
 def test_hidden_schema_uses_sanitized_closed_error(view: PolicyCatalogView) -> None:

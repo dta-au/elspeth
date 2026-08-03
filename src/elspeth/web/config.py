@@ -25,6 +25,7 @@ from elspeth.plugins.transforms.aws.guardrail_profiles import (
     BEDROCK_GUARDRAIL_PLUGIN_IDS,
     BedrockGuardrailProfileSettings,
 )
+from elspeth.plugins.transforms.aws.textract_regions import is_well_formed_aws_region
 from elspeth.telemetry.resource_identity import is_aws_ecs_name, is_aws_resource_label, is_aws_task_revision, is_release_identity
 from elspeth.web.auth.urls import (
     validate_oidc_browser_endpoints,
@@ -156,6 +157,7 @@ class WebSettings(BaseModel):
     # are resolved by web/deployment_contract.py.
     deployment_target: DeploymentTarget = "default"
     deployment_state_mode: DeploymentStateMode = "auto"
+    deployment_aws_region: str | None = None
     # Operator telemetry is deployment policy, not pipeline-authored routing.
     # The AWS destination and headers are intentionally absent from this model:
     # web/operator_telemetry.py fixes them to the task-local collector and the
@@ -486,6 +488,13 @@ class WebSettings(BaseModel):
         if not v.strip():
             raise ValueError("must not be blank (omit the field or set to a non-empty value)")
         return v
+
+    @field_validator("deployment_aws_region")
+    @classmethod
+    def _validate_deployment_aws_region(cls, value: str | None) -> str | None:
+        if value is not None and not is_well_formed_aws_region(value):
+            raise ValueError("deployment_aws_region must be a non-blank well-formed AWS region identifier")
+        return value
 
     @field_validator("oidc_authorization_allowed_origins")
     @classmethod
@@ -1082,6 +1091,8 @@ def settings_from_env() -> WebSettings:
         if not key.startswith(prefix):
             continue
         field_name = key[len(prefix) :].lower()
+        if field_name == "deployment_aws_region":
+            raise RuntimeError("ELSPETH_WEB__DEPLOYMENT_AWS_REGION is reserved; deployment region comes from ambient AWS_REGION")
         if field_name not in WebSettings.model_fields:
             raise RuntimeError(f"Unknown ELSPETH_WEB__ setting: {key}")
         if field_name in _JSON_COLLECTION_FIELDS | _JSON_OBJECT_FIELDS:
@@ -1102,6 +1113,16 @@ def settings_from_env() -> WebSettings:
             kwargs[field_name] = None
         else:
             kwargs[field_name] = _coerce_env_scalar(value, WebSettings.model_fields[field_name].annotation)
+
+    aws_region = os.environ.get("AWS_REGION")
+    aws_default_region = os.environ.get("AWS_DEFAULT_REGION")
+    if aws_region is not None and (not aws_region.strip() or not is_well_formed_aws_region(aws_region)):
+        raise RuntimeError("AWS_REGION must be a non-blank well-formed AWS region identifier")
+    if aws_default_region is not None and (not aws_default_region.strip() or not is_well_formed_aws_region(aws_default_region)):
+        raise RuntimeError("AWS_DEFAULT_REGION must be a non-blank well-formed AWS region identifier")
+    if aws_region is not None and aws_default_region is not None and aws_region != aws_default_region:
+        raise RuntimeError("AWS_REGION and AWS_DEFAULT_REGION must agree when both are set")
+    kwargs["deployment_aws_region"] = aws_region if aws_region is not None else aws_default_region
 
     try:
         return WebSettings(**kwargs)  # type: ignore[arg-type]

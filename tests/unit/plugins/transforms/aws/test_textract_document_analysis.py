@@ -9,8 +9,13 @@ import pytest
 
 from elspeth.contracts import AuditCharacteristic, Determinism
 from elspeth.contracts.errors import FrameworkBugError
+from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
+from elspeth.plugins.transforms.aws.textract_bucket_region import (
+    BucketRegionUnverifiedError,
+    BucketRegionVerification,
+)
 from elspeth.plugins.transforms.aws.textract_client import (
     AnalysisResultPage,
     StartAnalysisReceipt,
@@ -51,6 +56,7 @@ def test_minimal_default_chain_config() -> None:
     assert cfg.auth_mode == "default_chain"
     assert cfg.feature_types == ["FORMS", "TABLES"]
     assert cfg.all_output_field_names() == ["textract_text"]
+    assert AWSTextractDocumentAnalysis.web_config_authority is WebConfigAuthority.OPERATOR_PROFILED
 
 
 def test_secret_refs_mode_requires_access_and_secret_key() -> None:
@@ -130,6 +136,40 @@ def test_duplicate_feature_types_fail_without_reordering() -> None:
 def test_invalid_region_or_field_name_fails(field: str, value: object) -> None:
     with pytest.raises(PluginConfigError):
         _load(**{field: value})
+
+
+def test_textract_accepts_exact_supported_region_vocabulary() -> None:
+    supported = {
+        "ap-northeast-2",
+        "ap-south-1",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "ca-central-1",
+        "eu-central-1",
+        "eu-south-2",
+        "eu-west-1",
+        "eu-west-2",
+        "eu-west-3",
+        "us-east-1",
+        "us-east-2",
+        "us-west-1",
+        "us-west-2",
+    }
+
+    assert {_load(region=region).region for region in supported} == supported
+
+
+@pytest.mark.parametrize("region", ["af-south-1", "ap-northeast-1", "cn-north-1", "us-gov-west-1", "moon-east-1"])
+def test_textract_rejects_regex_valid_unsupported_region(region: str) -> None:
+    with pytest.raises(PluginConfigError, match="supported Amazon Textract region"):
+        _load(region=region)
+
+
+def test_textract_probe_uses_named_supported_non_default_region() -> None:
+    probe = AWSTextractDocumentAnalysis.probe_config()
+
+    assert probe["region"] == "ap-southeast-2"
+    assert _load(region=probe["region"]).region == probe["region"]
 
 
 @pytest.mark.parametrize(
@@ -271,6 +311,24 @@ class FakeTextractClient:
         return result
 
 
+class FakeBucketRegionCoordinator:
+    def __init__(self, outcome: BucketRegionVerification | Exception | None = None) -> None:
+        self.outcome = outcome or BucketRegionVerification(
+            region="ap-southeast-2",
+            source="response_header",
+            http_status=200,
+            cache_status="live",
+        )
+        self.calls: list[str] = []
+
+    def verify(self, bucket: str, live_verify: object) -> BucketRegionVerification:
+        del live_verify
+        self.calls.append(bucket)
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+
 def _page(
     *,
     status: str = "SUCCEEDED",
@@ -313,6 +371,7 @@ def _transform_for_client(client: FakeTextractClient, **overrides: object) -> AW
     transform._poll_interval_seconds = 0.001
     transform._poll_max_interval_seconds = 0.001
     transform._row_clients["state-1"] = client
+    transform._bucket_region_coordinator = FakeBucketRegionCoordinator()  # type: ignore[assignment]
     return transform
 
 
@@ -441,7 +500,86 @@ def test_in_progress_then_succeeded_enriches() -> None:
         "textract_text": "Complete document",
     }
     assert result.success_reason["action"] == "enriched"
+    assert result.success_reason["metadata"]["bucket_region_verification"] == {
+        "configured_region": "ap-southeast-2",
+        "observed_region": "ap-southeast-2",
+        "proof_source": "response_header",
+        "http_status": 200,
+        "cache_status": "live",
+    }
     assert len(client.get_calls) == 2
+
+
+def test_bucket_region_mismatch_stops_before_request_token_or_textract() -> None:
+    client = FakeTextractClient(pages=[])
+    transform = _transform_for_client(client)
+    coordinator = FakeBucketRegionCoordinator(
+        BucketRegionVerification(
+            region="us-east-1",
+            source="error_header",
+            http_status=403,
+            cache_status="live",
+        )
+    )
+    transform._bucket_region_coordinator = coordinator  # type: ignore[assignment]
+    transform._client_request_token = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("token computed too early"))  # type: ignore[method-assign]
+
+    result = _run(transform)
+
+    assert result.status == "error"
+    assert result.reason == {
+        "reason": "bucket_region_mismatch",
+        "configured_region": "ap-southeast-2",
+        "observed_region": "us-east-1",
+    }
+    assert result.retryable is False
+    assert client.start_calls == []
+
+
+def test_semantic_403_region_proof_is_safe_success_metadata() -> None:
+    client = FakeTextractClient(pages=[_page(blocks=_basic_blocks())])
+    transform = _transform_for_client(client)
+    transform._bucket_region_coordinator = FakeBucketRegionCoordinator(  # type: ignore[assignment]
+        BucketRegionVerification(
+            region="ap-southeast-2",
+            source="error_header",
+            http_status=403,
+            cache_status="live",
+            provider_code="AccessDenied",
+        )
+    )
+
+    result = _run(transform)
+
+    assert result.status == "success"
+    assert result.success_reason["metadata"]["bucket_region_verification"] == {
+        "configured_region": "ap-southeast-2",
+        "observed_region": "ap-southeast-2",
+        "proof_source": "error_header",
+        "http_status": 403,
+        "cache_status": "live",
+        "provider_code": "AccessDenied",
+    }
+
+
+@pytest.mark.parametrize("retryable", [False, True])
+def test_unverified_bucket_region_stops_textract_and_preserves_retryability(retryable: bool) -> None:
+    client = FakeTextractClient(pages=[])
+    transform = _transform_for_client(client)
+    transform._bucket_region_coordinator = FakeBucketRegionCoordinator(  # type: ignore[assignment]
+        BucketRegionUnverifiedError(code="transport_error" if retryable else "NoSuchBucket", retryable=retryable)
+    )
+    transform._client_request_token = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("token computed too early"))  # type: ignore[method-assign]
+
+    result = _run(transform)
+
+    assert result.status == "error"
+    assert result.reason == {
+        "reason": "bucket_region_unverified",
+        "error_type": "transport_error" if retryable else "NoSuchBucket",
+    }
+    assert result.retryable is retryable
+    assert client.start_calls == []
 
 
 def _all_facet_blocks() -> list[dict[str, object]]:
@@ -797,24 +935,37 @@ def test_on_start_requires_landscape() -> None:
 
 
 def test_on_start_builds_with_resolved_secrets_and_close_closes_sdk_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    sdk = FakeTextractClient(pages=[])
-    sdk.closed = False
+    textract_sdk = FakeTextractClient(pages=[])
+    textract_sdk.close_count = 0
+    s3_sdk = SimpleNamespace(close_count=0)
 
-    def close() -> None:
-        sdk.closed = True
+    def close_textract() -> None:
+        textract_sdk.close_count += 1
 
-    sdk.close = close  # type: ignore[attr-defined,method-assign]
-    captured: dict[str, object] = {}
+    def close_s3() -> None:
+        s3_sdk.close_count += 1
 
-    def build(**kwargs: object) -> object:
-        captured.update(kwargs)
-        return sdk
+    textract_sdk.close = close_textract  # type: ignore[attr-defined,method-assign]
+    s3_sdk.close = close_s3
+    captured: dict[str, dict[str, object]] = {}
+
+    def build_textract(**kwargs: object) -> object:
+        captured["textract"] = dict(kwargs)
+        return textract_sdk
+
+    def build_s3(**kwargs: object) -> object:
+        captured["s3"] = dict(kwargs)
+        return s3_sdk
 
     limiter = object()
     registry = SimpleNamespace(get_limiter=lambda name: limiter if name == "aws_textract_document_analysis" else None)
     monkeypatch.setattr(
         "elspeth.plugins.transforms.aws.textract_document_analysis.build_textract_sdk_client",
-        build,
+        build_textract,
+    )
+    monkeypatch.setattr(
+        "elspeth.plugins.transforms.aws.textract_document_analysis.build_s3_head_bucket_sdk_client",
+        build_s3,
     )
     transform = AWSTextractDocumentAnalysis(
         _config(
@@ -835,16 +986,51 @@ def test_on_start_builds_with_resolved_secrets_and_close_closes_sdk_once(monkeyp
 
     transform.on_start(ctx)
 
-    assert captured == {
+    expected = {
         "region": "ap-southeast-2",
         "aws_access_key_id": "resolved-access-id",
         "aws_secret_access_key": "resolved-secret-key",
         "aws_session_token": "resolved-session-token",
     }
+    assert captured == {"s3": expected, "textract": expected}
     assert transform._limiter is limiter
     transform.close()
     transform.close()
-    assert sdk.closed is True
+    assert textract_sdk.close_count == 1
+    assert s3_sdk.close_count == 1
+
+
+def test_on_start_closes_s3_when_textract_client_construction_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    s3_sdk = SimpleNamespace(close_count=0)
+
+    def close_s3() -> None:
+        s3_sdk.close_count += 1
+
+    s3_sdk.close = close_s3
+    monkeypatch.setattr(
+        "elspeth.plugins.transforms.aws.textract_document_analysis.build_s3_head_bucket_sdk_client",
+        lambda **_kwargs: s3_sdk,
+    )
+    monkeypatch.setattr(
+        "elspeth.plugins.transforms.aws.textract_document_analysis.build_textract_sdk_client",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("construction failed")),
+    )
+    transform = AWSTextractDocumentAnalysis(_config())
+    ctx = SimpleNamespace(
+        landscape=object(),
+        node_id="node-1",
+        run_id="run-1",
+        telemetry_emit=lambda _event: None,
+        rate_limit_registry=None,
+        shutdown_event=None,
+    )
+
+    with pytest.raises(RuntimeError, match="construction failed"):
+        transform.on_start(ctx)
+
+    assert s3_sdk.close_count == 1
+    assert transform._s3_sdk_client is None
+    assert transform._sdk_client is None
 
 
 def test_assistance_distinguishes_async_s3_and_secret_refs_from_inline_plugin() -> None:

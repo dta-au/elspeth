@@ -809,34 +809,24 @@ def discovery_digest(
         "sinks": _digest_entries(summaries["sink"]),
     }
 
-    # run-3 E4: each llm component carries its LIVE profile-alias enum so
-    # profile-first authoring never needs a discovery round to learn the
-    # aliases (they are already policy-public via the knob schema's choices).
-    def project_llm_profile(kind: PluginKind, entries: list[_PluginDigestEntry]) -> None:
-        llm_aliases = sorted(
-            alias
-            for plugin_id, aliases in catalog.snapshot.usable_profile_aliases
-            if plugin_id.kind == kind and plugin_id.name == "llm"
-            for alias in aliases
-        )
-        if not llm_aliases:
-            return
-        # run-5 P2 correction: required_options above came from the RAW
-        # plugin schema (provider-form), never the operator profile's public
-        # schema. On a profile-bound deployment that advertised provider/
-        # model/credential fields as required even though the profile resolver
-        # rejects them outright — steering the planner into a guaranteed
-        # profile_unavailable / plugin_unavailable rejection. Project each
-        # component through its own live public schema.
-        public_schema = catalog.get_schema(kind, "llm")
+    # Every operator-profiled component carries its live alias enum and public
+    # required set. Kind-qualified identity prevents same-name source and
+    # transform profiles from borrowing each other's contract.
+    digest_by_kind: dict[PluginKind, list[_PluginDigestEntry]] = {
+        "source": digest["sources"],
+        "transform": digest["transforms"],
+        "sink": digest["sinks"],
+    }
+    for plugin_id, aliases in catalog.snapshot.usable_profile_aliases:
+        if not aliases:
+            continue
+        public_schema = catalog.get_schema(plugin_id.kind, plugin_id.name)
         public_required = [field["name"] for field in public_schema.knob_schema.get("fields", ()) if field.get("required")]
-        for entry in entries:
-            if entry["name"] == "llm":
-                entry["profile_aliases"] = llm_aliases
+        for entry in digest_by_kind[plugin_id.kind]:
+            if entry["name"] == plugin_id.name:
+                entry["profile_aliases"] = sorted(aliases)
                 entry["required_options"] = public_required
-
-    project_llm_profile("source", digest["sources"])
-    project_llm_profile("transform", digest["transforms"])
+                break
     return digest
 
 

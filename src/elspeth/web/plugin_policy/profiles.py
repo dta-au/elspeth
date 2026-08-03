@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 from collections.abc import Mapping
 from copy import deepcopy
@@ -15,9 +16,10 @@ from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS, CredentialScope, RuntimeLLMProfile, lower_llm_profile_options
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
+from elspeth.plugins.transforms.aws.textract_regions import is_supported_textract_region
 
 if TYPE_CHECKING:
-    from elspeth.web.catalog.schemas import PluginSchemaInfo
+    from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.models import PluginId, WebPluginPolicy
 
@@ -31,6 +33,7 @@ class RuntimeWebPluginConfig:
     default_llm_profile: str | None
     bedrock_guardrail_profiles: tuple[BedrockGuardrailProfileSettings, ...] = field(repr=False)
     bedrock_guardrail_default_profiles: tuple[tuple[str, str], ...]
+    deployment_aws_region: str | None
 
     @property
     def operator_profiles(self) -> tuple[BedrockGuardrailProfileSettings, ...]:
@@ -52,6 +55,7 @@ class RuntimeWebPluginConfig:
             default_llm_profile=settings.default_llm_profile,
             bedrock_guardrail_profiles=tuple(sorted(settings.bedrock_guardrail_profiles, key=lambda profile: profile.alias)),
             bedrock_guardrail_default_profiles=tuple(sorted(settings.bedrock_guardrail_default_profiles.items())),
+            deployment_aws_region=settings.deployment_aws_region,
         )
 
 
@@ -505,6 +509,135 @@ class _BedrockGuardrailProfileResolver:
             raise ValueError("profile_unavailable") from None
 
 
+_TEXTRACT_PRIVATE_OPTIONS = frozenset(
+    {
+        "region",
+        "auth_mode",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    }
+)
+
+
+class _TextractDeploymentProfileResolver:
+    _ALIAS = "deployment"
+
+    def __init__(self, region: str) -> None:
+        if not is_supported_textract_region(region):
+            raise ValueError("profile_unavailable")
+        self._region = region
+
+    def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
+        from elspeth.web.catalog.schemas import PluginSchemaInfo
+
+        raw_properties = full_schema.json_schema.get("properties", {})
+        if not isinstance(raw_properties, dict):
+            raise ValueError("malformed_profile_schema")
+        safe_properties = {
+            "profile": {
+                "type": "string",
+                "enum": list(available_aliases),
+                "description": "Deployment-owned Amazon Textract profile alias",
+            },
+            **{
+                name: deepcopy(schema)
+                for name, schema in raw_properties.items()
+                if name not in _TEXTRACT_PRIVATE_OPTIONS and isinstance(schema, dict)
+            },
+        }
+        raw_required = full_schema.json_schema.get("required", ())
+        required = [
+            "profile",
+            *(name for name in raw_required if isinstance(name, str) and name not in _TEXTRACT_PRIVATE_OPTIONS),
+        ]
+        public_json_schema: dict[str, Any] = {
+            "type": "object",
+            "properties": safe_properties,
+            "required": required,
+            "additionalProperties": False,
+        }
+        definitions = full_schema.json_schema.get("$defs", {})
+        referenced_definitions: dict[str, Any] = {}
+        pending = _schema_refs(public_json_schema)
+        while pending:
+            definition_name = pending.pop()
+            if definition_name in referenced_definitions:
+                continue
+            definition = definitions.get(definition_name) if isinstance(definitions, dict) else None
+            if isinstance(definition, dict):
+                referenced_definitions[definition_name] = deepcopy(definition)
+                pending.update(_schema_refs(definition))
+        if referenced_definitions:
+            public_json_schema["$defs"] = referenced_definitions
+
+        raw_fields = full_schema.knob_schema.get("fields", ())
+        fields: list[dict[str, Any]] = [
+            {
+                "name": "profile",
+                "type": "string",
+                "required": True,
+                "description": "Deployment-owned Amazon Textract profile alias",
+                "choices": list(available_aliases),
+            }
+        ]
+        for raw_field in raw_fields:
+            if not isinstance(raw_field, dict) or raw_field.get("name") in _TEXTRACT_PRIVATE_OPTIONS:
+                continue
+            field_projection = deepcopy(raw_field)
+            field_name = field_projection.get("name")
+            if isinstance(field_name, str):
+                field_projection["required"] = field_name in required
+            fields.append(field_projection)
+        return PluginSchemaInfo(
+            name=full_schema.name,
+            plugin_type=full_schema.plugin_type,
+            description=full_schema.description,
+            json_schema=public_json_schema,
+            knob_schema={"fields": fields},
+            composer_hints=(
+                "Set profile to deployment; the server owns Amazon Textract region and default-chain authentication.",
+                "Provide bucket_field and key_field, choose feature_types, and map at least one output field.",
+                "The S3 bucket is verified against the deployment region before document analysis starts.",
+            ),
+            secret_requirements=(),
+            web_config_authority=full_schema.web_config_authority,
+            policy_capabilities=full_schema.policy_capabilities,
+        )
+
+    def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
+        if alias != self._ALIAS:
+            raise ValueError("profile_unavailable")
+        if set(safe_options) & _TEXTRACT_PRIVATE_OPTIONS:
+            raise ValueError("private_profile_option")
+        executable = {**safe_options, "region": self._region, "auth_mode": "default_chain"}
+        return LoweredPluginConfig(
+            executable_options=MappingProxyType(executable),
+            audit_safe_options=MappingProxyType({"profile": alias, **safe_options}),
+        )
+
+    def profile_availability(
+        self,
+        principal: str,
+        inventory: ProfileCredentialInventory,
+    ) -> tuple[ProfileAvailability, ...]:
+        del principal, inventory
+        generation = hashlib.sha256(
+            json.dumps(
+                {"region": self._region, "auth_mode": "default_chain"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        return (ProfileAvailability(alias=self._ALIAS, credential_scope=None, usable=True, generation=generation),)
+
+    def check_local_requirements(self, alias: str) -> LocalRequirementResult:
+        return LocalRequirementResult(available=alias == self._ALIAS)
+
+    def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None:
+        return self._ALIAS if self._ALIAS in usable_aliases else None
+
+
 def _schema_refs(value: object) -> set[str]:
     refs: set[str] = set()
     if isinstance(value, dict):
@@ -545,6 +678,11 @@ class OperatorProfileRegistry:
                     plugin_profiles,
                     default_alias=defaults.get(plugin_name),
                 )
+        if is_supported_textract_region(settings.deployment_aws_region) and importlib.util.find_spec("boto3") is not None:
+            assert settings.deployment_aws_region is not None
+            self._resolvers[PluginId("transform", "aws_textract_document_analysis")] = _TextractDeploymentProfileResolver(
+                settings.deployment_aws_region
+            )
 
     def public_schema(
         self,
@@ -557,6 +695,57 @@ class OperatorProfileRegistry:
         if resolver is None:
             return full_schema
         return resolver.public_schema(full_schema, available_aliases)
+
+    def public_summary(
+        self,
+        plugin_id: PluginId,
+        full_summary: PluginSummary,
+        full_schema: PluginSchemaInfo,
+        *,
+        available_aliases: tuple[str, ...],
+    ) -> PluginSummary:
+        """Project list discovery through the same profile contract as schema discovery."""
+        from elspeth.web.catalog.schema_parse import SchemaObject
+        from elspeth.web.catalog.schemas import ConfigFieldSummary
+
+        resolver = self._resolvers.get(plugin_id)
+        if resolver is None:
+            return full_summary
+        public_schema = resolver.public_schema(full_schema, available_aliases)
+        parsed = SchemaObject.model_validate(public_schema.json_schema)
+        required = set(parsed.required)
+        config_fields: list[ConfigFieldSummary] = []
+        for name, field_schema in parsed.properties.items():
+            json_type = field_schema.type or "object"
+            if field_schema.any_of and field_schema.type is None:
+                json_type = next((branch.type or "object" for branch in field_schema.any_of if branch.type != "null"), "object")
+            config_fields.append(
+                ConfigFieldSummary(
+                    name=name,
+                    type=json_type,
+                    required=name in required,
+                    description=field_schema.description,
+                    default=field_schema.default,
+                )
+            )
+        updates: dict[str, object] = {
+            "config_fields": config_fields,
+            "composer_hints": public_schema.composer_hints,
+            "secret_requirements": public_schema.secret_requirements,
+        }
+        if isinstance(resolver, _TextractDeploymentProfileResolver):
+            updates["example_use"] = (
+                "transform:\n"
+                "  plugin: aws_textract_document_analysis\n"
+                "  options:\n"
+                "    profile: deployment\n"
+                "    bucket_field: document_bucket\n"
+                "    key_field: document_key\n"
+                "    feature_types: [TABLES, FORMS]\n"
+                "    text_field: textract_text\n"
+                "    schema: {mode: observed}"
+            )
+        return full_summary.model_copy(update=updates)
 
     def lower_options(
         self,

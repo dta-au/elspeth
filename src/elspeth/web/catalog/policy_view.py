@@ -66,7 +66,26 @@ class PolicyCatalogView:
         return self._full_items_cache[kind]
 
     def _visible(self, kind: PluginKind, items: list[PluginSummary]) -> list[PluginSummary]:
-        return [item for item in items if PluginId(kind, item.name) in self.snapshot.available]
+        visible = [item for item in items if PluginId(kind, item.name) in self.snapshot.available]
+        if self._profiles is None:
+            return visible
+        aliases_by_plugin = dict(self.snapshot.usable_profile_aliases)
+        projected: list[PluginSummary] = []
+        for item in visible:
+            plugin_id = PluginId(kind, item.name)
+            aliases = aliases_by_plugin.get(plugin_id, ())
+            if not aliases:
+                projected.append(item)
+                continue
+            projected.append(
+                self._profiles.public_summary(
+                    plugin_id,
+                    item,
+                    self._full.get_schema(kind, item.name),
+                    available_aliases=aliases,
+                )
+            )
+        return projected
 
     def list_sources(self) -> list[PluginSummary]:
         return self._visible("source", self._full_items("source"))

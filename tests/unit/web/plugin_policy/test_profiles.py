@@ -215,10 +215,137 @@ def test_runtime_conversion_consumes_every_universal_setting_field() -> None:
         "default_llm_profile",
         "bedrock_guardrail_profiles",
         "bedrock_guardrail_default_profiles",
+        "deployment_aws_region",
     }
     runtime_fields = set(RuntimeWebPluginConfig.__dataclass_fields__)
 
     assert settings_fields == runtime_fields
+
+
+def test_textract_deployment_profile_exposes_only_alias_and_ordinary_options() -> None:
+    runtime = RuntimeWebPluginConfig.from_settings(_settings(deployment_aws_region="ap-southeast-1"))
+    policy = compile_web_plugin_policy(
+        registry=_isolated_manager_with_llm_source(),
+        settings=RuntimeWebPluginConfig.from_settings(
+            _settings(
+                deployment_aws_region="ap-southeast-1",
+                plugin_allowlist=("transform:aws_textract_document_analysis",),
+            )
+        ),
+    )
+    registry = OperatorProfileRegistry(policy=policy, settings=runtime)
+    plugin_id = PluginId("transform", "aws_textract_document_analysis")
+
+    public = registry.public_schema(
+        plugin_id,
+        create_catalog_service().get_schema("transform", "aws_textract_document_analysis"),
+        available_aliases=("deployment",),
+    )
+
+    properties = public.json_schema["properties"]
+    assert properties["profile"]["enum"] == ["deployment"]
+    assert {"bucket_field", "key_field", "feature_types", "text_field", "schema"} <= set(properties)
+    assert not set(properties) & {
+        "region",
+        "auth_mode",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    }
+    assert set(public.json_schema["required"]) == {
+        "profile",
+        "bucket_field",
+        "key_field",
+        "feature_types",
+        "schema",
+    }
+    assert public.json_schema["additionalProperties"] is False
+    assert public.secret_requirements == ()
+    assert "SchemaConfig" in public.json_schema["$defs"]
+
+
+def test_textract_deployment_profile_lowers_and_rotates_binding_with_region() -> None:
+    def registry_for(region: str) -> OperatorProfileRegistry:
+        runtime = RuntimeWebPluginConfig.from_settings(_settings(deployment_aws_region=region))
+        policy = compile_web_plugin_policy(
+            registry=_isolated_manager_with_llm_source(),
+            settings=RuntimeWebPluginConfig.from_settings(
+                _settings(
+                    deployment_aws_region=region,
+                    plugin_allowlist=("transform:aws_textract_document_analysis",),
+                )
+            ),
+        )
+        return OperatorProfileRegistry(policy=policy, settings=runtime)
+
+    plugin_id = PluginId("transform", "aws_textract_document_analysis")
+    safe = {
+        "bucket_field": "bucket",
+        "key_field": "key",
+        "feature_types": ["FORMS"],
+        "text_field": "text",
+        "schema": {"mode": "observed"},
+    }
+    first = registry_for("ap-southeast-1")
+    second = registry_for("eu-west-1")
+    lowered = first.lower_options(plugin_id, alias="deployment", safe_options=safe)
+
+    assert deep_thaw(lowered.executable_options) == {
+        **safe,
+        "region": "ap-southeast-1",
+        "auth_mode": "default_chain",
+    }
+    assert deep_thaw(lowered.audit_safe_options) == {"profile": "deployment", **safe}
+    assert first.profile_availability(plugin_id, principal="local:alice", inventory=cast(Any, object()))[0].generation != (
+        second.profile_availability(plugin_id, principal="local:alice", inventory=cast(Any, object()))[0].generation
+    )
+
+
+def test_textract_deployment_profile_requires_local_boto3(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.util
+
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        "elspeth.web.plugin_policy.profiles.importlib.util.find_spec",
+        lambda name: None if name == "boto3" else real_find_spec(name),
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(_settings(deployment_aws_region="ap-southeast-1"))
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
+    registry = OperatorProfileRegistry(policy=policy, settings=runtime)
+
+    assert (
+        registry.profile_availability(
+            PluginId("transform", "aws_textract_document_analysis"),
+            principal="local:alice",
+            inventory=cast(Any, object()),
+        )
+        == ()
+    )
+
+
+@pytest.mark.parametrize(
+    "private",
+    ["region", "auth_mode", "aws_access_key_id", "aws_secret_access_key", "aws_session_token"],
+)
+def test_textract_deployment_profile_rejects_private_or_mixed_options(private: str) -> None:
+    runtime = RuntimeWebPluginConfig.from_settings(_settings(deployment_aws_region="ap-southeast-1"))
+    policy = compile_web_plugin_policy(
+        registry=_isolated_manager_with_llm_source(),
+        settings=RuntimeWebPluginConfig.from_settings(
+            _settings(
+                deployment_aws_region="ap-southeast-1",
+                plugin_allowlist=("transform:aws_textract_document_analysis",),
+            )
+        ),
+    )
+    registry = OperatorProfileRegistry(policy=policy, settings=runtime)
+
+    with pytest.raises(ValueError, match="private_profile_option"):
+        registry.lower_options(
+            PluginId("transform", "aws_textract_document_analysis"),
+            alias="deployment",
+            safe_options={"bucket_field": "bucket", private: "attacker"},
+        )
 
 
 def test_llm_profiles_without_a_standard_profile_start_in_degraded_mode() -> None:

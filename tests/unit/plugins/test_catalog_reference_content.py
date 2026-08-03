@@ -95,8 +95,11 @@ OPERATOR_PROFILED_IDENTITIES = frozenset(
         "transform:llm",
         "transform:aws_bedrock_prompt_shield",
         "transform:aws_bedrock_content_safety",
+        "transform:aws_textract_document_analysis",
     }
 )
+RAW_TRAINED_OPERATOR_PROFILED_IDENTITIES = frozenset({"transform:aws_textract_document_analysis"})
+WEB_PROFILE_EXAMPLE_IDENTITIES = OPERATOR_PROFILED_IDENTITIES - RAW_TRAINED_OPERATOR_PROFILED_IDENTITIES
 REFERENCE_FIELDS = (
     "usage_when_to_use",
     "usage_when_not_to_use",
@@ -214,10 +217,13 @@ def test_every_builtin_owns_specific_reference_content(reference: BuiltinReferen
     assert_reference_tags(reference.plugin_cls)
 
 
-DIRECT_CONFIG_REFERENCES = tuple(reference for reference in REFERENCES if _identity(reference) not in OPERATOR_PROFILED_IDENTITIES)
+DIRECT_CONFIG_REFERENCES = tuple(reference for reference in REFERENCES if _identity(reference) not in WEB_PROFILE_EXAMPLE_IDENTITIES)
 
 
 def test_operator_profiled_exception_set_is_fixed_and_exhaustive() -> None:
+    assert {
+        _identity(reference) for reference in REFERENCES if reference.plugin_cls.web_config_authority.value == "operator_profiled"
+    } == OPERATOR_PROFILED_IDENTITIES
     profiled_examples: set[str] = set()
     for reference in REFERENCES:
         if reference.kind == "sink":
@@ -237,7 +243,7 @@ def test_operator_profiled_exception_set_is_fixed_and_exhaustive() -> None:
         if "profile" in options:
             profiled_examples.add(_identity(reference))
 
-    assert profiled_examples == OPERATOR_PROFILED_IDENTITIES
+    assert profiled_examples == WEB_PROFILE_EXAMPLE_IDENTITIES
     assert len(DIRECT_CONFIG_REFERENCES) == 44
 
 
@@ -248,7 +254,7 @@ def test_direct_config_builtin_examples_are_valid(reference: BuiltinReference) -
 
 @pytest.mark.parametrize(
     "identity",
-    sorted(OPERATOR_PROFILED_IDENTITIES),
+    sorted(WEB_PROFILE_EXAMPLE_IDENTITIES),
 )
 def test_operator_profiled_builtin_examples_are_valid(identity: str) -> None:
     reference = REFERENCES_BY_IDENTITY[identity]

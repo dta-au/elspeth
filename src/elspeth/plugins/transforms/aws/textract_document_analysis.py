@@ -22,6 +22,7 @@ from elspeth.contracts.enums import AuditCharacteristic
 from elspeth.contracts.errors import FrameworkBugError, TransformErrorCategory, TransformErrorReason
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.canonical import canonical_json
 from elspeth.plugins.infrastructure.base import BaseTransform
@@ -29,6 +30,15 @@ from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputP
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
+from elspeth.plugins.transforms.aws.textract_bucket_region import (
+    BucketRegionCoordinator,
+    BucketRegionProof,
+    BucketRegionUnverifiedError,
+    BucketRegionVerification,
+    HeadBucketClient,
+    S3HeadBucketSDKClient,
+    build_s3_head_bucket_sdk_client,
+)
 from elspeth.plugins.transforms.aws.textract_client import (
     StartAnalysisReceipt,
     TextractClient,
@@ -38,6 +48,7 @@ from elspeth.plugins.transforms.aws.textract_client import (
     TextractServiceError,
     build_textract_sdk_client,
 )
+from elspeth.plugins.transforms.aws.textract_regions import TEXTRACT_INVARIANT_PROBE_REGION, TEXTRACT_REGIONS
 from elspeth.plugins.transforms.aws.textract_result import (
     MalformedTextractResponse,
     NormalizedTextractResult,
@@ -48,7 +59,6 @@ FeatureType = Literal["TABLES", "FORMS", "QUERIES", "SIGNATURES", "LAYOUT"]
 AuthMode = Literal["default_chain", "secret_refs"]
 
 _FEATURE_TYPES = frozenset({"TABLES", "FORMS", "QUERIES", "SIGNATURES", "LAYOUT"})
-_REGION_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _QUERY_TEXT_PATTERN = re.compile(r"^[a-zA-Z0-9\s!\"#$%'&()*+,\-./:;=?@[\\\]^_`{|}~><]+$")
 _QUERY_PAGE_PATTERN = re.compile(r"^[0-9*\-]+$")
 _FACET_NAMES = ("pages", "tables", "forms", "queries", "signatures", "layout")
@@ -227,8 +237,8 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
     @field_validator("region")
     @classmethod
     def _region(cls, value: str) -> str:
-        if _REGION_PATTERN.fullmatch(value) is None:
-            raise ValueError("region must be a lowercase hyphen-separated AWS region identifier")
+        if value not in TEXTRACT_REGIONS:
+            raise ValueError("region must be a supported Amazon Textract region")
         return value
 
     @field_validator("bucket_field", "key_field", "version_field", "text_field", "page_count_field", "metadata_field", "result_field")
@@ -306,12 +316,13 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:a89e44b13e69f59c"
+    source_file_hash: str | None = "sha256:49ca338c7607169b"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
     audit_characteristics = frozenset({AuditCharacteristic.CREDENTIALS})
     capability_tags = ("aws", "textract", "document", "ocr", "enrichment")
+    web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
     usage_when_to_use = (
         "Use when each row names a document already stored in S3 and you need asynchronous Textract "
@@ -338,7 +349,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     @classmethod
     def probe_config(cls) -> dict[str, Any]:
         return {
-            "region": "us-east-1",
+            "region": TEXTRACT_INVARIANT_PROBE_REGION,
             "auth_mode": "default_chain",
             "bucket_field": "document_bucket",
             "key_field": "document_key",
@@ -402,6 +413,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._telemetry_emit: Callable[[Any], None] = _warn_telemetry_before_start
         self._limiter: Any = None
         self._sdk_client: TextractSDKClient | None = None
+        self._s3_sdk_client: S3HeadBucketSDKClient | None = None
+        self._bucket_region_coordinator = BucketRegionCoordinator()
         self._row_clients: dict[str, TextractClient] = {}
         self._row_clients_lock = threading.Lock()
         self._shutdown = threading.Event()
@@ -421,13 +434,34 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._limiter = ctx.rate_limit_registry.get_limiter(self.name) if ctx.rate_limit_registry is not None else None
         if ctx.shutdown_event is not None:
             self._shutdown = ctx.shutdown_event
-        if self._sdk_client is None:
-            self._sdk_client = build_textract_sdk_client(
-                region=self._region,
-                aws_access_key_id=self._aws_access_key_id,
-                aws_secret_access_key=self._aws_secret_access_key,
-                aws_session_token=self._aws_session_token,
-            )
+        self._bucket_region_coordinator = BucketRegionCoordinator()
+        created_s3 = False
+        created_textract = False
+        try:
+            if self._s3_sdk_client is None:
+                self._s3_sdk_client = build_s3_head_bucket_sdk_client(
+                    region=self._region,
+                    aws_access_key_id=self._aws_access_key_id,
+                    aws_secret_access_key=self._aws_secret_access_key,
+                    aws_session_token=self._aws_session_token,
+                )
+                created_s3 = True
+            if self._sdk_client is None:
+                self._sdk_client = build_textract_sdk_client(
+                    region=self._region,
+                    aws_access_key_id=self._aws_access_key_id,
+                    aws_secret_access_key=self._aws_secret_access_key,
+                    aws_session_token=self._aws_session_token,
+                )
+                created_textract = True
+        except Exception:
+            if created_textract and self._sdk_client is not None:
+                self._sdk_client.close()
+                self._sdk_client = None
+            if created_s3 and self._s3_sdk_client is not None:
+                self._s3_sdk_client.close()
+                self._s3_sdk_client = None
+            raise
 
     def connect_output(self, output: OutputPort, max_pending: int = 30) -> None:
         if self._batch_initialized:
@@ -460,6 +494,10 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._sdk_client = None
         if sdk_client is not None:
             sdk_client.close()
+        s3_sdk_client = self._s3_sdk_client
+        self._s3_sdk_client = None
+        if s3_sdk_client is not None:
+            s3_sdk_client.close()
         self._recorder = None
         self._limiter = None
 
@@ -579,6 +617,25 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         if isinstance(location, TransformResult):
             return location
         bucket, key, version = location
+        try:
+            verification = self._bucket_region_coordinator.verify(
+                bucket,
+                lambda: self._verify_bucket_region_live(bucket, state_id=state_id, token_id=token_id),
+            )
+        except BucketRegionUnverifiedError as error:
+            return TransformResult.error(
+                {"reason": "bucket_region_unverified", "error_type": error.code},
+                retryable=error.retryable,
+            )
+        if verification.region != self._region:
+            return TransformResult.error(
+                {
+                    "reason": "bucket_region_mismatch",
+                    "configured_region": self._region,
+                    "observed_region": verification.region,
+                },
+                retryable=False,
+            )
         started_at = time.monotonic()
         client = self._get_row_client(state_id, token_id=token_id)
         request_token = self._client_request_token(
@@ -633,7 +690,20 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             else:
                 validation_reason = "malformed_response"
             return TransformResult.error({"reason": validation_reason, "error_type": "result_validation"}, retryable=False)
-        return self._build_enriched_result(row, receipt, normalized)
+        return self._build_enriched_result(row, receipt, normalized, verification=verification)
+
+    def _verify_bucket_region_live(self, bucket: str, *, state_id: str, token_id: str) -> BucketRegionProof:
+        if self._recorder is None or self._s3_sdk_client is None or not self._run_id:
+            raise FrameworkBugError("Amazon Textract bucket verification used before on_start")
+        return HeadBucketClient(
+            execution=self._recorder,
+            state_id=state_id,
+            run_id=self._run_id,
+            telemetry_emit=self._telemetry_emit,
+            region=self._region,
+            sdk_client=self._s3_sdk_client,
+            token_id=token_id,
+        ).verify_bucket_region(bucket)
 
     def _poll_and_collect(
         self,
@@ -721,6 +791,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         row: PipelineRow,
         receipt: StartAnalysisReceipt,
         normalized: NormalizedTextractResult,
+        *,
+        verification: BucketRegionVerification,
     ) -> TransformResult:
         output = row.to_dict()
         if self._text_field is not None:
@@ -748,6 +820,15 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         metadata = normalized.metadata
         warnings = metadata["warnings"]
         warning_count = len(warnings) if isinstance(warnings, list | tuple) else 0
+        bucket_region_metadata: dict[str, object] = {
+            "configured_region": self._region,
+            "observed_region": verification.region,
+            "proof_source": verification.source,
+            "http_status": verification.http_status,
+            "cache_status": verification.cache_status,
+        }
+        if verification.provider_code is not None:
+            bucket_region_metadata["provider_code"] = verification.provider_code
         return TransformResult.success(
             PipelineRow(output, output_contract),
             success_reason={
@@ -761,6 +842,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                     "warning_count": warning_count,
                     "feature_types": list(self._feature_types),
                     "result_status": "succeeded",
+                    "bucket_region_verification": bucket_region_metadata,
                 },
             },
         )
@@ -801,11 +883,25 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             def close(self) -> None:
                 return None
 
+        class _ProbeS3SDK:
+            def head_bucket(self, **_kwargs: Any) -> Mapping[str, Any]:
+                return {
+                    "BucketRegion": self_region,
+                    "ResponseMetadata": {"HTTPStatusCode": 200, "RetryAttempts": 0},
+                }
+
+            def close(self) -> None:
+                return None
+
+        self_region = self._region
+
         prior_recorder = self._recorder
         prior_run_id = self._run_id
         prior_node_id = self._node_id
         prior_telemetry = self._telemetry_emit
         prior_sdk = self._sdk_client
+        prior_s3_sdk = self._s3_sdk_client
+        prior_bucket_region_coordinator = self._bucket_region_coordinator
         prior_limiter = self._limiter
         prior_clients = self._row_clients
         prior_shutdown = self._shutdown
@@ -815,6 +911,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             self._node_id = "textract-invariant-probe"
             self._telemetry_emit = ctx.telemetry_emit
             self._sdk_client = _ProbeSDK()
+            self._s3_sdk_client = _ProbeS3SDK()
+            self._bucket_region_coordinator = BucketRegionCoordinator()
             self._limiter = None
             self._row_clients = {}
             self._shutdown = threading.Event()
@@ -827,6 +925,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             self._node_id = prior_node_id
             self._telemetry_emit = prior_telemetry
             self._sdk_client = prior_sdk
+            self._s3_sdk_client = prior_s3_sdk
+            self._bucket_region_coordinator = prior_bucket_region_coordinator
             self._limiter = prior_limiter
             self._row_clients = prior_clients
             self._shutdown = prior_shutdown

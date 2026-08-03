@@ -1925,3 +1925,66 @@ def test_settings_from_env_coerces_numeric_strings_for_strict_fields(monkeypatch
     assert settings.composer_timeout_seconds == 20.0
     assert settings.operator_metrics_bearer_token is not None
     assert settings.operator_metrics_bearer_token.get_secret_value() == "operator-metrics-token-from-environment-0001"
+
+
+def test_settings_from_env_derives_deployment_region_only_from_ambient_aws_region(monkeypatch: pytest.MonkeyPatch) -> None:
+    import base64
+
+    from elspeth.web.config import settings_from_env
+
+    for key, value in {
+        "ELSPETH_WEB__COMPOSER_MAX_COMPOSITION_TURNS": "30",
+        "ELSPETH_WEB__COMPOSER_MAX_DISCOVERY_TURNS": "10",
+        "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS": "20.0",
+        "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE": "10",
+        "ELSPETH_WEB__SHAREABLE_LINK_SIGNING_KEY": base64.b64encode(b"deployment-region-signing-key-01").decode(),
+        "AWS_REGION": "ap-southeast-1",
+    }.items():
+        monkeypatch.setenv(key, value)
+
+    settings = settings_from_env()
+
+    assert settings.deployment_aws_region == "ap-southeast-1"
+
+
+def test_settings_from_env_rejects_reserved_web_deployment_region_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ELSPETH_WEB__DEPLOYMENT_AWS_REGION", "us-east-1")
+
+    with pytest.raises(RuntimeError, match="reserved"):
+        web_config.settings_from_env()
+
+
+@pytest.mark.parametrize(
+    ("aws_region", "aws_default_region"),
+    [
+        ("ap-southeast-1", "us-east-1"),
+        (" ", None),
+        (None, "moon_east_1"),
+    ],
+)
+def test_settings_from_env_rejects_conflicting_blank_or_unsupported_ambient_region(
+    monkeypatch: pytest.MonkeyPatch,
+    aws_region: str | None,
+    aws_default_region: str | None,
+) -> None:
+    if aws_region is not None:
+        monkeypatch.setenv("AWS_REGION", aws_region)
+    if aws_default_region is not None:
+        monkeypatch.setenv("AWS_DEFAULT_REGION", aws_default_region)
+
+    with pytest.raises(RuntimeError, match=r"AWS.*REGION"):
+        web_config.settings_from_env()
+
+
+def test_settings_from_env_retains_well_formed_unsupported_region_for_scoped_unavailability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "moon-east-1")
+
+    settings = web_config.settings_from_env()
+
+    assert settings.deployment_aws_region == "moon-east-1"
+
+
+def test_direct_web_settings_construction_may_inject_deployment_region() -> None:
+    assert _settings(deployment_aws_region="eu-west-1").deployment_aws_region == "eu-west-1"

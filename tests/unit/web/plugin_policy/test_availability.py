@@ -325,6 +325,35 @@ def test_operator_profiled_llm_is_unavailable_without_usable_alias() -> None:
     assert dict(snapshot.usable_profile_aliases)[PluginId("transform", "llm")] == ()
 
 
+def test_textract_is_available_only_with_supported_deployment_region_profile() -> None:
+    plugin_id = PluginId("transform", "aws_textract_document_analysis")
+    available = _build(
+        _settings(
+            plugin_allowlist=(str(plugin_id),),
+            deployment_aws_region="ap-southeast-1",
+        )
+    )
+
+    assert plugin_id in available.available
+    assert dict(available.usable_profile_aliases)[plugin_id] == ("deployment",)
+    assert dict(available.selected_profile_aliases)[plugin_id] == "deployment"
+
+
+@pytest.mark.parametrize("region", [None, "moon-east-1"])
+def test_missing_or_unsupported_deployment_region_only_hides_textract(region: str | None) -> None:
+    plugin_id = PluginId("transform", "aws_textract_document_analysis")
+    snapshot = _build(
+        _settings(
+            plugin_allowlist=(str(plugin_id),),
+            deployment_aws_region=region,
+        )
+    )
+
+    assert plugin_id not in snapshot.available
+    assert PluginId("source", "csv") in snapshot.available
+    assert [item.reason for item in snapshot.unavailable if item.plugin_id == plugin_id] == [PluginUnavailableReason.PROFILE_UNAVAILABLE]
+
+
 def test_bedrock_profile_is_locally_available_without_secret() -> None:
     snapshot = _build(
         _settings(

@@ -568,6 +568,8 @@ TransformErrorCategory = Literal[
     "operation_location_missing",  # 202 response lacked the Operation-Location header
     "operation_location_untrusted",  # Operation-Location host != configured endpoint (security)
     # Amazon Textract asynchronous document analysis
+    "bucket_region_mismatch",
+    "bucket_region_unverified",
     "submit_failed",
     "poll_failed",
     "partial_success",
@@ -684,6 +686,8 @@ class TransformErrorReason(TypedDict):
     error_type: NotRequired[str]
     message: NotRequired[str]
     code: NotRequired[str]
+    configured_region: NotRequired[str]
+    observed_region: NotRequired[str]
     url: NotRequired[str]
     blob_ref: NotRequired[str]
     encoding: NotRequired[str]

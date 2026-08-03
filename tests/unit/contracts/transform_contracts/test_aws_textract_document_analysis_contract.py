@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from elspeth.contracts import Determinism
 from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
 from elspeth.testing import make_pipeline_row
@@ -66,6 +68,29 @@ def test_forward_invariant_probe_enriches_and_passes_through() -> None:
 def test_forward_invariant_probe_success_reason_action() -> None:
     transform = _probe_transform()
     rows = transform.forward_invariant_probe_rows(make_pipeline_row({}))
-    result = transform.execute_forward_invariant_probe(rows, _probe_context())
+    context = _probe_context()
+    result = transform.execute_forward_invariant_probe(rows, context)
 
     assert result.success_reason["action"] == "enriched"
+    assert [call["request_data"].to_dict()["operation"] for call in context.landscape.calls] == [
+        "head_bucket_region",
+        "start_document_analysis",
+        "get_document_analysis",
+    ]
+
+
+def test_forward_invariant_probe_uses_isolated_clients_and_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    transform = _probe_transform()
+    rows = transform.forward_invariant_probe_rows(make_pipeline_row({}))
+    monkeypatch.setattr(
+        "elspeth.plugins.transforms.aws.textract_document_analysis.build_s3_head_bucket_sdk_client",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("probe touched S3 network builder")),
+    )
+    monkeypatch.setattr(
+        "elspeth.plugins.transforms.aws.textract_document_analysis.build_textract_sdk_client",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("probe touched Textract network builder")),
+    )
+
+    result = transform.execute_forward_invariant_probe(rows, _probe_context())
+
+    assert result.status == "success"
