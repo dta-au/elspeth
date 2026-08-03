@@ -2,7 +2,7 @@
 
 Last refreshed: 2026-08-04T04:16:13+10:00 (Australia/Canberra)
 Filigree snapshot: 2026-08-04T04:16:13+10:00
-Release baseline: `release/0.7.2@1213ab5b4b47`
+Release baseline: `release/0.7.2@1213ab5b4`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
