@@ -109,6 +109,77 @@ function buildPendingWorkingView(diagnostics: RunDiagnostics): RunDiagnosticsWor
   };
 }
 
+interface VisibleStateFailure {
+  label: string;
+  reason: string | null;
+  cause: string | null;
+  hint: string | null;
+}
+
+function nonEmptyDiagnosticText(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  return text.length > 0 ? text : null;
+}
+
+function visibleStateFailure(error: unknown): VisibleStateFailure | null {
+  if (error === null || typeof error !== "object" || Array.isArray(error)) {
+    return null;
+  }
+
+  const record = error as Record<string, unknown>;
+  const code = nonEmptyDiagnosticText(record.code);
+  const errorType = nonEmptyDiagnosticText(record.error_type);
+  const reason = nonEmptyDiagnosticText(record.reason);
+  const cause = nonEmptyDiagnosticText(record.cause);
+  const hint =
+    code === "InvalidS3ObjectException" && cause === "s3_object_unreadable"
+      ? nonEmptyDiagnosticText(record.error)
+      : null;
+
+  if (code === null && errorType === null && reason === null && cause === null && hint === null) {
+    return null;
+  }
+
+  // State error objects can contain audit-only raw response previews,
+  // offending values, and free-text provider detail. Render only the closed,
+  // scalar identifiers needed by an operator. The one longer hint admitted
+  // here is authored by ELSPETH for its exact S3-unreadable classification.
+  return {
+    label: code ?? errorType ?? reason ?? "recorded failure",
+    reason,
+    cause,
+    hint,
+  };
+}
+
+function RunStateFailureDetail({
+  error,
+  nodeId,
+  stateId,
+}: {
+  error: unknown;
+  nodeId: string;
+  stateId: string;
+}): JSX.Element | null {
+  const failure = visibleStateFailure(error);
+  if (failure === null) return null;
+
+  return (
+    <div
+      className="run-diagnostics-state-failure"
+      data-testid={`run-state-failure-${stateId}`}
+    >
+      <div>
+        {nodeId} failed - {failure.label}
+      </div>
+      {failure.reason && <div>Reason: {failure.reason}</div>}
+      {failure.cause && <div>Cause: {failure.cause}</div>}
+      {failure.hint && <div>{failure.hint}</div>}
+    </div>
+  );
+}
+
 export function RunsHistoryDrawer({ onClose, runsOverride }: RunsHistoryDrawerProps): JSX.Element {
   const storeRuns = useExecutionStore((s) => s.runs);
   const runs = runsOverride ?? storeRuns;
@@ -371,6 +442,16 @@ function RunDiagnosticsPanel({
                       </span>
                     ))}
                   </span>
+                  {token.states.map((state) =>
+                    state.status === "failed" ? (
+                      <RunStateFailureDetail
+                        key={`${state.state_id}-failure`}
+                        error={state.error}
+                        nodeId={state.node_id}
+                        stateId={state.state_id}
+                      />
+                    ) : null,
+                  )}
                 </div>
               ))}
             </div>

@@ -317,6 +317,64 @@ describe("RunsHistoryDrawer", () => {
     expect(screen.getByTestId("run-outputs-panel")).toHaveAttribute("data-run-id", "r2");
   });
 
+  it("surfaces structured transform failure provenance from the node state", async () => {
+    const diagnostics = makeDiagnostics({
+      failure_detail: null,
+      run_status: "completed_with_failures",
+    });
+    diagnostics.tokens[0].terminal_outcome = "routed_failure";
+    diagnostics.tokens[0].states[0].node_id = "transform_textract_93c6c46b8b72";
+    diagnostics.tokens[0].states[0].error = {
+      reason: "submit_failed",
+      error_type: "service_error",
+      code: "InvalidS3ObjectException",
+      cause: "s3_object_unreadable",
+      error:
+        "Amazon Textract could not read the S3 object. Check the task role's s3:GetObject prefix and s3:GetObjectVersion permission.",
+    };
+    useExecutionStore.setState({
+      runs: [{ id: "r2", status: "completed_with_failures" } as never],
+      diagnosticsByRunId: { r2: diagnostics },
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+
+    const failure = screen.getByTestId("run-state-failure-state-1");
+    expect(failure).toHaveTextContent(
+      "transform_textract_93c6c46b8b72 failed - InvalidS3ObjectException",
+    );
+    expect(failure).toHaveTextContent("Reason: submit_failed");
+    expect(failure).toHaveTextContent("Cause: s3_object_unreadable");
+    expect(failure).toHaveTextContent(
+      "Check the task role's s3:GetObject prefix and s3:GetObjectVersion permission.",
+    );
+    expect(failure).not.toHaveTextContent("service_error");
+  });
+
+  it("names the failed node and falls back to error_type without a provider code", async () => {
+    const diagnostics = makeDiagnostics({ failure_detail: null });
+    diagnostics.tokens[0].states[0].node_id = "content_safety";
+    diagnostics.tokens[0].states[0].error = {
+      reason: "api_error",
+      error_type: "guardrail_service_error",
+      error: "unclassified provider response text must stay audit-only",
+    };
+    useExecutionStore.setState({
+      diagnosticsByRunId: { r2: diagnostics },
+    } as never);
+
+    render(<RunsHistoryDrawer onClose={vi.fn()} />);
+    await userEvent.click(screen.getByRole("button", { name: /show detail for r2/i }));
+
+    const failure = screen.getByTestId("run-state-failure-state-1");
+    expect(failure).toHaveTextContent(
+      "content_safety failed - guardrail_service_error",
+    );
+    expect(failure).toHaveTextContent("Reason: api_error");
+    expect(failure).not.toHaveTextContent("unclassified provider response text");
+  });
+
   it("shows the stored run failure cause immediately before diagnostics load", async () => {
     const loadRunDiagnostics = vi.fn().mockResolvedValue(undefined);
     useExecutionStore.setState({
