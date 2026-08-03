@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import json
+import uuid
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from elspeth.contracts.errors import AuditIntegrityError, FailedTurnMetadata
 from elspeth.contracts.secrets import FingerprintKeyMissingError, SecretDecryptionError
 from elspeth.web.app import create_app
 from elspeth.web.config import WebSettings
+from elspeth.web.middleware.request_id import MAX_REQUEST_ID_LENGTH
 from elspeth.web.preferences.service import CorruptPreferencesError
 from elspeth.web.sessions.audit_story_service import AuditStoryIntegrityError, AuditStoryNotRecordedError
 from elspeth.web.sessions.protocol import (
@@ -327,30 +329,71 @@ class TestHTTPExceptionRequestIdEnvelope:
         app = create_app(_settings(tmp_path))
         handler = app.exception_handlers[StarletteHTTPException]
 
-        response = await handler(
-            _audit_request("req-dict-1"),
-            HTTPException(status_code=500, detail={"error_type": "guided_operation_terminal_failure"}),
-        )
+        with capture_logs() as logs:
+            response = await handler(
+                _audit_request("req-dict-1"),
+                HTTPException(status_code=500, detail={"error_type": "guided_operation_terminal_failure"}),
+            )
 
         assert response.status_code == 500
         assert json.loads(response.body)["detail"] == {
             "error_type": "guided_operation_terminal_failure",
             "request_id": "req-dict-1",
         }
+        assert logs == [
+            {
+                "event": "http_error_envelope",
+                "log_level": "warning",
+                "request_id": "req-dict-1",
+                "status_code": 500,
+            }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_dict_detail_log_never_projects_the_error_envelope(self, tmp_path: Path) -> None:
+        app = create_app(_settings(tmp_path))
+        handler = app.exception_handlers[StarletteHTTPException]
+        secret_canary = "provider-secret-correlation-canary"
+
+        with capture_logs() as logs:
+            await handler(
+                _audit_request("req-bounded-1"),
+                HTTPException(
+                    status_code=422,
+                    detail={
+                        "error_type": "convergence",
+                        "detail": secret_canary,
+                        "provider_detail": secret_canary,
+                        "session_id": secret_canary,
+                    },
+                ),
+            )
+
+        assert secret_canary not in repr(logs)
+        assert logs == [
+            {
+                "event": "http_error_envelope",
+                "log_level": "warning",
+                "request_id": "req-bounded-1",
+                "status_code": 422,
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_string_detail_is_left_exactly_as_raised(self, tmp_path: Path) -> None:
         app = create_app(_settings(tmp_path))
         handler = app.exception_handlers[StarletteHTTPException]
 
-        response = await handler(
-            _audit_request("req-str-1"),
-            HTTPException(status_code=400, detail="proposal_id must be a canonical UUID"),
-        )
+        with capture_logs() as logs:
+            response = await handler(
+                _audit_request("req-str-1"),
+                HTTPException(status_code=400, detail="proposal_id must be a canonical UUID"),
+            )
 
         assert response.status_code == 400
         assert json.loads(response.body) == {"detail": "proposal_id must be a canonical UUID"}
         assert "req-str-1" not in response.body.decode()
+        assert not [log for log in logs if log["event"] == "http_error_envelope"]
 
     @pytest.mark.asyncio
     async def test_an_envelope_that_already_carries_a_request_id_is_not_overwritten(self, tmp_path: Path) -> None:
@@ -358,12 +401,21 @@ class TestHTTPExceptionRequestIdEnvelope:
         app = create_app(_settings(tmp_path))
         handler = app.exception_handlers[StarletteHTTPException]
 
-        response = await handler(
-            _audit_request("req-from-middleware"),
-            HTTPException(status_code=500, detail={"error_type": "x", "request_id": "req-from-route"}),
-        )
+        with capture_logs() as logs:
+            response = await handler(
+                _audit_request("req-from-middleware"),
+                HTTPException(status_code=500, detail={"error_type": "x", "request_id": "req-from-route"}),
+            )
 
         assert json.loads(response.body)["detail"]["request_id"] == "req-from-route"
+        assert logs == [
+            {
+                "event": "http_error_envelope",
+                "log_level": "warning",
+                "request_id": "req-from-middleware",
+                "status_code": 500,
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_response_headers_survive_the_rewrap(self, tmp_path: Path) -> None:
@@ -454,6 +506,40 @@ class TestHTTPExceptionRequestIdEnvelope:
         plain = client.get("/api/_probe/string-detail")
         assert plain.status_code == 409
         assert plain.json() == {"detail": "a plain-language message"}
+
+    @pytest.mark.parametrize(
+        "supplied",
+        [
+            pytest.param("trace|log-injection", id="unsafe-characters"),
+            pytest.param("A" * (MAX_REQUEST_ID_LENGTH + 1), id="oversized"),
+        ],
+    )
+    def test_unsafe_inbound_id_is_regenerated_before_body_header_and_log(self, tmp_path: Path, supplied: str) -> None:
+        app = create_app(_settings(tmp_path))
+
+        @app.get("/api/_probe/correlated-error")
+        async def _probe_correlated_error() -> None:
+            raise HTTPException(status_code=422, detail={"error_type": "convergence"})
+
+        app.router.routes.insert(0, app.router.routes.pop())
+        client = SyncASGITestClient(app)
+
+        with capture_logs() as logs:
+            response = client.get("/api/_probe/correlated-error", headers={"X-Request-ID": supplied})
+
+        request_id = response.json()["detail"]["request_id"]
+        assert request_id != supplied
+        assert uuid.UUID(request_id).version == 4
+        assert response.headers["X-Request-ID"] == request_id
+        events = [log for log in logs if log["event"] == "http_error_envelope"]
+        assert events == [
+            {
+                "event": "http_error_envelope",
+                "log_level": "warning",
+                "request_id": request_id,
+                "status_code": 422,
+            }
+        ]
 
 
 @pytest.mark.asyncio

@@ -1587,7 +1587,17 @@ def _create_app(
         exc: RequestValidationError,
     ) -> JSONResponse:
         safe_errors = [{k: v for k, v in error.items() if k in _SAFE_VALIDATION_ERROR_KEYS} for error in exc.errors()]
-        return JSONResponse(status_code=422, content={"detail": safe_errors})
+        request_id = _request_id(request)
+        # Operational correlation only: never project the validation errors,
+        # request body, URL, identity, or exception into this event. Even the
+        # response-safe ``loc``/``msg`` fields are unnecessary for finding the
+        # user-reported id and would enlarge the log trust surface.
+        _handler_slog.warning(
+            "http_validation_error_envelope",
+            status_code=422,
+            request_id=request_id,
+        )
+        return JSONResponse(status_code=422, content={"detail": safe_errors, "request_id": request_id})
 
     # --- request_id on every structured error envelope (all routes) ---
     # ``RequestIdMiddleware`` stamps ``X-Request-ID`` on every response and
@@ -1619,11 +1629,22 @@ def _create_app(
         # through that subclass. Read it as ``object`` so the discrimination
         # below is a real runtime check rather than statically dead code.
         detail: object = exc.detail
-        if not isinstance(detail, dict) or "request_id" in detail:
+        if not isinstance(detail, dict):
+            return await fastapi_http_exception_handler(request, exc)
+        request_id = _request_id(request)
+        # One bounded lookup event for every structured HTTP error envelope.
+        # The request id has already crossed the middleware's closed grammar;
+        # no envelope fields or other request-derived values belong here.
+        _handler_slog.warning(
+            "http_error_envelope",
+            status_code=exc.status_code,
+            request_id=request_id,
+        )
+        if "request_id" in detail:
             return await fastapi_http_exception_handler(request, exc)
         correlated = HTTPException(
             status_code=exc.status_code,
-            detail={**detail, "request_id": _request_id(request)},
+            detail={**detail, "request_id": request_id},
             headers=exc.headers,
         )
         return await fastapi_http_exception_handler(request, correlated)

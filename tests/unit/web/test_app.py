@@ -2532,14 +2532,29 @@ class TestValidationErrorRedaction:
     def test_secrets_route_redacts_input(self, tmp_path) -> None:
         """POST /api/secrets with wrong value type must not echo the value."""
         client = self._authed_client(tmp_path)
-        resp = client.post(
-            "/api/secrets",
-            json={"name": "API_KEY", "value": {"nested": "super-secret-hunter2"}},
-        )
+        request_id = "trace-validation-422"
+        secret_canary = "super-secret-hunter2"
+        with capture_logs() as logs:
+            resp = client.post(
+                "/api/secrets",
+                headers={"X-Request-ID": request_id},
+                json={"name": "API_KEY", "value": {"nested": secret_canary}},
+            )
         assert resp.status_code == 422
         body = resp.json()
         body_text = resp.text
-        assert "super-secret-hunter2" not in body_text
+        assert secret_canary not in body_text
+        assert secret_canary not in repr(logs)
+        assert body["request_id"] == request_id
+        assert resp.headers["X-Request-ID"] == request_id
+        assert logs == [
+            {
+                "event": "http_validation_error_envelope",
+                "log_level": "warning",
+                "request_id": request_id,
+                "status_code": 422,
+            }
+        ]
         for error in body["detail"]:
             assert set(error.keys()) <= self._SAFE_KEYS
 
