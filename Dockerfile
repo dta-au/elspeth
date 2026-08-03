@@ -16,7 +16,7 @@
 # =============================================================================
 # Stage 1: Frontend Builder
 # =============================================================================
-FROM node:24.13.0-bookworm-slim@sha256:4660b1ca8b28d6d1906fd644abe34b2ed81d15434d26d845ef0aced307cf4b6f AS frontend-builder
+FROM node:26.5.1-bookworm-slim@sha256:9e6f9357d371591e32ab6f2d8a26d63bdd0d17c29eee3f4f3e7e454d9634bf73 AS frontend-builder
 
 WORKDIR /frontend
 
