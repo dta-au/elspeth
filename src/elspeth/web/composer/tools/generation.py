@@ -2464,6 +2464,8 @@ def compute_proof_diagnostics(
             metadata = _sync_get_blob(session_engine, resolved_blob_id, session_id)
             if metadata is None:
                 return None
+            if metadata["status"] != "ready":
+                return ResolvedProofBlob(metadata=metadata)
             storage_path = Path(metadata["storage_path"])
             if not storage_path.exists():
                 return ResolvedProofBlob(metadata=metadata)

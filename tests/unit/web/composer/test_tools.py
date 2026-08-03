@@ -14650,6 +14650,48 @@ class TestPreviewProofStep:
         assert metadata_reads == [self.csv_blob_id]
         assert content_reads == [self.csv_storage_path]
 
+    @pytest.mark.parametrize("status", ["pending", "error"])
+    def test_non_ready_blob_metadata_abstains_before_any_path_or_integrity_access(
+        self,
+        status: str,
+    ) -> None:
+        """Lifecycle status is checked before touching concurrent blob bytes."""
+        from sqlalchemy import update
+
+        from elspeth.web.composer.tools import generation as generation_module
+
+        state = self._state_with_csv_source(schema_mode="observed")
+        with self.engine.begin() as conn:
+            conn.execute(update(blobs_table).where(blobs_table.c.id == self.csv_blob_id).values(status=status, content_hash=None))
+
+        with (
+            patch.object(
+                Path,
+                "exists",
+                side_effect=AssertionError("non-ready proof blob must not access its backing path"),
+            ) as exists,
+            patch.object(
+                Path,
+                "read_bytes",
+                side_effect=AssertionError("non-ready proof blob must not read bytes"),
+            ) as read_bytes,
+            patch.object(
+                generation_module,
+                "_verify_blob_content_integrity",
+                side_effect=AssertionError("non-ready proof blob must not verify content"),
+            ) as verify,
+        ):
+            diagnostics = generation_module.compute_proof_diagnostics(
+                state,
+                session_engine=self.engine,
+                session_id=self.session_id,
+            )
+
+        assert diagnostics == []
+        exists.assert_not_called()
+        read_bytes.assert_not_called()
+        verify.assert_not_called()
+
     # -- csv_fixed_schema_omits_observed_columns ----------------------------
 
     def test_fixed_csv_omits_columns_with_discard_blocks(self) -> None:
