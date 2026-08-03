@@ -29,7 +29,7 @@ Gate Error:
   Expression exception + no policy → node_state=FAILED + re-raise → pipeline CRASH
   Expression exception + on_error  → node_state=FAILED + per-row DIVERT/discard
   Unknown route label    → node_state=FAILED + ValueError → pipeline CRASH
-  Non-string/bool result → str() conversion, then route lookup (may fail as above)
+  Non-string/bool result → node_state=FAILED + TypeError → pipeline CRASH (no coercion/lookup)
   Missing edge           → node_state=FAILED + MissingEdgeError → pipeline CRASH
 
 Aggregation Error:
