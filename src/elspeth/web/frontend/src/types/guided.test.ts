@@ -201,7 +201,7 @@ describe("guided protocol types", () => {
     expect(emptyCustom.custom_inputs).toEqual([]);
   });
 
-  it("GuidedRespondAction uses a target-only proposal revision contract", () => {
+  it("GuidedRespondAction permits target-only form rewinds but requires node feedback", () => {
     const targetOnlyRevision: GuidedRespondAction = {
       chosen: null,
       edited_values: null,
@@ -209,9 +209,30 @@ describe("guided protocol types", () => {
       proposal_id: "00000000-0000-4000-8000-000000000701",
       draft_hash: "f".repeat(64),
       edit_target: {
-        kind: "node",
+        kind: "source",
         stable_id: "00000000-0000-4000-8000-000000000702",
       },
+      control_signal: null,
+    };
+    // @ts-expect-error node proposal revisions require exact correction feedback
+    const targetOnlyNodeRevision: GuidedRespondAction = {
+      ...targetOnlyRevision,
+      edit_target: {
+        kind: "node",
+        stable_id: "00000000-0000-4000-8000-000000000703",
+      },
+    };
+    const nodeRevisionWithFeedback: GuidedRespondAction = {
+      chosen: null,
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: "00000000-0000-4000-8000-000000000701",
+      draft_hash: "f".repeat(64),
+      edit_target: {
+        kind: "node",
+        stable_id: "00000000-0000-4000-8000-000000000703",
+      },
+      correction_feedback: "Change the selected node mapping.",
       control_signal: null,
     };
     // @ts-expect-error proposal revisions name only the durable target; inline edited values are not accepted
@@ -219,7 +240,8 @@ describe("guided protocol types", () => {
       ...targetOnlyRevision,
       edited_values: {},
     };
-    expect(targetOnlyRevision.edit_target?.kind).toBe("node");
+    expect(targetOnlyRevision.edit_target?.kind).toBe("source");
+    expect(nodeRevisionWithFeedback.correction_feedback).toBe("Change the selected node mapping.");
     expect(revisionWithInlineValues.edited_values).toEqual({});
   });
 

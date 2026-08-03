@@ -2312,6 +2312,21 @@
   font-weight: 600;
 }
 
+.guided-proposal__correction {
+  flex: 1 1 100%;
+  display: grid;
+  gap: var(--space-sm);
+}
+
+.guided-proposal__correction p {
+  margin: 0;
+  color: var(--color-text-secondary);
+}
+
+.guided-proposal__correction button {
+  justify-self: end;
+}
+
 @media (max-width: 760px) {
   .guided-proposal__primary-actions,
   .guided-proposal__revise {

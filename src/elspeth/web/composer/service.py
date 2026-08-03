@@ -107,6 +107,7 @@ from elspeth.web.composer.llm_response_parsing import (
 )
 from elspeth.web.composer.pipeline_planner import (
     GuidedPlannerDecline,
+    PipelineCandidatePolicyRejection,
     PipelinePlannerError,
     PipelinePlanResult,
     PlannerBudgetPolicy,
@@ -120,7 +121,14 @@ from elspeth.web.composer.pipeline_planner import (
     plan_pipeline,
     prepare_pipeline_plan,
 )
-from elspeth.web.composer.pipeline_proposal import AbsentBase, PlannerSurface, PresentBase, composition_content_hash
+from elspeth.web.composer.pipeline_proposal import (
+    AbsentBase,
+    PipelineProposal,
+    PlannerSurface,
+    PresentBase,
+    composition_content_hash,
+    owned_composition_state_authority,
+)
 from elspeth.web.composer.progress import (
     advisor_checkpoint_progress_event,
     convergence_progress_event,
@@ -2829,12 +2837,14 @@ class ComposerServiceImpl:
         from elspeth.web.composer.guided.planning import (
             GuidedCorrectionTarget,
             bind_guided_reviewed_components,
+            build_guided_proposal_projection,
             guided_private_reviewed_facts,
             guided_redacted_current_state_context,
             guided_redacted_planner_context,
             guided_reviewed_sink_options,
             guided_unproducible_output_field_names,
             guided_unproducible_output_fields,
+            require_guided_proposal_correction_target_changed,
         )
         from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
         from elspeth.web.composer.guided.prompts import load_step_planner_skill
@@ -3049,6 +3059,39 @@ class ComposerServiceImpl:
         # is logged with its code+rejection_codes before it re-raises to the
         # (signed) guided route. An ``async def`` runs nothing until awaited, so
         # every PipelinePlannerError surfaces at ``await``, inside the guard.
+        candidate_acceptance: Callable[[CompositionState], None] | None = None
+        if correction_target is not None:
+
+            def require_selected_correction_delta(candidate_state: CompositionState) -> None:
+                candidate_proposal = PipelineProposal.create(
+                    pipeline=owned_composition_state_authority(candidate_state),
+                    base=base,
+                    reviewed_facts=reviewed_facts,
+                    surface=planner_surface,
+                    repair_count=0,
+                    skill_hash=stable_hash("composer.guided-correction-candidate-check.v1"),
+                    covered_deferred_intent_ids=(),
+                    supersedes_draft_hash=supersedes_draft_hash,
+                )
+                candidate_projection = build_guided_proposal_projection(
+                    proposal_id=base.state_id,
+                    proposal=candidate_proposal,
+                    guided=guided,
+                    catalog_plugin_ids=catalog_ids,
+                )
+                try:
+                    require_guided_proposal_correction_target_changed(
+                        candidate_projection,
+                        correction_target,
+                        candidate_state,
+                    )
+                except AuditIntegrityError as exc:
+                    if str(exc) != "guided correction planner did not change the selected component":
+                        raise
+                    raise PipelineCandidatePolicyRejection("guided_correction_unchanged") from exc
+
+            candidate_acceptance = require_selected_correction_delta
+
         guided_planner_call = plan_pipeline(
             intent=intent,
             current_state=current_state,
@@ -3105,6 +3148,7 @@ class ComposerServiceImpl:
                     correction_target=correction_target,
                 ),
             ),
+            candidate_acceptance=candidate_acceptance,
         )
         try:
             plan = await guided_planner_call

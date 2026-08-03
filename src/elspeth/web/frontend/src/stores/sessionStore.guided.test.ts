@@ -1526,6 +1526,90 @@ describe("sessionStore — guided-mode fields and actions", () => {
     });
   });
 
+  it("respondGuided: retains exact proposal correction feedback across an ambiguous retry", async () => {
+    const { respondGuided } = await import("@/api/client");
+    const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+    const successful = {
+      ...sampleRespondResponse,
+      guided_session: { ...sampleGuidedSession, step: "step_3_transforms" },
+      next_turn: sampleProposalTurn,
+    };
+    respondMock
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce(successful);
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: { ...sampleGuidedSession, step: "step_3_transforms" },
+      guidedNextTurn: sampleProposalTurn,
+      guidedProposalReview: {
+        status: "active",
+        proposal_id: PROPOSAL_ID,
+        draft_hash: PROPOSAL_HASH,
+      },
+    });
+    const action: GuidedRespondAction = {
+      chosen: null,
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: PROPOSAL_ID,
+      draft_hash: PROPOSAL_HASH,
+      edit_target: { kind: "node", stable_id: "00000000-0000-4000-8000-000000000506" },
+      correction_feedback: "Keep the threshold and change only the true destination.",
+      control_signal: null,
+    };
+
+    await useSessionStore.getState().respondGuided(action);
+    expect(useSessionStore.getState().guidedProposalReview).toMatchObject({
+      status: "error",
+      retryable: true,
+      retry_action: {
+        kind: "revise",
+        edit_target: action.edit_target,
+        correction_feedback: action.correction_feedback,
+      },
+    });
+    await useSessionStore.getState().respondGuided(action);
+
+    expect(respondMock.mock.calls[1]?.[1].operation_id).toBe(
+      respondMock.mock.calls[0]?.[1].operation_id,
+    );
+  });
+
+  it("respondGuided: refuses changed proposal correction feedback while retry custody is retained", async () => {
+    const { respondGuided } = await import("@/api/client");
+    const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+    respondMock.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: { ...sampleGuidedSession, step: "step_3_transforms" },
+      guidedNextTurn: sampleProposalTurn,
+      guidedProposalReview: {
+        status: "active",
+        proposal_id: PROPOSAL_ID,
+        draft_hash: PROPOSAL_HASH,
+      },
+    });
+    const action: GuidedRespondAction = {
+      chosen: null,
+      edited_values: null,
+      custom_inputs: null,
+      proposal_id: PROPOSAL_ID,
+      draft_hash: PROPOSAL_HASH,
+      edit_target: { kind: "edge", stable_id: "00000000-0000-4000-8000-000000000503" },
+      correction_feedback: "Route this edge to output-1.",
+      control_signal: null,
+    };
+
+    await useSessionStore.getState().respondGuided(action);
+    const changed = await useSessionStore.getState().respondGuided({
+      ...action,
+      correction_feedback: "Route this edge to discard instead.",
+    });
+
+    expect(changed).toMatchObject({ status: "not_applied", reason: "custody_conflict" });
+    expect(respondMock).toHaveBeenCalledTimes(1);
+  });
+
   it("respondGuided: a policy_blocked terminal failure settles custody and keeps the proposal controls live (F13-D)", async () => {
     // ``policy_blocked`` is permanent by construction: the copy says "Change
     // the highlighted component — retrying will fail the same way". The
@@ -1585,6 +1669,7 @@ describe("sessionStore — guided-mode fields and actions", () => {
       ...action,
       chosen: null,
       edit_target: { kind: "node", stable_id: "00000000-0000-4000-8000-00000000aaaa" },
+      correction_feedback: "Change the selected node mapping.",
     };
     const second = await useSessionStore.getState().respondGuided(revise);
     expect(second).toMatchObject({ status: "applied" });

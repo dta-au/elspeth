@@ -41,6 +41,7 @@ from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.pipeline_planner import (
     _REPEAT_NOTICE,
     PLANNER_DISCOVERY_TOOL_NAMES,
+    PipelineCandidatePolicyRejection,
     PipelinePlannerError,
     PlannerBudgetPolicy,
     PlannerConversationContext,
@@ -603,6 +604,7 @@ async def _plan(
     rendered_skill: str | None = None,
     supersedes_draft_hash: str | None = None,
     candidate_finalizer: Any = None,
+    candidate_acceptance: Any = None,
     unproducible_output_fields: tuple[str, ...] = (),
     conversation_context: PlannerConversationContext | None = None,
 ) -> Any:
@@ -641,6 +643,7 @@ async def _plan(
         lifecycle=lifecycle or _lifecycle(),
         recorder=recorder or BufferingRecorder(),
         candidate_finalizer=candidate_finalizer or (lambda candidate: candidate),
+        candidate_acceptance=candidate_acceptance,
     )
 
 
@@ -3440,6 +3443,40 @@ async def test_binder_candidate_shape_defect_gets_bounded_schema_repair(
     assert proposal.proposal.repair_count == 1
     assert len(attempts) == 2
     assert json.loads(completion.requests[1]["messages"][-1]["content"]) == _CANONICAL_SCHEMA_FEEDBACK
+
+
+@pytest.mark.asyncio
+async def test_candidate_policy_rejection_gets_closed_bounded_repair(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """A post-validation semantic obligation consumes repair budget, not the route."""
+
+    attempts: list[CompositionState] = []
+
+    def require_requested_delta(candidate: CompositionState) -> None:
+        attempts.append(candidate)
+        if len(attempts) == 1:
+            raise PipelineCandidatePolicyRejection("guided_correction_unchanged")
+
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        candidate_acceptance=require_requested_delta,
+    )
+
+    assert proposal.proposal.repair_count == 1
+    assert len(attempts) == 2
+    feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    assert _feedback_error_codes(feedback) == ("guided_correction_unchanged",)
+    assert feedback["validation"]["errors"][0]["explanation"]
+    assert feedback["validation"]["errors"][0]["suggested_fix"]
 
 
 @pytest.mark.asyncio

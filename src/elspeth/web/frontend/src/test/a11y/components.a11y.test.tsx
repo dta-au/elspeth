@@ -1064,7 +1064,11 @@ describe("ProposePipelineTurn", () => {
       draft_hash: DRAFT_HASH,
       message: "The response was not received. Retry the same action.",
       retryable: true,
-      retry_action: { kind: "revise", edit_target: { kind: "node", stable_id: NODE_ID } },
+      retry_action: {
+        kind: "revise",
+        edit_target: { kind: "node", stable_id: NODE_ID },
+        correction_feedback: "Change the selected node mapping.",
+      },
     };
     const { container } = render(
       <ProposePipelineTurn payload={proposalPayload()} reviewState={reviewState} onSubmit={() => {}} />,
@@ -1076,7 +1080,11 @@ describe("ProposePipelineTurn", () => {
     expect(alert).toHaveTextContent(/response was not received/i);
     expect(alert).toHaveFocus();
     expect(screen.getByRole("button", { name: "Review wiring" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: /Revise summarise/ })).toBeEnabled();
+    expect(screen.getByRole("button", { name: /Revise summarise/ })).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: "What should change?" })).toHaveValue(
+      "Change the selected node mapping.",
+    );
+    expect(screen.getByRole("button", { name: "Send revision request" })).toBeEnabled();
     expect(await axe(container)).toHaveNoViolations();
   });
 

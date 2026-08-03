@@ -389,8 +389,15 @@ describe("ProposePipelineTurn", () => {
     );
 
     await user.click(treatment);
+    expect(onSubmit).not.toHaveBeenCalled();
+    await user.type(
+      screen.getByRole("textbox", { name: "What should change?" }),
+      "Keep branch-1 unchanged and send only this fork to branch-2.",
+    );
+    await user.click(screen.getByRole("button", { name: "Send revision request" }));
     expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
       edit_target: { kind: "edge", stable_id: edgeId(7) },
+      correction_feedback: "Keep branch-1 unchanged and send only this fork to branch-2.",
     }));
   });
 
@@ -410,7 +417,7 @@ describe("ProposePipelineTurn", () => {
     expect(screen.queryByText("guided.proposal.rationale.review_required.v1")).toBeNull();
   });
 
-  it("submits exact proposal-bound review, reject, and target-only revise actions", async () => {
+  it("collects exact feedback before submitting a proposal-bound node revision", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();
     render(
@@ -424,6 +431,13 @@ describe("ProposePipelineTurn", () => {
     await user.click(screen.getByRole("button", { name: "Review wiring" }));
     await user.click(screen.getByRole("button", { name: "Reject proposal" }));
     await user.click(screen.getByRole("button", { name: "Revise node-1" }));
+
+    expect(onSubmit).toHaveBeenCalledTimes(2);
+    const feedback = screen.getByRole("textbox", { name: "What should change?" });
+    const submitRevision = screen.getByRole("button", { name: "Send revision request" });
+    expect(submitRevision).toBeDisabled();
+    await user.type(feedback, "Keep the threshold, but route the true branch to output-1 only.");
+    await user.click(submitRevision);
 
     expect(onSubmit.mock.calls).toEqual([
       [{
@@ -451,6 +465,7 @@ describe("ProposePipelineTurn", () => {
         proposal_id: IDS.proposal,
         draft_hash: "d".repeat(64),
         edit_target: { kind: "node", stable_id: IDS.gate },
+        correction_feedback: "Keep the threshold, but route the true branch to output-1 only.",
         control_signal: null,
       }],
     ]);
@@ -555,8 +570,12 @@ describe("ProposePipelineTurn", () => {
     ["reject", { kind: "reject" }, "Reject proposal"],
     [
       "one exact revise target",
-      { kind: "revise", edit_target: { kind: "node", stable_id: IDS.gate } },
-      "Revise node-1",
+      {
+        kind: "revise",
+        edit_target: { kind: "node", stable_id: IDS.gate },
+        correction_feedback: "Keep the threshold and change only the true destination.",
+      },
+      "Send revision request",
     ],
   ] as const)(
     "enables only the retained %s action after an ambiguous transport failure",

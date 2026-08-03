@@ -2551,12 +2551,14 @@ async def post_guided_respond(
         guided_candidate_state,
         guided_private_reviewed_facts,
         require_guided_correction_target_changed,
+        require_guided_proposal_correction_target_changed,
         resolve_guided_correction_target,
         resolve_guided_proposal_correction_target,
         verified_remaining_deferred_intents,
         verify_guided_proposal_projection,
     )
     from elspeth.web.composer.guided.protocol import (
+        GUIDED_PROPOSAL_CORRECTION_ACKNOWLEDGEMENT,
         GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT,
         GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT,
         PROPOSAL_RATIONALE_TEMPLATE,
@@ -2940,6 +2942,16 @@ async def post_guided_respond(
                 raise HTTPException(status_code=400, detail="Guided proposal action has an invalid closed shape.")
             if is_revise:
                 _require_bound_revision_target(current_turn, public_error=True)
+                if body.edit_target is not None and body.edit_target.kind in {"node", "edge"} and body.correction_feedback is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Guided node and edge proposal revisions require non-empty correction feedback.",
+                    )
+                if body.edit_target is not None and body.edit_target.kind in {"source", "output"} and body.correction_feedback is not None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Guided source and output proposal revisions use the reviewed settings form without correction feedback.",
+                    )
             if is_prose_revise:
                 instruction = (body.edited_values or {}).get("revision_instruction")
                 # Bound is the 8192-char contract mirrored in the settlement branch.
@@ -3540,6 +3552,12 @@ async def post_guided_respond(
 
                         if body.edit_target is not None or revision_instruction is not None:
                             if body.edit_target is not None:
+                                if body.edit_target.kind in {"node", "edge"} and body.correction_feedback is None:
+                                    raise AuditIntegrityError("guided node/edge proposal revision lost its correction feedback")
+                                if body.edit_target.kind in {"source", "output"} and body.correction_feedback is not None:
+                                    raise AuditIntegrityError(
+                                        "guided source/output proposal revision gained unexpected correction feedback"
+                                    )
                                 catalog_ids = {
                                     "source": frozenset(item.name for item in catalog.list_sources()),
                                     "transform": frozenset(item.name for item in catalog.list_transforms()),
@@ -3562,6 +3580,8 @@ async def post_guided_respond(
                                         "stable_id": body.edit_target.stable_id,
                                     },
                                 }
+                                if body.correction_feedback is not None:
+                                    response_payload["correction_feedback"] = body.correction_feedback
                             else:
                                 if revision_instruction is None:  # pragma: no cover - the branch condition guarantees this
                                     raise AuditIntegrityError("guided proposal revision lost its instruction after reservation")
@@ -3594,13 +3614,32 @@ async def post_guided_respond(
                                     reviewed_facts=reviewed_facts,
                                     prepared_response=prepared_response,
                                     origin="proposal_review",
+                                    correction_feedback=body.correction_feedback,
                                 )
 
+                            correction_message: GuidedOriginatingUserMessageDraft | None = None
+                            if body.edit_target is not None:
+                                if body.correction_feedback is None:
+                                    raise AuditIntegrityError("guided node/edge proposal revision lost its correction feedback")
+                                correction_message = GuidedOriginatingUserMessageDraft(
+                                    message_id=uuid4(),
+                                    content=body.correction_feedback,
+                                )
+                            correction_messages = guided.correction_messages
+                            if correction_message is not None:
+                                correction_messages = (
+                                    *correction_messages,
+                                    GuidedCorrectionMessageRef(
+                                        message_id=correction_message.message_id,
+                                        content_hash=_message_content_hash(correction_message.content),
+                                    ),
+                                )
                             planning_guided = _replace(
                                 guided,
                                 history=(*guided.history[:-1], answered),
                                 active_proposal=None,
                                 active_edit_target=None,
+                                correction_messages=correction_messages,
                             )
                             planner_current_state = state
                             correction_target = None
@@ -3652,13 +3691,9 @@ async def post_guided_respond(
                                 messages_by_id[deferred.originating_message_id].content for deferred in planning_guided.deferred_intents
                             )
                             if body.edit_target is not None:
-                                revision_intents = {
-                                    "source": "Regenerate the complete pipeline while revising the selected source component.",
-                                    "node": "Regenerate the complete pipeline while revising the selected node component.",
-                                    "edge": "Regenerate the complete pipeline while revising the selected edge component.",
-                                    "output": "Regenerate the complete pipeline while revising the selected output component.",
-                                }
-                                current_planner_intent = revision_intents[body.edit_target.kind]
+                                if correction_message is None:
+                                    raise AuditIntegrityError("guided proposal correction lost its originating message")
+                                current_planner_intent = correction_message.content
                             else:
                                 # Prose revision (``revision_instruction`` is non-None
                                 # here by the enclosing branch condition): the
@@ -3679,11 +3714,20 @@ async def post_guided_respond(
                                 )
                                 if part
                             )
-                            originating_message = PlannerOriginatingMessage(
-                                session_id=str(session_id),
-                                message_id=str(root_message.id) if root_message is not None else None,
-                                content=originating_content,
-                                user_id=user.user_id,
+                            originating_message = (
+                                PlannerOriginatingMessage(
+                                    session_id=str(session_id),
+                                    message_id=str(correction_message.message_id),
+                                    content=correction_message.content,
+                                    user_id=user.user_id,
+                                )
+                                if correction_message is not None
+                                else PlannerOriginatingMessage(
+                                    session_id=str(session_id),
+                                    message_id=str(root_message.id) if root_message is not None else None,
+                                    content=originating_content,
+                                    user_id=user.user_id,
+                                )
                             )
                             checkpoint_id = uuid4()
                             successor_proposal_id = uuid4()
@@ -3730,7 +3774,9 @@ async def post_guided_respond(
                                     current_turn=current_turn,
                                     prepared_current=_planned_current,
                                     pending_payloads=tuple(prepared_payloads),
-                                    user_instruction=revision_instruction,
+                                    user_instruction=(
+                                        correction_message.content if correction_message is not None else revision_instruction
+                                    ),
                                 )
                             plan, catalog_ids = outcome
                             projection = build_guided_proposal_projection(
@@ -3739,6 +3785,18 @@ async def post_guided_respond(
                                 guided=planning_guided,
                                 catalog_plugin_ids=catalog_ids,
                             )
+                            if correction_target is not None:
+                                # The production planner enforces this inside
+                                # its bounded repair/hatch loop. Recheck the
+                                # returned service contract before staging so
+                                # a substituted implementation cannot silently
+                                # supersede the selected target unchanged.
+                                successor_candidate = guided_candidate_state(plan.proposal)
+                                require_guided_proposal_correction_target_changed(
+                                    projection,
+                                    correction_target,
+                                    successor_candidate,
+                                )
                             proposal_turn = Turn(
                                 type=TurnType.PROPOSE_PIPELINE.value,
                                 step_index=2,
@@ -3763,9 +3821,13 @@ async def post_guided_respond(
                                     supersedes_draft_hash=authority.proposal.draft_hash,
                                 ),
                             )
-                            if revision_instruction is not None:
-                                # Transcript custody (R2-F6): a prose revision is
-                                # the author's own words driving a full re-plan.
+                            revision_transcript_content = (
+                                correction_message.content if correction_message is not None else revision_instruction
+                            )
+                            if revision_transcript_content is not None:
+                                # Transcript custody (R2-F6): a prose revision or
+                                # selected-component correction is the author's
+                                # own words driving a full re-plan.
                                 # It was durable only inside the turn_response
                                 # payload and a canned TurnRecord summary, so the
                                 # rendered transcript showed a new proposal with
@@ -3787,14 +3849,18 @@ async def post_guided_respond(
                                         *successor_guided.chat_history,
                                         ChatTurn(
                                             role=ChatRole.USER,
-                                            content=revision_instruction,
+                                            content=revision_transcript_content,
                                             seq=successor_guided.chat_turn_seq,
                                             step=guided.step,
                                             ts_iso=revision_ts_iso,
                                         ),
                                         ChatTurn(
                                             role=ChatRole.ASSISTANT,
-                                            content=GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT,
+                                            content=(
+                                                GUIDED_PROPOSAL_CORRECTION_ACKNOWLEDGEMENT
+                                                if correction_message is not None
+                                                else GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT
+                                            ),
                                             seq=successor_guided.chat_turn_seq + 1,
                                             step=guided.step,
                                             ts_iso=revision_ts_iso,
@@ -3867,11 +3933,21 @@ async def post_guided_respond(
                                         catalog_plugin_ids=catalog_ids,
                                         proposal_projection=projection,
                                         actor="composer_route",
-                                        user_message_id=root_message.id if root_message is not None else None,
-                                        user_message_content_hash=(
-                                            _message_content_hash(root_message.content) if root_message is not None else None
+                                        user_message_id=(
+                                            correction_message.message_id
+                                            if correction_message is not None
+                                            else root_message.id
+                                            if root_message is not None
+                                            else None
                                         ),
-                                        originating_message=None,
+                                        user_message_content_hash=(
+                                            _message_content_hash(correction_message.content)
+                                            if correction_message is not None
+                                            else _message_content_hash(root_message.content)
+                                            if root_message is not None
+                                            else None
+                                        ),
+                                        originating_message=correction_message,
                                         supersedes_proposal_id=authority.row.id,
                                         response=stage_response,
                                         payloads=(prepared_response, prepared_proposal),

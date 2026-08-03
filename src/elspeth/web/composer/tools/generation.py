@@ -761,6 +761,11 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "If a pass-through with no transforms is genuinely what the instruction calls for, re-emit the same pipeline unchanged to confirm the deliberate no-transform intent — the confirmation will be accepted.",
     ),
     (
+        r"guided_correction_unchanged",
+        "The candidate left the exact node or route selected by the operator unchanged. Changing a different component does not satisfy a selected-component correction.",
+        "Apply the operator's correction to the selected target identified by the correction_target object in the reviewed context, preserve unrelated components, and re-emit the complete pipeline.",
+    ),
+    (
         r"interpretation_review_draft_malformed|cleanup review draft is malformed",
         "The cleanup node's interpretation_requirements row IS present and its user_term matches the registered decision kind, but the draft text fails marker recognition — the contract recognizes the draft only when it contains both 'raw html' and 'fingerprint'. Do NOT add another row; the fix is the draft text alone.",
         "On the existing cleanup row, replace ONLY the draft string with the canonical draft, copied verbatim without rephrasing: "
@@ -1034,6 +1039,10 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # A revision candidate netting zero transform nodes drew one coded nudge
     # instead of silently shipping a passthrough with aspirational metadata.
     "proposal_missing_requested_transforms",
+    # ── Guided selected-correction convergence (elspeth-43208ece4c) ───────
+    # The candidate is otherwise valid but did not change the exact public
+    # semantics the operator selected. Keep it inside bounded repair/hatch.
+    "guided_correction_unchanged",
     # ── Unproducible declared output fields (R2-F4, 2026-08-01) ────────────
     # Planner-loop only: pairs the reviewed guided facts (what the sources
     # carry vs what the outputs declare) with the candidate's node count.

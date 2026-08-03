@@ -235,6 +235,19 @@ class _PipelineCandidateRejected(RuntimeError):
         self.result = result
 
 
+@final
+class PipelineCandidatePolicyRejection(RuntimeError):
+    """Closed repairable objection raised by a surface-specific acceptance check."""
+
+    def __init__(self, error_code: str) -> None:
+        if type(error_code) is not str or not error_code:
+            raise TypeError("candidate policy rejection code must be a non-empty exact string")
+        if explain_validation_code(error_code) is None:
+            raise ValueError("candidate policy rejection code must have closed repair guidance")
+        super().__init__("pipeline candidate did not satisfy a surface policy")
+        self.error_code = error_code
+
+
 @dataclass(frozen=True, slots=True)
 class PlannerBudgetPolicy:
     """Request-wide hard bounds, except cost which is a continuation cap.
@@ -389,6 +402,7 @@ class PlannerOriginatingMessage:
 
 
 type PipelineCandidateFinalizer = Callable[[Mapping[str, Any]], Mapping[str, Any]]
+type PipelineCandidateAcceptance = Callable[[CompositionState], None]
 type PipelineClaimEvaluator = Callable[[CompositionState, tuple[str, ...]], tuple[str, ...]]
 
 
@@ -1081,6 +1095,29 @@ def _nodeless_revision_rejection(state: CompositionState) -> ToolResult:
     )
 
 
+def _candidate_policy_rejection(
+    state: CompositionState,
+    *,
+    error_code: str,
+) -> ToolResult:
+    """Create one closed rejection raised by a post-validation surface policy."""
+
+    if explain_validation_code(error_code) is None:
+        raise AuditIntegrityError("candidate policy rejection code has no closed repair guidance")
+    entry = ValidationEntry(
+        component="pipeline",
+        message="The candidate did not satisfy a surface-specific semantic obligation.",
+        severity="high",
+        error_code=error_code,
+    )
+    return ToolResult(
+        success=False,
+        updated_state=state,
+        validation=ValidationSummary(is_valid=False, errors=(entry,), warnings=(), suggestions=()),
+        affected_nodes=(),
+    )
+
+
 def _missing_source_rejection(state: CompositionState) -> ToolResult:
     """Synthesize the coded rejection for a candidate that names no source.
 
@@ -1554,6 +1591,7 @@ async def _build_valid_pipeline_plan(
     reviewed_facts: Mapping[str, Any],
     claimed_deferred_intent_ids: tuple[str, ...],
     claim_evaluator: PipelineClaimEvaluator | None,
+    candidate_acceptance: PipelineCandidateAcceptance | None,
     supersedes_draft_hash: str | None,
     surface: PlannerSurface,
     repair_count: int,
@@ -1623,6 +1661,16 @@ async def _build_valid_pipeline_plan(
         claimed_deferred_intent_ids
     ):
         raise AuditIntegrityError("deferred intent claim evaluator changed the claimed identity set")
+    if candidate_acceptance is not None:
+        try:
+            candidate_acceptance(candidate.result.updated_state)
+        except PipelineCandidatePolicyRejection as exc:
+            raise _PipelineCandidateRejected(
+                _candidate_policy_rejection(
+                    candidate.result.updated_state,
+                    error_code=exc.error_code,
+                )
+            ) from exc
 
     safe_pipeline: Mapping[str, Any] = pipeline
     custody_result: PipelineCustodyResult = "not_required"
@@ -1775,6 +1823,7 @@ async def prepare_pipeline_plan(
             reviewed_facts=reviewed_facts,
             claimed_deferred_intent_ids=(),
             claim_evaluator=None,
+            candidate_acceptance=None,
             supersedes_draft_hash=supersedes_draft_hash,
             surface=surface,
             repair_count=repair_count,
@@ -1829,6 +1878,7 @@ async def plan_pipeline(
     lifecycle: PlannerRequestLifecycle,
     recorder: BufferingRecorder,
     candidate_finalizer: PipelineCandidateFinalizer,
+    candidate_acceptance: PipelineCandidateAcceptance | None = None,
 ) -> PipelinePlanResult:
     """Plan and validate one proposal without publishing state or DB rows."""
     if type(intent) is not str or not intent.strip():
@@ -1848,6 +1898,8 @@ async def plan_pipeline(
     canonical_json(provider_current_state)
     if not callable(candidate_finalizer):
         raise TypeError("candidate_finalizer must be callable")
+    if candidate_acceptance is not None and not callable(candidate_acceptance):
+        raise TypeError("candidate_acceptance must be callable or None")
     if type(unproducible_output_fields) is not tuple or any(type(field) is not str for field in unproducible_output_fields):
         raise TypeError("unproducible_output_fields must be an exact string tuple")
     if type(eligible_deferred_intent_ids) is not tuple or any(type(intent_id) is not str for intent_id in eligible_deferred_intent_ids):
@@ -1903,6 +1955,7 @@ async def plan_pipeline(
                 lifecycle=lifecycle,
                 recorder=recorder,
                 candidate_finalizer=candidate_finalizer,
+                candidate_acceptance=candidate_acceptance,
             )
         outcome = "complete"
         trail.log_summary("accepted")
@@ -1957,6 +2010,7 @@ async def _plan_pipeline_inner(
     lifecycle: PlannerRequestLifecycle,
     recorder: BufferingRecorder,
     candidate_finalizer: PipelineCandidateFinalizer,
+    candidate_acceptance: PipelineCandidateAcceptance | None,
 ) -> PipelinePlanResult:
     skill_hash = hashlib.sha256(rendered_skill.encode("utf-8")).hexdigest()
     deadline = asyncio.get_running_loop().time() + model_config.timeout_seconds
@@ -2652,6 +2706,7 @@ async def _plan_pipeline_inner(
                     reviewed_facts=reviewed_facts,
                     claimed_deferred_intent_ids=claimed_deferred_intent_ids,
                     claim_evaluator=claim_evaluator,
+                    candidate_acceptance=candidate_acceptance,
                     supersedes_draft_hash=supersedes_draft_hash,
                     surface=surface,
                     repair_count=repair_count,

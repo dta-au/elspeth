@@ -411,7 +411,13 @@ function proposalRetryActionForBody(
     return { kind: body.chosen[0] === "confirm_wiring" ? "confirm_wiring" : "review_wiring" };
   }
   if (body.control_signal === "reject") return { kind: "reject" };
-  if ("correction_feedback" in body) return null;
+  if ("correction_feedback" in body) {
+    return {
+      kind: "revise",
+      edit_target: body.edit_target,
+      correction_feedback: body.correction_feedback,
+    };
+  }
   if (body.edit_target !== null) {
     return { kind: "revise", edit_target: body.edit_target };
   }

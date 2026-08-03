@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 
 import type {
   GuidedEditTarget,
@@ -49,7 +49,8 @@ function sameRetryAction(
   if (retained.kind !== "revise" || candidate.kind !== "revise") return true;
   return (
     retained.edit_target.kind === candidate.edit_target.kind &&
-    retained.edit_target.stable_id === candidate.edit_target.stable_id
+    retained.edit_target.stable_id === candidate.edit_target.stable_id &&
+    (retained.correction_feedback ?? null) === (candidate.correction_feedback ?? null)
   );
 }
 
@@ -193,6 +194,20 @@ export function ProposePipelineTurn({
   isTutorial = false,
 }: ProposePipelineTurnProps): JSX.Element {
   const statusRef = useRef<HTMLParagraphElement | null>(null);
+  const revisionFeedbackId = useId();
+  const retainedCorrection =
+    reviewState.status === "error" &&
+    reviewState.retryable &&
+    reviewState.retry_action.kind === "revise" &&
+    reviewState.retry_action.correction_feedback !== undefined
+      ? reviewState.retry_action
+      : null;
+  const [revisionTarget, setRevisionTarget] = useState<GuidedEditTarget | null>(
+    retainedCorrection?.edit_target ?? null,
+  );
+  const [revisionFeedback, setRevisionFeedback] = useState(
+    retainedCorrection?.correction_feedback ?? "",
+  );
   const labelById = useMemo(() => {
     const labels = new Map<string, string>();
     for (const source of payload.graph.sources) labels.set(source.stable_id, source.label);
@@ -273,6 +288,15 @@ export function ProposePipelineTurn({
     if (reviewState.status !== "error") return true;
     if (!reviewState.retryable) return false;
     return sameRetryAction(reviewState.retry_action, candidate);
+  };
+  const revisionTargetEnabled = (target: GuidedEditTarget): boolean => {
+    if (target.kind === "source" || target.kind === "output") {
+      return actionEnabled({
+        kind: "revise",
+        edit_target: { kind: target.kind, stable_id: target.stable_id },
+      });
+    }
+    return !controlsLocked && reviewState.status !== "error";
   };
 
   useEffect(() => {
@@ -452,20 +476,78 @@ export function ProposePipelineTurn({
                 type="button"
                 className="guided-turn-secondary"
                 key={`${target.kind}-${target.stable_id}`}
-                disabled={!actionEnabled({ kind: "revise", edit_target: target })}
-                onClick={() => onSubmit({
-                  chosen: null,
-                  edited_values: null,
-                  custom_inputs: null,
-                  edit_target: target,
-                  control_signal: null,
-                  proposal_id: payload.proposal_id,
-                  draft_hash: payload.draft_hash,
-                } satisfies GuidedRespondAction)}
+                disabled={!revisionTargetEnabled(target)}
+                onClick={() => {
+                  if (target.kind === "source" || target.kind === "output") {
+                    const reviewedFormTarget = {
+                      kind: target.kind,
+                      stable_id: target.stable_id,
+                    } as const;
+                    onSubmit({
+                      chosen: null,
+                      edited_values: null,
+                      custom_inputs: null,
+                      edit_target: reviewedFormTarget,
+                      control_signal: null,
+                      proposal_id: payload.proposal_id,
+                      draft_hash: payload.draft_hash,
+                    } satisfies GuidedRespondAction);
+                    return;
+                  }
+                  setRevisionTarget(target);
+                  setRevisionFeedback("");
+                }}
               >
                 Revise {targetLabel(target)}
               </button>
             ))}
+            {revisionTarget !== null &&
+            (revisionTarget.kind === "node" || revisionTarget.kind === "edge") ? (
+              <div className="guided-proposal__correction">
+                <p>
+                  Revision for <strong>{targetLabel(revisionTarget)}</strong>
+                </p>
+                <label className="guided-schema-label" htmlFor={revisionFeedbackId}>
+                  What should change?
+                </label>
+                <textarea
+                  id={revisionFeedbackId}
+                  className="wire-stage__correction-input"
+                  rows={2}
+                  value={revisionFeedback}
+                  maxLength={4096}
+                  onChange={(event) => setRevisionFeedback(event.target.value)}
+                />
+                <button
+                  type="button"
+                  className="guided-turn-secondary"
+                  disabled={
+                    revisionFeedback.trim().length === 0 ||
+                    !actionEnabled({
+                      kind: "revise",
+                      edit_target: revisionTarget,
+                      correction_feedback: revisionFeedback.trim(),
+                    })
+                  }
+                  onClick={() => {
+                    const correctionFeedback = revisionFeedback.trim();
+                    if (correctionFeedback.length === 0) return;
+                    onSubmit({
+                      chosen: null,
+                      edited_values: null,
+                      custom_inputs: null,
+                      edit_target: revisionTarget,
+                      correction_feedback: correctionFeedback,
+                      control_signal: null,
+                      proposal_id: payload.proposal_id,
+                      draft_hash: payload.draft_hash,
+                    } satisfies GuidedRespondAction);
+                  }}
+                >
+                  Send revision request
+                </button>
+              </div>
+            ) : null}
           </fieldset>
         )}
       </div>

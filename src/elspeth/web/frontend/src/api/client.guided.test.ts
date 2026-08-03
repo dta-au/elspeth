@@ -785,7 +785,7 @@ describe("api/client guided functions", () => {
         edit_target: null,
         control_signal: "reject",
       }],
-      ["target-only revise", {
+      ["target-only form revise", {
         operation_id: "00000000-0000-4000-8000-000000000614",
         turn_token: "b".repeat(64),
         chosen: null,
@@ -794,7 +794,7 @@ describe("api/client guided functions", () => {
         proposal_id: "00000000-0000-4000-8000-000000000612",
         draft_hash: "c".repeat(64),
         edit_target: {
-          kind: "edge",
+          kind: "source",
           stable_id: "00000000-0000-4000-8000-000000000615",
         },
         control_signal: null,

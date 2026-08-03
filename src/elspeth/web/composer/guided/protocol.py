@@ -716,6 +716,7 @@ PROPOSAL_RATIONALE_TEMPLATE = "guided.proposal.rationale.review_required.v1"
 # constants (not inline literals) so the assertion in the integration tests
 # binds the exact rendered text.
 GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT = "I re-planned the whole pipeline with that instruction. Review the updated proposal below."
+GUIDED_PROPOSAL_CORRECTION_ACKNOWLEDGEMENT = "I re-planned the selected component with that correction. Review the updated proposal below."
 GUIDED_WIRE_CORRECTION_ACKNOWLEDGEMENT = "I re-planned the pipeline with that wiring correction. Review the updated wiring below."
 _PROPOSAL_BLOCKER_SUMMARY: Mapping[str, str] = {
     "pipeline_invalid": "guided.proposal.blocker.pipeline_invalid.v1",

@@ -384,6 +384,36 @@ def require_guided_correction_target_changed(
         raise AuditIntegrityError("guided correction planner did not change the selected component")
 
 
+def require_guided_proposal_correction_target_changed(
+    proposal_payload: Mapping[str, Any],
+    target: GuidedCorrectionTarget,
+    successor: CompositionState,
+) -> None:
+    """Apply the exact correction-change proof to a Step-3 proposal projection."""
+
+    graph = proposal_payload.get("graph")
+    nodes = proposal_payload.get("nodes")
+    outputs = proposal_payload.get("outputs")
+    if (
+        type(graph) is not dict
+        or type(graph.get("sources")) is not list
+        or type(graph.get("edges")) is not list
+        or type(nodes) is not list
+        or type(outputs) is not list
+    ):
+        raise AuditIntegrityError("guided proposal correction projection is malformed")
+    require_guided_correction_target_changed(
+        {
+            "sources": graph["sources"],
+            "nodes": nodes,
+            "connections": graph["edges"],
+            "outputs": outputs,
+        },
+        target,
+        successor,
+    )
+
+
 def guided_private_reviewed_facts(guided: GuidedSession) -> dict[str, object]:
     """Return the exact ordered facts whose hash is stored in a guided ref."""
 
@@ -1525,6 +1555,7 @@ __all__ = [
     "guided_unproducible_output_field_names",
     "guided_unproducible_output_fields",
     "require_guided_correction_target_changed",
+    "require_guided_proposal_correction_target_changed",
     "resolve_guided_correction_target",
     "resolve_guided_proposal_correction_target",
     "verified_remaining_deferred_intents",

@@ -184,6 +184,11 @@ export interface GuidedEditTarget {
   stable_id: string;
 }
 
+type GuidedReviewedFormEditTarget = {
+  kind: "source" | "output";
+  stable_id: string;
+};
+
 interface UnboundProposalFields {
   proposal_id: null;
   draft_hash: null;
@@ -274,7 +279,7 @@ export type GuidedRespondAction =
       chosen: null;
       edited_values: null;
       custom_inputs: null;
-      edit_target: GuidedEditTarget;
+      edit_target: GuidedReviewedFormEditTarget;
       control_signal: null;
     })
   | (BoundProposalFields & {
@@ -307,7 +312,16 @@ export type GuidedRespondAction =
 export type GuidedProposalRetryAction =
   | { kind: "review_wiring" | "confirm_wiring" }
   | { kind: "reject" }
-  | { kind: "revise"; edit_target: GuidedEditTarget };
+  | {
+      kind: "revise";
+      edit_target: GuidedReviewedFormEditTarget;
+      correction_feedback?: never;
+    }
+  | {
+      kind: "revise";
+      edit_target: GuidedEditTarget;
+      correction_feedback: string;
+    };
 
 /**
  * Local review lifecycle for one exact durable guided proposal projection.
