@@ -1,7 +1,7 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-04T07:27:12+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-04T07:27:12+10:00
+Last refreshed: 2026-08-04T07:52:21+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-04T07:52:21+10:00
 Release baseline: `release/0.7.2@937a8010b`
 Coordination owner: `codex-r3-rca-coordinator`
 
@@ -42,9 +42,9 @@ shell mechanics remains deferred even when it blocks a fresh install.
 |---|---:|---:|---|
 | Closed | 9 | 7 | Tracker says done; closure evidence is still sampled during the completion audit |
 | Verifying | 17 | 14 | Locally fixed; live or requirement-specific acceptance remains |
-| Fixing | 1 | 2 | Owned bug implementation is still in flight |
+| Fixing | 2 | 2 | Owned bug implementation is still in flight |
 | In progress | 0 | 0 | A delivery task spanning existing objective defects is in flight |
-| Open | 5 | 1 | Confirmed task/epic work not yet started here |
+| Open | 4 | 1 | Confirmed task/epic work not yet started here |
 | Triage | 9 | 1 | Root cause and reproducibility must be checked against current HEAD before fixing |
 | Proposed | 3 | 0 | Regression-gate features require approval/acceptance design before implementation |
 
@@ -83,7 +83,7 @@ claim custody.
 
 | Agent | Scope | Worktree/branch | File custody | AWS authority | Status |
 |---|---|---|---|---|---|
-| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`); `.claude/worktrees/verify-guided-schema-batch`; release checkout | This tracker and release integration | Sole mutation custodian | Active; advisor and JSON-codec fixes are durable through release `9d517df5e` after 37,233 combined tests, 1,189 release canaries, six frontend regressions, and TypeScript |
+| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`); `.claude/worktrees/verify-guided-schema-batch`; release checkout | This tracker and release integration | Sole mutation custodian | Active; advisor, JSON-codec, and retry-routing fixes are durable through `937a8010b`; exact release `d8c8ee7b8` passed 37,305 tests and Loomweave is fresh there |
 | `/root/review_guided_proposal_feedback` | Focused custody, retry, closed-shape, unchanged-target, security, and accessibility review | Read-only `.claude/worktrees/guided-proposal-feedback` | None | None | Complete; approved exact candidate `a5b5c9cee` with no P1/P2 findings |
 | `/root/rca_multiquery_standard_json` | Root-cause the standard-JSON provider-contract omission and audit-trace seam | Shared read-only release baseline | None | None | Complete; confirmed standard mode enforced names, types, and enums absent from both provider and Langfuse messages |
 | `/root/fix_multiquery_standard_json` | TDD implementation of deterministic standard-JSON contract projection | `.claude/worktrees/fix-multiquery-standard-json`; `codex/fix-multiquery-standard-json` | Released after integration | None | Complete exact candidate `f84a2fc37`; integrated as release `4f95c29a1` after two independent approvals |
@@ -104,6 +104,7 @@ claim custody.
 | `/root/fix_json_sink_encoding_validation` | Reject unavailable and non-text JSON codecs before publication or the first write | `.claude/worktrees/json-sink-encoding-validation`; `codex/fix-json-sink-encoding-validation` | Released after reviewed integration | None | Complete through release `9d517df5e`; codec validation and the refreshed authoritative DAG corpus are advanced to verifying |
 | `/root/fix_grounded_option_constraints` | Ground exact safe option obligations, keep private values out of provider context, and reject contradictory constraints | `.claude/worktrees/grounded-option-constraints`; `codex/fix-grounded-option-constraints` | Deferred-intent authority/admission/planning seams and direct tests | None | Active in strict TDD for `826765af90` + `d293c5d139`; advisor checkpoint wording is excluded |
 | `/root/fix_retry_exhaustion_routing` | Route retry exhaustion through the configured transform `on_error` contract with complete audit custody | `.claude/worktrees/retry-exhaustion-routing`; `codex/fix-retry-exhaustion-routing` | Released after reviewed integration | None | Complete as release `937a8010b`; exact release retry/processor/traversal/property/integration canary passed 325 tests plus mypy, Ruff, and non-inert Wardline |
+| `/root/fix_composer_provider_telemetry` | Project durable Composer provider-call audit facts into bounded operator metrics only after commit | `.claude/worktrees/composer-provider-telemetry`; `codex/fix-composer-provider-telemetry` | New provider projector, session post-commit seam, request/operator telemetry, and direct tests; grounded Composer files excluded | None | Active strict TDD for `ebba0b2171`; baseline 158 passed, first four projections are green, and rollback/audit-envelope boundary tests are driving the disjoint settlement implementation |
 | `/root/review_advisor_evidence_scope` | Adversarial review of bounded evidence and actual checkpoint wire instructions | Shared read-only advisor worktree | None | None | Complete; found and drove repair of the shared stuck-composer system-contract conflict, then approved current bytes with no findings |
 | `/root/audit_advisor_demo` | D1-D6 and advisor/F14 completion evidence | Shared read-only baseline | None | None | Completed; no residual local code defect found |
 | `/root/audit_compose_loop` | Six compose-loop RCAs and implementation partitioning | Shared read-only baseline | None | None | Completed; all six remain actionable |
@@ -163,7 +164,7 @@ Parent workstream state:
 | `elspeth-f159d2394b` | P2 | `confirmed` | unassigned | Core seconds-per-logical-turn premise disproved; defer Terraform/operator timeout tuning as setup ergonomics |
 | `elspeth-7bd0141bbe` | P2 | `verifying` | `codex-r3-rca-coordinator` | Reviewed `86453aa5c` + `3ec1036d6` reject invented terms before publication and retain the public registry through Anthropic/Bedrock adapters; verify live repair convergence |
 | `elspeth-ecd8594b63` | P3 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `2906409e1` + `e1d31f104`; prove a live freeform fixed-sink build preserves every required field |
-| `elspeth-ebba0b2171` | P3 | `confirmed` | unassigned | Current-HEAD RCA corrected the stale zero-telemetry headline: add a bounded post-commit projector from durable provider-call audit evidence to operator count/duration metrics; semantic convergence telemetry first needs a closed durable audit envelope |
+| `elspeth-ebba0b2171` | P3 | `fixing` | `codex-composer-provider-telemetry` | Add bounded post-commit provider-call count/duration and request duration/call-count projection from durable audit evidence; keep identifiers, payloads, model/provider strings, and arbitrary errors out of metrics |
 | `elspeth-73c7a4df36` | P1 | `closed` | `codex-compose-authoring-aids` | Delivery completed at `release/0.7.2@e1d31f104`; assignee retained as audit history |
 | `elspeth-57232f6f3c` | P1 | `closed` | `codex-r3-rca-coordinator` | Reviewed chain integrated through `a913ccb63`; complete no-session audit recovery and empty post-P4 replay evidence verified with 79 release-local tests |
 | `elspeth-4e6f2a59e4` | P2 | `closed` | `codex-guided-plan-terminal-progress` | Integrated through `859c2a642`; all guided-plan outcomes terminalize under exact generation and authoritative outcome primacy |
@@ -377,6 +378,8 @@ Append entries; do not rewrite history.
 | 2026-08-04 07:18 | Advisor and JSON combined full gate passed | Exact combined head `9aacd4768` completed `pytest tests/` with 37,233 passed, 66 skipped, and one expected trust-tier xfail in 13m32s; a prior isolated scheduler-contention start-starvation flake passed three immediate reproductions before the clean rerun |
 | 2026-08-04 07:24 | Advisor and JSON fixes integrated | Reviewed commits were cherry-picked through release `9d517df5e`; exact release canaries passed 1,189 backend tests, six frontend regressions, and TypeScript. `532dfcb0c7` and `0c73de77d5` advanced to verifying |
 | 2026-08-04 07:27 | Retry-exhaustion routing integrated | Independently approved `44c0b1a38` was cherry-picked as release `937a8010b`; 325 exact release tests plus mypy, Ruff, and non-inert Wardline passed, and `454892147c` advanced to verifying |
+| 2026-08-04 07:52 | Retry release full gate passed | Exact release `d8c8ee7b8` completed `pytest tests/` with 37,305 passed, 27 skipped, and one expected trust-tier xfail in 23m53s; Loomweave run `eb271254-4297-4b53-ab9b-f28e94838f55` is fresh at the same commit |
+| 2026-08-04 07:52 | Remaining demo-core work reconciled | Read-only current-state audit found no unclaimed local-code leaf: grounded constraints and bounded provider telemetry are the only active local implementations; thirty other core leaves require bundled live acceptance, and installer/setup/signing lanes remain deferred or externally owned |
 
 ## Reconciliation findings
 
