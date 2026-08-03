@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import {
   ExecuteButton,
   INTERPRETATION_PENDING_RUN_BLOCK_TITLE,
@@ -17,6 +17,7 @@ import type { CompositionState, PluginSummary } from "@/types/index";
 import type { InterpretationEvent } from "@/types/interpretation";
 import type { AuditReadinessSnapshot } from "@/types/api";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
+import { REQUEST_RUN_EVENT } from "@/lib/composer-events";
 
 const READY_READINESS = {
   authoring_valid: true,
@@ -325,6 +326,104 @@ describe("ExecuteButton", () => {
       within(dialog).getByRole("button", { name: /^run pipeline$/i }),
     );
     expect(execute).toHaveBeenCalledWith("sess-1");
+  });
+
+  it("routes an external run intent through the egress disclosure", () => {
+    const execute = vi.fn();
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+    fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("alertdialog", { name: /run pipeline\?/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("executes an acknowledged external run intent exactly once", () => {
+    const execute = vi.fn();
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+      runDisclosureAckBySession: { "sess-1": true },
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+    fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(execute).toHaveBeenCalledWith("sess-1");
+  });
+
+  it("rechecks live execution readiness before confirming an open disclosure", () => {
+    const execute = vi.fn();
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+      runDisclosureAckBySession: {},
+    } as never);
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+
+    render(<ExecuteButton />);
+    fireEvent(window, new CustomEvent(REQUEST_RUN_EVENT));
+    const dialog = screen.getByRole("alertdialog", { name: /run pipeline\?/i });
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", { name: /don't ask again/i }),
+    );
+    act(() => {
+      useExecutionStore.setState({
+        validationResult: {
+          is_valid: true,
+          checks: [],
+          errors: [],
+          warnings: [],
+          readiness: {
+            ...READY_READINESS,
+            execution_ready: false,
+          },
+        } as never,
+      });
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /^run pipeline$/i }),
+    );
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(
+      useExecutionStore.getState().runDisclosureAckBySession["sess-1"],
+    ).not.toBe(true);
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   });
 
   it("uses the live source catalog when building the disclosure", () => {

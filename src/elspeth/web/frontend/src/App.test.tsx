@@ -10,6 +10,7 @@ import { useAuthStore } from "./stores/authStore";
 import {
   OPEN_GRAPH_MODAL_EVENT,
   OPEN_YAML_MODAL_EVENT,
+  REQUEST_RUN_EVENT,
 } from "./lib/composer-events";
 import type {
   ChatMessage,
@@ -475,6 +476,77 @@ describe("App banner roles", () => {
     expect(onOpenYaml).toHaveBeenCalledTimes(1);
     window.removeEventListener(OPEN_GRAPH_MODAL_EVENT, onOpenGraph);
     window.removeEventListener(OPEN_YAML_MODAL_EVENT, onOpenYaml);
+  });
+
+  it("routes Ctrl+E through the run-intent owner and does not execute when backend execution readiness is false", async () => {
+    const execute = vi.fn();
+    const onRequestRun = vi.fn();
+    window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(1),
+    });
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: false,
+          completion_ready: false,
+          blockers: [],
+        },
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+    } as never);
+
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    fireEvent.keyDown(document, { key: "e", ctrlKey: true });
+
+    expect(onRequestRun).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
+  });
+
+  it("routes a ready Ctrl+E through run intent instead of calling the execution store directly", async () => {
+    const execute = vi.fn();
+    const onRequestRun = vi.fn();
+    window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(1),
+    });
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: true,
+          completion_ready: true,
+          blockers: [],
+        },
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+      runDisclosureAckBySession: {},
+    } as never);
+
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    fireEvent.keyDown(document, { key: "e", metaKey: true });
+
+    expect(onRequestRun).toHaveBeenCalledTimes(1);
+    expect(execute).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
   });
 
   it("does not dispatch retired inspector tab shortcuts on Alt+digit", async () => {

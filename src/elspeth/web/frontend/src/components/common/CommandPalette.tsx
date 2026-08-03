@@ -21,6 +21,7 @@ import { hasCompositionContent } from "@/utils/compositionState";
 import {
   OPEN_GRAPH_MODAL_EVENT,
   OPEN_YAML_MODAL_EVENT,
+  REQUEST_RUN_EVENT,
 } from "@/lib/composer-events";
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -62,8 +63,9 @@ export function CommandPalette({
   const guidedSession = useSessionStore((s) => s.guidedSession);
   const reenterGuided = useSessionStore((s) => s.reenterGuided);
 
-  const execute = useExecutionStore((s) => s.execute);
   const validationResult = useExecutionStore((s) => s.validationResult);
+  const isExecuting = useExecutionStore((s) => s.isExecuting);
+  const progress = useExecutionStore((s) => s.progress);
 
   // Build command list
   const commands = useMemo<Command[]>(() => {
@@ -100,10 +102,14 @@ export function CommandPalette({
       title: "Execute Pipeline",
       category: "action",
       shortcut: "Ctrl+E",
-      enabled: validationResult?.is_valid === true && !!activeSessionId,
+      enabled:
+        validationResult?.readiness.execution_ready === true &&
+        !isExecuting &&
+        progress?.status !== "running" &&
+        !!activeSessionId,
       action: () => {
         if (activeSessionId) {
-          execute(activeSessionId);
+          window.dispatchEvent(new CustomEvent(REQUEST_RUN_EVENT));
         }
         onClose();
       },
@@ -189,10 +195,11 @@ export function CommandPalette({
     compositionState,
     guidedSession,
     validationResult,
+    isExecuting,
+    progress,
     createSession,
     selectSession,
     reenterGuided,
-    execute,
     onClose,
   ]);
 

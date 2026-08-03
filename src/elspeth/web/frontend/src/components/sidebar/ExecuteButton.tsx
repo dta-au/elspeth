@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useCallback, useEffect, useId, useState } from "react";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
@@ -13,6 +13,7 @@ import type {
   SourceSpec,
 } from "@/types/index";
 import type { ReadinessRowId } from "@/types/api";
+import { REQUEST_RUN_EVENT } from "@/lib/composer-events";
 
 /**
  * Run-button tooltip text used when a pending interpretation event blocks
@@ -464,15 +465,16 @@ export function ExecuteButton(): JSX.Element | null {
   const [showRunDisclosure, setShowRunDisclosure] = useState(false);
   const [skipFutureDisclosure, setSkipFutureDisclosure] = useState(false);
 
-  if (!activeSessionId) return null;
-
-  const optedOut = optedOutInterpretationsBySession[activeSessionId] ?? false;
-  const pendingCount = Object.keys(
-    pendingInterpretationsBySession[activeSessionId] ?? {},
-  ).length;
+  const optedOut = activeSessionId
+    ? optedOutInterpretationsBySession[activeSessionId] ?? false
+    : false;
+  const pendingCount = activeSessionId
+    ? Object.keys(pendingInterpretationsBySession[activeSessionId] ?? {}).length
+    : 0;
   const isRunBlocked = !optedOut && pendingCount > 0;
 
   const canExecute =
+    activeSessionId !== null &&
     validationResult?.readiness.execution_ready === true &&
     !isExecuting &&
     progress?.status !== "running" &&
@@ -506,7 +508,7 @@ export function ExecuteButton(): JSX.Element | null {
         (row.status === "warning" || row.status === "error"),
     ) ?? false;
 
-  function handleRunClick(): void {
+  const handleRunClick = useCallback((): void => {
     // Blocked-but-focusable case (aria-disabled): activation is a no-op.
     if (!canExecute || !activeSessionId) return;
     if (disclosureAcknowledged) {
@@ -514,16 +516,29 @@ export function ExecuteButton(): JSX.Element | null {
       return;
     }
     setShowRunDisclosure(true);
-  }
+  }, [activeSessionId, canExecute, disclosureAcknowledged, execute]);
+
+  useEffect(() => {
+    function handleRunRequest(): void {
+      handleRunClick();
+    }
+    window.addEventListener(REQUEST_RUN_EVENT, handleRunRequest);
+    return () => window.removeEventListener(REQUEST_RUN_EVENT, handleRunRequest);
+  }, [handleRunClick]);
 
   function handleDisclosureConfirm(): void {
-    if (!activeSessionId) return;
+    if (!canExecute || !activeSessionId) {
+      setShowRunDisclosure(false);
+      return;
+    }
     if (skipFutureDisclosure) {
       acknowledgeRunDisclosure(activeSessionId);
     }
     setShowRunDisclosure(false);
     void execute(activeSessionId);
   }
+
+  if (!activeSessionId) return null;
 
   const egressLines = buildRunEgressSummary(
     compositionState,

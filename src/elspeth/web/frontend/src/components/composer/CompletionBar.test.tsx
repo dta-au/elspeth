@@ -42,6 +42,20 @@ const BLOCKED_READINESS = {
   ],
 } satisfies ValidationReadiness;
 
+const COMPLETION_BLOCKED_READINESS = {
+  authoring_valid: true,
+  execution_ready: true,
+  completion_ready: false,
+  blockers: [
+    {
+      code: "advisor_signoff_required",
+      component_id: null,
+      component_type: null,
+      detail: "Advisor sign-off is required before sharing for review.",
+    },
+  ],
+} satisfies ValidationReadiness;
+
 function _validValidation(): ValidationResult {
   return {
     is_valid: true,
@@ -151,6 +165,37 @@ describe("CompletionBar", () => {
     render(<CompletionBar />);
     const button = screen.getByTestId("completion-bar-save-for-review") as HTMLButtonElement;
     expect(button.disabled).toBe(false);
+  });
+
+  it("blocks Save on completion readiness while leaving Run admitted", () => {
+    const openAndMark = vi.fn();
+    useSessionStore.setState({ activeSessionId: "sess-1" } as never);
+    useExecutionStore.setState({
+      validationResult: {
+        ..._validValidation(),
+        readiness: COMPLETION_BLOCKED_READINESS,
+      },
+      isExecuting: false,
+      progress: null,
+    } as never);
+    useShareableReviewStore.setState({ openAndMark } as never);
+
+    render(<CompletionBar />);
+    const save = screen.getByTestId(
+      "completion-bar-save-for-review",
+    ) as HTMLButtonElement;
+    const run = screen
+      .getByTestId("completion-bar-run-pipeline")
+      .querySelector("button") as HTMLButtonElement;
+
+    expect(save).toBeDisabled();
+    expect(save).toHaveAttribute(
+      "title",
+      "Advisor sign-off is required before sharing for review.",
+    );
+    fireEvent.click(save);
+    expect(openAndMark).not.toHaveBeenCalled();
+    expect(run).not.toBeDisabled();
   });
 
   it("clicking Save for review invokes openAndMark with the active session id", () => {

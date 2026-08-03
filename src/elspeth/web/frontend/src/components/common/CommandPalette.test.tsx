@@ -5,6 +5,7 @@ import { CommandPalette } from "./CommandPalette";
 import {
   OPEN_GRAPH_MODAL_EVENT,
   OPEN_YAML_MODAL_EVENT,
+  REQUEST_RUN_EVENT,
 } from "@/lib/composer-events";
 import { useSessionStore } from "@/stores/sessionStore";
 import { resetStore } from "@/test/store-helpers";
@@ -28,12 +29,21 @@ vi.mock("@/api/client", () => ({
   chatGuided: vi.fn(),
 }));
 
+const executionStoreState = vi.hoisted(() => ({
+  execute: vi.fn(),
+  validationResult: null as null | {
+    is_valid: boolean;
+    readiness: {
+      execution_ready: boolean;
+    };
+  },
+  isExecuting: false,
+  progress: null as null | { status: string },
+}));
+
 vi.mock("@/stores/executionStore", () => ({
   useExecutionStore: (selector: (state: unknown) => unknown) =>
-    selector({
-      execute: vi.fn(),
-      validationResult: null,
-    }),
+    selector(executionStoreState),
 }));
 
 const exitedGuidedSession: GuidedSession = {
@@ -52,6 +62,9 @@ const exitedGuidedSession: GuidedSession = {
 describe("CommandPalette guided-mode commands", () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    executionStoreState.validationResult = null;
+    executionStoreState.isExecuting = false;
+    executionStoreState.progress = null;
     Element.prototype.scrollIntoView = vi.fn();
     resetStore(useSessionStore);
   });
@@ -166,5 +179,53 @@ describe("CommandPalette guided-mode commands", () => {
     expect(
       screen.queryByRole("option", { name: /Switch to YAML Tab/i }),
     ).toBeNull();
+  });
+
+  it("withholds Execute when structural validity passes but execution readiness is false", () => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    executionStoreState.validationResult = {
+      is_valid: true,
+      readiness: { execution_ready: false },
+    };
+
+    render(<CommandPalette isOpen onClose={vi.fn()} />);
+
+    expect(screen.queryByText("Execute Pipeline")).not.toBeInTheDocument();
+  });
+
+  it("dispatches run intent for an execution-ready pipeline", () => {
+    const onRequestRun = vi.fn();
+    const onClose = vi.fn();
+    window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    executionStoreState.validationResult = {
+      is_valid: true,
+      readiness: { execution_ready: true },
+    };
+
+    render(<CommandPalette isOpen onClose={onClose} />);
+    fireEvent.click(screen.getByText("Execute Pipeline"));
+
+    expect(onRequestRun).toHaveBeenCalledTimes(1);
+    expect(executionStoreState.execute).not.toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledTimes(1);
+    window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
+  });
+
+  it.each([
+    ["execution request is starting", true, null],
+    ["a run is active", false, { status: "running" }],
+  ])("withholds Execute while %s", (_label, isExecuting, progress) => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    executionStoreState.validationResult = {
+      is_valid: true,
+      readiness: { execution_ready: true },
+    };
+    executionStoreState.isExecuting = isExecuting;
+    executionStoreState.progress = progress;
+
+    render(<CommandPalette isOpen onClose={vi.fn()} />);
+
+    expect(screen.queryByText("Execute Pipeline")).not.toBeInTheDocument();
   });
 });

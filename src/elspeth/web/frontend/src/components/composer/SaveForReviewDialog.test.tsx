@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { axe, toHaveNoViolations } from "jest-axe";
 import { SaveForReviewDialog } from "./SaveForReviewDialog";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
+import { useExecutionStore } from "@/stores/executionStore";
 import * as api from "@/api/shareableReviews";
 
 expect.extend(toHaveNoViolations);
@@ -30,6 +31,20 @@ function _withOrigin(origin: string, fn: () => void) {
 describe("SaveForReviewDialog", () => {
   beforeEach(() => {
     useShareableReviewStore.getState().reset();
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: true,
+          completion_ready: true,
+          blockers: [],
+        },
+      } as never,
+    });
   });
 
   it("renders nothing when dialogOpen is false", () => {
@@ -113,6 +128,39 @@ describe("SaveForReviewDialog", () => {
     await waitFor(() =>
       expect(screen.getByTestId("save-for-review-success")).toBeInTheDocument(),
     );
+  });
+
+  it("disables and suppresses Retry when completion readiness becomes false", async () => {
+    const apiSpy = vi.spyOn(api, "markReadyForReview");
+    apiSpy.mockRejectedValueOnce({
+      status: 409,
+      detail: "composition validation failed",
+    });
+    await useShareableReviewStore.getState().openAndMark("sess-retry");
+    render(<SaveForReviewDialog />);
+
+    act(() => {
+      useExecutionStore.setState({
+        validationResult: {
+          is_valid: true,
+          checks: [],
+          errors: [],
+          warnings: [],
+          readiness: {
+            authoring_valid: true,
+            execution_ready: true,
+            completion_ready: false,
+            blockers: [],
+          },
+        } as never,
+      });
+    });
+
+    const retry = screen.getByTestId("save-for-review-retry");
+    const callsBeforeBlockedRetry = apiSpy.mock.calls.length;
+    expect(retry).toBeDisabled();
+    fireEvent.click(retry);
+    expect(apiSpy).toHaveBeenCalledTimes(callsBeforeBlockedRetry);
   });
 
   it("shows the share URL and prepends location.origin on success", () => {

@@ -26,6 +26,7 @@ import { SecretsPanel } from "./components/settings/SecretsPanel";
 import { ComposerPreferencesPanel } from "./components/settings/ComposerPreferencesPanel";
 import { HelloWorldTutorial } from "./components/tutorial";
 import { SideRailValidationBanner } from "./components/sidebar/SideRailValidationBanner";
+import { REQUEST_RUN_EVENT } from "./lib/composer-events";
 import { useAuthStore } from "./stores/authStore";
 import { initStoreSubscriptions, requestValidate } from "./stores/subscriptions";
 import { useSessionStore } from "./stores/sessionStore";
@@ -380,14 +381,7 @@ function App() {
       // Ctrl+E / Cmd+E: Execute pipeline
       if (e.key === "e" && (e.ctrlKey || e.metaKey) && activeSessionId) {
         e.preventDefault();
-        const execStore = useExecutionStore.getState();
-        const canExec =
-          execStore.validationResult?.is_valid === true &&
-          !execStore.isExecuting &&
-          execStore.progress?.status !== "running";
-        if (canExec) {
-          execStore.execute(activeSessionId);
-        }
+        window.dispatchEvent(new CustomEvent(REQUEST_RUN_EVENT));
         return;
       }
 

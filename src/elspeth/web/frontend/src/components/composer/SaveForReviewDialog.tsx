@@ -23,6 +23,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { useFocusTrap } from "@/hooks/useFocusTrap";
+import { useExecutionStore } from "@/stores/executionStore";
 import { useShareableReviewStore } from "@/stores/shareableReviewStore";
 
 const COPY_FEEDBACK_TIMEOUT_MS = 2000;
@@ -44,6 +45,9 @@ export function SaveForReviewDialog(): JSX.Element | null {
   const error = useShareableReviewStore((s) => s.error);
   const close = useShareableReviewStore((s) => s.close);
   const openAndMark = useShareableReviewStore((s) => s.openAndMark);
+  const validationResult = useExecutionStore((s) => s.validationResult);
+  const completionReady =
+    validationResult?.readiness.completion_ready === true;
 
   const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const copyTimeoutRef = useRef<number | null>(null);
@@ -106,6 +110,7 @@ export function SaveForReviewDialog(): JSX.Element | null {
   }
 
   function _onRetry() {
+    if (!completionReady) return;
     // The store has the session id captured from the original openAndMark
     // call. If we lost it (resetSession between attempts), the retry path
     // would no-op; the user closes and re-opens via the CompletionBar.
@@ -149,6 +154,14 @@ export function SaveForReviewDialog(): JSX.Element | null {
                 type="button"
                 className="btn btn-compact"
                 onClick={_onRetry}
+                disabled={!completionReady}
+                aria-disabled={!completionReady || undefined}
+                title={
+                  !completionReady
+                    ? validationResult?.readiness.blockers[0]?.detail ??
+                      "Resolve completion blockers before trying again."
+                    : undefined
+                }
                 data-testid="save-for-review-retry"
               >
                 Try again

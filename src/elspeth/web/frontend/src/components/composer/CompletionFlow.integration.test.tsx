@@ -53,6 +53,20 @@ const BLOCKED_READINESS = {
   ],
 } satisfies ValidationReadiness;
 
+const COMPLETION_BLOCKED_READINESS = {
+  authoring_valid: true,
+  execution_ready: true,
+  completion_ready: false,
+  blockers: [
+    {
+      code: "advisor_signoff_required",
+      component_id: null,
+      component_type: null,
+      detail: "Advisor sign-off is required before sharing for review.",
+    },
+  ],
+} satisfies ValidationReadiness;
+
 function _validValidation(): ValidationResult {
   return {
     is_valid: true,
@@ -207,6 +221,34 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
     const btn = screen.getByTestId("completion-bar-save-for-review") as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
     fireEvent.click(btn);
+    expect(apiSpy).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("save-for-review-dialog")).toBeNull();
+  });
+
+  it("does not call the review API or open the dialog when completion readiness is blocked", () => {
+    useExecutionStore.setState({
+      validationResult: {
+        ..._validValidation(),
+        readiness: COMPLETION_BLOCKED_READINESS,
+      },
+      isExecuting: false,
+      progress: null,
+      execute: vi.fn(),
+    } as never);
+    const apiSpy = vi.spyOn(api, "markReadyForReview");
+
+    render(
+      <>
+        <CompletionBar />
+        <SaveForReviewDialog />
+      </>,
+    );
+
+    const button = screen.getByTestId(
+      "completion-bar-save-for-review",
+    ) as HTMLButtonElement;
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
     expect(apiSpy).not.toHaveBeenCalled();
     expect(screen.queryByTestId("save-for-review-dialog")).toBeNull();
   });
