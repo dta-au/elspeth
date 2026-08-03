@@ -162,15 +162,22 @@ async def _publish_guided_full_terminal_preserving_primary(
     *,
     request: Request,
     progress: ComposerProgressSink,
-    primary_failure_code: GuidedOperationFailureCode,
+    primary_outcome: str,
+    event: ComposerProgressEvent,
 ) -> None:
-    """Terminalize progress without allowing UI cleanup to replace the primary."""
+    """Terminalize progress without allowing UI cleanup to replace the primary.
+
+    This runs only after a fence failure or durable winner has established the
+    authoritative outcome. A ``CancelledError`` raised by this secondary sink
+    is therefore cleanup failure, not the route's primary cancellation. Keep
+    the catch explicit: other ``BaseException`` subclasses must still escape.
+    """
     try:
-        await progress(_guided_full_failed_progress_event(primary_failure_code))
-    except Exception as progress_exc:
+        await progress(event)
+    except (asyncio.CancelledError, Exception) as progress_exc:
         _note_guided_full_secondary_failure(
             request=request,
-            primary_failure_code=primary_failure_code,
+            primary_failure_code=primary_outcome,
             secondary=progress_exc,
             site="terminal_progress",
         )
@@ -497,7 +504,8 @@ async def post_guided_plan(
             await _publish_guided_full_terminal_preserving_primary(
                 request=request,
                 progress=progress,
-                primary_failure_code=failure_code,
+                primary_outcome=failure_code,
+                event=_guided_full_failed_progress_event(failure_code),
             )
             raise
         if joined is None or isinstance(joined, (GuidedOperationLease, GuidedOperationExpired)):
@@ -510,13 +518,17 @@ async def post_guided_plan(
             await _publish_guided_full_terminal_preserving_primary(
                 request=request,
                 progress=progress,
-                primary_failure_code=failure_code,
+                primary_outcome=failure_code,
+                event=_guided_full_failed_progress_event(failure_code),
             )
             raise
-        await progress(
-            _guided_full_complete_progress_event(
+        await _publish_guided_full_terminal_preserving_primary(
+            request=request,
+            progress=progress,
+            primary_outcome="durable_complete",
+            event=_guided_full_complete_progress_event(
                 declined=type(joined) is GuidedPlanDeclinedResponse,
-            )
+            ),
         )
         return joined
     except asyncio.CancelledError as exc:

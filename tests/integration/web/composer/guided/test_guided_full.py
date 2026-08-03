@@ -643,6 +643,150 @@ def test_guided_full_main_fence_loss_without_a_replayable_winner_preserves_the_p
     )
 
 
+def test_guided_full_main_fence_primary_survives_cancelled_terminal_progress_cleanup(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from structlog.testing import capture_logs
+
+    class _FenceLosingPlanner:
+        async def plan_guided_full_pipeline(self, **kwargs):
+            await kwargs["progress"](
+                ComposerProgressEvent(
+                    phase="calling_model",
+                    headline="The guided planner is preparing a proposal.",
+                    evidence=("A bounded test provider call is active.",),
+                )
+            )
+            raise GuidedOperationFenceLostError(kwargs["operation_fence"])
+
+    real_reserve = reserve_or_replay_guided_operation
+
+    async def no_winner(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            return None
+        return await real_reserve(**kwargs)
+
+    registry = composer_test_client.app.state.composer_progress_registry
+    real_bind = registry.bind_request
+
+    def bind_with_cancelled_terminal(**kwargs):
+        bound = real_bind(**kwargs)
+
+        async def publish(event):
+            if event.phase == "failed":
+                raise asyncio.CancelledError("terminal progress publisher cancelled")
+            await bound(event)
+
+        return publish
+
+    composer_test_client.app.state.composer_service = _FenceLosingPlanner()
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", no_winner)
+    monkeypatch.setattr(registry, "bind_request", bind_with_cancelled_terminal)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cancelled terminal cleanup"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000082"
+
+    async def lose_fence() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            with pytest.raises(GuidedOperationFenceLostError, match="fence is no longer current"):
+                await client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Preserve this primary fence failure."},
+                )
+
+    with capture_logs() as logs:
+        asyncio.run(lose_fence())
+
+    terminal_cleanup_events = [
+        event
+        for event in logs
+        if event.get("event") == "guided.plan_failure_settlement_secondary_failure" and event.get("site") == "terminal_progress"
+    ]
+    assert len(terminal_cleanup_events) == 1
+    assert terminal_cleanup_events[0]["secondary_exc_class"] == "CancelledError"
+    assert "terminal progress publisher cancelled" not in str(terminal_cleanup_events)
+
+
+@pytest.mark.parametrize("publisher_failure", ("runtime_error", "cancelled_error"))
+def test_guided_full_replayable_winner_survives_terminal_progress_publication_failure(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+    publisher_failure: str,
+) -> None:
+    from structlog.testing import capture_logs
+
+    session = composer_test_client.post("/api/sessions", json={"title": f"guided winner {publisher_failure}"}).json()
+    seed = composer_test_client.post(
+        f"/api/sessions/{session['id']}/guided/plan",
+        json={"operation_id": "00000000-0000-4000-8000-000000000083", "intent": "Create a replayable winner."},
+    )
+    assert seed.status_code == 200, seed.text
+    winner = CompositionProposalResponse.model_validate_json(seed.text)
+
+    class _FenceLosingPlanner:
+        async def plan_guided_full_pipeline(self, **kwargs):
+            await kwargs["progress"](
+                ComposerProgressEvent(
+                    phase="calling_model",
+                    headline="The guided planner is preparing a proposal.",
+                    evidence=("A bounded test provider call is active.",),
+                )
+            )
+            raise GuidedOperationFenceLostError(kwargs["operation_fence"])
+
+    real_reserve = reserve_or_replay_guided_operation
+
+    async def replay_winner(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            return winner
+        return await real_reserve(**kwargs)
+
+    registry = composer_test_client.app.state.composer_progress_registry
+    real_bind = registry.bind_request
+
+    def bind_with_failed_complete(**kwargs):
+        bound = real_bind(**kwargs)
+
+        async def publish(event):
+            if event.phase == "complete":
+                if publisher_failure == "cancelled_error":
+                    raise asyncio.CancelledError("winner progress publisher cancelled")
+                raise RuntimeError("SENSITIVE_WINNER_PROGRESS_DETAIL")
+            await bound(event)
+
+        return publish
+
+    composer_test_client.app.state.composer_service = _FenceLosingPlanner()
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", replay_winner)
+    monkeypatch.setattr(registry, "bind_request", bind_with_failed_complete)
+    operation_id = "00000000-0000-4000-8000-000000000084"
+
+    async def recover_winner() -> Response:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            return await client.post(
+                f"/api/sessions/{session['id']}/guided/plan",
+                json={"operation_id": operation_id, "intent": "Recover the durable winner response."},
+            )
+
+    with capture_logs() as logs:
+        response = asyncio.run(recover_winner())
+
+    assert response.status_code == 200, response.text
+    assert response.json() == seed.json()
+    terminal_cleanup_events = [
+        event
+        for event in logs
+        if event.get("event") == "guided.plan_failure_settlement_secondary_failure" and event.get("site") == "terminal_progress"
+    ]
+    assert len(terminal_cleanup_events) == 1
+    assert terminal_cleanup_events[0]["primary_failure_code"] == "durable_complete"
+    assert terminal_cleanup_events[0]["secondary_exc_class"] == (
+        "CancelledError" if publisher_failure == "cancelled_error" else "RuntimeError"
+    )
+    assert "winner progress publisher cancelled" not in str(terminal_cleanup_events)
+    assert "SENSITIVE_WINNER_PROGRESS_DETAIL" not in str(terminal_cleanup_events)
+
+
 def test_guided_full_preserves_an_existing_canonical_state_as_the_checkpoint_base(
     composer_test_client,
 ) -> None:
