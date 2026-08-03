@@ -356,6 +356,7 @@ def test_s3_source_profile_constrains_bucket_prefix_region_and_auth() -> None:
         " secret.csv",
         "secret.csv ",
         "records/\x7fsecret.csv",
+        "records/\ud800.csv",
     ],
 )
 def test_s3_source_profile_rejects_noncanonical_or_escaping_relative_key(key: str) -> None:
@@ -485,6 +486,41 @@ def test_s3_source_profile_rejects_prefixed_key_over_1024_utf8_bytes() -> None:
 
 @pytest.mark.parametrize("prefix", ["/incoming", "C:/incoming", "s3://bucket/incoming", "incoming/../secret", "incoming//nested"])
 def test_s3_source_profile_rejects_noncanonical_operator_prefix(prefix: str) -> None:
+    with pytest.raises(ValidationError):
+        _settings(
+            aws_s3_source_profiles=({"alias": "demo-input", "bucket": "elspeth-demo-input", "prefix": prefix},),
+        )
+
+
+@pytest.mark.parametrize("prefix", ["a" * 1022, "é" * 511])
+def test_s3_source_profile_accepts_exact_1022_byte_prefix_with_one_byte_key(prefix: str) -> None:
+    settings = _settings(
+        deployment_aws_region="ap-southeast-1",
+        plugin_allowlist=("source:aws_s3",),
+        aws_s3_source_profiles=({"alias": "demo-input", "bucket": "elspeth-demo-input", "prefix": prefix},),
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    registry = OperatorProfileRegistry(
+        policy=compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime),
+        settings=runtime,
+    )
+
+    lowered = registry.lower_options(
+        PluginId("source", "aws_s3"),
+        alias="demo-input",
+        safe_options={
+            "key": "x",
+            "schema": {"mode": "observed"},
+            "on_validation_failure": "discard",
+        },
+    )
+
+    assert len(cast(str, lowered.executable_options["key"]).encode("utf-8")) == 1024
+
+
+@pytest.mark.parametrize("prefix", ["a" * 1023, "é" * 511 + "a"])
+def test_s3_source_profile_rejects_1023_byte_prefix_that_cannot_fit_one_byte_key(prefix: str) -> None:
+    assert len(prefix.encode("utf-8")) == 1023
     with pytest.raises(ValidationError):
         _settings(
             aws_s3_source_profiles=({"alias": "demo-input", "bucket": "elspeth-demo-input", "prefix": prefix},),

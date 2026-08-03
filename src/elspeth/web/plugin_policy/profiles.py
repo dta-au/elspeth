@@ -52,6 +52,10 @@ def _validate_relative_s3_path(value: str, *, field_name: str) -> str:
     parts = value.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError(f"{field_name} must not contain empty or traversal segments")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{field_name} must be valid UTF-8") from None
     return value
 
 
@@ -85,7 +89,7 @@ class AWSS3SourceProfileSettings(BaseModel):
         if value is None:
             return None
         validated = _validate_relative_s3_path(value, field_name="prefix")
-        if len(validated.encode("utf-8")) >= _S3_MAX_KEY_BYTES:
+        if len(validated.encode("utf-8")) > _S3_MAX_KEY_BYTES - 2:
             raise ValueError("prefix must leave room for a relative S3 object key")
         return validated
 
@@ -1011,6 +1015,14 @@ class OperatorProfileRegistry:
         }
         if isinstance(resolver, _S3SourceProfileResolver):
             example_alias = available_aliases[0] if available_aliases else "operator-approved-profile"
+            updates["usage_when_to_use"] = (
+                "Use in Web Composer when an operator-approved S3 source profile is available and the workflow "
+                "needs one bounded CSV, JSON-array, or JSONL object selected by relative object key."
+            )
+            updates["usage_when_not_to_use"] = (
+                "Do not use when no matching operator-approved profile is available, the object is outside the "
+                "approved prefix, or the workflow needs to enumerate or stream multiple objects."
+            )
             updates["example_use"] = (
                 "sources:\n"
                 "  s3_input:\n"

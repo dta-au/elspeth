@@ -427,6 +427,120 @@ def test_schema8_projected_next_turn_validates_before_history(monkeypatch) -> No
         )
 
 
+def test_direct_source_selection_rechecks_current_catalog_before_transitioning_stale_turn() -> None:
+    guided_route = importlib.import_module("elspeth.web.sessions.routes.composer.guided")
+    from elspeth.web.composer.guided.stage_transitions import WebSurfacePolicyRejectedError
+    from elspeth.web.sessions.schemas import GuidedRespondRequest
+
+    current_turn = {
+        "type": TurnType.SINGLE_SELECT.value,
+        "step_index": 0,
+        "payload": {
+            "question": "Choose a source",
+            "options": [{"id": "aws_s3", "label": "Amazon S3", "hint": None}],
+            "allow_custom": False,
+        },
+    }
+    guided, _record, _turn_type, _payload_hash = guided_route._append_server_turn_record(
+        GuidedSession.initial(),
+        current_step=GuidedStep.STEP_1_SOURCE,
+        turn=current_turn,
+    )
+
+    class _CurrentCatalog:
+        available = False
+
+        def unavailable_reason(self, plugin_id: PluginId) -> PluginUnavailableReason | None:
+            assert plugin_id == PluginId("source", "aws_s3")
+            return None if self.available else PluginUnavailableReason.PROFILE_UNAVAILABLE
+
+        def get_schema(self, plugin_type: str, plugin_name: str) -> None:
+            raise AssertionError(f"unavailable {plugin_type}:{plugin_name} must fail before schema lookup")
+
+    current_catalog = _CurrentCatalog()
+
+    body = GuidedRespondRequest.model_validate(
+        {
+            "operation_id": str(uuid4()),
+            "turn_token": "a" * 64,
+            "chosen": ["aws_s3"],
+        },
+        strict=True,
+    )
+
+    with pytest.raises(WebSurfacePolicyRejectedError, match="profile_unavailable"):
+        guided_route._schema8_transition(
+            guided,
+            current_turn,
+            body,
+            catalog=cast(Any, current_catalog),
+            new_stable_id=uuid4(),
+        )
+
+    assert guided.source_order == ()
+    assert guided.pending_source_intents == {}
+    assert guided.history[-1].response_hash is None
+
+    current_catalog.available = True
+    retried, _ = guided_route._schema8_transition(
+        guided,
+        current_turn,
+        body,
+        catalog=cast(Any, current_catalog),
+        new_stable_id=uuid4(),
+    )
+    assert retried.source_order
+    assert next(iter(retried.pending_source_intents.values())).plugin == "aws_s3"
+
+
+def test_chat_source_reselection_uses_current_catalog_not_stale_form_plugin_set() -> None:
+    guided_route = importlib.import_module("elspeth.web.sessions.routes.composer.guided")
+    guided_chat = importlib.import_module("elspeth.web.sessions.routes.composer.guided_chat_atomic")
+    from elspeth.web.composer.guided.state_machine import SourceIntent
+
+    stable_id = str(uuid4())
+    prospective = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=(stable_id,),
+        pending_source_intents={
+            stable_id: SourceIntent(
+                name="source",
+                phase="plugin_options",
+                plugin="csv",
+                options=None,
+                inspection_facts=None,
+                observed_columns=(),
+                sample_rows=(),
+            )
+        },
+        history=(
+            TurnRecord(
+                step=GuidedStep.STEP_1_SOURCE,
+                turn_type=TurnType.SCHEMA_FORM,
+                payload_hash="b" * 64,
+                response_hash=None,
+                emitter="server",
+            ),
+        ),
+    )
+    current_catalog = SimpleNamespace(list_sources=lambda: (SimpleNamespace(name="csv"),))
+
+    with pytest.raises(ValueError, match="permitted"):
+        guided_chat._prepare_step_1_source_plugin_reselection(
+            guided_route=guided_route,
+            current_state=_empty_composition_state(),
+            prospective=prospective,
+            plugin="aws_s3",
+            inspection_facts=None,
+            catalog=current_catalog,
+            shield_available=False,
+            payload_store=cast(Any, object()),
+        )
+
+    assert prospective.pending_source_intents[stable_id].plugin == "csv"
+    assert prospective.history[-1].response_hash is None
+
+
 def test_durable_current_turn_rejects_wrong_step_type_matrix(tmp_path: Path) -> None:
     preparation = importlib.import_module("elspeth.web.sessions.guided_payloads")
     from elspeth.web.sessions.routes.composer.guided import _load_durable_current_turn

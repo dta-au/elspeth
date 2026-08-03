@@ -221,6 +221,13 @@ def test_s3_source_web_discovery_and_assistance_expose_only_profile_safe_authori
     assert "region" not in summary.example_use
     assert "endpoint" not in summary.example_use
     assert "credential" not in summary.example_use
+    assert summary.usage_when_to_use is not None
+    assert "Web Composer" in summary.usage_when_to_use
+    assert "operator-approved S3 source profile" in summary.usage_when_to_use
+    assert "CLI or batch" not in summary.usage_when_to_use
+    assert summary.usage_when_not_to_use is not None
+    assert "Ordinary Web Composer cannot use this source" not in summary.usage_when_not_to_use
+    assert "matching operator-approved profile" in summary.usage_when_not_to_use
 
     schema = view.get_schema("source", "aws_s3")
     assert schema.json_schema["properties"]["profile"]["enum"] == ["demo-input"]
@@ -281,6 +288,11 @@ def test_trained_operator_view_still_offers_raw_s3_source_configuration() -> Non
     assert "aws_s3" in {item.name for item in view.list_sources()}
     assert view.unavailable_reason(PluginId("source", "aws_s3")) is None
     assert view.get_schema("source", "aws_s3").name == "aws_s3"
+    summary = next(item for item in view.list_sources() if item.name == "aws_s3")
+    assert summary.usage_when_to_use is not None
+    assert "trusted CLI or batch" in summary.usage_when_to_use
+    assert summary.usage_when_not_to_use is not None
+    assert "Ordinary Web Composer cannot use this source" in summary.usage_when_not_to_use
 
 
 def test_web_username_matching_trained_operator_marker_cannot_create_unrestricted_view() -> None:

@@ -2306,6 +2306,16 @@ def _schema8_transition(
             raise ValueError("single_select requires chosen")
         plugin_response = PluginSelectionResponse(chosen=body.chosen)
         if guided.step is GuidedStep.STEP_1_SOURCE:
+            permitted_plugins = _schema8_permitted_plugins(turn)
+            if len(body.chosen) == 1 and body.chosen[0] in permitted_plugins:
+                from elspeth.web.plugin_policy.models import PluginId
+
+                unavailable_reason = catalog.unavailable_reason(PluginId("source", body.chosen[0]))
+                if unavailable_reason is not None:
+                    raise WebSurfacePolicyRejectedError(
+                        f"Selected source plugin is no longer available under current Web policy "
+                        f"({unavailable_reason.value}); choose an available source."
+                    )
             selection_targets = [
                 stable_id for stable_id, intent in guided.pending_source_intents.items() if intent.phase == "plugin_selection"
             ]
@@ -2313,7 +2323,7 @@ def _schema8_transition(
                 guided,
                 turn=answered,
                 response=plugin_response,
-                permitted_plugins=_schema8_permitted_plugins(turn),
+                permitted_plugins=permitted_plugins,
                 inspection_facts=source_inspection_facts,
                 new_stable_id=new_stable_id if not selection_targets else None,
                 target_id=selection_targets[0] if len(selection_targets) == 1 else None,

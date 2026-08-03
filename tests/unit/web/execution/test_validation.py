@@ -769,6 +769,38 @@ def test_s3_source_profile_alias_remains_mandatory_when_snapshot_has_one_selecte
     assert "profile" not in state.sources["source"].options
 
 
+def test_canonical_web_validation_maps_non_utf8_s3_key_to_closed_profile_finding() -> None:
+    profiles, snapshot = _s3_source_profile_policy_context()
+    state = _make_state(
+        source_plugin="aws_s3",
+        source_options={
+            "profile": "demo-input",
+            "key": "records/\ud800.csv",
+            "format": "csv",
+            "schema": {"mode": "observed"},
+        },
+        outputs=(_make_output(),),
+    )
+    yaml_generator = MagicMock(spec=YamlGenerator)
+
+    result = validation_module.validate_pipeline(
+        state,
+        _make_settings(),
+        yaml_generator,
+        plugin_snapshot=snapshot,
+        profile_registry=profiles,
+        catalog=create_catalog_service(),
+        session_id="test-session",
+    )
+
+    assert result.is_valid is False
+    assert _check(result, "operator_profile_options").passed is False
+    assert result.errors[0].error_code == "profile_unavailable"
+    assert "canonical relative object key" in result.errors[0].message
+    assert "\ud800" not in result.errors[0].message
+    yaml_generator.generate_yaml.assert_not_called()
+
+
 def _bedrock_prompt_policy_context() -> tuple[OperatorProfileRegistry, PluginAvailabilitySnapshot]:
     from elspeth.web.dependencies import create_catalog_service
 
