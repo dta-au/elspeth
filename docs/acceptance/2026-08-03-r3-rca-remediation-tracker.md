@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-03T18:24:00+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-03T18:23:00+10:00
-Release baseline: `release/0.7.2@9016ce6a6`
+Last refreshed: 2026-08-03T18:39:00+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-03T18:37:00+10:00
+Release baseline: `release/0.7.2@e3804416f`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -40,10 +40,10 @@ shell mechanics remains deferred even when it blocks a fresh install.
 
 | State | Objective 44 | Additional 10 | Meaning |
 |---|---:|---:|---|
-| Closed | 8 | 2 | Tracker says done; closure evidence is still sampled during the completion audit |
-| Verifying | 12 | 2 | Locally fixed; live or requirement-specific acceptance remains |
-| Fixing | 6 | 0 | Owned bug implementation is still in flight |
-| In progress | 0 | 2 | A delivery task spanning existing objective defects is in flight |
+| Closed | 8 | 3 | Tracker says done; closure evidence is still sampled during the completion audit |
+| Verifying | 14 | 2 | Locally fixed; live or requirement-specific acceptance remains |
+| Fixing | 4 | 0 | Owned bug implementation is still in flight |
+| In progress | 0 | 1 | A delivery task spanning existing objective defects is in flight |
 | Open | 6 | 4 | Confirmed task/epic work not yet started here |
 | Triage | 9 | 0 | Root cause and reproducibility must be checked against current HEAD before fixing |
 | Proposed | 3 | 0 | Regression-gate features require approval/acceptance design before implementation |
@@ -75,17 +75,17 @@ claim custody.
 | `/root/design_demo_acceptance` | Cross-issue live demo acceptance matrix | Shared read-only baseline | None | None | Completed; 12-step deployment matrix produced |
 | `/root/review_text_tracker` | Tracker accuracy and completeness review | Shared read-only baseline | None | None | Completed; corrections incorporated |
 | `/root/impl_guided_node_custody` | Preserve unchanged node behavior across guided replanning | `.claude/worktrees/guided-node-custody`; `codex/fix-guided-node-custody` | Released after integration | None | Complete; reviewed commit integrated as `b424c08c4` |
-| `/root/impl_gate_row_error_policy` | Per-row gate `on_error` handling | `.claude/worktrees/gate-row-error-policy`; `codex/fix-gate-row-error-policy` | gate config/executor/traversal/source-iteration seams and direct tests | None | Second handoff held: real telemetry call site and empty-string Composer policy remain; third surgical follow-up active |
+| `/root/impl_gate_row_error_policy` | Per-row gate `on_error` handling | `.claude/worktrees/gate-row-error-policy`; `codex/fix-gate-row-error-policy` | Released after integration | None | Complete through `e3804416f`; 72 backend plus 56 frontend release-checkout regressions passed; live verification remains |
 | `/root/impl_csv_audit_characteristics` | Honest CSV audit characteristics | `.claude/worktrees/csv-audit-characteristics`; `codex/fix-csv-audit-characteristics` | CSV source, characteristic UI wording, exact scenario-corpus oracle, direct tests | None | Complete; behavior `d78fbbed6`, corpus oracle `10179f2c1` |
-| `/root/impl_s3_source_profiles` | Operator-profiled Web S3 source | `.claude/worktrees/s3-source-profiles`; `codex/fix-s3-source-profiles` | Web config/profile/policy/S3 lowering/source seams and direct tests | None | Third security handoff held: canonical validation lost audit-safe state and nominal binding is not exact; fourth follow-up active |
+| `/root/impl_s3_source_profiles` | Operator-profiled Web S3 source | `.claude/worktrees/s3-source-profiles`; `codex/fix-s3-source-profiles` | Web config/profile/policy/S3 lowering/source seams and direct tests | None | Fourth follow-up has all three security blockers implemented; one apparently pre-existing endpoint-policy test is being dispositioned before commit/re-review |
 | `/root/impl_run_diagnostics_ui` | Surface routed-failure provenance | `.claude/worktrees/run-diagnostics-ui`; `codex/fix-run-diagnostics-ui` | `RunsHistoryDrawer` and direct frontend diagnostics presentation/tests | None | Complete; integrated as `9130e1209` + `0928c6ac6` |
 | `/root/impl_compose_authoring_aids` | Compose context and truthful field-mapping aids | `.claude/worktrees/compose-authoring-aids`; `codex/fix-compose-authoring-aids` | Released after integration | None | Complete; integrated as `2906409e1` + `e1d31f104` |
-| `/root/impl_compose_required_controls` | Finalize deterministic required controls on both freeform publication paths | `.claude/worktrees/compose-required-controls`; `codex/fix-compose-required-controls` | `composer/service.py`, `tool_batch.py`, proposal finalizer seam, direct tests | None | Active; internal review found explicit-approval incremental completion misses the finalizer and unsupported serialization fails open for named/multi-source graphs |
+| `/root/impl_compose_required_controls` | Finalize deterministic required controls on both freeform publication paths | `.claude/worktrees/compose-required-controls`; `codex/fix-compose-required-controls` | `composer/service.py`, `tool_batch.py`, proposal finalizer seam, direct tests | None | Candidate `2f68a281f` held: incremental explicit approval still inserts controls only after consent, and finalization corrupts `affected_nodes`; surgical follow-up active |
 | `/root/audit_provider_projection_obligations` | Re-audit provider-facing projection and hidden-option custody on integrated release | Shared read-only `ca375291c` baseline | None | None | Complete; four P1 residuals reproduced and partitioned into three tracked implementation children |
-| `/root/impl_guided_chat_revision_custody` | Prevent blind source/sink replacement through guided chat | `.claude/worktrees/guided-chat-revision-custody`; `codex/fix-guided-chat-revision-custody` | `guided/chat_solver.py`, `guided_chat_atomic.py`, direct tests | None | Candidate `12bde9290` held only for contradictory impossible stale-pair retry copy; surgical follow-up active |
-| `/root/rca_compose_request_correlation` | Emit bounded correlation events for structured HTTP errors and Pydantic 422s | `.claude/worktrees/compose-request-correlation`; `codex/fix-compose-request-correlation` | `web/app.py`, runbook, and direct handler tests | None | `50717d0c6` fixed correlation/ordinary failure primacy but swallowed Tier-1 logger errors; third tiny follow-up active |
+| `/root/impl_guided_chat_revision_custody` | Prevent blind source/sink replacement through guided chat | `.claude/worktrees/guided-chat-revision-custody`; `codex/fix-guided-chat-revision-custody` | Released after integration; `guided_chat_atomic.py` handed to terminal-progress lane | None | Complete as `7afa62b6d` + `c4cade0f0`; independent review clean and 10 exact release regressions passed |
+| `/root/rca_compose_request_correlation` | Emit bounded correlation events for structured HTTP errors and Pydantic 422s | `.claude/worktrees/compose-request-correlation`; `codex/fix-compose-request-correlation` | Released after integration | None | Complete through `39c6b14a7`; 32 exact release-handler regressions passed; live CloudWatch lookup remains |
 | `/root/impl_frontend_readiness_axes` | Apply backend readiness axes to every frontend action | `.claude/worktrees/frontend-readiness-axes`; `codex/fix-frontend-readiness-axes` | Released after integration | None | Complete; integrated through `9016ce6a6`, exact release rerun 148 passed, task closed |
-| `/root/impl_guided_plan_terminal_progress` | Settle terminal progress for every guided-plan outcome | `.claude/worktrees/guided-plan-terminal-progress`; `codex/fix-guided-plan-terminal-progress` | progress registry/shared publishers/guided plan/direct tests; `guided_chat_atomic.py` temporarily held | None | `9672163d8` held for cleanup primacy, cross-surface generation, post-settlement truth, and restart replay; follow-up active |
+| `/root/impl_guided_plan_terminal_progress` | Settle terminal progress for every guided-plan outcome | `.claude/worktrees/guided-plan-terminal-progress`; `codex/fix-guided-plan-terminal-progress` | progress registry/shared publishers, freeform/guided callers, and direct tests; `guided_chat_atomic.py` now released | None | `9672163d8` held for cleanup primacy, cross-surface generation, post-settlement truth, and restart replay; follow-up active |
 
 No subagent may mutate AWS or the shared release checkout during this wave.
 Each implementation agent is confined to the explicit worktree/file custody
@@ -116,8 +116,8 @@ Parent workstream state:
 
 | ID | Priority | Live state | Filigree assignee | Next proof/action |
 |---|---:|---|---|---|
-| `elspeth-981130d70a` | P1 | `fixing` | `codex-compose-required-controls` | Finalize required controls exactly once before proposal/auto-commit hashes and audit state on both trust modes |
-| `elspeth-cd98ea9d82` | P1 | `fixing` | `codex-rca-compose-request-correlation` | Preserve exact body/header/log correlation and ordinary fail-soft logging while re-raising registered Tier-1 errors |
+| `elspeth-981130d70a` | P1 | `fixing` | `codex-compose-required-controls` | Move incremental explicit-approval finalization before consent and preserve exact changed-plus-inserted `affected_nodes` authority |
+| `elspeth-cd98ea9d82` | P1 | `verifying` | `codex-rca-compose-request-correlation` | Integrated through `39c6b14a7`; verify body/header/log equality in deployed CloudWatch events |
 | `elspeth-f159d2394b` | P2 | `confirmed` | unassigned | Core seconds-per-logical-turn premise disproved; defer Terraform/operator timeout tuning as setup ergonomics |
 | `elspeth-7bd0141bbe` | P2 | `fixing` | `codex-rca-compose-registry-assistance` | Integrated aids fixed prompt delivery and Textract false aid; queue write-boundary registry validation after active tool ownership releases |
 | `elspeth-ecd8594b63` | P3 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `2906409e1` + `e1d31f104`; prove a live freeform fixed-sink build preserves every required field |
@@ -134,11 +134,11 @@ Parent workstream state:
 | `elspeth-2ac590c79f` | P1 | `closed` | unassigned | Sample literal/`option_path` carry-forward through durable deferred intent |
 | `elspeth-82d8bea477` | P1 | `closed` | unassigned | Sample threshold vocabulary and topology-stage disposition |
 | `elspeth-fd32c3e6fd` | P1 | `verifying` | `codex-release-0.7.2-integration` | Live observed CSV numeric gate is rejected before run creation |
-| `elspeth-b326add5be` | P1 | `fixing` | `codex-gate-row-error-policy` | Make real gate telemetry call-site best-effort, reject empty Composer `on_error`, and correct obsolete coercion documentation |
+| `elspeth-b326add5be` | P1 | `verifying` | `codex-gate-row-error-policy` | Integrated through `e3804416f`; live mixed good/bad CSV run must route one row per policy without aborting the run |
 | `elspeth-dc07d517cf` | P2 | `closed` | unassigned | Sample clarification intent visibility/claimability at later stages |
 | `elspeth-6795b3ae3a` | P2 | `open` | unassigned | Inventory every provider-facing projection and compare obligations with rendered evidence |
 | `elspeth-dca1e81c58` | P1 | `open` | unassigned | Preserve selected-node hidden state and reuse schema-form rewind for wire-stage source/output edits after S3 releases `guided.py` custody |
-| `elspeth-3526685369` | P1 | `in_progress` | `codex-guided-chat-revision-custody` | Remove impossible rebuild/resend copy from form-directed stale-pair handling while preserving retained intent disposition |
+| `elspeth-3526685369` | P1 | `closed` | `codex-guided-chat-revision-custody` | Integrated as `7afa62b6d` + `c4cade0f0`; form-directed source/sink custody and retained intent verified locally |
 | `elspeth-eacfec09a6` | P1 | `open` | unassigned | Unify advisor evidence and injection candidates after the active required-controls `service.py` lane releases custody |
 | `elspeth-4c699cb5d0` | P1 | `closed` | `codex-frontend-readiness-axes` | Integrated through `9016ce6a6`; exact release 148-test action/fanout slice passed; parent D5 remains live-verifying |
 | `elspeth-d0d52e2fde` | P2 | `closed` | `codex-release-0.7.2-integration` | Sample the real HTTP/lifecycle regression added with the proof fix |
@@ -256,6 +256,10 @@ Append entries; do not rewrite history.
 | 2026-08-03 18:19 | Gate second handoff held again | Fresh review confirmed most prior gaps closed but reproduced telemetry replacing terminalization and empty Composer `on_error` collapsing to omission; third follow-up assigned, Filigree comment `2192` |
 | 2026-08-03 18:21 | Guided progress and request correlation held | `9672163d8` failed cleanup/cross-surface/post-settlement/replay lifecycle review; `50717d0c6` fixed original correlation blockers but swallowed Tier-1 logging errors; comments `2193`/`2194` record both holds |
 | 2026-08-03 18:23 | S3 and guided-chat handoffs held | S3 `263e3027c` needs typed audit-safe state plus authenticated binding and a shared option contract; guided chat `12bde9290` needs one non-contradictory form-directed stale-pair response; comments `2195`/`2196` record both |
+| 2026-08-03 18:28 | Request correlation integrated | Third review approved Tier-1 primacy and authoritative identity; integrated as `8101f1f08` + `1537c7885` + `39c6b14a7`; coordinator reran 32 exact release-handler regressions and advanced the bug to verifying |
+| 2026-08-03 18:34 | Guided chat revision custody integrated | Independent re-review approved `12bde9290` + `d7c60411c`; integrated as `7afa62b6d` + `c4cade0f0`; 10 exact release regressions passed, task closed, and `guided_chat_atomic.py` released to terminal progress |
+| 2026-08-03 18:36 | Gate row-error policy integrated | Reviewed four-commit chain integrated as `a80ea0259` + `947c242ac` + `65acd35fb` + `e3804416f`; coordinator reran 72 backend and 56 frontend release-checkout tests and advanced the bug to verifying |
+| 2026-08-03 18:38 | Required-controls candidate held | External review of `2f68a281f` reproduced consent after-the-fact control insertion for incremental proposals and corrupted `affected_nodes`; candidate remains isolated and a surgical follow-up is active |
 
 ## Reconciliation findings
 
