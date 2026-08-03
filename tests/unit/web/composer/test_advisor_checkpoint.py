@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import structlog
@@ -1554,6 +1554,75 @@ async def test_end_gate_starts_no_advisor_attempt_after_compose_deadline(make_se
     assert outcome.result.runtime_preflight.is_valid is True
     assert outcome.result.runtime_preflight.readiness.completion_ready is False
     assert "Runtime preflight failed" not in outcome.result.message
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_deadline_expiry_before_first_attempt_is_unavailable(make_service, simple_state):
+    service = make_service()
+    service._call_advisor_with_audit = _AsyncRecorder(return_value=("CLEAN", {}))
+
+    verdict = await service._run_advisor_checkpoint(
+        phase="end",
+        state=simple_state,
+        session_id="s1",
+        recorder=make_recorder(),
+        deadline=asyncio.get_running_loop().time() - 1.0,
+    )
+
+    assert service._call_advisor_with_audit.await_count == 0
+    assert verdict.ok is False
+    assert verdict.failure_class == "unavailable"
+    assert verdict.findings_text == _ADVISOR_UNAVAILABLE_USER_DETAIL
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_deadline_preserves_malformed_attempt_before_retry_expiry(make_service, simple_state):
+    service = make_service()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 0.005
+
+    async def malformed_after_deadline(*_args: object, **_kwargs: object) -> object:
+        await asyncio.sleep(0.01)
+        raise ValueError("malformed provider response")
+
+    service._call_advisor_with_audit = AsyncMock(side_effect=malformed_after_deadline)
+
+    verdict = await service._run_advisor_checkpoint(
+        phase="end",
+        state=simple_state,
+        session_id="s1",
+        recorder=make_recorder(),
+        deadline=deadline,
+    )
+
+    assert service._call_advisor_with_audit.await_count == 1
+    assert verdict.ok is False
+    assert verdict.failure_class == "malformed"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_deadline_preserves_unparseable_attempt_before_retry_expiry(make_service, simple_state):
+    service = make_service()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 0.005
+
+    async def unparseable_after_deadline(*_args: object, **_kwargs: object) -> tuple[str, dict[str, object]]:
+        await asyncio.sleep(0.01)
+        return "This reply states no verdict.", {}
+
+    service._call_advisor_with_audit = AsyncMock(side_effect=unparseable_after_deadline)
+
+    verdict = await service._run_advisor_checkpoint(
+        phase="end",
+        state=simple_state,
+        session_id="s1",
+        recorder=make_recorder(),
+        deadline=deadline,
+    )
+
+    assert service._call_advisor_with_audit.await_count == 1
+    assert verdict.ok is False
+    assert verdict.failure_class == "malformed"
 
 
 @pytest.mark.asyncio

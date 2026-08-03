@@ -6037,13 +6037,14 @@ class ComposerServiceImpl:
             if deadline is not None:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
-                    # The shared compose budget expired before this retry.
-                    # No outbound call starts; END classifies the checkpoint as
-                    # unavailable while retaining the already-green runtime
-                    # validation shape, and EARLY degrades before P4 persists
-                    # the completed tool turn.
-                    last_exc = TimeoutError()
-                    last_response_unparseable = False
+                    # The shared compose budget expired before this attempt.
+                    # If no advisor call ran, synthesize the truthful
+                    # unavailable outcome.  After an attempted call, retain its
+                    # provider/malformed outcome (including an unparseable
+                    # successful response) rather than overwriting that audit
+                    # evidence with a retry-budget timeout.
+                    if last_exc is None and not last_response_unparseable:
+                        last_exc = TimeoutError()
                     break
             try:
                 if remaining is None:
