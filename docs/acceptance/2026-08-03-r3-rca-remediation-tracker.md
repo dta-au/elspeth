@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-03T22:37:14+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-03T22:37:14+10:00
-Release baseline: `release/0.7.2@23c1494a2`
+Last refreshed: 2026-08-03T23:05:52+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-03T23:05:52+10:00
+Release baseline: `release/0.7.2@a8c6f091d`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -41,11 +41,11 @@ shell mechanics remains deferred even when it blocks a fresh install.
 | State | Objective 44 | Additional 19 | Meaning |
 |---|---:|---:|---|
 | Closed | 9 | 7 | Tracker says done; closure evidence is still sampled during the completion audit |
-| Verifying | 16 | 1 | Locally fixed; live or requirement-specific acceptance remains |
-| Fixing | 2 | 1 | Owned bug implementation is still in flight |
+| Verifying | 17 | 2 | Locally fixed; live or requirement-specific acceptance remains |
+| Fixing | 1 | 1 | Owned bug implementation is still in flight |
 | In progress | 0 | 0 | A delivery task spanning existing objective defects is in flight |
 | Open | 5 | 1 | Confirmed task/epic work not yet started here |
-| Triage | 9 | 9 | Root cause and reproducibility must be checked against current HEAD before fixing |
+| Triage | 9 | 8 | Root cause and reproducibility must be checked against current HEAD before fixing |
 | Proposed | 3 | 0 | Regression-gate features require approval/acceptance design before implementation |
 
 The additional records are newly discovered gate-custody bug
@@ -68,7 +68,8 @@ claim custody.
 
 | Agent | Scope | Worktree/branch | File custody | AWS authority | Status |
 |---|---|---|---|---|---|
-| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`) | This tracker; advisor evidence-contract worktree next | Sole mutation custodian | Active; CI-equivalent suite green at `6844b684a`, tracker durable at `23c1494a2`, exhaustive provider-projection audit closed, and residual advisor evidence contract is the current demo-aware P1 |
+| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`) | This tracker; next isolated lane is empty-state freeform history custody | Sole mutation custodian | Active; advisor evidence contract integrated at `a8c6f091d` after independent approval and a 36,986-test full-suite pass; empty-state freeform history loss is next |
+| `/root/review_advisor_evidence_scope` | Adversarial review of bounded evidence and actual checkpoint wire instructions | Shared read-only advisor worktree | None | None | Complete; found and drove repair of the shared stuck-composer system-contract conflict, then approved current bytes with no findings |
 | `/root/audit_advisor_demo` | D1-D6 and advisor/F14 completion evidence | Shared read-only baseline | None | None | Completed; no residual local code defect found |
 | `/root/audit_compose_loop` | Six compose-loop RCAs and implementation partitioning | Shared read-only baseline | None | None | Completed; all six remain actionable |
 | `/root/audit_gate_routing` | Closed/verifying routing audit plus residual routing RCAs | Shared read-only baseline | None | None | Completed; two residual and one new P1 confirmed |
@@ -100,7 +101,7 @@ Parent workstream state:
 
 | Parent record | Live state | Immediate coordination action |
 |---|---|---|
-| `elspeth-7ffd77deca` — advisor gate | `fixing` | Close the residual END evidence/obligation mismatch before deployed acceptance |
+| `elspeth-7ffd77deca` — advisor gate | `verifying` | Deploy `a8c6f091d` and prove a correct Textract pipeline reaches CLEAN without invented repair while visible mismatches still FLAG |
 | `elspeth-7da4e52344` — compose loop | `fixing` | Advisor timeout and registry lanes are integrated; run combined release gates and deployed acceptance |
 | `elspeth-e7ff15ac0b` — gate routing | `open` | Reconcile five closed, five verifying, and two residual children |
 | `elspeth-e54343d43b` — AWS installer | `open` | Hold implementation until demo-aware product/system work is accepted; only deconflict existing owners in the meantime |
@@ -109,14 +110,14 @@ Parent workstream state:
 
 | ID | Priority | Live state | Filigree assignee | Next proof/action |
 |---|---:|---|---|---|
-| `elspeth-955438d517` | P1 | `fixing` | `codex-r3-rca-coordinator` | Stop asking the advisor to certify constraints intentionally omitted by the bounded safe projection; retain deterministic validation authority and exact visible-evidence review |
+| `elspeth-955438d517` | P1 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `a8c6f091d`; live Composer must prove bounded/withheld facts neither false-FLAG nor receive false certification |
 | `elspeth-fcef029996` | P1 | `verifying` | `codex-release-0.7.2-integration` | Live second-pass re-review converges with prior findings/actions visible |
 | `elspeth-ca751fa4e1` | P1 | `verifying` | `codex-advisor-surface-deadline` | Integrated through `4f70a3619`; live FLAG-to-repair-to-CLEAN must expose only final clean user prose while retaining internal audit evidence |
 | `elspeth-f5a9021d2d` | P2 | `verifying` | `codex-release-0.7.2-integration` | Green runtime preflight remains green while advisor completion is withheld |
 | `elspeth-4b3ac84038` | P1 | `verifying` | `codex-release-0.7.2-integration` | Live surfaces agree on the chosen completion-only policy: execution remains admitted; Save/review completion is refused |
 | `elspeth-1033d97b6c` | P3 | `verifying` | `codex-release-0.7.2-integration` | Live Textract uses deployment-owned region and proves the bucket region before Textract |
 | `elspeth-bc6d1c5d8d` | P2 | `closed` | `codex-release-0.7.2-integration` | Sample merged telemetry and terminology evidence during final audit |
-| `elspeth-cecfeca77b` | P2 | `triage` | unassigned | EARLY advisor must receive user intent or stop evaluating user-intent fidelity |
+| `elspeth-cecfeca77b` | P2 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `a8c6f091d`; EARLY now asks only internal topology/field-contract questions and uses the checkpoint verdict system contract |
 
 ## Compose loop — `elspeth-7da4e52344`
 
@@ -178,7 +179,7 @@ supportability remains last.
 | `elspeth-68a2ff10aa` | P2 | `triage` | Planner repair escape hatch | Retain the final candidate whose remaining error must be repaired |
 | `elspeth-73c1af1562` | P2 | `triage` | Guided advisory chat | Provide graph structure or narrow the requested explanation |
 | `elspeth-b14aa70771` | P2 | `triage` | Run diagnostics | Preserve a safe failure classification through redaction and explanation |
-| `elspeth-cecfeca77b` | P2 | `triage` | EARLY advisor | Provide user intent or remove the unsupported fidelity obligation |
+| `elspeth-cecfeca77b` | P2 | `verifying` | EARLY advisor | Integrated at `a8c6f091d`; deployed prompt capture must confirm the internal-coherence-only rubric |
 | `elspeth-0502deb48c` | P1 | `triage` | Judge staging | Deferred: site-specific rationale is a release/supportability surface, after demo core |
 
 ## AWS installer — `elspeth-e54343d43b`
@@ -309,6 +310,8 @@ Append entries; do not rewrite history.
 | 2026-08-03 22:12 | Combined CI-equivalent gate passed and integrated | Exact candidate `07f86af34` completed `pytest tests/` with 36,982 passed, 66 skipped, and one expected trust-tier xfail in 12m15s; cherry-picked byte-identically as release `6844b684a`, then 375 release-local canaries passed |
 | 2026-08-03 22:16 | Structural index refreshed on durable release | Loomweave run `2881b4c0-e280-409d-9e52-93ff39b55b78` completed fresh at exact `23c1494a2` with 71,179 entities and 136,739 edges |
 | 2026-08-03 22:37 | Exhaustive provider-projection audit closed | Five independent read-only audits reconciled Loomweave with every production provider-call family; Filigree comment `2240` records thirteen residual links, nine new implementation issues, known-good boundaries, and no agent AWS mutation |
+| 2026-08-03 22:48 | Advisor localized candidate approved | Initial RED proved five evidence-scope failures; independent review then found the higher-priority shared “stuck composer / one hint” system contract on deterministic checkpoints. Trigger-specific wire instructions, visible-evidence scoping, nine-field omission evidence, manual-hint parity, and EARLY/END coverage passed 142 advisor plus 252 adjacent tests; reviewer approved with no findings |
+| 2026-08-03 23:04 | Advisor full gate passed and integrated | Exact candidate `ffe899fd4` completed `pytest tests/` with 36,986 passed, 66 skipped, and one expected trust-tier xfail in 12m18s; cherry-picked byte-identically as release `a8c6f091d`, exact release advisor rerun 142 passed, and D1/EARLY/parent advanced to verifying |
 
 ## Reconciliation findings
 
