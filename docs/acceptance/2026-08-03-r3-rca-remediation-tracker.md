@@ -1,7 +1,7 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-04T04:16:13+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-04T04:16:13+10:00
+Last refreshed: 2026-08-04T06:44:02+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-04T06:44:02+10:00
 Release baseline: `release/0.7.2@1213ab5b4`
 Coordination owner: `codex-r3-rca-coordinator`
 
@@ -36,16 +36,16 @@ evidence are core/demo-aware work even though they involve AWS. Installing,
 updating, or tearing down the environment through IAM, Terraform, runbooks, or
 shell mechanics remains deferred even when it blocks a fresh install.
 
-## Current roll-up — 44 objective items plus 24 discovered/delivery records
+## Current roll-up — 44 objective items plus 25 discovered/delivery records
 
-| State | Objective 44 | Additional 24 | Meaning |
+| State | Objective 44 | Additional 25 | Meaning |
 |---|---:|---:|---|
 | Closed | 9 | 7 | Tracker says done; closure evidence is still sampled during the completion audit |
 | Verifying | 17 | 11 | Locally fixed; live or requirement-specific acceptance remains |
 | Fixing | 1 | 4 | Owned bug implementation is still in flight |
 | In progress | 0 | 0 | A delivery task spanning existing objective defects is in flight |
 | Open | 5 | 1 | Confirmed task/epic work not yet started here |
-| Triage | 9 | 1 | Root cause and reproducibility must be checked against current HEAD before fixing |
+| Triage | 9 | 2 | Root cause and reproducibility must be checked against current HEAD before fixing |
 | Proposed | 3 | 0 | Regression-gate features require approval/acceptance design before implementation |
 
 The additional records are newly discovered gate-custody bug
@@ -72,6 +72,9 @@ The exact-option projection audit added two coupled core records:
 `elspeth-826765af90` for safely grounding option obligations before provider
 projection, and `elspeth-d293c5d139` for rejecting contradictory deferred
 constraints as one allegedly valid intent.
+A full-example dogfood run added `elspeth-454892147c`: retry exhaustion reaches
+the terminal `UNROUTED` arm without consulting the transform's configured
+`on_error` quarantine sink, contrary to the shipped example contracts.
 
 Closed-record assignees below are retained Filigree audit history, not active
 claim custody.
@@ -80,7 +83,7 @@ claim custody.
 
 | Agent | Scope | Worktree/branch | File custody | AWS authority | Status |
 |---|---|---|---|---|---|
-| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`); `.claude/worktrees/verify-guided-schema-batch`; release checkout | This tracker and release integration | Sole mutation custodian | Active; advisor `224e599b3` and JSON-codec `55e366c65` candidates are combined after 596 backend, 2,880 frontend, TypeScript, and Ruff checks; full Python gate is running before release integration |
+| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`); `.claude/worktrees/verify-guided-schema-batch`; release checkout | This tracker and release integration | Sole mutation custodian | Active; advisor `224e599b3` and JSON-codec `55e366c65` remain held from release after the full gate exposed exact DAG corpus identity drift; the corrected production-path suite is 158/158 and atomic corpus parity is under review |
 | `/root/review_guided_proposal_feedback` | Focused custody, retry, closed-shape, unchanged-target, security, and accessibility review | Read-only `.claude/worktrees/guided-proposal-feedback` | None | None | Complete; approved exact candidate `a5b5c9cee` with no P1/P2 findings |
 | `/root/rca_multiquery_standard_json` | Root-cause the standard-JSON provider-contract omission and audit-trace seam | Shared read-only release baseline | None | None | Complete; confirmed standard mode enforced names, types, and enums absent from both provider and Langfuse messages |
 | `/root/fix_multiquery_standard_json` | TDD implementation of deterministic standard-JSON contract projection | `.claude/worktrees/fix-multiquery-standard-json`; `codex/fix-multiquery-standard-json` | Released after integration | None | Complete exact candidate `f84a2fc37`; integrated as release `4f95c29a1` after two independent approvals |
@@ -100,6 +103,7 @@ claim custody.
 | `/root/fix_advisor_evidence_scope_wording` | Make skill, progress, terminal, readiness, and repair wording consistently evidence-scoped | `.claude/worktrees/advisor-evidence-scope-wording`; `codex/fix-advisor-evidence-scope-wording` | Wording strings/docstrings and exact tests only | None | Candidate `224e599b3` independently approved with no P1/P2 finding; combined full-suite verification is running before release integration |
 | `/root/fix_json_sink_encoding_validation` | Reject unavailable and non-text JSON codecs before publication or the first write | `.claude/worktrees/json-sink-encoding-validation`; `codex/fix-json-sink-encoding-validation` | JSON sink configuration, direct tests, and declared source hash | None | Candidate chain through `55e366c65` independently approved after 745 localized tests; combined full-suite verification is running |
 | `/root/fix_grounded_option_constraints` | Ground exact safe option obligations, keep private values out of provider context, and reject contradictory constraints | `.claude/worktrees/grounded-option-constraints`; `codex/fix-grounded-option-constraints` | Deferred-intent authority/admission/planning seams and direct tests | None | Active in strict TDD for `826765af90` + `d293c5d139`; advisor checkpoint wording is excluded |
+| `/root/rca_retry_exhaustion_error_routing` | Reconcile retry exhaustion with configured transform `on_error` routing and shipped example contracts | Shared read-only release baseline | None | None | Active read-only RCA for `elspeth-454892147c`; implementation awaits contract/root-cause confirmation |
 | `/root/review_advisor_evidence_scope` | Adversarial review of bounded evidence and actual checkpoint wire instructions | Shared read-only advisor worktree | None | None | Complete; found and drove repair of the shared stuck-composer system-contract conflict, then approved current bytes with no findings |
 | `/root/audit_advisor_demo` | D1-D6 and advisor/F14 completion evidence | Shared read-only baseline | None | None | Completed; no residual local code defect found |
 | `/root/audit_compose_loop` | Six compose-loop RCAs and implementation partitioning | Shared read-only baseline | None | None | Completed; all six remain actionable |
@@ -195,6 +199,7 @@ not gate-routing children.
 | `elspeth-926ac02d3e` | P1 | `verifying` | `codex-s3-source-profiles` | Integrated through `131a5f584`; run one live operator-profiled S3 read and confirm redacted audit evidence plus endpoint denial |
 | `elspeth-6801b71f71` | P2 | `closed` | `codex-r3-rca-coordinator` | Read-only live DB proof found complete structured failure and DIVERT provenance; UI gap split to `elspeth-18b39eb829` |
 | `elspeth-0c73de77d5` | P2 | `fixing` | `codex-r3-rca-coordinator` | Independently approved chain through `55e366c65` validates availability and text-codec runtime shape without I/O; combined full-suite verification is running before release integration |
+| `elspeth-454892147c` | P2 | `triage` | unassigned | Confirm whether retry exhaustion must preserve the declared transform `on_error` destination, then route the failed payload to quarantine or correct the conflicting engine/docs contract |
 
 ## Provider-projection audit follow-up
 
