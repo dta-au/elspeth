@@ -19,6 +19,7 @@ import asyncio
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -458,7 +459,7 @@ async def test_run_advisor_checkpoint_telemetry_failure_does_not_replace_complet
 async def test_run_advisor_checkpoint_end_threads_user_message(make_service, simple_state):
     """R2-F8a (elspeth-583c2a0792): the END checkpoint carries the originating
     user message through to the advisor call, bounded and rendered inside the
-    untrusted fence, with the constraint-fidelity rubric line present."""
+    untrusted fence, with a visible-evidence-only constraint rubric."""
     service = make_service()
     service._call_advisor_with_audit = _AsyncRecorder(return_value=("CLEAN", {}))
     await service._run_advisor_checkpoint(
@@ -470,11 +471,11 @@ async def test_run_advisor_checkpoint_end_threads_user_message(make_service, sim
     )
     args = service._call_advisor_with_audit.call_args.args[0]
     assert args["user_message"] == "Use a strictly fixed schema, not a flexible one."
-    assert (
-        "Quote each explicit configuration constraint in the user's message "
-        "(schema mode, field names/types, named plugins/values) and verify the "
-        "pipeline satisfies it; FLAG any mismatch."
-    ) in args["problem_summary"]
+    assert ("Within that scope, quote each explicit configuration constraint visible in the user's request excerpt") in args[
+        "problem_summary"
+    ]
+    assert "compare it only when the pipeline excerpt exposes the corresponding fact" in args["problem_summary"]
+    assert "it is not certification of withheld, omitted, or truncated constraints" in args["problem_summary"]
 
 
 @pytest.mark.asyncio
@@ -492,6 +493,136 @@ async def test_run_advisor_checkpoint_early_ignores_user_message(make_service, s
     )
     args = service._call_advisor_with_audit.call_args.args[0]
     assert "user_message" not in args
+    assert "user's intent" not in args["problem_summary"]
+    assert "internally coherent" in args["problem_summary"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["early", "end"])
+async def test_checkpoint_wire_uses_verdict_contract_not_stuck_hint_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    make_service,
+    simple_state,
+    phase: str,
+) -> None:
+    """Checkpoint system instructions must permit a finding-free CLEAN reply.
+
+    The shared manual-hint contract says the composer is stuck and demands one
+    actionable hint. Applying that higher-priority instruction to deterministic
+    checkpoints makes a correct pipeline structurally difficult to sign off.
+    """
+    from elspeth.web.composer import service as composer_service
+
+    captured: list[dict[str, Any]] = []
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        return SimpleNamespace(
+            model="advisor-test-model",
+            choices=[SimpleNamespace(message=SimpleNamespace(content="CLEAN"))],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=1, total_tokens=11),
+        )
+
+    monkeypatch.setattr(composer_service, "_litellm_acompletion", fake_acompletion)
+    service = make_service()
+    arguments = service._build_checkpoint_arguments(phase=phase, state=simple_state)
+
+    guidance, _metadata = await service._call_advisor_with_audit(arguments, recorder=make_recorder())
+
+    assert guidance == "CLEAN"
+    system_message = captured[0]["messages"][0]["content"]
+    assert "Advisor checkpoint mode" in system_message
+    assert "A correct pipeline requires no invented repair" in system_message
+    assert "If no blocking defect is visible, start with CLEAN and do not manufacture a hint" in system_message
+    assert "another LLM (a pipeline composer) that is stuck" not in system_message
+    assert "Return ONE concrete actionable hint" not in system_message
+
+
+@pytest.mark.asyncio
+async def test_manual_advisor_hint_wire_retains_stuck_hint_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    make_service,
+) -> None:
+    """Trigger-specific checkpoint wording must not weaken the manual tool."""
+    from elspeth.web.composer import service as composer_service
+
+    captured: list[dict[str, Any]] = []
+
+    async def fake_acompletion(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        return SimpleNamespace(
+            model="advisor-test-model",
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Inspect the source schema."))],
+            usage=SimpleNamespace(prompt_tokens=10, completion_tokens=4, total_tokens=14),
+        )
+
+    monkeypatch.setattr(composer_service, "_litellm_acompletion", fake_acompletion)
+    service = make_service()
+    arguments = {
+        "trigger": "proactive_security_safety",
+        "problem_summary": "The composer requested a manual security hint.",
+        "recent_errors": [],
+        "attempted_actions": [],
+    }
+
+    await service._call_advisor_with_audit(arguments, recorder=make_recorder())
+
+    system_message = captured[0]["messages"][0]["content"]
+    assert "another LLM (a pipeline composer) that is stuck" in system_message
+    assert "Return ONE concrete actionable hint" in system_message
+    assert "Advisor checkpoint mode" not in system_message
+
+
+def test_end_advisor_prompt_scopes_bounded_and_withheld_evidence(make_service) -> None:
+    """D1 residual: bounded projections cannot support a whole-state sign-off.
+
+    The advisor may still block concrete defects in evidence it can see, but
+    CLEAN must not certify user text, schema fields, or option values that the
+    safe projection intentionally omits.
+    """
+    from elspeth.web.composer.service import (
+        _ADVISOR_USER_MESSAGE_MAX_CHARS,
+        _build_advisor_user_message,
+    )
+
+    oversized = "Use a fixed schema. " * (_ADVISOR_USER_MESSAGE_MAX_CHARS // 5)
+    base_state = _textract_advisor_state()
+    base_source = base_state.sources["source"]
+    source_options = dict(base_source.options)
+    source_options["schema"] = {
+        "mode": "fixed",
+        "fields": [
+            {
+                "name": f"field_{index}",
+                "type": "str",
+                "required": True,
+                "nullable": False,
+            }
+            for index in range(9)
+        ],
+    }
+    state = base_state.with_source(
+        SourceSpec(
+            plugin=base_source.plugin,
+            on_success=base_source.on_success,
+            options=source_options,
+            on_validation_failure=base_source.on_validation_failure,
+        )
+    )
+    arguments = make_service()._build_checkpoint_arguments(
+        phase="end",
+        state=state,
+        user_message=oversized,
+    )
+    prompt = _build_advisor_user_message(arguments)
+
+    assert arguments["user_message"].endswith("…")
+    assert "Bounded, redacted excerpt of the user's original request" in prompt
+    assert "Do not infer or verify constraints whose required value is withheld, omitted, or truncated" in prompt
+    assert "Deterministic validation, not this advisor" in prompt
+    assert "CLEAN means only that no blocking defect is visible in the supplied advisory evidence" in prompt
+    assert "'additional_fields_withheld': 1" in prompt
+    assert "values withheld: blob_ref, path" in prompt
 
 
 def test_build_checkpoint_arguments_end_truncates_long_user_message(make_service, simple_state):
@@ -558,7 +689,7 @@ async def test_end_gate_flags_user_stated_schema_mode_mismatch(make_service, cle
     def _advisor_side_effect(arguments, **_kwargs):
         assert "user_message" in arguments
         assert "fixed schema" in arguments["user_message"]
-        assert "Quote each explicit configuration constraint" in arguments["problem_summary"]
+        assert "quote each explicit configuration constraint visible" in arguments["problem_summary"]
         return ("FLAGGED: the user asked for a fixed schema mode but the source is flexible", {})
 
     service = make_service()
@@ -1094,6 +1225,7 @@ def test_advisor_prompt_explains_withheld_values_are_present_and_not_defects(mak
     assert "present-but-not-shown" in prompt
     assert "never FLAG" in prompt
     assert "merely because its value is withheld" in prompt
+    assert "it is not certification of withheld, omitted, or truncated constraints" in prompt
 
 
 @pytest.mark.asyncio
@@ -2879,9 +3011,10 @@ def test_end_checkpoint_problem_summary_carries_degeneracy_rubric(make_service, 
     end_summary = end_args["problem_summary"]
     early_summary = early_args["problem_summary"]
 
-    assert "interpolate the row field" in end_summary
+    assert "visible prompt_template excerpt" in end_summary
+    assert "length-independent interpolated row fields" in end_summary
     assert "fabricate" in end_summary
     assert end_summary.rstrip().endswith("Start your reply with CLEAN or FLAGGED.")
 
-    assert "interpolate the row field" not in early_summary
+    assert "visible prompt_template excerpt" not in early_summary
     assert "fabricate" not in early_summary
