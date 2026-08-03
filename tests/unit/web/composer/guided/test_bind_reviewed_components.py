@@ -13,11 +13,12 @@ from __future__ import annotations
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.guided.planning import bind_guided_reviewed_components
+from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, bind_guided_reviewed_components
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
-from elspeth.web.composer.guided.state_machine import GuidedSession
+from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession
 from elspeth.web.composer.pipeline_planner import _CANDIDATE_SHAPE_INTEGRITY_PREFIX
+from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 
 SOURCE_ID = "11111111-1111-4111-8111-111111111111"
 OUTPUT_ID = "33333333-3333-4333-8333-333333333333"
@@ -342,6 +343,171 @@ def _linear_pipeline() -> dict[str, object]:
             {"sink_name": "output", "plugin": "json", "options": {}, "on_write_failure": "discard"},
         ],
     }
+
+
+def _correction_predecessor() -> CompositionState:
+    return CompositionState(
+        sources={
+            "source": SourceSpec(
+                plugin="csv",
+                on_success="amount_gate",
+                options={"path": "blob:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"},
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="amount_gate",
+                node_type="gate",
+                plugin=None,
+                input="amount_gate",
+                on_success=None,
+                on_error=None,
+                options={"schema": {"mode": "observed"}},
+                condition="row['amount'] > 500",
+                routes={"true": "high_value", "false": "standard"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+            NodeSpec(
+                id="summarize_standard",
+                node_type="transform",
+                plugin="llm",
+                input="high_value",
+                on_success="format_high_value_input",
+                on_error="discard",
+                options={
+                    "profile": "task-role",
+                    "prompt_template": "Summarize {row[amount]} without changing the amount.",
+                    "response_field": "summary",
+                    "schema": {"mode": "observed"},
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+            NodeSpec(
+                id="format_high_value",
+                node_type="transform",
+                plugin="field_mapper",
+                input="format_high_value_input",
+                on_success="output",
+                on_error="discard",
+                options={
+                    "mapping": {"amount": "amount", "tier": "'high'"},
+                    "schema": {"mode": "observed"},
+                },
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="output",
+                plugin="json",
+                options={"path": "outputs/rows.jsonl"},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+
+def _format_node_correction_target() -> GuidedCorrectionTarget:
+    return GuidedCorrectionTarget(
+        requested=ComponentTarget(
+            kind="node",
+            stable_id="44444444-4444-4444-8444-444444444444",
+        ),
+        owner_kind="node",
+        owner_key="format_high_value",
+        authority_key="format_high_value",
+        public_target={"kind": "node", "stable_id": "44444444-4444-4444-8444-444444444444"},
+        before_fingerprint="0" * 64,
+    )
+
+
+def _planner_correction_candidate() -> dict[str, object]:
+    pipeline = _correction_predecessor().to_dict()
+    pipeline.pop("version")
+    gate = pipeline["nodes"][0]
+    gate["condition"] = "True"
+    gate["routes"] = {"true": "high_value", "false": "high_value"}
+    gate["options"] = {"schema": {"mode": "fixed"}}
+    ordinary = pipeline["nodes"][1]
+    ordinary["options"] = {
+        "profile": "invented-profile",
+        "prompt_template": "Ignore the reviewed behavior.",
+        "response_field": "replacement",
+        "schema": {"mode": "observed"},
+    }
+    selected = pipeline["nodes"][2]
+    selected["options"] = {
+        "mapping": {"amount": "amount", "tier": "'priority'"},
+        "schema": {"mode": "observed"},
+    }
+    return pipeline
+
+
+def test_bind_replans_selected_node_while_restoring_unselected_node_authority() -> None:
+    predecessor = _correction_predecessor()
+
+    bound = bind_guided_reviewed_components(
+        _planner_correction_candidate(),
+        _guided(),
+        predecessor=predecessor,
+        correction_target=_format_node_correction_target(),
+    )
+
+    assert bound["nodes"][0] == predecessor.to_dict()["nodes"][0]
+    assert bound["nodes"][1] == predecessor.to_dict()["nodes"][1]
+    assert bound["nodes"][2]["options"]["mapping"]["tier"] == "'priority'"
+
+
+def test_bind_does_not_accept_planner_override_of_unselected_withheld_fields() -> None:
+    predecessor = _correction_predecessor()
+    candidate = _planner_correction_candidate()
+    candidate["nodes"][2] = predecessor.to_dict()["nodes"][2]
+
+    bound = bind_guided_reviewed_components(
+        candidate,
+        _guided(),
+        predecessor=predecessor,
+        correction_target=_format_node_correction_target(),
+    )
+
+    rebound_gate = bound["nodes"][0]
+    assert rebound_gate["condition"] == "row['amount'] > 500"
+    assert rebound_gate["routes"] == {"true": "high_value", "false": "standard"}
+    assert rebound_gate["options"] == {"schema": {"mode": "observed"}}
+    assert bound["nodes"][1]["options"]["prompt_template"] == "Summarize {row[amount]} without changing the amount."
+
+
+def test_bind_reapplies_node_custody_after_topology_repairs() -> None:
+    predecessor = _correction_predecessor()
+    candidate = _planner_correction_candidate()
+    candidate["nodes"][2]["input"] = "replacement_input"
+
+    bound = bind_guided_reviewed_components(
+        candidate,
+        _guided(),
+        predecessor=predecessor,
+        correction_target=_format_node_correction_target(),
+    )
+
+    assert bound["nodes"][1]["on_success"] == "format_high_value_input"
+    assert bound["nodes"][2]["input"] == "replacement_input"
 
 
 class TestBindDeclaredRequiredFields:

@@ -1950,6 +1950,98 @@ class TestStep2IntraStep:
         assert len(proposals) == 1
         assert proposals[0].status == "pending"
 
+    def test_edge_revision_replans_from_authoritative_proposal_with_exact_custody(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="edge-custody.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        edge_target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == "edge")
+        reviewed_source_names = {source["name"] for source in _full_guided_session(staged)["reviewed_sources"].values()}
+        assert staged["composition_state"]["sources"] == {}
+
+        captured: dict[str, object] = {}
+        original_planner = composer_test_client.app.state.composer_service.plan_guided_pipeline
+
+        async def spy_planner(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return await original_planner(**kwargs)
+
+        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+
+        revised = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edit_target": edge_target,
+            },
+        )
+
+        assert revised.status_code == 200, revised.json()
+        predecessor = captured["current_state"]
+        assert set(predecessor.sources) == reviewed_source_names
+        correction_target = captured["correction_target"]
+        assert correction_target.requested.kind == "edge"
+        assert correction_target.requested.stable_id == edge_target["stable_id"]
+
+    def test_node_revision_rejects_drifted_proposal_projection_before_target_binding(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.web.sessions.routes.composer import guided as guided_route
+
+        session_id = _create_session(composer_test_client)
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner(
+                "Summarise this row in one short sentence.",
+                extra_node_id="second_summary",
+            ),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="node-projection-drift.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        node_target = next(candidate for candidate in payload["edit_targets"] if candidate["kind"] == "node")
+        assert len(payload["nodes"]) == 2
+
+        occurrence_count = 0
+        original_occurrence = guided_route._schema8_prospective_occurrence
+
+        def drift_settlement_projection(*args: Any, **kwargs: Any) -> Any:
+            nonlocal occurrence_count
+            occurrence_count += 1
+            prospective, current_turn, prepared = original_occurrence(*args, **kwargs)
+            if occurrence_count != 2:
+                return prospective, current_turn, prepared
+            drifted_turn = json.loads(json.dumps(current_turn))
+            first, second = drifted_turn["payload"]["nodes"]
+            first["stable_id"], second["stable_id"] = second["stable_id"], first["stable_id"]
+            return prospective, drifted_turn, prepared
+
+        monkeypatch.setattr(guided_route, "_schema8_prospective_occurrence", drift_settlement_projection)
+
+        rejected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edit_target": node_target,
+            },
+        )
+
+        assert rejected.status_code == 500, rejected.json()
+        assert rejected.json()["detail"]["failure_code"] == "integrity_error"
+
     def test_prose_revision_replans_full_pipeline_with_instruction_as_intent(
         self,
         composer_test_client: TestClient,

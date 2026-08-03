@@ -296,6 +296,44 @@ def resolve_guided_correction_target(
     )
 
 
+def resolve_guided_proposal_correction_target(
+    *,
+    requested: ComponentTarget,
+    proposal_payload: Mapping[str, Any],
+    predecessor: CompositionState,
+) -> GuidedCorrectionTarget:
+    """Resolve an exact correction target from the PROPOSE_PIPELINE projection.
+
+    Proposal review nests sources and edges under ``graph`` while wire review
+    names the same closed collections ``sources`` and ``connections`` at the
+    top level.  Normalize only that structural envelope, then delegate to the
+    one positional stable-ID/private-owner resolver.  No private option value
+    is added to the provider-visible target.
+    """
+
+    graph = proposal_payload.get("graph")
+    nodes = proposal_payload.get("nodes")
+    outputs = proposal_payload.get("outputs")
+    if (
+        type(graph) is not dict
+        or type(graph.get("sources")) is not list
+        or type(graph.get("edges")) is not list
+        or type(nodes) is not list
+        or type(outputs) is not list
+    ):
+        raise AuditIntegrityError("guided proposal correction projection is malformed")
+    return resolve_guided_correction_target(
+        requested=requested,
+        wire_payload={
+            "sources": graph["sources"],
+            "nodes": nodes,
+            "connections": graph["edges"],
+            "outputs": outputs,
+        },
+        predecessor=predecessor,
+    )
+
+
 def require_guided_correction_target_changed(
     wire_payload: Mapping[str, Any],
     target: GuidedCorrectionTarget,
@@ -668,14 +706,28 @@ def guided_unproducible_output_field_names(guided: GuidedSession) -> tuple[str, 
 def bind_guided_reviewed_components(
     pipeline: Mapping[str, Any],
     guided: GuidedSession,
+    *,
+    predecessor: CompositionState | None = None,
+    correction_target: GuidedCorrectionTarget | None = None,
 ) -> GuidedBoundPipeline:
     """Replace provider-authored component configuration with reviewed authority.
 
     The planner remains responsible for topology.  Source and output plugin
     configuration was already reviewed by the operator, so those private
     values are restored server-side after the terminal model call and before
-    candidate validation or proposal sealing.
+    candidate validation or proposal sealing.  During an exact guided
+    correction, pre-existing nodes outside the selected correction owner are
+    also server-owned: their option values and structural behavior are absent
+    from the provider context, so accepting a model-authored reconstruction
+    would turn redaction into mutation authority.
     """
+
+    if (predecessor is None) != (correction_target is None):
+        raise ValueError("predecessor and correction_target must be supplied together")
+    if predecessor is not None and type(predecessor) is not CompositionState:
+        raise TypeError("predecessor must be an exact CompositionState or None")
+    if correction_target is not None and type(correction_target) is not GuidedCorrectionTarget:
+        raise TypeError("correction_target must be an exact GuidedCorrectionTarget or None")
 
     bound = cast(dict[str, Any], deep_thaw(pipeline))
     raw_sources = bound.get("sources")
@@ -823,6 +875,24 @@ def bind_guided_reviewed_components(
                     # Only the destination can be a sink; a dangling from_node
                     # has no unambiguous resolution and stays for validation.
                     _resolve_dangling(topology_edge, "to_node")
+    if predecessor is not None and correction_target is not None:
+        raw_nodes = bound.get("nodes")
+        if type(raw_nodes) is not list:
+            raise AuditIntegrityError("guided planner candidate nodes are malformed")
+        selected_node_id = correction_target.owner_key if correction_target.owner_kind == "node" else None
+        predecessor_nodes = predecessor.to_dict()["nodes"]
+        for private_node in predecessor_nodes:
+            private_node_id = private_node["id"]
+            if private_node_id == selected_node_id:
+                continue
+            positions = [
+                index
+                for index, candidate_node in enumerate(raw_nodes)
+                if type(candidate_node) is dict and candidate_node.get("id") == private_node_id
+            ]
+            if len(positions) != 1:
+                raise AuditIntegrityError("guided planner candidate changed an unselected predecessor node identity")
+            raw_nodes[positions[0]] = private_node
     return cast(GuidedBoundPipeline, bound)
 
 
@@ -1437,6 +1507,7 @@ __all__ = [
     "guided_unproducible_output_fields",
     "require_guided_correction_target_changed",
     "resolve_guided_correction_target",
+    "resolve_guided_proposal_correction_target",
     "verified_remaining_deferred_intents",
     "verify_guided_proposal_projection",
 ]

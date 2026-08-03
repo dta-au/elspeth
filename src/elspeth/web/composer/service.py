@@ -2996,7 +2996,12 @@ class ComposerServiceImpl:
             candidate_finalizer=_required_controls_candidate_finalizer(
                 policy_catalog=policy_catalog,
                 plugin_snapshot=plugin_snapshot,
-                inner=lambda candidate: bind_guided_reviewed_components(candidate, guided),
+                inner=lambda candidate: bind_guided_reviewed_components(
+                    candidate,
+                    guided,
+                    predecessor=current_state if correction_target is not None else None,
+                    correction_target=correction_target,
+                ),
             ),
         )
         try:

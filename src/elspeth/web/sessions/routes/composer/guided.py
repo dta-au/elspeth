@@ -2538,10 +2538,13 @@ async def post_guided_respond(
     from elspeth.core.canonical import stable_hash as _message_content_hash
     from elspeth.web.composer.guided.planning import (
         build_guided_proposal_projection,
+        guided_candidate_state,
         guided_private_reviewed_facts,
         require_guided_correction_target_changed,
         resolve_guided_correction_target,
+        resolve_guided_proposal_correction_target,
         verified_remaining_deferred_intents,
+        verify_guided_proposal_projection,
     )
     from elspeth.web.composer.guided.protocol import (
         GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT,
@@ -3411,6 +3414,18 @@ async def post_guided_respond(
 
                         if body.edit_target is not None or revision_instruction is not None:
                             if body.edit_target is not None:
+                                catalog_ids = {
+                                    "source": frozenset(item.name for item in catalog.list_sources()),
+                                    "transform": frozenset(item.name for item in catalog.list_transforms()),
+                                    "sink": frozenset(item.name for item in catalog.list_sinks()),
+                                }
+                                verify_guided_proposal_projection(
+                                    payload=current_turn["payload"],
+                                    proposal_id=guided.active_proposal.proposal_id,
+                                    proposal=authority.proposal,
+                                    guided=guided,
+                                    catalog_plugin_ids=catalog_ids,
+                                )
                                 _require_bound_revision_target(current_turn, public_error=False)
                                 response_payload = {
                                     "action": "revise",
@@ -3533,6 +3548,19 @@ async def post_guided_respond(
                                 active_proposal=None,
                                 active_edit_target=None,
                             )
+                            planner_current_state = state
+                            correction_target = None
+                            if body.edit_target is not None:
+                                predecessor_candidate = guided_candidate_state(authority.proposal)
+                                correction_target = resolve_guided_proposal_correction_target(
+                                    requested=ComponentTarget(
+                                        kind=body.edit_target.kind,
+                                        stable_id=body.edit_target.stable_id,
+                                    ),
+                                    proposal_payload=current_turn["payload"],
+                                    predecessor=predecessor_candidate,
+                                )
+                                planner_current_state = predecessor_candidate
 
                             expected_originating_message_id = (
                                 UUID(planning_guided.root_intent_message_id) if planning_guided.root_intent_message_id is not None else None
@@ -3621,7 +3649,7 @@ async def post_guided_respond(
                                 raise AuditIntegrityError("guided planner call reached settlement without rate admission")
                             outcome = await composer.plan_guided_pipeline(
                                 intent=planner_intent,
-                                current_state=state,
+                                current_state=planner_current_state,
                                 guided=planning_guided,
                                 originating_message=originating_message,
                                 base=PresentBase(
@@ -3633,6 +3661,7 @@ async def post_guided_respond(
                                 recorder=planner_recorder,
                                 operation_fence=fence,
                                 progress=planner_progress,
+                                correction_target=correction_target,
                             )
                             if isinstance(outcome, GuidedPlannerDecline):
                                 return await _settle_guided_planner_decline(
@@ -3801,11 +3830,6 @@ async def post_guided_respond(
                                 )
                             )
                             return _response_from_record(stage_settlement.result_state)
-
-                        from elspeth.web.composer.guided.planning import (
-                            guided_candidate_state,
-                            verify_guided_proposal_projection,
-                        )
 
                         catalog_ids = {
                             "source": frozenset(item.name for item in catalog.list_sources()),
