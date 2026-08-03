@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-03T21:15:46+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-03T21:15:46+10:00
-Release baseline: `release/0.7.2@3ec1036d6`
+Last refreshed: 2026-08-03T22:13:28+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-03T22:13:28+10:00
+Release baseline: `release/0.7.2@6844b684a`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -66,7 +66,7 @@ claim custody.
 
 | Agent | Scope | Worktree/branch | File custody | AWS authority | Status |
 |---|---|---|---|---|---|
-| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`) | This tracker; registry worktree released after integration | Sole mutation custodian | Active; advisor timeout and registry chains reviewed, integrated, and release-tested; combined release gates next |
+| `/root` | Integration, tracker custody, combined release verification, worktree partitioning, and AWS operations | `.claude/worktrees/r3-rca-remediation-tracker` (`codex/r3-rca-remediation-tracker`) | This tracker; full-suite regression worktree released after integration | Sole mutation custodian | Active; reviewed settlement/registry repair and stale-fixture correction integrated; CI-equivalent suite green at `6844b684a`; next demo-aware core item selection in progress |
 | `/root/audit_advisor_demo` | D1-D6 and advisor/F14 completion evidence | Shared read-only baseline | None | None | Completed; no residual local code defect found |
 | `/root/audit_compose_loop` | Six compose-loop RCAs and implementation partitioning | Shared read-only baseline | None | None | Completed; all six remain actionable |
 | `/root/audit_gate_routing` | Closed/verifying routing audit plus residual routing RCAs | Shared read-only baseline | None | None | Completed; two residual and one new P1 confirmed |
@@ -145,7 +145,7 @@ Parent workstream state:
 | `elspeth-eacfec09a6` | P1 | `closed` | unassigned | Current-head D1 audit proved unified evidence/injection candidates, withheld-value semantics, complete bounded triples, and failure routes; 12 focused regressions passed at `131a5f584` |
 | `elspeth-4c699cb5d0` | P1 | `closed` | `codex-frontend-readiness-axes` | Integrated through `9016ce6a6`; exact release 148-test action/fanout slice passed; parent D5 remains live-verifying |
 | `elspeth-d0d52e2fde` | P2 | `closed` | `codex-release-0.7.2-integration` | Sample the real HTTP/lifecycle regression added with the proof fix |
-| `elspeth-c4734bc69a` | P3 | `verifying` | `codex-r3-rca-coordinator` | Behavior `d78fbbed6` plus corpus `10179f2c1`; live catalog acceptance and combined full-suite gate remain |
+| `elspeth-c4734bc69a` | P3 | `verifying` | `codex-r3-rca-coordinator` | Behavior `d78fbbed6` plus corpus `10179f2c1`; combined full-suite gate passed at `6844b684a`, while live catalog acceptance remains |
 | `elspeth-aaa9e3f597` | P2 | `verifying` | `codex-release-0.7.2-integration` | Live guided path retains the decision heading and treats gates as topology, not plugins |
 | `elspeth-1d97fc4b80` | P1 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `b424c08c4`; live correction must preserve unrelated gate routes and LLM prompt/profile options byte-for-byte |
 | `elspeth-18b39eb829` | P2 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `0928c6ac6`; live run panel must expose the already-recorded Textract node/code/hint without direct DB access |
@@ -284,6 +284,8 @@ Append entries; do not rewrite history.
 | 2026-08-03 20:50 | Compose registry boundary active | Reclaimed `7bd0141bbe` to the coordinator and opened a clean `4f70a3619`-based worktree; RED proves unknown `pipeline_decision` terms currently publish on all four node writers and the tool schema accepts them; localized fail-closed repair is under test |
 | 2026-08-03 21:13 | Advisor timeout recovery integrated | Independently approved three-commit chain integrated through `a913ccb63`; 79 release-local advisor/persistence tests passed and `57232f6f3c` closed with exact recovery/non-replay evidence |
 | 2026-08-03 21:15 | Compose registry boundary integrated | Reviewed `e6b44424a` + provider follow-up `f82b5fee6` integrated as `86453aa5c` + `3ec1036d6`; 376 release-local tests passed, supported provider transforms retain exactly the three public terms, and `7bd0141bbe` advanced to verifying |
+| 2026-08-03 21:59 | Full-suite regression candidate approved | Two independent reviews approved `07f86af34` after one stale semantic-failure expectation was corrected; 499 boundary/authority tests, 626 service/guided tests, source-slice mypy, lints, and Wardline passed |
+| 2026-08-03 22:12 | Combined CI-equivalent gate passed and integrated | Exact candidate `07f86af34` completed `pytest tests/` with 36,982 passed, 66 skipped, and one expected trust-tier xfail in 12m15s; cherry-picked byte-identically as release `6844b684a`, then 375 release-local canaries passed |
 
 ## Reconciliation findings
 
