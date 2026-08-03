@@ -577,9 +577,9 @@ describe("AuditReadinessPanel", () => {
 
   // ── Gate legibility (elspeth-088bf83922 T-2, option (a)) ───────────────────
   //
-  // canExecute (ExecuteButton.tsx) only reads the `validation` row's
-  // is_valid and interpretation-pending state (which the `llm_interpretations`
-  // row mirrors) — plugin_trust/provenance/retention/secrets never gate Run.
+  // canExecute (ExecuteButton.tsx) reads backend execution readiness and
+  // interpretation-pending state (which the `llm_interpretations` row
+  // mirrors) — plugin_trust/provenance/retention/secrets never gate Run.
   // These two tests pin that the panel's per-row badges classify honestly
   // against that real predicate, and that the header carries a one-line
   // explanation — without touching any gating behaviour.
@@ -635,6 +635,49 @@ describe("AuditReadinessPanel", () => {
     // gating/advisory row count) — not colour-only.
     expect(screen.getAllByText("Blocks Run")).toHaveLength(2);
     expect(screen.getAllByText("Advisory")).toHaveLength(4);
+  });
+
+  it("labels an execution-ready advisor-pending validation row Advisory", async () => {
+    const base = allGreenSnapshot(1);
+    const advisorPending: AuditReadinessSnapshot = {
+      ...base,
+      rows: base.rows.map((row) =>
+        row.id === "validation"
+          ? {
+              ...row,
+              status: "warning" as const,
+              summary: "Advisor sign-off pending",
+            }
+          : row,
+      ),
+      validation_result: {
+        ...base.validation_result,
+        checks: [
+          {
+            name: "advisor_signoff",
+            passed: false,
+            detail: "Advisor sign-off pending.",
+            affected_nodes: [],
+            outcome_code: null,
+          },
+        ],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: true,
+          completion_ready: false,
+          blockers: [],
+        },
+      },
+    };
+    vi.mocked(api.fetchAuditReadiness).mockImplementationOnce(
+      (_sid, signal) => makeAbortablePromise(advisorPending, { signal }),
+    );
+
+    render(<AuditReadinessPanel />);
+
+    const validation = await screen.findByText("Validation");
+    expect(validation.closest("li")).toHaveAttribute("data-gate", "advisory");
+    expect(validation.closest("li")).toHaveTextContent("Advisory");
   });
 
   it("explains the 'Blocks Run' / 'Advisory' classification in the expanded header", async () => {

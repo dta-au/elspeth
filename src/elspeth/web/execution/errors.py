@@ -94,8 +94,6 @@ class ExecutionReadinessError(Exception):
 
     def __init__(self, *, blockers: tuple[ValidationReadinessBlocker, ...]) -> None:
         blockers = tuple(blockers)
-        if not blockers:
-            raise ValueError("ExecutionReadinessError requires at least one readiness blocker")
         self.blockers = blockers
         super().__init__("Pipeline is not ready for execution.")
 

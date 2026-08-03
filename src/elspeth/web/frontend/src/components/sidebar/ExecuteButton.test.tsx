@@ -785,13 +785,10 @@ describe("ExecuteButton", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("never surfaces the advisory note for a non-green GATING row (honesty guard: classification, not snapshot judgment)", () => {
-    // The live validationResult says the composition is valid (Run is
-    // enabled), but the (decoupled, e.g. stale) audit snapshot shows the
-    // validation ROW itself as non-green. Because `validation` is a
-    // gating row, it must be excluded from the advisory-note check —
-    // showing "Advisory checks don't block Run" next to a gating row
-    // would be a false, self-contradicting statement.
+  it("surfaces the advisory note for an execution-ready validation warning", () => {
+    // Backend execution readiness is authoritative: a non-green validation
+    // row can represent completion-only advisor pending while Run remains
+    // admitted, so the note must classify it as advisory.
     useExecutionStore.setState({
       validationResult: { is_valid: true, checks: [], errors: [], warnings: [], readiness: READY_READINESS } as never,
       isExecuting: false,
@@ -809,21 +806,22 @@ describe("ExecuteButton", () => {
 
     expect(
       screen.queryByText("Advisory checks don't block Run."),
-    ).not.toBeInTheDocument();
+    ).toBeInTheDocument();
   });
 });
 
 describe("isRunGatingReadinessRow", () => {
-  it("classifies validation and llm_interpretations as gating", () => {
-    expect(isRunGatingReadinessRow("validation")).toBe(true);
-    expect(isRunGatingReadinessRow("llm_interpretations")).toBe(true);
+  it("classifies validation from backend execution readiness and llm_interpretations as gating", () => {
+    expect(isRunGatingReadinessRow("validation", false)).toBe(true);
+    expect(isRunGatingReadinessRow("validation", true)).toBe(false);
+    expect(isRunGatingReadinessRow("llm_interpretations", true)).toBe(true);
   });
 
   it("classifies plugin_trust, provenance, retention, and secrets as advisory", () => {
-    expect(isRunGatingReadinessRow("plugin_trust")).toBe(false);
-    expect(isRunGatingReadinessRow("provenance")).toBe(false);
-    expect(isRunGatingReadinessRow("retention")).toBe(false);
-    expect(isRunGatingReadinessRow("secrets")).toBe(false);
+    expect(isRunGatingReadinessRow("plugin_trust", false)).toBe(false);
+    expect(isRunGatingReadinessRow("provenance", false)).toBe(false);
+    expect(isRunGatingReadinessRow("retention", false)).toBe(false);
+    expect(isRunGatingReadinessRow("secrets", false)).toBe(false);
   });
 });
 

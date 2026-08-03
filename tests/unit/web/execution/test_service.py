@@ -929,6 +929,33 @@ class TestExecutionFlow:
         mock_session_service.create_run.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_execute_rejects_backend_execution_readiness_without_blockers(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+    ) -> None:
+        not_execution_ready = ValidationResult(
+            is_valid=True,
+            checks=[],
+            errors=[],
+            readiness=ValidationReadiness(
+                authoring_valid=True,
+                execution_ready=False,
+                completion_ready=False,
+                blockers=[],
+            ),
+        )
+
+        with (
+            patch("elspeth.web.execution.validation.validate_pipeline", return_value=not_execution_ready),
+            pytest.raises(ExecutionReadinessError) as exc_info,
+        ):
+            await service.execute(session_id=uuid4())
+
+        assert exc_info.value.blockers == ()
+        mock_session_service.create_run.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_execute_rejects_saved_now_disabled_plugin_before_run_or_constructor(
         self,
         service: ExecutionServiceImpl,

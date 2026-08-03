@@ -292,16 +292,19 @@ export function buildRunEgressSummary(
  * rows (plugin_trust, provenance, retention, secrets) never appear in
  * `canExecute` and are always advisory.
  *
- * This file is the single source of truth for what actually gates Run —
- * AuditReadinessRow (components/audit) imports this function rather than
- * re-deriving the classification, so the audit panel's "Blocks Run" /
- * "Advisory" labelling cannot drift from the real predicate below. The
- * exhaustive switch (the `never` default arm) fails the build if a future
- * backend row id is added without an explicit classification here.
+ * This helper is the single source of truth for what actually gates Run.
+ * The live and shared panel parents use it to prepare each row's explicit
+ * `blocksRun` value from backend execution readiness; AuditReadinessRow only
+ * renders that prepared fact. The exhaustive switch fails the build if a
+ * future backend row id lacks an explicit classification.
  */
-export function isRunGatingReadinessRow(id: ReadinessRowId): boolean {
+export function isRunGatingReadinessRow(
+  id: ReadinessRowId,
+  validationExecutionReady: boolean,
+): boolean {
   switch (id) {
     case "validation":
+      return !validationExecutionReady;
     case "llm_interpretations":
       return true;
     case "plugin_trust":
@@ -496,7 +499,10 @@ export function ExecuteButton(): JSX.Element | null {
   const advisoryRowsNonGreen =
     auditSnapshot?.rows.some(
       (row) =>
-        !isRunGatingReadinessRow(row.id) &&
+        !isRunGatingReadinessRow(
+          row.id,
+          auditSnapshot.validation_result.readiness.execution_ready,
+        ) &&
         (row.status === "warning" || row.status === "error"),
     ) ?? false;
 

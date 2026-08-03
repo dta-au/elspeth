@@ -799,6 +799,26 @@ class TestExecuteEndpoint:
         }
 
     @pytest.mark.asyncio
+    async def test_execute_returns_safe_422_for_execution_readiness_without_blockers(self) -> None:
+        from elspeth.web.execution.errors import ExecutionReadinessError
+
+        exc = ExecutionReadinessError(blockers=())
+        svc = _execution_service()
+        svc.execute = AsyncMock(spec=ExecutionService.execute, side_effect=exc)
+        app = _create_test_app(execution_service=svc)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(f"/api/sessions/{uuid4()}/execute")
+
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == {
+            "error_type": "execution_not_ready",
+            "detail": "Pipeline is not ready for execution.",
+            "kind": "execution_not_ready",
+            "blockers": [],
+        }
+
+    @pytest.mark.asyncio
     async def test_execute_returns_safe_500_for_completion_gate_integrity_failure(self) -> None:
         from elspeth.web.execution.errors import CompletionGateIntegrityError
 

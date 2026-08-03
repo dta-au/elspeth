@@ -23,6 +23,7 @@ function makeRow(
           : status === "ok"
             ? "OK"
             : "Not applicable",
+    blocksRun: id === "validation" || id === "llm_interpretations",
   };
 }
 
@@ -89,6 +90,26 @@ describe("AuditReadinessRow", () => {
     expect(screen.getByText("Provenance error")).toBeInTheDocument();
   });
 
+  it("renders an explicitly non-run-gating validation warning as Advisory in read-only mode", () => {
+    const row = {
+      ...makeRow("warning", "validation"),
+      heading: "Validation",
+      blocksRun: false,
+    } as RowPresentation;
+
+    render(
+      <ReadOnlyProvider value={true}>
+        <ul>
+          <AuditReadinessRow row={row} onSelect={() => {}} />
+        </ul>
+      </ReadOnlyProvider>,
+    );
+
+    expect(screen.getByRole("listitem")).toHaveAttribute("data-gate", "advisory");
+    expect(screen.getByText("Advisory")).toBeInTheDocument();
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+  });
+
   it("applies extraClassName and testId when supplied", () => {
     render(
       <ul>
@@ -108,11 +129,10 @@ describe("AuditReadinessRow", () => {
 
   // ── Gate legibility (elspeth-088bf83922 T-2, option (a)) ───────────────────
   //
-  // Every row carries a "Blocks Run" / "Advisory" text badge next to its
-  // heading, classified by isRunGatingReadinessRow (ExecuteButton.tsx) —
-  // the same file that owns canExecute. Only `validation` and
-  // `llm_interpretations` are gating; the other four ids are always
-  // advisory. The badge is visible text (not aria-hidden) and also
+  // Every row carries a parent-prepared "Blocks Run" / "Advisory" text badge
+  // next to its heading. Validation follows backend execution readiness;
+  // llm_interpretations remains gating; the other four ids are advisory.
+  // The badge is visible text (not aria-hidden) and also
   // exposed programmatically via `data-gate` on the row's <li>, so both
   // sighted and assistive-tech users, and tests/tooling, get the same
   // classification.

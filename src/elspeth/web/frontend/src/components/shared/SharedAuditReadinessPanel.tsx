@@ -24,6 +24,7 @@ import {
   AuditReadinessRow,
   type RowPresentation,
 } from "../audit/AuditReadinessRow";
+import { isRunGatingReadinessRow } from "../sidebar/ExecuteButton";
 import type {
   AuditReadinessSnapshot,
   ReadinessRow,
@@ -83,7 +84,10 @@ function rowHeading(id: ReadinessRowId): string {
   }
 }
 
-function presentationForSharedRow(row: ReadinessRow): RowPresentation {
+function presentationForSharedRow(
+  row: ReadinessRow,
+  validationExecutionReady: boolean,
+): RowPresentation {
   const { glyph, aria } = statusGlyph(row.status);
   return {
     id: row.id,
@@ -92,6 +96,7 @@ function presentationForSharedRow(row: ReadinessRow): RowPresentation {
     summaryText: row.summary,
     glyph,
     ariaStatusLabel: aria,
+    blocksRun: isRunGatingReadinessRow(row.id, validationExecutionReady),
     // Per-row test ids match the pre-FIX-C inline table to keep any
     // upstream consumer / contract tests stable.
     testId: `shared-inspect-readiness-row-${row.id}`,
@@ -142,7 +147,10 @@ export function SharedAuditReadinessPanel({
           {snapshot.rows.map((row) => (
             <AuditReadinessRow
               key={row.id}
-              row={presentationForSharedRow(row)}
+              row={presentationForSharedRow(
+                row,
+                snapshot.validation_result.readiness.execution_ready,
+              )}
             />
           ))}
         </ul>

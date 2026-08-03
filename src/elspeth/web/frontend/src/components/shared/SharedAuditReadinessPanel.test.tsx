@@ -167,16 +167,16 @@ describe("SharedAuditReadinessPanel", () => {
   //
   // The shared read-only view renders through the same AuditReadinessRow
   // primitive as the live panel, so it inherits the identical "Blocks Run" /
-  // "Advisory" classification (validation + llm_interpretations gate;
-  // plugin_trust/provenance/retention/secrets are advisory). It also gets a
+  // "Advisory" classification (validation follows snapshot execution
+  // readiness; llm_interpretations gates; the other rows are advisory). It also gets a
   // standalone explanatory line in the header, since a reviewer here has no
   // ExecuteButton in view to infer the distinction from.
 
-  it("labels validation and llm_interpretations rows 'Blocks Run' and the other four 'Advisory'", () => {
+  it("labels execution-ready validation and the four informational rows Advisory while llm_interpretations Blocks Run", () => {
     render(<SharedAuditReadinessPanel snapshot={_snapshot} />);
     expect(
       screen.getByTestId("shared-inspect-readiness-row-validation"),
-    ).toHaveAttribute("data-gate", "blocks");
+    ).toHaveAttribute("data-gate", "advisory");
     expect(
       screen.getByTestId("shared-inspect-readiness-row-llm_interpretations"),
     ).toHaveAttribute("data-gate", "blocks");
@@ -185,6 +185,46 @@ describe("SharedAuditReadinessPanel", () => {
         screen.getByTestId(`shared-inspect-readiness-row-${id}`),
       ).toHaveAttribute("data-gate", "advisory");
     }
+  });
+
+  it("labels an execution-ready advisor-pending validation row Advisory in the read-only snapshot", () => {
+    const advisorPending: AuditReadinessSnapshot = {
+      ..._snapshot,
+      rows: _snapshot.rows.map((row) =>
+        row.id === "validation"
+          ? {
+              ...row,
+              status: "warning" as const,
+              summary: "Advisor sign-off pending",
+            }
+          : row,
+      ),
+      validation_result: {
+        ..._snapshot.validation_result,
+        checks: [
+          {
+            name: "advisor_signoff",
+            passed: false,
+            detail: "Advisor sign-off pending.",
+            affected_nodes: [],
+            outcome_code: null,
+          },
+        ],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: true,
+          completion_ready: false,
+          blockers: [],
+        },
+      },
+    };
+
+    render(<SharedAuditReadinessPanel snapshot={advisorPending} />);
+
+    const validation = screen.getByTestId("shared-inspect-readiness-row-validation");
+    expect(validation).toHaveAttribute("data-gate", "advisory");
+    expect(validation).toHaveTextContent("Advisory");
+    expect(screen.queryByRole("button", { name: /validation/i })).not.toBeInTheDocument();
   });
 
   it("explains the 'Blocks Run' classification in the frozen-snapshot header", () => {

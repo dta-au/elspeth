@@ -31,6 +31,7 @@ import type {
 import { ReadinessRowDetail } from "./ReadinessRowDetail";
 import { ExplainDialog } from "./ExplainDialog";
 import { AuditReadinessRow, type RowPresentation } from "./AuditReadinessRow";
+import { isRunGatingReadinessRow } from "../sidebar/ExecuteButton";
 
 /** Glyph + accessible label for each row status. */
 function statusGlyph(status: ReadinessStatus): { glyph: string; aria: string } {
@@ -590,6 +591,10 @@ export function AuditReadinessPanel() {
                 summaryText: formatted.summaryText,
                 glyph: formatted.glyph,
                 ariaStatusLabel: formatted.ariaStatusLabel,
+                blocksRun: isRunGatingReadinessRow(
+                  row.id,
+                  snapshot.validation_result.readiness.execution_ready,
+                ),
                 extraClassName: "audit-readiness-row--llm-interpretations",
                 testId: "audit-readiness-row-llm-interpretations",
               };
@@ -626,6 +631,10 @@ export function AuditReadinessPanel() {
               summaryText,
               glyph,
               ariaStatusLabel: aria,
+              blocksRun: isRunGatingReadinessRow(
+                row.id,
+                snapshot.validation_result.readiness.execution_ready,
+              ),
             };
             return (
               <AuditReadinessRow
