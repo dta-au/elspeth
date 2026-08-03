@@ -7,6 +7,7 @@ import { useSessionStore } from "@/stores/sessionStore";
 import { useExecutionStore } from "@/stores/executionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
+import type { ValidationReadiness, ValidationResult } from "@/types/index";
 
 // The Export-YAML dialog body renders YamlView, which pulls in session state
 // and YAML rendering machinery irrelevant to the assertions in this file.
@@ -20,12 +21,34 @@ vi.mock("@/components/inspector/YamlView", () => ({
   ),
 }));
 
-function _validValidation() {
+const READY_READINESS = {
+  authoring_valid: true,
+  execution_ready: true,
+  completion_ready: true,
+  blockers: [],
+} satisfies ValidationReadiness;
+
+const BLOCKED_READINESS = {
+  authoring_valid: false,
+  execution_ready: false,
+  completion_ready: false,
+  blockers: [
+    {
+      code: "validation_error",
+      component_id: "node1",
+      component_type: "transform",
+      detail: "The transform did not pass validation.",
+    },
+  ],
+} satisfies ValidationReadiness;
+
+function _validValidation(): ValidationResult {
   return {
     is_valid: true,
     checks: [],
     errors: [],
-  } as never;
+    readiness: READY_READINESS,
+  };
 }
 
 // Minimal composition with content: the Export-YAML button gates on
@@ -43,7 +66,7 @@ function _nonEmptyComposition() {
   } as never;
 }
 
-function _invalidValidation() {
+function _invalidValidation(): ValidationResult {
   return {
     is_valid: false,
     checks: [],
@@ -55,7 +78,8 @@ function _invalidValidation() {
         suggestion: null,
       },
     ],
-  } as never;
+    readiness: BLOCKED_READINESS,
+  };
 }
 
 describe("CompletionBar", () => {

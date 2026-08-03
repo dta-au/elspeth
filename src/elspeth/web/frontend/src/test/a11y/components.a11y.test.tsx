@@ -328,6 +328,7 @@ import type {
   CompositionState,
   PluginSummary,
   Run,
+  ValidationReadiness,
 } from "@/types/index";
 import type { ReadinessRow, AuditReadinessSnapshot } from "@/types/api";
 import type {
@@ -342,6 +343,13 @@ import type { InterpretationEvent } from "@/types/interpretation";
 import { compositionStateAuthorityFields } from "@/test/composerFixtures";
 
 // --- Shared store reset ----------------------------------------------------
+
+const READY_READINESS = {
+  authoring_valid: true,
+  execution_ready: true,
+  completion_ready: true,
+  blockers: [],
+} satisfies ValidationReadiness;
 
 function resetAllStores() {
   resetStore(usePreferencesStore);
@@ -588,7 +596,14 @@ describe("AuditReadinessPanel", () => {
         { id: "llm_interpretations", label: "LLM interpretations", status: "not_applicable", summary: "n/a", detail: null, component_ids: [] },
         { id: "secrets", label: "Secrets", status: "not_applicable", summary: "n/a", detail: null, component_ids: [] },
       ],
-      validation_result: { is_valid: true, checks: [], errors: [], warnings: [], semantic_contracts: [] } as never,
+      validation_result: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: READY_READINESS,
+        semantic_contracts: [],
+      },
     };
     vi.mocked(auditApi.fetchAuditReadiness).mockResolvedValue(snapshot);
     const { container } = render(<AuditReadinessPanel />);
@@ -763,7 +778,12 @@ describe("InlineSourceFallbackPrompt", () => {
 describe("CompletionBar", () => {
   it("has no axe violations", async () => {
     useExecutionStore.setState({
-      validationResult: { is_valid: true, checks: [], errors: [] } as never,
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        readiness: READY_READINESS,
+      },
     } as never);
     const { container } = render(<CompletionBar />);
     expect(await axe(container)).toHaveNoViolations();
@@ -875,6 +895,7 @@ describe("PipelineValidationSummary", () => {
             suggestion: null,
           },
         ],
+        readiness: READY_READINESS,
       },
     } as never);
     const { container } = render(<PipelineValidationSummary />);

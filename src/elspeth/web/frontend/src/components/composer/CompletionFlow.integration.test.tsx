@@ -30,13 +30,52 @@ import { useExecutionStore } from "@/stores/executionStore";
 import { useInterpretationEventsStore } from "@/stores/interpretationEventsStore";
 import { resetStore } from "@/test/store-helpers";
 import * as api from "@/api/shareableReviews";
+import type { ValidationReadiness, ValidationResult } from "@/types/index";
 
-function _validValidation() {
+const READY_READINESS = {
+  authoring_valid: true,
+  execution_ready: true,
+  completion_ready: true,
+  blockers: [],
+} satisfies ValidationReadiness;
+
+const BLOCKED_READINESS = {
+  authoring_valid: false,
+  execution_ready: false,
+  completion_ready: false,
+  blockers: [
+    {
+      code: "validation_error",
+      component_id: "n",
+      component_type: "transform",
+      detail: "The transform did not pass validation.",
+    },
+  ],
+} satisfies ValidationReadiness;
+
+function _validValidation(): ValidationResult {
   return {
     is_valid: true,
     checks: [],
     errors: [],
-  } as never;
+    readiness: READY_READINESS,
+  };
+}
+
+function _invalidValidation(): ValidationResult {
+  return {
+    is_valid: false,
+    checks: [],
+    errors: [
+      {
+        component_id: "n",
+        component_type: "transform",
+        message: "x",
+        suggestion: null,
+      },
+    ],
+    readiness: BLOCKED_READINESS,
+  };
 }
 
 function _withOrigin(origin: string, fn: () => void) {
@@ -150,7 +189,7 @@ describe("Phase 6B completion-flow (CompletionBar + Dialog + store)", () => {
 
   it("clicking Save for review is a no-op when validation is invalid", () => {
     useExecutionStore.setState({
-      validationResult: { is_valid: false, checks: [], errors: [{ component_id: "n", component_type: "transform", message: "x", suggestion: null }] } as never,
+      validationResult: _invalidValidation(),
       isExecuting: false,
       progress: null,
       execute: vi.fn(),
