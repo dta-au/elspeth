@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
+from fastapi.routing import APIRoute
 from starlette.requests import Request
 
 from elspeth.web.sessions.routes import _helpers
+from elspeth.web.sessions.routes.composer import guided
 
 
 @dataclass
@@ -38,20 +41,28 @@ async def _settle_dependency(
     registry = _Registry()
     lifecycle: list[tuple[Any, ...]] = []
     token = object()
+
+    def begin_metrics(*, surface: str) -> object:
+        lifecycle.append(("begin", surface))
+        return token
+
+    def finish_metrics(observed_token: object, *, status: str) -> None:
+        lifecycle.append(("finish", observed_token, status))
+
     monkeypatch.setattr(_helpers, "_get_composer_progress_registry", lambda request: registry)
     monkeypatch.setattr(
         _helpers,
         "begin_composer_request_metrics",
-        lambda *, surface: lifecycle.append(("begin", surface)) or token,
+        begin_metrics,
         raising=False,
     )
     monkeypatch.setattr(
         _helpers,
         "finish_composer_request_metrics",
-        lambda observed_token, *, status: lifecycle.append(("finish", observed_token, status)),
+        finish_metrics,
         raising=False,
     )
-    dependency = _helpers._track_compose_inflight(uuid4(), _request(path))
+    dependency = cast("AsyncGenerator[None, None]", _helpers._track_compose_inflight(uuid4(), _request(path)))
     await anext(dependency)
     if failure is None:
         with pytest.raises(StopAsyncIteration):
@@ -68,6 +79,7 @@ async def _settle_dependency(
     (
         ("/api/sessions/1/messages", "freeform"),
         ("/api/sessions/1/guided/plan", "guided"),
+        ("/api/sessions/1/guided/respond", "guided"),
         ("/api/sessions/1/guided/chat", "guided"),
     ),
 )
@@ -78,10 +90,19 @@ async def test_request_dependency_projects_closed_surface_and_success(
 ) -> None:
     lifecycle, registry = await _settle_dependency(path=path, monkeypatch=monkeypatch)
 
+    assert len(lifecycle) == 2
     assert lifecycle[0] == ("begin", surface)
     assert lifecycle[1][0] == "finish"
     assert lifecycle[1][2] == "completed"
     assert [event for event, _session_id in registry.events] == ["begin", "end"]
+
+
+def test_guided_respond_route_mounts_request_lifecycle_dependency_exactly_once() -> None:
+    routes = [route for route in guided.router.routes if isinstance(route, APIRoute) and route.path == "/{session_id}/guided/respond"]
+
+    assert len(routes) == 1
+    dependencies = [dependency.call for dependency in routes[0].dependant.dependencies]
+    assert dependencies.count(_helpers._track_compose_inflight) == 1
 
 
 @pytest.mark.asyncio
@@ -101,11 +122,14 @@ async def test_request_dependency_projects_closed_failure_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     lifecycle, registry = await _settle_dependency(
-        path="/api/sessions/1/messages",
+        path="/api/sessions/1/guided/respond",
         monkeypatch=monkeypatch,
         failure=failure,
     )
 
+    assert len(lifecycle) == 2
+    assert lifecycle[0] == ("begin", "guided")
+    assert lifecycle[1][0] == "finish"
     assert lifecycle[1][2] == status
     assert [event for event, _session_id in registry.events] == ["begin", "end"]
 
