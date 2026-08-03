@@ -170,6 +170,24 @@ def _make_advisor_tool_call(
     )
 
 
+def _make_tool_call(call_id: str, name: str, arguments: dict[str, object]) -> _FakeLLMResponse:
+    return _FakeLLMResponse(
+        choices=[
+            _FakeChoice(
+                message=_FakeMessage(
+                    content=None,
+                    tool_calls=[
+                        _FakeToolCall(
+                            id=call_id,
+                            function=_FakeFunction(name=name, arguments=json.dumps(arguments)),
+                        )
+                    ],
+                )
+            )
+        ]
+    )
+
+
 def _make_text_only_response(content: str) -> _FakeLLMResponse:
     return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=content, tool_calls=None))])
 
@@ -854,6 +872,8 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
         mock_llm.side_effect = [
+            _make_tool_call("call_metadata", "set_metadata", {"patch": {"name": "Prepared"}}),
+            _make_tool_call("call_sources", "list_sources", {}),
             _make_advisor_tool_call("call_deadline"),
             _make_text_only_response("would incorrectly continue"),
         ]
@@ -861,7 +881,8 @@ async def test_advisor_call_is_bounded_by_remaining_compose_deadline() -> None:
         await service.compose("help me", [], state)
 
     assert exc_info.value.budget_exhausted == "timeout"
-    assert mock_llm.call_count == 1
+    assert exc_info.value.max_turns == 2
+    assert mock_llm.call_count == 3
     advisor_await = mock_advisor.await_args
     assert advisor_await is not None
     advisor_timeout = advisor_await.kwargs["timeout"]
@@ -889,12 +910,18 @@ async def test_advisor_zero_remaining_preserves_compose_timeout_without_outbound
         ),
         pytest.raises(ComposerConvergenceError) as exc_info,
     ):
-        mock_llm.side_effect = [_make_advisor_tool_call("call_zero_remaining")]
+        mock_llm.side_effect = [
+            _make_tool_call("call_sources", "list_sources", {}),
+            _make_tool_call("call_transforms", "list_transforms", {}),
+            _make_advisor_tool_call("call_zero_remaining"),
+        ]
         await service.compose("help me", [], _empty_state())
 
     assert exc_info.value.budget_exhausted == "timeout"
+    assert exc_info.value.max_turns == 2
     assert mock_advisor.await_count == 0
     assert tuple(tracker._failures) == initial_failures
+    assert len(exc_info.value.tool_invocations) == 1
     invocations = [inv for inv in exc_info.value.tool_invocations if inv.tool_name == "request_advisor_hint"]
     assert len(invocations) == 1
     payload = json.loads(_result_canonical(invocations[0]))

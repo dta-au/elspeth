@@ -96,7 +96,6 @@ from elspeth.web.composer.progress import (
 )
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import (
-    ComposerConvergenceError,
     ComposerPluginCrashError,
     ComposerRuntimePreflightError,
     ComposerServiceError,
@@ -634,6 +633,7 @@ async def run_tool_batch(
     tool_outcomes: list[_ToolOutcome] = []
     plugin_crash: ComposerPluginCrashError | None = None
     plugin_crash_cause: BaseException | None = None
+    advisor_compose_timeout: Literal["pre_call", "in_flight"] | None = None
     pre_state_id: str | None = current_state_id
     ctx.service._phase3_last_expected_current_state_id = pre_state_id
     decoded_args_by_call_id: dict[str, dict[str, Any]] = {}
@@ -1559,14 +1559,8 @@ async def run_tool_batch(
                     error_message=None,
                     post_version=state.version,
                 )
-                raise ComposerConvergenceError.capture(
-                    max_turns=0,
-                    budget_exhausted="timeout",
-                    state=state,
-                    initial_version=initial_version,
-                    tool_invocations=recorder.invocations,
-                    llm_calls=recorder.llm_calls,
-                )
+                advisor_compose_timeout = "pre_call"
+                break
 
             elif remaining < _MIN_USEFUL_ADVISOR_SECONDS:
                 deadline_payload = {
@@ -1647,14 +1641,8 @@ async def run_tool_batch(
                         error_message=None,
                         post_version=state.version,
                     )
-                    raise ComposerConvergenceError.capture(
-                        max_turns=0,
-                        budget_exhausted="timeout",
-                        state=state,
-                        initial_version=initial_version,
-                        tool_invocations=recorder.invocations,
-                        llm_calls=recorder.llm_calls,
-                    ) from None
+                    advisor_compose_timeout = "in_flight"
+                    break
                 # Advisor-specific timeout with compose budget still
                 # remaining: return structured tool feedback so the
                 # composer can continue within its global deadline.
@@ -2258,6 +2246,7 @@ async def run_tool_batch(
         all_cache_hits=all_cache_hits,
         plugin_crash=plugin_crash,
         plugin_crash_cause=plugin_crash_cause,
+        advisor_compose_timeout=advisor_compose_timeout,
         assistant_message=assistant_message,
         raw_assistant_content=raw_assistant_content,
         assistant_tool_calls=assistant_tool_calls,

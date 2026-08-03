@@ -23,7 +23,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.web.composer import tool_batch as tool_batch_module
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
-from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerServiceError, ToolArgumentError
+from elspeth.web.composer.protocol import ComposerConvergenceError, ComposerPluginCrashError, ComposerServiceError, ToolArgumentError
 from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_tool_call_response
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, ValidationSummary
@@ -1609,6 +1609,156 @@ async def test_step2_persists_intercepted_advisor_tool_call_rows(
     assert persisted_rows[0]["tool_calls"][0]["function"]["name"] == "request_advisor_hint"
     assert persisted_rows[1]["tool_call_id"] == "call_advisor_phase3"
     assert json.loads(persisted_rows[1]["content"])["guidance"] == "<redacted>"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remaining", "expected_provider_calls", "expected_advisor_audits"),
+    ((0.0, 0, 0), (5.0, 1, 1)),
+)
+async def test_step2_advisor_compose_timeout_persists_recovery_envelope(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+    remaining: float,
+    expected_provider_calls: int,
+    expected_advisor_audits: int,
+) -> None:
+    """Zero/in-flight timeout preserves the current turn before recovery."""
+    service = composer_service_with_real_sessions
+    service._settings = service._settings.model_copy(  # type: ignore[attr-defined]
+        update={
+            "composer_advisor_max_calls_per_compose": 3,
+            "composer_advisor_timeout_seconds": 60.0,
+        }
+    )
+    responses = [
+        _metadata_tool_response("call_prior_metadata", "Prepared"),
+        _advisor_tool_call_response("call_advisor_timeout"),
+    ]
+
+    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+        return responses.pop(0)
+
+    provider_calls = 0
+
+    async def _timeout_advisor(**_kwargs: Any) -> Any:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise TimeoutError
+
+    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", _timeout_advisor)
+    monkeypatch.setattr("elspeth.web.composer.tool_batch._remaining_compose_seconds", lambda _deadline: remaining)
+
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await _run_one_turn(
+            service,
+            llm=_fake_llm,
+            session_id=result_session_id,
+        )
+
+    exc = exc_info.value
+    assert provider_calls == expected_provider_calls
+    assert exc.budget_exhausted == "timeout"
+    assert exc.max_turns == 1
+    assert exc.partial_state is not None
+    assert exc.partial_state.metadata.name == "Prepared"
+    assert exc.tool_invocations == (), "both completed tool turns were persisted; the recovery carrier must not replay either"
+    failed_turn = exc.failed_turn
+    assert failed_turn is not None
+    assert failed_turn.assistant_message_id is not None
+    assert failed_turn.tool_calls_attempted == 1
+    assert failed_turn.tool_responses_persisted == 1
+
+    advisor_audits = [call for call in exc.llm_calls if call.model_requested == "anthropic/claude-sonnet-4-6"]
+    assert len(advisor_audits) == expected_advisor_audits
+    if advisor_audits:
+        assert advisor_audits[0].status.name == "TIMEOUT"
+
+    sessions_service = service._sessions_service  # type: ignore[attr-defined]
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        persisted_rows = list(
+            conn.execute(
+                select(
+                    chat_messages_table.c.id,
+                    chat_messages_table.c.role,
+                    chat_messages_table.c.tool_calls,
+                    chat_messages_table.c.tool_call_id,
+                    chat_messages_table.c.content,
+                )
+                .where(chat_messages_table.c.session_id == result_session_id)
+                .where(chat_messages_table.c.role.in_(("assistant", "tool")))
+                .order_by(chat_messages_table.c.sequence_no)
+            ).mappings()
+        )
+
+    assert [row["role"] for row in persisted_rows] == ["assistant", "tool", "assistant", "tool"]
+    assert persisted_rows[2]["id"] == failed_turn.assistant_message_id
+    assert persisted_rows[2]["tool_calls"][0]["function"]["name"] == "request_advisor_hint"
+    persisted_arguments = json.loads(persisted_rows[2]["tool_calls"][0]["function"]["arguments"])
+    assert persisted_arguments["problem_summary"].startswith("<advisor-problem-summary:")
+    timeout_payload = json.loads(persisted_rows[3]["content"])
+    assert timeout_payload["status"] == "COMPOSE_TIMEOUT"
+    assert timeout_payload["error"] == "<redacted-response-text>"
+    assert "Advisor call exceeded the remaining compose deadline." not in persisted_rows[3]["content"]
+    assert timeout_payload["budget_used"] == expected_provider_calls
+    assert timeout_payload["budget_remaining"] == 3 - expected_provider_calls
+
+
+@pytest.mark.asyncio
+async def test_step2_advisor_compose_timeout_preserves_audit_failure_primacy(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    result_session_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed timeout-envelope write remains an audit failure, not timeout."""
+    service = composer_service_with_real_sessions
+    responses = [
+        _metadata_tool_response("call_prior_metadata", "Prepared"),
+        _advisor_tool_call_response("call_advisor_timeout"),
+    ]
+
+    async def _fake_llm(_messages: Any, _tools: Any) -> Any:
+        return responses.pop(0)
+
+    monkeypatch.setattr("elspeth.web.composer.tool_batch._remaining_compose_seconds", lambda _deadline: 0.0)
+    sessions_service = service._sessions_service  # type: ignore[attr-defined]
+    original_persist = sessions_service.persist_compose_turn_async
+    writes = 0
+
+    async def _fail_second_write(**kwargs: Any) -> Any:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise AuditIntegrityError("timeout envelope write failed")
+        return await original_persist(**kwargs)
+
+    monkeypatch.setattr(sessions_service, "persist_compose_turn_async", _fail_second_write)
+
+    with pytest.raises(AuditIntegrityError, match="timeout envelope write failed") as exc_info:
+        await _run_one_turn(
+            service,
+            llm=_fake_llm,
+            session_id=result_session_id,
+        )
+
+    assert writes == 2
+    failed_turn = exc_info.value.failed_turn
+    assert failed_turn is not None
+    assert failed_turn.assistant_message_id is None
+    assert failed_turn.tool_calls_attempted == 1
+    assert failed_turn.tool_responses_persisted == 0
+
+    with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
+        persisted_roles = list(
+            conn.execute(
+                select(chat_messages_table.c.role)
+                .where(chat_messages_table.c.session_id == result_session_id)
+                .where(chat_messages_table.c.role.in_(("assistant", "tool")))
+                .order_by(chat_messages_table.c.sequence_no)
+            ).scalars()
+        )
+    assert persisted_roles == ["assistant", "tool"]
 
 
 @pytest.mark.asyncio

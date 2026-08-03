@@ -4816,7 +4816,7 @@ class ComposerServiceImpl:
                 # the completed audit prefix.
                 early_advisor_message_count = len(llm_messages)
                 early_checkpoint_deadline_expired = False
-                if not _cancellation_requested.is_set():
+                if not _cancellation_requested.is_set() and dispatch_result.advisor_compose_timeout is None:
                     try:
                         await self._maybe_run_early_checkpoint(
                             state=dispatch_result.state,
@@ -4968,6 +4968,20 @@ class ComposerServiceImpl:
                 # the first safe checkpoint before P5 or another model turn.
                 attach_llm_calls(deferred_cancel, recorder)
                 raise deferred_cancel
+
+            if dispatch.advisor_compose_timeout is not None:
+                current_invocation_count = len(dispatch.tool_outcomes)
+                if current_invocation_count == 0 or current_invocation_count > len(recorder.invocations):
+                    raise InvariantError("advisor timeout dispatch must carry one invocation per current-turn tool outcome")
+                raise ComposerConvergenceError.capture(
+                    max_turns=composition_turns_used + discovery_turns_used,
+                    budget_exhausted="timeout",
+                    state=state,
+                    initial_version=initial_version,
+                    tool_invocations=(() if persisted_tool_call_turn else recorder.invocations[-current_invocation_count:]),
+                    llm_calls=recorder.llm_calls,
+                    failed_turn=failed_turn,
+                )
 
             if early_checkpoint_deadline_expired:
                 charged_composition_turns = composition_turns_used + (1 if dispatch.turn_has_mutation else 0)

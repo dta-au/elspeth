@@ -203,6 +203,11 @@ class _DispatchOutcome:
     plugin_crash: ComposerPluginCrashError | None
     plugin_crash_cause: BaseException | None
 
+    # Advisor-tool compose timeout — the tool envelope is already closed in
+    # P3, but P4 must persist/redact the current assistant+tool turn before the
+    # driver raises the ordinary convergence-timeout recovery carrier.
+    advisor_compose_timeout: Literal["pre_call", "in_flight"] | None
+
     # LLM call result threaded through — P4 reads .content and .tool_calls
     # for redaction / persist; P5 unused.
     assistant_message: Any
