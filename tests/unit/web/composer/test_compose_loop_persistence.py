@@ -906,7 +906,9 @@ async def test_tool_batch_rejects_session_reused_id_before_current_turn_proposal
     except BaseException as exc:
         caught = exc
 
-    assert handler_calls == []
+    # The first explicit-approval batch performs one pure handler preview;
+    # the reused-ID second batch is rejected before any handler or effect.
+    assert handler_calls == ["set_metadata"]
     assert proposal_calls == 1
     with sessions_service._engine.connect() as conn:  # type: ignore[attr-defined]
         assert list(
