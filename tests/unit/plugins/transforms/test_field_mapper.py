@@ -835,3 +835,14 @@ class TestFieldMapperOutputSchemaContract:
         guaranteed = frozenset(transform._output_schema_config.guaranteed_fields)
         assert "id" in guaranteed
         assert "name" in guaranteed
+
+
+def test_select_only_assistance_requires_every_downstream_field() -> None:
+    """Discovery guidance names the contract obligation behind a whitelist."""
+    from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+    assistance = FieldMapper.get_agent_assistance()
+    assert assistance is not None
+    rendered = " ".join(assistance.composer_hints)
+
+    assert "every field required by the downstream sink" in rendered

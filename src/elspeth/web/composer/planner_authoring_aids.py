@@ -51,6 +51,12 @@ from elspeth.web.provider_config_policy import WEB_LLM_SEQUENTIAL_MULTI_QUERY_MA
 # The prompt never models a fabricated identifier — provenance is the lesson.
 PLACEHOLDER_BLOB_ID: Final[str] = "<blob_id copied verbatim from a list_blobs or create_blob result>"
 
+# Prompt-injection exposure follows every untrusted remote-text producer, but
+# the raw-HTML/fingerprint cleanup contract is specific to web_scrape output.
+# Keeping these producer sets separate prevents document extraction plugins
+# such as Textract from inheriting a factually false audit-card draft.
+_RAW_HTML_CLEANUP_PRODUCER_PLUGINS: Final[frozenset[str]] = frozenset({"web_scrape"})
+
 
 class _PluginDigestEntry(TypedDict):
     """Closed policy-visible plugin summary rendered into the planner prompt."""
@@ -254,6 +260,7 @@ _FORK_COALESCE_RULES: Final[tuple[str, ...]] = (
 )
 
 _FORK_EXEMPLAR_CONTENT: Final[str] = "ticket_id,body\nT-1001,Cannot log in since the update\nT-1002,Invoice totals look wrong\n"
+_ROW_UNION_EXEMPLAR_CONTENT: Final[str] = "case_id,variant_text\nC-1001,Control copy\nC-1002,Treatment copy\n"
 
 _FORK_ROW_UNION_RULES: Final[tuple[str, ...]] = (
     "Use row_union for require_all N-to-N reconvergence: every fork branch contributes its original rows, "
@@ -1116,6 +1123,12 @@ def fork_coalesce_exemplar_args(
             "name": "Per-branch fan-out and rejoin",
             "description": "Fan rows out to one transform per branch, rejoin with a coalesce, tidy, and save.",
         }
+    tidy_fields = list(tidy_mapping.values())
+    tidy_schema = {
+        "mode": "flexible",
+        "fields": [f"{field}: str" for field in tidy_fields],
+        "guaranteed_fields": tidy_fields,
+    }
 
     # Required-control coverage is proved per LLM node: the shield must dominate
     # the node's prompt inputs and content safety must dominate every one of its
@@ -1234,7 +1247,7 @@ def fork_coalesce_exemplar_args(
                 "on_success": "main",
                 "on_error": "discard",
                 "options": {
-                    "schema": {"mode": "observed"},
+                    "schema": tidy_schema,
                     "mapping": tidy_mapping,
                     "select_only": True,
                 },
@@ -1248,7 +1261,7 @@ def fork_coalesce_exemplar_args(
                 "options": {
                     "path": "outputs/ticket_assessments.json",
                     "format": "json",
-                    "schema": {"mode": "observed"},
+                    "schema": {"mode": "fixed", "fields": [f"{field}: str" for field in tidy_fields]},
                     "mode": "write",
                     "collision_policy": "auto_increment",
                 },
@@ -1284,15 +1297,15 @@ def fork_row_union_exemplar_args(
             "options": {
                 "schema": {
                     "mode": "flexible",
-                    "fields": ["ticket_id: str", "body: str"],
-                    "guaranteed_fields": ["ticket_id", "body"],
+                    "fields": ["case_id: str", "variant_text: str"],
+                    "guaranteed_fields": ["case_id", "variant_text"],
                 }
             },
             "on_validation_failure": "discard",
             "inline_blob": {
-                "filename": "support_tickets.csv",
+                "filename": "experiment_variants.csv",
                 "mime_type": "text/csv",
-                "content": _FORK_EXEMPLAR_CONTENT,
+                "content": _ROW_UNION_EXEMPLAR_CONTENT,
                 "description": "Literal rows the user pasted into chat",
             },
         },
@@ -1339,8 +1352,12 @@ def fork_row_union_exemplar_args(
                 "on_success": "main",
                 "on_error": "discard",
                 "options": {
-                    "schema": {"mode": "observed"},
-                    "mapping": {"ticket_id": "ticket_id", "body": "body"},
+                    "schema": {
+                        "mode": "flexible",
+                        "fields": ["case_id: str", "variant_text: str"],
+                        "guaranteed_fields": ["case_id", "variant_text"],
+                    },
+                    "mapping": {"case_id": "case_id", "variant_text": "variant_text"},
                     "select_only": True,
                 },
             },
@@ -1353,7 +1370,7 @@ def fork_row_union_exemplar_args(
                 "options": {
                     "path": "outputs/row_union_variants.json",
                     "format": "json",
-                    "schema": {"mode": "observed"},
+                    "schema": {"mode": "fixed", "fields": ["case_id: str", "variant_text: str"]},
                     "mode": "write",
                     "collision_policy": "auto_increment",
                 },
@@ -1471,6 +1488,7 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
         "rules": list(_REVIEW_REGISTRY_RULES),
     }
     visible_untrusted_producers = tuple(sorted(_UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS & visible["transform"]))
+    visible_raw_html_producers = tuple(sorted(_RAW_HTML_CLEANUP_PRODUCER_PLUGINS & visible["transform"]))
     control_modes = dict(catalog.snapshot.control_modes)
     if visible_untrusted_producers and "llm" in visible["transform"]:
         aids["prompt_shield"] = {
@@ -1489,8 +1507,8 @@ def _build_planner_authoring_aids(catalog: PolicyCatalogView) -> _PlannerAuthori
         }
     if "llm" in visible["transform"] and required_output_control is not None:
         aids["content_safety"] = {"rules": _content_safety_rules(safety_plugin=required_output_control, auto_wired=safety_auto_wired)}
-    if visible_untrusted_producers and "field_mapper" in visible["transform"]:
-        aids["raw_html_cleanup"] = {"rules": _raw_html_cleanup_rules(untrusted_producers=visible_untrusted_producers)}
+    if visible_raw_html_producers and "field_mapper" in visible["transform"]:
+        aids["raw_html_cleanup"] = {"rules": _raw_html_cleanup_rules(untrusted_producers=visible_raw_html_producers)}
     if "web_scrape" in visible["transform"]:
         aids["web_scrape_http_identity"] = {"rules": list(_WEB_SCRAPE_HTTP_IDENTITY_RULES)}
     aids["discovery_digest"] = {

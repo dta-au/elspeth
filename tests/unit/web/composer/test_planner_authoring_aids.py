@@ -864,6 +864,26 @@ class TestForkRowUnionExemplar:
         assert "N-to-N" in rendered
         assert "first branch" in rendered
 
+    def test_select_only_exemplars_cover_distinct_fixed_sink_contracts(self) -> None:
+        """Every taught whitelist visibly preserves its downstream required fields."""
+        trained_view, _trained_snapshot = _trained_view()
+        fork_args = fork_coalesce_exemplar_args(trained_view)
+        union_args = planner_authoring_aids.fork_row_union_exemplar_args(trained_view)
+        assert fork_args is not None and union_args is not None
+
+        sink_contracts: list[set[str]] = []
+        for args in (fork_args, union_args):
+            cleanup = next(node for node in args["nodes"] if node.get("plugin") == "field_mapper")
+            sink_schema = args["outputs"][0]["options"]["schema"]
+            assert sink_schema["mode"] == "fixed"
+            required_fields = {field.partition(":")[0].strip() for field in sink_schema["fields"]}
+            assert required_fields
+            assert required_fields <= set(cleanup["options"]["mapping"].values())
+            assert set(cleanup["options"]["mapping"]) <= set(cleanup["options"]["schema"]["guaranteed_fields"])
+            sink_contracts.append(required_fields)
+
+        assert sink_contracts[0] != sink_contracts[1]
+
     def test_alias_less_control_exemplar_validates_through_the_real_candidate_builder(self, tmp_path: Path) -> None:
         """The exact alias-less control exemplar bytes must build."""
         (tmp_path / "outputs").mkdir(exist_ok=True)
@@ -1297,6 +1317,18 @@ class TestPromptShieldRules:
         )
         for producer in _UNTRUSTED_REMOTE_CONTENT_PRODUCER_PLUGINS:
             assert producer in rendered
+
+    def test_textract_is_shielded_but_never_taught_web_scrape_cleanup(self) -> None:
+        """Document text is untrusted input, not raw HTML with a fingerprint field."""
+        view, _snapshot = _trained_view()
+
+        aids = build_planner_authoring_aids(view)
+        shield_rules = "\n".join(aids["prompt_shield"]["rules"])
+        cleanup_rules = "\n".join(aids["raw_html_cleanup"]["rules"])
+
+        assert "aws_textract_document_analysis" in shield_rules
+        assert "web_scrape" in cleanup_rules
+        assert "aws_textract_document_analysis" not in cleanup_rules
 
     def test_recommend_mode_draft_names_the_selected_shield_not_azure(self) -> None:
         """A selected non-Azure shield's audit card must not claim azure_prompt_shield.

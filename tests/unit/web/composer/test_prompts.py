@@ -26,6 +26,7 @@ from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSecretRequirement, PluginSummary
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
+from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
 from elspeth.web.composer.prompts import (
     SYSTEM_PROMPT,
     build_run_diagnostics_messages,
@@ -294,6 +295,21 @@ class TestBuildContextString:
         assert "csv" in plugins["sources"]
         assert "passthrough" in plugins["transforms"]
         assert "csv" in plugins["sinks"]
+
+    def test_context_includes_the_live_planner_authoring_aids(self) -> None:
+        """The ordinary compose loop gets the same live aid payload as the planner."""
+        catalog = _stub_catalog()
+        view, snapshot = _trained_policy_context(catalog)
+
+        context = _build_context_string(
+            _empty_state(),
+            view,
+            plugin_snapshot=snapshot,
+            schemas_loaded=frozenset(),
+        )
+        parsed = json.loads(context.split("\n", 1)[1])
+
+        assert parsed["authoring_aids"] == build_planner_authoring_aids(view)
 
     def test_context_emits_only_safe_policy_inventory(self) -> None:
         class _CapabilityCatalog(StubCatalog):
