@@ -2547,11 +2547,13 @@ async def post_guided_respond(
 
     from elspeth.core.canonical import stable_hash as _message_content_hash
     from elspeth.web.composer.guided.planning import (
+        GuidedRevisionAuthority,
         build_guided_proposal_projection,
         guided_candidate_state,
         guided_private_reviewed_facts,
         require_guided_correction_target_changed,
         require_guided_proposal_correction_target_changed,
+        require_guided_prose_revision_successor,
         resolve_guided_correction_target,
         resolve_guided_proposal_correction_target,
         verified_remaining_deferred_intents,
@@ -2870,6 +2872,30 @@ async def post_guided_respond(
         )
         return _response_from_record(rewound.result_state)
 
+    def _prose_revision_values(*, public_error: bool) -> tuple[str, Literal["amend", "replace"]] | None:
+        """Parse the one closed prose-revision action at both custody seams."""
+
+        edited = body.edited_values
+        if edited is None:
+            return None
+
+        def reject(detail: str) -> None:
+            if public_error:
+                raise HTTPException(status_code=400, detail=detail)
+            raise AuditIntegrityError("guided proposal prose revision authority changed after reservation")
+
+        if set(edited) not in ({"revision_instruction"}, {"revision_instruction", "revision_mode"}):
+            reject("Guided proposal revision values have an invalid closed shape.")
+        instruction = edited.get("revision_instruction")
+        if type(instruction) is not str or not instruction.strip() or len(instruction) > 8192:
+            reject("Guided proposal revision instruction must be a non-empty string of at most 8192 characters.")
+        assert type(instruction) is str
+        mode = edited.get("revision_mode", "amend")
+        if type(mode) is not str or mode not in {"amend", "replace"}:
+            reject("Guided proposal revision mode must be amend or replace.")
+        assert type(mode) is str
+        return instruction, cast(Literal["amend", "replace"], mode)
+
     async def _preflight_attempt(attempt_stable_id: UUID) -> tuple[SourceInspectionFacts | None, SourceInspectionFacts | None, bool]:
         observed = await service.get_current_state(session_id)
         observed_state = _state_from_record(observed) if observed is not None else _initial_composition_state_with_guided_session()
@@ -2926,17 +2952,19 @@ async def post_guided_respond(
                 and body.custom_inputs is None
                 and body.control_signal is None
             )
-            # Prose revision: the docked composer sends a free-text instruction to
-            # regenerate the whole pipeline. Its only response field is a closed
-            # ``{"revision_instruction": <str>}`` bag (no edit_target — this is a
-            # full re-plan, not a component-scoped rewind).
+            # Prose revision: the docked composer sends a free-text instruction and
+            # an optional explicit amend/replace mode. These are carried in one of
+            # two closed bags and never combined with a component edit target.
+            prose_revision_values = (
+                _prose_revision_values(public_error=True) if body.edited_values is not None and body.edit_target is None else None
+            )
             is_prose_revise = (
-                body.edited_values is not None
-                and set(body.edited_values) == {"revision_instruction"}
+                prose_revision_values is not None
                 and body.chosen is None
                 and body.custom_inputs is None
                 and body.control_signal is None
                 and body.edit_target is None
+                and body.correction_feedback is None
             )
             if sum((is_review_wiring, is_reject, is_revise, is_prose_revise)) != 1:
                 raise HTTPException(status_code=400, detail="Guided proposal action has an invalid closed shape.")
@@ -2951,14 +2979,6 @@ async def post_guided_respond(
                     raise HTTPException(
                         status_code=400,
                         detail="Guided source and output proposal revisions use the reviewed settings form without correction feedback.",
-                    )
-            if is_prose_revise:
-                instruction = (body.edited_values or {}).get("revision_instruction")
-                # Bound is the 8192-char contract mirrored in the settlement branch.
-                if type(instruction) is not str or not instruction.strip() or len(instruction) > 8192:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Guided proposal revision instruction must be a non-empty string of at most 8192 characters.",
                     )
             requires_planner = is_prose_revise or (is_revise and body.edit_target is not None and body.edit_target.kind in {"node", "edge"})
             return None, None, requires_planner
@@ -3530,27 +3550,17 @@ async def post_guided_respond(
                             )
                             return _response_from_record(rejected.result_state)
 
-                        # A prose revision (a docked-composer instruction) carries a
-                        # closed ``{"revision_instruction": <str>}`` bag and no
-                        # edit_target. It drives the SAME full re-plan as a node/edge
-                        # component revision below, differing only in the planner
-                        # intent and originating content. The shape/bound is already
-                        # gated in the preflight; re-derive it defensively before any
-                        # durable write, mirroring the module's post-reservation
+                        # A prose revision carries a closed instruction plus optional
+                        # amend/replace mode and no edit_target. The shape/bound is
+                        # already gated in preflight; re-derive it defensively before
+                        # any durable write, mirroring the module's post-reservation
                         # custody re-checks.
-                        revision_instruction: str | None = None
-                        if body.edited_values is not None:
-                            instruction_value = body.edited_values.get("revision_instruction")
-                            if (
-                                set(body.edited_values) != {"revision_instruction"}
-                                or type(instruction_value) is not str
-                                or not instruction_value.strip()
-                                or len(instruction_value) > 8192
-                            ):
-                                raise AuditIntegrityError("guided proposal prose revision instruction changed after reservation")
-                            revision_instruction = instruction_value
+                        revision_values = _prose_revision_values(public_error=False)
+                        revision_instruction = revision_values[0] if revision_values is not None else None
+                        revision_mode = revision_values[1] if revision_values is not None else None
 
                         if body.edit_target is not None or revision_instruction is not None:
+                            response_payload: dict[str, Any]
                             if body.edit_target is not None:
                                 if body.edit_target.kind in {"node", "edge"} and body.correction_feedback is None:
                                     raise AuditIntegrityError("guided node/edge proposal revision lost its correction feedback")
@@ -3590,6 +3600,7 @@ async def post_guided_respond(
                                     "proposal_id": str(authority.row.id),
                                     "draft_hash": authority.proposal.draft_hash,
                                     "revision_instruction": revision_instruction,
+                                    "revision_mode": revision_mode,
                                 }
                             prepared_response = prepare_guided_json_payload(
                                 payload_store,
@@ -3617,23 +3628,25 @@ async def post_guided_respond(
                                     correction_feedback=body.correction_feedback,
                                 )
 
-                            correction_message: GuidedOriginatingUserMessageDraft | None = None
                             if body.edit_target is not None:
                                 if body.correction_feedback is None:
                                     raise AuditIntegrityError("guided node/edge proposal revision lost its correction feedback")
-                                correction_message = GuidedOriginatingUserMessageDraft(
-                                    message_id=uuid4(),
-                                    content=body.correction_feedback,
-                                )
-                            correction_messages = guided.correction_messages
-                            if correction_message is not None:
-                                correction_messages = (
-                                    *correction_messages,
-                                    GuidedCorrectionMessageRef(
-                                        message_id=correction_message.message_id,
-                                        content_hash=_message_content_hash(correction_message.content),
-                                    ),
-                                )
+                                correction_content = body.correction_feedback
+                            else:
+                                if revision_instruction is None:
+                                    raise AuditIntegrityError("guided prose revision lost its originating instruction")
+                                correction_content = revision_instruction
+                            correction_message = GuidedOriginatingUserMessageDraft(
+                                message_id=uuid4(),
+                                content=correction_content,
+                            )
+                            correction_messages = (
+                                *guided.correction_messages,
+                                GuidedCorrectionMessageRef(
+                                    message_id=correction_message.message_id,
+                                    content_hash=_message_content_hash(correction_message.content),
+                                ),
+                            )
                             planning_guided = _replace(
                                 guided,
                                 history=(*guided.history[:-1], answered),
@@ -3643,6 +3656,7 @@ async def post_guided_respond(
                             )
                             planner_current_state = state
                             correction_target = None
+                            revision_authority = None
                             if body.edit_target is not None:
                                 predecessor_candidate = guided_candidate_state(authority.proposal)
                                 correction_target = resolve_guided_proposal_correction_target(
@@ -3654,14 +3668,38 @@ async def post_guided_respond(
                                     predecessor=predecessor_candidate,
                                 )
                                 planner_current_state = predecessor_candidate
+                            else:
+                                predecessor_candidate = guided_candidate_state(authority.proposal)
+                                planner_current_state = predecessor_candidate
+                                revision_authority = GuidedRevisionAuthority(
+                                    mode=revision_mode or "amend",
+                                    predecessor=predecessor_candidate,
+                                )
 
                             expected_originating_message_id = (
                                 UUID(planning_guided.root_intent_message_id) if planning_guided.root_intent_message_id is not None else None
                             )
-                            if authority.row.user_message_id != expected_originating_message_id:
+                            predecessor_correction = next(
+                                (
+                                    reference
+                                    for reference in guided.correction_messages
+                                    if reference.message_id == authority.row.user_message_id
+                                ),
+                                None,
+                            )
+                            if authority.row.user_message_id != expected_originating_message_id and predecessor_correction is None:
                                 raise AuditIntegrityError("guided proposal revision user-message lineage drifted")
+                            if (
+                                authority.row.user_message_id == expected_originating_message_id
+                                and expected_originating_message_id is not None
+                            ):
+                                await service.get_verified_guided_root_intent(
+                                    session_id=session_id,
+                                    root_message_id=expected_originating_message_id,
+                                )
                             message_ids = {
                                 *(intent.originating_message_id for intent in planning_guided.deferred_intents),
+                                *((str(predecessor_correction.message_id),) if predecessor_correction is not None else ()),
                             }
                             messages_by_id: dict[str, Any] = {}
                             if message_ids:
@@ -3678,56 +3716,23 @@ async def post_guided_respond(
                                         != deferred.message_content_hash
                                     ):
                                         raise AuditIntegrityError("guided deferred intent message content hash mismatch")
+                                if (
+                                    predecessor_correction is not None
+                                    and _message_content_hash(messages_by_id[str(predecessor_correction.message_id)].content)
+                                    != predecessor_correction.content_hash
+                                ):
+                                    raise AuditIntegrityError("guided predecessor correction message content hash mismatch")
 
-                            root_message = (
-                                await service.get_verified_guided_root_intent(
-                                    session_id=session_id,
-                                    root_message_id=UUID(planning_guided.root_intent_message_id),
-                                )
-                                if planning_guided.root_intent_message_id is not None
-                                else None
-                            )
                             deferred_planner_intent = "\n\n".join(
                                 messages_by_id[deferred.originating_message_id].content for deferred in planning_guided.deferred_intents
                             )
-                            if body.edit_target is not None:
-                                if correction_message is None:
-                                    raise AuditIntegrityError("guided proposal correction lost its originating message")
-                                current_planner_intent = correction_message.content
-                            else:
-                                # Prose revision (``revision_instruction`` is non-None
-                                # here by the enclosing branch condition): the
-                                # instruction is the planner intent verbatim. With a
-                                # root intent, the planner sees the root content first,
-                                # then the instruction on a new paragraph; with no root
-                                # (e.g. the tutorial) the instruction stands alone.
-                                if revision_instruction is None:  # pragma: no cover - the branch condition guarantees this
-                                    raise AuditIntegrityError("guided proposal revision lost its instruction after reservation")
-                                current_planner_intent = revision_instruction
+                            current_planner_intent = correction_message.content
                             planner_intent = "\n\n".join(part for part in (deferred_planner_intent, current_planner_intent) if part)
-                            originating_content = "\n\n".join(
-                                part
-                                for part in (
-                                    root_message.content if root_message is not None else None,
-                                    deferred_planner_intent,
-                                    current_planner_intent,
-                                )
-                                if part
-                            )
-                            originating_message = (
-                                PlannerOriginatingMessage(
-                                    session_id=str(session_id),
-                                    message_id=str(correction_message.message_id),
-                                    content=correction_message.content,
-                                    user_id=user.user_id,
-                                )
-                                if correction_message is not None
-                                else PlannerOriginatingMessage(
-                                    session_id=str(session_id),
-                                    message_id=str(root_message.id) if root_message is not None else None,
-                                    content=originating_content,
-                                    user_id=user.user_id,
-                                )
+                            originating_message = PlannerOriginatingMessage(
+                                session_id=str(session_id),
+                                message_id=str(correction_message.message_id),
+                                content=correction_message.content,
+                                user_id=user.user_id,
                             )
                             checkpoint_id = uuid4()
                             successor_proposal_id = uuid4()
@@ -3760,6 +3765,7 @@ async def post_guided_respond(
                                 operation_fence=fence,
                                 progress=planner_progress,
                                 correction_target=correction_target,
+                                revision_authority=revision_authority,
                             )
                             if isinstance(outcome, GuidedPlannerDecline):
                                 return await _settle_guided_planner_decline(
@@ -3796,6 +3802,12 @@ async def post_guided_respond(
                                     projection,
                                     correction_target,
                                     successor_candidate,
+                                )
+                            elif revision_authority is not None:
+                                require_guided_prose_revision_successor(
+                                    guided_candidate_state(plan.proposal),
+                                    planning_guided,
+                                    authority=revision_authority,
                                 )
                             proposal_turn = Turn(
                                 type=TurnType.PROPOSE_PIPELINE.value,
@@ -3858,7 +3870,7 @@ async def post_guided_respond(
                                             role=ChatRole.ASSISTANT,
                                             content=(
                                                 GUIDED_PROPOSAL_CORRECTION_ACKNOWLEDGEMENT
-                                                if correction_message is not None
+                                                if correction_target is not None
                                                 else GUIDED_PROSE_REVISION_ACKNOWLEDGEMENT
                                             ),
                                             seq=successor_guided.chat_turn_seq + 1,
@@ -3933,20 +3945,8 @@ async def post_guided_respond(
                                         catalog_plugin_ids=catalog_ids,
                                         proposal_projection=projection,
                                         actor="composer_route",
-                                        user_message_id=(
-                                            correction_message.message_id
-                                            if correction_message is not None
-                                            else root_message.id
-                                            if root_message is not None
-                                            else None
-                                        ),
-                                        user_message_content_hash=(
-                                            _message_content_hash(correction_message.content)
-                                            if correction_message is not None
-                                            else _message_content_hash(root_message.content)
-                                            if root_message is not None
-                                            else None
-                                        ),
+                                        user_message_id=correction_message.message_id,
+                                        user_message_content_hash=_message_content_hash(correction_message.content),
                                         originating_message=correction_message,
                                         supersedes_proposal_id=authority.row.id,
                                         response=stage_response,

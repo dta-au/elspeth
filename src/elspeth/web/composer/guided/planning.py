@@ -137,6 +137,65 @@ class GuidedCorrectionTarget:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class GuidedRevisionAuthority:
+    """Closed authority for an unscoped prose revision of a live proposal.
+
+    ``amend`` is deliberately the conservative default at the HTTP boundary:
+    the active proposal is the predecessor and its existing node semantics stay
+    server-owned.  ``replace`` is an explicit destructive choice and permits a
+    fresh topology while the reviewed source/output authority remains bound by
+    :func:`bind_guided_reviewed_components`.
+    """
+
+    mode: Literal["amend", "replace"]
+    predecessor: CompositionState
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"amend", "replace"}:
+            raise ValueError("guided revision mode must be amend or replace")
+        if type(self.predecessor) is not CompositionState:
+            raise TypeError("guided revision predecessor must be an exact CompositionState")
+
+    def planner_context(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "existing_node_policy": (
+                "preserve_existing_nodes_allow_insertion_rewiring" if self.mode == "amend" else "explicit_replacement_allowed"
+            ),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class GuidedRevisionBindingResult:
+    """Server-bound candidate plus one closed repair disposition."""
+
+    pipeline: GuidedBoundPipeline
+    rejection_code: Literal["guided_amend_contract_violation"] | None
+
+
+def guided_revision_execution_hash(state: CompositionState) -> str:
+    """Hash revision-responsive pipeline semantics only.
+
+    ``edges`` are a UI projection; runtime routing is owned by source/node
+    connection fields.  Metadata is descriptive and cannot satisfy an
+    operator request to revise the processing topology.  Keep the general
+    composition content hash unchanged and use this narrower equality only
+    for prose-revision convergence.
+    """
+
+    if type(state) is not CompositionState:
+        raise TypeError("state must be an exact CompositionState")
+    payload = state.to_dict()
+    return stable_hash(
+        {
+            "sources": payload["sources"],
+            "nodes": payload["nodes"],
+            "outputs": payload["outputs"],
+        }
+    )
+
+
 def _wire_target_fingerprint(
     payload: Mapping[str, Any],
     *,
@@ -945,6 +1004,210 @@ def bind_guided_reviewed_components(
     return cast(GuidedBoundPipeline, bound)
 
 
+def bind_guided_prose_revision_candidate(
+    pipeline: Mapping[str, Any],
+    guided: GuidedSession,
+    *,
+    authority: GuidedRevisionAuthority,
+) -> GuidedRevisionBindingResult:
+    """Bind an unscoped prose revision without granting hidden-state custody.
+
+    The provider sees node identity and topology but not private option values
+    or the full control semantics of gates/barriers.  In conservative ``amend``
+    mode every predecessor node is therefore reconstructed from private
+    authority.  Only ``input``/``on_success`` rewiring that actually names a
+    newly inserted node's connection is admitted.  Any attempted removal,
+    duplication, type/plugin substitution, or protected-field change is
+    restored server-side and returned as one closed repair disposition.
+
+    ``replace`` is intentionally simpler: its explicit destructive authority
+    permits node replacement/removal, while the ordinary guided binder still
+    restores the reviewed source and output contracts.
+    """
+
+    if type(authority) is not GuidedRevisionAuthority:
+        raise TypeError("authority must be an exact GuidedRevisionAuthority")
+    bound = bind_guided_reviewed_components(pipeline, guided)
+    if authority.mode == "replace":
+        return GuidedRevisionBindingResult(pipeline=bound, rejection_code=None)
+
+    predecessor = authority.predecessor
+    predecessor_dict = predecessor.to_dict()
+    predecessor_nodes = cast(list[dict[str, Any]], predecessor_dict["nodes"])
+    predecessor_by_id = {node["id"]: node for node in predecessor_nodes}
+    raw_nodes = bound.get("nodes")
+    if type(raw_nodes) is not list:
+        raise AuditIntegrityError("guided planner candidate nodes are malformed")
+
+    candidate_nodes = [node for node in raw_nodes if type(node) is dict]
+    malformed_node = len(candidate_nodes) != len(raw_nodes)
+    added_nodes = [node for node in candidate_nodes if node.get("id") not in predecessor_by_id]
+
+    def connection_values(node: Mapping[str, Any]) -> set[str]:
+        values: set[str] = set()
+        node_id = node.get("id")
+        if type(node_id) is str:
+            values.add(node_id)
+        for key in ("input", "on_success"):
+            value = node.get(key)
+            if type(value) is str:
+                values.add(value)
+        for key in ("routes", "branches"):
+            value = node.get(key)
+            if isinstance(value, Mapping):
+                values.update(item for item in value.values() if type(item) is str)
+            elif type(value) is list:
+                values.update(item for item in value if type(item) is str)
+        fork_to = node.get("fork_to")
+        if type(fork_to) is list:
+            values.update(item for item in fork_to if type(item) is str)
+        return values
+
+    predecessor_connections = {
+        *predecessor.sources,
+        *(source.on_success for source in predecessor.sources.values()),
+        *(output.name for output in predecessor.outputs),
+    }
+    for node in predecessor_nodes:
+        predecessor_connections.update(connection_values(node))
+    # Existing members may be rewired only through a genuinely new insertion
+    # port.  Values merely mentioned by a new node (an old source/output/node,
+    # a route destination, or a fork branch) do not widen authority.  ELSPETH
+    # topology connects producers/consumers by input/on_success channel names,
+    # which need not equal a node id, so admit the new node's direct ports as
+    # well as its id, but only when that value is absent from the predecessor.
+    insertion_connections = {
+        value
+        for node in added_nodes
+        for key in ("id", "input", "on_success")
+        if type(value := node.get(key)) is str and value not in predecessor_connections
+    }
+
+    violated = malformed_node
+    predecessor_order = [node["id"] for node in predecessor_nodes]
+    candidate_existing_order = [
+        node_id for node in candidate_nodes if type(node_id := node.get("id")) is str and node_id in predecessor_by_id
+    ]
+    if candidate_existing_order != predecessor_order:
+        violated = True
+    rebuilt_by_id: dict[str, dict[str, Any]] = {}
+    for private_node in predecessor_nodes:
+        node_id = private_node["id"]
+        matches = [node for node in candidate_nodes if node.get("id") == node_id]
+        if len(matches) != 1:
+            violated = True
+            rebuilt_by_id[node_id] = cast(dict[str, Any], deep_thaw(private_node))
+            continue
+        candidate_node = matches[0]
+        if candidate_node.get("node_type") != private_node.get("node_type"):
+            violated = True
+        if "plugin" in candidate_node and candidate_node.get("plugin") != private_node.get("plugin"):
+            violated = True
+        if set(candidate_node) - set(private_node):
+            violated = True
+        protected_keys = set(private_node) - {"id", "node_type", "plugin", "input", "on_success"}
+        if any(key in candidate_node and candidate_node[key] != private_node[key] for key in protected_keys):
+            violated = True
+
+        rebuilt = cast(dict[str, Any], deep_thaw(private_node))
+        for rewiring_key in ("input", "on_success"):
+            if rewiring_key not in candidate_node:
+                continue
+            candidate_value = candidate_node[rewiring_key]
+            if candidate_value == private_node.get(rewiring_key):
+                continue
+            if type(candidate_value) is str and candidate_value in insertion_connections:
+                rebuilt[rewiring_key] = candidate_value
+            else:
+                violated = True
+        rebuilt_by_id[node_id] = rebuilt
+
+    # Preserve the provider's insertion order while replacing every old node
+    # occurrence with exactly one server-owned reconstruction. Missing old
+    # nodes are appended in predecessor order only on the rejected candidate;
+    # this keeps validation safe without making the repair disposition depend
+    # on a malformed partial topology.
+    rebuilt_nodes: list[dict[str, Any]] = []
+    emitted_existing: set[str] = set()
+    for node in candidate_nodes:
+        node_id = node.get("id")
+        if type(node_id) is str and node_id in rebuilt_by_id:
+            if node_id not in emitted_existing:
+                rebuilt_nodes.append(rebuilt_by_id[node_id])
+                emitted_existing.add(node_id)
+            continue
+        rebuilt_nodes.append(node)
+    for private_node in predecessor_nodes:
+        if private_node["id"] not in emitted_existing:
+            rebuilt_nodes.append(rebuilt_by_id[private_node["id"]])
+    if violated:
+        # A rejected reconstruction never stages, but keeping its server-side
+        # validation input deterministic avoids secondary topology errors
+        # obscuring the one closed amend-contract disposition.
+        rebuilt_nodes = [cast(dict[str, Any], deep_thaw(node)) for node in predecessor_nodes] + added_nodes
+    bound["nodes"] = rebuilt_nodes
+
+    predecessor_sources = cast(dict[str, dict[str, Any]], predecessor_dict["sources"])
+    for source_name, predecessor_source in predecessor_sources.items():
+        candidate_source = bound["sources"].get(source_name)
+        if candidate_source is None:
+            violated = True
+            continue
+        candidate_success = candidate_source["on_success"]
+        predecessor_success = predecessor_source["on_success"]
+        if candidate_success != predecessor_success and candidate_success not in insertion_connections:
+            violated = True
+            candidate_source["on_success"] = predecessor_success
+
+    return GuidedRevisionBindingResult(
+        pipeline=bound,
+        rejection_code="guided_amend_contract_violation" if violated else None,
+    )
+
+
+def require_guided_prose_revision_successor(
+    successor: CompositionState,
+    guided: GuidedSession,
+    *,
+    authority: GuidedRevisionAuthority,
+) -> None:
+    """Recheck a service-returned revision against route-held authority.
+
+    The production service binds and rejects candidates inside its repair
+    loop.  The route repeats the closed contract before staging so a
+    substituted service cannot omit that boundary, return unbound reviewed
+    fields, or supersede an amend predecessor unchanged.
+    """
+
+    if type(successor) is not CompositionState:
+        raise TypeError("successor must be an exact CompositionState")
+    binding = bind_guided_prose_revision_candidate(successor.to_dict(), guided, authority=authority)
+    if binding.rejection_code is not None:
+        raise AuditIntegrityError("guided prose revision successor violates amend authority")
+    predecessor = authority.predecessor
+    if authority.mode == "amend":
+        successor_nodes = {node["id"]: node for node in successor.to_dict()["nodes"]}
+        bound_nodes = {node["id"]: node for node in binding.pipeline["nodes"] if type(node) is dict and type(node.get("id")) is str}
+        for predecessor_node in predecessor.to_dict()["nodes"]:
+            node_id = predecessor_node["id"]
+            if successor_nodes.get(node_id) != bound_nodes.get(node_id):
+                raise AuditIntegrityError("guided prose revision successor differs from bound node authority")
+    if set(successor.sources) != set(predecessor.sources):
+        raise AuditIntegrityError("guided prose revision successor changed reviewed source identity")
+    for source_name, predecessor_source in predecessor.sources.items():
+        successor_source = successor.sources[source_name]
+        if (
+            successor_source.plugin != predecessor_source.plugin
+            or successor_source.options != predecessor_source.options
+            or successor_source.on_validation_failure != predecessor_source.on_validation_failure
+        ):
+            raise AuditIntegrityError("guided prose revision successor changed reviewed source authority")
+    if successor.outputs != predecessor.outputs:
+        raise AuditIntegrityError("guided prose revision successor changed reviewed output authority")
+    if guided_revision_execution_hash(successor) == guided_revision_execution_hash(predecessor):
+        raise AuditIntegrityError("guided prose revision successor is unchanged")
+
+
 def _canonical_state_from_private_pipeline(raw: dict[str, JsonValue]) -> CompositionState:
     """Canonicalise a planner-authored private pipeline dict into a state.
 
@@ -1545,6 +1808,9 @@ def verified_remaining_deferred_intents(
 
 __all__ = [
     "GuidedCorrectionTarget",
+    "GuidedRevisionAuthority",
+    "GuidedRevisionBindingResult",
+    "bind_guided_prose_revision_candidate",
     "bind_guided_reviewed_components",
     "build_guided_proposal_projection",
     "guided_candidate_state",
@@ -1552,10 +1818,12 @@ __all__ = [
     "guided_redacted_current_state_context",
     "guided_redacted_planner_context",
     "guided_reviewed_sink_options",
+    "guided_revision_execution_hash",
     "guided_unproducible_output_field_names",
     "guided_unproducible_output_fields",
     "require_guided_correction_target_changed",
     "require_guided_proposal_correction_target_changed",
+    "require_guided_prose_revision_successor",
     "resolve_guided_correction_target",
     "resolve_guided_proposal_correction_target",
     "verified_remaining_deferred_intents",

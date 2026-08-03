@@ -1575,6 +1575,56 @@ describe("sessionStore — guided-mode fields and actions", () => {
     );
   });
 
+  it("respondGuided: retains exact prose instruction and mode across an ambiguous retry", async () => {
+    const { respondGuided } = await import("@/api/client");
+    const respondMock = respondGuided as ReturnType<typeof vi.fn>;
+    respondMock
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValueOnce({
+        ...sampleRespondResponse,
+        guided_session: { ...sampleGuidedSession, step: "step_3_transforms" },
+        next_turn: sampleProposalTurn,
+      });
+    useSessionStore.setState({
+      activeSessionId: RETRY_SESSION_ID,
+      guidedSession: { ...sampleGuidedSession, step: "step_3_transforms" },
+      guidedNextTurn: sampleProposalTurn,
+      guidedProposalReview: {
+        status: "active",
+        proposal_id: PROPOSAL_ID,
+        draft_hash: PROPOSAL_HASH,
+      },
+    });
+    const action: GuidedRespondAction = {
+      chosen: null,
+      edited_values: {
+        revision_instruction: "Replace the topology with one audited transform.",
+        revision_mode: "replace",
+      },
+      custom_inputs: null,
+      proposal_id: PROPOSAL_ID,
+      draft_hash: PROPOSAL_HASH,
+      edit_target: null,
+      control_signal: null,
+    };
+
+    await useSessionStore.getState().respondGuided(action);
+    expect(useSessionStore.getState().guidedProposalReview).toMatchObject({
+      status: "error",
+      retryable: true,
+      retry_action: {
+        kind: "revise_instruction",
+        revision_instruction: action.edited_values.revision_instruction,
+        revision_mode: "replace",
+      },
+    });
+    await useSessionStore.getState().respondGuided(action);
+
+    expect(respondMock.mock.calls[1]?.[1].operation_id).toBe(
+      respondMock.mock.calls[0]?.[1].operation_id,
+    );
+  });
+
   it("respondGuided: refuses changed proposal correction feedback while retry custody is retained", async () => {
     const { respondGuided } = await import("@/api/client");
     const respondMock = respondGuided as ReturnType<typeof vi.fn>;
@@ -3258,12 +3308,40 @@ describe("sessionStore — guided-mode fields and actions", () => {
           chosen: null,
           edited_values: {
             revision_instruction: "Add a deduplication transform before the output.",
+            revision_mode: "amend",
           },
           custom_inputs: null,
           edit_target: null,
           control_signal: null,
           turn_token: sampleProposalTurn.turn_token,
           operation_id: expect.any(String),
+        }),
+      );
+    });
+
+    it("threads an explicit replace choice without inferring it from prose", async () => {
+      const { respondGuided } = await import("@/api/client");
+      (respondGuided as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+        sampleRespondResponse,
+      );
+      useSessionStore.setState({
+        activeSessionId: RETRY_SESSION_ID,
+        guidedSession: { ...sampleGuidedSession, step: "step_3_transforms" },
+        guidedNextTurn: sampleProposalTurn,
+        compositionState: sampleCompositionState,
+      });
+
+      await useSessionStore
+        .getState()
+        .chatGuided("Keep every current step.", undefined, "replace");
+
+      expect(respondGuided).toHaveBeenCalledWith(
+        RETRY_SESSION_ID,
+        expect.objectContaining({
+          edited_values: {
+            revision_instruction: "Keep every current step.",
+            revision_mode: "replace",
+          },
         }),
       );
     });

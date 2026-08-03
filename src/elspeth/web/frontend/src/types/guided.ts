@@ -227,6 +227,9 @@ export type GuidedComponentAction =
     }
   | { action: "finish"; component_kind: GuidedComponentKind };
 
+/** Explicit scope for a prose revision of the active proposal. */
+export type GuidedRevisionMode = "amend" | "replace";
+
 /** One exact legal response action before retry/turn identity is attached. */
 export type GuidedRespondAction =
   | (UnboundProposalFields & {
@@ -283,11 +286,13 @@ export type GuidedRespondAction =
       control_signal: null;
     })
   | (BoundProposalFields & {
-      // Prose proposal revision: a free-text instruction (from the docked
-      // step-3 composer) that regenerates the whole pipeline. No edit_target —
-      // this is a full re-plan, not a component-scoped rewind.
+      // Prose proposal revision: a free-text instruction plus explicit scope
+      // from the docked step-3 composer. It is never combined with edit_target.
       chosen: null;
-      edited_values: { revision_instruction: string };
+      edited_values: {
+        revision_instruction: string;
+        revision_mode: GuidedRevisionMode;
+      };
       custom_inputs: null;
       edit_target: null;
       control_signal: null;
@@ -321,6 +326,11 @@ export type GuidedProposalRetryAction =
       kind: "revise";
       edit_target: GuidedEditTarget;
       correction_feedback: string;
+    }
+  | {
+      kind: "revise_instruction";
+      revision_instruction: string;
+      revision_mode: GuidedRevisionMode;
     };
 
 /**

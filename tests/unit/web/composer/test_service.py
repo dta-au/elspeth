@@ -32,13 +32,14 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.advisor_checkpoint_telemetry import record_advisor_checkpoint_pass
 from elspeth.web.composer.audit import BufferingRecorder
+from elspeth.web.composer.guided.planning import GuidedRevisionAuthority
 from elspeth.web.composer.guided.profile import EMPTY_PROFILE, TUTORIAL_PROFILE
 from elspeth.web.composer.guided.prompts import load_step_planner_skill
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
 from elspeth.web.composer.guided.state_machine import GuidedSession
-from elspeth.web.composer.pipeline_planner import PlannerOriginatingMessage
-from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase
+from elspeth.web.composer.pipeline_planner import PipelineCandidatePolicyRejection, PlannerOriginatingMessage
+from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
 from elspeth.web.composer.protocol import (
     COMPOSER_HISTORY_USER_AUTHORED_KEY,
     ComposerConvergenceError,
@@ -60,6 +61,7 @@ from elspeth.web.composer.service import (
 from elspeth.web.composer.state import (
     CompositionState,
     EdgeSpec,
+    NodeSpec,
     OutputSpec,
     PipelineMetadata,
     SourceSpec,
@@ -199,6 +201,186 @@ async def test_guided_service_routes_step3_through_the_planner_only_capability_p
         lease_token=custody_fence.lease_token,
         attempt=custody_fence.attempt,
     )
+
+
+@pytest.mark.asyncio
+async def test_guided_service_keeps_amend_contract_and_noop_inside_candidate_repair(
+    composer_service_with_real_sessions: ComposerServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_id = "11111111-1111-4111-8111-111111111111"
+    output_id = "22222222-2222-4222-8222-222222222222"
+    guided = GuidedSession(
+        step=GuidedStep.STEP_3_TRANSFORMS,
+        root_intent_message_id="33333333-3333-4333-8333-333333333333",
+        source_order=(source_id,),
+        reviewed_sources={
+            source_id: SourceResolved(
+                name="input",
+                plugin="csv",
+                options={"path": "/data/input.csv"},
+                observed_columns=("id",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+        output_order=(output_id,),
+        reviewed_outputs={
+            output_id: SinkOutputResolved(
+                name="results",
+                plugin="json",
+                options={"path": "/data/results.jsonl"},
+                required_fields=("id",),
+                schema_mode="observed",
+                on_write_failure="discard",
+            )
+        },
+    )
+    predecessor = CompositionState(
+        sources={
+            "input": SourceSpec(
+                plugin="csv",
+                options={"path": "/data/input.csv"},
+                on_success="rows",
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            NodeSpec(
+                id="keep",
+                node_type="transform",
+                plugin="passthrough",
+                input="rows",
+                on_success="results",
+                on_error="discard",
+                options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        ),
+        edges=(),
+        outputs=(
+            OutputSpec(
+                name="results",
+                plugin="json",
+                options={"path": "/data/results.jsonl"},
+                on_write_failure="discard",
+            ),
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    captured: dict[str, Any] = {}
+
+    async def capture_plan_pipeline(**kwargs: Any) -> object:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("elspeth.web.composer.service.plan_pipeline", capture_plan_pipeline)
+    session_id = uuid4()
+    await composer_service_with_real_sessions.plan_guided_pipeline(
+        intent="Add a normalization transform.",
+        current_state=predecessor,
+        guided=guided,
+        originating_message=PlannerOriginatingMessage(
+            session_id=str(session_id),
+            message_id=str(uuid4()),
+            content="Add a normalization transform.",
+            user_id="test-user",
+        ),
+        base=PresentBase(state_id=uuid4(), composition_content_hash=composition_content_hash(predecessor)),
+        user_id="test-user",
+        supersedes_draft_hash="f" * 64,
+        recorder=BufferingRecorder(),
+        operation_fence=GuidedOperationFence(
+            session_id=session_id,
+            operation_id=str(uuid4()),
+            lease_token=uuid4().hex,
+            attempt=1,
+        ),
+        revision_authority=GuidedRevisionAuthority(mode="amend", predecessor=predecessor),
+    )
+
+    finalizer = captured["candidate_finalizer"]
+    acceptance = captured["candidate_acceptance"]
+    assert callable(finalizer)
+    assert callable(acceptance)
+
+    violating = predecessor.to_dict()
+    violating.pop("version")
+    violating["nodes"][0]["plugin"] = "field_mapper"
+    rebound = finalizer(violating)
+    assert rebound["nodes"][0]["plugin"] == "passthrough"
+    with pytest.raises(PipelineCandidatePolicyRejection) as contract_rejection:
+        acceptance(predecessor)
+    assert contract_rejection.value.error_code == "guided_amend_contract_violation"
+
+    unchanged = predecessor.to_dict()
+    unchanged.pop("version")
+    finalizer(unchanged)
+    with pytest.raises(PipelineCandidatePolicyRejection) as unchanged_rejection:
+        acceptance(predecessor)
+    assert unchanged_rejection.value.error_code == "guided_revision_unchanged"
+    edge_only = replace(
+        predecessor,
+        edges=(
+            EdgeSpec(
+                id="ui-edge-churn",
+                from_node="input",
+                to_node="keep",
+                edge_type="on_success",
+                label="display-only change",
+            ),
+        ),
+    )
+    metadata_only = replace(
+        predecessor,
+        metadata=PipelineMetadata(name="Aspirational rename", description="No execution change."),
+    )
+    for nonsemantic_candidate in (edge_only, metadata_only):
+        with pytest.raises(PipelineCandidatePolicyRejection) as nonsemantic_rejection:
+            acceptance(nonsemantic_candidate)
+        assert nonsemantic_rejection.value.error_code == "guided_revision_unchanged"
+
+    captured.clear()
+    await composer_service_with_real_sessions.plan_guided_pipeline(
+        intent="Replace the current transform topology.",
+        current_state=predecessor,
+        guided=guided,
+        originating_message=PlannerOriginatingMessage(
+            session_id=str(session_id),
+            message_id=str(uuid4()),
+            content="Replace the current transform topology.",
+            user_id="test-user",
+        ),
+        base=PresentBase(state_id=uuid4(), composition_content_hash=composition_content_hash(predecessor)),
+        user_id="test-user",
+        supersedes_draft_hash="f" * 64,
+        recorder=BufferingRecorder(),
+        operation_fence=GuidedOperationFence(
+            session_id=session_id,
+            operation_id=str(uuid4()),
+            lease_token=uuid4().hex,
+            attempt=1,
+        ),
+        revision_authority=GuidedRevisionAuthority(mode="replace", predecessor=predecessor),
+    )
+    replace_finalizer = captured["candidate_finalizer"]
+    replace_acceptance = captured["candidate_acceptance"]
+    assert callable(replace_finalizer)
+    assert callable(replace_acceptance)
+    replace_finalizer(unchanged)
+    with pytest.raises(PipelineCandidatePolicyRejection) as replace_unchanged_rejection:
+        replace_acceptance(predecessor)
+    assert replace_unchanged_rejection.value.error_code == "guided_revision_unchanged"
+    for nonsemantic_candidate in (edge_only, metadata_only):
+        with pytest.raises(PipelineCandidatePolicyRejection) as replace_nonsemantic_rejection:
+            replace_acceptance(nonsemantic_candidate)
+        assert replace_nonsemantic_rejection.value.error_code == "guided_revision_unchanged"
 
 
 @pytest.mark.asyncio

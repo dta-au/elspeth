@@ -413,6 +413,21 @@ class TestClosedCodeCatalogueInvariants:
         assert single_prompt is not None
         assert guidance != single_prompt
 
+    @pytest.mark.parametrize(
+        "code",
+        ("guided_amend_contract_violation", "guided_revision_unchanged"),
+    )
+    def test_guided_prose_amend_codes_are_closed_and_actionable(self, code: str) -> None:
+        assert code in _CLOSED_VALIDATION_ERROR_CODES
+        guidance = explain_validation_code(code)
+        assert guidance is not None
+        explanation, fix = guidance
+        assert explanation and fix
+        assert "correction_target" not in explanation
+        assert "correction_target" not in fix
+        assert "private" not in explanation.lower()
+        assert "private" not in fix.lower()
+
     def test_codes_are_containment_free(self) -> None:
         """No closed code may be a substring of another.
 

@@ -602,6 +602,46 @@ describe("ProposePipelineTurn", () => {
     },
   );
 
+  it("retries only the exact retained prose instruction and destructive mode", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    render(
+      <ProposePipelineTurn
+        payload={payload()}
+        reviewState={{
+          status: "error",
+          proposal_id: IDS.proposal,
+          draft_hash: "d".repeat(64),
+          message: "The response was not received. Retry the same action.",
+          retryable: true,
+          retry_action: {
+            kind: "revise_instruction",
+            revision_instruction: "Replace the topology with one audited transform.",
+            revision_mode: "replace",
+          },
+        }}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    const retry = screen.getByRole("button", { name: "Retry replace revision" });
+    expect(retry).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Review wiring" })).toBeDisabled();
+    await user.click(retry);
+    expect(onSubmit).toHaveBeenCalledWith({
+      chosen: null,
+      edited_values: {
+        revision_instruction: "Replace the topology with one audited transform.",
+        revision_mode: "replace",
+      },
+      custom_inputs: null,
+      edit_target: null,
+      control_signal: null,
+      proposal_id: IDS.proposal,
+      draft_hash: "d".repeat(64),
+    });
+  });
+
   it("locks the stale proposal controls when an authoritative reload fails", () => {
     render(
       <ProposePipelineTurn

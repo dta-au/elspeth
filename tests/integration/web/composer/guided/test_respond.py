@@ -2447,11 +2447,11 @@ class TestStep2IntraStep:
         assert _full_guided_session(staged)["deferred_intents"] == []
 
         captured: dict[str, object] = {}
-        original_planner = composer_test_client.app.state.composer_service.plan_guided_pipeline
+        replacement = _llm_prompt_template_planner("Deduplicate each row before writing it.")
 
         async def spy_planner(**kwargs: object) -> object:
             captured.update(kwargs)
-            return await original_planner(**kwargs)
+            return await replacement(**kwargs)
 
         monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
 
@@ -2502,9 +2502,349 @@ class TestStep2IntraStep:
         assert replay.json() == body
         assert captured == {}
 
+    def test_prose_revision_defaults_to_amend_from_active_proposal_with_exact_message_custody(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Legacy/missing mode is a conservative amendment of the live draft.
+
+        The persisted composition checkpoint intentionally does not contain the
+        pending proposal.  Revision authority therefore has to come from the
+        proposal row, and the author's instruction must be staged as the exact
+        originating user message rather than borrowing the root intent.
+        """
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="prose-amend-authority.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        assert staged["composition_state"]["sources"] == {}
+
+        captured: dict[str, object] = {}
+        replacement = _llm_prompt_template_planner("Normalize each row while preserving the reviewed pipeline.")
+
+        async def spy_planner(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return await replacement(**kwargs)
+
+        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+
+        instruction = "Insert a deduplication transform while preserving the reviewed gate and existing transforms."
+        revised = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {"revision_instruction": instruction},
+            },
+        )
+
+        assert revised.status_code == 200, revised.json()
+        predecessor = cast(CompositionState, captured["current_state"])
+        reviewed_source_names = {source["name"] for source in _full_guided_session(staged)["reviewed_sources"].values()}
+        assert set(predecessor.sources) == reviewed_source_names
+        revision_authority = captured["revision_authority"]
+        assert revision_authority.mode == "amend"
+        assert revision_authority.predecessor == predecessor
+        originating_message = cast("PlannerOriginatingMessage", captured["originating_message"])
+        assert originating_message.content == instruction
+        assert originating_message.message_id is not None
+
+        messages = asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+        matching = [message for message in messages if message.content == instruction]
+        assert len(matching) == 1
+        assert str(matching[0].id) == originating_message.message_id
+        assert matching[0].role == "user"
+        assert matching[0].writer_principal == "route_user_message"
+        guided = _full_guided_session(revised.json())
+        assert guided["correction_messages"][-1]["message_id"] == originating_message.message_id
+
+    def test_prose_revision_uses_explicit_replace_authority(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="prose-replace-authority.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        captured: dict[str, object] = {}
+        replacement = _llm_prompt_template_planner("Pass each row through one audited processing step.")
+
+        async def spy_planner(**kwargs: object) -> object:
+            captured.update(kwargs)
+            return await replacement(**kwargs)
+
+        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
+        response = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {
+                    "revision_instruction": "Replace the transform topology with one pass-through.",
+                    "revision_mode": "replace",
+                },
+            },
+        )
+
+        assert response.status_code == 200, response.json()
+        assert captured["revision_authority"].mode == "replace"
+
+    def test_consecutive_prose_revisions_accept_exact_retained_instruction_lineage(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        current = self._stage_proposal(composer_test_client, session_id, filename="consecutive-prose-revisions.jsonl")
+
+        for index, instruction in enumerate(
+            (
+                "Replace the proposal with one summarization step.",
+                "Replace that proposal with a differently instructed summarization step.",
+            ),
+            start=1,
+        ):
+            monkeypatch.setattr(
+                composer_test_client.app.state.composer_service,
+                "plan_guided_pipeline",
+                _llm_prompt_template_planner(f"Revision {index} prompt."),
+            )
+            turn = current["next_turn"]
+            payload = turn["payload"]
+            revised = composer_test_client.post(
+                f"/api/sessions/{session_id}/guided/respond",
+                json={
+                    "operation_id": str(uuid4()),
+                    "turn_token": turn["turn_token"],
+                    "proposal_id": payload["proposal_id"],
+                    "draft_hash": payload["draft_hash"],
+                    "edited_values": {
+                        "revision_instruction": instruction,
+                        "revision_mode": "replace",
+                    },
+                },
+            )
+
+            assert revised.status_code == 200, revised.json()
+            current = revised.json()
+
+        guided = _full_guided_session(current)
+        assert len(guided["correction_messages"]) == 2
+        messages = asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+        by_id = {str(message.id): message for message in messages}
+        for reference, instruction in zip(
+            guided["correction_messages"],
+            (
+                "Replace the proposal with one summarization step.",
+                "Replace that proposal with a differently instructed summarization step.",
+            ),
+            strict=True,
+        ):
+            message = by_id[reference["message_id"]]
+            assert message.content == instruction
+            assert message.role == "user"
+
+    @pytest.mark.parametrize("revision_mode", ("amend", "replace"))
+    def test_substituted_unchanged_prose_planner_cannot_supersede_revision_predecessor(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        revision_mode: str,
+    ) -> None:
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="unchanged-prose-amend.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        service = composer_test_client.app.state.session_service
+        state_record = asyncio.run(service.get_current_state(UUID(session_id)))
+        assert state_record is not None
+        guided = state_from_record(state_record).guided_session
+        assert guided is not None and guided.active_proposal is not None
+        authority = asyncio.run(
+            service.get_authoritative_pipeline_proposal(
+                session_id=UUID(session_id),
+                proposal_id=guided.active_proposal.proposal_id,
+                reviewed_facts=guided_private_reviewed_facts(guided),
+            )
+        )
+
+        async def unchanged_planner(**kwargs: object) -> object:
+            proposal = PipelineProposal.create(
+                pipeline=deep_thaw(authority.proposal.pipeline),
+                base=kwargs["base"],
+                reviewed_facts=guided_private_reviewed_facts(kwargs["guided"]),
+                surface=authority.proposal.surface,
+                repair_count=0,
+                skill_hash=authority.proposal.skill_hash,
+                covered_deferred_intent_ids=authority.proposal.covered_deferred_intent_ids,
+                supersedes_draft_hash=authority.proposal.draft_hash,
+            )
+            return (
+                PipelinePlanResult(
+                    proposal=proposal,
+                    tool_call_id="unchanged-prose-amend",
+                    custody_result="not_required",
+                    model_identifier="unchanged-model",
+                    model_version="unchanged-v1",
+                    provider="test",
+                ),
+                {
+                    "source": frozenset({"csv"}),
+                    "transform": frozenset(),
+                    "sink": frozenset({"json"}),
+                },
+            )
+
+        monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", unchanged_planner)
+        rejected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {
+                    "revision_instruction": "Add one transform without replacing anything.",
+                    "revision_mode": revision_mode,
+                },
+            },
+        )
+
+        assert rejected.status_code == 500, rejected.json()
+        assert rejected.json()["detail"]["failure_code"] == "integrity_error"
+        current = _get_guided(composer_test_client, session_id)
+        assert current["next_turn"]["payload"] == payload
+
+    def test_substituted_prose_planner_cannot_change_amend_predecessor_private_fields(
+        self,
+        composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from elspeth.contracts.freeze import deep_thaw
+        from elspeth.web.composer.pipeline_planner import PipelinePlanResult
+        from elspeth.web.composer.pipeline_proposal import PipelineProposal
+
+        session_id = _create_session(composer_test_client)
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner("Keep this exact reviewed prompt."),
+        )
+        staged = self._stage_proposal(composer_test_client, session_id, filename="private-prose-amend.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+        service = composer_test_client.app.state.session_service
+        state_record = asyncio.run(service.get_current_state(UUID(session_id)))
+        assert state_record is not None
+        guided = state_from_record(state_record).guided_session
+        assert guided is not None and guided.active_proposal is not None
+        authority = asyncio.run(
+            service.get_authoritative_pipeline_proposal(
+                session_id=UUID(session_id),
+                proposal_id=guided.active_proposal.proposal_id,
+                reviewed_facts=guided_private_reviewed_facts(guided),
+            )
+        )
+
+        async def private_field_changing_planner(**kwargs: object) -> object:
+            pipeline = deep_thaw(authority.proposal.pipeline)
+            pipeline["nodes"][0]["options"]["prompt_template"] = "Silently replaced private prompt."
+            proposal = PipelineProposal.create(
+                pipeline=pipeline,
+                base=kwargs["base"],
+                reviewed_facts=guided_private_reviewed_facts(kwargs["guided"]),
+                surface=authority.proposal.surface,
+                repair_count=0,
+                skill_hash=authority.proposal.skill_hash,
+                covered_deferred_intent_ids=authority.proposal.covered_deferred_intent_ids,
+                supersedes_draft_hash=authority.proposal.draft_hash,
+            )
+            return (
+                PipelinePlanResult(
+                    proposal=proposal,
+                    tool_call_id="private-field-changing-prose-amend",
+                    custody_result="not_required",
+                    model_identifier="unsafe-model",
+                    model_version="unsafe-v1",
+                    provider="test",
+                ),
+                {
+                    "source": frozenset({"csv"}),
+                    "transform": frozenset({"llm"}),
+                    "sink": frozenset({"json"}),
+                },
+            )
+
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            private_field_changing_planner,
+        )
+        rejected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": {
+                    "revision_instruction": "Insert another step without changing the reviewed prompt.",
+                    "revision_mode": "amend",
+                },
+            },
+        )
+
+        assert rejected.status_code == 500, rejected.json()
+        assert rejected.json()["detail"]["failure_code"] == "integrity_error"
+        assert _get_guided(composer_test_client, session_id)["next_turn"]["payload"] == payload
+
+    @pytest.mark.parametrize(
+        "edited_values",
+        (
+            {"revision_instruction": "Change it.", "revision_mode": "destroy"},
+            {"revision_instruction": "Change it.", "revision_mode": 1},
+            {"revision_instruction": "Change it.", "revision_mode": "amend", "unexpected": True},
+        ),
+    )
+    def test_prose_revision_rejects_invalid_mode_or_open_shape_without_mutation(
+        self,
+        composer_test_client: TestClient,
+        edited_values: dict[str, object],
+    ) -> None:
+        session_id = _create_session(composer_test_client)
+        staged = self._stage_proposal(composer_test_client, session_id, filename="prose-invalid-mode.jsonl")
+        turn = staged["next_turn"]
+        payload = turn["payload"]
+
+        rejected = composer_test_client.post(
+            f"/api/sessions/{session_id}/guided/respond",
+            json={
+                "operation_id": str(uuid4()),
+                "turn_token": turn["turn_token"],
+                "proposal_id": payload["proposal_id"],
+                "draft_hash": payload["draft_hash"],
+                "edited_values": edited_values,
+            },
+        )
+
+        assert rejected.status_code == 400, rejected.json()
+        current = _get_guided(composer_test_client, session_id)
+        assert current["next_turn"]["payload"] == payload
+
     def test_prose_revision_records_the_instruction_in_the_transcript(
         self,
         composer_test_client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """R2-F6: a transform-stage instruction is transcript evidence.
 
@@ -2520,6 +2860,11 @@ class TestStep2IntraStep:
         turn = staged["next_turn"]
         payload = turn["payload"]
         before = _full_guided_session(staged)
+        monkeypatch.setattr(
+            composer_test_client.app.state.composer_service,
+            "plan_guided_pipeline",
+            _llm_prompt_template_planner("Deduplicate each row before writing it."),
+        )
         instruction = "Add a deduplication transform before the output."
         request_payload = {
             "operation_id": str(uuid4()),
@@ -2618,6 +2963,9 @@ class TestStep2IntraStep:
         assert guided["chat_turn_seq"] == before["chat_turn_seq"] + 2
         # The decline stages nothing: the pending proposal survives untouched.
         assert guided["active_proposal"]["proposal_id"] == payload["proposal_id"]
+        assert guided["correction_messages"] == before["correction_messages"]
+        messages = asyncio.run(composer_test_client.app.state.session_service.get_messages(UUID(session_id), limit=None))
+        assert all(message.content != instruction for message in messages)
 
     def test_wire_correction_records_the_feedback_in_the_transcript(
         self,
@@ -3000,16 +3348,12 @@ class TestStep2IntraStep:
         failed = [item for item in row if item["status"] == "failed"]
         assert failed and all(item["failure_code"] == "policy_blocked" for item in failed)
 
-    def test_prose_revision_appends_instruction_to_root_intent(
+    def test_prose_revision_keeps_exact_instruction_as_origin_when_root_exists(
         self,
         composer_test_client: TestClient,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """With a live root intent, the instruction is appended after it.
-
-        The planner originating content is the root intent first, then the
-        instruction on a new paragraph (root-present branch).
-        """
+        """A revision owns one exact message even when the session has a root."""
         session_id = _create_session(composer_test_client)
         intent = "Author a pipeline that ingests the CSV and writes JSON results."
         started = composer_test_client.post(
@@ -3022,11 +3366,11 @@ class TestStep2IntraStep:
         payload = turn["payload"]
 
         captured: dict[str, object] = {}
-        original_planner = composer_test_client.app.state.composer_service.plan_guided_pipeline
+        replacement = _llm_prompt_template_planner("Deduplicate each row before writing it.")
 
         async def spy_planner(**kwargs: object) -> object:
             captured.update(kwargs)
-            return await original_planner(**kwargs)
+            return await replacement(**kwargs)
 
         monkeypatch.setattr(composer_test_client.app.state.composer_service, "plan_guided_pipeline", spy_planner)
 
@@ -3045,7 +3389,7 @@ class TestStep2IntraStep:
         assert revised.status_code == 200, revised.json()
         assert revised.json()["next_turn"]["type"] == "propose_pipeline"
         assert captured["intent"] == instruction
-        assert captured["originating_message"].content == f"{intent}\n\n{instruction}"
+        assert captured["originating_message"].content == instruction
 
     @pytest.mark.parametrize("instruction", ["", "   ", "x" * 8193, 123])
     def test_prose_revision_rejects_invalid_instruction_without_mutation(

@@ -1407,6 +1407,76 @@ describe("ChatPanel mode discriminator", () => {
     },
   );
 
+  it("makes replace explicit for proposal prose and resets the selector to amend after send", async () => {
+    const chatGuidedSpy = vi.fn().mockResolvedValue(undefined);
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: { ...activeGuidedSession(), step: "step_3_transforms" },
+      guidedNextTurn: proposalTurn(),
+      guidedProposalReview: proposalReview("active"),
+      chatGuided: chatGuidedSpy,
+    });
+
+    render(<ChatPanel />);
+
+    const scope = screen.getByRole("combobox", { name: "Revision scope" });
+    expect(scope).toHaveValue("amend");
+    fireEvent.change(scope, { target: { value: "replace" } });
+    await act(async () => {
+      screen.getByTestId("chat-input").click();
+    });
+
+    await waitFor(() => {
+      expect(chatGuidedSpy).toHaveBeenCalledWith(
+        "test-chat-message",
+        expect.any(AbortSignal),
+        "replace",
+      );
+    });
+    expect(scope).toHaveValue("amend");
+  });
+
+  it("does not carry a selected replace scope into another proposal or session", async () => {
+    useSessionStore.setState({
+      activeSessionId: "session-guided",
+      sessions: [guidedSessionFixture],
+      messages: [],
+      guidedSession: { ...activeGuidedSession(), step: "step_3_transforms" },
+      guidedNextTurn: proposalTurn(),
+      guidedProposalReview: proposalReview("active"),
+    });
+    render(<ChatPanel />);
+    const scope = screen.getByRole("combobox", { name: "Revision scope" });
+    fireEvent.change(scope, { target: { value: "replace" } });
+    expect(scope).toHaveValue("replace");
+
+    const replacement = proposalTurn();
+    if (replacement.type !== "propose_pipeline") throw new Error("expected proposal fixture");
+    const nextProposalId = "00000000-0000-4000-8000-000000000799";
+    act(() => {
+      useSessionStore.setState({
+        activeSessionId: "session-other",
+        guidedNextTurn: {
+          ...replacement,
+          payload: {
+            ...replacement.payload,
+            proposal_id: nextProposalId,
+            draft_hash: "a".repeat(64),
+          },
+        },
+        guidedProposalReview: {
+          status: "active",
+          proposal_id: nextProposalId,
+          draft_hash: "a".repeat(64),
+        },
+      });
+    });
+
+    await waitFor(() => expect(scope).toHaveValue("amend"));
+  });
+
   it("keeps the live Review wiring primary on the tutorial revision proposal review", () => {
     // The tutorial proposal is a REAL planner proposal (no canned exhibit
     // exists post-7.1); the learner advances by accepting it, so the primary

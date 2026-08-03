@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
     from elspeth.web.catalog.policy_view import PolicyCatalogView
     from elspeth.web.composer.audit import BufferingRecorder
+    from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, GuidedRevisionAuthority
     from elspeth.web.composer.guided.state_machine import GuidedSession, TerminalState
     from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, PipelinePlanResult, PlannerOriginatingMessage
     from elspeth.web.composer.pipeline_proposal import PresentBase
@@ -1231,6 +1232,8 @@ class ComposerService(Protocol):
         recorder: BufferingRecorder,
         operation_fence: GuidedOperationFence,
         progress: ComposerProgressSink | None = None,
+        correction_target: GuidedCorrectionTarget | None = None,
+        revision_authority: GuidedRevisionAuthority | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Run the shared planner once with split private/provider-safe facts."""
         ...

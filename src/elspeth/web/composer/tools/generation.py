@@ -766,6 +766,16 @@ _VALIDATION_ERROR_PATTERNS: Final[tuple[tuple[str, str, str], ...]] = (
         "Apply the operator's correction to the selected target identified by the correction_target object in the reviewed context, preserve unrelated components, and re-emit the complete pipeline.",
     ),
     (
+        r"guided_amend_contract_violation",
+        "The candidate was submitted as a conservative amendment but removed, duplicated, retyped, replugged, or changed protected behavior on an existing node. The accepted proposal named by revision_authority is the predecessor; omitted fields do not grant replacement authority.",
+        "Keep every existing node id, node_type, plugin, options, and control behavior unchanged. Add the requested new nodes and change only input/on_success connections needed to insert them, then re-emit the complete pipeline. If replacement or removal is genuinely intended, the operator must choose explicit replace mode instead of amend.",
+    ),
+    (
+        r"guided_revision_unchanged",
+        "The revision candidate is semantically identical to the accepted predecessor proposal, so it does not satisfy the operator's revision request. Explicit replace mode permits replacement or removal; it does not permit a no-op.",
+        "Apply the requested change under revision_authority: preserve existing nodes and use only insertion rewiring in amend mode, or perform the explicitly requested replacement in replace mode, then re-emit the complete pipeline.",
+    ),
+    (
         r"interpretation_review_draft_malformed|cleanup review draft is malformed",
         "The cleanup node's interpretation_requirements row IS present and its user_term matches the registered decision kind, but the draft text fails marker recognition — the contract recognizes the draft only when it contains both 'raw html' and 'fingerprint'. Do NOT add another row; the fix is the draft text alone.",
         "On the existing cleanup row, replace ONLY the draft string with the canonical draft, copied verbatim without rephrasing: "
@@ -1043,6 +1053,11 @@ _CLOSED_VALIDATION_ERROR_CODES: Final[tuple[str, ...]] = (
     # The candidate is otherwise valid but did not change the exact public
     # semantics the operator selected. Keep it inside bounded repair/hatch.
     "guided_correction_unchanged",
+    # ── Guided unscoped amendment convergence (elspeth-1d97fc4b80) ───────
+    # Prose revisions default to additive custody of the accepted proposal;
+    # protected-change attempts and no-op candidates stay inside repair/hatch.
+    "guided_amend_contract_violation",
+    "guided_revision_unchanged",
     # ── Unproducible declared output fields (R2-F4, 2026-08-01) ────────────
     # Planner-loop only: pairs the reviewed guided facts (what the sources
     # carry vs what the outputs declare) with the candidate's node count.

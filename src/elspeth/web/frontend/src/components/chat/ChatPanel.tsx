@@ -76,6 +76,7 @@ import {
   type ChatTurn as GuidedChatTurn,
   type GuidedSourceBlobCandidate,
   type GuidedStep,
+  type GuidedRevisionMode,
 } from "@/types/guided";
 
 function isTerminalComposerPhase(
@@ -674,6 +675,16 @@ export function ChatPanel({
     (s) => s.composerTimeoutUnavailable,
   );
   const guidedSelfHealNotice = useSessionStore((s) => s.guidedSelfHealNotice);
+  const [guidedRevisionMode, setGuidedRevisionMode] = useState<GuidedRevisionMode>("amend");
+  const isProposalRevisionComposer =
+    guidedSession?.step === "step_3_transforms" &&
+    guidedNextTurn?.type === "propose_pipeline";
+  const proposalRevisionIdentity = isProposalRevisionComposer
+    ? `${activeSessionId ?? ""}:${guidedNextTurn.payload.proposal_id}:${guidedNextTurn.payload.draft_hash}`
+    : null;
+  useEffect(() => {
+    setGuidedRevisionMode("amend");
+  }, [proposalRevisionIdentity]);
   // Whether the CURRENT chat has any work — gates the mode-switch confirmation
   // (ModeSwitchButton). Freeform work = messages or a non-empty composition;
   // guided work = any chat turns or completed steps. Switching is
@@ -738,13 +749,15 @@ export function ChatPanel({
   // guidedChatPending so the turn can be retried.
   const guidedChatControllerRef = useRef<AbortController | null>(null);
   const sendGuidedChat = useCallback(
-    (content: string) =>
+    (content: string, revisionMode?: GuidedRevisionMode) =>
       // Same shared primitive freeform's useComposer.runWithTimeout uses: one
       // timer + readiness guard for both paths. Until the backend wall clock
       // has landed at boot the guided send does not run (no request, no
       // timer) — the guided input is disabled until readiness.
       runComposeWithTimeout(guidedChatControllerRef, composeTimeoutReady, (signal) =>
-        chatGuided(content, signal),
+        revisionMode === undefined
+          ? chatGuided(content, signal)
+          : chatGuided(content, signal, revisionMode),
       ),
     [chatGuided, composeTimeoutReady],
   );
@@ -2048,8 +2061,32 @@ export function ChatPanel({
             has built this step. Review the decision, then continue.
           </p>
         ) : (
-          <ChatInput
-            onSend={(content) => void sendGuidedChat(content)}
+          <>
+            {isProposalRevisionComposer && !isTutorial ? (
+              <label className="guided-proposal-revision-scope">
+                Revision scope
+                <select
+                  value={guidedRevisionMode}
+                  disabled={guidedResponsePending || guidedChatPending}
+                  onChange={(event) => setGuidedRevisionMode(
+                    event.target.value as GuidedRevisionMode,
+                  )}
+                >
+                  <option value="amend">Amend current proposal — preserve existing steps</option>
+                  <option value="replace">Replace proposal — steps may be removed</option>
+                </select>
+              </label>
+            ) : null}
+            <ChatInput
+              onSend={(content) => {
+                if (isProposalRevisionComposer && !isTutorial) {
+                  const selectedMode = guidedRevisionMode;
+                  setGuidedRevisionMode("amend");
+                  void sendGuidedChat(content, selectedMode);
+                  return;
+                }
+                void sendGuidedChat(content);
+              }}
             onBlobUploadStarted={handleGuidedBlobUploadStarted}
             onBlobUploadCompleted={handleGuidedBlobUploadCompleted}
             onBlobUploadRejected={handleGuidedBlobUploadRejected}
@@ -2084,7 +2121,8 @@ export function ChatPanel({
             }
             onChange={isTutorial ? () => undefined : undefined}
             readOnly={isTutorial === true}
-          />
+            />
+          </>
         )}
       </section>
     );

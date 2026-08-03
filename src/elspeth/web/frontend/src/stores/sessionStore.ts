@@ -21,6 +21,7 @@ import type {
   GuidedRespondAction,
   GuidedProposalReviewState,
   GuidedProposalRetryAction,
+  GuidedRevisionMode,
   GuidedRespondRequest,
   GuidedRespondResponse,
   GuidedStartOperationReconciliation,
@@ -411,6 +412,18 @@ function proposalRetryActionForBody(
     return { kind: body.chosen[0] === "confirm_wiring" ? "confirm_wiring" : "review_wiring" };
   }
   if (body.control_signal === "reject") return { kind: "reject" };
+  const revisionInstruction = body.edited_values?.revision_instruction;
+  const revisionMode = body.edited_values?.revision_mode;
+  if (
+    typeof revisionInstruction === "string" &&
+    (revisionMode === "amend" || revisionMode === "replace")
+  ) {
+    return {
+      kind: "revise_instruction",
+      revision_instruction: revisionInstruction,
+      revision_mode: revisionMode,
+    };
+  }
   if ("correction_feedback" in body) {
     return {
       kind: "revise",
@@ -1185,7 +1198,11 @@ interface SessionState {
   enterGuided: () => Promise<void>;
   // `signal` aborts the underlying fetch (Stop button / client timeout) — the
   // guided mirror of sendMessage's AbortController plumbing (useComposer).
-  chatGuided: (message: string, signal?: AbortSignal) => Promise<void>;
+  chatGuided: (
+    message: string,
+    signal?: AbortSignal,
+    revisionMode?: GuidedRevisionMode,
+  ) => Promise<void>;
   exitToFreeform: () => Promise<GuidedRespondOutcome>;
   clearError: () => void;
   injectSystemMessage: (content: string, stableId?: string) => void;
@@ -3288,7 +3305,11 @@ export const useSessionStore = create<SessionState>((set, get) => ({
     await get().convertToGuided(activeSessionId);
   },
 
-  async chatGuided(message: string, signal?: AbortSignal) {
+  async chatGuided(
+    message: string,
+    signal?: AbortSignal,
+    revisionMode: GuidedRevisionMode = "amend",
+  ) {
     const { activeSessionId, guidedSession, guidedNextTurn, compositionState } = get();
     // Offensive guards: caller must not invoke without an active session
     // or before guidedSession is loaded.  Per CLAUDE.md "proactively detect
@@ -3462,7 +3483,10 @@ export const useSessionStore = create<SessionState>((set, get) => ({
         proposal_id: guidedNextTurn.payload.proposal_id,
         draft_hash: guidedNextTurn.payload.draft_hash,
         chosen: null,
-        edited_values: { revision_instruction: message },
+        edited_values: {
+          revision_instruction: message,
+          revision_mode: revisionMode,
+        },
         custom_inputs: null,
         edit_target: null,
         control_signal: null,

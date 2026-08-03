@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, cast
 from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
-    from elspeth.web.composer.guided.planning import GuidedCorrectionTarget
+    from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, GuidedRevisionAuthority
     from elspeth.web.composer.guided.state_machine import TerminalState
     from elspeth.web.composer.redaction_telemetry import RedactionTelemetry
     from elspeth.web.sessions.protocol import GuidedOperationFence, SessionServiceProtocol
@@ -2830,18 +2830,22 @@ class ComposerServiceImpl:
         operation_fence: GuidedOperationFence,
         progress: ComposerProgressSink | None = None,
         correction_target: GuidedCorrectionTarget | None = None,
+        revision_authority: GuidedRevisionAuthority | None = None,
     ) -> tuple[PipelinePlanResult, Mapping[str, frozenset[str]]] | GuidedPlannerDecline:
         """Run one shared planner call for the current guided checkpoint."""
 
         from elspeth.web.composer.guided.deferred_intents import evaluate_deferred_intent_coverage
         from elspeth.web.composer.guided.planning import (
             GuidedCorrectionTarget,
+            GuidedRevisionAuthority,
+            bind_guided_prose_revision_candidate,
             bind_guided_reviewed_components,
             build_guided_proposal_projection,
             guided_private_reviewed_facts,
             guided_redacted_current_state_context,
             guided_redacted_planner_context,
             guided_reviewed_sink_options,
+            guided_revision_execution_hash,
             guided_unproducible_output_field_names,
             guided_unproducible_output_fields,
             require_guided_proposal_correction_target_changed,
@@ -2861,6 +2865,10 @@ class ComposerServiceImpl:
             raise TypeError("operation_fence must be an exact GuidedOperationFence")
         if correction_target is not None and type(correction_target) is not GuidedCorrectionTarget:
             raise TypeError("correction_target must be an exact GuidedCorrectionTarget or None")
+        if revision_authority is not None and type(revision_authority) is not GuidedRevisionAuthority:
+            raise TypeError("revision_authority must be an exact GuidedRevisionAuthority or None")
+        if correction_target is not None and revision_authority is not None:
+            raise ValueError("guided selected correction and prose revision authority are mutually exclusive")
         if str(operation_fence.session_id) != originating_message.session_id:
             raise AuditIntegrityError("guided planner operation fence targets a different session")
         if guided.active_proposal is not None:
@@ -2879,6 +2887,13 @@ class ComposerServiceImpl:
             reviewed_context = {
                 **reviewed_context,
                 "correction_target": correction_target.planner_context(),
+            }
+        if revision_authority is not None:
+            if revision_authority.predecessor != current_state:
+                raise AuditIntegrityError("guided prose revision predecessor differs from planner current state")
+            reviewed_context = {
+                **reviewed_context,
+                "revision_authority": revision_authority.planner_context(),
             }
 
         def evaluate_claims(candidate: CompositionState, claimed_intent_ids: tuple[str, ...]) -> tuple[str, ...]:
@@ -3059,38 +3074,65 @@ class ComposerServiceImpl:
         # is logged with its code+rejection_codes before it re-raises to the
         # (signed) guided route. An ``async def`` runs nothing until awaited, so
         # every PipelinePlannerError surfaces at ``await``, inside the guard.
+        pending_revision_rejection: Literal["guided_amend_contract_violation"] | None = None
+
+        def bind_guided_candidate(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+            nonlocal pending_revision_rejection
+            pending_revision_rejection = None
+            if revision_authority is not None:
+                binding = bind_guided_prose_revision_candidate(
+                    candidate,
+                    guided,
+                    authority=revision_authority,
+                )
+                pending_revision_rejection = binding.rejection_code
+                return binding.pipeline
+            return bind_guided_reviewed_components(
+                candidate,
+                guided,
+                predecessor=current_state if correction_target is not None else None,
+                correction_target=correction_target,
+            )
+
         candidate_acceptance: Callable[[CompositionState], None] | None = None
-        if correction_target is not None:
+        if correction_target is not None or revision_authority is not None:
 
-            def require_selected_correction_delta(candidate_state: CompositionState) -> None:
-                candidate_proposal = PipelineProposal.create(
-                    pipeline=owned_composition_state_authority(candidate_state),
-                    base=base,
-                    reviewed_facts=reviewed_facts,
-                    surface=planner_surface,
-                    repair_count=0,
-                    skill_hash=stable_hash("composer.guided-correction-candidate-check.v1"),
-                    covered_deferred_intent_ids=(),
-                    supersedes_draft_hash=supersedes_draft_hash,
-                )
-                candidate_projection = build_guided_proposal_projection(
-                    proposal_id=base.state_id,
-                    proposal=candidate_proposal,
-                    guided=guided,
-                    catalog_plugin_ids=catalog_ids,
-                )
-                try:
-                    require_guided_proposal_correction_target_changed(
-                        candidate_projection,
-                        correction_target,
-                        candidate_state,
+            def require_guided_revision_delta(candidate_state: CompositionState) -> None:
+                if pending_revision_rejection is not None:
+                    raise PipelineCandidatePolicyRejection(pending_revision_rejection)
+                if revision_authority is not None and guided_revision_execution_hash(candidate_state) == guided_revision_execution_hash(
+                    revision_authority.predecessor
+                ):
+                    raise PipelineCandidatePolicyRejection("guided_revision_unchanged")
+                if correction_target is not None:
+                    candidate_proposal = PipelineProposal.create(
+                        pipeline=owned_composition_state_authority(candidate_state),
+                        base=base,
+                        reviewed_facts=reviewed_facts,
+                        surface=planner_surface,
+                        repair_count=0,
+                        skill_hash=stable_hash("composer.guided-correction-candidate-check.v1"),
+                        covered_deferred_intent_ids=(),
+                        supersedes_draft_hash=supersedes_draft_hash,
                     )
-                except AuditIntegrityError as exc:
-                    if str(exc) != "guided correction planner did not change the selected component":
-                        raise
-                    raise PipelineCandidatePolicyRejection("guided_correction_unchanged") from exc
+                    candidate_projection = build_guided_proposal_projection(
+                        proposal_id=base.state_id,
+                        proposal=candidate_proposal,
+                        guided=guided,
+                        catalog_plugin_ids=catalog_ids,
+                    )
+                    try:
+                        require_guided_proposal_correction_target_changed(
+                            candidate_projection,
+                            correction_target,
+                            candidate_state,
+                        )
+                    except AuditIntegrityError as exc:
+                        if str(exc) != "guided correction planner did not change the selected component":
+                            raise
+                        raise PipelineCandidatePolicyRejection("guided_correction_unchanged") from exc
 
-            candidate_acceptance = require_selected_correction_delta
+            candidate_acceptance = require_guided_revision_delta
 
         guided_planner_call = plan_pipeline(
             intent=intent,
@@ -3141,12 +3183,7 @@ class ComposerServiceImpl:
             candidate_finalizer=_required_controls_candidate_finalizer(
                 policy_catalog=policy_catalog,
                 plugin_snapshot=plugin_snapshot,
-                inner=lambda candidate: bind_guided_reviewed_components(
-                    candidate,
-                    guided,
-                    predecessor=current_state if correction_target is not None else None,
-                    correction_target=correction_target,
-                ),
+                inner=bind_guided_candidate,
             ),
             candidate_acceptance=candidate_acceptance,
         )

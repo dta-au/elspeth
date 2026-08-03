@@ -46,6 +46,15 @@ function sameRetryAction(
   candidate: GuidedProposalRetryAction,
 ): boolean {
   if (retained.kind !== candidate.kind) return false;
+  if (
+    retained.kind === "revise_instruction" &&
+    candidate.kind === "revise_instruction"
+  ) {
+    return (
+      retained.revision_instruction === candidate.revision_instruction &&
+      retained.revision_mode === candidate.revision_mode
+    );
+  }
   if (retained.kind !== "revise" || candidate.kind !== "revise") return true;
   return (
     retained.edit_target.kind === candidate.edit_target.kind &&
@@ -200,6 +209,12 @@ export function ProposePipelineTurn({
     reviewState.retryable &&
     reviewState.retry_action.kind === "revise" &&
     reviewState.retry_action.correction_feedback !== undefined
+      ? reviewState.retry_action
+      : null;
+  const retainedInstruction =
+    reviewState.status === "error" &&
+    reviewState.retryable &&
+    reviewState.retry_action.kind === "revise_instruction"
       ? reviewState.retry_action
       : null;
   const [revisionTarget, setRevisionTarget] = useState<GuidedEditTarget | null>(
@@ -431,6 +446,27 @@ export function ProposePipelineTurn({
       ) : null}
       <div className="guided-proposal__controls">
         <div className="guided-proposal__primary-actions">
+          {retainedInstruction !== null ? (
+            <button
+              type="button"
+              className="guided-turn-primary"
+              disabled={!actionEnabled(retainedInstruction)}
+              onClick={() => onSubmit({
+                chosen: null,
+                edited_values: {
+                  revision_instruction: retainedInstruction.revision_instruction,
+                  revision_mode: retainedInstruction.revision_mode,
+                },
+                custom_inputs: null,
+                edit_target: null,
+                control_signal: null,
+                proposal_id: payload.proposal_id,
+                draft_hash: payload.draft_hash,
+              } satisfies GuidedRespondAction)}
+            >
+              Retry {retainedInstruction.revision_mode} revision
+            </button>
+          ) : null}
           {!(isTutorial && payload.supersedes_draft_hash === null) && (
             <button
               type="button"

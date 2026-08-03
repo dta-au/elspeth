@@ -13,7 +13,12 @@ from __future__ import annotations
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.web.composer.guided.planning import GuidedCorrectionTarget, bind_guided_reviewed_components
+from elspeth.web.composer.guided import planning as guided_planning
+from elspeth.web.composer.guided.planning import (
+    GuidedCorrectionTarget,
+    GuidedRevisionAuthority,
+    bind_guided_reviewed_components,
+)
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
 from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession
@@ -616,6 +621,206 @@ def test_bind_reapplies_node_custody_after_topology_repairs() -> None:
 
     assert bound["nodes"][1]["on_success"] == "format_high_value_input"
     assert bound["nodes"][2]["input"] == "replacement_input"
+
+
+def _amend_authority() -> GuidedRevisionAuthority:
+    return GuidedRevisionAuthority(mode="amend", predecessor=_correction_predecessor())
+
+
+def _minimal_amend_reconstruction() -> dict[str, object]:
+    """What the redacted provider can honestly reconstruct for old nodes."""
+    predecessor = _correction_predecessor().to_dict()
+    predecessor.pop("version")
+    predecessor["nodes"] = [
+        {
+            "id": node["id"],
+            "node_type": node["node_type"],
+            "plugin": node["plugin"],
+            "input": node["input"],
+            "on_success": node["on_success"],
+        }
+        for node in predecessor["nodes"]
+    ]
+    return predecessor
+
+
+def test_bind_prose_amend_restores_every_withheld_predecessor_node_field() -> None:
+    predecessor = _correction_predecessor()
+
+    result = guided_planning.bind_guided_prose_revision_candidate(
+        _minimal_amend_reconstruction(),
+        _guided(),
+        authority=_amend_authority(),
+    )
+
+    assert result.rejection_code is None
+    assert result.pipeline["nodes"] == predecessor.to_dict()["nodes"]
+    assert result.pipeline["nodes"][0]["condition"] == "row['amount'] > 500"
+    assert result.pipeline["nodes"][0]["routes"] == {"true": "high_value", "false": "standard"}
+    assert result.pipeline["nodes"][1]["options"] == predecessor.to_dict()["nodes"][1]["options"]
+
+
+def test_bind_prose_amend_allows_only_insertion_rewiring_of_existing_nodes() -> None:
+    candidate = _correction_predecessor().to_dict()
+    candidate.pop("version")
+    candidate["sources"]["source"]["on_success"] = "normalize_input"
+    candidate["nodes"].insert(
+        0,
+        {
+            "id": "normalize_amount",
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": "normalize_input",
+            "on_success": "amount_gate",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+        },
+    )
+
+    result = guided_planning.bind_guided_prose_revision_candidate(
+        candidate,
+        _guided(),
+        authority=_amend_authority(),
+    )
+
+    assert result.rejection_code is None
+    assert result.pipeline["sources"]["source"]["on_success"] == "normalize_input"
+    assert result.pipeline["nodes"][0]["id"] == "normalize_amount"
+    assert result.pipeline["nodes"][1:] == _correction_predecessor().to_dict()["nodes"]
+
+
+@pytest.mark.parametrize("laundered_target", ("source", "output", "amount_gate"))
+def test_bind_prose_amend_rejects_new_node_laundering_of_existing_targets(
+    laundered_target: str,
+) -> None:
+    candidate = _correction_predecessor().to_dict()
+    candidate.pop("version")
+    candidate["nodes"].append(
+        {
+            "id": "new_transform",
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": laundered_target,
+            "on_success": "new_rows",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+        }
+    )
+    candidate["nodes"][1]["on_success"] = laundered_target
+
+    result = guided_planning.bind_guided_prose_revision_candidate(
+        candidate,
+        _guided(),
+        authority=_amend_authority(),
+    )
+
+    assert result.rejection_code == "guided_amend_contract_violation"
+    assert result.pipeline["nodes"][:3] == _correction_predecessor().to_dict()["nodes"]
+
+
+def test_bind_prose_amend_rejects_existing_node_relative_order_changes() -> None:
+    candidate = _correction_predecessor().to_dict()
+    candidate.pop("version")
+    candidate["nodes"][0], candidate["nodes"][1] = candidate["nodes"][1], candidate["nodes"][0]
+
+    result = guided_planning.bind_guided_prose_revision_candidate(
+        candidate,
+        _guided(),
+        authority=_amend_authority(),
+    )
+
+    assert result.rejection_code == "guided_amend_contract_violation"
+    assert result.pipeline["nodes"] == _correction_predecessor().to_dict()["nodes"]
+
+
+def test_prose_revision_successor_recheck_rejects_omitted_private_fields_with_a_real_insertion() -> None:
+    candidate = _correction_predecessor().to_dict()
+    candidate["sources"]["source"]["on_success"] = "normalize_input"
+    candidate["nodes"][1].pop("options")
+    candidate["nodes"].insert(
+        0,
+        {
+            "id": "normalize_amount",
+            "node_type": "transform",
+            "plugin": "passthrough",
+            "input": "normalize_input",
+            "on_success": "amount_gate",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+            "condition": None,
+            "routes": None,
+            "fork_to": None,
+            "branches": None,
+            "policy": None,
+            "merge": None,
+        },
+    )
+    successor = guided_planning._canonical_state_from_private_pipeline(candidate)
+
+    with pytest.raises(AuditIntegrityError, match="violates amend authority"):
+        guided_planning.require_guided_prose_revision_successor(
+            successor,
+            _guided(),
+            authority=_amend_authority(),
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        lambda nodes: nodes.pop(0),
+        lambda nodes: nodes.append(dict(nodes[0])),
+        lambda nodes: nodes[0].__setitem__("node_type", "transform"),
+        lambda nodes: nodes[1].__setitem__("plugin", "passthrough"),
+        lambda nodes: nodes[0].__setitem__("condition", "True"),
+        lambda nodes: nodes[0].__setitem__("routes", {"true": "high_value", "false": "high_value"}),
+        lambda nodes: nodes[1].__setitem__("options", {"prompt_template": "replace reviewed behavior"}),
+        lambda nodes: nodes[1].__setitem__("on_error", "output"),
+        lambda nodes: nodes[1].__setitem__("new_control", {"route": "output"}),
+    ),
+    ids=(
+        "removed",
+        "duplicate",
+        "node-type",
+        "plugin",
+        "gate-condition",
+        "gate-routes",
+        "private-options",
+        "control-route",
+        "new-control-key",
+    ),
+)
+def test_bind_prose_amend_marks_contract_violations_for_bounded_repair(mutate: object) -> None:
+    candidate = _correction_predecessor().to_dict()
+    candidate.pop("version")
+    mutate(candidate["nodes"])
+
+    result = guided_planning.bind_guided_prose_revision_candidate(
+        candidate,
+        _guided(),
+        authority=_amend_authority(),
+    )
+
+    assert result.rejection_code == "guided_amend_contract_violation"
+    assert result.pipeline["nodes"] == _correction_predecessor().to_dict()["nodes"]
+
+
+def test_bind_explicit_prose_replace_permits_node_removal() -> None:
+    predecessor = _correction_predecessor()
+    candidate = predecessor.to_dict()
+    candidate.pop("version")
+    candidate["nodes"] = []
+    candidate["sources"]["source"]["on_success"] = "output"
+
+    result = guided_planning.bind_guided_prose_revision_candidate(
+        candidate,
+        _guided(),
+        authority=GuidedRevisionAuthority(mode="replace", predecessor=predecessor),
+    )
+
+    assert result.rejection_code is None
+    assert result.pipeline["nodes"] == []
+    assert result.pipeline["sources"]["source"]["on_success"] == "output"
 
 
 class TestBindDeclaredRequiredFields:
