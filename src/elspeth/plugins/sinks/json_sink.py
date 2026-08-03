@@ -119,6 +119,13 @@ class JSONSinkConfig(SinkPathConfig):
             codecs.lookup(value)
         except LookupError as exc:
             raise ValueError("unknown encoding for JSON sink") from exc
+        try:
+            encoded = "".encode(value)
+            incremental = codecs.getincrementalencoder(value)().encode("", final=True)
+        except (LookupError, TypeError, UnicodeError, ValueError) as exc:
+            raise ValueError("encoding is not a supported text codec for JSON sink") from exc
+        if type(encoded) is not bytes or type(incremental) is not bytes:
+            raise ValueError("encoding is not a supported text codec for JSON sink")
         return value
 
     @model_validator(mode="after")

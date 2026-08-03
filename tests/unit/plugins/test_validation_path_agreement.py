@@ -474,6 +474,16 @@ _SINK_REJECTION_CASES = [
         "unknown encoding",
         id="json_sink-invalid-encoding",
     ),
+    pytest.param(
+        "json",
+        {
+            "path": "/tmp/output.json",
+            "schema": _make_observed_schema(),
+            "encoding": "rot_13",
+        },
+        "not a supported text codec",
+        id="json_sink-non-text-codec",
+    ),
     # ── csv sink ──────────────────────────────────────────────────────────
     pytest.param(
         "csv",

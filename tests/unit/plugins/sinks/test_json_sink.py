@@ -94,6 +94,22 @@ class TestJSONSink:
         assert "sensitive-output-name" not in str(config_error.value)
         assert str(sink_error.value) == str(config_error.value)
 
+    @pytest.mark.parametrize("encoding", ["rot_13", "base64_codec", "undefined"])
+    def test_non_text_codec_is_rejected_before_sink_construction(self, tmp_path: Path, encoding: str) -> None:
+        """Registered transforms that cannot emit JSON text bytes must fail config."""
+        from elspeth.plugins.sinks.json_sink import JSONSink, JSONSinkConfig
+
+        config = {
+            "path": str(tmp_path / "sensitive-output-name.json"),
+            "schema": DYNAMIC_SCHEMA,
+            "encoding": encoding,
+        }
+
+        with pytest.raises(PluginConfigError, match=r"encoding: Value error, encoding is not a supported text codec"):
+            JSONSinkConfig.from_dict(config, plugin_name="json")
+        with pytest.raises(PluginConfigError, match=r"encoding: Value error, encoding is not a supported text codec"):
+            JSONSink(config)
+
     @pytest.mark.parametrize("encoding", ["utf-8", "utf-16", "utf8"])
     def test_available_text_encoding_is_accepted(self, tmp_path: Path, encoding: str) -> None:
         """Standard, non-default, and normalized alias spellings remain valid."""
