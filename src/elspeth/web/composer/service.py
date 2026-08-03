@@ -488,6 +488,15 @@ class _BadRequestLLMError(ComposerServiceError):
         self.provider_status_code = provider_status_code
 
 
+class _AdvisorCheckpointComposeDeadlineExpired(Exception):
+    """Internal signal: the compose budget expired before an advisor call.
+
+    This is not an advisor verdict or provider failure.  Phase owners convert
+    it to the existing ``ComposerConvergenceError(timeout)`` only after they
+    have the authoritative state, turn counters, and persisted-audit status.
+    """
+
+
 def _apply_openrouter_app_identity(kwargs: dict[str, Any]) -> None:
     """Brand OpenRouter-routed composer calls as ELSPETH, not LiteLLM.
 
@@ -3775,34 +3784,45 @@ class ComposerServiceImpl:
                 )
                 assistant_message = response.choices[0].message
                 if not assistant_message.tool_calls:
-                    advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
-                        state=state,
-                        session_id=session_id,
-                        current_state_id=persist.current_state_id,
-                        assistant_message=assistant_message,
-                        llm_messages=llm_messages,
-                        recorder=recorder,
-                        progress=progress,
-                        advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
-                        repair_turns_used=repair_turns_used,
-                        persisted_assistant_message_id=persisted_assistant_message_id,
-                        persisted_tool_call_turn=persisted_tool_call_turn,
-                        allow_repair_continue=False,
-                        user_message=message,
-                        runtime_preflight=await self._turn_runtime_preflight(
+                    try:
+                        advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
                             state=state,
-                            user_id=user_id,
                             session_id=session_id,
-                            last_runtime_preflight=last_runtime_preflight,
-                            runtime_preflight_cache=runtime_preflight_cache,
-                            initial_version=initial_version,
-                            session_scope=session_scope,
+                            current_state_id=persist.current_state_id,
+                            assistant_message=assistant_message,
+                            llm_messages=llm_messages,
                             recorder=recorder,
-                            plugin_snapshot=plugin_snapshot,
-                        ),
-                        advisor_review_state=advisor_review_state or _AdvisorReviewState(),
-                        deadline=deadline,
-                    )
+                            progress=progress,
+                            advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                            repair_turns_used=repair_turns_used,
+                            persisted_assistant_message_id=persisted_assistant_message_id,
+                            persisted_tool_call_turn=persisted_tool_call_turn,
+                            allow_repair_continue=False,
+                            user_message=message,
+                            runtime_preflight=await self._turn_runtime_preflight(
+                                state=state,
+                                user_id=user_id,
+                                session_id=session_id,
+                                last_runtime_preflight=last_runtime_preflight,
+                                runtime_preflight_cache=runtime_preflight_cache,
+                                initial_version=initial_version,
+                                session_scope=session_scope,
+                                recorder=recorder,
+                                plugin_snapshot=plugin_snapshot,
+                            ),
+                            advisor_review_state=advisor_review_state or _AdvisorReviewState(),
+                            deadline=deadline,
+                        )
+                    except _AdvisorCheckpointComposeDeadlineExpired:
+                        raise ComposerConvergenceError.capture(
+                            max_turns=new_composition_turns_used + discovery_turns_used,
+                            budget_exhausted="timeout",
+                            state=state,
+                            initial_version=initial_version,
+                            tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                            llm_calls=recorder.llm_calls,
+                            failed_turn=failed_turn,
+                        ) from None
                     if advisor_gate.action == "return":
                         return _ClassifyOutcome(
                             action="return",
@@ -3902,6 +3922,9 @@ class ComposerServiceImpl:
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
         deadline: float | None = None,
+        composition_turns_used: int = 0,
+        discovery_turns_used: int = 0,
+        failed_turn: FailedTurnMetadata | None = None,
     ) -> _TerminateOutcome:
         """Phase P2 of the compose loop — handle the no-tool-calls branch.
 
@@ -4037,34 +4060,45 @@ class ComposerServiceImpl:
         ):
             return _TerminateOutcome(action="continue", repair_turns_delta=1)
 
-        advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
-            state=state,
-            session_id=session_id,
-            current_state_id=current_state_id,
-            assistant_message=assistant_message,
-            llm_messages=llm_messages,
-            recorder=recorder,
-            progress=progress,
-            advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
-            repair_turns_used=repair_turns_used,
-            persisted_assistant_message_id=persisted_assistant_message_id,
-            persisted_tool_call_turn=persisted_tool_call_turn,
-            allow_repair_continue=True,
-            user_message=message,
-            runtime_preflight=await self._turn_runtime_preflight(
+        try:
+            advisor_gate = await self._evaluate_terminal_no_tool_advisor_gate(
                 state=state,
-                user_id=user_id,
                 session_id=session_id,
-                last_runtime_preflight=last_runtime_preflight,
-                runtime_preflight_cache=runtime_preflight_cache,
-                initial_version=initial_version,
-                session_scope=session_scope,
+                current_state_id=current_state_id,
+                assistant_message=assistant_message,
+                llm_messages=llm_messages,
                 recorder=recorder,
-                plugin_snapshot=plugin_snapshot,
-            ),
-            advisor_review_state=advisor_review_state or _AdvisorReviewState(),
-            deadline=deadline,
-        )
+                progress=progress,
+                advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+                repair_turns_used=repair_turns_used,
+                persisted_assistant_message_id=persisted_assistant_message_id,
+                persisted_tool_call_turn=persisted_tool_call_turn,
+                allow_repair_continue=True,
+                user_message=message,
+                runtime_preflight=await self._turn_runtime_preflight(
+                    state=state,
+                    user_id=user_id,
+                    session_id=session_id,
+                    last_runtime_preflight=last_runtime_preflight,
+                    runtime_preflight_cache=runtime_preflight_cache,
+                    initial_version=initial_version,
+                    session_scope=session_scope,
+                    recorder=recorder,
+                    plugin_snapshot=plugin_snapshot,
+                ),
+                advisor_review_state=advisor_review_state or _AdvisorReviewState(),
+                deadline=deadline,
+            )
+        except _AdvisorCheckpointComposeDeadlineExpired:
+            raise ComposerConvergenceError.capture(
+                max_turns=composition_turns_used + discovery_turns_used,
+                budget_exhausted="timeout",
+                state=state,
+                initial_version=initial_version,
+                tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                llm_calls=recorder.llm_calls,
+                failed_turn=failed_turn,
+            ) from None
         if advisor_gate.action == "return":
             return _TerminateOutcome(
                 action="return",
@@ -4700,6 +4734,9 @@ class ComposerServiceImpl:
                     plugin_snapshot=plugin_snapshot,
                     advisor_review_state=advisor_review_state,
                     deadline=deadline,
+                    composition_turns_used=composition_turns_used,
+                    discovery_turns_used=discovery_turns_used,
+                    failed_turn=failed_turn,
                 )
                 if terminate.advisor_review_state is not None:
                     advisor_review_state = terminate.advisor_review_state
@@ -4742,7 +4779,7 @@ class ComposerServiceImpl:
                 _persisted_tool_call_turn: bool = persisted_tool_call_turn,
                 _persisted_assistant_message_id: str | None = persisted_assistant_message_id,
                 _advisor_repair_context_introduced: bool = advisor_repair_context_introduced,
-            ) -> tuple[_DispatchOutcome, _PersistOutcome, int, bool]:
+            ) -> tuple[_DispatchOutcome, _PersistOutcome, int, bool, bool]:
                 dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
                     call_model=_call_model,
                     state=_state,
@@ -4778,16 +4815,23 @@ class ComposerServiceImpl:
                 # the enclosing shield lets it finish and P4 still publishes
                 # the completed audit prefix.
                 early_advisor_message_count = len(llm_messages)
+                early_checkpoint_deadline_expired = False
                 if not _cancellation_requested.is_set():
-                    await self._maybe_run_early_checkpoint(
-                        state=dispatch_result.state,
-                        prev_state=_state,
-                        session_id=session_id,
-                        llm_messages=llm_messages,
-                        recorder=recorder,
-                        progress=progress,
-                        deadline=deadline,
-                    )
+                    try:
+                        await self._maybe_run_early_checkpoint(
+                            state=dispatch_result.state,
+                            prev_state=_state,
+                            session_id=session_id,
+                            llm_messages=llm_messages,
+                            recorder=recorder,
+                            progress=progress,
+                            deadline=deadline,
+                        )
+                    except _AdvisorCheckpointComposeDeadlineExpired:
+                        # P4 still owns publication of the completed tool turn.
+                        # The driver converts this signal after persistence and
+                        # after plugin/cancellation primacy checks.
+                        early_checkpoint_deadline_expired = True
                 early_advisor_context_introduced = len(llm_messages) > early_advisor_message_count
                 persist_result = await self._persist_turn_audit(
                     tool_outcomes=dispatch_result.tool_outcomes,
@@ -4802,7 +4846,13 @@ class ComposerServiceImpl:
                     persisted_assistant_message_id=_persisted_assistant_message_id,
                     advisor_repair_context_introduced=_advisor_repair_context_introduced,
                 )
-                return dispatch_result, persist_result, updated_advisor_calls_used, early_advisor_context_introduced
+                return (
+                    dispatch_result,
+                    persist_result,
+                    updated_advisor_calls_used,
+                    early_advisor_context_introduced,
+                    early_checkpoint_deadline_expired,
+                )
 
             (
                 (
@@ -4810,6 +4860,7 @@ class ComposerServiceImpl:
                     persist,
                     advisor_calls_used,
                     early_advisor_context_introduced,
+                    early_checkpoint_deadline_expired,
                 ),
                 deferred_cancel,
             ) = await _await_tool_turn_with_deferred_cancellation(
@@ -4917,6 +4968,21 @@ class ComposerServiceImpl:
                 # the first safe checkpoint before P5 or another model turn.
                 attach_llm_calls(deferred_cancel, recorder)
                 raise deferred_cancel
+
+            if early_checkpoint_deadline_expired:
+                charged_composition_turns = composition_turns_used + (1 if dispatch.turn_has_mutation else 0)
+                charged_discovery_turns = discovery_turns_used + (
+                    1 if dispatch.turn_has_discovery and not dispatch.turn_has_mutation else 0
+                )
+                raise ComposerConvergenceError.capture(
+                    max_turns=charged_composition_turns + charged_discovery_turns,
+                    budget_exhausted="timeout",
+                    state=state,
+                    initial_version=initial_version,
+                    tool_invocations=() if persisted_tool_call_turn else recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                    failed_turn=failed_turn,
+                )
 
             classify = await self._classify_and_budget_turn(
                 dispatch=dispatch,
@@ -6038,13 +6104,14 @@ class ComposerServiceImpl:
                 remaining = deadline - asyncio.get_running_loop().time()
                 if remaining <= 0:
                     # The shared compose budget expired before this attempt.
-                    # If no advisor call ran, synthesize the truthful
-                    # unavailable outcome.  After an attempted call, retain its
-                    # provider/malformed outcome (including an unparseable
-                    # successful response) rather than overwriting that audit
-                    # evidence with a retry-budget timeout.
+                    # If no advisor call ran, this is a compose timeout rather
+                    # than an advisor verdict/provider failure.  Signal the
+                    # phase owner before ``completed()`` can emit fabricated
+                    # advisor-pass telemetry.  After an attempted call, retain
+                    # its provider/malformed outcome (including an unparseable
+                    # successful response).
                     if last_exc is None and not last_response_unparseable:
-                        last_exc = TimeoutError()
+                        raise _AdvisorCheckpointComposeDeadlineExpired
                     break
             try:
                 if remaining is None:

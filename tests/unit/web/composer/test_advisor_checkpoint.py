@@ -32,6 +32,7 @@ from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.errors import InvariantError
+from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.service import (
     _ADVISOR_UNAVAILABLE_USER_DETAIL,
     AdvisorCheckpointVerdict,
@@ -1538,41 +1539,35 @@ async def test_end_gate_four_attempts_share_one_shrinking_compose_deadline(make_
 
 
 @pytest.mark.asyncio
-async def test_end_gate_starts_no_advisor_attempt_after_compose_deadline(make_service, simple_state):
+async def test_end_gate_starts_no_advisor_attempt_after_compose_deadline(
+    make_service,
+    simple_state,
+    monkeypatch: pytest.MonkeyPatch,
+):
     service = make_service()
     service._call_advisor_with_audit = _AsyncRecorder(return_value=("CLEAN", {}))
+    recorder = make_recorder()
+    checkpoint_telemetry = MagicMock()
+    monkeypatch.setattr("elspeth.web.composer.service.record_advisor_checkpoint_pass", checkpoint_telemetry)
 
-    outcome = await drive_try_terminate(
-        service,
-        simple_state,
-        advisor_checkpoint_passes_used=0,
-        deadline=asyncio.get_running_loop().time() - 1.0,
-    )
-
-    assert service._call_advisor_with_audit.await_count == 0
-    assert outcome.action == "return"
-    assert outcome.result.runtime_preflight.is_valid is True
-    assert outcome.result.runtime_preflight.readiness.completion_ready is False
-    assert "Runtime preflight failed" not in outcome.result.message
-
-
-@pytest.mark.asyncio
-async def test_checkpoint_deadline_expiry_before_first_attempt_is_unavailable(make_service, simple_state):
-    service = make_service()
-    service._call_advisor_with_audit = _AsyncRecorder(return_value=("CLEAN", {}))
-
-    verdict = await service._run_advisor_checkpoint(
-        phase="end",
-        state=simple_state,
-        session_id="s1",
-        recorder=make_recorder(),
-        deadline=asyncio.get_running_loop().time() - 1.0,
-    )
+    with pytest.raises(ComposerConvergenceError) as exc_info:
+        await drive_try_terminate(
+            service,
+            simple_state,
+            advisor_checkpoint_passes_used=0,
+            deadline=asyncio.get_running_loop().time() - 1.0,
+            recorder=recorder,
+            initial_version=0,
+        )
 
     assert service._call_advisor_with_audit.await_count == 0
-    assert verdict.ok is False
-    assert verdict.failure_class == "unavailable"
-    assert verdict.findings_text == _ADVISOR_UNAVAILABLE_USER_DETAIL
+    assert recorder.llm_calls == ()
+    checkpoint_telemetry.assert_not_called()
+    assert exc_info.value.budget_exhausted == "timeout"
+    assert exc_info.value.reason == "convergence_wall_clock_timeout"
+    assert exc_info.value.llm_calls == ()
+    assert exc_info.value.partial_state is simple_state
+    assert "advisor model was unavailable after retry" not in str(exc_info.value).lower()
 
 
 @pytest.mark.asyncio
@@ -1728,6 +1723,8 @@ async def drive_try_terminate(
     runtime_preflight_valid: bool = True,
     message: str = "rate how cool the pages are",
     deadline: float | None = None,
+    recorder: BufferingRecorder | None = None,
+    initial_version: int = 1,
 ):
     """Drive ``_try_terminate_no_tools`` with the full kwarg set.
 
@@ -1790,13 +1787,13 @@ async def drive_try_terminate(
         state=state,
         session_id="s1",
         current_state_id="cs1",
-        initial_version=1,
+        initial_version=initial_version,
         user_id="alice",
         last_runtime_preflight=None,
         runtime_preflight_cache=service._new_runtime_preflight_cache(),
         session_scope="s1",
         mutation_success_seen=True,
-        recorder=make_recorder(),
+        recorder=recorder or make_recorder(),
         progress=None,
         repair_turns_used=repair_turns_used,
         persisted_assistant_message_id=None,

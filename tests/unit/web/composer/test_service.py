@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID, uuid4
 
 import pytest
@@ -3179,6 +3179,131 @@ class TestComposeTimeout:
             with pytest.raises(ComposerConvergenceError) as exc_info:
                 await service.compose("Slow pipeline", [], state)
             assert exc_info.value.budget_exhausted == "timeout"
+
+    @pytest.mark.asyncio
+    async def test_advisor_zero_attempt_deadline_uses_compose_timeout_contract(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An expired compose budget is not a fabricated advisor outage."""
+        import asyncio
+
+        service = ComposerServiceImpl.for_trained_operator(
+            catalog=_mock_catalog(),
+            settings=_make_settings(composer_timeout_seconds=0.005),
+        )
+        service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "input.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+        progress_events: list[ComposerProgressEvent] = []
+        checkpoint_telemetry = MagicMock()
+        monkeypatch.setattr("elspeth.web.composer.service.record_advisor_checkpoint_pass", checkpoint_telemetry)
+
+        async def terminal_response_after_deadline(*_args: object, **_kwargs: object) -> Any:
+            await asyncio.sleep(0.01)
+            return _make_llm_response(content="The pipeline is ready.")
+
+        async def record_progress(event: ComposerProgressEvent) -> None:
+            progress_events.append(event)
+
+        with (
+            patch.object(service, "_call_llm_before_deadline", new_callable=AsyncMock, side_effect=terminal_response_after_deadline),
+            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as advisor_call,
+            pytest.raises(ComposerConvergenceError) as exc_info,
+        ):
+            await service.compose("Review this pipeline", [], state, progress=record_progress)
+
+        assert advisor_call.await_count == 0
+        checkpoint_telemetry.assert_not_called()
+        assert exc_info.value.budget_exhausted == "timeout"
+        assert exc_info.value.reason == "convergence_wall_clock_timeout"
+        assert exc_info.value.llm_calls == ()
+        assert exc_info.value.tool_invocations == ()
+        assert "advisor model was unavailable after retry" not in str(exc_info.value).lower()
+        failed_events = [event for event in progress_events if event.phase == "failed"]
+        assert len(failed_events) == 1
+        assert failed_events[0].reason == "convergence_wall_clock_timeout"
+        assert "timed out" in failed_events[0].headline.lower()
+
+    @pytest.mark.asyncio
+    async def test_early_advisor_zero_attempt_deadline_preserves_mutation_audit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """EARLY expiry publishes the completed tool turn before timeout."""
+        import asyncio
+
+        service = ComposerServiceImpl.for_trained_operator(
+            catalog=_mock_catalog(),
+            settings=_make_settings(composer_timeout_seconds=0.005),
+        )
+        service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
+        checkpoint_telemetry = MagicMock()
+        monkeypatch.setattr("elspeth.web.composer.service.record_advisor_checkpoint_pass", checkpoint_telemetry)
+        source_arguments = {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {"path": "/data/input.csv", "schema": {"mode": "observed"}},
+            "on_validation_failure": "discard",
+        }
+
+        def mutate_source(
+            _tool_name: str,
+            _arguments: dict[str, Any],
+            current_state: CompositionState,
+            _catalog: Any,
+            **_kwargs: Any,
+        ) -> ToolResult:
+            updated_state = current_state.with_source(SourceSpec(**source_arguments))
+            return ToolResult(
+                success=True,
+                updated_state=updated_state,
+                validation=updated_state.validate(),
+                affected_nodes=("source",),
+                data=None,
+            )
+
+        async def mutation_response_after_deadline(*_args: object, **_kwargs: object) -> Any:
+            await asyncio.sleep(0.01)
+            return _make_llm_response(
+                tool_calls=[
+                    {
+                        "id": "source-1",
+                        "name": "set_source",
+                        "arguments": source_arguments,
+                    }
+                ]
+            )
+
+        with (
+            patch.object(service, "_call_llm_before_deadline", new_callable=AsyncMock, side_effect=mutation_response_after_deadline),
+            patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock) as advisor_call,
+            patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=mutate_source),
+            pytest.raises(ComposerConvergenceError) as exc_info,
+        ):
+            await service.compose("Build a CSV pipeline", [], _empty_state())
+
+        assert advisor_call.await_count == 0
+        checkpoint_telemetry.assert_not_called()
+        assert exc_info.value.budget_exhausted == "timeout"
+        assert exc_info.value.llm_calls == ()
+        assert len(exc_info.value.tool_invocations) == 1
+        assert exc_info.value.tool_invocations[0].tool_name == "set_source"
+        assert exc_info.value.partial_state is not None
+        assert exc_info.value.partial_state.sources["source"].plugin == "csv"
 
     @pytest.mark.asyncio
     async def test_mutation_tool_state_preserved_on_timeout(self) -> None:
