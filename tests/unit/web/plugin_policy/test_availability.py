@@ -278,32 +278,43 @@ def test_llm_source_with_no_configured_profile_fails_closed() -> None:
     assert [item.reason for item in snapshot.unavailable if item.plugin_id == source_id] == [PluginUnavailableReason.PROFILE_UNAVAILABLE]
 
 
-def test_web_prohibited_source_is_a_declined_authorization_not_an_offer() -> None:
-    """A runtime-authorized aws_s3 SOURCE must be declined, never offered.
-
-    A deployment can legitimately authorize S3 for its own runtime (the AWS
-    scenario module's ``default_plugin_allowlist`` does). The web authoring
-    surface refuses author-controlled S3 reads categorically, so the snapshot
-    has to carry that authorization as a *declined* one: without it, every
-    reader of ``available`` (discovery listings, the guided step-1 picker,
-    prompts, tool validation) offers the plugin and only the far end of
-    authoring refuses it — an unrepairable dead end (F13/F14, 2026-07-31).
-    """
+def test_unconfigured_s3_source_is_profile_unavailable_not_categorically_prohibited() -> None:
+    """Allowlisting authorizes S3, but only an operator profile can offer it."""
     policy, snapshot = _build_with_policy(_settings(plugin_allowlist=_AWS_S3_ALLOWLIST))
     baseline = _build(_settings())
     source_id = PluginId("source", "aws_s3")
 
     assert source_id in policy.authorized
     assert source_id not in snapshot.available
-    # Declared exactly once, and with the reason that names a policy no
-    # operator setting can clear — not a repairable credential/profile gap.
-    assert [item.reason for item in snapshot.unavailable if item.plugin_id == source_id] == [PluginUnavailableReason.WEB_SURFACE_PROHIBITED]
+    assert [item.reason for item in snapshot.unavailable if item.plugin_id == source_id] == [PluginUnavailableReason.PROFILE_UNAVAILABLE]
     # The SINK is untouched: kind-qualified identity keeps S3 writes usable.
     assert PluginId("sink", "aws_s3") in snapshot.available
-    # available never exceeds authorized, and a prohibition cannot silently
-    # re-point a capability selection.
+    # available never exceeds authorized, and an unavailable profile cannot
+    # silently re-point a capability selection.
     assert snapshot.available <= policy.authorized
     assert snapshot.selected == baseline.selected
+
+
+def test_allowlisted_s3_source_with_operator_profile_is_available() -> None:
+    source_id = PluginId("source", "aws_s3")
+
+    snapshot = _build(
+        _settings(
+            plugin_allowlist=(str(source_id),),
+            deployment_aws_region="ap-southeast-1",
+            aws_s3_source_profiles=(
+                {
+                    "alias": "demo-input",
+                    "bucket": "elspeth-demo-input",
+                    "prefix": "incoming",
+                },
+            ),
+        )
+    )
+
+    assert source_id in snapshot.available
+    assert dict(snapshot.usable_profile_aliases)[source_id] == ("demo-input",)
+    assert dict(snapshot.selected_profile_aliases)[source_id] == "demo-input"
 
 
 def test_trained_operator_snapshot_keeps_the_web_prohibited_source() -> None:

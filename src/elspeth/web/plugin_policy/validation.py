@@ -414,10 +414,16 @@ def _lower_profiled_components(
             allowed_properties = set(public_schema.get("properties") or ())
             unexpected = sorted(set(public_options) - allowed_properties)
             if unexpected:
-                detail = (
-                    f"option(s) not authorable on a profile-bound node: {unexpected}. "
-                    "The operator profile supplies provider/model/credential/pacing settings — remove them."
-                )
+                if plugin_id == PluginId("source", "aws_s3"):
+                    detail = (
+                        f"option(s) not authorable on a profile-bound source: {unexpected}. "
+                        "Remove them; the operator profile supplies the private storage binding."
+                    )
+                else:
+                    detail = (
+                        f"option(s) not authorable on a profile-bound node: {unexpected}. "
+                        "The operator profile supplies provider/model/credential/pacing settings — remove them."
+                    )
             else:
                 failing = sorted({"/".join(str(part) for part in error.absolute_path) or "<options>" for error in schema_errors})
                 detail = f"option(s) failing the public profile schema: {failing}."
@@ -446,10 +452,21 @@ def _lower_profiled_components(
             # real defect was an operator-private option in their node — a
             # message no planner can repair from.
             if str(exc) == "private_profile_option":
+                if plugin_id == PluginId("source", "aws_s3"):
+                    message = (
+                        f"Plugin '{plugin_id}' profile-bound options include operator-private storage settings. "
+                        "Remove them; the operator profile supplies the private binding."
+                    )
+                else:
+                    message = (
+                        f"Plugin '{plugin_id}' profile-bound options include operator-private option(s) "
+                        "(provider/model/credential/pacing settings such as pool_size or "
+                        "max_capacity_retry_seconds). Remove them — the operator profile supplies these."
+                    )
+            elif str(exc) == "unsafe_s3_object_key":
                 message = (
-                    f"Plugin '{plugin_id}' profile-bound options include operator-private option(s) "
-                    "(provider/model/credential/pacing settings such as pool_size or "
-                    "max_capacity_retry_seconds). Remove them — the operator profile supplies these."
+                    f"Plugin '{plugin_id}' requires a canonical relative object key within the selected operator profile. "
+                    "Remove absolute, traversal, empty-segment, trailing-separator, or overlong key forms."
                 )
             else:
                 message = f"Plugin '{plugin_id}' operator profile is no longer available."

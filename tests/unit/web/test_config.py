@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import types
@@ -1945,6 +1946,56 @@ def test_settings_from_env_derives_deployment_region_only_from_ambient_aws_regio
     settings = settings_from_env()
 
     assert settings.deployment_aws_region == "ap-southeast-1"
+
+
+def test_settings_from_env_parses_s3_source_profiles_without_repr_leaking_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_bucket = "operator-private-bucket-marker"
+    private_prefix = "operator-private-prefix-marker"
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-1")
+    monkeypatch.setenv(
+        "ELSPETH_WEB__AWS_S3_SOURCE_PROFILES",
+        json.dumps(
+            [
+                {
+                    "alias": "demo-input",
+                    "bucket": private_bucket,
+                    "prefix": private_prefix,
+                }
+            ]
+        ),
+    )
+
+    settings = web_config.settings_from_env()
+
+    assert settings.deployment_aws_region == "ap-southeast-1"
+    assert settings.aws_s3_source_profiles[0].alias == "demo-input"
+    assert settings.aws_s3_source_profiles[0].bucket == private_bucket
+    assert settings.aws_s3_source_profiles[0].prefix == private_prefix
+    assert private_bucket not in repr(settings.aws_s3_source_profiles[0])
+    assert private_prefix not in repr(settings.aws_s3_source_profiles[0])
+
+
+def test_settings_from_env_rejects_duplicate_s3_profile_aliases_without_echoing_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_bucket = "operator-private-bucket-marker"
+    monkeypatch.setenv(
+        "ELSPETH_WEB__AWS_S3_SOURCE_PROFILES",
+        json.dumps(
+            [
+                {"alias": "demo-input", "bucket": private_bucket},
+                {"alias": "demo-input", "bucket": "other-private-bucket-marker"},
+            ]
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        web_config.settings_from_env()
+
+    assert "AWS_S3_SOURCE_PROFILES" in str(exc_info.value).upper()
+    assert private_bucket not in str(exc_info.value)
 
 
 def test_settings_from_env_rejects_reserved_web_deployment_region_override(monkeypatch: pytest.MonkeyPatch) -> None:

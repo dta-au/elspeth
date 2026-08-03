@@ -215,6 +215,7 @@ def test_runtime_conversion_consumes_every_universal_setting_field() -> None:
         "default_llm_profile",
         "bedrock_guardrail_profiles",
         "bedrock_guardrail_default_profiles",
+        "aws_s3_source_profiles",
         "deployment_aws_region",
     }
     runtime_fields = set(RuntimeWebPluginConfig.__dataclass_fields__)
@@ -262,6 +263,328 @@ def test_textract_deployment_profile_exposes_only_alias_and_ordinary_options() -
     assert public.json_schema["additionalProperties"] is False
     assert public.secret_requirements == ()
     assert "SchemaConfig" in public.json_schema["$defs"]
+
+
+def test_s3_source_profile_constrains_bucket_prefix_region_and_auth() -> None:
+    settings = _settings(
+        deployment_aws_region="ap-southeast-1",
+        plugin_allowlist=("source:aws_s3",),
+        aws_s3_source_profiles=(
+            {
+                "alias": "demo-input",
+                "bucket": "elspeth-demo-input",
+                "prefix": "incoming",
+            },
+        ),
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
+    registry = OperatorProfileRegistry(policy=policy, settings=runtime)
+    plugin_id = PluginId("source", "aws_s3")
+
+    public = registry.public_schema(
+        plugin_id,
+        create_catalog_service().get_schema("source", "aws_s3"),
+        available_aliases=("demo-input",),
+    )
+    lowered = registry.lower_options(
+        plugin_id,
+        alias="demo-input",
+        safe_options={
+            "key": "records/input.csv",
+            "format": "csv",
+            "schema": {"mode": "observed"},
+            "on_validation_failure": "discard",
+        },
+    )
+
+    assert set(public.json_schema["properties"]) == {
+        "profile",
+        "key",
+        "format",
+        "csv_options",
+        "json_options",
+        "columns",
+        "field_mapping",
+        "on_validation_failure",
+        "schema",
+    }
+    assert not set(public.json_schema["properties"]) & {
+        "bucket",
+        "prefix",
+        "region",
+        "region_name",
+        "auth_mode",
+        "endpoint_url",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    }
+    assert deep_thaw(lowered.executable_options) == {
+        "bucket": "elspeth-demo-input",
+        "key": "incoming/records/input.csv",
+        "region_name": "ap-southeast-1",
+        "format": "csv",
+        "schema": {"mode": "observed"},
+        "on_validation_failure": "discard",
+    }
+    assert deep_thaw(lowered.audit_safe_options) == {
+        "profile": "demo-input",
+        "key": "records/input.csv",
+        "format": "csv",
+        "schema": {"mode": "observed"},
+        "on_validation_failure": "discard",
+    }
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "/secret.csv",
+        "//secret.csv",
+        "C:/secret.csv",
+        "C:\\secret.csv",
+        "s3://other-bucket/secret.csv",
+        "https://example.invalid/secret.csv",
+        ".",
+        "..",
+        "./secret.csv",
+        "records/../secret.csv",
+        "records/./secret.csv",
+        "records//secret.csv",
+        "records/",
+        " secret.csv",
+        "secret.csv ",
+        "records/\x7fsecret.csv",
+    ],
+)
+def test_s3_source_profile_rejects_noncanonical_or_escaping_relative_key(key: str) -> None:
+    settings = _settings(
+        deployment_aws_region="ap-southeast-1",
+        plugin_allowlist=("source:aws_s3",),
+        aws_s3_source_profiles=({"alias": "demo-input", "bucket": "elspeth-demo-input", "prefix": "incoming"},),
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    registry = OperatorProfileRegistry(
+        policy=compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime),
+        settings=runtime,
+    )
+
+    with pytest.raises(ValueError, match="unsafe_s3_object_key"):
+        registry.lower_options(
+            PluginId("source", "aws_s3"),
+            alias="demo-input",
+            safe_options={
+                "key": key,
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            },
+        )
+
+
+@pytest.mark.parametrize("key", ["/secret.csv", "C:/secret.csv", "s3://other-bucket/secret.csv", "records/../secret.csv"])
+def test_s3_source_public_schema_rejects_unsafe_relative_key(key: str) -> None:
+    settings = _settings(
+        deployment_aws_region="ap-southeast-1",
+        plugin_allowlist=("source:aws_s3",),
+        aws_s3_source_profiles=({"alias": "demo-input", "bucket": "elspeth-demo-input", "prefix": "incoming"},),
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    registry = OperatorProfileRegistry(
+        policy=compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime),
+        settings=runtime,
+    )
+    public_schema = registry.public_schema(
+        PluginId("source", "aws_s3"),
+        create_catalog_service().get_schema("source", "aws_s3"),
+        available_aliases=("demo-input",),
+    ).json_schema
+
+    errors = list(
+        Draft202012Validator(public_schema).iter_errors(
+            {
+                "profile": "demo-input",
+                "key": key,
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            }
+        )
+    )
+
+    assert errors
+
+
+@pytest.mark.parametrize(
+    "private_name",
+    [
+        "bucket",
+        "prefix",
+        "region",
+        "region_name",
+        "auth_mode",
+        "endpoint",
+        "endpoint_url",
+        "credential",
+        "credentials",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+        "access_key",
+        "secret_key",
+        "session_token",
+    ],
+)
+def test_s3_source_profile_rejects_every_operator_private_option(private_name: str) -> None:
+    settings = _settings(
+        deployment_aws_region="ap-southeast-1",
+        plugin_allowlist=("source:aws_s3",),
+        aws_s3_source_profiles=({"alias": "demo-input", "bucket": "elspeth-demo-input"},),
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    registry = OperatorProfileRegistry(
+        policy=compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime),
+        settings=runtime,
+    )
+
+    with pytest.raises(ValueError, match="private_profile_option"):
+        registry.lower_options(
+            PluginId("source", "aws_s3"),
+            alias="demo-input",
+            safe_options={
+                "key": "records/input.csv",
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+                private_name: "attacker-controlled",
+            },
+        )
+
+
+def test_s3_source_profile_rejects_prefixed_key_over_1024_utf8_bytes() -> None:
+    settings = _settings(
+        deployment_aws_region="ap-southeast-1",
+        plugin_allowlist=("source:aws_s3",),
+        aws_s3_source_profiles=({"alias": "demo-input", "bucket": "elspeth-demo-input", "prefix": "incoming"},),
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    registry = OperatorProfileRegistry(
+        policy=compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime),
+        settings=runtime,
+    )
+
+    with pytest.raises(ValueError, match="unsafe_s3_object_key"):
+        registry.lower_options(
+            PluginId("source", "aws_s3"),
+            alias="demo-input",
+            safe_options={
+                "key": "é" * 508,
+                "schema": {"mode": "observed"},
+                "on_validation_failure": "discard",
+            },
+        )
+
+
+@pytest.mark.parametrize("prefix", ["/incoming", "C:/incoming", "s3://bucket/incoming", "incoming/../secret", "incoming//nested"])
+def test_s3_source_profile_rejects_noncanonical_operator_prefix(prefix: str) -> None:
+    with pytest.raises(ValidationError):
+        _settings(
+            aws_s3_source_profiles=({"alias": "demo-input", "bucket": "elspeth-demo-input", "prefix": prefix},),
+        )
+
+
+def test_s3_source_profile_without_deployment_region_is_unavailable_not_a_boot_crash() -> None:
+    settings = _settings(
+        plugin_allowlist=("source:aws_s3",),
+        aws_s3_source_profiles=({"alias": "demo-input", "bucket": "elspeth-demo-input"},),
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
+    registry = OperatorProfileRegistry(policy=policy, settings=runtime)
+
+    assert (
+        registry.profile_availability(
+            PluginId("source", "aws_s3"),
+            principal="local:alice",
+            inventory=cast(Any, object()),
+        )
+        == ()
+    )
+
+
+def test_s3_source_profile_requires_local_boto3(monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.util
+
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(
+        "elspeth.web.plugin_policy.profiles.importlib.util.find_spec",
+        lambda name: None if name == "boto3" else real_find_spec(name),
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(
+        _settings(
+            deployment_aws_region="ap-southeast-1",
+            plugin_allowlist=("source:aws_s3",),
+            aws_s3_source_profiles=({"alias": "demo-input", "bucket": "elspeth-demo-input"},),
+        )
+    )
+    registry = OperatorProfileRegistry(
+        policy=compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime),
+        settings=runtime,
+    )
+
+    assert (
+        registry.profile_availability(
+            PluginId("source", "aws_s3"),
+            principal="local:alice",
+            inventory=cast(Any, object()),
+        )
+        == ()
+    )
+
+
+def test_s3_source_profile_binding_rotates_for_bucket_prefix_and_region() -> None:
+    def generation(*, bucket: str, prefix: str, region: str) -> str | None:
+        runtime = RuntimeWebPluginConfig.from_settings(
+            _settings(
+                deployment_aws_region=region,
+                plugin_allowlist=("source:aws_s3",),
+                aws_s3_source_profiles=({"alias": "demo-input", "bucket": bucket, "prefix": prefix},),
+            )
+        )
+        registry = OperatorProfileRegistry(
+            policy=compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime),
+            settings=runtime,
+        )
+        return registry.profile_availability(
+            PluginId("source", "aws_s3"),
+            principal="local:alice",
+            inventory=cast(Any, object()),
+        )[0].generation
+
+    baseline = generation(bucket="first-bucket", prefix="incoming", region="ap-southeast-1")
+
+    assert baseline is not None
+    assert baseline != generation(bucket="second-bucket", prefix="incoming", region="ap-southeast-1")
+    assert baseline != generation(bucket="first-bucket", prefix="archive", region="ap-southeast-1")
+    assert baseline != generation(bucket="first-bucket", prefix="incoming", region="eu-west-1")
+
+
+def test_s3_source_profile_has_no_implicit_selection_when_multiple_profiles_are_usable() -> None:
+    runtime = RuntimeWebPluginConfig.from_settings(
+        _settings(
+            deployment_aws_region="ap-southeast-1",
+            plugin_allowlist=("source:aws_s3",),
+            aws_s3_source_profiles=(
+                {"alias": "first", "bucket": "first-bucket"},
+                {"alias": "second", "bucket": "second-bucket"},
+            ),
+        )
+    )
+    registry = OperatorProfileRegistry(
+        policy=compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime),
+        settings=runtime,
+    )
+
+    assert registry.selected_profile_alias(PluginId("source", "aws_s3"), usable_aliases=("first", "second")) is None
+    assert registry.selected_profile_alias(PluginId("source", "aws_s3"), usable_aliases=("second",)) == "second"
 
 
 def test_textract_deployment_profile_lowers_and_rotates_binding_with_region() -> None:

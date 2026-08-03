@@ -52,6 +52,8 @@ from elspeth.web.composer.tools import (
 from elspeth.web.composer.tools import (
     execute_tool as _execute_tool,
 )
+from elspeth.web.config import WebSettings
+from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import ValidationCheck, ValidationError, ValidationReadiness, ValidationResult
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -64,12 +66,10 @@ from elspeth.web.plugin_policy.models import (
     PluginAvailabilitySnapshot,
     PluginId,
     PluginUnavailableReason,
+    WebPluginPolicy,
 )
-from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
-from elspeth.web.provider_config_policy import (
-    AWS_S3_ENDPOINT_URL_POLICY_ERROR,
-    AWS_S3_SOURCE_POLICY_ERROR,
-)
+from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
@@ -139,6 +139,12 @@ _AWS_S3_ENDPOINT_SENTINEL = "https://composer-canary.attacker.invalid/private"
 _VALID_AWS_S3_OPTIONS: Mapping[str, Any] = {
     "bucket": "test-bucket",
     "key": "test-key",
+    "schema": {"mode": "observed"},
+}
+_VALID_AWS_S3_PROFILE_OPTIONS: Mapping[str, Any] = {
+    "profile": "demo-input",
+    "key": "records/input.csv",
+    "format": "csv",
     "schema": {"mode": "observed"},
 }
 
@@ -363,6 +369,43 @@ def _web_authored_policy_pair(
         binding_generation_fingerprint="web-authored-test-generation",
     )
     return PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry)), snapshot
+
+
+def _profiled_s3_policy_pair() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
+    catalog = create_catalog_service()
+    source_id = PluginId("source", "aws_s3")
+    settings = WebSettings.model_validate(
+        {
+            "composer_max_composition_turns": 4,
+            "composer_max_discovery_turns": 4,
+            "composer_timeout_seconds": 60,
+            "composer_rate_limit_per_minute": 20,
+            "shareable_link_signing_key": b"0123456789abcdef0123456789abcdef",
+            "deployment_aws_region": "ap-southeast-1",
+            "aws_s3_source_profiles": ({"alias": "demo-input", "bucket": "elspeth-demo-input", "prefix": "incoming"},),
+        }
+    )
+    runtime = RuntimeWebPluginConfig.from_settings(settings)
+    policy = WebPluginPolicy.create(
+        required=frozenset({source_id}),
+        configured_optional=frozenset(),
+        preferences=(),
+        control_modes=(),
+        plugin_code_identities=((source_id, "1.0.0", "profiled-s3-test"),),
+    )
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime)
+    trained = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash="profiled-s3-test-policy",
+        principal_scope="local:test-user",
+        available=trained.available,
+        unavailable=(),
+        selected=trained.selected,
+        usable_profile_aliases=((source_id, ("demo-input",)),),
+        selected_profile_aliases=((source_id, "demo-input"),),
+        binding_generation_fingerprint="profiled-s3-test-generation",
+    )
+    return PolicyCatalogView(catalog, snapshot, profiles), snapshot
 
 
 def _restricted_policy_pair(
@@ -1161,23 +1204,16 @@ class TestAwsS3EndpointUrlComposerPolicy:
 
 
 class TestAwsS3SourceComposerPolicy:
-    """Mutation-time enforcement must not diverge from authoritative validation.
-
-    ``execution/validation.py`` unconditionally rejects any web-authored
-    (non-trained-operator) ``aws_s3`` source — independent of
-    ``endpoint_url`` — because S3 reads there would use the server AWS
-    credential chain with author-chosen bucket/key. ``set_source``
-    previously only enforced the narrower endpoint_url policy, so a
-    non-trained session could store an aws_s3 source with no
-    endpoint_url override that would then unconditionally fail every
-    subsequent dry-run/proposal validation — a state that can never be
-    made valid without deleting the source.
-    """
+    """Mutation-time profile enforcement must match authoritative validation."""
 
     def test_set_source_rejects_aws_s3_for_web_authored_session_without_mutating_state(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
-        view, snapshot = _web_authored_policy_pair(catalog)
+        view, snapshot = _restricted_policy_pair(
+            catalog,
+            PluginId("source", "aws_s3"),
+            PluginUnavailableReason.PROFILE_UNAVAILABLE,
+        )
 
         result = execute_tool(
             "set_source",
@@ -1196,8 +1232,8 @@ class TestAwsS3SourceComposerPolicy:
         assert result.updated_state is state
         assert result.updated_state.version == state.version
         assert result.data is not None
-        assert result.data["error"] == AWS_S3_SOURCE_POLICY_ERROR
-        assert result.data["error_code"] == "aws_s3_source_not_allowed"
+        assert "operator profile" in result.data["error"]
+        assert result.data["error_code"] == "profile_unavailable"
 
     def test_set_source_allows_aws_s3_for_trained_operator_session(self) -> None:
         """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
@@ -1218,10 +1254,35 @@ class TestAwsS3SourceComposerPolicy:
         assert result.success is True
         assert result.updated_state.sources["source"].plugin == "aws_s3"
 
+    def test_set_source_accepts_operator_profile_and_persists_only_safe_options(self) -> None:
+        state = _empty_state()
+        view, snapshot = _profiled_s3_policy_pair()
+
+        result = execute_tool(
+            "set_source",
+            {
+                "plugin": "aws_s3",
+                "on_success": "main",
+                "options": dict(_VALID_AWS_S3_PROFILE_OPTIONS),
+                "on_validation_failure": "discard",
+            },
+            state,
+            view,
+            plugin_snapshot=snapshot,
+        )
+
+        assert result.success is True, result.data
+        assert deep_thaw(result.updated_state.sources["source"].options) == dict(_VALID_AWS_S3_PROFILE_OPTIONS)
+        assert "bucket" not in repr(result.updated_state.sources["source"].options)
+
     def test_set_pipeline_rejects_aws_s3_named_source_for_web_authored_session_without_mutating_state(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
-        view, snapshot = _web_authored_policy_pair(catalog)
+        view, snapshot = _restricted_policy_pair(
+            catalog,
+            PluginId("source", "aws_s3"),
+            PluginUnavailableReason.PROFILE_UNAVAILABLE,
+        )
         args = _valid_pipeline_args()
         args.pop("source")
         args["sources"] = {
@@ -1241,13 +1302,18 @@ class TestAwsS3SourceComposerPolicy:
         assert result.updated_state is state
         assert result.updated_state.version == state.version
         assert result.data is not None
-        assert result.data["error"] == f"Source 'archive': {AWS_S3_SOURCE_POLICY_ERROR}"
-        assert result.data["error_code"] == "aws_s3_source_not_allowed"
+        assert "Source 'archive':" in result.data["error"]
+        assert "operator profile" in result.data["error"]
+        assert result.data["error_code"] == "profile_unavailable"
 
     def test_set_pipeline_rejects_aws_s3_legacy_source_for_web_authored_session_without_mutating_state(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
-        view, snapshot = _web_authored_policy_pair(catalog)
+        view, snapshot = _restricted_policy_pair(
+            catalog,
+            PluginId("source", "aws_s3"),
+            PluginUnavailableReason.PROFILE_UNAVAILABLE,
+        )
         args = _valid_pipeline_args()
         args["source"]["plugin"] = "aws_s3"
         args["source"]["options"] = dict(_VALID_AWS_S3_OPTIONS)
@@ -1258,8 +1324,8 @@ class TestAwsS3SourceComposerPolicy:
         assert result.updated_state is state
         assert result.updated_state.version == state.version
         assert result.data is not None
-        assert result.data["error"] == AWS_S3_SOURCE_POLICY_ERROR
-        assert result.data["error_code"] == "aws_s3_source_not_allowed"
+        assert "operator profile" in result.data["error"]
+        assert result.data["error_code"] == "profile_unavailable"
 
     def test_set_pipeline_allows_aws_s3_legacy_source_for_trained_operator_session(self) -> None:
         """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
@@ -1272,6 +1338,52 @@ class TestAwsS3SourceComposerPolicy:
 
         assert result.success is True
         assert result.updated_state.sources["source"].plugin == "aws_s3"
+
+    @pytest.mark.parametrize("source_shape", ["legacy", "named"])
+    def test_set_pipeline_accepts_operator_profiled_s3_source(self, source_shape: str) -> None:
+        state = _empty_state()
+        view, snapshot = _profiled_s3_policy_pair()
+        args = _valid_pipeline_args()
+        source = {
+            "plugin": "aws_s3",
+            "on_success": "main",
+            "options": dict(_VALID_AWS_S3_PROFILE_OPTIONS),
+            "on_validation_failure": "discard",
+        }
+        if source_shape == "legacy":
+            args["source"] = source
+        else:
+            args.pop("source")
+            args["sources"] = {"archive": source}
+        args["nodes"] = []
+        args["edges"] = []
+
+        result = execute_tool("set_pipeline", args, state, view, plugin_snapshot=snapshot)
+
+        assert result.success is True, result.data
+        persisted = next(iter(result.updated_state.sources.values()))
+        assert deep_thaw(persisted.options) == dict(_VALID_AWS_S3_PROFILE_OPTIONS)
+
+    def test_set_source_rejects_private_bucket_override_without_mutating_state(self) -> None:
+        state = _empty_state()
+        view, snapshot = _profiled_s3_policy_pair()
+
+        result = execute_tool(
+            "set_source",
+            {
+                "plugin": "aws_s3",
+                "on_success": "main",
+                "options": {**_VALID_AWS_S3_PROFILE_OPTIONS, "bucket": "attacker-bucket"},
+                "on_validation_failure": "discard",
+            },
+            state,
+            view,
+            plugin_snapshot=snapshot,
+        )
+
+        assert result.success is False
+        assert result.updated_state is state
+        assert "attacker-bucket" not in repr(result.data)
 
     def test_set_source_from_blob_rejects_aws_s3_for_web_authored_session_without_mutating_state(self) -> None:
         from elspeth.web.composer.tools.sources import _execute_set_source_from_blob, _ResolvedSourceBlob
@@ -1289,20 +1401,26 @@ class TestAwsS3SourceComposerPolicy:
             },
             creation_modality=CreationModality.VERBATIM,
         )
+        catalog = _mock_catalog()
+        view, snapshot = _restricted_policy_pair(
+            catalog,
+            PluginId("source", "aws_s3"),
+            PluginUnavailableReason.PROFILE_UNAVAILABLE,
+        )
 
         with patch("elspeth.web.composer.tools.sources._resolve_source_blob", return_value=resolved):
             result = _execute_set_source_from_blob(
                 {"blob_id": str(uuid4()), "on_success": "main", "options": {}},
                 state,
-                _web_authored_tool_context(),
+                ToolContext(catalog=view, plugin_snapshot=snapshot),
             )
 
         assert result.success is False
         assert result.updated_state is state
         assert result.updated_state.version == state.version
         assert result.data is not None
-        assert result.data["error"] == AWS_S3_SOURCE_POLICY_ERROR
-        assert result.data["error_code"] == "aws_s3_source_not_allowed"
+        assert "operator profile" in result.data["error"]
+        assert result.data["error_code"] == "profile_unavailable"
 
     def test_set_source_from_blob_allows_aws_s3_for_trained_operator_session(self) -> None:
         """Trained-operator (local MCP) sessions remain exempt, matching validation.py."""
@@ -1332,7 +1450,7 @@ class TestAwsS3SourceComposerPolicy:
         assert result.success is True
         assert result.updated_state.sources["source"].plugin == "aws_s3"
 
-    def test_prohibited_source_selection_explains_the_policy_not_a_repairable_setting(self) -> None:
+    def test_snapshot_prohibited_source_selection_explains_the_generic_policy(self) -> None:
         """A snapshot-declared prohibition must name the policy, not a code.
 
         Once ``build_plugin_snapshot`` declines ``source:aws_s3`` with
@@ -1356,7 +1474,7 @@ class TestAwsS3SourceComposerPolicy:
 
         assert violation is not None
         assert violation.error_code is PluginUnavailableReason.WEB_SURFACE_PROHIBITED
-        assert AWS_S3_SOURCE_POLICY_ERROR in violation.message
+        assert "prohibited on the web authoring surface" in violation.message
 
         result = execute_tool(
             "set_source",
@@ -1373,7 +1491,7 @@ class TestAwsS3SourceComposerPolicy:
 
         assert result.success is False
         assert result.data["error_code"] == "plugin_not_allowed_on_web"
-        assert AWS_S3_SOURCE_POLICY_ERROR in result.data["error"]
+        assert "prohibited on the web authoring surface" in result.data["error"]
 
     def test_prohibited_sink_selection_is_unaffected(self) -> None:
         """Only the SOURCE is prohibited; S3 writes stay authorable."""

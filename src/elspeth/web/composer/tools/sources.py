@@ -77,7 +77,6 @@ from elspeth.web.composer.tools.declarations import (
 from elspeth.web.interpretation_state import SOURCE_AUTHORING_KEY, SourceAuthoringMetadata, source_component_id
 from elspeth.web.provider_config_policy import (
     web_aws_s3_endpoint_url_policy_error,
-    web_aws_s3_source_policy_error,
 )
 from elspeth.web.sessions.models import blobs_table
 
@@ -578,20 +577,6 @@ def _execute_set_source(
     if plugin_error is not None:
         return _plugin_policy_failure(state, plugin_error)
 
-    # Mirror execution/validation.py's unconditional aws_s3-source ban for
-    # non-trained-operator sessions (reusing the same predicate so the two
-    # paths cannot drift). Checked independently of endpoint_url above:
-    # authoritative validation rejects every web-authored aws_s3 source
-    # regardless of endpoint_url, because reads use the server AWS
-    # credential chain with author-chosen bucket/key. Without this check
-    # here, a non-trained session could persist an aws_s3 source with no
-    # endpoint_url override — a state that passes mutation but can never
-    # pass dry-run/proposal validation.
-    if not context.plugin_snapshot.is_trained_operator:
-        source_policy_error = web_aws_s3_source_policy_error(plugin)
-        if source_policy_error is not None:
-            return _failure_result(state, source_policy_error, error_code="aws_s3_source_not_allowed")
-
     # Reject manual blob_ref injection.  The canonical write path for a
     # blob-backed source is set_source_from_blob, which forces the path to
     # the blob's authoritative storage_path.  set_source with a hand-crafted
@@ -741,17 +726,9 @@ def _execute_set_source_from_blob(
     endpoint_policy_error = web_aws_s3_endpoint_url_policy_error(resolved.plugin, resolved.options)
     if endpoint_policy_error is not None:
         return _failure_result(state, endpoint_policy_error)
-
-    # Mirror execution/validation.py's unconditional aws_s3-source ban for
-    # non-trained-operator sessions (see _execute_set_source above for the
-    # full rationale). Checked against the resolved plugin — blob binding
-    # can infer aws_s3 from an explicit ``plugin`` override even when the
-    # blob's own MIME type would infer something else — so a non-trained
-    # session cannot reach the same never-valid state via blob binding.
-    if not context.plugin_snapshot.is_trained_operator:
-        source_policy_error = web_aws_s3_source_policy_error(resolved.plugin)
-        if source_policy_error is not None:
-            return _failure_result(state, source_policy_error, error_code="aws_s3_source_not_allowed")
+    plugin_error = _validate_plugin_name(context, "source", resolved.plugin)
+    if plugin_error is not None:
+        return _plugin_policy_failure(state, plugin_error)
 
     source = SourceSpec(
         plugin=resolved.plugin,

@@ -32,7 +32,7 @@ from elspeth.web.execution._validation_model import (
     PolicyLoweredState,
 )
 from elspeth.web.execution.schemas import SemanticEdgeContractResponse
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 
 _BLOB_ID = UUID("5b7a4e0e-9e4a-4f0b-8d3e-2c0e1f0d3a4b")
 _BLOB_HASH = "a" * 64
@@ -137,6 +137,21 @@ def _web_snapshot() -> PluginAvailabilitySnapshot:
         usable_profile_aliases=(),
         selected_profile_aliases=(),
         binding_generation_fingerprint="materialization-phase-test-generation",
+    )
+
+
+def _profiled_s3_snapshot() -> PluginAvailabilitySnapshot:
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+    source_id = PluginId("source", "aws_s3")
+    return PluginAvailabilitySnapshot.create(
+        policy_hash="materialization-profiled-s3-policy",
+        principal_scope="local:alice",
+        available=unrestricted.available,
+        unavailable=(),
+        selected=unrestricted.selected,
+        usable_profile_aliases=((source_id, ("demo-input",)),),
+        selected_profile_aliases=((source_id, "demo-input"),),
+        binding_generation_fingerprint="materialization-profiled-s3-generation",
     )
 
 
@@ -372,7 +387,7 @@ def test_materialization_rejects_non_dict_yaml_as_an_uncaught_invariant() -> Non
             "aws_s3_endpoint_url_policy",
             "aws_s3_endpoint_url_not_allowed",
         ),
-        ("aws_source", _state(source=_source(plugin="aws_s3")), "aws_s3_source_policy", "aws_s3_source_not_allowed"),
+        ("aws_source", _state(source=_source(plugin="aws_s3")), "aws_s3_source_policy", "aws_s3_source_profile_required"),
     ],
 )
 def test_provider_policy_phases_read_authored_policy_and_preserve_failure_evidence(
@@ -441,3 +456,25 @@ def test_provider_policy_successes_detach_materialized_semantic_evidence(phase_n
     assert result.artifact.pipeline_yaml == artifact.pipeline_yaml
     assert result.artifact.authored.semantic_contracts[0].outcome == "satisfied"
     assert [(check.name, check.passed) for check in result.checks] == [(check_name, True)]
+
+
+def test_s3_source_policy_accepts_profile_lowered_source_evidence() -> None:
+    artifact = _materialized(
+        _state(
+            source=_source(
+                plugin="aws_s3",
+                options={
+                    "bucket": "elspeth-demo-input",
+                    "key": "incoming/records/input.csv",
+                    "region_name": "ap-southeast-1",
+                    "schema": {"mode": "observed"},
+                },
+            )
+        )
+    )
+
+    result = validate_aws_s3_source_policy(artifact, plugin_snapshot=_profiled_s3_snapshot())
+
+    assert isinstance(result, PhaseReport)
+    assert [(check.name, check.passed) for check in result.checks] == [("aws_s3_source_policy", True)]
+    assert "operator profile" in result.checks[0].detail

@@ -62,7 +62,6 @@ from elspeth.web.plugin_policy.models import (
 )
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
 from elspeth.web.plugin_policy.validation import validate_plugin_policy
-from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR, AWS_S3_SOURCE_POLICY_ERROR
 
 
 def validate_pipeline_for_trained_operator(
@@ -693,6 +692,83 @@ def test_operator_profile_lowering_preserves_authored_state() -> None:
     }
 
 
+def _s3_source_profile_policy_context() -> tuple[OperatorProfileRegistry, PluginAvailabilitySnapshot]:
+    settings = WebSettings.model_validate(
+        {
+            **_make_settings().model_dump(),
+            "plugin_allowlist": ["source:aws_s3"],
+            "deployment_aws_region": "ap-southeast-1",
+            "aws_s3_source_profiles": [
+                {
+                    "alias": "demo-input",
+                    "bucket": "operator-private-bucket-marker",
+                    "prefix": "incoming",
+                }
+            ],
+        }
+    )
+    runtime_config = RuntimeWebPluginConfig.from_settings(settings)
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime_config)
+    profiles = OperatorProfileRegistry(policy=policy, settings=runtime_config)
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+    source_id = PluginId("source", "aws_s3")
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash=policy.policy_hash,
+        principal_scope="local:alice",
+        available=unrestricted.available,
+        unavailable=(),
+        selected=unrestricted.selected,
+        usable_profile_aliases=((source_id, ("demo-input",)),),
+        selected_profile_aliases=((source_id, "demo-input"),),
+        binding_generation_fingerprint="s3-profile-lowering-generation",
+    )
+    return profiles, snapshot
+
+
+def test_s3_source_profile_lowering_rejects_unsafe_final_key_with_actionable_value_free_finding() -> None:
+    profiles, snapshot = _s3_source_profile_policy_context()
+    state = _make_state(
+        source_plugin="aws_s3",
+        source_options={
+            "profile": "demo-input",
+            "key": "é" * 508,
+            "format": "csv",
+            "schema": {"mode": "observed"},
+        },
+        outputs=(_make_output(),),
+    )
+
+    result = validate_plugin_policy(state, snapshot=snapshot, profile_registry=profiles, catalog=create_catalog_service())
+
+    assert len(result.findings) == 1
+    finding = result.findings[0]
+    assert finding.stage == "operator_profile_options"
+    assert "relative object key" in finding.message
+    assert "operator profile is no longer available" not in finding.message
+    assert "é" not in finding.message
+
+
+def test_s3_source_profile_alias_remains_mandatory_when_snapshot_has_one_selected_profile() -> None:
+    profiles, snapshot = _s3_source_profile_policy_context()
+    state = _make_state(
+        source_plugin="aws_s3",
+        source_options={
+            "key": "records/input.csv",
+            "format": "csv",
+            "schema": {"mode": "observed"},
+        },
+        outputs=(_make_output(),),
+    )
+
+    result = validate_plugin_policy(state, snapshot=snapshot, profile_registry=profiles, catalog=create_catalog_service())
+
+    assert len(result.findings) == 1
+    assert result.findings[0].error_code == "profile_unavailable"
+    assert "set the 'profile' option" in result.findings[0].message
+    assert result.executable_state is state
+    assert "profile" not in state.sources["source"].options
+
+
 def _bedrock_prompt_policy_context() -> tuple[OperatorProfileRegistry, PluginAvailabilitySnapshot]:
     from elspeth.web.dependencies import create_catalog_service
 
@@ -965,6 +1041,60 @@ def test_public_facade_resolves_runtime_dependencies_at_call_time() -> None:
     instantiate_plugins.assert_called_once()
     build_graph.assert_called_once()
     validate_routes.assert_called_once()
+
+
+def test_canonical_web_validation_lowers_profiled_s3_source_before_runtime_construction() -> None:
+    profiles, snapshot = _s3_source_profile_policy_context()
+    state = _make_state(
+        source_plugin="aws_s3",
+        source_options={
+            "profile": "demo-input",
+            "key": "records/input.csv",
+            "format": "csv",
+            "schema": {"mode": "observed"},
+        },
+        outputs=(_make_output(),),
+    )
+    yaml_generator = _FakeYamlGenerator("sources: {}\nsinks: {}\n")
+    graph = _runtime_graph_mock()
+
+    with (
+        patch("elspeth.web.execution.validation.load_settings_from_yaml_string", return_value=_fake_settings()) as load_settings,
+        patch(
+            "elspeth.web.execution.validation.instantiate_runtime_plugins",
+            return_value=_FakeRuntimeBundle(),
+        ) as instantiate_plugins,
+        patch("elspeth.web.execution.validation.build_runtime_graph", return_value=graph),
+        patch(
+            "elspeth.web.execution.validation.assemble_and_validate_pipeline_config",
+            return_value=_fake_pipeline_config(),
+        ),
+    ):
+        result = validation_module.validate_pipeline(
+            state,
+            _make_settings(),
+            yaml_generator,
+            plugin_snapshot=snapshot,
+            profile_registry=profiles,
+            catalog=create_catalog_service(),
+            session_id="test-session",
+        )
+
+    assert result.is_valid is True
+    assert all(check.passed for check in result.checks)
+    assert len(yaml_generator.rendered_states) == 1
+    rendered_options = yaml_generator.rendered_states[0].sources["source"].options
+    assert rendered_options == {
+        "bucket": "operator-private-bucket-marker",
+        "key": "incoming/records/input.csv",
+        "region_name": "ap-southeast-1",
+        "format": "csv",
+        "schema": {"mode": "observed"},
+    }
+    assert "profile" in state.sources["source"].options
+    assert "bucket" not in state.sources["source"].options
+    load_settings.assert_called_once()
+    instantiate_plugins.assert_called_once()
 
 
 def test_public_facade_resolves_bounded_and_dict_loaders_at_call_time() -> None:
@@ -1986,10 +2116,16 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         assert all(error.error_code != "aws_s3_endpoint_url_not_allowed" for error in result.errors)
         mock_load.assert_called_once()
 
-    def test_aws_s3_source_endpoint_url_is_blocked_before_settings_or_plugins(self) -> None:
+    def test_profiled_aws_s3_source_endpoint_url_is_blocked_before_materialization(self) -> None:
+        profiles, snapshot = _s3_source_profile_policy_context()
         state = _make_state(
             source_plugin="aws_s3",
-            source_options={"endpoint_url": self._ENDPOINT_SENTINEL},
+            source_options={
+                "profile": "demo-input",
+                "key": "records/input.csv",
+                "schema": {"mode": "observed"},
+                "endpoint_url": self._ENDPOINT_SENTINEL,
+            },
             outputs=(_make_output(name="results"),),
         )
         settings = _make_settings()
@@ -2000,17 +2136,27 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
             patch("elspeth.web.execution.validation.load_settings_from_yaml_string") as mock_load,
             patch("elspeth.web.execution.validation.instantiate_runtime_plugins") as mock_instantiate,
         ):
-            result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
+            result = validation_module.validate_pipeline(
+                state,
+                settings,
+                mock_yaml_gen,
+                plugin_snapshot=snapshot,
+                profile_registry=profiles,
+                catalog=create_catalog_service(),
+                session_id="test-session",
+            )
 
         assert result.is_valid is False
-        assert _check(result, "aws_s3_endpoint_url_policy").passed is False
-        assert result.errors[0].error_code == "aws_s3_endpoint_url_not_allowed"
+        assert _check(result, "operator_profile_options").passed is False
+        assert result.errors[0].error_code == "profile_unavailable"
         assert result.errors[0].component_id == "source"
         assert result.errors[0].component_type == "source"
+        assert "not authorable" in result.errors[0].message
+        assert self._ENDPOINT_SENTINEL not in result.errors[0].message
         assert result.readiness.execution_ready is False
-        assert result.readiness.blockers[0].code == "aws_s3_endpoint_url_policy"
+        assert result.readiness.blockers[0].code == "profile_unavailable"
         assert result.readiness.blockers[0].component_id == "source"
-        mock_yaml_gen.generate_yaml.assert_called_once_with(state)
+        mock_yaml_gen.generate_yaml.assert_not_called()
         mock_load.assert_not_called()
         mock_instantiate.assert_not_called()
 
@@ -2046,14 +2192,10 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         mock_load.assert_not_called()
         mock_instantiate.assert_not_called()
 
-    @pytest.mark.parametrize("endpoint_options", [{}, {"endpoint_url": None}])
-    def test_aws_s3_source_is_blocked_even_without_endpoint_url(
-        self,
-        endpoint_options: dict[str, object],
-    ) -> None:
+    def test_aws_s3_source_requires_a_configured_operator_profile(self) -> None:
         state = _make_state(
             source_plugin="aws_s3",
-            source_options=endpoint_options,
+            source_options={},
             outputs=(_make_output(name="results"),),
         )
         settings = _make_settings()
@@ -2067,12 +2209,12 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
             result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
 
         assert result.is_valid is False
-        assert _check(result, "aws_s3_endpoint_url_policy").passed is True
-        assert _check(result, "aws_s3_source_policy").passed is False
-        assert result.errors[0].message == AWS_S3_SOURCE_POLICY_ERROR
-        assert result.errors[0].error_code == "aws_s3_source_not_allowed"
+        assert _check(result, "operator_profile_options").passed is False
+        assert result.errors[0].error_code == "profile_unavailable"
+        assert "operator profile" in result.errors[0].message
         assert result.errors[0].component_id == "source"
-        assert result.readiness.blockers[0].code == "aws_s3_source_policy"
+        assert result.readiness.blockers[0].code == "profile_unavailable"
+        mock_yaml_gen.generate_yaml.assert_not_called()
         mock_load.assert_not_called()
         mock_instantiate.assert_not_called()
 
@@ -2095,7 +2237,7 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
 
         assert _check(result, "aws_s3_endpoint_url_policy").passed is True
         assert _check(result, "aws_s3_source_policy").passed is True
-        assert all(error.error_code != "aws_s3_source_not_allowed" for error in result.errors)
+        assert all(error.error_code != "aws_s3_source_profile_required" for error in result.errors)
         mock_load.assert_called_once()
 
     @pytest.mark.parametrize("endpoint_options", [{}, {"endpoint_url": None}])
@@ -2129,9 +2271,15 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         mock_instantiate.assert_not_called()
 
     def test_aws_s3_endpoint_url_is_redacted_from_all_validation_surfaces(self) -> None:
+        profiles, snapshot = _s3_source_profile_policy_context()
         state = _make_state(
             source_plugin="aws_s3",
-            source_options={"endpoint_url": self._ENDPOINT_SENTINEL},
+            source_options={
+                "profile": "demo-input",
+                "key": "records/input.csv",
+                "schema": {"mode": "observed"},
+                "endpoint_url": self._ENDPOINT_SENTINEL,
+            },
             outputs=(_make_output(name="results"),),
         )
         settings = _make_settings()
@@ -2139,9 +2287,17 @@ class TestValidatePipelineAwsS3EndpointUrlPolicy:
         mock_yaml_gen.generate_yaml.return_value = "sources: {}\nsinks: {}\n"
 
         with capture_logs() as logs:
-            result = validate_pipeline_for_web_principal(state, settings, mock_yaml_gen)
+            result = validation_module.validate_pipeline(
+                state,
+                settings,
+                mock_yaml_gen,
+                plugin_snapshot=snapshot,
+                profile_registry=profiles,
+                catalog=create_catalog_service(),
+                session_id="test-session",
+            )
 
-        assert result.errors[0].message == AWS_S3_ENDPOINT_URL_POLICY_ERROR
+        assert "not authorable" in result.errors[0].message
         serialized_surfaces = (
             result.model_dump_json(),
             repr(result.checks),

@@ -41,9 +41,9 @@ LLM_RETRY_BUDGET_POLICY_ERROR: Final[str] = (
     "Set max_capacity_retry_seconds to a small positive value or use pool_size > 1 for pooled retry handling."
 )
 AWS_S3_SOURCE_POLICY_ERROR: Final[str] = (
-    "Web-authored aws_s3 sources are disabled because they read with the server AWS "
-    "credential chain while bucket and key are author-controlled. Use an operator-controlled "
-    "connector, allowlisted ingestion job, or batch/CLI runtime for S3 reads."
+    "Web-authored aws_s3 sources require an available operator profile that fixes the bucket, "
+    "optional prefix, deployment region, and default-chain authentication. Ask an operator to "
+    "configure that profile, or use a batch/CLI runtime for raw S3 source options."
 )
 AWS_S3_ENDPOINT_URL_POLICY_ERROR: Final[str] = (
     "Web-authored aws_s3 source and sink options may not set endpoint_url. "
@@ -62,13 +62,19 @@ _INT_ADAPTER: Final[TypeAdapter[int]] = TypeAdapter(int)
     source_param="plugin",
     suppresses=("R1", "R5"),
     invariant=(
-        "non-aws_s3 source plugins are ignored; every aws_s3 source returns the static "
-        "policy error because S3 reads would use server credentials with author-chosen keys; never raises"
+        "non-aws_s3 source plugins are ignored; an aws_s3 source with an available operator profile "
+        "is admitted; otherwise returns one static profile-required policy error; never raises"
     ),
 )
-def web_aws_s3_source_policy_error(plugin: str | None) -> str | None:
-    """Reject web-authored AWS S3 sources that would read with server AWS credentials."""
+def web_aws_s3_source_policy_error(
+    plugin: str | None,
+    *,
+    operator_profile_available: bool = False,
+) -> str | None:
+    """Require profile-derived authority for a Web-authored AWS S3 source."""
     if plugin != "aws_s3":
+        return None
+    if operator_profile_available:
         return None
     return AWS_S3_SOURCE_POLICY_ERROR
 

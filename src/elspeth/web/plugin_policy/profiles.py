@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import re
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -12,17 +13,81 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
-from elspeth.core.llm_profiles import LLM_PROFILE_PRIVATE_FIELDS, CredentialScope, RuntimeLLMProfile, lower_llm_profile_options
+from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
+from elspeth.core.llm_profiles import (
+    LLM_PROFILE_PRIVATE_FIELDS,
+    CredentialScope,
+    RuntimeLLMProfile,
+    lower_llm_profile_options,
+    validate_profile_alias,
+)
 from elspeth.plugins.transforms.aws.guardrail_profiles import BedrockGuardrailProfileSettings
-from elspeth.plugins.transforms.aws.textract_regions import is_supported_textract_region
+from elspeth.plugins.transforms.aws.textract_regions import is_supported_textract_region, is_well_formed_aws_region
 
 if TYPE_CHECKING:
     from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
     from elspeth.web.config import WebSettings
     from elspeth.web.plugin_policy.models import PluginId, WebPluginPolicy
+
+
+_S3_MAX_BUCKET_CHARS = 2048
+_S3_MAX_KEY_BYTES = 1024
+
+
+def _validate_relative_s3_path(value: str, *, field_name: str) -> str:
+    """Validate one canonical relative S3 path without normalizing attacker input."""
+    if not value or value != value.strip():
+        raise ValueError(f"{field_name} must be a non-blank canonical relative S3 path")
+    if value.startswith("/") or value.endswith("/") or "\\" in value:
+        raise ValueError(f"{field_name} must be a canonical relative S3 path")
+    if re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", value) is not None:
+        raise ValueError(f"{field_name} must not use an absolute drive or URI scheme")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise ValueError(f"{field_name} must not contain control characters")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"{field_name} must not contain empty or traversal segments")
+    return value
+
+
+class AWSS3SourceProfileSettings(BaseModel):
+    """Operator-owned binding for one Web-authorable S3 source location."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    alias: str
+    bucket: str = Field(repr=False)
+    prefix: str | None = Field(default=None, repr=False)
+
+    @field_validator("alias")
+    @classmethod
+    def _validate_alias(cls, value: str) -> str:
+        validate_profile_alias(value)
+        return value
+
+    @field_validator("bucket")
+    @classmethod
+    def _validate_bucket(cls, value: str) -> str:
+        if not value or value != value.strip() or len(value) > _S3_MAX_BUCKET_CHARS:
+            raise ValueError("bucket must be non-blank, canonical, and at most 2048 characters")
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+            raise ValueError("bucket must not contain control characters")
+        return reject_operator_required_placeholder_value(value, field_name="bucket")
+
+    @field_validator("prefix")
+    @classmethod
+    def _validate_prefix(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        validated = _validate_relative_s3_path(value, field_name="prefix")
+        if len(validated.encode("utf-8")) >= _S3_MAX_KEY_BYTES:
+            raise ValueError("prefix must leave room for a relative S3 object key")
+        return validated
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +99,7 @@ class RuntimeWebPluginConfig:
     default_llm_profile: str | None
     bedrock_guardrail_profiles: tuple[BedrockGuardrailProfileSettings, ...] = field(repr=False)
     bedrock_guardrail_default_profiles: tuple[tuple[str, str], ...]
+    aws_s3_source_profiles: tuple[AWSS3SourceProfileSettings, ...] = field(repr=False)
     deployment_aws_region: str | None
 
     @property
@@ -56,6 +122,7 @@ class RuntimeWebPluginConfig:
             default_llm_profile=settings.default_llm_profile,
             bedrock_guardrail_profiles=tuple(sorted(settings.bedrock_guardrail_profiles, key=lambda profile: profile.alias)),
             bedrock_guardrail_default_profiles=tuple(sorted(settings.bedrock_guardrail_default_profiles.items())),
+            aws_s3_source_profiles=tuple(sorted(settings.aws_s3_source_profiles, key=lambda profile: profile.alias)),
             deployment_aws_region=settings.deployment_aws_region,
         )
 
@@ -510,6 +577,203 @@ class _BedrockGuardrailProfileResolver:
             raise ValueError("profile_unavailable") from None
 
 
+_S3_SOURCE_PUBLIC_OPTIONS = (
+    "key",
+    "format",
+    "csv_options",
+    "json_options",
+    "columns",
+    "field_mapping",
+    "schema",
+    "on_validation_failure",
+)
+_S3_SOURCE_PRIVATE_OPTIONS = frozenset(
+    {
+        "bucket",
+        "prefix",
+        "region",
+        "region_name",
+        "auth_mode",
+        "endpoint",
+        "endpoint_url",
+        "credential",
+        "credentials",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+        "access_key",
+        "secret_key",
+        "session_token",
+    }
+)
+
+
+class _S3SourceProfileResolver:
+    def __init__(self, profiles: tuple[AWSS3SourceProfileSettings, ...], *, region: str) -> None:
+        if not profiles or not is_well_formed_aws_region(region):
+            raise ValueError("profile_unavailable")
+        self._profiles = {profile.alias: profile for profile in profiles}
+        self._region = region
+
+    def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
+        from elspeth.web.catalog.schemas import PluginSchemaInfo
+
+        raw_properties = full_schema.json_schema.get("properties", {})
+        if not isinstance(raw_properties, dict):
+            raise ValueError("malformed_profile_schema")
+        safe_properties: dict[str, Any] = {
+            "profile": {
+                "type": "string",
+                "enum": list(available_aliases),
+                "description": "Operator-approved S3 source profile alias",
+            }
+        }
+        for name in _S3_SOURCE_PUBLIC_OPTIONS:
+            raw_schema = raw_properties.get(name)
+            if not isinstance(raw_schema, dict):
+                raise ValueError("malformed_profile_schema")
+            safe_properties[name] = deepcopy(raw_schema)
+        safe_properties["key"].update(
+            {
+                "description": "Relative object key within the operator-approved S3 source prefix",
+                "pattern": (
+                    r"^(?!/)(?![A-Za-z][A-Za-z0-9+.-]*:)(?!.*\\)"
+                    r"(?!.*(?:^|/)(?:\.|\.\.)(?:/|$))(?!.*//)(?!.*\/$).+$"
+                ),
+            }
+        )
+        raw_required = full_schema.json_schema.get("required", ())
+        required = [
+            "profile",
+            *(name for name in raw_required if isinstance(name, str) and name in _S3_SOURCE_PUBLIC_OPTIONS),
+        ]
+        public_json_schema: dict[str, Any] = {
+            "type": "object",
+            "properties": safe_properties,
+            "required": required,
+            "additionalProperties": False,
+        }
+        definitions = full_schema.json_schema.get("$defs", {})
+        referenced_definitions: dict[str, Any] = {}
+        pending = _schema_refs(public_json_schema)
+        while pending:
+            definition_name = pending.pop()
+            if definition_name in referenced_definitions:
+                continue
+            definition = definitions.get(definition_name) if isinstance(definitions, dict) else None
+            if isinstance(definition, dict):
+                referenced_definitions[definition_name] = deepcopy(definition)
+                pending.update(_schema_refs(definition))
+        if referenced_definitions:
+            public_json_schema["$defs"] = referenced_definitions
+
+        raw_fields = full_schema.knob_schema.get("fields", ())
+        canonical_fields = {
+            raw_field["name"]: raw_field
+            for raw_field in raw_fields
+            if isinstance(raw_field, dict) and isinstance(raw_field.get("name"), str)
+        }
+        fields: list[dict[str, Any]] = [
+            {
+                "name": "profile",
+                "label": "Profile",
+                "kind": "enum",
+                "required": True,
+                "nullable": False,
+                "enum": list(available_aliases),
+                "description": "Operator-approved S3 source profile alias",
+            }
+        ]
+        for name in _S3_SOURCE_PUBLIC_OPTIONS:
+            try:
+                field_projection = deepcopy(canonical_fields[name])
+            except KeyError as exc:
+                raise ValueError("malformed_profile_schema") from exc
+            field_projection["required"] = name in required
+            if name == "key":
+                field_projection["label"] = "Relative Object Key"
+                field_projection["description"] = "Relative object key within the operator-approved S3 source prefix"
+            fields.append(field_projection)
+        return PluginSchemaInfo(
+            name=full_schema.name,
+            plugin_type=full_schema.plugin_type,
+            description=full_schema.description,
+            json_schema=public_json_schema,
+            knob_schema={"fields": fields},
+            composer_hints=(
+                "Select an operator-approved S3 source profile and provide only a relative object key.",
+                "The server supplies the profile's private runtime binding.",
+                "Choose the parser, schema, and validation-failure routing for the selected object.",
+            ),
+            secret_requirements=(),
+            web_config_authority=full_schema.web_config_authority,
+            policy_capabilities=full_schema.policy_capabilities,
+        )
+
+    def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
+        try:
+            profile = self._profiles[alias]
+        except KeyError:
+            raise ValueError("profile_unavailable") from None
+        if set(safe_options) & _S3_SOURCE_PRIVATE_OPTIONS:
+            raise ValueError("private_profile_option")
+        if set(safe_options) - set(_S3_SOURCE_PUBLIC_OPTIONS):
+            raise ValueError("private_profile_option")
+        relative_key = safe_options.get("key")
+        if type(relative_key) is not str:
+            raise ValueError("unsafe_s3_object_key")
+        try:
+            relative_key = _validate_relative_s3_path(relative_key, field_name="key")
+        except ValueError:
+            raise ValueError("unsafe_s3_object_key") from None
+        executable_key = f"{profile.prefix}/{relative_key}" if profile.prefix is not None else relative_key
+        if len(executable_key.encode("utf-8")) > _S3_MAX_KEY_BYTES:
+            raise ValueError("unsafe_s3_object_key")
+        executable = {
+            **safe_options,
+            "bucket": profile.bucket,
+            "key": executable_key,
+            "region_name": self._region,
+        }
+        return LoweredPluginConfig(
+            executable_options=MappingProxyType(executable),
+            audit_safe_options=MappingProxyType({"profile": alias, **safe_options}),
+        )
+
+    def profile_availability(
+        self,
+        principal: str,
+        inventory: ProfileCredentialInventory,
+    ) -> tuple[ProfileAvailability, ...]:
+        del principal, inventory
+        return tuple(
+            ProfileAvailability(
+                alias=alias,
+                credential_scope=None,
+                usable=True,
+                generation=hashlib.sha256(
+                    json.dumps(
+                        {
+                            "bucket": profile.bucket,
+                            "prefix": profile.prefix,
+                            "region_name": self._region,
+                            "auth_mode": "default_chain",
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+            )
+            for alias, profile in self._profiles.items()
+        )
+
+    def check_local_requirements(self, alias: str) -> LocalRequirementResult:
+        return LocalRequirementResult(available=alias in self._profiles)
+
+    def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None:
+        return usable_aliases[0] if len(usable_aliases) == 1 else None
+
+
 _TEXTRACT_PRIVATE_OPTIONS = frozenset(
     {
         "region",
@@ -679,6 +943,17 @@ class OperatorProfileRegistry:
                     plugin_profiles,
                     default_alias=defaults.get(plugin_name),
                 )
+        if (
+            settings.aws_s3_source_profiles
+            and type(settings.deployment_aws_region) is str
+            and is_well_formed_aws_region(settings.deployment_aws_region)
+            and importlib.util.find_spec("boto3") is not None
+        ):
+            assert settings.deployment_aws_region is not None
+            self._resolvers[PluginId("source", "aws_s3")] = _S3SourceProfileResolver(
+                settings.aws_s3_source_profiles,
+                region=settings.deployment_aws_region,
+            )
         if is_supported_textract_region(settings.deployment_aws_region) and importlib.util.find_spec("boto3") is not None:
             assert settings.deployment_aws_region is not None
             self._resolvers[PluginId("transform", "aws_textract_document_analysis")] = _TextractDeploymentProfileResolver(
@@ -734,7 +1009,21 @@ class OperatorProfileRegistry:
             "composer_hints": public_schema.composer_hints,
             "secret_requirements": public_schema.secret_requirements,
         }
-        if isinstance(resolver, _TextractDeploymentProfileResolver):
+        if isinstance(resolver, _S3SourceProfileResolver):
+            example_alias = available_aliases[0] if available_aliases else "operator-approved-profile"
+            updates["example_use"] = (
+                "sources:\n"
+                "  s3_input:\n"
+                "    plugin: aws_s3\n"
+                "    on_success: output\n"
+                "    options:\n"
+                f"      profile: {example_alias}\n"
+                "      key: records/input.csv\n"
+                "      format: csv\n"
+                "      schema: {mode: observed}\n"
+                "      on_validation_failure: discard"
+            )
+        elif isinstance(resolver, _TextractDeploymentProfileResolver):
             updates["example_use"] = (
                 "transform:\n"
                 "  plugin: aws_textract_document_analysis\n"
@@ -755,18 +1044,29 @@ class OperatorProfileRegistry:
     ) -> PluginAssistance:
         """Project plugin guidance through the same operator-profile authority."""
         resolver = self._resolvers.get(plugin_id)
-        if not isinstance(resolver, _TextractDeploymentProfileResolver):
-            return full_assistance
-        return PluginAssistance(
-            plugin_name=full_assistance.plugin_name,
-            issue_code=full_assistance.issue_code,
-            summary="Analyze S3-backed documents asynchronously through the deployment-owned Amazon Textract profile.",
-            composer_hints=(
-                "Set profile to deployment; the server owns the Amazon Textract runtime binding.",
-                "Provide bucket_field and key_field, choose feature_types, and map at least one output field.",
-                "The S3 bucket location is verified against the deployment before document analysis starts.",
-            ),
-        )
+        if isinstance(resolver, _S3SourceProfileResolver):
+            return PluginAssistance(
+                plugin_name=full_assistance.plugin_name,
+                issue_code=full_assistance.issue_code,
+                summary="Read bounded CSV, JSON-array, or JSONL rows through an operator-approved S3 source profile.",
+                composer_hints=(
+                    "Select an available profile and provide a canonical relative object key.",
+                    "Choose the parser, schema, and validation-failure routing for the selected object.",
+                    "Use a different approved profile when the object belongs to a different operator-managed location.",
+                ),
+            )
+        if isinstance(resolver, _TextractDeploymentProfileResolver):
+            return PluginAssistance(
+                plugin_name=full_assistance.plugin_name,
+                issue_code=full_assistance.issue_code,
+                summary="Analyze S3-backed documents asynchronously through the deployment-owned Amazon Textract profile.",
+                composer_hints=(
+                    "Set profile to deployment; the server owns the Amazon Textract runtime binding.",
+                    "Provide bucket_field and key_field, choose feature_types, and map at least one output field.",
+                    "The S3 bucket location is verified against the deployment before document analysis starts.",
+                ),
+            )
+        return full_assistance
 
     def lower_options(
         self,

@@ -41,6 +41,7 @@ def _build_view(
     principal_scope: str = "local:alice",
     plugin_allowlist: tuple[str, ...] = (),
     deployment_aws_region: str | None = None,
+    aws_s3_source_profiles: tuple[dict[str, str], ...] = (),
 ) -> PolicyCatalogView:
     settings = WebSettings(
         composer_max_composition_turns=4,
@@ -50,6 +51,7 @@ def _build_view(
         shareable_link_signing_key=SecretBytes(b"0123456789abcdef0123456789abcdef"),
         plugin_allowlist=plugin_allowlist,
         deployment_aws_region=deployment_aws_region,
+        aws_s3_source_profiles=aws_s3_source_profiles,
         llm_profiles={
             "task-role": {
                 "provider": "bedrock",
@@ -182,6 +184,64 @@ def test_trained_operator_textract_assistance_retains_raw_configuration_guidance
     assert "explicit AWS credentials" in guidance
 
 
+def test_s3_source_web_discovery_and_assistance_expose_only_profile_safe_authoring() -> None:
+    from elspeth.web.composer.planner_authoring_aids import discovery_digest
+
+    view = _build_view(
+        plugin_allowlist=("source:aws_s3",),
+        deployment_aws_region="ap-southeast-1",
+        aws_s3_source_profiles=(
+            {
+                "alias": "demo-input",
+                "bucket": "operator-private-bucket-marker",
+                "prefix": "operator-private-prefix-marker",
+            },
+        ),
+    )
+
+    summary = next(item for item in view.list_sources() if item.name == "aws_s3")
+    field_names = {field.name for field in summary.config_fields}
+    assert {"profile", "key", "format", "schema", "on_validation_failure"} <= field_names
+    assert not field_names & {
+        "bucket",
+        "prefix",
+        "region",
+        "region_name",
+        "auth_mode",
+        "endpoint_url",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    }
+    assert summary.example_use is not None
+    assert "profile: demo-input" in summary.example_use
+    assert "key: records/input.csv" in summary.example_use
+    assert "operator-private" not in summary.model_dump_json()
+    assert "bucket:" not in summary.example_use
+    assert "region" not in summary.example_use
+    assert "endpoint" not in summary.example_use
+    assert "credential" not in summary.example_use
+
+    schema = view.get_schema("source", "aws_s3")
+    assert schema.json_schema["properties"]["profile"]["enum"] == ["demo-input"]
+    digest_entry = next(item for item in discovery_digest(view)["sources"] if item["name"] == "aws_s3")
+    assert digest_entry["profile_aliases"] == ["demo-input"]
+    assert {"profile", "key", "schema"} <= set(digest_entry["required_options"])
+
+    result = _execute_get_plugin_assistance(
+        {"plugin_type": "source", "plugin_name": "aws_s3"},
+        CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+        ToolContext(catalog=view, plugin_snapshot=view.snapshot),
+    )
+    assert result.success is True
+    guidance = " ".join((result.data["summary"], *result.data["composer_hints"]))
+    assert "profile" in guidance.casefold()
+    assert "relative" in guidance.casefold()
+    assert "operator-private" not in guidance
+    for private_name in ("bucket", "prefix", "region", "endpoint", "credential"):
+        assert private_name not in guidance.casefold()
+
+
 def test_hidden_schema_uses_sanitized_closed_error(view: PolicyCatalogView) -> None:
     with pytest.raises(ValueError) as exc_info:
         view.get_schema("transform", "azure_prompt_shield")
@@ -189,8 +249,8 @@ def test_hidden_schema_uses_sanitized_closed_error(view: PolicyCatalogView) -> N
     assert str(exc_info.value) == "plugin_not_enabled"
 
 
-def test_web_prohibited_source_is_coherent_across_every_reader() -> None:
-    """All three readers of one prohibition must agree.
+def test_unconfigured_profiled_source_is_coherent_across_every_reader() -> None:
+    """All three readers of one unavailable profile must agree.
 
     ``PolicyCatalogView`` answers "what exists" (``list_*``), "why not"
     (``unavailable_reason``) and "configure it" (``get_schema``) from the same
@@ -198,22 +258,22 @@ def test_web_prohibited_source_is_coherent_across_every_reader() -> None:
     the listing but still schema-readable, or hidden with no reason attached,
     leaves the composer able to name the plugin and be told nothing it can act
     on. Kind-qualified identity is what keeps the aws_s3 SINK fully usable
-    while the SOURCE is refused.
+    while the unconfigured SOURCE is refused.
     """
     view = _build_view(plugin_allowlist=("source:aws_s3", "sink:aws_s3"))
     source_id = PluginId("source", "aws_s3")
 
     assert "aws_s3" not in {item.name for item in view.list_sources()}
     assert "aws_s3" in {item.name for item in view.list_sinks()}
-    assert view.unavailable_reason(source_id) is PluginUnavailableReason.WEB_SURFACE_PROHIBITED
+    assert view.unavailable_reason(source_id) is PluginUnavailableReason.PROFILE_UNAVAILABLE
     assert view.unavailable_reason(PluginId("sink", "aws_s3")) is None
     with pytest.raises(ValueError, match="plugin_not_enabled"):
         view.get_schema("source", "aws_s3")
     assert view.get_schema("sink", "aws_s3").name == "aws_s3"
 
 
-def test_trained_operator_view_still_offers_the_web_prohibited_source() -> None:
-    """The local MCP projection keeps the plugin the web surface refuses."""
+def test_trained_operator_view_still_offers_raw_s3_source_configuration() -> None:
+    """The local MCP projection keeps unrestricted raw S3 configuration."""
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     view = PolicyCatalogView.for_trained_operator(catalog, snapshot)

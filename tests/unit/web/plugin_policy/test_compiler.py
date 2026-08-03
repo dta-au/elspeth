@@ -74,14 +74,7 @@ def test_required_llm_source_compiles_with_isolated_registration() -> None:
     assert PluginId("source", "llm") in policy.authorized
 
 
-def test_compiling_a_categorically_prohibited_allowlist_entry_warns_at_boot() -> None:
-    """``source:aws_s3`` is a deliberate carve-out (R2-F1): the allowlist can
-    authorize it for the deployment's own runtime, but the web authoring
-    surface refuses it categorically (``provider_config_policy.py``). The
-    predicate is name-static — it needs no principal or credential state — so
-    the compiler can and should surface it at boot, not only when a
-    principal-scoped snapshot later declines it.
-    """
+def test_compiling_profiled_s3_allowlist_does_not_claim_categorical_prohibition() -> None:
     with capture_logs() as logs:
         policy = compile_web_plugin_policy(
             registry=_isolated_manager_with_llm_source(),
@@ -89,10 +82,7 @@ def test_compiling_a_categorically_prohibited_allowlist_entry_warns_at_boot() ->
         )
 
     assert PluginId("source", "aws_s3") in policy.authorized
-    warnings = [entry for entry in logs if entry.get("log_level") == "warning"]
-    assert len(warnings) == 1
-    assert warnings[0]["event"] == "web_plugin_policy_allowlist_contains_categorical_prohibition"
-    assert warnings[0]["plugin_ids"] == ["source:aws_s3"]
+    assert [entry for entry in logs if entry.get("log_level") == "warning"] == []
 
 
 def test_compiling_without_a_categorically_prohibited_entry_does_not_warn() -> None:

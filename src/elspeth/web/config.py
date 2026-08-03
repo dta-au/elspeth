@@ -32,6 +32,7 @@ from elspeth.web.auth.urls import (
     validate_oidc_browser_origins,
     validate_oidc_issuer,
 )
+from elspeth.web.plugin_policy.profiles import AWSS3SourceProfileSettings
 from elspeth.web.validation import (
     SERVER_SECRET_RESERVED_PREFIX,
     is_reserved_server_secret_name,
@@ -352,6 +353,7 @@ class WebSettings(BaseModel):
     default_llm_profile: str | None = None
     bedrock_guardrail_profiles: tuple[BedrockGuardrailProfileSettings, ...] = ()
     bedrock_guardrail_default_profiles: Mapping[str, str] = Field(default_factory=dict)
+    aws_s3_source_profiles: tuple[AWSS3SourceProfileSettings, ...] = ()
     orphan_run_max_age_seconds: int = Field(default=3600, ge=60)
     orphan_run_check_interval_seconds: int = Field(default=300, ge=30)
 
@@ -723,6 +725,17 @@ class WebSettings(BaseModel):
                 raise ValueError("Bedrock Guardrail default profile must name a profile for the same plugin")
         return self
 
+    @field_validator("aws_s3_source_profiles")
+    @classmethod
+    def _validate_aws_s3_source_profiles(
+        cls,
+        profiles: tuple[AWSS3SourceProfileSettings, ...],
+    ) -> tuple[AWSS3SourceProfileSettings, ...]:
+        aliases = [profile.alias for profile in profiles]
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("AWS S3 source profile aliases must be unique")
+        return profiles
+
     @field_validator("operator_telemetry_service_name")
     @classmethod
     def _validate_operator_telemetry_service_name(cls, value: str) -> str:
@@ -1039,7 +1052,14 @@ class WebSettings(BaseModel):
 # Add new tuple-typed WebSettings fields here so settings_from_env() decodes
 # them. Scalar fields are handled by Pydantic.
 _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
-    {"cors_origins", "server_secret_allowlist", "oidc_authorization_allowed_origins", "plugin_allowlist", "bedrock_guardrail_profiles"}
+    {
+        "cors_origins",
+        "server_secret_allowlist",
+        "oidc_authorization_allowed_origins",
+        "plugin_allowlist",
+        "bedrock_guardrail_profiles",
+        "aws_s3_source_profiles",
+    }
 )
 _JSON_OBJECT_FIELDS: frozenset[str] = frozenset(
     {"plugin_preferences", "plugin_control_modes", "llm_profiles", "bedrock_guardrail_default_profiles"}
@@ -1135,6 +1155,7 @@ def settings_from_env() -> WebSettings:
             "default_llm_profile",
             "bedrock_guardrail_profiles",
             "bedrock_guardrail_default_profiles",
+            "aws_s3_source_profiles",
         }
         safe_paths = {
             str(item) for detail in error.errors(include_input=False) for item in detail.get("loc", ()) if isinstance(item, (str, int))

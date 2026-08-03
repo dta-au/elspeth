@@ -559,12 +559,14 @@ def _source_for(data: bytes, **config_overrides: Any) -> tuple[Any, _RuntimeClie
 class TestAWSS3SourceRegistrationAndParsing:
     def test_protocol_metadata_and_assistance(self) -> None:
         from elspeth.contracts import Determinism
+        from elspeth.contracts.plugin_capabilities import WebConfigAuthority
         from elspeth.plugins.sources.aws_s3_source import AWSS3Source
 
         assert AWSS3Source.name == "aws_s3"
         assert AWSS3Source.determinism is Determinism.IO_READ
         assert AWSS3Source.plugin_version == "1.0.0"
         assert AWSS3Source.source_file_hash.startswith("sha256:")
+        assert AWSS3Source.web_config_authority is WebConfigAuthority.OPERATOR_PROFILED
         assistance = AWSS3Source.get_agent_assistance()
         assert assistance is not None and assistance.summary
         assert assistance.composer_hints
@@ -575,7 +577,7 @@ class TestAWSS3SourceRegistrationAndParsing:
 
         assert "endpoint_url" not in allowed_secret_ref_fields("source", "aws_s3")
 
-    def test_registered_aws_s3_source_is_endpoint_url_gated(self) -> None:
+    def test_registered_aws_s3_source_fails_closed_without_operator_profile(self) -> None:
         from pathlib import Path
         from unittest.mock import MagicMock, patch
 
@@ -636,10 +638,12 @@ class TestAWSS3SourceRegistrationAndParsing:
                 catalog=catalog,
                 session_id="test-session",
             )
-        check = next(check for check in result.checks if check.name == "aws_s3_endpoint_url_policy")
+        check = next(check for check in result.checks if check.name == "operator_profile_options")
         assert check.passed is False
-        assert result.errors[0].error_code == "aws_s3_endpoint_url_not_allowed"
-        yaml_generator.generate_yaml.assert_called_once_with(state)
+        assert result.errors[0].error_code == "profile_unavailable"
+        assert "operator profile" in result.errors[0].message
+        assert "credential-canary" not in result.errors[0].message
+        yaml_generator.generate_yaml.assert_not_called()
         load_settings.assert_not_called()
         instantiate.assert_not_called()
 

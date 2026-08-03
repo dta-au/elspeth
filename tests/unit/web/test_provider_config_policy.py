@@ -38,24 +38,21 @@ class TestWebLlmBaseUrlPolicy:
 class TestWebAwsS3SourcePolicy:
     @pytest.mark.parametrize("plugin", ["csv", None, "json"])
     def test_allows_non_aws_s3_sources(self, plugin: str | None) -> None:
-        assert web_aws_s3_source_policy_error(plugin) is None
+        assert web_aws_s3_source_policy_error(plugin, operator_profile_available=False) is None
 
-    def test_rejects_aws_s3_source_without_echoing_bucket_or_key(self) -> None:
-        error = web_aws_s3_source_policy_error("aws_s3")
+    def test_rejects_aws_s3_source_without_operator_profile(self) -> None:
+        error = web_aws_s3_source_policy_error("aws_s3", operator_profile_available=False)
 
         assert error == AWS_S3_SOURCE_POLICY_ERROR
         assert "prod-confidential-bucket" not in error
         assert "payroll/ssn.csv" not in error
 
+    def test_allows_aws_s3_source_with_operator_profile(self) -> None:
+        assert web_aws_s3_source_policy_error("aws_s3", operator_profile_available=True) is None
+
 
 class TestWebSurfaceProhibitionExplanation:
-    """The prohibition must arrive as plain language, not a bare policy code.
-
-    ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED`` is the snapshot-level
-    declaration of this module's aws_s3-source ban; the composer renders it
-    through ``_PLUGIN_UNAVAILABLE_EXPLANATIONS``, which is keyed by reason and
-    read with a total lookup.
-    """
+    """A generic snapshot prohibition must arrive as plain language."""
 
     def test_every_unavailable_reason_has_an_explanation(self) -> None:
         """A reason without an entry raises KeyError mid-tool-call.
@@ -70,10 +67,9 @@ class TestWebSurfaceProhibitionExplanation:
         message = _plugin_unavailable_message("source", PluginUnavailableReason.WEB_SURFACE_PROHIBITED)
 
         assert PluginUnavailableReason.WEB_SURFACE_PROHIBITED.value in message
-        # The single source of truth is reused, so the two copies cannot drift.
-        assert AWS_S3_SOURCE_POLICY_ERROR in message
-        # It must not read as an operator-repairable gap (the other reasons do).
-        assert "no operator setting can enable it here" in message
+        assert "prohibited on the web authoring surface" in message
+        assert "aws_s3" not in message
+        assert "no operator setting can enable it here" not in message
 
 
 class TestWebAwsS3EndpointUrlPolicy:

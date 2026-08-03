@@ -35,7 +35,6 @@ from elspeth.web.composer.guided_blob_refs import reviewed_schema_declared_field
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_from_dict, facts_to_dict
 from elspeth.web.composer.state import validate_composer_output_name
 from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS
-from elspeth.web.provider_config_policy import web_aws_s3_source_policy_error
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
 
 _PATH_OPTION_NAMES: Final = frozenset({"path", "file"})
@@ -298,40 +297,6 @@ class WebSurfacePolicyRejectedError(ValueError):
     """
 
     rejection_code = "web_surface_policy_rejected"
-
-
-def _require_web_authorable_source_plugin(plugin: str) -> None:
-    """Reject a source plugin the web authoring surface prohibits categorically.
-
-    ``permitted_plugins`` is NOT sufficient authority here. A wizard respond
-    replays the PERSISTED turn's option list (``_schema8_permitted_plugins``),
-    and a persisted turn is immutable: a session that was emitted before the
-    deployment banned a source still offers it, and a stale tab or a resumed
-    session can answer with it long after the live catalog stopped listing it.
-    Without this check the selection is admitted at Step 1, carried through
-    options/inspection/review, and only refused at the far end of the flow by
-    the authoritative gate — the "first option of the first step is a guaranteed
-    dead end" failure this fixes.
-
-    Policy authority is ``web_aws_s3_source_policy_error`` — the SAME predicate
-    ``build_plugin_snapshot`` uses to mark a plugin
-    ``PluginUnavailableReason.WEB_SURFACE_PROHIBITED``, so this pure module needs
-    no catalog to agree with the snapshot. If a second producer of
-    WEB_SURFACE_PROHIBITED ever appears, this check must consult the snapshot
-    reason instead of the single predicate (the reason enum's one-producer note
-    in ``composer/tools/_common.py`` is the tripwire).
-
-    Raises :class:`WebSurfacePolicyRejectedError` — the guided plane's
-    client-fault ``ValueError`` idiom, subtyped so the guided 400 handler can
-    log the policy explanation under its distinct rejection code (the generic
-    contract-rejection branch logs the class only, because generic messages
-    echo raw client input). The route still answers its closed generic 400,
-    so no policy text egresses to the client.
-    """
-
-    policy_error = web_aws_s3_source_policy_error(plugin)
-    if policy_error is not None:
-        raise WebSurfacePolicyRejectedError(f"source plugin {plugin!r} is prohibited on the web authoring surface: {policy_error}")
 
 
 def _next_component_name(base: str, existing_names: Sequence[str]) -> str:
@@ -886,7 +851,6 @@ def transition_source_plugin_selection(
         expected_turn_type=TurnType.SINGLE_SELECT,
     )
     plugin = _selected_plugin(response, permitted_plugins)
-    _require_web_authorable_source_plugin(plugin)
     facts = _validated_inspection_facts(inspection_facts) if inspection_facts is not None else None
     if facts is not None:
         _require_inspection_plugin_match(plugin, facts)
@@ -927,7 +891,6 @@ def transition_source_plugin_reselection(
     )
     stable_id, intent = _require_source_intent(session, target_id, "plugin_options")
     selected = _selected_plugin(PluginSelectionResponse(chosen=(plugin,)), permitted_plugins)
-    _require_web_authorable_source_plugin(selected)
     if selected == intent.plugin:
         raise ValueError("source plugin reselection must change the server-held plugin")
     facts = _validated_inspection_facts(inspection_facts) if inspection_facts is not None else None

@@ -44,7 +44,7 @@ from elspeth.web.execution.schemas import (
     ValidationCheck,
     ValidationError,
 )
-from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
 from elspeth.web.provider_config_policy import (
     web_aws_s3_endpoint_url_policy_error,
     web_aws_s3_source_policy_error,
@@ -492,11 +492,19 @@ def validate_aws_s3_source_policy(
     *,
     plugin_snapshot: PluginAvailabilitySnapshot,
 ) -> PhaseReport[MaterializedYaml] | PhaseFailure:
-    """Reject web-authored AWS S3 sources that use server credentials."""
+    """Require profile-derived authority for every Web-authored S3 source."""
+    profiled_source = False
     if not plugin_snapshot.is_trained_operator:
+        aliases_by_plugin = dict(plugin_snapshot.usable_profile_aliases)
+        source_id = PluginId("source", "aws_s3")
+        operator_profile_available = source_id in plugin_snapshot.available and bool(aliases_by_plugin.get(source_id))
         for source_name, source in materialized.authored.policy.state.sources.items():
-            policy_error = web_aws_s3_source_policy_error(source.plugin)
+            policy_error = web_aws_s3_source_policy_error(
+                source.plugin,
+                operator_profile_available=operator_profile_available,
+            )
             if policy_error is None:
+                profiled_source = profiled_source or source.plugin == "aws_s3"
                 continue
             source_component = "source" if source_name == "source" else f"source:{source_name}"
             return PhaseFailure(
@@ -513,8 +521,8 @@ def validate_aws_s3_source_policy(
                         component_id=source_component,
                         component_type="source",
                         message=policy_error,
-                        suggestion="Use an operator-controlled connector, allowlisted ingestion job, or batch/CLI runtime for S3 reads.",
-                        error_code="aws_s3_source_not_allowed",
+                        suggestion="Ask an operator to configure an S3 source profile, or use batch/CLI for raw S3 options.",
+                        error_code="aws_s3_source_profile_required",
                     ),
                 ),
                 readiness=_blocked_readiness(
@@ -527,7 +535,11 @@ def validate_aws_s3_source_policy(
             )
 
     detail = (
-        "Web-authored pipeline does not use an aws_s3 source"
+        (
+            "Web-authored aws_s3 source is bound through an available operator profile"
+            if profiled_source
+            else "Web-authored pipeline does not use an aws_s3 source"
+        )
         if not plugin_snapshot.is_trained_operator
         else "Local trained-operator validation is exempt from the web aws_s3 source policy"
     )

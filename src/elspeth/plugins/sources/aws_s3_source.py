@@ -27,6 +27,7 @@ from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
 from elspeth.contracts.identifiers import validate_field_names
 from elspeth.contracts.plugin_assistance import PluginAssistance
+from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.schema_contract_factory import create_contract_from_config
 from elspeth.contracts.wire_visible_identity import reject_operator_required_placeholder_value
 from elspeth.plugins.aws_s3_common import build_s3_client
@@ -830,8 +831,9 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3395879a00e6c3e4"
+    source_file_hash: str | None = "sha256:e832e0f4c7aebaf3"
     config_model = AWSS3SourceConfig
+    web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
     usage_when_to_use: str = (
         "Use for trusted CLI or batch ingestion of one bounded CSV, JSON-array, or JSONL S3 object through the "

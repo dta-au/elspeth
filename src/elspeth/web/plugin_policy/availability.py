@@ -20,7 +20,6 @@ from elspeth.web.plugin_policy.models import (
     WebPluginPolicy,
 )
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, ProfileCredentialInventory
-from elspeth.web.provider_config_policy import web_aws_s3_source_policy_error
 
 if TYPE_CHECKING:
     from elspeth.contracts.auth import AuthProviderType
@@ -102,20 +101,6 @@ def build_plugin_snapshot(
         summary = catalog_items.get(plugin_id)
         if summary is None:
             unavailable.append(PluginAvailability(plugin_id, PluginUnavailableReason.NOT_INSTALLED))
-            continue
-        if plugin_id.kind == "source" and web_aws_s3_source_policy_error(plugin_id.name) is not None:
-            # Categorical web-surface prohibition, adjudicated FIRST: every
-            # later reason in this loop (profile, credential) names something an
-            # operator could configure, and none of them can clear this ban —
-            # reporting one of those would send the user to a repair that can
-            # never work. Declaring the prohibition here is what makes it
-            # visible to every reader of the snapshot (discovery listings, the
-            # guided picker, prompts, tool validation) instead of only at the
-            # far end of authoring, where the same rejection arrives as an
-            # unrepairable failure (F13/F14, 2026-07-31). The ban itself is
-            # unchanged: this is the same predicate the execution and tool
-            # boundaries enforce, so the surfaces cannot drift.
-            unavailable.append(PluginAvailability(plugin_id, PluginUnavailableReason.WEB_SURFACE_PROHIBITED))
             continue
         if summary.web_config_authority is WebConfigAuthority.OPERATOR_PROFILED:
             profile_states = profiles.profile_availability(

@@ -1168,16 +1168,7 @@ async def test_plan_preserves_custom_review_identity_through_internal_reconcilia
 
 
 def _web_authored_policy_pair() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
-    """RESTRICTED (web-authored) authority over the FULL catalog availability.
-
-    Deliberately NOT the snapshot ``build_plugin_snapshot`` would produce for a
-    web principal: that one declines ``source:aws_s3`` up front, and the
-    plugin-visibility gate would then answer first. Keeping every installed
-    plugin available isolates the plumbing under test — the authoritative
-    aws_s3-source gate's own rejection code reaching the planner failure — from
-    the separate availability question. Do not "fix" this to match production
-    availability: that would silently stop pinning the plumbing.
-    """
+    """RESTRICTED (web-authored) authority over full catalog availability."""
     full_catalog = create_catalog_service()
     unrestricted = PluginAvailabilitySnapshot.for_trained_operator(full_catalog)
     snapshot = PluginAvailabilitySnapshot.create(
@@ -1254,10 +1245,10 @@ async def test_server_derived_rejection_carries_its_closed_codes(tmp_path: Path)
         )
 
     assert caught.value.code == "VALIDATION_FAILED"
-    assert caught.value.detail_codes == ("aws_s3_source_not_allowed",)
+    assert caught.value.detail_codes == ("plugin_options_invalid",)
     # The code must resolve to actionable guidance, or the planner and the
     # durable disposition both carry a bare token.
-    assert explain_validation_code("aws_s3_source_not_allowed") is not None
+    assert explain_validation_code("plugin_options_invalid") is not None
 
 
 @pytest.mark.asyncio

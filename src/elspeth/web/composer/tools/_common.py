@@ -92,11 +92,7 @@ from elspeth.web.paths import (
     resolve_sink_data_path,
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
-from elspeth.web.provider_config_policy import (
-    AWS_S3_SOURCE_POLICY_ERROR,
-    web_llm_retry_budget_policy_error,
-    web_rag_provider_config_policy_error,
-)
+from elspeth.web.provider_config_policy import web_llm_retry_budget_policy_error, web_rag_provider_config_policy_error
 from elspeth.web.secrets.ref_policy import (
     allowed_secret_ref_fields,
     allowed_secret_ref_fields_text,
@@ -1446,13 +1442,9 @@ _PLUGIN_UNAVAILABLE_EXPLANATIONS: Final[dict[PluginUnavailableReason, str]] = {
         "the plugin is installed but not turned on in this deployment — no operator profile is "
         "configured for it; an operator must enable one before it can be used"
     ),
-    # WEB_SURFACE_PROHIBITED has exactly ONE producer today — the aws_s3 source
-    # ban in ``build_plugin_snapshot`` — so this entry names that policy directly
-    # by reusing its single source of truth instead of restating it (the two
-    # copies cannot drift). A second producer must generalise this text.
     PluginUnavailableReason.WEB_SURFACE_PROHIBITED: (
         "the plugin is installed and authorized for this deployment's runtime but prohibited on the "
-        f"web authoring surface by security policy, and no operator setting can enable it here: {AWS_S3_SOURCE_POLICY_ERROR}"
+        "web authoring surface by security policy"
     ),
 }
 
