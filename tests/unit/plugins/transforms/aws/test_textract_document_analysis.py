@@ -227,6 +227,19 @@ def test_poll_max_interval_must_cover_initial_interval() -> None:
         _load(poll_interval_seconds=2.0, poll_max_interval_seconds=1.0)
 
 
+def test_batch_wait_reserves_head_bucket_and_textract_sdk_allowances() -> None:
+    transform = AWSTextractDocumentAnalysis(
+        _config(
+            poll_timeout_seconds=5.0,
+            batch_wait_timeout_seconds=1.0,
+        )
+    )
+
+    # HeadBucket: 3 * (10s connect + 30s read). Textract retains its existing
+    # 90s SDK overrun after that preflight completes.
+    assert transform._effective_batch_wait_timeout_seconds == 215.0
+
+
 @pytest.mark.parametrize(
     "field",
     [

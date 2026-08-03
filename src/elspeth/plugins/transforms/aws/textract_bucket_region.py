@@ -25,8 +25,14 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 _MAX_ERROR_CODE_LENGTH = 128
-_SDK_TOTAL_MAX_ATTEMPTS = 3
 _RETRYABLE_SERVICE_CODES = frozenset({"InternalError", "ServiceUnavailable", "SlowDown", "Throttling"})
+
+S3_HEAD_BUCKET_CONNECT_TIMEOUT_SECONDS = 10
+S3_HEAD_BUCKET_READ_TIMEOUT_SECONDS = 30
+S3_HEAD_BUCKET_TOTAL_MAX_ATTEMPTS = 3
+S3_HEAD_BUCKET_SDK_ALLOWANCE_SECONDS = S3_HEAD_BUCKET_TOTAL_MAX_ATTEMPTS * (
+    S3_HEAD_BUCKET_CONNECT_TIMEOUT_SECONDS + S3_HEAD_BUCKET_READ_TIMEOUT_SECONDS
+)
 
 BucketRegionProofSource = Literal["response_field", "response_header", "error_header"]
 BucketRegionCacheStatus = Literal["live", "cached"]
@@ -79,9 +85,9 @@ def build_s3_head_bucket_sdk_client(
     kwargs: dict[str, Any] = {
         "region_name": region,
         "config": Config(
-            connect_timeout=10,
-            read_timeout=30,
-            retries={"mode": "standard", "total_max_attempts": _SDK_TOTAL_MAX_ATTEMPTS},
+            connect_timeout=S3_HEAD_BUCKET_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=S3_HEAD_BUCKET_READ_TIMEOUT_SECONDS,
+            retries={"mode": "standard", "total_max_attempts": S3_HEAD_BUCKET_TOTAL_MAX_ATTEMPTS},
         ),
     }
     if aws_access_key_id is not None:

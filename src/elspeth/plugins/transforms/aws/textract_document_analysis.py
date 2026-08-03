@@ -36,6 +36,7 @@ from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.plugins.infrastructure.telemetry import make_warn_telemetry_before_start
 from elspeth.plugins.transforms.aws.textract_bucket_region import (
+    S3_HEAD_BUCKET_SDK_ALLOWANCE_SECONDS,
     BucketRegionCoordinator,
     BucketRegionProof,
     BucketRegionUnverifiedError,
@@ -68,7 +69,7 @@ _QUERY_TEXT_PATTERN = re.compile(r"^[a-zA-Z0-9\s!\"#$%'&()*+,\-./:;=?@[\\\]^_`{|
 _QUERY_PAGE_PATTERN = re.compile(r"^[0-9*\-]+$")
 _FACET_NAMES = ("pages", "tables", "forms", "queries", "signatures", "layout")
 _BUCKET_PATTERN = re.compile(r"^[0-9A-Za-z.\-_]*$")
-_SDK_TIMEOUT_HEADROOM_SECONDS = 90.0
+_TEXTRACT_SDK_TIMEOUT_HEADROOM_SECONDS = 90.0
 
 # Textract raises InvalidS3ObjectException whenever it cannot READ the object —
 # it does not distinguish authorization failures from missing or corrupt files.
@@ -321,7 +322,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:cc0d5b8beb151b01"
+    source_file_hash: str | None = "sha256:b1722897f229612a"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -401,7 +402,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._max_result_bytes = cfg.max_result_bytes
         self._effective_batch_wait_timeout_seconds = max(
             float(cfg.batch_wait_timeout_seconds),
-            float(cfg.poll_timeout_seconds) + _SDK_TIMEOUT_HEADROOM_SECONDS,
+            float(cfg.poll_timeout_seconds) + S3_HEAD_BUCKET_SDK_ALLOWANCE_SECONDS + _TEXTRACT_SDK_TIMEOUT_HEADROOM_SECONDS,
         )
 
         self.declared_output_fields = frozenset(cfg.all_output_field_names())
