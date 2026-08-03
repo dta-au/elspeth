@@ -337,6 +337,9 @@ async def _await_pipeline_staging_write_with_deferred_cancellation[T](
 _blocking_result_from_tool_invocations = _no_tool_policy.blocking_result_from_tool_invocations
 _compose_advisor_signoff_pending_message = _no_tool_policy.compose_advisor_signoff_pending_message
 _ADVISOR_SIGNOFF_PENDING_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTICE
+_ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE
+_ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
+_ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE
 _compose_empty_state_message = _no_tool_policy.compose_empty_state_message
 _compose_preflight_failure_message = _no_tool_policy.compose_preflight_failure_message
 _enforce_augmentation_prefix_invariant = _no_tool_policy.enforce_augmentation_prefix_invariant
@@ -843,6 +846,41 @@ def _append_interpretation_review_handoff_message(result: ComposerResult, raw_co
         augmented=augmented,
     )
     return replace(result, message=augmented, raw_assistant_content=raw)
+
+
+def _replace_advisor_repair_public_result(result: ComposerResult) -> ComposerResult:
+    """Publish fixed prose after hidden advisor repair context was introduced.
+
+    The returned state, tool/audit evidence, and deterministic validation
+    result are authoritative and remain untouched.  Only primary-model prose
+    is replaced: it was generated after the model received an internal advisor
+    finding, so it is not safe as a human or persisted transcript surface even
+    when the next checkpoint returns CLEAN.
+    """
+    runtime_result = result.runtime_preflight
+    if runtime_result is None or (runtime_result.is_valid and runtime_result.readiness.completion_ready):
+        return replace(
+            result,
+            message=_ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE,
+            raw_assistant_content=None,
+        )
+    if _is_pending_interpretation_handoff(runtime_result):
+        return replace(
+            result,
+            message=_ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE,
+            raw_assistant_content=None,
+        )
+    if not runtime_result.is_valid:
+        return replace(
+            result,
+            message=_compose_preflight_failure_message("", runtime_result=runtime_result),
+            raw_assistant_content="",
+        )
+    return replace(
+        result,
+        message=_compose_advisor_signoff_pending_message(""),
+        raw_assistant_content="",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -3434,16 +3472,25 @@ class ComposerServiceImpl:
         current_state_id: str | None,
         persisted_tool_call_turn: bool,
         persisted_assistant_message_id: str | None,
+        advisor_repair_context_introduced: bool = False,
     ) -> _PersistOutcome:
         """Phase P4 of the compose loop — delegates to :func:`turn_audit.persist_turn_audit`."""
         from elspeth.web.composer.turn_audit import persist_turn_audit
+
+        persisted_assistant_message = assistant_message
+        persisted_raw_assistant_content = raw_assistant_content
+        if advisor_repair_context_introduced:
+            persisted_assistant_message = SimpleNamespace(
+                content=_ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE,
+            )
+            persisted_raw_assistant_content = None
 
         return await persist_turn_audit(
             self,
             tool_outcomes=tool_outcomes,
             decoded_args_by_call_id=decoded_args_by_call_id,
-            assistant_message=assistant_message,
-            raw_assistant_content=raw_assistant_content,
+            assistant_message=persisted_assistant_message,
+            raw_assistant_content=persisted_raw_assistant_content,
             assistant_tool_calls=assistant_tool_calls,
             plugin_crash=plugin_crash,
             session_id=session_id,
@@ -3754,6 +3801,7 @@ class ComposerServiceImpl:
                             plugin_snapshot=plugin_snapshot,
                         ),
                         advisor_review_state=advisor_review_state or _AdvisorReviewState(),
+                        deadline=deadline,
                     )
                     if advisor_gate.action == "return":
                         return _ClassifyOutcome(
@@ -3853,6 +3901,7 @@ class ComposerServiceImpl:
         advisor_checkpoint_passes_used: int,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
         advisor_review_state: _AdvisorReviewState | None = None,
+        deadline: float | None = None,
     ) -> _TerminateOutcome:
         """Phase P2 of the compose loop — handle the no-tool-calls branch.
 
@@ -4014,6 +4063,7 @@ class ComposerServiceImpl:
                 plugin_snapshot=plugin_snapshot,
             ),
             advisor_review_state=advisor_review_state or _AdvisorReviewState(),
+            deadline=deadline,
         )
         if advisor_gate.action == "return":
             return _TerminateOutcome(
@@ -4279,6 +4329,7 @@ class ComposerServiceImpl:
         runtime_preflight: ValidationResult | None,
         user_message: str,
         advisor_review_state: _AdvisorReviewState | None = None,
+        deadline: float | None = None,
     ) -> _TerminalNoToolAdvisorGateOutcome:
         """Run the shared terminal no-tool END advisor gate for P2 and P5.
 
@@ -4332,6 +4383,7 @@ class ComposerServiceImpl:
                 user_message=user_message,
                 pass_index=pass_index,
                 advisor_review_state=review_state,
+                deadline=deadline,
             )
             passes_delta += 1
             review_state = _advance_advisor_review_state(
@@ -4588,6 +4640,7 @@ class ComposerServiceImpl:
         persisted_tool_call_turn = False
         failed_turn: FailedTurnMetadata | None = None
         current_state_id: str | None = initial_current_state_id
+        advisor_repair_context_introduced = False
         # Finalize-context elision (Task 6 Step 3, elspeth-bff8fe6864,
         # belt-and-braces on top of the output-contract clause in the
         # injected advisor message itself). Indices of FLAGGED advisor
@@ -4646,6 +4699,7 @@ class ComposerServiceImpl:
                     advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
                     plugin_snapshot=plugin_snapshot,
                     advisor_review_state=advisor_review_state,
+                    deadline=deadline,
                 )
                 if terminate.advisor_review_state is not None:
                     advisor_review_state = terminate.advisor_review_state
@@ -4664,11 +4718,15 @@ class ComposerServiceImpl:
                             "the terminate-phase contract requires result to be set whenever the "
                             "phase signals a return."
                         )
-                    return terminate.result
+                    return (
+                        _replace_advisor_repair_public_result(terminate.result) if advisor_repair_context_introduced else terminate.result
+                    )
                 repair_turns_used += terminate.repair_turns_delta
                 advisor_checkpoint_passes_used += terminate.advisor_passes_delta
-                if _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE and terminate.advisor_injection_index is not None:
-                    pending_advisor_elision_indices.append(terminate.advisor_injection_index)
+                if terminate.advisor_injection_index is not None:
+                    advisor_repair_context_introduced = True
+                    if _ELIDE_ADVISOR_EXCHANGE_AT_FINALIZE:
+                        pending_advisor_elision_indices.append(terminate.advisor_injection_index)
                 continue
 
             cancellation_requested = asyncio.Event()
@@ -4683,7 +4741,8 @@ class ComposerServiceImpl:
                 _cancellation_requested: asyncio.Event = cancellation_requested,
                 _persisted_tool_call_turn: bool = persisted_tool_call_turn,
                 _persisted_assistant_message_id: str | None = persisted_assistant_message_id,
-            ) -> tuple[_DispatchOutcome, _PersistOutcome, int]:
+                _advisor_repair_context_introduced: bool = advisor_repair_context_introduced,
+            ) -> tuple[_DispatchOutcome, _PersistOutcome, int, bool]:
                 dispatch_result, updated_advisor_calls_used = await self._dispatch_tool_batch(
                     call_model=_call_model,
                     state=_state,
@@ -4718,6 +4777,7 @@ class ComposerServiceImpl:
                 # advisory call was already running when cancellation landed,
                 # the enclosing shield lets it finish and P4 still publishes
                 # the completed audit prefix.
+                early_advisor_message_count = len(llm_messages)
                 if not _cancellation_requested.is_set():
                     await self._maybe_run_early_checkpoint(
                         state=dispatch_result.state,
@@ -4726,7 +4786,9 @@ class ComposerServiceImpl:
                         llm_messages=llm_messages,
                         recorder=recorder,
                         progress=progress,
+                        deadline=deadline,
                     )
+                early_advisor_context_introduced = len(llm_messages) > early_advisor_message_count
                 persist_result = await self._persist_turn_audit(
                     tool_outcomes=dispatch_result.tool_outcomes,
                     decoded_args_by_call_id=dispatch_result.decoded_args_by_call_id,
@@ -4738,13 +4800,24 @@ class ComposerServiceImpl:
                     current_state_id=_current_state_id,
                     persisted_tool_call_turn=_persisted_tool_call_turn,
                     persisted_assistant_message_id=_persisted_assistant_message_id,
+                    advisor_repair_context_introduced=_advisor_repair_context_introduced,
                 )
-                return dispatch_result, persist_result, updated_advisor_calls_used
+                return dispatch_result, persist_result, updated_advisor_calls_used, early_advisor_context_introduced
 
-            (dispatch, persist, advisor_calls_used), deferred_cancel = await _await_tool_turn_with_deferred_cancellation(
+            (
+                (
+                    dispatch,
+                    persist,
+                    advisor_calls_used,
+                    early_advisor_context_introduced,
+                ),
+                deferred_cancel,
+            ) = await _await_tool_turn_with_deferred_cancellation(
                 _dispatch_and_persist_tool_turn(),
                 cancellation_requested=cancellation_requested,
             )
+            if early_advisor_context_introduced:
+                advisor_repair_context_introduced = True
             # State the driver still owns across iterations updates from
             # the dispatch carrier; persist + classify consume the rest
             # of the dispatch fields directly.
@@ -4886,7 +4959,7 @@ class ComposerServiceImpl:
                         "the classify-phase contract requires result to be set whenever the "
                         "phase signals a return."
                     )
-                return classify.result
+                return _replace_advisor_repair_public_result(classify.result) if advisor_repair_context_introduced else classify.result
             continue
 
     def _persist_crashed_session(self, session_id: str) -> None:
@@ -5904,6 +5977,7 @@ class ComposerServiceImpl:
         user_message: str | None = None,
         pass_index: int = 1,
         advisor_review_state: _AdvisorReviewState | None = None,
+        deadline: float | None = None,
     ) -> AdvisorCheckpointVerdict:
         """Backend-initiated deterministic advisor checkpoint (early|end).
 
@@ -5959,8 +6033,30 @@ class ComposerServiceImpl:
         last_response_unparseable = False
         call_arguments: dict[str, Any] = arguments
         for _ in range(attempts):
+            remaining: float | None = None
+            if deadline is not None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    # The shared compose budget expired before this retry.
+                    # No outbound call starts; END classifies the checkpoint as
+                    # unavailable while retaining the already-green runtime
+                    # validation shape, and EARLY degrades before P4 persists
+                    # the completed tool turn.
+                    last_exc = TimeoutError()
+                    last_response_unparseable = False
+                    break
             try:
-                guidance, _meta = await self._call_advisor_with_audit(call_arguments, recorder=recorder)
+                if remaining is None:
+                    guidance, _meta = await self._call_advisor_with_audit(
+                        call_arguments,
+                        recorder=recorder,
+                    )
+                else:
+                    guidance, _meta = await self._call_advisor_with_audit(
+                        call_arguments,
+                        recorder=recorder,
+                        timeout=remaining,
+                    )
             except Exception as exc:
                 # Convert-to-verdict (non-raising): the call core re-raises
                 # typed LLM errors (timeout, auth, transport, malformed); a
@@ -6056,6 +6152,7 @@ class ComposerServiceImpl:
         llm_messages: list[dict[str, Any]],
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None = None,
+        deadline: float | None = None,
     ) -> bool:
         """Run the EARLY advisory checkpoint on the empty->non-empty pipeline
         TRANSITION (structurally <= once per session). Advisory only: inject the
@@ -6066,7 +6163,12 @@ class ComposerServiceImpl:
         if not _state_is_structurally_empty(prev_state):
             return False  # pipeline was already non-empty before this turn (or resumed session)
         verdict = await self._run_advisor_checkpoint(
-            phase="early", state=state, session_id=session_id, recorder=recorder, progress=progress
+            phase="early",
+            state=state,
+            session_id=session_id,
+            recorder=recorder,
+            progress=progress,
+            deadline=deadline,
         )
         if verdict.ok and verdict.blocking:
             # ok and blocking => free advisor text (or the backend pre-scan

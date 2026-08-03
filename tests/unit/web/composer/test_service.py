@@ -1485,7 +1485,7 @@ class TestComposerMultiTurnToolCalls:
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state)
 
-        assert result.message == "Pipeline is ready."
+        assert result.message == "The pipeline is configured and ready."
         assert len(captured_messages) == 3
         # Turn 2 (the repair call) saw the injected advisor findings.
         assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[1])
@@ -1503,6 +1503,117 @@ class TestComposerMultiTurnToolCalls:
         # the drain removed exactly one entry and touched nothing else.
         turn2_minus_advisor = [m for m in captured_messages[1] if "Advisor sign-off" not in (m.get("content") or "")]
         assert captured_messages[2][: len(turn2_minus_advisor)] == turn2_minus_advisor
+
+    @pytest.mark.asyncio
+    async def test_flagged_repair_clean_replaces_every_public_and_persisted_echo_surface(self) -> None:
+        """Advisor findings are internal even when the primary model parrots them.
+
+        This is the real compose-loop/persistence regression for D3: pass one
+        FLAGs, the primary emits an interleaved repair tool turn containing the
+        hidden findings, pass two returns CLEAN, and the primary's terminal
+        prose parrots the same hidden material again.  Tool calls and state
+        still land, but no human/transcript field may retain model-authored
+        prose produced from the advisor repair context.
+        """
+        from elspeth.web.composer.service import (
+            _ADVISOR_FINDINGS_UNTRUSTED_BEGIN,
+            _ADVISOR_FINDINGS_UNTRUSTED_END,
+            _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_BEGIN,
+            _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_END,
+            _ADVISOR_UNTRUSTED_SUMMARY_BEGIN,
+            _ADVISOR_UNTRUSTED_SUMMARY_END,
+        )
+
+        service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
+        service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
+        state = CompositionState(
+            source=SourceSpec(
+                plugin="csv",
+                on_success="rows",
+                options={"path": "input.csv"},
+                on_validation_failure="discard",
+            ),
+            nodes=(),
+            edges=(),
+            outputs=(),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+        false_claim = "the source schema is missing and text_field, page_count_field, and on_error are not wired"
+        foreign_repair = "Repair: {transform: numeric_route, options: {mode: gate}}"
+        sentinels = (
+            _ADVISOR_FINDINGS_UNTRUSTED_BEGIN,
+            _ADVISOR_FINDINGS_UNTRUSTED_END,
+            _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_BEGIN,
+            _ADVISOR_UNTRUSTED_PRIOR_FINDINGS_END,
+            _ADVISOR_UNTRUSTED_SUMMARY_BEGIN,
+            _ADVISOR_UNTRUSTED_SUMMARY_END,
+        )
+        findings = "\n".join((f"FLAGGED: {false_claim}", foreign_repair, *sentinels))
+        echoed_primary_prose = f"The advisor says {false_claim}. {foreign_repair} {' '.join(sentinels)}"
+        responses = [
+            _make_llm_response(content="The pipeline is ready."),
+            _make_llm_response(
+                content=echoed_primary_prose,
+                tool_calls=[{"id": "repair-1", "name": "set_metadata", "arguments": {"patch": {"name": "Repaired"}}}],
+            ),
+            _make_llm_response(content=echoed_primary_prose),
+        ]
+        passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
+
+        with (
+            patch.object(service, "_call_llm", new_callable=AsyncMock, side_effect=responses),
+            patch.object(service, "_runtime_preflight", return_value=passing_preflight),
+            patch.object(
+                service,
+                "_call_advisor_with_audit",
+                new_callable=AsyncMock,
+                side_effect=[(findings, {}), ("CLEAN", {})],
+            ),
+        ):
+            result = await service.compose("Review this pipeline", [], state, session_id=session_id)
+
+        engine = service._session_engine
+        assert engine is not None
+        with engine.connect() as conn:
+            persisted_assistant_rows = (
+                conn.execute(
+                    select(chat_messages_table).where(
+                        chat_messages_table.c.session_id == session_id,
+                        chat_messages_table.c.role == "assistant",
+                        chat_messages_table.c.writer_principal == "compose_loop",
+                    )
+                )
+                .mappings()
+                .all()
+            )
+
+        assert result.message == "The pipeline is configured and ready."
+        assert result.raw_assistant_content is None
+        assert result.state.metadata.name == "Repaired"
+        assert len(persisted_assistant_rows) == 1
+        assert persisted_assistant_rows[0]["content"] == "ELSPETH is applying a pipeline correction."
+        assert persisted_assistant_rows[0]["raw_content"] is None
+        assert persisted_assistant_rows[0]["tool_calls"] is not None
+
+        runtime_preflight = result.runtime_preflight
+        assert runtime_preflight is not None
+        public_surfaces = [
+            result.message,
+            result.raw_assistant_content or "",
+            *(row["content"] for row in persisted_assistant_rows),
+            *((row["raw_content"] or "") for row in persisted_assistant_rows),
+            *(check.detail for check in runtime_preflight.checks),
+            *(error.message for error in runtime_preflight.errors),
+            *((error.suggestion or "") for error in runtime_preflight.errors),
+            *(blocker.detail for blocker in runtime_preflight.readiness.blockers),
+        ]
+        for surface in public_surfaces:
+            assert false_claim not in surface
+            assert foreign_repair not in surface
+            assert "Repair:" not in surface
+            for sentinel in sentinels:
+                assert sentinel not in surface
 
     @pytest.mark.asyncio
     async def test_advisor_rereview_carries_prior_finding_mutation_and_current_evidence(self) -> None:
@@ -1658,7 +1769,7 @@ class TestComposerMultiTurnToolCalls:
             mock_llm.side_effect = _fake_call_llm
             result = await service.compose("Review this pipeline", [], state)
 
-        assert result.message == "Pipeline is ready."
+        assert result.message == "The pipeline is configured and ready."
         assert len(captured_messages) == 4
         # Turn 2 (discovery-only) still sees it — not drained by a non-mutating turn.
         assert any("Advisor sign-off" in (m.get("content") or "") for m in captured_messages[1])

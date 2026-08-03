@@ -80,6 +80,18 @@ _ADVISOR_SIGNOFF_PENDING_NOTICE: Final = (
 )
 _ADVISOR_SIGNOFF_PENDING_FINALIZE_SUFFIX = _TRUSTED_NOTICE_SEPARATOR + _TRUSTED_NOTICE_MARKER + _ADVISOR_SIGNOFF_PENDING_NOTICE
 
+# Primary-model prose produced after hidden advisor findings entered its
+# context is not an operator transcript.  The model may quote, paraphrase, or
+# rebut those findings even after the pipeline is repaired and the next
+# checkpoint returns CLEAN.  These fixed backend-authored messages are the
+# only prose published for that repair cohort; the state, tool calls, provider
+# audit, and deterministic validation result remain unchanged.
+ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE: Final = "ELSPETH is applying a pipeline correction."
+ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE: Final = "The pipeline is configured and ready."
+ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE: Final = (
+    "The pipeline update is ready for the required review. Resolve the pending review before running it."
+)
+
 _MAX_INTENT_CLASSIFICATION_CHARS: Final = 4_096
 _MUTATION_ACTION_PATTERN: Final = (
     r"(?:set\s+(?:this|it)\s+up|set\s+up|setup|build|create|make|wire|add|update|modify|change|run|execute|process|route|split|save)"

@@ -15,7 +15,9 @@ Async collaborators are faked locally; ``_build_checkpoint_arguments`` and
 from __future__ import annotations
 
 import ast
+import asyncio
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -1510,6 +1512,121 @@ async def test_exhausted_unknown_exception_fails_closed_as_malformed(make_servic
     assert "req-secret" not in verdict.findings_text
 
 
+@pytest.mark.asyncio
+async def test_end_gate_four_attempts_share_one_shrinking_compose_deadline(make_service, simple_state):
+    """Two END passes with two retries each must not mint four fresh budgets."""
+    service = make_service()
+    service._call_advisor_with_audit = _AsyncRecorder(side_effect=TimeoutError("provider timeout"))
+    deadline = asyncio.get_running_loop().time() + 30.0
+
+    outcome = await drive_try_terminate(
+        service,
+        simple_state,
+        advisor_checkpoint_passes_used=0,
+        deadline=deadline,
+    )
+
+    assert outcome.action == "return"
+    assert service._call_advisor_with_audit.await_count == 4
+    timeouts = [call.kwargs["timeout"] for call in service._call_advisor_with_audit.calls]
+    assert all(timeout > 0 for timeout in timeouts)
+    assert all(later < earlier for earlier, later in pairwise(timeouts))
+    assert timeouts[0] <= 30.0
+    assert outcome.result.runtime_preflight.is_valid is True
+    assert outcome.result.runtime_preflight.readiness.completion_ready is False
+    assert "Runtime preflight failed" not in outcome.result.message
+
+
+@pytest.mark.asyncio
+async def test_end_gate_starts_no_advisor_attempt_after_compose_deadline(make_service, simple_state):
+    service = make_service()
+    service._call_advisor_with_audit = _AsyncRecorder(return_value=("CLEAN", {}))
+
+    outcome = await drive_try_terminate(
+        service,
+        simple_state,
+        advisor_checkpoint_passes_used=0,
+        deadline=asyncio.get_running_loop().time() - 1.0,
+    )
+
+    assert service._call_advisor_with_audit.await_count == 0
+    assert outcome.action == "return"
+    assert outcome.result.runtime_preflight.is_valid is True
+    assert outcome.result.runtime_preflight.readiness.completion_ready is False
+    assert "Runtime preflight failed" not in outcome.result.message
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_deadline_preserves_cancellation_primacy(make_service, simple_state):
+    service = make_service()
+    service._call_advisor_with_audit = _AsyncRecorder(side_effect=asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        await service._run_advisor_checkpoint(
+            phase="end",
+            state=simple_state,
+            session_id="s1",
+            recorder=make_recorder(),
+            deadline=asyncio.get_running_loop().time() + 30.0,
+        )
+
+    assert service._call_advisor_with_audit.await_count == 1
+    assert service._call_advisor_with_audit.calls[0].kwargs["timeout"] > 0
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_deadline_preserves_provider_error_classification(make_service, simple_state):
+    service = make_service()
+    service._call_advisor_with_audit = _AsyncRecorder(side_effect=ValueError("malformed provider response"))
+
+    verdict = await service._run_advisor_checkpoint(
+        phase="end",
+        state=simple_state,
+        session_id="s1",
+        recorder=make_recorder(),
+        deadline=asyncio.get_running_loop().time() + 30.0,
+    )
+
+    assert service._call_advisor_with_audit.await_count == 2
+    assert verdict.ok is False
+    assert verdict.failure_class == "malformed"
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_deadline_cancels_provider_and_retains_timeout_audit(
+    make_service,
+    simple_state,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
+
+    service = make_service()
+    recorder = make_recorder()
+    provider_cleanup_seen = asyncio.Event()
+
+    async def wait_until_cancelled(**_kwargs: object) -> object:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            provider_cleanup_seen.set()
+
+    monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", wait_until_cancelled)
+
+    verdict = await service._run_advisor_checkpoint(
+        phase="end",
+        state=simple_state,
+        session_id="s1",
+        recorder=recorder,
+        deadline=asyncio.get_running_loop().time() + 0.01,
+    )
+
+    assert provider_cleanup_seen.is_set()
+    assert verdict.ok is False
+    assert verdict.failure_class == "unavailable"
+    assert len(recorder.llm_calls) == 1
+    assert recorder.llm_calls[0].status is ComposerLLMCallStatus.TIMEOUT
+
+
 # ---------------------------------------------------------------------------
 # Task 6: END authoritative gate (re-review loop; fail-closed; separate budget).
 # ---------------------------------------------------------------------------
@@ -1541,6 +1658,7 @@ async def drive_try_terminate(
     repair_turns_used: int = 0,
     runtime_preflight_valid: bool = True,
     message: str = "rate how cool the pages are",
+    deadline: float | None = None,
 ):
     """Drive ``_try_terminate_no_tools`` with the full kwarg set.
 
@@ -1593,6 +1711,9 @@ async def drive_try_terminate(
             )
         )
     )
+    kwargs = {}
+    if deadline is not None:
+        kwargs["deadline"] = deadline
     return await service._try_terminate_no_tools(
         assistant_message=_AssistantMessage(),
         message=message,
@@ -1612,6 +1733,7 @@ async def drive_try_terminate(
         persisted_assistant_message_id=None,
         persisted_tool_call_turn=False,
         advisor_checkpoint_passes_used=advisor_checkpoint_passes_used,
+        **kwargs,
     )
 
 
