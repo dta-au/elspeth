@@ -260,6 +260,15 @@ def _form_directed_revision_message(message: str, revision_kind: Literal["source
     return message if message.endswith(suffix) else f"{message}\n\n{suffix}"
 
 
+def _form_directed_withheld_resolution_message(revision_kind: Literal["source", "output"]) -> str:
+    """Render one coherent disposition for a retained stale mutation pair."""
+    return (
+        f"I couldn't apply that {revision_kind} revision through chat, so your pipeline {revision_kind} is unchanged. "
+        f"To revise this applied {revision_kind}, update its exact settings in the current wizard form and submit "
+        "the form through the wizard controls."
+    )
+
+
 def _guided_chat_endpoint_kwargs(settings: Any) -> tuple[str | None, str | None]:
     """Resolve the PRIMARY-role endpoint affordance for guided-chat solvers.
 
@@ -338,14 +347,16 @@ async def run_guided_chat_provider_attempt(
         )
         if not isinstance(source_outcome, GuidedStepChatEmptyResult):
             if revision_form == "source":
+                assistant_message = (
+                    _form_directed_withheld_resolution_message(revision_form)
+                    if type(source_outcome) is GuidedStepDeferredIntentWithheldResolutionResult
+                    else _form_directed_revision_message(source_outcome.chat.assistant_message, revision_form)
+                )
                 source_outcome = _replace(
                     source_outcome,
                     chat=_replace(
                         source_outcome.chat,
-                        assistant_message=_form_directed_revision_message(
-                            source_outcome.chat.assistant_message,
-                            revision_form,
-                        ),
+                        assistant_message=assistant_message,
                     ),
                 )
             return source_outcome
@@ -377,14 +388,16 @@ async def run_guided_chat_provider_attempt(
         )
         if not isinstance(sink_outcome, GuidedStepChatEmptyResult):
             if revision_form == "output":
+                assistant_message = (
+                    _form_directed_withheld_resolution_message(revision_form)
+                    if type(sink_outcome) is GuidedStepDeferredIntentWithheldResolutionResult
+                    else _form_directed_revision_message(sink_outcome.chat.assistant_message, revision_form)
+                )
                 sink_outcome = _replace(
                     sink_outcome,
                     chat=_replace(
                         sink_outcome.chat,
-                        assistant_message=_form_directed_revision_message(
-                            sink_outcome.chat.assistant_message,
-                            revision_form,
-                        ),
+                        assistant_message=assistant_message,
                     ),
                 )
             return sink_outcome
@@ -1145,9 +1158,13 @@ async def post_guided_chat_schema8(
                     elif revision_kind is not None:
                         chat_result = _replace(
                             chat_result,
-                            assistant_message=_form_directed_revision_message(
-                                chat_result.assistant_message,
-                                revision_kind,
+                            assistant_message=(
+                                _form_directed_withheld_resolution_message(revision_kind)
+                                if deferred_paired_resolution
+                                else _form_directed_revision_message(
+                                    chat_result.assistant_message,
+                                    revision_kind,
+                                )
                             ),
                         )
                     if source_resolution is not None and TurnType(frozen.current_turn["type"]) is TurnType.SCHEMA_FORM:
