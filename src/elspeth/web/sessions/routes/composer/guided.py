@@ -2257,6 +2257,7 @@ def _schema8_transition(
     new_stable_id: UUID,
     source_inspection_facts: SourceInspectionFacts | None = None,
     sink_prefill_options: Mapping[str, Any] | None = None,
+    sink_prefill_name: str | None = None,
 ) -> tuple[GuidedSession, Mapping[str, Any]]:
     if body.proposal_id is not None or body.draft_hash is not None or body.edit_target is not None:
         raise _schema8_unsupported_stage(guided.step)
@@ -2329,6 +2330,7 @@ def _schema8_transition(
                 new_stable_id=new_stable_id if not selection_targets else None,
                 target_id=selection_targets[0] if len(selection_targets) == 1 else None,
                 prefill_options=sink_prefill_options,
+                prefill_name=sink_prefill_name,
             )
         else:
             raise _schema8_unsupported_stage(guided.step)
@@ -2438,6 +2440,7 @@ def _schema8_answer_and_project_next(
     new_stable_id: UUID,
     source_inspection_facts: SourceInspectionFacts | None = None,
     sink_prefill_options: Mapping[str, Any] | None = None,
+    sink_prefill_name: str | None = None,
     fallback_blob_inspection: SourceInspectionFacts | None = None,
 ) -> tuple[CompositionState, PreparedGuidedJsonPayload, Turn | None, PreparedGuidedJsonPayload | None]:
     if body.control_signal == ControlSignal.EXIT_TO_FREEFORM.value:
@@ -2468,6 +2471,7 @@ def _schema8_answer_and_project_next(
             new_stable_id=new_stable_id,
             source_inspection_facts=source_inspection_facts,
             sink_prefill_options=sink_prefill_options,
+            sink_prefill_name=sink_prefill_name,
         )
     response_id = guided_json_payload_id("turn_response", response_payload)
     answered_record = _replace(
@@ -2864,6 +2868,27 @@ async def post_guided_respond(
                 raise HTTPException(status_code=400, detail="Guided wire action has an invalid closed shape.")
             if is_correction:
                 _require_bound_wire_target(current_turn, public_error=True)
+            if is_confirm_wiring:
+                active = observed_guided.active_proposal
+                if active is None:
+                    raise AuditIntegrityError("guided wire confirmation lost its active proposal reference")
+                try:
+                    authority = await service.get_authoritative_pipeline_proposal(
+                        session_id=session_id,
+                        proposal_id=active.proposal_id,
+                        reviewed_facts=guided_private_reviewed_facts(observed_guided),
+                    )
+                except (KeyError, ValueError) as exc:
+                    raise AuditIntegrityError("guided wire confirmation proposal authority is missing or cross-session") from exc
+                if verified_remaining_deferred_intents(guided=observed_guided, proposal=authority.proposal):
+                    # Refuse before operation reservation or pipeline dispatch.
+                    # Constraint-bearing debt belongs back in planner repair;
+                    # constraint-free clarification debt needs an explicit
+                    # operator edit/cancel and must remain visibly pending.
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Guided wiring still has unresolved retained instructions.",
+                    )
             return None, None, is_correction
         if not is_active_exit and observed_guided.step not in {GuidedStep.STEP_1_SOURCE, GuidedStep.STEP_2_SINK}:
             raise _schema8_unsupported_stage(observed_guided.step)
@@ -3541,6 +3566,9 @@ async def post_guided_respond(
                                 if planning_guided.root_intent_message_id is not None
                                 else None
                             )
+                            deferred_planner_intent = "\n\n".join(
+                                messages_by_id[deferred.originating_message_id].content for deferred in planning_guided.deferred_intents
+                            )
                             if body.edit_target is not None:
                                 revision_intents = {
                                     "source": "Regenerate the complete pipeline while revising the selected source component.",
@@ -3548,8 +3576,7 @@ async def post_guided_respond(
                                     "edge": "Regenerate the complete pipeline while revising the selected edge component.",
                                     "output": "Regenerate the complete pipeline while revising the selected output component.",
                                 }
-                                planner_intent = revision_intents[body.edit_target.kind]
-                                originating_content = root_message.content if root_message is not None else planner_intent
+                                current_planner_intent = revision_intents[body.edit_target.kind]
                             else:
                                 # Prose revision (``revision_instruction`` is non-None
                                 # here by the enclosing branch condition): the
@@ -3559,12 +3586,17 @@ async def post_guided_respond(
                                 # (e.g. the tutorial) the instruction stands alone.
                                 if revision_instruction is None:  # pragma: no cover - the branch condition guarantees this
                                     raise AuditIntegrityError("guided proposal revision lost its instruction after reservation")
-                                planner_intent = revision_instruction
-                                originating_content = (
-                                    f"{root_message.content}\n\n{revision_instruction}"
-                                    if root_message is not None
-                                    else revision_instruction
+                                current_planner_intent = revision_instruction
+                            planner_intent = "\n\n".join(part for part in (deferred_planner_intent, current_planner_intent) if part)
+                            originating_content = "\n\n".join(
+                                part
+                                for part in (
+                                    root_message.content if root_message is not None else None,
+                                    deferred_planner_intent,
+                                    current_planner_intent,
                                 )
+                                if part
+                            )
                             originating_message = PlannerOriginatingMessage(
                                 session_id=str(session_id),
                                 message_id=str(root_message.id) if root_message is not None else None,
@@ -4556,9 +4588,14 @@ async def post_guided_respond(
                                 if resulting_guided.root_intent_message_id is not None
                                 else None
                             )
+                            planner_intent_parts = [root_message.content] if root_message is not None else []
+                            planner_intent_parts.extend(
+                                planner_messages_by_id[deferred.originating_message_id].content
+                                for deferred in resulting_guided.deferred_intents
+                            )
                             planner_intent = (
-                                root_message.content
-                                if root_message is not None
+                                "\n\n".join(planner_intent_parts)
+                                if planner_intent_parts
                                 else "Build the complete pipeline from the reviewed guided components and deferred constraints."
                             )
                             originating_message = PlannerOriginatingMessage(

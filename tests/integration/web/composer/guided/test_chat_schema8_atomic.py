@@ -1303,6 +1303,10 @@ def test_sink_resolution_prefills_schema_form_from_chat_options(
     assert sink_prefilled["path"] == "out.json"
     assert sink_prefilled["schema"]["mode"] == "observed"
     assert sink_prefilled["on_write_failure"] == "discard"
+    record = asyncio.run(composer_test_client.app.state.session_service.get_current_state(UUID(session_id)))
+    assert record is not None
+    persisted_guided = record.composer_meta["guided_session"]
+    assert next(iter(persisted_guided["pending_output_intents"].values()))["name"] == "result"
 
 
 def test_invalid_sink_prefill_never_reaches_operator_logs(

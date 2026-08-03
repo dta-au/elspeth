@@ -737,10 +737,12 @@ async def test_guided_claims_are_verified_from_candidate_and_unproven_claims_rep
     )
     evaluations = 0
 
-    def reject_unproven(_candidate: CompositionState, _claims: tuple[str, ...]) -> tuple[str, ...]:
+    def reject_unproven(_candidate: CompositionState, claims: tuple[str, ...]) -> tuple[str, ...]:
         nonlocal evaluations
         evaluations += 1
-        raise DeferredIntentClaimError("unproven")
+        if claims:
+            raise DeferredIntentClaimError("unproven")
+        return ()
 
     result = await _plan(
         tmp_path=tmp_path,
@@ -751,8 +753,46 @@ async def test_guided_claims_are_verified_from_candidate_and_unproven_claims_rep
         claim_evaluator=reject_unproven,
     )
 
-    assert evaluations == 1
+    assert evaluations == 2
     assert result.proposal.covered_deferred_intent_ids == ()
+    assert result.proposal.repair_count == 1
+    assert "deferred_intent_claim" in completion.requests[1]["messages"][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_guided_required_claims_are_evaluated_when_the_model_omits_the_claim_list(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    intent_id = "00000000-0000-4000-8000-000000000314"
+    completion = _ScriptedCompletion(
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+        _response(
+            (
+                "emit_pipeline_proposal",
+                {"pipeline": _pipeline(tmp_path), "claimed_deferred_intent_ids": [intent_id]},
+            )
+        ),
+    )
+    evaluations: list[tuple[str, ...]] = []
+
+    def require_claim(_candidate: CompositionState, claims: tuple[str, ...]) -> tuple[str, ...]:
+        evaluations.append(claims)
+        if claims != (intent_id,):
+            raise DeferredIntentClaimError("omitted required deferred intent coverage")
+        return claims
+
+    result = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        surface=PlannerSurface.GUIDED_STAGED,
+        eligible_deferred_intent_ids=(intent_id,),
+        claim_evaluator=require_claim,
+    )
+
+    assert evaluations == [(), (intent_id,)]
+    assert result.proposal.covered_deferred_intent_ids == (intent_id,)
     assert result.proposal.repair_count == 1
     assert "deferred_intent_claim" in completion.requests[1]["messages"][-1]["content"]
 

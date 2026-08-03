@@ -13,9 +13,11 @@ from uuid import UUID
 
 import pytest
 
+from elspeth.core.canonical import stable_hash
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.protocol import ControlSignal, GuidedStep, TurnType
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
+from elspeth.web.composer.guided.stage_subjects import StableSubject, StatedGateRoutingConstraint
 from elspeth.web.composer.guided.stage_transitions import (
     AnsweredTurn,
     FieldSelectionResponse,
@@ -36,7 +38,14 @@ from elspeth.web.composer.guided.stage_transitions import (
     transition_source_plugin_selection,
     transition_source_schema_form,
 )
-from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession, SinkIntent, SourceIntent, TurnRecord
+from elspeth.web.composer.guided.state_machine import (
+    ComponentTarget,
+    DeferredStageIntent,
+    GuidedSession,
+    SinkIntent,
+    SourceIntent,
+    TurnRecord,
+)
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_to_dict
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId, PluginUnavailableReason
@@ -720,10 +729,11 @@ def test_sink_selection_allocates_stable_id_and_reuses_pending_target() -> None:
         response=PluginSelectionResponse(chosen=("json",)),
         permitted_plugins=("json",),
         new_stable_id=UUID(OUTPUT_A),
+        prefill_name="high_value",
     )
     assert result.output_order == (OUTPUT_A,)
     assert result.pending_output_intents[OUTPUT_A] == SinkIntent(
-        name="output",
+        name="high_value",
         phase="plugin_options",
         plugin="json",
         options=None,
@@ -734,7 +744,7 @@ def test_sink_selection_allocates_stable_id_and_reuses_pending_target() -> None:
         result,
         history=(),
         output_order=(OUTPUT_A, OUTPUT_B),
-        reviewed_outputs={OUTPUT_A: _output("output")},
+        reviewed_outputs={OUTPUT_A: _output("high_value")},
         pending_output_intents={OUTPUT_B: pending},
     )
     resumed, resumed_turn = _with_unanswered_turn(resumed, TurnType.SINGLE_SELECT)
@@ -744,9 +754,97 @@ def test_sink_selection_allocates_stable_id_and_reuses_pending_target() -> None:
         turn=resumed_turn,
         response=PluginSelectionResponse(chosen=("json",)),
         permitted_plugins=("json",),
+        prefill_name="standard",
     )
     assert resumed_result.output_order == (OUTPUT_A, OUTPUT_B)
-    assert resumed_result.reviewed_outputs[OUTPUT_A].name == "output"
+    assert resumed_result.reviewed_outputs[OUTPUT_A].name == "high_value"
+    assert resumed_result.pending_output_intents[OUTPUT_B].name == "standard"
+
+
+def test_sink_selection_uses_grounded_deferred_route_targets_for_wizard_created_outputs() -> None:
+    routing = StatedGateRoutingConstraint(
+        kind="stated_gate_routing",
+        subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_A),
+        column="amount",
+        operator="greater_than",
+        value=500,
+        true_target="high_value",
+        false_target="standard",
+    )
+    deferred = DeferredStageIntent.create(
+        intent_id="55555555-5555-4555-8555-555555555555",
+        receiving_stage="source",
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Retained route targets.",
+        originating_message_id="66666666-6666-4666-8666-666666666666",
+        message_content_hash=stable_hash("route amount to high_value, everything else to standard"),
+        constraints=(routing,),
+    )
+    base = GuidedSession(
+        step=GuidedStep.STEP_2_SINK,
+        source_order=(SOURCE_A,),
+        reviewed_sources={SOURCE_A: _source("source", ("amount",))},
+        deferred_intents=(deferred,),
+    )
+    session, turn = _with_unanswered_turn(base, TurnType.SINGLE_SELECT)
+    first = transition_sink_plugin_selection(
+        session,
+        turn=turn,
+        response=PluginSelectionResponse(chosen=("json",)),
+        permitted_plugins=("json",),
+        new_stable_id=UUID(OUTPUT_A),
+        prefill_name="standard",
+    )
+    assert first.pending_output_intents[OUTPUT_A].name == "standard"
+
+    pending_second = replace(
+        first,
+        history=(),
+        reviewed_outputs={OUTPUT_A: _output("standard")},
+        pending_output_intents={OUTPUT_B: SinkIntent(name="output_2", phase="plugin_selection", plugin=None, options=None)},
+        output_order=(OUTPUT_A, OUTPUT_B),
+    )
+    pending_second, second_turn = _with_unanswered_turn(pending_second, TurnType.SINGLE_SELECT)
+    second = transition_sink_plugin_selection(
+        pending_second,
+        target_id=OUTPUT_B,
+        turn=second_turn,
+        response=PluginSelectionResponse(chosen=("json",)),
+        permitted_plugins=("json",),
+    )
+    assert second.pending_output_intents[OUTPUT_B].name == "high_value"
+
+
+def test_sink_selection_rejects_prefill_name_that_collides_with_a_source() -> None:
+    base = GuidedSession(
+        step=GuidedStep.STEP_2_SINK,
+        source_order=(SOURCE_A,),
+        reviewed_sources={SOURCE_A: _source("high_value", ("amount",))},
+    )
+    session, turn = _with_unanswered_turn(base, TurnType.SINGLE_SELECT)
+
+    with pytest.raises(ValueError, match="guided component"):
+        transition_sink_plugin_selection(
+            session,
+            turn=turn,
+            response=PluginSelectionResponse(chosen=("json",)),
+            permitted_plugins=("json",),
+            new_stable_id=UUID(OUTPUT_A),
+            prefill_name="high_value",
+        )
+
+
+def test_guided_session_rejects_cross_kind_component_name_collision() -> None:
+    with pytest.raises(InvariantError, match="globally unique"):
+        GuidedSession(
+            step=GuidedStep.STEP_2_SINK,
+            source_order=(SOURCE_A,),
+            reviewed_sources={SOURCE_A: _source("shared", ("amount",))},
+            output_order=(OUTPUT_A,),
+            reviewed_outputs={OUTPUT_A: _output("shared")},
+        )
 
 
 def test_sink_selection_rejects_any_unreviewed_ordered_source() -> None:

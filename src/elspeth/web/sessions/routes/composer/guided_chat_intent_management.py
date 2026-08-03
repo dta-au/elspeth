@@ -375,6 +375,7 @@ def apply_deferred_request(
             receiving_stage=_guided_stage_name(authority.guided.step),
             catalog=authority.catalog,
             guided=authority.guided,
+            originating_message_content=authority.originating_message.content,
         )
         if type(disposition) is DeferredIntentUnsupported and not _message_names_identifier(
             authority.originating_message.content,
@@ -396,6 +397,7 @@ def apply_deferred_request(
             intent_id=str(authority.new_intent_id),
             originating_message_id=str(authority.originating_message.message_id),
             originating_message_content=authority.originating_message.content,
+            guided=authority.guided,
         )
         prospective = replace(authority.guided, deferred_intents=(*authority.guided.deferred_intents, retained))
         return DeferredRequestRetained(

@@ -35,6 +35,7 @@ from elspeth.web.composer.guided.stage_subjects import (
     EdgeRouteConstraint,
     OptionValueConstraint,
     PluginSubject,
+    StatedGateRoutingConstraint,
     SubjectPresenceConstraint,
 )
 from elspeth.web.composer.guided.state_machine import GuidedSession
@@ -60,7 +61,16 @@ from elspeth.web.sessions.protocol import GUIDED_FAILURE_AUDIT_LINEAGE_KEY, Guid
 from elspeth.web.sessions.routes.composer import guided as guided_route
 from elspeth.web.sessions.routes.composer import guided_chat_atomic
 from elspeth.web.sessions.routes.composer.guided_chat_atomic import GuidedChatProviderOutcome
-from tests.integration.web.composer.guided.test_respond import TestStep2IntraStep
+from tests.integration.web.composer.guided.test_respond import (
+    TestStep2IntraStep,
+    _post_current_response,
+    _respond,
+    _review_wiring,
+)
+from tests.integration.web.composer.guided.test_respond import (
+    _outputs_path as _respond_outputs_path,
+)
+from tests.integration.web.composer.guided.test_respond_schema8_atomic import _respond_operation_count
 from tests.integration.web.composer.guided.test_step_chat import TestStepChatCrossStep, _create_session, _outputs_path
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
 
@@ -347,6 +357,31 @@ def _topology_presence_action() -> DeferredIntentAction:
     )
 
 
+def _stated_gate_routing_action() -> DeferredIntentAction:
+    return DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Preserve the explicitly stated gate routes.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="11111111-1111-4111-8111-111111111111",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+
 def _wire_review_action(*, present: bool) -> DeferredIntentAction:
     return DeferredIntentAction(
         target_stage="wire_review",
@@ -394,6 +429,159 @@ def _stage_schema8_topology_intent_proposal(
     staged = TestStep2IntraStep()._stage_proposal(client, session_id, filename="schema8-rewind.jsonl")
     assert staged["guided_session"]["step"] == "step_3_transforms"
     return session_id, retained, staged
+
+
+def test_initial_topology_planner_receives_verified_deferred_user_instruction(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2-F17: the target-stage planner must receive the retained prose.
+
+    The route already loads the originating user row and verifies its session,
+    role, and content hash.  The exact verified content — not a canned fallback
+    — is the planner intent that lets the existing stated-threshold guard reject
+    a constant fan-out gate.
+    """
+    client = composer_test_client
+    created = client.post("/api/sessions", json={"title": "r2-f17-no-root-intent"})
+    assert created.status_code == 201, created.json()
+    session_id = created.json()["id"]
+    started = client.post(
+        f"/api/sessions/{session_id}/guided/start",
+        json={"profile": "tutorial", "operation_id": str(uuid4())},
+    )
+    assert started.status_code == 200, started.json()
+    initial = started.json()
+    instruction = "Later add a gate that routes csv rows with amount > 500 to high_value, and every other row to standard."
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", _provider(_stated_gate_routing_action()))
+    retained = _post(
+        client,
+        session_id,
+        operation_id=str(uuid4()),
+        turn_token=initial["next_turn"]["turn_token"],
+        message=instruction,
+    )
+    assert retained.status_code == 200, retained.json()
+
+    captured: dict[str, object] = {}
+    planner = client.app.state.composer_service
+    real_plan = planner.plan_guided_pipeline
+
+    async def capture_plan(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return await real_plan(**kwargs)
+
+    monkeypatch.setattr(planner, "plan_guided_pipeline", capture_plan)
+    TestStep2IntraStep()._drive_to_step_2_single_select(client, session_id)
+    _respond(client, session_id, chosen=["json"])
+    _respond(
+        client,
+        session_id,
+        edited_values={
+            "plugin": "json",
+            "options": {
+                "path": _respond_outputs_path(client, session_id, "r2-f17.jsonl"),
+                "schema": {"mode": "observed"},
+                "mode": "write",
+                "collision_policy": "auto_increment",
+            },
+        },
+    )
+    _respond(client, session_id, chosen=["text"], custom_inputs=[])
+    # The shared test planner intentionally returns a no-gate fixture.  The
+    # newly mandatory constraint correctly rejects that fixture after the call;
+    # this test is about what prose reached the call boundary.
+    rejected = _post_current_response(
+        client,
+        session_id,
+        component_action={"action": "finish", "component_kind": "output"},
+    )
+    assert rejected.status_code == 500
+    assert captured["intent"] == instruction
+
+
+def test_proposal_revision_keeps_verified_deferred_instruction_in_planner_intent(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later revision cannot silently displace an uncovered obligation."""
+    client = composer_test_client
+    session_id, _retained, staged = _stage_schema8_topology_intent_proposal(client, monkeypatch)
+    proposal = staged["next_turn"]["payload"]
+    captured: dict[str, object] = {}
+    planner = client.app.state.composer_service
+    real_plan = planner.plan_guided_pipeline
+
+    async def capture_plan(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return await real_plan(**kwargs)
+
+    monkeypatch.setattr(planner, "plan_guided_pipeline", capture_plan)
+    revision = "Also add a deduplication transform before the outputs."
+    revised = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json={
+            "operation_id": str(uuid4()),
+            "turn_token": staged["next_turn"]["turn_token"],
+            "proposal_id": proposal["proposal_id"],
+            "draft_hash": proposal["draft_hash"],
+            "edited_values": {"revision_instruction": revision},
+        },
+    )
+
+    assert revised.status_code == 200, revised.json()
+    assert captured["intent"] == f"Later retain the topology constraint.\n\n{revision}"
+
+
+def test_wire_confirmation_refuses_to_complete_with_an_uncovered_deferred_intent(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ignored retained instruction cannot survive as hidden terminal debt."""
+    client = composer_test_client
+    session_id, retained, _staged = _stage_schema8_topology_intent_proposal(client, monkeypatch)
+    reviewed = _review_wiring(client, session_id)
+    turn = reviewed["next_turn"]
+
+    from elspeth.web.composer.guided import planning as guided_planning
+
+    monkeypatch.setattr(
+        guided_planning,
+        "verified_remaining_deferred_intents",
+        lambda **_kwargs: (retained,),
+    )
+    from elspeth.web.composer import pipeline_commit
+
+    async def unexpected_prepare(**_kwargs: object) -> None:
+        raise AssertionError("unresolved retained intent reached commit preparation")
+
+    service = client.app.state.session_service
+
+    async def unexpected_dispatch(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("unresolved retained intent reached pipeline dispatch")
+
+    monkeypatch.setattr(pipeline_commit, "prepare_pipeline_proposal_commit", unexpected_prepare)
+    monkeypatch.setattr(service, "record_guided_pipeline_dispatch", unexpected_dispatch)
+    operations_before = _respond_operation_count(client, session_id)
+
+    rejected = client.post(
+        f"/api/sessions/{session_id}/guided/respond",
+        json={
+            "operation_id": str(uuid4()),
+            "turn_token": turn["turn_token"],
+            "proposal_id": turn["payload"]["proposal_id"],
+            "draft_hash": turn["payload"]["draft_hash"],
+            "chosen": ["confirm_wiring"],
+        },
+    )
+
+    assert rejected.status_code == 409, rejected.json()
+    assert rejected.json()["detail"] == "Guided wiring still has unresolved retained instructions."
+    assert _respond_operation_count(client, session_id) == operations_before
+    current = client.get(f"/api/sessions/{session_id}/guided").json()
+    assert current["terminal"] is None
+    assert current["next_turn"]["type"] == "confirm_wiring"
+    assert _guided(client, session_id).deferred_intents == (retained,)
 
 
 def test_unique_future_catalog_intent_is_private_atomic_retryable_and_restart_durable(

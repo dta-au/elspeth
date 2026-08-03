@@ -1218,6 +1218,7 @@ async def post_guided_chat_schema8(
                             source_plugin=source_plugin_reselection,
                         )
                     sink_prefill_options: dict[str, Any] | None = None
+                    sink_prefill_name: str | None = None
                     if (
                         sink_resolution is not None
                         and prospective.step is GuidedStep.STEP_2_SINK
@@ -1256,6 +1257,7 @@ async def post_guided_chat_schema8(
                             )
                             sink_resolution = None
                         else:
+                            sink_prefill_name = resolved_output.name
                             sink_prefill_options = dict(deep_thaw(resolved_output.options))
                             sink_prefill_options["on_write_failure"] = resolved_output.on_write_failure
                     transition_body = _transition_request(
@@ -1354,6 +1356,7 @@ async def post_guided_chat_schema8(
                                 new_stable_id=uuid4(),
                                 source_inspection_facts=source_inspection_facts,
                                 sink_prefill_options=sink_prefill_options,
+                                sink_prefill_name=sink_prefill_name,
                             )
                             transition_succeeded = True
                         except (PluginConfigError, InvariantError, TypeError, ValueError):

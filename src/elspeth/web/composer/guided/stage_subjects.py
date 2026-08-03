@@ -13,6 +13,7 @@ from typing import Any, Literal, TypedDict, cast
 from uuid import UUID
 
 from elspeth.core.canonical import canonical_json
+from elspeth.core.config import validate_sink_name
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.composer.guided.errors import InvariantError
@@ -246,6 +247,158 @@ class ComponentCountConstraintData(TypedDict):
     count: int
 
 
+class StatedPredicateConstraintData(TypedDict):
+    kind: str
+    subject: dict[str, str]
+    column: str
+    operator: str
+    value: JsonScalar
+
+
+class StatedGateRoutingConstraintData(TypedDict):
+    kind: str
+    subject: dict[str, str]
+    column: str
+    operator: str
+    value: JsonScalar
+    true_target: str
+    false_target: str
+
+
+_STATED_PREDICATE_OPERATORS = frozenset(
+    {
+        "equals",
+        "not_equals",
+        "greater_than",
+        "greater_than_or_equal",
+        "less_than",
+        "less_than_or_equal",
+    }
+)
+
+
+def _validate_stated_predicate_parts(
+    *,
+    subject: object,
+    column: object,
+    operator: object,
+    value: object,
+    owner: str,
+) -> None:
+    if type(subject) not in {StableSubject, PluginSubject}:
+        raise InvariantError(f"{owner}.subject is malformed")
+    if _subject_component_kind(cast(DeferredSubject, subject)) not in {"source", "node"}:
+        raise InvariantError(f"{owner} subject must identify a source or node")
+    if type(column) is not str or not 1 <= len(column) <= 128:
+        raise InvariantError(f"{owner}.column must contain 1 to 128 characters")
+    if type(operator) is not str or operator not in _STATED_PREDICATE_OPERATORS:
+        raise InvariantError(f"{owner}.operator is unsupported")
+    _require_json_scalar(value, f"{owner}.value")
+    if operator not in {"equals", "not_equals"} and type(value) in {bool, type(None)}:
+        raise InvariantError(f"{owner} ordered comparison requires a string or number literal")
+
+
+@dataclass(frozen=True, slots=True)
+class StatedPredicateConstraint:
+    """Operator-stated row predicate that a later gate must implement.
+
+    ``subject`` identifies the reviewed producer whose rows the operator is
+    describing.  The predicate itself stays closed and typed: one column, one
+    comparison operator, and one canonical JSON literal.  Raw prose never
+    enters persisted deferred metadata.
+    """
+
+    kind: Literal["stated_predicate"]
+    subject: DeferredSubject
+    column: str
+    operator: Literal[
+        "equals",
+        "not_equals",
+        "greater_than",
+        "greater_than_or_equal",
+        "less_than",
+        "less_than_or_equal",
+    ]
+    value: JsonScalar
+
+    def __post_init__(self) -> None:
+        if self.kind != "stated_predicate":
+            raise InvariantError("StatedPredicateConstraint.kind must be 'stated_predicate'")
+        _validate_stated_predicate_parts(
+            subject=self.subject,
+            column=self.column,
+            operator=self.operator,
+            value=self.value,
+            owner="StatedPredicateConstraint",
+        )
+
+    def to_dict(self) -> StatedPredicateConstraintData:
+        return {
+            "kind": self.kind,
+            "subject": self.subject.to_dict(),
+            "column": self.column,
+            "operator": self.operator,
+            "value": self.value,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class StatedGateRoutingConstraint:
+    """Exact two-way routing obligation for an operator-stated predicate."""
+
+    kind: Literal["stated_gate_routing"]
+    subject: DeferredSubject
+    column: str
+    operator: Literal[
+        "equals",
+        "not_equals",
+        "greater_than",
+        "greater_than_or_equal",
+        "less_than",
+        "less_than_or_equal",
+    ]
+    value: JsonScalar
+    true_target: str
+    false_target: str
+
+    def __post_init__(self) -> None:
+        if self.kind != "stated_gate_routing":
+            raise InvariantError("StatedGateRoutingConstraint.kind must be 'stated_gate_routing'")
+        _validate_stated_predicate_parts(
+            subject=self.subject,
+            column=self.column,
+            operator=self.operator,
+            value=self.value,
+            owner="StatedGateRoutingConstraint",
+        )
+        for value, field_name in (
+            (self.true_target, "true_target"),
+            (self.false_target, "false_target"),
+        ):
+            if type(value) is not str:
+                raise InvariantError(f"StatedGateRoutingConstraint.{field_name} must be an exact str")
+            try:
+                validate_sink_name(
+                    value,
+                    field_label=f"StatedGateRoutingConstraint.{field_name}",
+                )
+            except ValueError as exc:
+                raise InvariantError(f"StatedGateRoutingConstraint.{field_name} is not a valid output name") from exc
+        if self.true_target == self.false_target:
+            raise InvariantError("StatedGateRoutingConstraint targets must be distinct")
+
+    def to_dict(self) -> StatedGateRoutingConstraintData:
+        return {
+            "kind": self.kind,
+            "subject": self.subject.to_dict(),
+            "column": self.column,
+            "operator": self.operator,
+            "value": self.value,
+            "true_target": self.true_target,
+            "false_target": self.false_target,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class ComponentCountConstraint:
     kind: Literal["component_count"]
@@ -374,12 +527,20 @@ class FailureRouteConstraint:
 
 
 type DeferredConstraint = (
-    SubjectPresenceConstraint | OptionValueConstraint | ComponentCountConstraint | EdgeRouteConstraint | FailureRouteConstraint
+    SubjectPresenceConstraint
+    | OptionValueConstraint
+    | ComponentCountConstraint
+    | StatedPredicateConstraint
+    | StatedGateRoutingConstraint
+    | EdgeRouteConstraint
+    | FailureRouteConstraint
 )
 type DeferredConstraintData = (
     SubjectPresenceConstraintData
     | OptionValueConstraintData
     | ComponentCountConstraintData
+    | StatedPredicateConstraintData
+    | StatedGateRoutingConstraintData
     | EdgeRouteConstraintData
     | FailureRouteConstraintData
 )
@@ -425,6 +586,34 @@ def constraint_from_dict(value: object) -> DeferredConstraint:
             plugin_name=_require_optional_nonempty_str(record["plugin_name"], "ComponentCountConstraint.plugin_name"),
             operator=cast(Any, record["operator"]),
             count=record["count"],
+        )
+    if kind == "stated_predicate":
+        record = _require_exact_dict(
+            value,
+            frozenset({"kind", "subject", "column", "operator", "value"}),
+            "StatedPredicateConstraint.from_dict",
+        )
+        return StatedPredicateConstraint(
+            kind="stated_predicate",
+            subject=subject_from_dict(record["subject"]),
+            column=_require_nonempty_str(record["column"], "StatedPredicateConstraint.column"),
+            operator=cast(Any, record["operator"]),
+            value=_require_json_scalar(record["value"], "StatedPredicateConstraint.value"),
+        )
+    if kind == "stated_gate_routing":
+        record = _require_exact_dict(
+            value,
+            frozenset({"kind", "subject", "column", "operator", "value", "true_target", "false_target"}),
+            "StatedGateRoutingConstraint.from_dict",
+        )
+        return StatedGateRoutingConstraint(
+            kind="stated_gate_routing",
+            subject=subject_from_dict(record["subject"]),
+            column=_require_nonempty_str(record["column"], "StatedGateRoutingConstraint.column"),
+            operator=cast(Any, record["operator"]),
+            value=_require_json_scalar(record["value"], "StatedGateRoutingConstraint.value"),
+            true_target=_require_nonempty_str(record["true_target"], "StatedGateRoutingConstraint.true_target"),
+            false_target=_require_nonempty_str(record["false_target"], "StatedGateRoutingConstraint.false_target"),
         )
     if kind == "edge_route":
         record = _require_exact_dict(

@@ -28,6 +28,8 @@ from elspeth.web.composer.guided.stage_subjects import (
     FailureRouteConstraint,
     OptionValueConstraint,
     StageName,
+    StatedGateRoutingConstraint,
+    StatedPredicateConstraint,
     SubjectPresenceConstraint,
 )
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
@@ -84,6 +86,8 @@ def _provider_safe_constraint(constraint: DeferredConstraint) -> dict[str, objec
             SubjectPresenceConstraint,
             OptionValueConstraint,
             ComponentCountConstraint,
+            StatedGateRoutingConstraint,
+            StatedPredicateConstraint,
             EdgeRouteConstraint,
             FailureRouteConstraint,
         ),
@@ -222,6 +226,7 @@ def resolve_deferred_intent_management(
             receiving_stage=existing.receiving_stage,
             catalog=catalog,
             guided=guided,
+            originating_message_content=originating_message_content,
         )
         if type(disposition) is not DeferredIntentAccepted:
             return disposition
@@ -231,6 +236,7 @@ def resolve_deferred_intent_management(
             intent_id=existing.intent_id,
             originating_message_id=originating_message_id,
             originating_message_content=originating_message_content,
+            guided=guided,
         )
         return DeferredIntentManagementApplied(
             prior_intent=existing,

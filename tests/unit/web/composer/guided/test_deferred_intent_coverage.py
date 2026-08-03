@@ -22,6 +22,8 @@ from elspeth.web.composer.guided.stage_subjects import (
     OptionValueConstraint,
     PluginSubject,
     StableSubject,
+    StatedGateRoutingConstraint,
+    StatedPredicateConstraint,
     SubjectPresenceConstraint,
 )
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
@@ -29,6 +31,7 @@ from elspeth.web.composer.state import CompositionState, EdgeSpec, NodeSpec, Nod
 
 SOURCE_ID = "00000000-0000-4000-8000-000000000301"
 OUTPUT_ID = "00000000-0000-4000-8000-000000000302"
+SECOND_OUTPUT_ID = "00000000-0000-4000-8000-000000000315"
 INTENT_A = "00000000-0000-4000-8000-000000000303"
 INTENT_B = "00000000-0000-4000-8000-000000000304"
 MESSAGE_A = "00000000-0000-4000-8000-000000000305"
@@ -129,6 +132,7 @@ def _node(
     on_error: str | None = None,
     routes: dict[str, str] | None = None,
     fork_to: tuple[str, ...] | None = None,
+    condition: str | None = None,
 ) -> NodeSpec:
     return NodeSpec(
         id=node_id,
@@ -138,7 +142,7 @@ def _node(
         on_success=on_success,
         on_error=on_error,
         options={},
-        condition="True" if node_type == "gate" else None,
+        condition=(condition or "True") if node_type == "gate" else None,
         routes=routes,
         fork_to=fork_to,
         branches=None,
@@ -207,6 +211,16 @@ def test_unproven_claim_is_invalid_but_unclaimed_intent_remains_pending() -> Non
         reviewed_guided=_guided(),
         claimed_intent_ids=(INTENT_A,),
     ) == (INTENT_A,)
+
+
+def test_required_deferred_intent_omission_is_repairable_model_output() -> None:
+    with pytest.raises(DeferredIntentClaimError, match="omitted required"):
+        evaluate_deferred_intent_coverage(
+            candidate=_candidate(),
+            reviewed_guided=_guided(),
+            claimed_intent_ids=(INTENT_A,),
+            required_intent_ids=(INTENT_B,),
+        )
 
 
 def test_ambiguous_plugin_subject_cannot_prove_negative_presence() -> None:
@@ -429,6 +443,536 @@ def test_gate_routes_resolve_connections_through_consumer_inputs(
         ) == (INTENT_A,)
     else:
         _assert_unproven(candidate, constraint)
+
+
+@pytest.mark.parametrize(
+    "condition",
+    (
+        "row['amount'] > 500",
+        'row["amount"] > 500',
+        "row.get('amount') > 500",
+        "500 < row['amount']",
+    ),
+)
+def test_stated_predicate_is_proven_against_a_reachable_gate(condition: str) -> None:
+    candidate = replace(
+        _candidate(),
+        sources={
+            "primary": SourceSpec(
+                plugin="csv",
+                options={"schema": {"mode": "observed"}},
+                on_success="gate-input",
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            _node(
+                node_id=NODE_ID,
+                plugin=None,
+                node_type="gate",
+                input_name="gate-input",
+                on_success=None,
+                routes={"true": "rows", "false": "rows"},
+                condition=condition,
+            ),
+        ),
+    )
+    constraint = StatedPredicateConstraint(
+        kind="stated_predicate",
+        subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_ID),
+        column="amount",
+        operator="greater_than",
+        value=500,
+    )
+
+    assert evaluate_deferred_intent_coverage(
+        candidate=candidate,
+        reviewed_guided=_guided_with_constraint(constraint),
+        claimed_intent_ids=(INTENT_A,),
+    ) == (INTENT_A,)
+
+
+@pytest.mark.parametrize(
+    "condition",
+    (
+        "True",
+        "row['amount'] >= 500",
+        "row['amount'] > 501",
+        "row['total'] > 500",
+        "row['amount'] > 500 and row['active'] == True",
+    ),
+)
+def test_stated_predicate_rejects_constant_or_semantically_different_gate(condition: str) -> None:
+    candidate = replace(
+        _candidate(),
+        sources={
+            "primary": SourceSpec(
+                plugin="csv",
+                options={"schema": {"mode": "observed"}},
+                on_success="gate-input",
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            _node(
+                node_id=NODE_ID,
+                plugin=None,
+                node_type="gate",
+                input_name="gate-input",
+                on_success=None,
+                routes={"true": "rows", "false": "rows"},
+                condition=condition,
+            ),
+        ),
+    )
+    constraint = StatedPredicateConstraint(
+        kind="stated_predicate",
+        subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_ID),
+        column="amount",
+        operator="greater_than",
+        value=500,
+    )
+
+    _assert_unproven(candidate, constraint)
+
+
+@pytest.mark.parametrize(
+    ("routes", "fork_to", "proven"),
+    (
+        ({"true": "high_value", "false": "standard"}, None, True),
+        ({"true": "standard", "false": "high_value"}, None, False),
+        ({"true": "high_value", "false": "high_value"}, None, False),
+        ({"true": "fork", "false": "fork"}, ("high_value", "standard"), False),
+    ),
+)
+def test_stated_gate_routing_proves_the_predicate_and_exactly_one_sink_per_branch(
+    routes: dict[str, str],
+    fork_to: tuple[str, ...] | None,
+    proven: bool,
+) -> None:
+    candidate = replace(
+        _candidate(),
+        sources={
+            "primary": SourceSpec(
+                plugin="csv",
+                options={"schema": {"mode": "observed"}},
+                on_success="gate-input",
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            _node(
+                node_id=NODE_ID,
+                plugin=None,
+                node_type="gate",
+                input_name="gate-input",
+                on_success=None,
+                routes=routes,
+                fork_to=fork_to,
+                condition="row['amount'] > 500",
+            ),
+        ),
+        outputs=(
+            OutputSpec(
+                name="high_value",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+            OutputSpec(
+                name="standard",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+    )
+    constraint = StatedGateRoutingConstraint(
+        kind="stated_gate_routing",
+        subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_ID),
+        column="amount",
+        operator="greater_than",
+        value=500,
+        true_target="high_value",
+        false_target="standard",
+    )
+    reviewed = replace(
+        _guided_with_constraint(constraint),
+        output_order=(OUTPUT_ID, SECOND_OUTPUT_ID),
+        reviewed_outputs={
+            OUTPUT_ID: SinkOutputResolved(
+                name="high_value",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                required_fields=(),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+            SECOND_OUTPUT_ID: SinkOutputResolved(
+                name="standard",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                required_fields=(),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+        },
+    )
+
+    if proven:
+        assert evaluate_deferred_intent_coverage(
+            candidate=candidate,
+            reviewed_guided=reviewed,
+            claimed_intent_ids=(INTENT_A,),
+        ) == (INTENT_A,)
+    else:
+        with pytest.raises(DeferredIntentClaimError, match="unproven"):
+            evaluate_deferred_intent_coverage(
+                candidate=candidate,
+                reviewed_guided=reviewed,
+                claimed_intent_ids=(INTENT_A,),
+            )
+
+
+def test_stated_gate_routing_resolves_real_output_named_discard_before_virtual_sentinel() -> None:
+    candidate = replace(
+        _candidate(),
+        sources={
+            "primary": SourceSpec(
+                plugin="csv",
+                options={"schema": {"mode": "observed"}},
+                on_success="gate-input",
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            _node(
+                node_id=NODE_ID,
+                plugin=None,
+                node_type="gate",
+                input_name="gate-input",
+                on_success=None,
+                routes={"true": "high_value", "false": "discard"},
+                fork_to=None,
+                condition="row['amount'] > 500",
+            ),
+        ),
+        outputs=(
+            OutputSpec(
+                name="high_value",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+            OutputSpec(
+                name="discard",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+    )
+    constraint = StatedGateRoutingConstraint(
+        kind="stated_gate_routing",
+        subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_ID),
+        column="amount",
+        operator="greater_than",
+        value=500,
+        true_target="high_value",
+        false_target="discard",
+    )
+    reviewed = replace(
+        _guided_with_constraint(constraint),
+        output_order=(OUTPUT_ID, SECOND_OUTPUT_ID),
+        reviewed_outputs={
+            OUTPUT_ID: SinkOutputResolved(
+                name="high_value",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                required_fields=(),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+            SECOND_OUTPUT_ID: SinkOutputResolved(
+                name="discard",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                required_fields=(),
+                schema_mode="observed",
+                on_write_failure="discard",
+            ),
+        },
+    )
+
+    assert evaluate_deferred_intent_coverage(
+        candidate=candidate,
+        reviewed_guided=reviewed,
+        claimed_intent_ids=(INTENT_A,),
+    ) == (INTENT_A,)
+
+
+def test_stated_gate_routing_rejects_a_matching_gate_beyond_an_upstream_fanout_gate() -> None:
+    downstream_gate_id = "00000000-0000-4000-8000-000000000311"
+    candidate = replace(
+        _candidate(),
+        sources={
+            "primary": SourceSpec(
+                plugin="csv",
+                options={"schema": {"mode": "observed"}},
+                on_success="first-gate",
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            _node(
+                node_id=NODE_ID,
+                plugin=None,
+                node_type="gate",
+                input_name="first-gate",
+                on_success=None,
+                routes={"true": "fork", "false": "fork"},
+                fork_to=("standard", "second-gate"),
+                condition="True",
+            ),
+            _node(
+                node_id=downstream_gate_id,
+                plugin=None,
+                node_type="gate",
+                input_name="second-gate",
+                on_success=None,
+                routes={"true": "high_value", "false": "standard"},
+                condition="row['amount'] > 500",
+            ),
+        ),
+        outputs=(
+            OutputSpec(
+                name="high_value",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+            OutputSpec(
+                name="standard",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+    )
+    constraint = StatedGateRoutingConstraint(
+        kind="stated_gate_routing",
+        subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_ID),
+        column="amount",
+        operator="greater_than",
+        value=500,
+        true_target="high_value",
+        false_target="standard",
+    )
+
+    _assert_unproven(candidate, constraint)
+
+
+def test_stated_gate_routing_rejects_duplicate_paths_to_the_same_branch_sink() -> None:
+    second_path_id = "00000000-0000-4000-8000-000000000312"
+    candidate = replace(
+        _candidate(),
+        sources={
+            "primary": SourceSpec(
+                plugin="csv",
+                options={"schema": {"mode": "observed"}},
+                on_success="gate-input",
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            _node(
+                node_id=NODE_ID,
+                plugin=None,
+                node_type="gate",
+                input_name="gate-input",
+                on_success=None,
+                routes={"true": "duplicated-high-path", "false": "standard"},
+                condition="row['amount'] > 500",
+            ),
+            _node(
+                node_id=MISSING_ID,
+                input_name="duplicated-high-path",
+                on_success="high_value",
+            ),
+            _node(
+                node_id=second_path_id,
+                input_name="duplicated-high-path",
+                on_success="high_value",
+            ),
+        ),
+        outputs=(
+            OutputSpec(
+                name="high_value",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+            OutputSpec(
+                name="standard",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+    )
+    constraint = StatedGateRoutingConstraint(
+        kind="stated_gate_routing",
+        subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_ID),
+        column="amount",
+        operator="greater_than",
+        value=500,
+        true_target="high_value",
+        false_target="standard",
+    )
+
+    _assert_unproven(candidate, constraint)
+
+
+def test_stated_gate_routing_rejects_a_downstream_gate_that_can_discard_rows() -> None:
+    downstream_gate_id = "00000000-0000-4000-8000-000000000313"
+    candidate = replace(
+        _candidate(),
+        sources={
+            "primary": SourceSpec(
+                plugin="csv",
+                options={"schema": {"mode": "observed"}},
+                on_success="gate-input",
+                on_validation_failure="discard",
+            )
+        },
+        nodes=(
+            _node(
+                node_id=NODE_ID,
+                plugin=None,
+                node_type="gate",
+                input_name="gate-input",
+                on_success=None,
+                routes={"true": "second-gate", "false": "standard"},
+                condition="row['amount'] > 500",
+            ),
+            _node(
+                node_id=downstream_gate_id,
+                plugin=None,
+                node_type="gate",
+                input_name="second-gate",
+                on_success=None,
+                routes={"true": "high_value", "false": "discard"},
+                condition="row['region'] == 'priority'",
+            ),
+        ),
+        outputs=(
+            OutputSpec(
+                name="high_value",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+            OutputSpec(
+                name="standard",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+    )
+    constraint = StatedGateRoutingConstraint(
+        kind="stated_gate_routing",
+        subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_ID),
+        column="amount",
+        operator="greater_than",
+        value=500,
+        true_target="high_value",
+        false_target="standard",
+    )
+
+    _assert_unproven(candidate, constraint)
+
+
+@pytest.mark.parametrize("transform_position", ("before_gate", "true_branch"))
+def test_stated_gate_routing_rejects_transform_error_paths_that_bypass_required_sinks(
+    transform_position: Literal["before_gate", "true_branch"],
+) -> None:
+    transform_id = "00000000-0000-4000-8000-000000000314"
+    if transform_position == "before_gate":
+        source_connection = "pre-transform"
+        nodes = (
+            _node(
+                node_id=transform_id,
+                input_name="pre-transform",
+                on_success="gate-input",
+                on_error="discard",
+            ),
+            _node(
+                node_id=NODE_ID,
+                plugin=None,
+                node_type="gate",
+                input_name="gate-input",
+                on_success=None,
+                routes={"true": "high_value", "false": "standard"},
+                condition="row['amount'] > 500",
+            ),
+        )
+    else:
+        source_connection = "gate-input"
+        nodes = (
+            _node(
+                node_id=NODE_ID,
+                plugin=None,
+                node_type="gate",
+                input_name="gate-input",
+                on_success=None,
+                routes={"true": "post-transform", "false": "standard"},
+                condition="row['amount'] > 500",
+            ),
+            _node(
+                node_id=transform_id,
+                input_name="post-transform",
+                on_success="high_value",
+                on_error="discard",
+            ),
+        )
+    candidate = replace(
+        _candidate(),
+        sources={
+            "primary": SourceSpec(
+                plugin="csv",
+                options={"schema": {"mode": "observed"}},
+                on_success=source_connection,
+                on_validation_failure="discard",
+            )
+        },
+        nodes=nodes,
+        outputs=(
+            OutputSpec(
+                name="high_value",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+            OutputSpec(
+                name="standard",
+                plugin="json",
+                options={"schema": {"mode": "observed"}},
+                on_write_failure="discard",
+            ),
+        ),
+    )
+    constraint = StatedGateRoutingConstraint(
+        kind="stated_gate_routing",
+        subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_ID),
+        column="amount",
+        operator="greater_than",
+        value=500,
+        true_target="high_value",
+        false_target="standard",
+    )
+
+    _assert_unproven(candidate, constraint)
 
 
 def test_missing_option_path_cannot_prove_not_equals() -> None:

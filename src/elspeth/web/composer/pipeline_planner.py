@@ -1492,9 +1492,7 @@ async def _build_valid_pipeline_plan(
     if not candidate.acceptable:
         raise AuditIntegrityError("canonical interpretation requirements failed candidate revalidation")
     covered_deferred_intent_ids = (
-        claim_evaluator(candidate.result.updated_state, claimed_deferred_intent_ids)
-        if claimed_deferred_intent_ids and claim_evaluator is not None
-        else ()
+        claim_evaluator(candidate.result.updated_state, claimed_deferred_intent_ids) if claim_evaluator is not None else ()
     )
     if claimed_deferred_intent_ids and claim_evaluator is None:
         raise DeferredIntentClaimError("this planner surface has no eligible deferred intent claims")

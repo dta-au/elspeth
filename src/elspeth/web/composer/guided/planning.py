@@ -38,6 +38,8 @@ from elspeth.web.composer.guided.stage_subjects import (
     EdgeRouteConstraint,
     FailureRouteConstraint,
     OptionValueConstraint,
+    StatedGateRoutingConstraint,
+    StatedPredicateConstraint,
     SubjectPresenceConstraint,
 )
 from elspeth.web.composer.guided.state_machine import ComponentTarget, DeferredStageIntent, GuidedSession
@@ -355,9 +357,17 @@ def guided_private_reviewed_facts(guided: GuidedSession) -> dict[str, object]:
 
 
 def _provider_safe_deferred_constraint(
-    constraint: SubjectPresenceConstraint | OptionValueConstraint | ComponentCountConstraint | EdgeRouteConstraint | FailureRouteConstraint,
+    constraint: (
+        SubjectPresenceConstraint
+        | OptionValueConstraint
+        | ComponentCountConstraint
+        | StatedGateRoutingConstraint
+        | StatedPredicateConstraint
+        | EdgeRouteConstraint
+        | FailureRouteConstraint
+    ),
 ) -> dict[str, object]:
-    """Project one private constraint without option paths or values."""
+    """Project one private constraint, exposing only operator-authored facts."""
 
     if type(constraint) is SubjectPresenceConstraint:
         return {
@@ -389,6 +399,8 @@ def _provider_safe_deferred_constraint(
             "operator": constraint.operator,
             "count": constraint.count,
         }
+    if type(constraint) in {StatedPredicateConstraint, StatedGateRoutingConstraint}:
+        return cast(dict[str, object], constraint.to_dict())
     if type(constraint) is EdgeRouteConstraint:
         return {
             "kind": constraint.kind,

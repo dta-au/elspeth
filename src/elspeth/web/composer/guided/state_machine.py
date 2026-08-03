@@ -800,6 +800,8 @@ class DeferredStageIntent:
             stage_subjects.SubjectPresenceConstraint,
             stage_subjects.OptionValueConstraint,
             stage_subjects.ComponentCountConstraint,
+            stage_subjects.StatedGateRoutingConstraint,
+            stage_subjects.StatedPredicateConstraint,
             stage_subjects.EdgeRouteConstraint,
             stage_subjects.FailureRouteConstraint,
         }
@@ -1092,6 +1094,8 @@ class GuidedSession:
             raise InvariantError("GuidedSession source names must be unique")
         if len(set(output_names)) != len(output_names):
             raise InvariantError("GuidedSession output names must be unique")
+        if set(source_names) & set(output_names):
+            raise InvariantError("GuidedSession component names must be globally unique across sources and outputs")
 
         if type(self.deferred_intents) is not tuple or any(type(intent) is not DeferredStageIntent for intent in self.deferred_intents):
             raise TypeError("deferred_intents must be tuple[DeferredStageIntent, ...]")

@@ -29,9 +29,11 @@ from elspeth.web.composer.guided.resolved import (
     freeze_guided_json_mapping,
     freeze_guided_str_sequence,
 )
+from elspeth.web.composer.guided.stage_subjects import StatedGateRoutingConstraint
 from elspeth.web.composer.guided.state_machine import ComponentTarget, GuidedSession, SinkIntent, SourceIntent
 from elspeth.web.composer.guided_blob_refs import reviewed_schema_declared_field_names
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, facts_from_dict, facts_to_dict
+from elspeth.web.composer.state import validate_composer_output_name
 from elspeth.web.paths import SINK_LOCAL_PATH_OPTION_KEYS
 from elspeth.web.provider_config_policy import web_aws_s3_source_policy_error
 from elspeth.web.secrets.ref_policy import allowed_secret_ref_fields
@@ -413,6 +415,37 @@ def _sink_selection_target(
     if sum(item.phase == "plugin_selection" for item in session.pending_output_intents.values()) != 1:
         raise ValueError("sink selection target is ambiguous for the current turn occurrence")
     return stable_id, intent.name, False
+
+
+def _validated_sink_prefill_name(session: GuidedSession, stable_id: str, prefill_name: str) -> str:
+    validate_composer_output_name(prefill_name)
+    other_names = {
+        *(source.name for source in session.reviewed_sources.values()),
+        *(intent.name for intent in session.pending_source_intents.values()),
+        *(output.name for candidate_id, output in session.reviewed_outputs.items() if candidate_id != stable_id),
+        *(intent.name for candidate_id, intent in session.pending_output_intents.items() if candidate_id != stable_id),
+    }
+    if prefill_name in other_names:
+        raise ValueError("sink prefill name duplicates another guided component")
+    return prefill_name
+
+
+def _unused_stated_routing_output_names(session: GuidedSession, stable_id: str) -> tuple[str, ...]:
+    used_names = {
+        *(source.name for source in session.reviewed_sources.values()),
+        *(intent.name for intent in session.pending_source_intents.values()),
+        *(output.name for candidate_id, output in session.reviewed_outputs.items() if candidate_id != stable_id),
+        *(intent.name for candidate_id, intent in session.pending_output_intents.items() if candidate_id != stable_id),
+    }
+    unused: list[str] = []
+    for intent in session.deferred_intents:
+        for constraint in intent.constraints:
+            if type(constraint) is not StatedGateRoutingConstraint:
+                continue
+            for target in (constraint.true_target, constraint.false_target):
+                if target not in used_names and target not in unused:
+                    unused.append(target)
+    return tuple(unused)
 
 
 def _require_source_intent(session: GuidedSession, target_id: str, phase: str) -> tuple[str, SourceIntent]:
@@ -1084,6 +1117,7 @@ def transition_sink_plugin_selection(
     new_stable_id: UUID | None = None,
     target_id: str | None = None,
     prefill_options: Mapping[str, Any] | None = None,
+    prefill_name: str | None = None,
 ) -> GuidedSession:
     """Move one output from plugin selection to plugin options.
 
@@ -1107,6 +1141,14 @@ def transition_sink_plugin_selection(
         target_id=target_id,
         new_stable_id=new_stable_id,
     )
+    required_names = _unused_stated_routing_output_names(session, stable_id)
+    if prefill_name is not None:
+        validated_prefill_name = _validated_sink_prefill_name(session, stable_id, prefill_name)
+        if required_names and validated_prefill_name not in required_names:
+            raise ValueError("sink prefill name does not match an unused stated routing target")
+        name = validated_prefill_name
+    elif required_names:
+        name = _validated_sink_prefill_name(session, stable_id, required_names[0])
     pending = dict(session.pending_output_intents)
     pending[stable_id] = SinkIntent(name=name, phase="plugin_options", plugin=plugin, options=prefill_options)
     output_order = (*session.output_order, stable_id) if created else session.output_order

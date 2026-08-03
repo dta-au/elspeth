@@ -32,7 +32,13 @@ from elspeth.web.composer.guided.protocol import (
     validate_payload,
 )
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
-from elspeth.web.composer.guided.stage_subjects import EdgeRouteConstraint, OptionValueConstraint, PluginSubject, StableSubject
+from elspeth.web.composer.guided.stage_subjects import (
+    EdgeRouteConstraint,
+    OptionValueConstraint,
+    PluginSubject,
+    StableSubject,
+    StatedGateRoutingConstraint,
+)
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
 from elspeth.web.composer.pipeline_planner import plan_pipeline, prepare_pipeline_plan
 from elspeth.web.composer.pipeline_proposal import PipelineProposal, PlannerSurface, PresentBase
@@ -522,6 +528,47 @@ def test_option_value_constraint_exposes_only_closed_structural_semantics_to_pro
             "operator": "equals",
             "value_type": "string",
             "value_present": True,
+        }
+    ]
+
+
+def test_stated_gate_routing_projects_the_operator_literal_and_exact_branch_targets() -> None:
+    guided = replace(
+        _guided(),
+        deferred_intents=(
+            DeferredStageIntent.create(
+                intent_id="00000000-0000-4000-8000-000000000112",
+                receiving_stage="source",
+                target_stage="topology",
+                catalog_kind=None,
+                catalog_name=None,
+                redacted_summary="Apply the stated gate routing.",
+                originating_message_id="00000000-0000-4000-8000-000000000113",
+                message_content_hash=stable_hash("operator gate instruction"),
+                constraints=(
+                    StatedGateRoutingConstraint(
+                        kind="stated_gate_routing",
+                        subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_ID),
+                        column="amount",
+                        operator="greater_than",
+                        value=500,
+                        true_target="high_value",
+                        false_target="standard",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    assert guided_redacted_planner_context(guided)["deferred_intents"][0]["constraints"] == [
+        {
+            "kind": "stated_gate_routing",
+            "subject": {"kind": "stable", "component_kind": "source", "stable_id": SOURCE_ID},
+            "column": "amount",
+            "operator": "greater_than",
+            "value": 500,
+            "true_target": "high_value",
+            "false_target": "standard",
         }
     ]
 

@@ -1007,6 +1007,7 @@ def _expected_guided_deferred_intents_after_management(
                 intent_id=existing.intent_id,
                 originating_message_id=str(originating.message_id),
                 originating_message_content=originating.content,
+                guided=prior_guided,
             ),
         )
     else:  # pragma: no cover - command owns the exact union

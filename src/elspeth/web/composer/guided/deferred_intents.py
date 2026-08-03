@@ -9,8 +9,11 @@ it is reduced to a content hash; it is never stored in deferred metadata.
 
 from __future__ import annotations
 
+import ast
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, Protocol, cast
 from uuid import UUID
 
@@ -22,6 +25,7 @@ from referencing.jsonschema import DRAFT202012
 
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.core.canonical import canonical_json, stable_hash
+from elspeth.core.expression_parser import ExpressionParser, ExpressionSecurityError, ExpressionSyntaxError
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginKind
 from elspeth.web.composer.guided.connection_consumers import ConsumerIdentity, canonical_connection_consumers
@@ -38,6 +42,8 @@ from elspeth.web.composer.guided.stage_subjects import (
     PluginSubject,
     StableSubject,
     StageName,
+    StatedGateRoutingConstraint,
+    StatedPredicateConstraint,
     SubjectPresenceConstraint,
     constraint_from_dict,
     resolve_catalog_subject,
@@ -65,6 +71,8 @@ _ALLOWED_CONSTRAINT_TYPES = {
     SubjectPresenceConstraint,
     OptionValueConstraint,
     ComponentCountConstraint,
+    StatedGateRoutingConstraint,
+    StatedPredicateConstraint,
     EdgeRouteConstraint,
     FailureRouteConstraint,
 }
@@ -203,6 +211,7 @@ DeferredIntentRejectionReason = Literal[
     "catalog_kind_mismatch",
     "malformed_catalog_identity",
     "option_value_unproven",
+    "stated_fact_unproven",
 ]
 
 
@@ -217,6 +226,7 @@ class DeferredIntentRejected:
             "catalog_kind_mismatch",
             "malformed_catalog_identity",
             "option_value_unproven",
+            "stated_fact_unproven",
         }:
             raise InvariantError("DeferredIntentRejected.reason is unsupported")
 
@@ -300,8 +310,12 @@ def _constraint_stage(constraint: DeferredConstraint) -> StageName:
         return _subject_stage(constraint.subject)
     if type(constraint) is ComponentCountConstraint:
         return _COMPONENT_STAGE[constraint.component_kind]
+    if type(constraint) is StatedPredicateConstraint:
+        return "topology"
+    if type(constraint) is StatedGateRoutingConstraint:
+        return "topology"
     if type(constraint) is EdgeRouteConstraint:
-        return "wire_review"
+        return "topology" if constraint.edge_type in {"route_true", "route_false", "fork"} else "wire_review"
     if type(constraint) is FailureRouteConstraint:
         return "wire_review" if constraint.target != "discard" else _subject_stage(constraint.subject)
     raise InvariantError("DeferredIntentAction constraint is malformed")
@@ -322,6 +336,8 @@ def _plugin_identities(action: DeferredIntentAction) -> tuple[tuple[PluginKind, 
         elif type(constraint) is ComponentCountConstraint:
             if constraint.plugin_kind is not None and constraint.plugin_name is not None:
                 identities.append((constraint.plugin_kind, constraint.plugin_name))
+        elif type(constraint) is StatedPredicateConstraint or type(constraint) is StatedGateRoutingConstraint:
+            add_subject(constraint.subject)
         elif type(constraint) is EdgeRouteConstraint:
             add_subject(constraint.from_subject)
             add_subject(constraint.to_subject)
@@ -514,6 +530,449 @@ def _exact_json_scalar(left: object, right: object) -> bool:
     return type(left) is type(right) and left == right
 
 
+_PREDICATE_OPERATOR_BY_AST: dict[type[ast.cmpop], str] = {
+    ast.Eq: "equals",
+    ast.NotEq: "not_equals",
+    ast.Gt: "greater_than",
+    ast.GtE: "greater_than_or_equal",
+    ast.Lt: "less_than",
+    ast.LtE: "less_than_or_equal",
+}
+_REVERSED_PREDICATE_OPERATOR: dict[str, str] = {
+    "equals": "equals",
+    "not_equals": "not_equals",
+    "greater_than": "less_than",
+    "greater_than_or_equal": "less_than_or_equal",
+    "less_than": "greater_than",
+    "less_than_or_equal": "greater_than_or_equal",
+}
+_MESSAGE_OPERATOR_PATTERN: dict[str, str] = {
+    "equals": r"(?:==|(?<![!<>])=(?!=)|\bequals?\b|\bequal\s+to\b)",
+    "not_equals": r"(?:!=|\bdoes\s+not\s+equal\b|\bnot\s+equal\s+to\b|\bis\s+not\b)",
+    "greater_than": r"(?:>(?!=)|\bgreater\s+than\b(?!\s+or\s+equal)|\bmore\s+than\b|\babove\b|\bover\b)",
+    "greater_than_or_equal": r"(?:>=|\bgreater\s+than\s+or\s+equal\s+to\b|\bat\s+least\b|\bno\s+less\s+than\b)",
+    "less_than": r"(?:<(?!=)|\bless\s+than\b(?!\s+or\s+equal)|\bbelow\b|\bunder\b)",
+    "less_than_or_equal": r"(?:<=|\bless\s+than\s+or\s+equal\s+to\b|\bat\s+most\b|\bno\s+more\s+than\b)",
+}
+_FALSE_ROUTE_MARKER = re.compile(
+    r"\b(?:(?:everything|anything|all)\s+else|every\s+other\s+rows?|(?:the\s+)?rest(?:\s+of\s+(?:the\s+)?rows?)?|"
+    r"otherwise|remaining\s+rows?|false(?:\s+branch)?)\b",
+    re.IGNORECASE,
+)
+_UNREPRESENTED_NEGATION = re.compile(
+    r"\b(?:no|never|without|except|unless|instead|neither|nor|not|avoid(?:s|ed|ing)?|skip(?:s|ped|ping)?|"
+    r"prohibit(?:s|ed|ing)?|prevent(?:s|ed|ing)?|forbid(?:s|den|ding)?|exclud(?:e[sd]?|ing))\b|"
+    r"\b(?:cannot|can['\u2019]t|won['\u2019]t)\b|"
+    r"\b(?:do|does|did|should|must|would|could|is|are|was|were|has|have|had)n['\u2019]t\b",
+    re.IGNORECASE,
+)
+_GENERIC_ROUTE_DESTINATION = re.compile(
+    r"\b(?:(?:to|into)|(?:go(?:es)?|land(?:s|ing)?|route[sd]?|send[sd]?)\s+(?:to|into|in))\s+"
+    r"(?:(?:a|the)\s+)?[a-z0-9_][a-z0-9_-]*\b",
+    re.IGNORECASE,
+)
+_GATE_OR_ROUTE_WORD = re.compile(
+    r"\b(?:gate|route|routes|routed|routing|send|sends|sent|split|splits|divert|diverts|separate|separates|land|lands|landing)\b",
+    re.IGNORECASE,
+)
+_GATE_WORD = re.compile(r"\bgate\b", re.IGNORECASE)
+_CONDITIONAL_ROUTING_MARKER = re.compile(r"\b(?:where|whose|which|when|if|with)\b", re.IGNORECASE)
+_STATED_CLAUSE_BOUNDARY = re.compile(
+    r"\.(?!\d)|[;:!?\n]|\band\b|\bthen\b|\bbut\b|\bwhile\b|\balso\b",
+    re.IGNORECASE,
+)
+_STATED_COMMAND_BOUNDARY = re.compile(r"\.(?!\d)|[!?\n]", re.IGNORECASE)
+_STATED_THRESHOLD_NUMBER = r"\$?\d+(?:[.,]\d+)*(?!\d)"
+_STATED_THRESHOLD_UNIT_NOUN = (
+    r"(?!\s*(?:%|(?:words?|characters?|chars?|rows?|records?|branch|branches|sinks?|nodes?|tokens?|"
+    r"seconds?|secs?|minutes?|ms|milliseconds?|times?|items?|entries|columns?|fields?)\b))"
+)
+_STATED_THRESHOLD_QUANTITY = _STATED_THRESHOLD_NUMBER + _STATED_THRESHOLD_UNIT_NOUN
+_STATED_THRESHOLD_OPERATOR = r"(?<![-=<>!])(?:>=|<=|==|>|<)"
+_STATED_THRESHOLD_WORDING = (
+    r"(?:greater than|less than|more than|fewer than|at least|at most|no more than|no less than|above|below|over|under)"
+)
+_STATED_THRESHOLD_PATTERN = re.compile(
+    rf"[A-Za-z_]\w*\s*{_STATED_THRESHOLD_OPERATOR}\s*{_STATED_THRESHOLD_QUANTITY}"
+    rf"|{_STATED_THRESHOLD_NUMBER}\s*{_STATED_THRESHOLD_OPERATOR}\s*[A-Za-z_]\w*"
+    rf"|{_STATED_THRESHOLD_WORDING}\s+{_STATED_THRESHOLD_QUANTITY}",
+    re.IGNORECASE,
+)
+_STATED_UNIT_AFTER_LITERAL = re.compile(
+    r"^\s*(?:%|words?|characters?|chars?|rows?|records?|branch|branches|sinks?|nodes?|tokens?|seconds?|secs?|"
+    r"minutes?|ms|milliseconds?|times?|items?|entries|columns?|fields?)\b",
+    re.IGNORECASE,
+)
+_STATED_COMPARISON_LITERAL = re.compile(
+    r"\s*(?:[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|true\b|false\b|null\b|none\b|"
+    r'"[^"\r\n]{1,128}"|\'[^\'\r\n]{1,128}\'|[A-Za-z_][A-Za-z0-9_.-]*)',
+    re.IGNORECASE,
+)
+_AFFIRMATIVE_STATED_PREFIX = re.compile(
+    r"^\s*(?:please\s+)?(?:later(?:\s+on)?[\s,]+)?"
+    r"(?:(?:i|we)\s+(?:want|need|require)\s+(?:to\s+)?)?"
+    r"(?:(?:add|apply|use|create|make|have)\s+(?:(?:a|the)\s+)?gate|a\s+gate|route|send|split|divert|separate|gate)"
+    r"(?:\s+(?:that|which)\s+(?:route[sd]?|send[sd]?|split[sd]?|divert[sd]?|separate[sd]?))?"
+    r"\s+(?:"
+    r"(?:(?:to|for)\s+)?(?:(?:the|all|each|every)\s+)?"
+    r"(?:(?P<subject_before_rows>(?!rows?\b)[A-Za-z0-9_-]+)\s+(?:rows?\s+)?|rows?\s+)?(?:where|whose|with)"
+    r"|(?:where|whose|with)\s+(?:(?:the|all|each|every)\s+)?(?:(?P<subject_after_connector>[A-Za-z0-9_-]+)\s+)?"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+
+def _message_token_pattern(value: str) -> str:
+    return rf"(?<![A-Za-z0-9_-]){re.escape(value)}(?![A-Za-z0-9_-])"
+
+
+def _stated_preceding_context_is_benign(
+    context: str,
+    constraint: StatedPredicateConstraint | StatedGateRoutingConstraint,
+) -> bool:
+    """Permit only one closed source-description sentence before a command."""
+
+    if not context.strip():
+        return True
+    subject = constraint.subject
+    if type(subject) is not PluginSubject:
+        return False
+    description = re.compile(
+        r"^\s*(?:this|it)\s+is\s+(?:(?:a|an|the)\s+)?"
+        r"(?:[A-Za-z0-9_-]+\s+){0,2}" + _message_token_pattern(subject.plugin_name) + r"(?:\s+(?:source|input|file|data))?\s*\.\s*$",
+        re.IGNORECASE,
+    )
+    return description.fullmatch(context) is not None
+
+
+def _stated_predicate_message_match(
+    message: str,
+    constraint: StatedPredicateConstraint | StatedGateRoutingConstraint,
+) -> re.Match[str] | None:
+    prefix = _message_token_pattern(constraint.column) + r"[\s\S]{0,80}?" + _MESSAGE_OPERATOR_PATTERN[constraint.operator] + r"\s*"
+    value = constraint.value
+    if type(value) in {int, float}:
+        pattern = re.compile(
+            prefix + r"(?P<literal>[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)",
+            re.IGNORECASE,
+        )
+        expected = Decimal(str(value))
+        for match in pattern.finditer(message):
+            try:
+                if Decimal(match.group("literal")) == expected:
+                    return match
+            except InvalidOperation:  # pragma: no cover - regex admits only Decimal syntax
+                continue
+        return None
+    if type(value) is bool:
+        literal_pattern = rf"\b{str(value).lower()}\b"
+    elif value is None:
+        literal_pattern = r"\b(?:null|none)\b"
+    else:
+        literal_pattern = _message_token_pattern(cast(str, value))
+    return re.search(prefix + literal_pattern, message, re.IGNORECASE)
+
+
+def _stated_constraint_is_grounded(
+    message: str,
+    constraint: StatedPredicateConstraint | StatedGateRoutingConstraint,
+    *,
+    guided: GuidedSession | None = None,
+) -> bool:
+    predicate = _stated_predicate_message_match(message, constraint)
+    if predicate is None:
+        return False
+    clause_start = 0
+    clause_end = len(message)
+    # Qualifiers before ``and``/``then``/``;`` remain part of the command.
+    # Only a completed sentence may start a fresh affirmative authority span.
+    for boundary in _STATED_COMMAND_BOUNDARY.finditer(message):
+        if boundary.end() <= predicate.start():
+            clause_start = boundary.end()
+            continue
+        if boundary.start() >= predicate.end():
+            clause_end = boundary.start()
+            break
+    if not _stated_preceding_context_is_benign(message[:clause_start], constraint):
+        return False
+    predicate_prefix = message[clause_start : predicate.start()]
+    # Only promote a stated fact from a closed affirmative command grammar.
+    # Free-form text before the predicate can carry approval, review, or other
+    # preconditions that the closed constraint tuple cannot represent.
+    prefix_match = _AFFIRMATIVE_STATED_PREFIX.fullmatch(predicate_prefix)
+    if prefix_match is None:
+        return False
+    explicit_subjects = tuple(
+        value for value in (prefix_match.group("subject_before_rows"), prefix_match.group("subject_after_connector")) if value is not None
+    )
+    subject = constraint.subject
+    if explicit_subjects:
+        if type(subject) is PluginSubject:
+            allowed_subject_tokens = {subject.plugin_name.casefold()}
+        elif type(subject) is StableSubject and guided is not None:
+            if subject.component_kind == "source":
+                source_component = guided.reviewed_sources.get(subject.stable_id) or guided.pending_source_intents.get(subject.stable_id)
+                component_identity = (source_component.name, source_component.plugin) if source_component is not None else None
+            elif subject.component_kind == "output":
+                output_component = guided.reviewed_outputs.get(subject.stable_id) or guided.pending_output_intents.get(subject.stable_id)
+                component_identity = (output_component.name, output_component.plugin) if output_component is not None else None
+            else:
+                component_identity = None
+            allowed_subject_tokens = (
+                {component_identity[0].casefold(), component_identity[1].casefold()}
+                if component_identity is not None and component_identity[1] is not None
+                else {component_identity[0].casefold()}
+                if component_identity is not None
+                else set()
+            )
+        else:
+            allowed_subject_tokens = set()
+        if any(value.casefold() not in allowed_subject_tokens for value in explicit_subjects):
+            return False
+    if _GATE_OR_ROUTE_WORD.search(message[clause_start:clause_end]) is None:
+        return False
+    if type(constraint.value) in {int, float} and _STATED_UNIT_AFTER_LITERAL.search(message[predicate.end() :]) is not None:
+        return False
+    # The closed tuple has no polarity/exception field.  Reject prose whose
+    # remaining words contradict or qualify the matched predicate rather than
+    # laundering it into affirmative mandatory authority.
+    unrepresented = message[: predicate.start()] + " " + message[predicate.end() :]
+    if _UNREPRESENTED_NEGATION.search(unrepresented) is not None:
+        return False
+    if any(_clause_has_stated_comparison(clause) for clause in _STATED_CLAUSE_BOUNDARY.split(unrepresented)):
+        return False
+    if type(constraint) is StatedPredicateConstraint:
+        # An explicit else/otherwise clause is a routing obligation, not a
+        # condition-only statement.  Do not let the solver retain the weaker
+        # constraint and thereby omit the operator's branch destinations.
+        return _FALSE_ROUTE_MARKER.search(message[predicate.end() :]) is None
+    routing_constraint = cast(StatedGateRoutingConstraint, constraint)
+    routing_tail = message[predicate.end() :]
+    false_marker = _FALSE_ROUTE_MARKER.search(routing_tail)
+    if false_marker is None:
+        return False
+    true_segment = routing_tail[: false_marker.start()]
+    false_segment = routing_tail[false_marker.end() :]
+    return _message_segment_affirmatively_targets(true_segment, routing_constraint.true_target) and _message_segment_affirmatively_targets(
+        false_segment, routing_constraint.false_target
+    )
+
+
+def _message_segment_affirmatively_targets(segment: str, target: str) -> bool:
+    if _UNREPRESENTED_NEGATION.search(segment) is not None:
+        return False
+    destination = re.compile(
+        r"^\s*(?:(?:(?:go(?:es)?|land(?:s|ing)?|route[sd]?|send(?:s|ing)?|sent)"
+        r"(?:\s+(?:them|rows?))?\s+(?:to|into|in))|(?:to|into))\s+"
+        r"(?:(?:a|the)\s+)?" + _message_token_pattern(target) + r"(?:\s+(?:json\s+)?sink)?\s*(?:(?:,\s*and|[.;])\s*)?"
+        r"(?:Every\s+row\s+must\s+land\s+in\s+exactly\s+one\s+of\s+them\.)?\s*$",
+        re.IGNORECASE,
+    )
+    return destination.fullmatch(segment) is not None
+
+
+def _message_requires_stated_constraint(message: str) -> Literal["predicate", "routing"] | None:
+    """Classify explicit gate prose that weaker constraint kinds cannot encode."""
+
+    false_marker = _FALSE_ROUTE_MARKER.search(message)
+    routing_word_present = _GATE_OR_ROUTE_WORD.search(message) is not None
+    destination_count = len(_GENERIC_ROUTE_DESTINATION.findall(message))
+    if destination_count and _GATE_WORD.search(message) is not None:
+        return "routing"
+    if routing_word_present and (false_marker is not None or destination_count >= 2):
+        # Two-way routing is stronger than every pre-existing deferred
+        # constraint kind regardless of how the operator phrases the
+        # predicate.  Unsupported comparison prose must clarify, never fall
+        # back to a weaker fact that can be claimed by a zero-gate pipeline.
+        return "routing"
+    if routing_word_present and _CONDITIONAL_ROUTING_MARKER.search(message) is not None:
+        return "routing" if destination_count else "predicate"
+    routing_comparison_present = any(
+        _GATE_OR_ROUTE_WORD.search(clause) is not None and _clause_has_stated_comparison(clause)
+        for clause in _STATED_CLAUSE_BOUNDARY.split(message)
+    )
+    if not routing_comparison_present:
+        return None
+    return "routing" if destination_count else "predicate"
+
+
+def _clause_has_stated_comparison(clause: str) -> bool:
+    if _STATED_THRESHOLD_PATTERN.search(clause) is not None:
+        return True
+    for operator_pattern in _MESSAGE_OPERATOR_PATTERN.values():
+        for operator in re.finditer(operator_pattern, clause, re.IGNORECASE):
+            literal = _STATED_COMPARISON_LITERAL.match(clause, operator.end())
+            if literal is None:
+                continue
+            if _STATED_UNIT_AFTER_LITERAL.search(clause[literal.end() :]) is None:
+                return True
+    return False
+
+
+def _stated_subject_is_grounded(
+    message: str,
+    constraint: StatedPredicateConstraint | StatedGateRoutingConstraint,
+    guided: GuidedSession,
+) -> bool:
+    """Bind a stated predicate to current component or explicit plugin authority."""
+
+    predicate = _stated_predicate_message_match(message, constraint)
+    if predicate is None:
+        return False
+    subject_context_start = 0
+    for boundary in _STATED_CLAUSE_BOUNDARY.finditer(message):
+        if boundary.end() > predicate.start():
+            break
+        subject_context_start = boundary.end()
+    subject_context = message[subject_context_start : predicate.end()]
+
+    subject = constraint.subject
+    if type(subject) is StableSubject:
+        live_components: dict[str, tuple[str, str | None]]
+        if subject.component_kind == "source":
+            live_components = {stable_id: (source.name, source.plugin) for stable_id, source in guided.reviewed_sources.items()}
+            live_components.update((stable_id, (intent.name, intent.plugin)) for stable_id, intent in guided.pending_source_intents.items())
+        elif subject.component_kind == "output":
+            live_components = {stable_id: (output.name, output.plugin) for stable_id, output in guided.reviewed_outputs.items()}
+            live_components.update((stable_id, (intent.name, intent.plugin)) for stable_id, intent in guided.pending_output_intents.items())
+        else:
+            return False
+        identity = live_components.get(subject.stable_id)
+        if identity is None:
+            return False
+        if len(live_components) == 1:
+            return True
+        component_name, plugin_name = identity
+        if re.search(_message_token_pattern(component_name), subject_context, re.IGNORECASE) is not None:
+            return True
+        return (
+            plugin_name is not None
+            and sum(candidate_plugin == plugin_name for _, candidate_plugin in live_components.values()) == 1
+            and re.search(_message_token_pattern(plugin_name), subject_context, re.IGNORECASE) is not None
+        )
+
+    plugin_subject = cast(PluginSubject, subject)
+    if plugin_subject.plugin_kind == "source":
+        live_plugins = {stable_id: source.plugin for stable_id, source in guided.reviewed_sources.items()}
+        live_plugins.update(
+            (stable_id, intent.plugin) for stable_id, intent in guided.pending_source_intents.items() if intent.plugin is not None
+        )
+    elif plugin_subject.plugin_kind == "sink":
+        live_plugins = {stable_id: output.plugin for stable_id, output in guided.reviewed_outputs.items()}
+        live_plugins.update(
+            (stable_id, intent.plugin) for stable_id, intent in guided.pending_output_intents.items() if intent.plugin is not None
+        )
+    else:
+        live_plugins = {}
+    matching_ids = [stable_id for stable_id, plugin_name in live_plugins.items() if plugin_name == plugin_subject.plugin_name]
+    if live_plugins.get(plugin_subject.subject_id) == plugin_subject.plugin_name:
+        resolved_id = plugin_subject.subject_id
+    elif len(matching_ids) == 1:
+        resolved_id = matching_ids[0]
+    elif matching_ids:
+        return False
+    else:
+        plugin_context = subject_context if live_plugins else message
+        return re.search(_message_token_pattern(plugin_subject.plugin_name), plugin_context, re.IGNORECASE) is not None
+    if len(live_plugins) == 1:
+        return True
+    if plugin_subject.plugin_kind == "source":
+        component_name = (
+            guided.reviewed_sources[resolved_id].name
+            if resolved_id in guided.reviewed_sources
+            else guided.pending_source_intents[resolved_id].name
+        )
+    elif plugin_subject.plugin_kind == "sink":
+        component_name = (
+            guided.reviewed_outputs[resolved_id].name
+            if resolved_id in guided.reviewed_outputs
+            else guided.pending_output_intents[resolved_id].name
+        )
+    else:  # pragma: no cover - transform subjects have no live guided component map
+        return False
+    if re.search(_message_token_pattern(component_name), subject_context, re.IGNORECASE) is not None:
+        return True
+    return (
+        len(matching_ids) == 1 and re.search(_message_token_pattern(plugin_subject.plugin_name), subject_context, re.IGNORECASE) is not None
+    )
+
+
+def _row_column(node: ast.expr) -> str | None:
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "row"
+        and isinstance(node.slice, ast.Constant)
+        and type(node.slice.value) is str
+        and node.slice.value
+    ):
+        return node.slice.value
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "row"
+        and node.func.attr == "get"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Constant)
+        and type(node.args[0].value) is str
+        and node.args[0].value
+    ):
+        return node.args[0].value
+    return None
+
+
+def _json_literal(node: ast.expr) -> tuple[bool, object]:
+    if isinstance(node, ast.Constant) and type(node.value) in {str, int, float, bool, type(None)}:
+        return True, node.value
+    if (
+        isinstance(node, ast.UnaryOp)
+        and isinstance(node.op, (ast.UAdd, ast.USub))
+        and isinstance(node.operand, ast.Constant)
+        and type(node.operand.value) in {int, float}
+    ):
+        numeric = cast(int | float, node.operand.value)
+        value = numeric if isinstance(node.op, ast.UAdd) else -numeric
+        return True, value
+    return False, None
+
+
+def _gate_condition_matches_stated_predicate(
+    condition: str | None,
+    constraint: StatedPredicateConstraint | StatedGateRoutingConstraint,
+) -> bool:
+    if type(condition) is not str:
+        return False
+    try:
+        ExpressionParser(condition)
+        body = ast.parse(condition, mode="eval").body
+    except (ExpressionSecurityError, ExpressionSyntaxError, SyntaxError, ValueError):
+        return False
+    if not isinstance(body, ast.Compare) or len(body.ops) != 1 or len(body.comparators) != 1:
+        return False
+    operator = _PREDICATE_OPERATOR_BY_AST.get(type(body.ops[0]))
+    if operator is None:
+        return False
+    left_column = _row_column(body.left)
+    right_column = _row_column(body.comparators[0])
+    if left_column is not None and right_column is None:
+        literal_present, literal = _json_literal(body.comparators[0])
+        column = left_column
+    elif right_column is not None and left_column is None:
+        literal_present, literal = _json_literal(body.left)
+        column = right_column
+        operator = _REVERSED_PREDICATE_OPERATOR[operator]
+    else:
+        return False
+    return (
+        literal_present
+        and column == constraint.column
+        and operator == constraint.operator
+        and _exact_json_scalar(literal, constraint.value)
+    )
+
+
 def _is_exact_json_scalar(value: object) -> bool:
     if type(value) not in {str, int, float, bool, type(None)}:
         return False
@@ -701,6 +1160,7 @@ def validate_deferred_intent_action(
     receiving_stage: StageName,
     catalog: PolicyCatalogView,
     guided: GuidedSession,
+    originating_message_content: str | None = None,
 ) -> DeferredIntentValidation:
     """Validate a typed suggestion against live stage and policy authority."""
 
@@ -722,11 +1182,32 @@ def validate_deferred_intent_action(
         if action.target_stage != responsible_stage:
             return DeferredIntentRejected(reason="wrong_responsible_stage")
 
+    stated_requirement = (
+        _message_requires_stated_constraint(originating_message_content) if type(originating_message_content) is str else None
+    )
+    stated_types = {type(constraint) for constraint in action.constraints}
+    if (stated_requirement == "routing" and StatedGateRoutingConstraint not in stated_types) or (
+        stated_requirement == "predicate" and not stated_types.intersection({StatedPredicateConstraint, StatedGateRoutingConstraint})
+    ):
+        return DeferredIntentRejected(reason="stated_fact_unproven")
+
     for plugin_kind, plugin_name in _plugin_identities(action):
         invalid = _validate_catalog_identity(catalog, plugin_kind=plugin_kind, plugin_name=plugin_name)
         if invalid is not None:
             return invalid
     for constraint in action.constraints:
+        if isinstance(constraint, (StatedPredicateConstraint, StatedGateRoutingConstraint)):
+            if (
+                type(originating_message_content) is not str
+                or not _stated_subject_is_grounded(originating_message_content, constraint, guided)
+                or not _stated_constraint_is_grounded(originating_message_content, constraint, guided=guided)
+            ):
+                return DeferredIntentRejected(reason="stated_fact_unproven")
+            if isinstance(constraint, StatedGateRoutingConstraint):
+                source_names = {source.name for source in guided.reviewed_sources.values()}
+                source_names.update(intent.name for intent in guided.pending_source_intents.values())
+                if {constraint.true_target, constraint.false_target} & source_names:
+                    return DeferredIntentRejected(reason="stated_fact_unproven")
         if type(constraint) is OptionValueConstraint:
             invalid_option = _validate_option_value_constraint(constraint, guided=guided, catalog=catalog)
             if invalid_option is not None:
@@ -818,6 +1299,65 @@ class _DeferredCoverageContext:
                 connections = set(node.fork_to or ()) if edge_type == "fork" else set()
         return {destination for connection in connections for destination in self.consumers.get(connection, ())}
 
+    def exclusively_reached_gate(self, subject: _CandidateComponent) -> _CandidateComponent | None:
+        """Return the first gate on an exclusive success path from ``subject``.
+
+        A later correct gate cannot discharge an earlier fan-out: before the
+        stated predicate, each connection must have exactly one consumer and
+        every non-gate node must continue through exactly one success edge.
+        """
+
+        current = subject
+        visited: set[tuple[_ComponentKind, str]] = set()
+        while True:
+            identity = (current.kind, current.stable_id)
+            if identity in visited:
+                return None
+            visited.add(identity)
+            if current.kind == "node":
+                node = next(item for item in self.candidate.nodes if item.id == current.name)
+                if node.node_type == "gate":
+                    return current
+                if node.on_error not in {None, node.on_success}:
+                    return None
+            elif current.kind != "source":
+                return None
+            successors = self.route_targets(current, "on_success")
+            if len(successors) != 1:
+                return None
+            successor = self.exact_components.get(next(iter(successors)))
+            if successor is None:
+                return None
+            current = successor
+
+    def route_output_name(self, gate: _CandidateComponent, route_label: Literal["true", "false"]) -> str | None:
+        """Resolve one branch only when it has one linear path to one output."""
+
+        node = next(item for item in self.candidate.nodes if item.id == gate.name)
+        connection = dict(node.routes or {}).get(route_label)
+        if connection is None or connection == "fork":
+            return None
+        visited: set[ConsumerIdentity] = set()
+        while True:
+            consumers = self.consumers.get(connection, ())
+            if len(consumers) != 1:
+                return None
+            identity = consumers[0]
+            if identity in visited:
+                return None
+            visited.add(identity)
+            component = self.exact_components.get(identity)
+            if component is None:
+                return None
+            if component.kind == "output":
+                return component.name
+            if component.kind != "node":
+                return None
+            downstream = next(item for item in self.candidate.nodes if item.id == component.name)
+            if downstream.node_type == "gate" or downstream.on_success is None or downstream.on_error not in {None, downstream.on_success}:
+                return None
+            connection = downstream.on_success
+
     def failure_target(self, component: _CandidateComponent, failure_kind: str) -> str | None:
         if failure_kind == "source_validation":
             return self.candidate.sources[component.name].on_validation_failure
@@ -852,6 +1392,29 @@ class _DeferredCoverageContext:
                 "at_least": count >= constraint.count,
                 "at_most": count <= constraint.count,
             }[constraint.operator]
+        if type(constraint) is StatedPredicateConstraint:
+            subjects = self.resolve(constraint.subject)
+            if subjects.ambiguous or len(subjects.components) != 1:
+                return False
+            gate = self.exclusively_reached_gate(subjects.components[0])
+            return gate is not None and _gate_condition_matches_stated_predicate(
+                next(item for item in self.candidate.nodes if item.id == gate.name).condition,
+                constraint,
+            )
+        if type(constraint) is StatedGateRoutingConstraint:
+            subjects = self.resolve(constraint.subject)
+            if subjects.ambiguous or len(subjects.components) != 1:
+                return False
+            gate = self.exclusively_reached_gate(subjects.components[0])
+            return (
+                gate is not None
+                and _gate_condition_matches_stated_predicate(
+                    next(item for item in self.candidate.nodes if item.id == gate.name).condition,
+                    constraint,
+                )
+                and self.route_output_name(gate, "true") == constraint.true_target
+                and self.route_output_name(gate, "false") == constraint.false_target
+            )
         if type(constraint) is EdgeRouteConstraint:
             origins = self.resolve(constraint.from_subject)
             destinations = self.resolve(constraint.to_subject)
@@ -949,6 +1512,7 @@ def evaluate_deferred_intent_coverage(
     candidate: CompositionState,
     reviewed_guided: GuidedSession,
     claimed_intent_ids: tuple[str, ...],
+    required_intent_ids: tuple[str, ...] = (),
 ) -> tuple[str, ...]:
     """Prove model claims and return only the verified reviewed-order subset."""
 
@@ -956,10 +1520,20 @@ def evaluate_deferred_intent_coverage(
         raise TypeError("deferred coverage requires exact candidate and reviewed guided authority")
     if type(claimed_intent_ids) is not tuple or any(type(intent_id) is not str for intent_id in claimed_intent_ids):
         raise DeferredIntentClaimError("guided proposal claims must be an exact string tuple")
+    if type(required_intent_ids) is not tuple or any(type(intent_id) is not str for intent_id in required_intent_ids):
+        raise DeferredIntentClaimError("guided required claims must be an exact string tuple")
     if len(set(claimed_intent_ids)) != len(claimed_intent_ids):
         raise DeferredIntentClaimError("guided proposal contained a duplicate deferred intent claim")
+    if len(set(required_intent_ids)) != len(required_intent_ids):
+        raise DeferredIntentClaimError("guided proposal contained a duplicate required deferred intent id")
 
     claimed = set(claimed_intent_ids)
+    required = set(required_intent_ids)
+    known = {intent.intent_id for intent in reviewed_guided.deferred_intents}
+    if not required.issubset(known):
+        raise DeferredIntentClaimError("guided proposal required an unknown deferred intent")
+    if not required.issubset(claimed):
+        raise DeferredIntentClaimError("guided proposal omitted required deferred intent coverage")
     context = _coverage_context(candidate, reviewed_guided)
     verified: list[str] = []
     for intent in reviewed_guided.deferred_intents:
@@ -980,6 +1554,7 @@ def create_deferred_stage_intent(
     intent_id: str,
     originating_message_id: str,
     originating_message_content: str,
+    guided: GuidedSession | None = None,
 ) -> DeferredStageIntent:
     """Create durable state from a server-validated action and private row.
 
@@ -992,6 +1567,18 @@ def create_deferred_stage_intent(
     if type(action) is not DeferredIntentAction:
         raise TypeError("action must be an exact DeferredIntentAction")
     _require_nonempty_exact_str(originating_message_content, "originating_message_content")
+    stated_requirement = _message_requires_stated_constraint(originating_message_content)
+    stated_types = {type(constraint) for constraint in action.constraints}
+    if (stated_requirement == "routing" and StatedGateRoutingConstraint not in stated_types) or (
+        stated_requirement == "predicate" and not stated_types.intersection({StatedPredicateConstraint, StatedGateRoutingConstraint})
+    ):
+        raise InvariantError("explicit stated gate prose is not represented by a closed stated constraint")
+    if any(
+        isinstance(constraint, (StatedPredicateConstraint, StatedGateRoutingConstraint))
+        and not _stated_constraint_is_grounded(originating_message_content, constraint, guided=guided)
+        for constraint in action.constraints
+    ):
+        raise InvariantError("stated deferred constraint is not grounded in its originating user message")
     subject = (
         f"{action.catalog_kind} plugin {action.catalog_name!r}"
         if action.catalog_kind is not None and action.catalog_name is not None

@@ -32,12 +32,16 @@ from elspeth.web.composer.guided.intent_management import (
     schema8_deferred_management_rewind_step,
 )
 from elspeth.web.composer.guided.protocol import GuidedStep
-from elspeth.web.composer.guided.resolved import SinkOutputResolved
+from elspeth.web.composer.guided.resolved import SinkOutputResolved, SourceResolved
 from elspeth.web.composer.guided.stage_subjects import (
     ComponentCountConstraint,
+    EdgeRouteConstraint,
     OptionValueConstraint,
     PluginSubject,
     StableSubject,
+    StatedGateRoutingConstraint,
+    StatedPredicateConstraint,
+    SubjectPresenceConstraint,
 )
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedSession
 from elspeth.web.dependencies import create_catalog_service
@@ -1091,6 +1095,1012 @@ def test_live_unique_catalog_identity_is_accepted_only_at_its_responsible_later_
         guided=GuidedSession.initial(),
     )
     assert wrong_target == DeferredIntentRejected(reason="wrong_responsible_stage")
+
+
+def test_stated_predicate_is_a_topology_constraint_without_plugin_option_schema_authority() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated amount predicate at the topology stage.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    result = validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content="Later apply a gate where csv amount is greater than 500.",
+    )
+
+    assert result == DeferredIntentAccepted(action=action)
+
+
+def test_stated_gate_routing_is_a_topology_constraint_with_closed_future_output_names() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Route amount-threshold rows to the two named outputs.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    result = validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=(
+            "This is an orders CSV. Later on I want a gate that routes rows with amount greater than 500 to a "
+            "high_value JSON sink, and everything else to a standard JSON sink. Every row must land in exactly one of them."
+        ),
+    )
+
+    assert result == DeferredIntentAccepted(action=action)
+
+
+@pytest.mark.parametrize(
+    ("value", "true_target", "false_target"),
+    (
+        (999, "high_value", "standard"),
+        (500, "standard", "high_value"),
+    ),
+)
+def test_stated_gate_routing_rejects_solver_facts_not_grounded_in_the_operator_message(
+    value: int,
+    true_target: str,
+    false_target: str,
+) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Route the stated threshold.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=value,
+                true_target=true_target,
+                false_target=false_target,
+            ),
+        ),
+    )
+
+    result = validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=("Later route rows with amount greater than 500 to high_value, and everything else to standard."),
+    )
+
+    assert result == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_condition_only_constraint_cannot_underrepresent_an_explicit_routing_instruction() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated amount predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    result = validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=("Later route rows with amount greater than 500 to high_value, and everything else to standard."),
+    )
+
+    assert result == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_grounding_rejects_broad_equals_and_negated_route_false_accepts() -> None:
+    subject = PluginSubject(
+        kind="plugin",
+        subject_id="33333333-3333-4333-8333-333333333333",
+        plugin_kind="source",
+        plugin_name="csv",
+    )
+    actions = (
+        (
+            DeferredIntentAction(
+                target_stage="topology",
+                catalog_kind=None,
+                catalog_name=None,
+                redacted_summary="Wrong equality.",
+                constraints=(
+                    StatedPredicateConstraint(
+                        kind="stated_predicate",
+                        subject=subject,
+                        column="amount",
+                        operator="equals",
+                        value="greater",
+                    ),
+                ),
+            ),
+            "amount is greater than 500",
+        ),
+        (
+            DeferredIntentAction(
+                target_stage="topology",
+                catalog_kind=None,
+                catalog_name=None,
+                redacted_summary="Negated target.",
+                constraints=(
+                    StatedGateRoutingConstraint(
+                        kind="stated_gate_routing",
+                        subject=subject,
+                        column="amount",
+                        operator="greater_than",
+                        value=500,
+                        true_target="high_value",
+                        false_target="standard",
+                    ),
+                ),
+            ),
+            "amount greater than 500 not to high_value but to manual_review, and everything else to standard",
+        ),
+    )
+
+    for action, message in actions:
+        assert validate_deferred_intent_action(
+            action,
+            receiving_stage="source",
+            catalog=_view((("source", "csv"),)),
+            guided=GuidedSession.initial(),
+            originating_message_content=message,
+        ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def _stated_gate_routing_action_for_grounding() -> DeferredIntentAction:
+    return DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later do not apply a gate where csv amount is greater than 500.",
+        "Later route csv rows with amount greater than 500; never send them to high_value, and everything else to standard.",
+    ),
+)
+def test_stated_grounding_rejects_semantic_negation_outside_the_matched_tokens(message: str) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Route the stated threshold.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later add a gate that routes csv rows with amount > 500 to high_value, and every other row to standard.",
+        "Later send csv rows where amount > 500 into high_value; the rest go into standard.",
+        "Later send csv rows where amount > 500 to high_value; the rest go to standard.",
+        "Later route csv rows where amount > 500 into high_value, with remaining rows landing in standard.",
+        "Later route csv rows where status equals priority to high_value, and everything else to standard.",
+        "Later route csv rows where amount exceeds 500 to high_value, and everything else to standard.",
+        "Later route csv rows where amount is higher than 500 to high_value, and everything else to standard.",
+        "Later route csv rows where amount is between 500 and 1000 to high_value, and everything else to standard.",
+        "Later route csv rows where status is priority to high_value, and everything else to standard.",
+    ),
+)
+def test_explicit_gate_routing_prose_cannot_be_retained_as_a_weaker_constraint_kind(message: str) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind="transform",
+        catalog_name="passthrough",
+        redacted_summary="Preserve a source during topology authoring.",
+        constraints=(
+            SubjectPresenceConstraint(
+                kind="subject_presence",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                present=True,
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"), ("transform", "passthrough"))),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later add a gate for csv rows whose amount exceeds 500.",
+        "Later add a gate for csv rows whose amount is higher than 500.",
+        "Later add a gate for csv rows whose amount is between 500 and 1000.",
+        "Later add a gate for csv rows where status is priority.",
+        "Later add a gate which routes csv rows with amount exceeding 500 to high_value.",
+        "Later route csv rows with amount exceeding 500 to high_value.",
+    ),
+)
+def test_explicit_condition_only_gate_prose_cannot_be_retained_as_a_weaker_constraint_kind(message: str) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind="transform",
+        catalog_name="passthrough",
+        redacted_summary="Preserve a source during topology authoring.",
+        constraints=(
+            SubjectPresenceConstraint(
+                kind="subject_presence",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                present=True,
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"), ("transform", "passthrough"))),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later add a gate that routes csv rows with amount greater than 500 to high_value.",
+        "Later send csv rows with amount greater than 500 to high_value.",
+    ),
+)
+def test_condition_only_constraint_cannot_drop_an_explicit_single_branch_destination(message: str) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="33333333-3333-4333-8333-333333333333",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later add a gate only if approved that routes csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate if the owner approves that routes csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate provided the owner agrees that routes csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate subject to security review that routes csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate after the change is signed off that routes csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate only if approved and route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later add a gate only if approved then route csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate only if approved but route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later add a gate only if approved while route csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate only if approved also route csv rows with amount greater than 500 to high_value, "
+        "and everything else to standard.",
+        "Later add a gate only if approved; route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later add a gate only if approved: route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Only after security review. Later route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Pending owner sign-off. Later route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+    ),
+)
+def test_stated_grounding_rejects_unrepresented_authority_preconditions(message: str) -> None:
+    assert validate_deferred_intent_action(
+        _stated_gate_routing_action_for_grounding(),
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize("row_qualifier", ("priority", "authorized", "pending"))
+def test_stated_grounding_rejects_unrepresented_row_qualifier(row_qualifier: str) -> None:
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=("77777777-7777-4777-8777-777777777777",),
+        reviewed_sources={
+            "77777777-7777-4777-8777-777777777777": SourceResolved(
+                name="orders",
+                plugin="csv",
+                options={"path": "/data/orders.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+        },
+    )
+    assert validate_deferred_intent_action(
+        _stated_gate_routing_action_for_grounding(),
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=guided,
+        originating_message_content=(
+            f"Later add a gate for {row_qualifier} rows where amount greater than 500 to high_value, and everything else to standard."
+        ),
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_grounding_accepts_exact_live_stable_subject_name_with_ambiguous_plugins() -> None:
+    orders_id = "77777777-7777-4777-8777-777777777777"
+    returns_id = "88888888-8888-4888-8888-888888888888"
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=(orders_id, returns_id),
+        reviewed_sources={
+            orders_id: SourceResolved(
+                name="orders",
+                plugin="csv",
+                options={"path": "/data/orders.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+            returns_id: SourceResolved(
+                name="returns",
+                plugin="csv",
+                options={"path": "/data/returns.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+        },
+    )
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=StableSubject(kind="stable", component_kind="source", stable_id=orders_id),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=guided,
+        originating_message_content=(
+            "Later route orders rows with amount greater than 500 to high_value, and everything else to standard."
+        ),
+    ) == DeferredIntentAccepted(action=action)
+
+
+def test_stated_constraint_rejects_nonexistent_stable_subject_even_when_text_matches() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=StableSubject(
+                    kind="stable",
+                    component_kind="source",
+                    stable_id="99999999-9999-4999-8999-999999999999",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view(()),
+        guided=GuidedSession.initial(),
+        originating_message_content="Later apply a gate where amount is greater than 500.",
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_plugin_subject_rejects_ambiguous_same_plugin_sources() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+    source_ids = (
+        "77777777-7777-4777-8777-777777777777",
+        "88888888-8888-4888-8888-888888888888",
+    )
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=source_ids,
+        reviewed_sources={
+            stable_id: SourceResolved(
+                name=f"source_{index}",
+                plugin="csv",
+                options={"path": f"/data/source_{index}.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            )
+            for index, stable_id in enumerate(source_ids, start=1)
+        },
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=guided,
+        originating_message_content="Later apply a gate where csv amount is greater than 500.",
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_plugin_subject_rejects_exact_live_id_when_message_names_another_source() -> None:
+    csv_id = "77777777-7777-4777-8777-777777777777"
+    json_id = "88888888-8888-4888-8888-888888888888"
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=(csv_id, json_id),
+        reviewed_sources={
+            csv_id: SourceResolved(
+                name="csv_source",
+                plugin="csv",
+                options={"path": "/data/input.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+            json_id: SourceResolved(
+                name="json_source",
+                plugin="json",
+                options={"path": "/data/input.jsonl"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+        },
+    )
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id=json_id,
+                    plugin_kind="source",
+                    plugin_name="json",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"), ("source", "json"))),
+        guided=guided,
+        originating_message_content="Later apply a gate to csv rows where amount is greater than 500.",
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_plugin_subject_ignores_destination_plugin_words_when_binding_source() -> None:
+    csv_id = "77777777-7777-4777-8777-777777777777"
+    json_id = "88888888-8888-4888-8888-888888888888"
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=(csv_id, json_id),
+        reviewed_sources={
+            csv_id: SourceResolved(
+                name="csv_source",
+                plugin="csv",
+                options={"path": "/data/input.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+            json_id: SourceResolved(
+                name="json_source",
+                plugin="json",
+                options={"path": "/data/input.jsonl"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+        },
+    )
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id=json_id,
+                    plugin_kind="source",
+                    plugin_name="json",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"), ("source", "json"))),
+        guided=guided,
+        originating_message_content=(
+            "Later route csv rows where amount is greater than 500 to a high_value JSON sink, and everything else to standard."
+        ),
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_stable_subject_rejects_message_that_names_a_different_live_source() -> None:
+    csv_id = "77777777-7777-4777-8777-777777777777"
+    json_id = "88888888-8888-4888-8888-888888888888"
+    guided = GuidedSession(
+        step=GuidedStep.STEP_1_SOURCE,
+        source_order=(csv_id, json_id),
+        reviewed_sources={
+            csv_id: SourceResolved(
+                name="csv_source",
+                plugin="csv",
+                options={"path": "/data/input.csv"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+            json_id: SourceResolved(
+                name="json_source",
+                plugin="json",
+                options={"path": "/data/input.jsonl"},
+                observed_columns=("amount",),
+                sample_rows=(),
+                on_validation_failure="discard",
+            ),
+        },
+    )
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=StableSubject(kind="stable", component_kind="source", stable_id=json_id),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view(()),
+        guided=guided,
+        originating_message_content="Later apply a gate to csv rows where amount is greater than 500.",
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_grounding_does_not_turn_an_unrelated_word_limit_into_a_row_predicate() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="result",
+                operator="less_than",
+                value=50,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=(
+            "Summarize each csv result in under 50 words, then route errors to high_value and everything else to standard."
+        ),
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later add a gate that routes csv rows with amount greater than 500 and amount less than 1000 "
+        "to high_value, and everything else to standard.",
+        "Later add a gate that routes csv rows with amount greater than 500 or priority equals true "
+        "to high_value, and everything else to standard.",
+    ),
+)
+def test_stated_grounding_rejects_unrepresented_compound_predicates(message: str) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later add a gate that routes csv rows with amount greater than 500 to high_value and audit_copy, and everything else to standard.",
+        "Later add a gate that routes csv rows with amount greater than 500 to high_value after first sending them "
+        "to manual_review, and everything else to standard.",
+    ),
+)
+def test_stated_grounding_rejects_unrepresented_extra_branch_destinations(message: str) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Later avoid a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later skip the gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later prohibit routing csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later, no gate should route csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later refrain from routing csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later remove the gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later delete the gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later disable the gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later we cannot use a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later we can't use a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later we can\u2019t use a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later we won't use a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+        "Later we won\u2019t use a gate that routes csv rows with amount greater than 500 to high_value, and everything else to standard.",
+    ),
+)
+def test_stated_grounding_rejects_negative_authority_verbs(message: str) -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated routing.",
+        constraints=(
+            StatedGateRoutingConstraint(
+                kind="stated_gate_routing",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+                true_target="high_value",
+                false_target="standard",
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content=message,
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+def test_stated_predicate_rejects_unrepresented_exclusion_clause() -> None:
+    action = DeferredIntentAction(
+        target_stage="topology",
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated predicate.",
+        constraints=(
+            StatedPredicateConstraint(
+                kind="stated_predicate",
+                subject=PluginSubject(
+                    kind="plugin",
+                    subject_id="99999999-9999-4999-8999-999999999999",
+                    plugin_kind="source",
+                    plugin_name="csv",
+                ),
+                column="amount",
+                operator="greater_than",
+                value=500,
+            ),
+        ),
+    )
+
+    assert validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view((("source", "csv"),)),
+        guided=GuidedSession.initial(),
+        originating_message_content="Later apply a gate where csv amount is greater than 500, excluding priority rows.",
+    ) == DeferredIntentRejected(reason="stated_fact_unproven")
+
+
+@pytest.mark.parametrize(
+    ("edge_type", "target_stage", "expected"),
+    (
+        ("route_true", "topology", DeferredIntentAccepted),
+        ("route_false", "topology", DeferredIntentAccepted),
+        ("fork", "topology", DeferredIntentAccepted),
+        ("on_success", "topology", DeferredIntentRejected),
+    ),
+)
+def test_gate_route_constraints_belong_to_topology_instead_of_wire_review(
+    edge_type: str,
+    target_stage: str,
+    expected: type[DeferredIntentAccepted] | type[DeferredIntentRejected],
+) -> None:
+    action = DeferredIntentAction(
+        target_stage=target_stage,  # type: ignore[arg-type]
+        catalog_kind=None,
+        catalog_name=None,
+        redacted_summary="Apply the stated gate route while authoring topology.",
+        constraints=(
+            EdgeRouteConstraint(
+                kind="edge_route",
+                from_subject=StableSubject(
+                    kind="stable",
+                    component_kind="node",
+                    stable_id="33333333-3333-4333-8333-333333333333",
+                ),
+                edge_type=edge_type,  # type: ignore[arg-type]
+                to_subject=StableSubject(
+                    kind="stable",
+                    component_kind="output",
+                    stable_id="44444444-4444-4444-8444-444444444444",
+                ),
+                present=True,
+            ),
+        ),
+    )
+
+    result = validate_deferred_intent_action(
+        action,
+        receiving_stage="source",
+        catalog=_view(()),
+        guided=GuidedSession.initial(),
+    )
+
+    assert type(result) is expected
+    if expected is DeferredIntentRejected:
+        assert result == DeferredIntentRejected(reason="wrong_responsible_stage")
 
 
 def test_kind_qualified_name_resolves_without_guessing_across_other_plugin_kinds() -> None:

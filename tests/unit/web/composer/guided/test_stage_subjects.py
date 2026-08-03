@@ -22,6 +22,8 @@ from elspeth.web.composer.guided.stage_subjects import (
     PluginSubject,
     StableSubject,
     StageName,
+    StatedGateRoutingConstraint,
+    StatedPredicateConstraint,
     SubjectPresenceConstraint,
     constraint_from_dict,
     resolve_catalog_subject,
@@ -142,6 +144,22 @@ def test_subject_and_constraint_fixtures_round_trip_without_schema_drift() -> No
             operator="equals",
             target=StableSubject(kind="stable", component_kind="output", stable_id=OUTPUT_ID),
         ),
+        StatedPredicateConstraint(
+            kind="stated_predicate",
+            subject=stable,
+            column="amount",
+            operator="greater_than",
+            value=500,
+        ),
+        StatedGateRoutingConstraint(
+            kind="stated_gate_routing",
+            subject=stable,
+            column="amount",
+            operator="greater_than",
+            value=500,
+            true_target="high_value",
+            false_target="standard",
+        ),
     )
     expected = (
         {"kind": "subject_presence", "subject": plugin.to_dict(), "present": True},
@@ -174,10 +192,53 @@ def test_subject_and_constraint_fixtures_round_trip_without_schema_drift() -> No
             "operator": "equals",
             "target": constraints[4].target.to_dict(),  # type: ignore[union-attr]
         },
+        {
+            "kind": "stated_predicate",
+            "subject": stable.to_dict(),
+            "column": "amount",
+            "operator": "greater_than",
+            "value": 500,
+        },
+        {
+            "kind": "stated_gate_routing",
+            "subject": stable.to_dict(),
+            "column": "amount",
+            "operator": "greater_than",
+            "value": 500,
+            "true_target": "high_value",
+            "false_target": "standard",
+        },
     )
     for constraint, encoded in zip(constraints, expected, strict=True):
         assert constraint.to_dict() == encoded
         assert constraint_from_dict(encoded) == constraint
+
+
+@pytest.mark.parametrize("target", ("high value", "fork", "__private", "High_Value", "a" * 39))
+def test_stated_gate_routing_targets_must_be_runtime_valid_output_names(target: str) -> None:
+    with pytest.raises(InvariantError, match="valid output name"):
+        StatedGateRoutingConstraint(
+            kind="stated_gate_routing",
+            subject=StableSubject(kind="stable", component_kind="source", stable_id=SOURCE_ID),
+            column="amount",
+            operator="greater_than",
+            value=500,
+            true_target=target,
+            false_target="standard",
+        )
+
+
+def test_stated_constraint_decoder_rejects_non_string_operator_as_an_invariant_error() -> None:
+    with pytest.raises(InvariantError, match="operator is unsupported"):
+        constraint_from_dict(
+            {
+                "kind": "stated_predicate",
+                "subject": {"kind": "stable", "component_kind": "source", "stable_id": SOURCE_ID},
+                "column": "amount",
+                "operator": ["greater_than"],
+                "value": 500,
+            }
+        )
 
 
 @pytest.mark.parametrize(

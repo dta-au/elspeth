@@ -230,6 +230,20 @@ def _validate_connection_or_sink_name(value: str, *, field_label: str) -> str:
     return value
 
 
+def validate_sink_name(value: str, *, field_label: str = "Sink name") -> str:
+    """Validate one sink name against the exact runtime settings contract."""
+
+    if value != value.lower():
+        raise ValueError(f"{field_label} '{value}' must be lowercase. Suggested fix: '{value.lower()}'.")
+    _validate_max_length(value, field_label=field_label, max_length=_MAX_NODE_NAME_LENGTH)
+    _validate_connection_name_chars(value, field_label=field_label)
+    if value in _RESERVED_EDGE_LABELS:
+        raise ValueError(f"{field_label} '{value}' is reserved. Reserved: {sorted(_RESERVED_EDGE_LABELS)}")
+    if value.startswith("__"):
+        raise ValueError(f"{field_label} '{value}' starts with '__', which is reserved for system edges")
+    return value
+
+
 _ENV_VAR_NAME_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
 """Valid POSIX environment-variable name: leading letter/underscore, then word chars.
 
@@ -2142,19 +2156,8 @@ class ElspethSettings(BaseModel):
         2. Avoid case mismatches between keys and references
         3. Ensure consistency with environment variable overrides (which are uppercased by Dynaconf)
         """
-        non_lowercase = [name for name in v if name != name.lower()]
-        if non_lowercase:
-            # Provide helpful suggestions
-            suggestions = [f"'{name}' -> '{name.lower()}'" for name in non_lowercase]
-            raise ValueError(f"Sink names must be lowercase. Found: {non_lowercase}. Suggested fixes: {', '.join(suggestions)}")
-
         for sink_name in v:
-            _validate_max_length(sink_name, field_label="Sink name", max_length=_MAX_NODE_NAME_LENGTH)
-            _validate_connection_name_chars(sink_name, field_label="Sink name")
-            if sink_name in _RESERVED_EDGE_LABELS:
-                raise ValueError(f"Sink name '{sink_name}' is reserved. Reserved sink/edge labels: {sorted(_RESERVED_EDGE_LABELS)}")
-            if sink_name.startswith("__"):
-                raise ValueError(f"Sink name '{sink_name}' starts with '__', which is reserved for system edges")
+            validate_sink_name(sink_name)
         return v
 
 

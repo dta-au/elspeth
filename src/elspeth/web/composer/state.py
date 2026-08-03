@@ -48,6 +48,7 @@ from elspeth.core.config import (
     _validate_connection_or_sink_name,
     _validate_max_length,
     _validate_node_name_chars,
+    validate_sink_name,
 )
 from elspeth.core.dag.coalesce_merge import merge_guaranteed_fields
 from elspeth.core.templates import extract_jinja2_field_usage
@@ -84,6 +85,14 @@ def validate_composer_source_name(source_name: str) -> None:
         raise ValueError(f"Source name '{source_name}' is reserved. Reserved source/edge labels: {sorted(_RESERVED_EDGE_LABELS)}")
     if source_name.startswith("__"):
         raise ValueError(f"Source name '{source_name}' starts with '__', which is reserved for system edges")
+
+
+def validate_composer_output_name(output_name: str) -> None:
+    """Validate an output's routing label against runtime settings constraints."""
+
+    if not output_name or not output_name.strip() or output_name != output_name.strip():
+        raise ValueError("Output name must be a non-empty string without surrounding whitespace")
+    validate_sink_name(output_name, field_label="Output name")
 
 
 def _composer_source_name_validation_message(source_name: str) -> str | None:

@@ -2736,6 +2736,7 @@ class ComposerServiceImpl:
         )
         from elspeth.web.composer.guided.profile import TUTORIAL_PROFILE
         from elspeth.web.composer.guided.prompts import load_step_planner_skill
+        from elspeth.web.composer.guided.stage_subjects import StatedGateRoutingConstraint, StatedPredicateConstraint
         from elspeth.web.composer.guided.state_machine import GuidedSession
 
         if type(guided) is not GuidedSession:
@@ -2769,10 +2770,16 @@ class ComposerServiceImpl:
             }
 
         def evaluate_claims(candidate: CompositionState, claimed_intent_ids: tuple[str, ...]) -> tuple[str, ...]:
+            required_intent_ids = tuple(
+                intent.intent_id
+                for intent in guided.deferred_intents
+                if any(type(constraint) in {StatedPredicateConstraint, StatedGateRoutingConstraint} for constraint in intent.constraints)
+            )
             return evaluate_deferred_intent_coverage(
                 candidate=candidate,
                 reviewed_guided=guided,
                 claimed_intent_ids=claimed_intent_ids,
+                required_intent_ids=required_intent_ids,
             )
 
         planner_surface = PlannerSurface.TUTORIAL_PROFILE if guided.profile == TUTORIAL_PROFILE else PlannerSurface.GUIDED_STAGED

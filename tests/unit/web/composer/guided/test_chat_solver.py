@@ -46,7 +46,11 @@ from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.intent_management import deferred_intent_management_option
 from elspeth.web.composer.guided.protocol import GuidedStep, TurnType
 from elspeth.web.composer.guided.resolved import SinkOutputResolved, SinkResolved, SourceResolved
-from elspeth.web.composer.guided.stage_subjects import ComponentCountConstraint
+from elspeth.web.composer.guided.stage_subjects import (
+    ComponentCountConstraint,
+    StatedGateRoutingConstraint,
+    StatedPredicateConstraint,
+)
 from elspeth.web.composer.guided.stage_transitions import (
     PluginSelectionResponse,
     SchemaFormAuthority,
@@ -2809,6 +2813,102 @@ def test_parse_step_2_sink_rejects_non_object_arguments() -> None:
     """Malformed LLM resolve_sink arguments are rejected at the Tier-3 parse boundary."""
     with pytest.raises(ValueError, match="must decode to an object"):
         _parse_step_2_sink_tool_arguments('["not", "an", "object"]')
+
+
+def test_deferred_tool_offers_and_parses_the_closed_stated_predicate_vocabulary() -> None:
+    branches = chat_solver._DEFERRED_CONSTRAINT_SCHEMA["oneOf"]
+    predicate_schema = next(branch for branch in branches if branch["properties"]["kind"]["enum"] == ["stated_predicate"])
+    assert predicate_schema["required"] == ["kind", "subject", "column", "operator", "value"]
+    assert predicate_schema["additionalProperties"] is False
+    assert predicate_schema["properties"]["operator"]["enum"] == [
+        "equals",
+        "not_equals",
+        "greater_than",
+        "greater_than_or_equal",
+        "less_than",
+        "less_than_or_equal",
+    ]
+
+    action = chat_solver._parse_deferred_intent_tool_arguments(
+        json.dumps(
+            {
+                "target_stage": "topology",
+                "catalog_kind": None,
+                "catalog_name": None,
+                "redacted_summary": "Apply the amount threshold.",
+                "constraints": [
+                    {
+                        "kind": "stated_predicate",
+                        "subject": {
+                            "kind": "plugin",
+                            "subject_id": "33333333-3333-4333-8333-333333333333",
+                            "plugin_kind": "source",
+                            "plugin_name": "csv",
+                        },
+                        "column": "amount",
+                        "operator": "greater_than",
+                        "value": 500,
+                    }
+                ],
+            }
+        )
+    )
+
+    assert type(action.constraints[0]) is StatedPredicateConstraint
+    assert action.constraints[0].to_dict()["value"] == 500
+
+
+def test_deferred_tool_offers_and_parses_exact_gate_routing_without_a_fork_escape() -> None:
+    branches = chat_solver._DEFERRED_CONSTRAINT_SCHEMA["oneOf"]
+    routing_schema = next(branch for branch in branches if branch["properties"]["kind"]["enum"] == ["stated_gate_routing"])
+    assert routing_schema["required"] == [
+        "kind",
+        "subject",
+        "column",
+        "operator",
+        "value",
+        "true_target",
+        "false_target",
+    ]
+    assert routing_schema["additionalProperties"] is False
+    assert routing_schema["properties"]["true_target"] == {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 38,
+        "pattern": "^[a-z0-9_][a-z0-9_-]*$",
+    }
+    assert routing_schema["properties"]["false_target"] == routing_schema["properties"]["true_target"]
+
+    action = chat_solver._parse_deferred_intent_tool_arguments(
+        json.dumps(
+            {
+                "target_stage": "topology",
+                "catalog_kind": None,
+                "catalog_name": None,
+                "redacted_summary": "Route the two threshold outcomes.",
+                "constraints": [
+                    {
+                        "kind": "stated_gate_routing",
+                        "subject": {
+                            "kind": "plugin",
+                            "subject_id": "33333333-3333-4333-8333-333333333333",
+                            "plugin_kind": "source",
+                            "plugin_name": "csv",
+                        },
+                        "column": "amount",
+                        "operator": "greater_than",
+                        "value": 500,
+                        "true_target": "high_value",
+                        "false_target": "standard",
+                    }
+                ],
+            }
+        )
+    )
+
+    assert type(action.constraints[0]) is StatedGateRoutingConstraint
+    assert action.constraints[0].true_target == "high_value"
+    assert action.constraints[0].false_target == "standard"
 
 
 def test_step_2_sink_tool_schema_and_parser_are_exactly_singular() -> None:

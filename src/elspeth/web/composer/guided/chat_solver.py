@@ -597,6 +597,52 @@ _DEFERRED_CONSTRAINT_SCHEMA: dict[str, Any] = {
         {
             "type": "object",
             "additionalProperties": False,
+            "required": ["kind", "subject", "column", "operator", "value"],
+            "properties": {
+                "kind": {"type": "string", "enum": ["stated_predicate"]},
+                "subject": _DEFERRED_SUBJECT_SCHEMA,
+                "column": {"type": "string", "minLength": 1, "maxLength": 128},
+                "operator": {
+                    "type": "string",
+                    "enum": [
+                        "equals",
+                        "not_equals",
+                        "greater_than",
+                        "greater_than_or_equal",
+                        "less_than",
+                        "less_than_or_equal",
+                    ],
+                },
+                "value": {"type": ["string", "integer", "number", "boolean", "null"]},
+            },
+        },
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["kind", "subject", "column", "operator", "value", "true_target", "false_target"],
+            "properties": {
+                "kind": {"type": "string", "enum": ["stated_gate_routing"]},
+                "subject": _DEFERRED_SUBJECT_SCHEMA,
+                "column": {"type": "string", "minLength": 1, "maxLength": 128},
+                "operator": {
+                    "type": "string",
+                    "enum": [
+                        "equals",
+                        "not_equals",
+                        "greater_than",
+                        "greater_than_or_equal",
+                        "less_than",
+                        "less_than_or_equal",
+                    ],
+                },
+                "value": {"type": ["string", "integer", "number", "boolean", "null"]},
+                "true_target": {"type": "string", "minLength": 1, "maxLength": 38, "pattern": "^[a-z0-9_][a-z0-9_-]*$"},
+                "false_target": {"type": "string", "minLength": 1, "maxLength": 38, "pattern": "^[a-z0-9_][a-z0-9_-]*$"},
+            },
+        },
+        {
+            "type": "object",
+            "additionalProperties": False,
             "required": ["kind", "from_subject", "edge_type", "to_subject", "present"],
             "properties": {
                 "kind": {"type": "string", "enum": ["edge_route"]},
