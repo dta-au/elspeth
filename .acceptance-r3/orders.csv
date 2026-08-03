@@ -1,0 +1,7 @@
+order_id,customer,amount,region,notes
+1001,Acme Pty Ltd,250.00,NSW,standard delivery
+1002,Bright Industries,1450.50,VIC,expedited freight requested
+1003,Coastal Foods,89.95,QLD,fragile goods
+1004,Delta Logistics,720.00,NSW,bulk order discount applied
+1005,Everest Mining,2310.75,WA,site access restricted
+1006,Foreshore Marine,45.20,TAS,small parcel

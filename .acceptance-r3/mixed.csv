@@ -1,0 +1,6 @@
+record_id,value,label
+1,42,valid
+2,not_a_number,bad row on purpose
+3,17,valid
+4,,empty value on purpose
+5,8,valid

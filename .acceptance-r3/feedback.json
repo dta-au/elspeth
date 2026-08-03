@@ -1,0 +1,6 @@
+[
+ {"ticket_id":"T-1","channel":"email","message":"The invoice total looks wrong, can someone check it?"},
+ {"ticket_id":"T-2","channel":"phone","message":"Delivery arrived two days early, very happy."},
+ {"ticket_id":"T-3","channel":"web","message":"Cannot log in to the portal since the update."},
+ {"ticket_id":"T-4","channel":"email","message":"Please add a purchase order field to the form."}
+]

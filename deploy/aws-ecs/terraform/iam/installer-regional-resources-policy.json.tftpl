@@ -149,6 +149,22 @@
       }
     },
     {
+      "Sid": "CreateChildrenOfRunTaggedVpc",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:CreateRouteTable",
+        "ec2:CreateSecurityGroup",
+        "ec2:CreateSubnet"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceTag/ACCEPTANCE_RUN_ID": "${run_id}",
+          "aws:RequestedRegion": "${aws_region}"
+        }
+      }
+    },
+    {
       "Sid": "DeregisterTaskDefinitionsRegionScopedOnly",
       "Effect": "Allow",
       "Action": [
