@@ -2122,15 +2122,40 @@ class TestAuthoritativeProofDiagnostics:
         assert result.checks[24].passed is True
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_exited_guided_history", [False, True])
     async def test_uninspectable_blob_source_abstains_with_passing_proof_check(
         self,
         service: ExecutionServiceImpl,
         tmp_path: Path,
+        with_exited_guided_history: bool,
     ) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
+
+        blob_id = uuid4()
+        source_path = tmp_path / "not-authoritatively-resolved.csv"
         state = _proof_gate_state(
-            source_path=tmp_path / "not-authoritatively-resolved.csv",
-            blob_id=uuid4(),
+            source_path=source_path,
+            blob_id=blob_id,
         )
+        if with_exited_guided_history:
+            historical_guided = _guided_sentinel_proof_gate_state(
+                source_path=source_path,
+                blob_id=blob_id,
+            ).guided_session
+            assert historical_guided is not None
+            state = replace(
+                state,
+                guided_session=replace(
+                    historical_guided,
+                    terminal=TerminalState(
+                        kind=TerminalKind.EXITED_TO_FREEFORM,
+                        reason=TerminalReason.USER_PRESSED_EXIT,
+                        pipeline_yaml=None,
+                    ),
+                ),
+            )
         service._blob_service = None
 
         with patch(

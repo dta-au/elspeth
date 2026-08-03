@@ -750,14 +750,16 @@ class ExecutionServiceImpl:
         session_id: UUID | None,
     ) -> Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]:
         """Resolve only exact, session-owned, ready blob bindings for proof."""
+        from elspeth.web.composer.guided.state_machine import TerminalKind
         from elspeth.web.composer.guided_blob_refs import validate_guided_reviewed_blob_binding
         from elspeth.web.composer.tools.blobs import BlobToolRecord
         from elspeth.web.composer.tools.generation import ResolvedProofBlob, UnresolvedClaimedProofBlob
         from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
 
         claimed_sentinel_blob_ids: set[str] = set()
-        if state.guided_session is not None:
-            for reviewed_source in state.guided_session.reviewed_sources.values():
+        guided = state.guided_session
+        if guided is not None and (guided.terminal is None or guided.terminal.kind is not TerminalKind.EXITED_TO_FREEFORM):
+            for reviewed_source in guided.reviewed_sources.values():
                 binding = validate_guided_reviewed_blob_binding(reviewed_source.options)
                 if binding is not None and binding.is_sentinel:
                     claimed_sentinel_blob_ids.add(binding.blob_ref)
