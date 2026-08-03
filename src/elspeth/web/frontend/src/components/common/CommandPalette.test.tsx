@@ -80,7 +80,13 @@ describe("CommandPalette guided-mode commands", () => {
       reenterGuided,
     });
 
-    render(<CommandPalette isOpen onClose={onClose} />);
+    render(
+      <CommandPalette
+        isOpen
+        onClose={onClose}
+        runAdmissionAvailable
+      />,
+    );
 
     await user.click(
       screen.getByRole("option", { name: /re-enter guided mode/i }),
@@ -91,7 +97,9 @@ describe("CommandPalette guided-mode commands", () => {
   });
 
   it("does not offer navigation to the removed Runs tab", () => {
-    render(<CommandPalette isOpen onClose={vi.fn()} />);
+    render(
+      <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+    );
 
     expect(
       screen.queryByRole("option", { name: /Switch to Runs Tab/i }),
@@ -112,7 +120,9 @@ describe("CommandPalette guided-mode commands", () => {
       ],
     });
 
-    render(<CommandPalette isOpen onClose={vi.fn()} />);
+    render(
+      <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+    );
 
     expect(screen.getByRole("group", { name: "Actions" })).toBeInTheDocument();
     expect(screen.getByRole("group", { name: "Navigation" })).toBeInTheDocument();
@@ -120,7 +130,9 @@ describe("CommandPalette guided-mode commands", () => {
   });
 
   it("does not offer navigation to the removed Spec tab", () => {
-    render(<CommandPalette isOpen onClose={vi.fn()} />);
+    render(
+      <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+    );
 
     expect(
       screen.queryByRole("option", { name: /Switch to Spec Tab/i }),
@@ -131,7 +143,9 @@ describe("CommandPalette guided-mode commands", () => {
     const handler = vi.fn();
     window.addEventListener(OPEN_GRAPH_MODAL_EVENT, handler);
 
-    render(<CommandPalette isOpen onClose={vi.fn()} />);
+    render(
+      <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+    );
     fireEvent.click(screen.getByText(/open graph view/i));
 
     expect(handler).toHaveBeenCalled();
@@ -153,7 +167,9 @@ describe("CommandPalette guided-mode commands", () => {
       },
     } as never);
 
-    render(<CommandPalette isOpen onClose={vi.fn()} />);
+    render(
+      <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+    );
     fireEvent.click(screen.getByText(/export yaml/i));
 
     expect(handler).toHaveBeenCalled();
@@ -165,13 +181,17 @@ describe("CommandPalette guided-mode commands", () => {
   // as ExportYamlButton — the command is withheld entirely (disabled
   // commands are filtered from the palette, matching Validate/Execute).
   it("withholds 'Export YAML' when the pipeline is empty", () => {
-    render(<CommandPalette isOpen onClose={vi.fn()} />);
+    render(
+      <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+    );
 
     expect(screen.queryByText(/export yaml/i)).toBeNull();
   });
 
   it("does not offer the old Graph or YAML tab commands", () => {
-    render(<CommandPalette isOpen onClose={vi.fn()} />);
+    render(
+      <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+    );
 
     expect(
       screen.queryByRole("option", { name: /Switch to Graph Tab/i }),
@@ -188,7 +208,27 @@ describe("CommandPalette guided-mode commands", () => {
       readiness: { execution_ready: false },
     };
 
-    render(<CommandPalette isOpen onClose={vi.fn()} />);
+    render(
+      <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+    );
+
+    expect(screen.queryByText("Execute Pipeline")).not.toBeInTheDocument();
+  });
+
+  it("withholds Execute when the run-admission owner is not mounted", () => {
+    useSessionStore.setState({ activeSessionId: "session-1" });
+    executionStoreState.validationResult = {
+      is_valid: true,
+      readiness: { execution_ready: true },
+    };
+
+    render(
+      <CommandPalette
+        isOpen
+        onClose={vi.fn()}
+        runAdmissionAvailable={false}
+      />,
+    );
 
     expect(screen.queryByText("Execute Pipeline")).not.toBeInTheDocument();
   });
@@ -203,7 +243,13 @@ describe("CommandPalette guided-mode commands", () => {
       readiness: { execution_ready: true },
     };
 
-    render(<CommandPalette isOpen onClose={onClose} />);
+    render(
+      <CommandPalette
+        isOpen
+        onClose={onClose}
+        runAdmissionAvailable
+      />,
+    );
     fireEvent.click(screen.getByText("Execute Pipeline"));
 
     expect(onRequestRun).toHaveBeenCalledTimes(1);
@@ -224,7 +270,9 @@ describe("CommandPalette guided-mode commands", () => {
     executionStoreState.isExecuting = isExecuting;
     executionStoreState.progress = progress;
 
-    render(<CommandPalette isOpen onClose={vi.fn()} />);
+    render(
+      <CommandPalette isOpen onClose={vi.fn()} runAdmissionAvailable />,
+    );
 
     expect(screen.queryByText("Execute Pipeline")).not.toBeInTheDocument();
   });

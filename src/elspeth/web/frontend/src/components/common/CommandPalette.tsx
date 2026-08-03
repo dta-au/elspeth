@@ -39,6 +39,7 @@ interface Command {
 interface CommandPaletteProps {
   isOpen: boolean;
   onClose: () => void;
+  runAdmissionAvailable: boolean;
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -46,6 +47,7 @@ interface CommandPaletteProps {
 export function CommandPalette({
   isOpen,
   onClose,
+  runAdmissionAvailable,
 }: CommandPaletteProps) {
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -103,6 +105,7 @@ export function CommandPalette({
       category: "action",
       shortcut: "Ctrl+E",
       enabled:
+        runAdmissionAvailable &&
         validationResult?.readiness.execution_ready === true &&
         !isExecuting &&
         progress?.status !== "running" &&
@@ -195,6 +198,7 @@ export function CommandPalette({
     compositionState,
     guidedSession,
     validationResult,
+    runAdmissionAvailable,
     isExecuting,
     progress,
     createSession,

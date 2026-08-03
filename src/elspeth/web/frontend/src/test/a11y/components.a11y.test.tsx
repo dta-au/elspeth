@@ -1550,7 +1550,13 @@ describe("CommandPalette", () => {
     // palette scrolls the selected row into view on mount) — same stub as
     // CommandPalette.test.tsx.
     Element.prototype.scrollIntoView = vi.fn();
-    const { container } = render(<CommandPalette isOpen onClose={() => {}} />);
+    const { container } = render(
+      <CommandPalette
+        isOpen
+        onClose={() => {}}
+        runAdmissionAvailable
+      />,
+    );
     expect(await axe(container)).toHaveNoViolations();
   });
 });

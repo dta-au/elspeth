@@ -549,6 +549,50 @@ describe("App banner roles", () => {
     window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
   });
 
+  it("does not dispatch run intent from Ctrl+E while the guided build hides the run owner", async () => {
+    const execute = vi.fn();
+    const onRequestRun = vi.fn();
+    window.addEventListener(REQUEST_RUN_EVENT, onRequestRun);
+    useSessionStore.setState({
+      activeSessionId: "session-1",
+      compositionState: makeState(1),
+      guidedSession: {
+        step: "step_3_transforms",
+        history: [],
+        terminal: null,
+        chat_history: [],
+        chat_turn_seq: 0,
+        profile: null,
+      } as unknown as import("./types/guided").GuidedSession,
+      guidedNextTurn: null,
+    });
+    useExecutionStore.setState({
+      validationResult: {
+        is_valid: true,
+        checks: [],
+        errors: [],
+        warnings: [],
+        readiness: {
+          authoring_valid: true,
+          execution_ready: true,
+          completion_ready: true,
+          blockers: [],
+        },
+      } as never,
+      isExecuting: false,
+      progress: null,
+      execute,
+    } as never);
+
+    render(<App />);
+    await waitFor(() => expect(api.fetchSystemStatus).toHaveBeenCalled());
+    fireEvent.keyDown(document, { key: "e", ctrlKey: true });
+
+    expect(onRequestRun).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    window.removeEventListener(REQUEST_RUN_EVENT, onRequestRun);
+  });
+
   it("does not dispatch retired inspector tab shortcuts on Alt+digit", async () => {
     const onSwitchTab = vi.fn();
     window.addEventListener("elspeth-switch-tab", onSwitchTab);

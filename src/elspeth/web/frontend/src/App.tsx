@@ -180,6 +180,16 @@ function App() {
   const showEmptyLanding =
     sessionsLoaded && !hasLiveSessions && activeSessionId === null;
 
+  // REQUEST_RUN_EVENT has exactly one policy owner: ExecuteButton inside
+  // CompletionBar. Keep every emitter aligned with the same availability
+  // fact used to mount that owner, so shortcuts and the command palette can
+  // never dispatch into a zero-listener surface.
+  const runAdmissionAvailable =
+    sharedToken === null &&
+    !showTutorial &&
+    !showEmptyLanding &&
+    !guidedBuildActive;
+
   useEffect(() => {
     function handleOpenCatalog() {
       setCatalogOpen(true);
@@ -379,7 +389,12 @@ function App() {
       }
 
       // Ctrl+E / Cmd+E: Execute pipeline
-      if (e.key === "e" && (e.ctrlKey || e.metaKey) && activeSessionId) {
+      if (
+        e.key === "e" &&
+        (e.ctrlKey || e.metaKey) &&
+        activeSessionId &&
+        runAdmissionAvailable
+      ) {
         e.preventDefault();
         window.dispatchEvent(new CustomEvent(REQUEST_RUN_EVENT));
         return;
@@ -396,7 +411,7 @@ function App() {
     }
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [createSession, activeSessionId, compositionState]);
+  }, [createSession, activeSessionId, compositionState, runAdmissionAvailable]);
 
   // Initial health check and periodic polling
   useEffect(() => {
@@ -605,7 +620,7 @@ function App() {
                 // Copy-YAML live in CompletionBar, so the completed surface
                 // must have it back. isGuidedBuildActive is the SAME
                 // predicate ChatPanel's workspace branch renders under.
-                guidedBuildActive ? null : (
+                runAdmissionAvailable ? (
                   <SideRail
                     auditReadinessSlot={<AuditReadinessPanel />}
                     validationBannerSlot={<SideRailValidationBanner />}
@@ -620,7 +635,7 @@ function App() {
                     // are preserved untouched.
                     completionBarSlot={<CompletionBar />}
                   />
-                )
+                ) : null
               }
             />
           </div>
@@ -645,7 +660,11 @@ function App() {
             onResetTutorialComplete={handleResetTutorialComplete}
           />
         )}
-        <CommandPalette isOpen={showPalette} onClose={closePalette} />
+        <CommandPalette
+          isOpen={showPalette}
+          onClose={closePalette}
+          runAdmissionAvailable={runAdmissionAvailable}
+        />
         {showShortcuts && (
           <ShortcutsHelp onClose={() => setShowShortcuts(false)} />
         )}
