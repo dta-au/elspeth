@@ -1114,6 +1114,70 @@ async def test_step_1_pair_of_resolve_source_and_retain_applies_both(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
+async def test_form_directed_revision_keeps_retain_from_pair_with_withheld_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    """Withholding revision tools must not discard the pair's valid future intent."""
+
+    async def stale_pair_acompletion(**kwargs: Any) -> _FakeLLMResponse:
+        offered_tools = {tool["function"]["name"] for tool in kwargs["tools"]}
+        mutation_name = "resolve_source" if stage == "source" else "resolve_sink"
+        assert mutation_name not in offered_tools
+        calls = [
+            SimpleNamespace(
+                id="c_resolution",
+                function=SimpleNamespace(
+                    name=mutation_name,
+                    arguments=json.dumps(_PAIR_SOURCE_ARGUMENTS if stage == "source" else _PAIR_SINK_ARGUMENTS),
+                ),
+            ),
+            SimpleNamespace(
+                id="c_retain",
+                function=SimpleNamespace(name="retain_deferred_intent", arguments=json.dumps(_VALID_DEFERRED_ARGUMENTS)),
+            ),
+        ]
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", stale_pair_acompletion)
+    context_block = build_step_chat_context_block(
+        step=GuidedStep.STEP_1_SOURCE if stage == "source" else GuidedStep.STEP_2_SINK,
+        current_source=None,
+        current_sink=None,
+        state=None,
+        deferred_intents=(),
+        authoritative_revision_form="source" if stage == "source" else "output",
+    )
+    if stage == "source":
+        outcome = await maybe_resolve_step_1_source_chat(
+            model="test/model",
+            user_message="Change the source and later add the passthrough transform.",
+            plugin_hint="json",
+            current_source=None,
+            available_source_plugins=("csv", "json"),
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            context_block=context_block,
+        )
+    else:
+        outcome = await maybe_resolve_step_2_sink_chat(
+            model="test/model",
+            user_message="Change the output and later add the passthrough transform.",
+            current_sink=None,
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            context_block=context_block,
+        )
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.action == _EXPECTED_DEFERRED_ACTION
+    assert outcome.resolution_error_class == "PairedResolutionNotResent"
+
+
+@pytest.mark.asyncio
 async def test_step_2_pair_with_malformed_retain_is_repaired_then_applies_both(monkeypatch: pytest.MonkeyPatch) -> None:
     """The retain half of a pair gets the bounded repair without losing the sink half."""
     calls: list[dict[str, Any]] = []
@@ -2082,13 +2146,18 @@ async def test_guided_chat_route_selects_active_output_for_revision_and_keeps_al
 
     system_messages = [str(message["content"]) for message in captured["messages"] if message["role"] == "system"]
     assert len(system_messages) == 2
-    revision_prompt, advisory_context = system_messages
-    assert '"revision_target_index": 3' in revision_prompt
-    assert '"output": {"option_count": 0, "plugin": "csv"' in revision_prompt
-    assert '"outputs": [' not in revision_prompt
+    tool_prompt, advisory_context = system_messages
+    assert "Guided Pipeline Composer" in tool_prompt
+    assert "form-directed revision" in tool_prompt
+    assert "COMPLETE updated output" not in tool_prompt
+    assert '"revision_target_index": 3' in tool_prompt
     assert '"outputs": [{"option_count": 0, "output_index": 1, "plugin": "json"' in advisory_context
     assert '"output_index": 3, "plugin": "csv"' in advisory_context
     assert '"output_index": 2' not in advisory_context
+    assert "current output wizard form is authoritative" in advisory_context
+    assert "construct a replacement" in advisory_context
+    offered_tools = {tool["function"]["name"] for tool in captured["tools"]}
+    assert offered_tools == {"retain_deferred_intent", "manage_deferred_intent"}
     for raw_value in (source_label, output_label_a, output_label_b, literal_sample):
         assert raw_value not in "\n".join(system_messages)
     user_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] == "user")
@@ -2153,15 +2222,127 @@ async def test_guided_chat_route_preserves_gapped_index_for_single_advisory_outp
 
     system_messages = [str(message["content"]) for message in captured["messages"] if message["role"] == "system"]
     assert len(system_messages) == 2
-    revision_prompt, advisory_context = system_messages
-    assert '"revision_target_index": 3' in revision_prompt
-    assert '"output_index"' not in revision_prompt
+    tool_prompt, advisory_context = system_messages
+    assert "Guided Pipeline Composer" in tool_prompt
+    assert "form-directed revision" in tool_prompt
+    assert "COMPLETE updated output" not in tool_prompt
+    assert '"revision_target_index": 3' in tool_prompt
     assert '"output": {"option_count": 1, "output_index": 3, "plugin": "json"' in advisory_context
+    assert "current output wizard form is authoritative" in advisory_context
+    offered_tools = {tool["function"]["name"] for tool in captured["tools"]}
+    assert offered_tools == {"retain_deferred_intent", "manage_deferred_intent"}
     assert output_label not in "\n".join(system_messages)
     assert raw_option not in "\n".join(system_messages)
     user_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] == "user")
     assert output_label in user_content
     assert raw_option not in user_content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("step", "target_kind"),
+    (
+        (GuidedStep.STEP_1_SOURCE, "source"),
+        (GuidedStep.STEP_2_SINK, "output"),
+    ),
+)
+async def test_applied_component_chat_revision_is_form_directed_without_mutation_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    step: GuidedStep,
+    target_kind: str,
+) -> None:
+    """A partial projection can explain an edit, but can never author it."""
+    source = SourceResolved(
+        name="private-source-name",
+        plugin="csv",
+        options={
+            "path": "/private/source.csv",
+            "schema": {"mode": "observed"},
+            "on_validation_failure": "quarantine",
+        },
+        observed_columns=("amount",),
+        sample_rows=(),
+        on_validation_failure="quarantine",
+    )
+    output = SinkOutputResolved(
+        name="private-output-name",
+        plugin="json",
+        options={
+            "path": "/private/output.jsonl",
+            "collision_policy": "auto_increment",
+        },
+        required_fields=("amount",),
+        schema_mode="observed",
+        on_write_failure="failures",
+    )
+    stable_id = "source-a" if target_kind == "source" else "output-a"
+    guided = SimpleNamespace(
+        active_edit_target=SimpleNamespace(kind=target_kind, stable_id=stable_id),
+        source_order=("source-a",),
+        reviewed_sources={"source-a": source},
+        output_order=("output-a",),
+        reviewed_outputs={"output-a": output},
+        pending_source_intents={},
+        deferred_intents=(),
+    )
+    captured: dict[str, Any] = {}
+
+    async def capture_advisory_provider(**kwargs: Any) -> _FakeLLMResponse:
+        captured.update(kwargs)
+        return _ok_response("Use the current wizard form to make that change.")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", capture_advisory_provider)
+
+    outcome = await guided_chat_atomic_module.run_guided_chat_provider_attempt(
+        session_id=uuid4(),
+        user=SimpleNamespace(user_id="user"),
+        step=step,
+        guided=guided,
+        state=SimpleNamespace(sources={}, nodes=(), outputs=(), edges=()),
+        message="Change the private path and failure policy.",
+        settings=SimpleNamespace(
+            composer_model="test/model",
+            composer_temperature=None,
+            composer_seed=None,
+            composer_max_discovery_turns=1,
+            composer_max_tool_calls_per_turn=16,
+            composer_timeout_seconds=30.0,
+            composer_endpoint_base_url=None,
+            composer_endpoint_api_key=None,
+        ),
+        catalog=SimpleNamespace(list_sources=lambda: (SimpleNamespace(name="csv"),)),
+        plugin_snapshot=None,
+        secret_service=None,
+        recorder=BufferingRecorder(),
+        progress=None,
+    )
+
+    assert type(outcome) is guided_step_chat_module.GuidedStepChatOnlyResult
+    assert outcome.chat.assistant_message.endswith(
+        f"No changes were applied through chat. To revise this applied {target_kind}, update its exact settings "
+        "in the current wizard form and submit the form through the wizard controls."
+    )
+    offered_tools = {tool["function"]["name"] for tool in captured["tools"]}
+    assert offered_tools == {"retain_deferred_intent", "manage_deferred_intent"}
+    system_content = "\n".join(str(message["content"]) for message in captured["messages"] if message["role"] == "system")
+    assert "authoritative" in system_content
+    assert "wizard form" in system_content
+    assert "summarized only as counts" in system_content
+    assert "plugins and settings below" not in system_content
+    assert "COMPLETE updated source" not in system_content
+    assert "COMPLETE updated output" not in system_content
+    assert "private-source-name" not in system_content
+    assert "private-output-name" not in system_content
+    assert "/private/source.csv" not in system_content
+    assert "/private/output.jsonl" not in system_content
+    transition = guided_chat_atomic_module._transition_request(
+        body=SimpleNamespace(operation_id=str(uuid4()), turn_token="turn-token"),
+        guided=SimpleNamespace(step=step, active_edit_target=guided.active_edit_target),
+        current_turn={"type": "inspect_and_confirm" if target_kind == "source" else "schema_form"},
+        source_resolution=(SimpleNamespace(plugin="csv", observed_columns=("amount",)) if target_kind == "source" else None),
+        sink_resolution=SinkResolved(outputs=(output,)) if target_kind == "output" else None,
+    )
+    assert transition is None
 
 
 @pytest.mark.asyncio

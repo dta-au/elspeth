@@ -240,6 +240,26 @@ def _current_sink_revision_target(guided: Any) -> tuple[SinkResolved | None, int
     return SinkResolved(outputs=(guided.reviewed_outputs[target.stable_id],)), target_index
 
 
+def _active_component_revision_kind(guided: Any, step: GuidedStep) -> Literal["source", "output"] | None:
+    """Return the applied component whose server-owned form is being edited."""
+    target = guided.active_edit_target
+    if target is None:
+        return None
+    if step is GuidedStep.STEP_1_SOURCE and target.kind == "source":
+        return "source"
+    if step is GuidedStep.STEP_2_SINK and target.kind == "output":
+        return "output"
+    return None
+
+
+def _form_directed_revision_message(message: str, revision_kind: Literal["source", "output"]) -> str:
+    suffix = (
+        f"No changes were applied through chat. To revise this applied {revision_kind}, update its exact settings "
+        "in the current wizard form and submit the form through the wizard controls."
+    )
+    return message if message.endswith(suffix) else f"{message}\n\n{suffix}"
+
+
 def _guided_chat_endpoint_kwargs(settings: Any) -> tuple[str | None, str | None]:
     """Resolve the PRIMARY-role endpoint affordance for guided-chat solvers.
 
@@ -275,6 +295,7 @@ async def run_guided_chat_provider_attempt(
     source = _current_source(guided)
     sink = _current_sink(guided)
     sink_output_indices = _current_sink_output_indices(guided)
+    revision_form = _active_component_revision_kind(guided, step)
     context_block = build_step_chat_context_block(
         step=step,
         current_source=source,
@@ -282,6 +303,7 @@ async def run_guided_chat_provider_attempt(
         current_sink_output_indices=sink_output_indices,
         state=state,
         deferred_intents=guided.deferred_intents,
+        authoritative_revision_form=revision_form,
     )
     if step is GuidedStep.STEP_1_SOURCE:
         plugin_hint = None
@@ -315,6 +337,17 @@ async def run_guided_chat_provider_attempt(
             api_key=endpoint_api_key,
         )
         if not isinstance(source_outcome, GuidedStepChatEmptyResult):
+            if revision_form == "source":
+                source_outcome = _replace(
+                    source_outcome,
+                    chat=_replace(
+                        source_outcome.chat,
+                        assistant_message=_form_directed_revision_message(
+                            source_outcome.chat.assistant_message,
+                            revision_form,
+                        ),
+                    ),
+                )
             return source_outcome
 
     elif step is GuidedStep.STEP_2_SINK:
@@ -343,6 +376,17 @@ async def run_guided_chat_provider_attempt(
             api_key=endpoint_api_key,
         )
         if not isinstance(sink_outcome, GuidedStepChatEmptyResult):
+            if revision_form == "output":
+                sink_outcome = _replace(
+                    sink_outcome,
+                    chat=_replace(
+                        sink_outcome.chat,
+                        assistant_message=_form_directed_revision_message(
+                            sink_outcome.chat.assistant_message,
+                            revision_form,
+                        ),
+                    ),
+                )
             return sink_outcome
     elif step in {GuidedStep.STEP_3_TRANSFORMS, GuidedStep.STEP_4_WIRE}:
         management = await resolve_deferred_intent_management_chat_with_auto_drop(
@@ -381,6 +425,11 @@ async def run_guided_chat_provider_attempt(
         api_base=endpoint_base_url,
         api_key=endpoint_api_key,
     )
+    if revision_form is not None:
+        advisory = _replace(
+            advisory,
+            assistant_message=_form_directed_revision_message(advisory.assistant_message, revision_form),
+        )
     return GuidedStepChatOnlyResult(chat=advisory)
 
 
@@ -392,6 +441,8 @@ def _transition_request(
     source_resolution: Any | None,
     sink_resolution: SinkResolved | None,
 ) -> GuidedRespondRequest | None:
+    if _active_component_revision_kind(guided, guided.step) is not None:
+        return None
     turn_type = TurnType(current_turn["type"])
     common = {"operation_id": body.operation_id, "turn_token": body.turn_token}
     if source_resolution is not None and guided.step is GuidedStep.STEP_1_SOURCE:
@@ -1074,6 +1125,31 @@ async def post_guided_chat_schema8(
                             provider_outcome.action if type(provider_outcome) is GuidedStepDeferredManagementResult else None
                         )
                         deferred_clarification = type(provider_outcome) is GuidedStepDeferredClarificationResult
+                    revision_kind = _active_component_revision_kind(frozen.guided, frozen.guided.step)
+                    if revision_kind is not None and (
+                        source_resolution is not None or source_plugin_reselection is not None or sink_resolution is not None
+                    ):
+                        source_resolution = None
+                        source_plugin_reselection = None
+                        sink_resolution = None
+                        chat_result = StepChatResult(
+                            assistant_message=(
+                                f"I didn't apply that chat revision because the current {revision_kind} wizard form "
+                                "is authoritative. Update its exact settings and submit it through the wizard "
+                                "controls; your existing settings remain unchanged."
+                            ),
+                            status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+                            latency_ms=chat_result.latency_ms,
+                            error_class="ComponentRevisionNotApplied",
+                        )
+                    elif revision_kind is not None:
+                        chat_result = _replace(
+                            chat_result,
+                            assistant_message=_form_directed_revision_message(
+                                chat_result.assistant_message,
+                                revision_kind,
+                            ),
+                        )
                     if source_resolution is not None and TurnType(frozen.current_turn["type"]) is TurnType.SCHEMA_FORM:
                         source_resolution = None
                         chat_result = StepChatResult(
@@ -1409,6 +1485,7 @@ async def post_guided_chat_schema8(
                             if chat_result.error_class
                             in {
                                 "StepTransitionRejected",
+                                "ComponentRevisionNotApplied",
                                 "InlineSourceNotApplied",
                                 "UploadedSourceTypeMismatch",
                                 "DeferredIntentActionShapeError",

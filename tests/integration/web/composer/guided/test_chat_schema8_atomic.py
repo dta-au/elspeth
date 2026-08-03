@@ -128,7 +128,7 @@ def test_step_2_singular_sink_resolution_maps_to_the_live_transition() -> None:
 
     request = _transition_request(
         body=body,
-        guided=SimpleNamespace(step=GuidedStep.STEP_2_SINK),
+        guided=SimpleNamespace(step=GuidedStep.STEP_2_SINK, active_edit_target=None),
         current_turn={"type": "single_select", "step_index": 1, "payload": {}},
         source_resolution=None,
         sink_resolution=sink,
