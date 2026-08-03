@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from pydantic import ValidationError as PydanticValidationError
 
 from elspeth.contracts import SinkProtocol, SourceProtocol, TransformProtocol
+from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.core.config import AggregationSettings, ElspethSettings
 from elspeth.core.dag.graph import ExecutionGraph
@@ -215,6 +216,15 @@ def validate_runtime_plugins(
     semantic_contracts = _semantic_contracts(loaded.materialized)
     try:
         bundle = instantiate_plugins(loaded.settings, plugin_snapshot=plugin_snapshot)
+        from elspeth.web.execution.preflight import bind_profiled_s3_source_audit_identities
+
+        bind_profiled_s3_source_audit_identities(
+            bundle,
+            authored_options_by_source={
+                name: deep_thaw(source.options) for name, source in loaded.materialized.authored.policy.state.sources.items()
+            },
+            plugin_snapshot=plugin_snapshot,
+        )
     except ValueSourceValidationError as exc:
         errors = tuple(
             ValidationError(

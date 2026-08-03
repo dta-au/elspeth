@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from elspeth.contracts import CallStatus, CallType, Determinism, PluginSchema, SourceRow
+from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentity
 from elspeth.contracts.contexts import SourceContext
 from elspeth.contracts.contract_builder import ContractBuilder, ContractFieldLimitExceeded
 from elspeth.contracts.identifiers import validate_field_names
@@ -58,6 +59,18 @@ _MAX_ENDPOINT_CHARS = 2048
 _MAX_REGION_CHARS = 64
 _MAX_JSON_DEPTH = 64
 _SAFE_ERROR_TYPE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}\Z")
+_PROFILED_AUDIT_PRIVATE_CONFIG_FIELDS = frozenset(
+    {
+        "bucket",
+        "prefix",
+        "region",
+        "region_name",
+        "endpoint_url",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+    }
+)
 
 
 class _RowSentinel(enum.Enum):
@@ -808,8 +821,7 @@ def _record_download_call(
     ctx: SourceContext,
     *,
     status: CallStatus,
-    bucket: str,
-    key: str,
+    audit_identity: dict[str, str],
     latency_ms: float,
     response_data: dict[str, Any] | None = None,
     error_data: dict[str, Any] | None = None,
@@ -817,7 +829,7 @@ def _record_download_call(
     ctx.record_call(
         call_type=CallType.HTTP,
         status=status,
-        request_data={"operation": "read_object", "bucket": bucket, "key": key},
+        request_data={"operation": "read_object", **audit_identity},
         response_data=response_data,
         error=error_data,
         latency_ms=latency_ms,
@@ -831,7 +843,7 @@ class AWSS3Source(BaseSource):
     name = "aws_s3"
     determinism = Determinism.IO_READ
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:e832e0f4c7aebaf3"
+    source_file_hash: str | None = "sha256:e002343c06326e8f"
     config_model = AWSS3SourceConfig
     web_config_authority = WebConfigAuthority.OPERATOR_PROFILED
 
@@ -890,6 +902,7 @@ class AWSS3Source(BaseSource):
         self._max_object_bytes = cfg.max_object_bytes
         self._max_record_chars = cfg.max_record_chars
         self._on_validation_failure = cfg.on_validation_failure
+        self._profiled_audit_identity: S3ProfiledAuditIdentity | None = None
         self._schema_config = cfg.schema_config
         self._initialize_declared_guaranteed_fields(self._schema_config)
         self._field_resolution: FieldResolution | None = None
@@ -910,6 +923,35 @@ class AWSS3Source(BaseSource):
         self._s3_client: _S3Client | None = None
         self._active_download: _DownloadedObject | None = None
         self._closed = False
+
+    def _bind_profiled_audit_identity(
+        self,
+        identity: object,
+        *,
+        audit_safe_config: object,
+    ) -> None:
+        """Bind Web-only audit authority without adding a forgeable config field."""
+        if not isinstance(identity, S3ProfiledAuditIdentity):
+            raise TypeError("profiled S3 audit authority must be an S3ProfiledAuditIdentity")
+        if self._profiled_audit_identity is not None:
+            raise RuntimeError("profiled S3 audit authority is already bound")
+        if type(audit_safe_config) is not dict:
+            raise TypeError("profiled S3 audit-safe config must be an exact dict")
+        safe_config = cast(dict[str, object], audit_safe_config)
+        if set(safe_config) & _PROFILED_AUDIT_PRIVATE_CONFIG_FIELDS:
+            raise ValueError("profiled S3 audit-safe config contains a private binding field")
+        if safe_config.get("profile") != identity.profile_alias or safe_config.get("key") != identity.relative_key:
+            raise ValueError("profiled S3 audit-safe config does not match its nominal identity")
+        if self._key != identity.relative_key and not self._key.endswith(f"/{identity.relative_key}"):
+            raise ValueError("profiled S3 executable key does not match its nominal identity")
+        self._profiled_audit_identity = identity
+        self.config = dict(safe_config)
+
+    def _audit_object_identity(self) -> dict[str, str]:
+        identity = self._profiled_audit_identity
+        if identity is None:
+            return {"bucket": self._bucket, "key": self._key}
+        return {"profile": identity.profile_alias, "key": identity.relative_key}
 
     def _get_s3_client(self) -> _S3Client:
         if self._s3_client is None:
@@ -962,8 +1004,7 @@ class AWSS3Source(BaseSource):
             _record_download_call(
                 ctx,
                 status=CallStatus.ERROR,
-                bucket=self._bucket,
-                key=self._key,
+                audit_identity=self._audit_object_identity(),
                 latency_ms=latency_ms,
                 error_data=error_data,
             )
@@ -977,8 +1018,7 @@ class AWSS3Source(BaseSource):
             _record_download_call(
                 ctx,
                 status=CallStatus.SUCCESS,
-                bucket=self._bucket,
-                key=self._key,
+                audit_identity=self._audit_object_identity(),
                 latency_ms=latency_ms,
                 response_data=download.audit_metadata,
             )
@@ -1013,7 +1053,7 @@ class AWSS3Source(BaseSource):
                 download.close()
 
     def _file_error(self, ctx: SourceContext, message: str) -> Generator[SourceRow, None, None]:
-        raw_row = {"bucket": self._bucket, "key": self._key, "error": message}
+        raw_row = {**self._audit_object_identity(), "error": message}
         ctx.record_validation_error(
             row=raw_row,
             error=message,
@@ -1152,7 +1192,7 @@ class AWSS3Source(BaseSource):
                     line_number += 1
                     yield from self._quarantine_parse_row(
                         ctx,
-                        {"bucket": self._bucket, "key": self._key, "__line_number__": line_number},
+                        {**self._audit_object_identity(), "__line_number__": line_number},
                         "JSONL record has invalid encoded text",
                         line_number - 1,
                     )

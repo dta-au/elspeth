@@ -294,6 +294,46 @@ def _profiled_plugin_ids(plugin_snapshot: PluginAvailabilitySnapshot) -> frozens
     return frozenset(plugin_id for plugin_id, _aliases in plugin_snapshot.usable_profile_aliases)
 
 
+def bind_profiled_s3_source_audit_identities(
+    bundle: PluginBundle,
+    *,
+    authored_options_by_source: Mapping[str, object],
+    plugin_snapshot: PluginAvailabilitySnapshot,
+) -> None:
+    """Bind nominal safe evidence identities to Web-profiled S3 sources."""
+    source_id = PluginId("source", "aws_s3")
+    if source_id not in _profiled_plugin_ids(plugin_snapshot):
+        return
+
+    from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentity
+    from elspeth.plugins.sources.aws_s3_source import AWSS3Source
+
+    allowed_aliases = dict(plugin_snapshot.usable_profile_aliases)[source_id]
+    for source_name, source in bundle.sources.items():
+        if source.name != "aws_s3":
+            continue
+        runtime_source: object = source
+        if not isinstance(runtime_source, AWSS3Source):
+            raise TypeError("profiled aws_s3 source must be the owned AWSS3Source implementation")
+        try:
+            raw_options = authored_options_by_source[source_name]
+        except KeyError:
+            raise KeyError(f"audit-safe settings have no source named {source_name!r}") from None
+        if type(raw_options) is not dict:
+            raise TypeError(f"audit-safe options for source {source_name!r} must be an exact dict")
+        options = cast(dict[str, object], raw_options)
+        alias = options.get("profile")
+        relative_key = options.get("key")
+        if type(alias) is not str or alias not in allowed_aliases:
+            raise ValueError(f"audit-safe options for source {source_name!r} do not select an available profile")
+        if type(relative_key) is not str:
+            raise ValueError(f"audit-safe options for source {source_name!r} do not carry an exact relative key")
+        runtime_source._bind_profiled_audit_identity(
+            S3ProfiledAuditIdentity(profile_alias=alias, relative_key=relative_key),
+            audit_safe_config=options,
+        )
+
+
 def _required_component_mapping(
     config: Mapping[str, Any],
     key: str,
@@ -516,6 +556,13 @@ def build_validated_runtime_graph(
     still run normally once the approved bundle reaches the orchestrator.
     """
     bundle = instantiate_runtime_plugins(settings, plugin_snapshot=plugin_snapshot)
+    if audit_safe_settings is not None:
+        authored_sources = _authored_sources(audit_safe_settings)
+        bind_profiled_s3_source_audit_identities(
+            bundle,
+            authored_options_by_source={name: _authored_options(component) for name, component in authored_sources.items()},
+            plugin_snapshot=plugin_snapshot,
+        )
     if audit_safe_settings is None:
         graph = build_runtime_graph(settings, bundle)
     else:

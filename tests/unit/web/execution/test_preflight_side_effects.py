@@ -240,6 +240,160 @@ sinks:
     return settings, audit_safe, snapshot
 
 
+def test_profiled_s3_runtime_uses_private_binding_only_for_boto_call(tmp_path: Path) -> None:
+    import yaml
+
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.plugins.sources.aws_s3_source import AWSS3Source
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    private_bucket = "operator-private-bucket-marker"
+    private_prefix = "operator-private-prefix-marker"
+    relative_key = "records/input.csv"
+    profile_alias = "demo-input"
+    web_settings = WebSettings.model_validate(
+        {
+            **_web_settings(tmp_path).model_dump(),
+            "plugin_allowlist": ["source:aws_s3"],
+            "deployment_aws_region": "ap-southeast-1",
+            "aws_s3_source_profiles": [
+                {
+                    "alias": profile_alias,
+                    "bucket": private_bucket,
+                    "prefix": private_prefix,
+                }
+            ],
+        }
+    )
+    runtime_config = RuntimeWebPluginConfig.from_settings(web_settings)
+    profiles = OperatorProfileRegistry(
+        policy=compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime_config),
+        settings=runtime_config,
+    )
+    lowered = profiles.lower_options(
+        PluginId("source", "aws_s3"),
+        alias=profile_alias,
+        safe_options={
+            "key": relative_key,
+            "format": "csv",
+            "schema": {"mode": "observed"},
+            "on_validation_failure": "quarantine",
+        },
+    )
+    output_path = tmp_path / "outputs" / "profiled-s3.csv"
+    output_path.parent.mkdir(exist_ok=True)
+    executable_config = {
+        "sources": {
+            "primary": {
+                "plugin": "aws_s3",
+                "on_success": "quarantine",
+                "options": deep_thaw(lowered.executable_options),
+            }
+        },
+        "sinks": {
+            "quarantine": {
+                "plugin": "csv",
+                "on_write_failure": "discard",
+                "options": {"path": str(output_path), "schema": {"mode": "observed"}},
+            }
+        },
+    }
+    audit_safe_config = {
+        **executable_config,
+        "sources": {
+            "primary": {
+                "plugin": "aws_s3",
+                "on_success": "quarantine",
+                "options": deep_thaw(lowered.audit_safe_options),
+            }
+        },
+    }
+    settings = load_settings_from_yaml_string(yaml.safe_dump(executable_config))
+    snapshot = _snapshot_with_profiles((PluginId("source", "aws_s3"), profile_alias))
+
+    runtime = build_validated_runtime_graph(
+        settings,
+        plugin_snapshot=snapshot,
+        audit_safe_settings=audit_safe_config,
+    )
+    source = runtime.plugin_bundle.sources["primary"]
+    assert isinstance(source, AWSS3Source)
+
+    class _Body:
+        def read(self, _size: int) -> bytes:
+            return b""
+
+        def close(self) -> None:
+            return None
+
+    class _Client:
+        def __init__(self) -> None:
+            self.head_calls: list[dict[str, object]] = []
+            self.get_calls: list[dict[str, object]] = []
+
+        def head_object(self, **kwargs: object) -> object:
+            self.head_calls.append(kwargs)
+            return {"ContentLength": 0, "ETag": '"etag"'}
+
+        def get_object(self, **kwargs: object) -> object:
+            self.get_calls.append(kwargs)
+            return {"ContentLength": 0, "Body": _Body()}
+
+        def close(self) -> None:
+            return None
+
+    class _Context:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+            self.validation_errors: list[dict[str, object]] = []
+
+        def record_call(self, **kwargs: object) -> None:
+            self.calls.append(kwargs)
+
+        def record_validation_error(self, **kwargs: object) -> None:
+            self.validation_errors.append(kwargs)
+
+    client = _Client()
+    context = _Context()
+    source._s3_client = client
+    rows = list(source.load(cast(Any, context)))
+
+    executable_key = f"{private_prefix}/{relative_key}"
+    assert client.head_calls == [{"Bucket": private_bucket, "Key": executable_key}]
+    assert client.get_calls == [{"Bucket": private_bucket, "Key": executable_key, "IfMatch": '"etag"'}]
+    assert context.calls[0]["request_data"] == {
+        "operation": "read_object",
+        "profile": profile_alias,
+        "key": relative_key,
+    }
+    assert context.validation_errors[0]["row"] == {
+        "profile": profile_alias,
+        "key": relative_key,
+        "error": "CSV parse error: empty file contains no header row",
+    }
+    assert rows[0].row == context.validation_errors[0]["row"]
+    assert source.config == deep_thaw(lowered.audit_safe_options)
+
+    graph_configs = [runtime.graph.get_node_info(node_id).config for node_id in runtime.graph.topological_order()]
+    persisted_projection = json.dumps(
+        {
+            "source_config": source.config,
+            "graph_configs": graph_configs,
+            "call_audit": context.calls,
+            "validation_errors": context.validation_errors,
+            "quarantine_rows": [row.row for row in rows],
+        },
+        default=dict,
+    )
+    assert profile_alias in persisted_projection
+    assert relative_key in persisted_projection
+    assert private_bucket not in persisted_projection
+    assert private_prefix not in persisted_projection
+    assert executable_key not in persisted_projection
+
+
 def _external_plugin_probe_pipeline_yaml(tmp_path: Path) -> str:
     """Pipeline YAML with representative external plugins for constructor-purity checks.
 

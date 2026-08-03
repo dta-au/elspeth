@@ -956,6 +956,38 @@ class TestAWSS3SourceAuditAndLifecycle:
         assert call["provider"] == "aws_s3"
         assert "endpoint" not in repr(call).lower()
 
+    def test_raw_source_parse_failure_retains_cli_audit_and_quarantine_identity(self) -> None:
+        source, _, ctx = _source_for(b"")
+
+        rows = list(source.load(ctx))
+
+        raw_identity = {"bucket": "input-bucket", "key": "incoming/data.csv"}
+        assert ctx.calls[0]["request_data"] == {"operation": "read_object", **raw_identity}
+        assert ctx.validation_errors[0]["row"] == {
+            **raw_identity,
+            "error": "CSV parse error: empty file contains no header row",
+        }
+        assert rows[0].row == ctx.validation_errors[0]["row"]
+
+    def test_raw_config_and_structural_impostor_cannot_forge_profiled_audit_authority(self) -> None:
+        from elspeth.plugins.sources.aws_s3_source import AWSS3Source
+
+        forged_authority: Any = {"profile": "demo-input", "relative_key": "records/input.csv"}
+        with pytest.raises(PluginConfigError, match="Extra inputs are not permitted"):
+            AWSS3Source(_config(profiled_audit_identity=forged_authority))
+
+        source = AWSS3Source(_config())
+        with pytest.raises(TypeError, match="S3ProfiledAuditIdentity"):
+            source._bind_profiled_audit_identity(
+                forged_authority,
+                audit_safe_config={
+                    "profile": "demo-input",
+                    "key": "records/input.csv",
+                    "schema": {"mode": "observed"},
+                    "on_validation_failure": "quarantine",
+                },
+            )
+
     def test_transport_failure_audits_only_safe_fields(self) -> None:
         from elspeth.plugins.sources.aws_s3_source import S3SourceReadError
 
