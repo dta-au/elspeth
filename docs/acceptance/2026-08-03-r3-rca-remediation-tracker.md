@@ -1,7 +1,7 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-04T07:52:21+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-04T07:52:21+10:00
+Last refreshed: 2026-08-04T08:02:24+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-04T08:02:24+10:00
 Release baseline: `release/0.7.2@937a8010b`
 Coordination owner: `codex-r3-rca-coordinator`
 
@@ -36,13 +36,13 @@ evidence are core/demo-aware work even though they involve AWS. Installing,
 updating, or tearing down the environment through IAM, Terraform, runbooks, or
 shell mechanics remains deferred even when it blocks a fresh install.
 
-## Current roll-up — 44 objective items plus 25 discovered/delivery records
+## Current roll-up — 44 objective items plus 26 discovered/delivery records
 
-| State | Objective 44 | Additional 25 | Meaning |
+| State | Objective 44 | Additional 26 | Meaning |
 |---|---:|---:|---|
 | Closed | 9 | 7 | Tracker says done; closure evidence is still sampled during the completion audit |
 | Verifying | 17 | 14 | Locally fixed; live or requirement-specific acceptance remains |
-| Fixing | 2 | 2 | Owned bug implementation is still in flight |
+| Fixing | 2 | 3 | Owned bug implementation is still in flight |
 | In progress | 0 | 0 | A delivery task spanning existing objective defects is in flight |
 | Open | 4 | 1 | Confirmed task/epic work not yet started here |
 | Triage | 9 | 1 | Root cause and reproducibility must be checked against current HEAD before fixing |
@@ -75,6 +75,10 @@ constraints as one allegedly valid intent.
 A full-example dogfood run added `elspeth-454892147c`: retry exhaustion reaches
 the terminal `UNROUTED` arm without consulting the transform's configured
 `on_error` quarantine sink, contrary to the shipped example contracts.
+Provider-telemetry review added `elspeth-4d0d239886`: the provider-capable
+`guided/respond` route is not mounted on the shared Composer request telemetry
+dependency, so provider-call metrics exist without the matching request
+duration, call-count aggregate, status, or inflight lifecycle.
 
 Closed-record assignees below are retained Filigree audit history, not active
 claim custody.
@@ -105,6 +109,7 @@ claim custody.
 | `/root/fix_grounded_option_constraints` | Ground exact safe option obligations, keep private values out of provider context, and reject contradictory constraints | `.claude/worktrees/grounded-option-constraints`; `codex/fix-grounded-option-constraints` | Deferred-intent authority/admission/planning seams and direct tests | None | Active in strict TDD for `826765af90` + `d293c5d139`; advisor checkpoint wording is excluded |
 | `/root/fix_retry_exhaustion_routing` | Route retry exhaustion through the configured transform `on_error` contract with complete audit custody | `.claude/worktrees/retry-exhaustion-routing`; `codex/fix-retry-exhaustion-routing` | Released after reviewed integration | None | Complete as release `937a8010b`; exact release retry/processor/traversal/property/integration canary passed 325 tests plus mypy, Ruff, and non-inert Wardline |
 | `/root/fix_composer_provider_telemetry` | Project durable Composer provider-call audit facts into bounded operator metrics only after commit | `.claude/worktrees/composer-provider-telemetry`; `codex/fix-composer-provider-telemetry` | New provider projector, session post-commit seam, request/operator telemetry, and direct tests; grounded Composer files excluded | None | Active strict TDD for `ebba0b2171`; baseline 158 passed, first four projections are green, and rollback/audit-envelope boundary tests are driving the disjoint settlement implementation |
+| `/root/fix_guided_respond_request_telemetry` | Mount provider-capable guided/respond on the shared request telemetry lifecycle | Isolated worktree/branch from release with `98c0ff961` available as a temporary combined test base | `guided.py` route dependency and direct request-telemetry tests only | None | Active strict TDD for `4d0d239886`; no overlap with grounded candidate files or telemetry projector production files |
 | `/root/review_advisor_evidence_scope` | Adversarial review of bounded evidence and actual checkpoint wire instructions | Shared read-only advisor worktree | None | None | Complete; found and drove repair of the shared stuck-composer system-contract conflict, then approved current bytes with no findings |
 | `/root/audit_advisor_demo` | D1-D6 and advisor/F14 completion evidence | Shared read-only baseline | None | None | Completed; no residual local code defect found |
 | `/root/audit_compose_loop` | Six compose-loop RCAs and implementation partitioning | Shared read-only baseline | None | None | Completed; all six remain actionable |
@@ -165,6 +170,7 @@ Parent workstream state:
 | `elspeth-7bd0141bbe` | P2 | `verifying` | `codex-r3-rca-coordinator` | Reviewed `86453aa5c` + `3ec1036d6` reject invented terms before publication and retain the public registry through Anthropic/Bedrock adapters; verify live repair convergence |
 | `elspeth-ecd8594b63` | P3 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `2906409e1` + `e1d31f104`; prove a live freeform fixed-sink build preserves every required field |
 | `elspeth-ebba0b2171` | P3 | `fixing` | `codex-composer-provider-telemetry` | Add bounded post-commit provider-call count/duration and request duration/call-count projection from durable audit evidence; keep identifiers, payloads, model/provider strings, and arbitrary errors out of metrics |
+| `elspeth-4d0d239886` | P3 | `fixing` | `codex-guided-respond-request-telemetry` | Add the shared request lifecycle dependency to provider-capable guided/respond and prove success/failure/timeout/cancel/replay aggregates; this blocks telemetry verification but remains a separate route-ownership patch |
 | `elspeth-73c7a4df36` | P1 | `closed` | `codex-compose-authoring-aids` | Delivery completed at `release/0.7.2@e1d31f104`; assignee retained as audit history |
 | `elspeth-57232f6f3c` | P1 | `closed` | `codex-r3-rca-coordinator` | Reviewed chain integrated through `a913ccb63`; complete no-session audit recovery and empty post-P4 replay evidence verified with 79 release-local tests |
 | `elspeth-4e6f2a59e4` | P2 | `closed` | `codex-guided-plan-terminal-progress` | Integrated through `859c2a642`; all guided-plan outcomes terminalize under exact generation and authoritative outcome primacy |
@@ -380,6 +386,7 @@ Append entries; do not rewrite history.
 | 2026-08-04 07:27 | Retry-exhaustion routing integrated | Independently approved `44c0b1a38` was cherry-picked as release `937a8010b`; 325 exact release tests plus mypy, Ruff, and non-inert Wardline passed, and `454892147c` advanced to verifying |
 | 2026-08-04 07:52 | Retry release full gate passed | Exact release `d8c8ee7b8` completed `pytest tests/` with 37,305 passed, 27 skipped, and one expected trust-tier xfail in 23m53s; Loomweave run `eb271254-4297-4b53-ab9b-f28e94838f55` is fresh at the same commit |
 | 2026-08-04 07:52 | Remaining demo-core work reconciled | Read-only current-state audit found no unclaimed local-code leaf: grounded constraints and bounded provider telemetry are the only active local implementations; thirty other core leaves require bundled live acceptance, and installer/setup/signing lanes remain deferred or externally owned |
+| 2026-08-04 08:02 | Guided/respond telemetry split tracked | Exact current-source probe found three provider-planner call sites without `_track_compose_inflight`; SEI-bound P3 `4d0d239886` was filed, made a blocker of `ebba0b2171`, and assigned in a disjoint route-only worktree |
 
 ## Reconciliation findings
 
