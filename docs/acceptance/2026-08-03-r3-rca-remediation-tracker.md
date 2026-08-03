@@ -1,8 +1,8 @@
 # R3 RCA remediation tracker
 
-Last refreshed: 2026-08-03T16:43:00+10:00 (Australia/Canberra)
-Filigree snapshot: 2026-08-03T16:42:49+10:00
-Release baseline: `release/0.7.2@d78fbbed6`
+Last refreshed: 2026-08-03T16:46:00+10:00 (Australia/Canberra)
+Filigree snapshot: 2026-08-03T16:44:58+10:00
+Release baseline: `release/0.7.2@4af3456b1`
 Coordination owner: `codex-r3-rca-coordinator`
 
 This is the human-readable companion to Filigree for the R3 remediation
@@ -36,22 +36,23 @@ evidence are core/demo-aware work even though they involve AWS. Installing,
 updating, or tearing down the environment through IAM, Terraform, runbooks, or
 shell mechanics remains deferred even when it blocks a fresh install.
 
-## Current roll-up — 44 objective items plus 3 discovered/delivery records
+## Current roll-up — 44 objective items plus 4 discovered/delivery records
 
-| State | Objective 44 | Additional 3 | Meaning |
+| State | Objective 44 | Additional 4 | Meaning |
 |---|---:|---:|---|
 | Closed | 8 | 0 | Tracker says done; closure evidence is still sampled during the completion audit |
-| Verifying | 11 | 0 | Locally fixed; live or requirement-specific acceptance remains |
-| Fixing | 3 | 2 | Owned bug implementation is still in flight |
+| Verifying | 10 | 0 | Locally fixed; live or requirement-specific acceptance remains |
+| Fixing | 4 | 2 | Owned bug implementation is still in flight |
 | In progress | 0 | 1 | A delivery task spanning existing objective defects is in flight |
-| Open | 4 | 0 | Confirmed task/epic work not yet started here |
+| Open | 4 | 1 | Confirmed task/epic work not yet started here |
 | Triage | 15 | 0 | Root cause and reproducibility must be checked against current HEAD before fixing |
 | Proposed | 3 | 0 | Regression-gate features require approval/acceptance design before implementation |
 
 The additional records are newly discovered gate-custody bug
 `elspeth-1d97fc4b80`, run-diagnostics UI bug `elspeth-18b39eb829`, and
-non-overlapping compose delivery task `elspeth-73c7a4df36`. They are tracked
-without changing the supplied objective's 44-item arithmetic.
+non-overlapping compose delivery task `elspeth-73c7a4df36`, plus deferred
+evidence-supportability task `elspeth-01c627b420`. They are tracked without
+changing the supplied objective's 44-item arithmetic.
 
 Closed-record assignees below are retained Filigree audit history, not active
 claim custody.
@@ -70,7 +71,7 @@ claim custody.
 | `/root/review_text_tracker` | Tracker accuracy and completeness review | Shared read-only baseline | None | None | Completed; corrections incorporated |
 | `/root/impl_guided_node_custody` | Preserve unchanged node behavior across guided replanning | `.claude/worktrees/guided-node-custody`; `codex/fix-guided-node-custody` | `guided/planning.py`, `composer/service.py`, `pipeline_planner.py`, direct tests | None | RED captured; implementation active |
 | `/root/impl_gate_row_error_policy` | Per-row gate `on_error` handling | `.claude/worktrees/gate-row-error-policy`; `codex/fix-gate-row-error-policy` | gate config/executor/traversal/source-iteration seams and direct tests | None | RED captured at missing `GateSettings.on_error`; active |
-| `/root/impl_csv_audit_characteristics` | Honest CSV audit characteristics | `.claude/worktrees/csv-audit-characteristics`; `codex/fix-csv-audit-characteristics` | CSV source, characteristic UI wording, direct tests | None | Completed; integrated as `d78fbbed6` |
+| `/root/impl_csv_audit_characteristics` | Honest CSV audit characteristics | `.claude/worktrees/csv-audit-characteristics`; `codex/fix-csv-audit-characteristics` | CSV source, characteristic UI wording, exact scenario-corpus oracle, direct tests | None | Returned to fixing after exact corpus test exposed pinned old plugin hash |
 | `/root/impl_s3_source_profiles` | Operator-profiled Web S3 source | `.claude/worktrees/s3-source-profiles`; `codex/fix-s3-source-profiles` | Web config/profile/policy/S3 lowering/source seams and direct tests | None | Active; two bounded review subagents |
 | `/root/impl_run_diagnostics_ui` | Surface routed-failure provenance | `.claude/worktrees/run-diagnostics-ui`; `codex/fix-run-diagnostics-ui` | `RunsHistoryDrawer` and direct frontend diagnostics presentation/tests | None | Active |
 | `/root/impl_compose_authoring_aids` | Compose context and truthful field-mapping aids | `.claude/worktrees/compose-authoring-aids`; `codex/fix-compose-authoring-aids` | `prompts.py`, `planner_authoring_aids.py`, `field_mapper.py`, direct tests | None | Active |
@@ -85,7 +86,7 @@ Parent workstream state:
 |---|---|---|
 | `elspeth-7ffd77deca` — advisor gate | `verifying` | Run the merged D1-D6 acceptance matrix on one deployed candidate |
 | `elspeth-7da4e52344` — compose loop | `fixing` | Integrate the no-collision aids lane, then sequence the shared `service.py` and tool-boundary lanes |
-| `elspeth-e7ff15ac0b` — gate routing | `open` | Reconcile five closed, three verifying, and four residual/discovered children |
+| `elspeth-e7ff15ac0b` — gate routing | `open` | Reconcile five closed, two verifying, and five residual/discovered children |
 | `elspeth-e54343d43b` — AWS installer | `open` | Hold implementation until demo-aware product/system work is accepted; only deconflict existing owners in the meantime |
 
 ## Advisor gate — `elspeth-7ffd77deca`
@@ -124,7 +125,7 @@ Parent workstream state:
 | `elspeth-dc07d517cf` | P2 | `closed` | unassigned | Sample clarification intent visibility/claimability at later stages |
 | `elspeth-6795b3ae3a` | P2 | `open` | unassigned | Inventory every provider-facing projection and compare obligations with rendered evidence |
 | `elspeth-d0d52e2fde` | P2 | `closed` | `codex-release-0.7.2-integration` | Sample the real HTTP/lifecycle regression added with the proof fix |
-| `elspeth-c4734bc69a` | P3 | `verifying` | `codex-r3-rca-coordinator` | Integrated as `d78fbbed6`; live catalog proves observed strings versus fixed/flexible declared coercion |
+| `elspeth-c4734bc69a` | P3 | `fixing` | `codex-csv-audit-characteristics` | Behavior fix is `d78fbbed6`; update and verify the authoritative CSV-backed scenario-corpus projections for the new source hash |
 | `elspeth-aaa9e3f597` | P2 | `verifying` | `codex-release-0.7.2-integration` | Live guided path retains the decision heading and treats gates as topology, not plugins |
 | `elspeth-1d97fc4b80` | P1 | `fixing` | `codex-guided-node-custody` | Preserve server-custodied unchanged node behavior/options during unrelated guided corrections |
 | `elspeth-18b39eb829` | P2 | `fixing` | `codex-run-diagnostics-ui` | Surface scrubbed failed-state reason, provider code, node, and actionable hint in expanded run diagnostics |
@@ -173,6 +174,12 @@ AWS; those are core/demo-aware product work.
 | `elspeth-9f7d336e1c` | P1 | `fixing` | `operator` | Preserve operator custody; verify a published candidate image boots after the signing/release gate |
 | `elspeth-5c0c09db31` | P1 | `closed` | `codex-r2-f17` | Objective text is stale: sample the closed R2-F17 evidence instead of reopening by assumption |
 
+## Deferred supportability after demo-aware core
+
+| ID | Priority | Live state | Filigree assignee | Next proof/action |
+|---|---:|---|---|---|
+| `elspeth-01c627b420` | P2 | `open` | unassigned | Make all 16 `docs-archive/acceptance/` artifacts clone-visible or migrate the 89 affected issue references after core integration stabilizes |
+
 ## AWS operation ledger
 
 | Time (AEST) | Actor | Mode | Scope/result | Mutation |
@@ -205,6 +212,8 @@ Append entries; do not rewrite history.
 | 2026-08-03 16:38 | Landscape audit question settled | Direct read-only DB proof closed `elspeth-6801b71f71`; UI discoverability bug `elspeth-18b39eb829` filed and assigned independently |
 | 2026-08-03 16:40 | Compose implementation started | Parent advanced to fixing; delivery task `elspeth-73c7a4df36` assigned with exclusive prompt/aids/field-mapper custody |
 | 2026-08-03 16:42 | CSV audit-honesty fix integrated | Reviewed `1d85fbb758`, cherry-picked as `d78fbbed6`; 100 backend and 114 frontend focused tests plus repository gates passed; item advanced to verifying |
+| 2026-08-03 16:44 | CSV corpus obligation discovered | Exact maintained `linear:happy-path` production case failed only at durable-projection equality because the manifest pins the old honest plugin hash; item returned to fixing and ownership expanded narrowly to the corpus oracle |
+| 2026-08-03 16:44 | Ignored evidence risk tracked | Filed deferred supportability task `elspeth-01c627b420`; read-only audit found 89 acceptance-related issues citing paths absent from fresh clones |
 
 ## Reconciliation findings
 
