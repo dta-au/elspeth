@@ -43,11 +43,12 @@ def _state(
     blob_id: UUID,
     source_path: str,
     output_dir: Path,
-    through_passthrough: bool,
+    topology: str,
 ) -> CompositionState:
-    gate_input = "preserved_rows" if through_passthrough else "rows"
+    source_output = "inbound" if topology == "queue" else "rows"
+    gate_input = "preserved_rows" if topology == "passthrough" else source_output
     nodes: tuple[NodeSpec, ...] = ()
-    if through_passthrough:
+    if topology == "passthrough":
         nodes = (
             NodeSpec(
                 id="retain_fields",
@@ -57,6 +58,24 @@ def _state(
                 on_success="preserved_rows",
                 on_error="discard",
                 options={"schema": {"mode": "observed"}},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            ),
+        )
+    elif topology == "queue":
+        nodes = (
+            NodeSpec(
+                id="inbound",
+                node_type="queue",
+                plugin=None,
+                input="inbound",
+                on_success=None,
+                on_error=None,
+                options={},
                 condition=None,
                 routes=None,
                 fork_to=None,
@@ -86,7 +105,7 @@ def _state(
         sources={
             "source": SourceSpec(
                 plugin="csv",
-                on_success="rows",
+                on_success=source_output,
                 options={
                     "path": source_path,
                     "blob_ref": str(blob_id),
@@ -124,10 +143,10 @@ def _state(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-@pytest.mark.parametrize("through_passthrough", [False, True], ids=["direct", "passthrough"])
+@pytest.mark.parametrize("topology", ["direct", "passthrough", "queue"])
 async def test_validate_and_execute_block_observed_numeric_gate_before_run_creation(
     tmp_path: Path,
-    through_passthrough: bool,
+    topology: str,
 ) -> None:
     """Real validate and execute surfaces must agree and create no run."""
     app = create_app(settings=_settings(tmp_path))
@@ -159,7 +178,7 @@ async def test_validate_and_execute_block_observed_numeric_gate_before_run_creat
             blob_id=blob.id,
             source_path=blob.storage_path,
             output_dir=output_dir,
-            through_passthrough=through_passthrough,
+            topology=topology,
         )
         state_dict = state.to_dict()
         await app.state.session_service.save_composition_state(

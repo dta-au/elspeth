@@ -14552,6 +14552,104 @@ class TestPreviewProofStep:
         assert matching
         assert matching[0]["evidence_locator"]["source_name"] == "url_source"
 
+    def test_same_blob_sources_share_one_metadata_and_verified_content_read(self) -> None:
+        """Composer preview evaluates each alias without re-reading its blob."""
+        from elspeth.web.composer.tools import generation as generation_module
+
+        base = self._state_with_csv_source(schema_mode="observed")
+        source = base.sources["source"]
+        gate = NodeSpec(
+            id="orders_gate",
+            node_type="gate",
+            plugin=None,
+            input="order_rows",
+            on_success=None,
+            on_error=None,
+            options={},
+            condition="row['price'] > 100",
+            routes={"true": "high_value", "false": "standard"},
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = replace(
+            base,
+            sources={
+                "orders": replace(source, on_success="order_rows"),
+                "refunds": replace(source, on_success="refund_rows"),
+            },
+            nodes=(
+                gate,
+                replace(gate, id="refunds_gate", input="refund_rows"),
+            ),
+            outputs=(
+                OutputSpec(
+                    name="high_value",
+                    plugin="json",
+                    options={
+                        "path": "outputs/high.json",
+                        "schema": {"mode": "observed"},
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    on_write_failure="discard",
+                ),
+                OutputSpec(
+                    name="standard",
+                    plugin="json",
+                    options={
+                        "path": "outputs/standard.json",
+                        "schema": {"mode": "observed"},
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    on_write_failure="discard",
+                ),
+            ),
+        )
+        original_sync_get_blob = generation_module._sync_get_blob
+        original_read_bytes = Path.read_bytes
+        metadata_reads: list[str] = []
+        content_reads: list[Path] = []
+
+        def counted_sync_get_blob(engine: Any, blob_id: str, session_id: str) -> Any:
+            metadata_reads.append(blob_id)
+            return original_sync_get_blob(engine, blob_id, session_id)
+
+        def counted_read_bytes(path: Path) -> bytes:
+            content_reads.append(path)
+            return original_read_bytes(path)
+
+        with (
+            patch.object(generation_module, "_sync_get_blob", side_effect=counted_sync_get_blob),
+            patch.object(Path, "read_bytes", counted_read_bytes),
+        ):
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+            )
+
+        assert result.data["authoring_validation"]["is_valid"] is True
+        matching = [
+            diagnostic
+            for diagnostic in result.data["proof_diagnostics"]
+            if diagnostic["code"] == "gate_expression_type_mismatch_against_source_schema"
+        ]
+        assert [
+            (
+                diagnostic["evidence_locator"]["source_name"],
+                diagnostic["evidence_locator"]["node_id"],
+            )
+            for diagnostic in matching
+        ] == [("orders", "orders_gate"), ("refunds", "refunds_gate")]
+        assert metadata_reads == [self.csv_blob_id]
+        assert content_reads == [self.csv_storage_path]
+
     # -- csv_fixed_schema_omits_observed_columns ----------------------------
 
     def test_fixed_csv_omits_columns_with_discard_blocks(self) -> None:

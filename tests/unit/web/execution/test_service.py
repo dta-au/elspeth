@@ -1535,6 +1535,59 @@ class TestExecutionFlow:
 
 class TestAuthoritativeProofDiagnostics:
     @pytest.mark.asyncio
+    async def test_observed_csv_numeric_gate_after_declared_queue_is_rejected(
+        self,
+        service: ExecutionServiceImpl,
+        tmp_path: Path,
+    ) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.composer.state import SourceSpec
+
+        session_id = uuid4()
+        blob_id = uuid4()
+        source_path = tmp_path / "queued-amounts.csv"
+        source_path.write_text("amount\n250.00\n750.00\n", encoding="utf-8")
+        direct_state = _proof_gate_state(source_path=source_path, blob_id=blob_id)
+        state = replace(
+            direct_state,
+            sources={
+                "source": replace(
+                    direct_state.sources["source"],
+                    on_success="inbound",
+                ),
+                "other": SourceSpec(
+                    plugin="csv",
+                    on_success="inbound",
+                    options={
+                        "path": str(tmp_path / "other.csv"),
+                        "schema": {"mode": "fixed", "fields": ["amount: float"]},
+                    },
+                    on_validation_failure="discard",
+                ),
+            },
+            nodes=(
+                _queue_node("inbound"),
+                replace(direct_state.nodes[0], input="inbound"),
+            ),
+        )
+        _install_ready_proof_blob(
+            service,
+            session_id=session_id,
+            blob_id=blob_id,
+            source_path=source_path,
+        )
+
+        with patch(
+            "elspeth.web.execution.validation.validate_pipeline",
+            return_value=_successful_core_validation_result(),
+        ):
+            result = await service.validate_state(state, user_id="alice", session_id=session_id)
+
+        assert result.is_valid is False
+        assert [error.error_code for error in result.errors] == ["gate_expression_type_mismatch_against_source_schema"]
+
+    @pytest.mark.asyncio
     async def test_more_than_256_blob_sources_blocks_instead_of_partially_passing(
         self,
         service: ExecutionServiceImpl,

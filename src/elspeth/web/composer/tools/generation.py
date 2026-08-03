@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal, TypedDict
+from uuid import UUID
 
 from opentelemetry import metrics
 from sqlalchemy import Engine
@@ -33,7 +34,7 @@ from elspeth.plugins.transforms.llm.model_catalog import (
 )
 from elspeth.web.blobs.protocol import BlobIntegrityError
 from elspeth.web.catalog.protocol import PluginKind
-from elspeth.web.composer._producer_resolver import ProducerResolver, is_source_producer_id, source_producer_id
+from elspeth.web.composer._producer_resolver import ProducerEntry, ProducerResolver, is_source_producer_id, source_producer_id
 from elspeth.web.composer.source_inspection import (
     SourceInspectionFacts,
     derive_extra_column_risk,
@@ -1892,9 +1893,11 @@ def _source_field_reaches_connection_without_type_change(
 ) -> bool:
     """Return True when a source field flows to a connection unchanged.
 
-    This intentionally recognises only field-preserving nodes. Unknown
-    transforms may coerce, overwrite, delete, or synthesize the field, so the
-    proof step abstains instead of emitting a false positive.
+    This intentionally recognises only field-preserving nodes. Declared queues
+    traverse their predecessor set source-by-source; unrelated fan-in never
+    stands in for the target source. Unknown transforms may coerce, overwrite,
+    delete, or synthesize the field, so the proof step abstains instead of
+    emitting a false positive.
     """
     resolver = ProducerResolver.build(
         source=None,
@@ -1902,32 +1905,44 @@ def _source_field_reaches_connection_without_type_change(
         nodes=state.nodes,
         sink_names=frozenset(output.name for output in state.outputs),
     )
-    current = connection_name
-    visited: set[str] = set()
-    while True:
-        if current in visited:
-            return False
-        visited.add(current)
+    target_source_id = source_producer_id(source_name)
 
-        producer = resolver.find_producer_for(current)
-        if producer is None:
-            return False
+    def _producer_preserves_field(
+        producer: ProducerEntry,
+        *,
+        visiting: frozenset[str],
+    ) -> bool:
         if is_source_producer_id(producer.producer_id):
-            return producer.producer_id == source_producer_id(source_name)
-
+            return producer.producer_id == target_source_id
+        if producer.producer_id in visiting:
+            return False
         node = resolver.get_node(producer.producer_id)
         if node is None:
             return False
+        next_visiting = visiting | {producer.producer_id}
+        if node.node_type == "queue":
+            return any(
+                _producer_preserves_field(predecessor, visiting=next_visiting) for predecessor in resolver.queue_predecessors(node.id)
+            )
         if node.node_type == "gate":
-            current = node.input
-            continue
+            return _connection_preserves_field(node.input, visiting=next_visiting)
         if node.plugin == "value_transform" and _value_transform_preserves_field(node, field_name):
-            current = node.input
-            continue
+            return _connection_preserves_field(node.input, visiting=next_visiting)
         if node.plugin == "passthrough":
-            current = node.input
-            continue
+            return _connection_preserves_field(node.input, visiting=next_visiting)
         return False
+
+    def _connection_preserves_field(
+        current: str,
+        *,
+        visiting: frozenset[str],
+    ) -> bool:
+        producer = resolver.find_producer_for(current)
+        if producer is None:
+            return False
+        return _producer_preserves_field(producer, visiting=visiting)
+
+    return _connection_preserves_field(connection_name, visiting=frozenset())
 
 
 def _numeric_aggregation_diagnostics_for_observed_csv(
@@ -2447,9 +2462,42 @@ def compute_proof_diagnostics(
 
         def _resolve_from_composer_store(resolved_blob_id: str) -> ResolvedProofBlob | None:
             metadata = _sync_get_blob(session_engine, resolved_blob_id, session_id)
-            return None if metadata is None else ResolvedProofBlob(metadata=metadata)
+            if metadata is None:
+                return None
+            storage_path = Path(metadata["storage_path"])
+            if not storage_path.exists():
+                return ResolvedProofBlob(metadata=metadata)
+            content = storage_path.read_bytes()
+            _verify_blob_content_integrity(metadata, content)
+            stored_hash = metadata["content_hash"]
+            if stored_hash is None:
+                raise AuditIntegrityError("ready proof blob has null content_hash")
+            return ResolvedProofBlob(
+                metadata=metadata,
+                verified_prefix=content[: 8 * 1024],
+                verified_content_hash=stored_hash,
+                total_size_bytes=len(content),
+            )
 
         effective_resolver = _resolve_from_composer_store
+
+    uncached_resolver = effective_resolver
+    resolved_by_blob_id: dict[tuple[str, str], ResolvedProofBlob | None] = {}
+
+    def _memoized_resolver(resolved_blob_id: str) -> ResolvedProofBlob | None:
+        try:
+            parsed_blob_id = UUID(resolved_blob_id)
+        except ValueError:
+            cache_key = ("raw", resolved_blob_id)
+        else:
+            canonical_blob_id = str(parsed_blob_id)
+            cache_key = (
+                "uuid" if canonical_blob_id == resolved_blob_id else "noncanonical",
+                canonical_blob_id if canonical_blob_id == resolved_blob_id else resolved_blob_id,
+            )
+        if cache_key not in resolved_by_blob_id:
+            resolved_by_blob_id[cache_key] = uncached_resolver(resolved_blob_id)
+        return resolved_by_blob_id[cache_key]
 
     blob_sources: list[tuple[str, SourceSpec, object]] = []
     for source_name, source in state.sources.items():
@@ -2484,7 +2532,7 @@ def compute_proof_diagnostics(
             source_name=source_name,
             source=source,
             blob_id=blob_id,
-            blob_resolver=effective_resolver,
+            blob_resolver=_memoized_resolver,
         )
         diagnostics.extend(_attribute_proof_diagnostic_to_source(diagnostic, source_name=source_name) for diagnostic in source_diagnostics)
     return diagnostics
