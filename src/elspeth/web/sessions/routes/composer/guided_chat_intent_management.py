@@ -39,6 +39,7 @@ from elspeth.web.composer.guided.protocol import GuidedStep, Turn, TurnType
 from elspeth.web.composer.guided.stage_subjects import StageName
 from elspeth.web.composer.guided.state_machine import DeferredStageIntent, GuidedProposalRef, GuidedSession, TurnRecord
 from elspeth.web.composer.state import CompositionState
+from elspeth.web.plugin_policy.models import PluginId
 from elspeth.web.sessions._guided_step_chat import StepChatResult
 from elspeth.web.sessions.guided_payloads import prepare_guided_json_payload
 from elspeth.web.sessions.protocol import (
@@ -243,6 +244,25 @@ def _message_names_identifier(message: str, identifier: str) -> bool:
     return re.search(rf"(?<![a-z0-9_]){re.escape(identifier)}(?![a-z0-9_])", message.casefold()) is not None
 
 
+def _has_unmentioned_unavailable_action_identity(
+    action: DeferredIntentAction,
+    *,
+    catalog: PolicyCatalogView,
+    originating_message_content: str,
+) -> bool:
+    """Recognize only the model-authored unavailable catalog identity seam."""
+
+    if action.catalog_kind is None or action.catalog_name is None:
+        return False
+    if _message_names_identifier(originating_message_content, action.catalog_name):
+        return False
+    try:
+        plugin_id = PluginId.parse(f"{action.catalog_kind}:{action.catalog_name}")
+    except ValueError:
+        return False
+    return catalog.unavailable_reason(plugin_id) is not None
+
+
 def _policy_visible_alternatives(
     catalog: PolicyCatalogView,
     *,
@@ -370,16 +390,10 @@ def apply_deferred_request(
     chat: StepChatResult,
 ) -> DeferredRequestApplication:
     if deferred_action is not None:
-        disposition = validate_deferred_intent_action(
+        if _has_unmentioned_unavailable_action_identity(
             deferred_action,
-            receiving_stage=_guided_stage_name(authority.guided.step),
             catalog=authority.catalog,
-            guided=authority.guided,
             originating_message_content=authority.originating_message.content,
-        )
-        if type(disposition) is DeferredIntentUnsupported and not _message_names_identifier(
-            authority.originating_message.content,
-            disposition.plugin_name,
         ):
             return apply_deferred_clarification(
                 authority=authority,
@@ -388,6 +402,13 @@ def apply_deferred_request(
                     latency_ms=chat.latency_ms,
                 ),
             )
+        disposition = validate_deferred_intent_action(
+            deferred_action,
+            receiving_stage=_guided_stage_name(authority.guided.step),
+            catalog=authority.catalog,
+            guided=authority.guided,
+            originating_message_content=authority.originating_message.content,
+        )
         resolved_chat = _deferred_disposition_chat(disposition, catalog=authority.catalog, latency_ms=chat.latency_ms)
         if type(disposition) is not DeferredIntentAccepted:
             return DeferredRequestUnchanged(guided=authority.guided, chat=resolved_chat)
