@@ -2074,7 +2074,19 @@ def test_composer_wall_clock_fits_under_the_app_guard_and_the_alb() -> None:
     fired, replacing the discriminated 422 (which persists the partial
     pipeline) with an opaque 504 (which does not). That is a live-only
     failure, so it is caught here rather than in production.
+
+    The ceiling and headroom are read from the `WebSettings` field defaults,
+    which is only the value the task actually boots with while this module
+    ships no environment override for them — so the absence of an override
+    is asserted rather than assumed. A deployment that does override them
+    (staging does, in `deploy/elspeth-web.env`) moves the real ceiling, and
+    this test would otherwise keep validating the wrong chain in silence.
     """
+    tf_sources = "\n".join(path.read_text(encoding="utf-8") for path in _source_files() if path.name.endswith(".tf"))
+    assert "ELSPETH_WEB__COMPOSER_TRANSPORT_" not in tf_sources, (
+        "the module now overrides a composer transport bound, so this test's ceiling/headroom "
+        "must be read from that override instead of from the WebSettings defaults"
+    )
     ceiling = WebSettings.model_fields["composer_transport_idle_ceiling_seconds"].default
     headroom = WebSettings.model_fields["composer_transport_headroom_seconds"].default
 
