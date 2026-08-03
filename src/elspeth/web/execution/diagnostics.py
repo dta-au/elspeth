@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Final, Literal, get_args
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.engine import Connection
 
+from elspeth.contracts.errors import TransformErrorCategory
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.export_mappers import artifact_producer_kind, validate_artifact_publication_projection
 from elspeth.core.landscape.schema import (
@@ -41,6 +42,51 @@ _DEFAULT_DIAGNOSTIC_LIMIT = 50
 _MAX_DIAGNOSTIC_LIMIT = 100
 _OPERATION_PREVIEW_LIMIT = 20
 _ARTIFACT_PREVIEW_LIMIT = 20
+
+_SafeFailureClassification = Literal[
+    "authentication_failed",
+    "authorization_denied",
+    "connectivity_failure",
+    "provider_unavailable",
+    "rate_limited",
+    "source_object_unreadable",
+    "timeout",
+]
+_SAFE_TRANSFORM_ERROR_REASONS: Final[frozenset[object]] = frozenset(get_args(TransformErrorCategory))
+_PROVIDER_FAILURE_CLASSIFICATIONS: Final[dict[tuple[str, str, str], _SafeFailureClassification]] = {
+    ("submit_failed", "service_error", "AccessDeniedException"): "authorization_denied",
+    ("submit_failed", "service_error", "ThrottlingException"): "rate_limited",
+    ("poll_failed", "service_error", "AccessDeniedException"): "authorization_denied",
+    ("poll_failed", "service_error", "ThrottlingException"): "rate_limited",
+}
+_EXCEPTION_FAILURE_CLASSIFICATIONS: Final[dict[str, _SafeFailureClassification]] = {
+    "ConnectionResetError": "connectivity_failure",
+    "PermissionError": "authorization_denied",
+    "TimeoutError": "timeout",
+}
+_TEXTRACT_OBJECT_UNREADABLE_TUPLE: Final[tuple[str, str, str, str]] = (
+    "submit_failed",
+    "service_error",
+    "InvalidS3ObjectException",
+    "s3_object_unreadable",
+)
+_TEXTRACT_OBJECT_UNREADABLE_REMEDIATION: Final = (
+    "Check that the pipeline AWS role can read the referenced S3 object and that the object is in the Amazon Textract endpoint region."
+)
+_STATUS_FAILURE_CLASSIFICATIONS: Final[dict[int, _SafeFailureClassification]] = {
+    401: "authentication_failed",
+    403: "authorization_denied",
+    408: "timeout",
+    429: "rate_limited",
+}
+_JSON_PAYLOAD_TYPE_NAMES: Final[dict[type[object], str]] = {
+    bool: "bool",
+    dict: "dict",
+    float: "float",
+    int: "int",
+    list: "list",
+    str: "str",
+}
 
 
 def llm_safe_diagnostics_snapshot(diagnostics: RunDiagnosticsResponse) -> dict[str, Any]:
@@ -73,14 +119,51 @@ def _summarize_error_payload_for_llm(error_payload: Any | None) -> dict[str, obj
     if error_payload is None:
         return None
     try:
-        serialized_chars = len(json.dumps(error_payload, sort_keys=True, allow_nan=False, default=str))
-    except (TypeError, ValueError):
+        serialized_chars = len(json.dumps(error_payload, sort_keys=True, allow_nan=False))
+    except (RecursionError, TypeError, UnicodeError, ValueError):
         serialized_chars = None
-    return {
+    summary: dict[str, object] = {
         "redacted": True,
-        "payload_type": type(error_payload).__name__,
+        "payload_type": _JSON_PAYLOAD_TYPE_NAMES.get(type(error_payload), "unknown"),
         "serialized_chars": serialized_chars,
     }
+    if type(error_payload) is dict:
+        reason = error_payload.get("reason")
+        if type(reason) is str and reason in _SAFE_TRANSFORM_ERROR_REASONS:
+            summary["reason"] = reason
+
+        valid_statuses: list[int] = []
+        for field_name in ("status_code", "http_status"):
+            status = error_payload.get(field_name)
+            if type(status) is int and 100 <= status <= 599:
+                summary[field_name] = status
+                valid_statuses.append(status)
+
+        classification: _SafeFailureClassification | None = None
+        remediation: str | None = None
+        error_type = error_payload.get("error_type")
+        code = error_payload.get("code")
+        cause = error_payload.get("cause")
+        if type(reason) is str and type(error_type) is str and type(code) is str:
+            if type(cause) is str and (reason, error_type, code, cause) == _TEXTRACT_OBJECT_UNREADABLE_TUPLE:
+                classification = "source_object_unreadable"
+                remediation = _TEXTRACT_OBJECT_UNREADABLE_REMEDIATION
+            else:
+                classification = _PROVIDER_FAILURE_CLASSIFICATIONS.get((reason, error_type, code))
+        if classification is None and "reason" not in error_payload:
+            exception_type = error_payload.get("type")
+            if type(exception_type) is str and type(error_payload.get("exception")) is str:
+                classification = _EXCEPTION_FAILURE_CLASSIFICATIONS.get(exception_type)
+        if classification is None and valid_statuses and all(status == valid_statuses[0] for status in valid_statuses):
+            status = valid_statuses[0]
+            classification = _STATUS_FAILURE_CLASSIFICATIONS.get(status)
+            if classification is None and 500 <= status <= 599:
+                classification = "provider_unavailable"
+        if classification is not None:
+            summary["failure_classification"] = classification
+            if remediation is not None:
+                summary["remediation"] = remediation
+    return summary
 
 
 def _bounded_limit(limit: int) -> int:
