@@ -412,6 +412,42 @@ async def test_run_advisor_checkpoint_emits_one_bounded_pass_event(make_service,
     assert "TELEMETRY_FINDINGS_CANARY" not in repr(pass_events)
 
 
+@pytest.mark.parametrize("failing_sink", ["logger", "counter"])
+@pytest.mark.asyncio
+async def test_run_advisor_checkpoint_telemetry_failure_does_not_replace_completed_verdict(
+    make_service,
+    simple_state,
+    monkeypatch,
+    failing_sink,
+):
+    from elspeth.web.composer import advisor_checkpoint_telemetry as telemetry
+
+    service = make_service()
+    findings = "FLAGGED: TELEMETRY_FAILURE_FINDINGS_CANARY"
+    service._call_advisor_with_audit = _AsyncRecorder(return_value=(findings, {}))
+    logger = MagicMock()
+    counter = MagicMock()
+    monkeypatch.setattr(telemetry, "slog", logger)
+    monkeypatch.setattr(telemetry, "_ADVISOR_CHECKPOINT_PASSES_COUNTER", counter)
+    if failing_sink == "logger":
+        logger.info.side_effect = RuntimeError("logger unavailable")
+    else:
+        counter.add.side_effect = RuntimeError("counter unavailable")
+
+    verdict = await service._run_advisor_checkpoint(
+        phase="end",
+        state=simple_state,
+        session_id="s1",
+        recorder=make_recorder(),
+    )
+
+    assert verdict == AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=findings)
+    logger.info.assert_called_once()
+    counter.add.assert_called_once_with(1, {"phase": "end", "verdict": "flagged"})
+    assert "TELEMETRY_FAILURE_FINDINGS_CANARY" not in repr(logger.info.call_args)
+    assert "TELEMETRY_FAILURE_FINDINGS_CANARY" not in repr(counter.add.call_args)
+
+
 @pytest.mark.asyncio
 async def test_run_advisor_checkpoint_end_threads_user_message(make_service, simple_state):
     """R2-F8a (elspeth-583c2a0792): the END checkpoint carries the originating

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
 from typing import Literal
 
 import structlog
@@ -28,13 +29,19 @@ def record_advisor_checkpoint_pass(
     verdict: AdvisorCheckpointTelemetryVerdict,
     findings_text: str,
 ) -> None:
-    """Emit one event and one metric increment for a logical checkpoint call."""
-    slog.info(
-        "composer.advisor_checkpoint_pass",
-        session_id=session_id,
-        phase=phase,
-        pass_index=pass_index,
-        verdict=verdict,
-        findings_hash=stable_hash({"advisor_findings": findings_text}),
-    )
-    _ADVISOR_CHECKPOINT_PASSES_COUNTER.add(1, {"phase": phase, "verdict": verdict})
+    """Best-effort event and metric increment for a logical checkpoint call."""
+    # The checkpoint verdict is already complete. Optional telemetry must
+    # neither replace it nor recursively log raw advisor findings.
+    with suppress(Exception):
+        slog.info(
+            "composer.advisor_checkpoint_pass",
+            session_id=session_id,
+            phase=phase,
+            pass_index=pass_index,
+            verdict=verdict,
+            findings_hash=stable_hash({"advisor_findings": findings_text}),
+        )
+    # Keep the metric independent from the event sink and off the correctness
+    # path, matching the composer's telemetry policy.
+    with suppress(Exception):
+        _ADVISOR_CHECKPOINT_PASSES_COUNTER.add(1, {"phase": phase, "verdict": verdict})
