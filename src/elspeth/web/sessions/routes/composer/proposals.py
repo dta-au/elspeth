@@ -5,7 +5,10 @@ from dataclasses import replace
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.composer.required_controls import wire_required_controls_state
+from elspeth.web.composer.required_controls import (
+    merge_required_control_affected_components,
+    wire_required_controls_state,
+)
 from elspeth.web.composer.tools import is_approval_required_blob_store_only_mutation_tool
 
 from .._helpers import (
@@ -259,7 +262,11 @@ async def accept_composition_proposal(
                     result,
                     updated_state=finalized_validation.authored_state,
                     validation=finalized_validation.validation,
-                    affected_nodes=tuple(node.id for node in finalized_validation.authored_state.nodes),
+                    affected_nodes=merge_required_control_affected_components(
+                        result.affected_nodes,
+                        result.updated_state,
+                        finalized_validation.authored_state,
+                    ),
                 )
         if result.updated_state.version == current_state.version:
             # The tool ran but did not advance composition state. The route

@@ -562,7 +562,66 @@ async def test_auto_commit_wires_controls_when_set_output_completes_incremental_
     invocation = next(item for item in result.tool_invocations if item.tool_call_id == "call_complete_with_output")
     assert invocation.tool_name == "set_output"
     assert invocation.result_canonical is not None
-    assert json.loads(invocation.result_canonical)["validation"]["is_valid"] is True
+    invocation_result = json.loads(invocation.result_canonical)
+    assert invocation_result["validation"]["is_valid"] is True
+    assert invocation_result["affected_nodes"] == [
+        "output_rows",
+        "prompt_shield_auto_1",
+        "content_safety_auto_1",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_incremental_completion_stages_one_canonical_wired_pipeline_proposal(tmp_path: Path) -> None:
+    harness = _harness(tmp_path)
+    view, snapshot = _required_textract_policy(tmp_path)
+    initial_state, output = await _incremental_textract_state(
+        tmp_path,
+        harness=harness,
+        view=view,
+        snapshot=snapshot,
+    )
+    llm = _ScriptedLLM(_tool_turn("call_review_incremental_completion", "set_output", output))
+
+    with (
+        patch.object(harness.service, "_plugin_policy_context", return_value=(snapshot, view)),
+        patch.object(harness.service, "_call_llm", new=llm),
+    ):
+        result = await harness.service.compose(
+            "Add the final JSON output and prepare the complete pipeline for review.",
+            [],
+            initial_state,
+            session_id=harness.session_id,
+            user_id="proposal-prevalidation-user",
+            user_message_id=harness.user_message_id,
+        )
+
+    proposals = await harness.sessions.list_composition_proposals(UUID(harness.session_id))
+    assert len(proposals) == 1
+    proposal = proposals[0]
+    assert proposal.tool_name == "set_pipeline"
+    assert proposal.pipeline_metadata is not None
+    authority = await harness.sessions.get_authoritative_composition_proposal(
+        session_id=UUID(harness.session_id),
+        proposal_id=proposal.id,
+        reviewed_facts=None,
+    )
+    assert authority.pipeline is not None
+    sealed = deep_thaw(authority.pipeline.proposal.pipeline)
+    assert _node_plugins(sealed) == [
+        "aws_textract_document_analysis",
+        "aws_bedrock_prompt_shield",
+        "llm",
+        "aws_bedrock_content_safety",
+        "field_mapper",
+    ]
+    _assert_required_control_disclosures(sealed)
+    assert proposal.tool_arguments_hash == stable_hash(sealed)
+    assert set(proposal.affects) >= {"graph", "validation"}
+    assert result.state is initial_state
+    invocation = next(item for item in result.tool_invocations if item.tool_call_id == "call_review_incremental_completion")
+    assert invocation.tool_name == "set_output"
+    assert json.loads(invocation.arguments_canonical) == output
 
 
 @pytest.mark.asyncio

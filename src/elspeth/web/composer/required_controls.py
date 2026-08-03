@@ -889,4 +889,45 @@ def wire_required_controls_state(
     return replace(finalized_state, guided_session=state.guided_session)
 
 
-__all__ = ["wire_required_controls", "wire_required_controls_state"]
+def merge_required_control_affected_components(
+    original: Sequence[str],
+    before_finalization: CompositionState,
+    after_finalization: CompositionState,
+) -> tuple[str, ...]:
+    """Preserve the mutation's affected components and append inserted controls.
+
+    ``affected_nodes`` is the audit-visible changed-component list even though
+    it may contain sink/source names. Required-control finalization owns only
+    newly inserted control nodes; unchanged pre-existing nodes must never be
+    attributed to the triggering mutation, and the triggering sink/source must
+    never be dropped.
+    """
+    before_ids = {node.id for node in before_finalization.nodes}
+    inserted: list[str] = []
+    for node in after_finalization.nodes:
+        if node.id in before_ids:
+            continue
+        requirements = node.options.get(INTERPRETATION_REQUIREMENTS_KEY)
+        auto_wired = isinstance(requirements, (list, tuple)) and any(
+            isinstance(requirement, Mapping) and requirement.get("user_term") == REQUIRED_CONTROL_AUTO_WIRED_USER_TERM
+            for requirement in requirements
+        )
+        if not auto_wired:
+            raise AuditIntegrityError("Required-control finalization inserted a node without its server disclosure")
+        inserted.append(node.id)
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for component_id in (*original, *inserted):
+        if component_id in seen:
+            continue
+        seen.add(component_id)
+        merged.append(component_id)
+    return tuple(merged)
+
+
+__all__ = [
+    "merge_required_control_affected_components",
+    "wire_required_controls",
+    "wire_required_controls_state",
+]

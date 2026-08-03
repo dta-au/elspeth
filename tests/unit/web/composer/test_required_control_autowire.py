@@ -26,7 +26,11 @@ from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.plugins.sources.llm.source import LLMSource
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.implicit_decisions import build_implicit_decisions_report
-from elspeth.web.composer.required_controls import wire_required_controls
+from elspeth.web.composer.required_controls import (
+    merge_required_control_affected_components,
+    wire_required_controls,
+    wire_required_controls_state,
+)
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
 from elspeth.web.composer.tools import build_set_pipeline_candidate
 from elspeth.web.dependencies import create_catalog_service
@@ -174,6 +178,22 @@ def _disclosure_rows(node: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 class TestAutoWireSplicing:
+    def test_affected_components_preserve_trigger_and_add_only_inserted_controls(self, tmp_path: Path) -> None:
+        (tmp_path / "outputs").mkdir(exist_ok=True)
+        view, snapshot = _guardrail_profile_view(tmp_path)
+        context = _custody_context(tmp_path, _INLINE_CONTENT, view=view, snapshot=snapshot)
+        candidate = build_set_pipeline_candidate(_bare_llm_candidate(), _empty_state(), context)
+        assert candidate.acceptable is True
+        before = candidate.result.updated_state
+
+        after = wire_required_controls_state(before, snapshot, view)
+
+        assert merge_required_control_affected_components(("output_rows", "output_rows"), before, after) == (
+            "output_rows",
+            "prompt_shield_auto_1",
+            "content_safety_auto_1",
+        )
+
     def test_selected_controls_are_spliced_on_the_offending_edges(self, tmp_path: Path) -> None:
         view, snapshot = _guardrail_profile_view(tmp_path)
         candidate = _bare_llm_candidate()

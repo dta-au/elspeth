@@ -100,7 +100,11 @@ from elspeth.web.composer.protocol import (
     ComposerServiceError,
     ToolArgumentError,
 )
-from elspeth.web.composer.required_controls import wire_required_controls, wire_required_controls_state
+from elspeth.web.composer.required_controls import (
+    merge_required_control_affected_components,
+    wire_required_controls,
+    wire_required_controls_state,
+)
 from elspeth.web.composer.state import CompositionState, ValidationSummary
 from elspeth.web.composer.tool_error_payloads import (
     INVALID_TOOL_ARGUMENTS_REDACTION_STATUS,
@@ -110,6 +114,7 @@ from elspeth.web.composer.tool_error_payloads import (
     arg_error_payload as _arg_error_payload,
 )
 from elspeth.web.composer.tools import (
+    _MUTATION_TOOLS,
     RuntimePreflight,
     ToolContext,
     ToolResult,
@@ -124,7 +129,7 @@ from elspeth.web.composer.tools import (
     is_session_aware_tool,
     normalize_tool_result_validation,
 )
-from elspeth.web.composer.tools._common import _failure_result
+from elspeth.web.composer.tools._common import _failure_result, _serialize_set_pipeline_arguments
 from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -446,7 +451,11 @@ async def _finalize_completed_incremental_mutation(
         result,
         updated_state=finalized_validation.authored_state,
         validation=finalized_validation.validation,
-        affected_nodes=tuple(node.id for node in finalized_validation.authored_state.nodes),
+        affected_nodes=merge_required_control_affected_components(
+            result.affected_nodes,
+            result.updated_state,
+            finalized_validation.authored_state,
+        ),
     )
 
 
@@ -1067,6 +1076,10 @@ async def run_tool_batch(
             except PydanticValidationError:
                 redacted_arguments = None
 
+            proposal_tool_name = tool_name
+            proposal_arguments: Mapping[str, Any] = arguments
+            proposal_redacted_arguments = redacted_arguments
+
             if redacted_arguments is not None and tool_name == "set_pipeline":
                 if preproposal_exception is not None:
                     redacted_arguments = None
@@ -1233,13 +1246,138 @@ async def run_tool_batch(
                             # dispatch/outcome without proposal publication.
                             redacted_arguments = None
 
-            if redacted_arguments is not None:
+            proposal_redacted_arguments = redacted_arguments
+            if redacted_arguments is not None and tool_name in _MUTATION_TOOLS and tool_name != "set_pipeline":
+                try:
+                    preview_result = await run_sync_in_worker(
+                        execute_tool,
+                        tool_name,
+                        arguments,
+                        state,
+                        ctx.policy_catalog,
+                        plugin_snapshot=ctx.plugin_snapshot,
+                        data_dir=ctx.service._data_dir,
+                        session_engine=ctx.service._session_engine,
+                        session_id=session_id,
+                        secret_service=ctx.service._secret_service,
+                        user_id=user_id,
+                        prior_validation=last_validation,
+                        runtime_preflight=None,
+                        max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
+                        user_message_id=user_message_id,
+                        user_message_content=user_message_content,
+                        composer_model_identifier=ctx.service._model,
+                        composer_model_version=safe_response_model(response) or ctx.service._model,
+                        composer_provider=ctx.service._availability.provider or "unknown",
+                        composer_skill_hash=ctx.service._composer_skill_hash,
+                        tool_arguments_hash=audit.binding_arguments_hash,
+                        validate_arguments=True,
+                        require_data_dir_for_paths=True,
+                        raise_schema_argument_errors=True,
+                    )
+                    if (
+                        preview_result.success
+                        and preview_result.updated_state.version > state.version
+                        and preview_result.validation.is_valid
+                    ):
+                        finalized_state = await run_sync_in_worker(
+                            wire_required_controls_state,
+                            preview_result.updated_state,
+                            ctx.plugin_snapshot,
+                            ctx.policy_catalog,
+                        )
+                        if finalized_state is not preview_result.updated_state:
+                            finalized_validation = await run_sync_in_worker(
+                                ctx.policy_catalog.validate_composition_state,
+                                finalized_state,
+                            )
+                            if not finalized_validation.validation.is_valid:
+                                raise AuditIntegrityError("Required-control proposal finalization produced an invalid composition")
+                            serialized, serialization_error = _serialize_set_pipeline_arguments(finalized_validation.authored_state)
+                            if serialized is None:
+                                prevalidated_unapplied_result = normalize_tool_result_validation(
+                                    _failure_result(
+                                        state,
+                                        (
+                                            "The completed pipeline could not be prepared as one review-safe proposal: "
+                                            f"{serialization_error or 'its authored state is not safely reconstructible'}."
+                                        ),
+                                        error_code="PROPOSAL_PIPELINE_NOT_RECONSTRUCTIBLE",
+                                    ),
+                                    ctx.policy_catalog,
+                                )
+                                proposal_redacted_arguments = None
+                            else:
+                                canonical_arguments = canonicalize_authored_node_review_requirements(
+                                    serialized,
+                                    current_state=state,
+                                )
+                                candidate_prior_validation = (
+                                    last_validation
+                                    if last_validation is not None
+                                    else ctx.policy_catalog.validate_composition_state(state).validation
+                                )
+                                candidate_context = ToolContext(
+                                    catalog=ctx.policy_catalog,
+                                    plugin_snapshot=ctx.plugin_snapshot,
+                                    data_dir=ctx.service._data_dir,
+                                    require_data_dir_for_paths=True,
+                                    session_engine=ctx.service._session_engine,
+                                    session_id=session_id,
+                                    secret_service=ctx.service._secret_service,
+                                    user_id=user_id,
+                                    current_validation=candidate_prior_validation,
+                                    max_blob_storage_per_session_bytes=ctx.service._settings.max_blob_storage_per_session_bytes,
+                                    user_message_id=user_message_id,
+                                    user_message_content=user_message_content,
+                                    composer_model_identifier=ctx.service._model,
+                                    composer_model_version=safe_response_model(response) or ctx.service._model,
+                                    composer_provider=ctx.service._availability.provider or "unknown",
+                                    composer_skill_hash=ctx.service._composer_skill_hash,
+                                    tool_arguments_hash=composer_authority_hash(inline_custody_audit_projection(canonical_arguments)),
+                                    _interpretation_requirements_are_internal=True,
+                                )
+                                candidate = await run_sync_in_worker(
+                                    build_set_pipeline_candidate,
+                                    canonical_arguments,
+                                    state,
+                                    candidate_context,
+                                )
+                                if not candidate.acceptable:
+                                    raise AuditIntegrityError(
+                                        "Finalized incremental preview did not reconstruct as an acceptable set_pipeline candidate"
+                                    )
+                                proposal_tool_name = "set_pipeline"
+                                proposal_arguments = canonical_arguments
+                                proposal_redacted_arguments = cast(
+                                    dict[str, Any],
+                                    _remove_inline_blob_redaction_defaults(
+                                        redact_tool_call_arguments(
+                                            proposal_tool_name,
+                                            proposal_arguments,
+                                            telemetry=ctx.service._redaction_telemetry,
+                                        )
+                                    ),
+                                )
+                except ToolArgumentError:
+                    # Preserve the established explicit-approval contract for
+                    # ordinary incremental proposals: semantic tool-argument
+                    # rejection occurs only if the user approves execution.
+                    pass
+                except BaseException as exc:
+                    preproposal_exception = exc
+                    proposal_redacted_arguments = None
+
+            if proposal_redacted_arguments is not None and proposal_tool_name == tool_name:
+                proposal_arguments = arguments
+
+            if proposal_redacted_arguments is not None:
                 proposal_summary = build_tool_proposal_summary(
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    redacted_arguments=redacted_arguments,
+                    tool_name=proposal_tool_name,
+                    arguments=proposal_arguments,
+                    redacted_arguments=proposal_redacted_arguments,
                 )
-                if tool_name == "set_pipeline":
+                if proposal_tool_name == "set_pipeline":
                     proposal_base = (
                         PresentBase(
                             state_id=UUID(current_state_id),
@@ -1249,7 +1387,7 @@ async def run_tool_batch(
                         else AbsentBase()
                     )
                     pipeline_proposal = PipelineProposal.create(
-                        pipeline=arguments,
+                        pipeline=proposal_arguments,
                         base=proposal_base,
                         reviewed_facts={},
                         surface=PlannerSurface.FREEFORM,
@@ -1282,11 +1420,11 @@ async def run_tool_batch(
                     proposal = await turn_sessions_service.create_composition_proposal(
                         session_id=turn_session_uuid,
                         tool_call_id=tool_call.id,
-                        tool_name=tool_name,
+                        tool_name=proposal_tool_name,
                         summary=proposal_summary.summary,
                         rationale=proposal_summary.rationale,
                         affects=proposal_summary.affects,
-                        arguments_json=arguments,
+                        arguments_json=proposal_arguments,
                         arguments_redacted_json=proposal_summary.arguments_redacted_json,
                         base_state_id=UUID(current_state_id) if current_state_id is not None else None,
                         actor=f"composer-web:user:{user_id}" if user_id is not None else "composer-web:anonymous",
@@ -1302,7 +1440,7 @@ async def run_tool_batch(
                     "success": True,
                     "status": "APPROVAL_REQUIRED",
                     "proposal_id": str(proposal.id),
-                    "tool_name": tool_name,
+                    "tool_name": proposal_tool_name,
                     "summary": proposal.summary,
                     "message": "The requested pipeline change is pending human approval and has not been applied.",
                 }
