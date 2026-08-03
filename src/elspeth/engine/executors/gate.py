@@ -9,7 +9,10 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from elspeth.contracts import (
+    ConfigGateErrorReason,
     ConfigGateReason,
+    ExecutionError,
+    FailureInfo,
     GateResult,
     RouteDestination,
     RouteDestinationKind,
@@ -17,6 +20,7 @@ from elspeth.contracts import (
     RoutingReason,
     RoutingSpec,
     TokenInfo,
+    error_edge_label,
 )
 from elspeth.contracts.enums import (
     NodeStateStatus,
@@ -125,6 +129,7 @@ class GateExecutor:
         step_resolver: StepResolver,
         edge_map: dict[tuple[NodeID, str], str] | None = None,
         route_resolution_map: dict[tuple[NodeID, str], RouteDestination] | None = None,
+        error_edge_ids: dict[NodeID, str] | None = None,
     ) -> None:
         """Initialize executor.
 
@@ -134,12 +139,14 @@ class GateExecutor:
             step_resolver: Resolves NodeID to 1-indexed audit step position
             edge_map: Maps (node_id, label) -> edge_id for routing
             route_resolution_map: Maps (node_id, label) -> resolved route destination
+            error_edge_ids: Maps config-gate node IDs to their DIVERT edge IDs.
         """
         self._execution = execution
         self._spans = span_factory
         self._step_resolver = step_resolver
         self._edge_map = edge_map or {}
         self._route_resolution_map = route_resolution_map or {}
+        self._error_edge_ids = error_edge_ids or {}
         self._condition_parser_cache: dict[tuple[str, str, str], ExpressionParser] = {}
 
     def _resolve_route_destination(self, *, node_id: str, route_label: str) -> RouteDestination:
@@ -297,7 +304,69 @@ class GateExecutor:
                     # This preserves dual-name access (normalized and original field names)
                     eval_result = parser.evaluate(token.row_data)
                     duration_ms = (time.perf_counter() - start) * 1000
-                except (ExpressionEvaluationError, ExpressionSecurityError, ExpressionSyntaxError):
+                except ExpressionEvaluationError as exc:
+                    duration_ms = (time.perf_counter() - start) * 1000
+                    on_error = gate_config.on_error
+                    if on_error is None:
+                        raise
+
+                    error_message = scrub_text_for_audit(str(exc))
+                    failure = FailureInfo(
+                        exception_type=type(exc).__name__,
+                        message=error_message,
+                    )
+                    error_reason: ConfigGateErrorReason = {
+                        "condition": gate_config.condition,
+                        "error_type": type(exc).__name__,
+                        "error": error_message,
+                    }
+                    route_label = error_edge_label(gate_config.name)
+                    action = RoutingAction.route(
+                        route_label,
+                        mode=RoutingMode.DIVERT,
+                        reason=error_reason,
+                    )
+
+                    if on_error != "discard":
+                        try:
+                            edge_id = self._error_edge_ids[NodeID(node_id)]
+                        except KeyError as missing_edge:
+                            raise OrchestrationInvariantError(
+                                f"Gate '{node_id}' has on_error={on_error!r} but no DIVERT edge registered. "
+                                "DAG construction should have created an __error_{name}__ edge."
+                            ) from missing_edge
+                        self._execution.record_routing_event(
+                            state_id=guard.state_id,
+                            edge_id=edge_id,
+                            mode=RoutingMode.DIVERT,
+                            reason=error_reason,
+                        )
+
+                    guard.complete(
+                        NodeStateStatus.FAILED,
+                        duration_ms=duration_ms,
+                        error=ExecutionError(
+                            exception=error_message,
+                            exception_type=type(exc).__name__,
+                        ),
+                    )
+
+                    result = GateResult(
+                        row=input_dict,
+                        action=action,
+                        contract=token.row_data.contract,
+                    )
+                    result.input_hash = input_hash
+                    result.duration_ms = duration_ms
+                    updated_token = token.with_updated_data(token.row_data)
+                    return GateOutcome(
+                        result=result,
+                        updated_token=updated_token,
+                        sink_name=on_error if on_error != "discard" else None,
+                        discarded=on_error == "discard",
+                        error=failure,
+                    )
+                except (ExpressionSecurityError, ExpressionSyntaxError):
                     duration_ms = (time.perf_counter() - start) * 1000
                     raise
 

@@ -41,8 +41,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from elspeth.contracts import RowResult, TokenInfo, TransformResult
-from elspeth.contracts.enums import TerminalOutcome, TerminalPath
+from elspeth.contracts import FailureInfo, RowResult, TokenInfo, TransformResult
+from elspeth.contracts.enums import RoutingMode, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import MaxRetriesExceeded, OrchestrationInvariantError
 from elspeth.contracts.results import GateResult
 from elspeth.contracts.routing import RoutingAction
@@ -248,6 +248,66 @@ class TestProcessSingleTokenOrchestration:
         assert isinstance(result, RowResult)
         assert (result.outcome, result.path) == (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW)
         assert result.sink_name == "terminal_sink"
+
+    def test_gate_error_discard_records_and_emits_gate_specific_failure_path(self) -> None:
+        """A gate-error discard owns a distinct audit and telemetry provenance path."""
+        _db, factory = _make_factory()
+        ctx = make_context(landscape=factory.plugin_audit_writer())
+        source_node = NodeID("source-0")
+        gate_node = NodeID("gate-1")
+        gate_config = GateSettings(
+            name="threshold",
+            input="default",
+            condition="row['amount'] > 500",
+            routes={"true": "high", "false": "standard"},
+            on_error="discard",
+        )
+        processor = _make_processor(
+            factory,
+            node_step_map={source_node: 0, gate_node: 1},
+            node_to_next={source_node: gate_node, gate_node: None},
+            node_to_plugin={gate_node: gate_config},
+        )
+        token = make_token_info(row_id="row-1", token_id="tok-1", data={"amount": "bad"})
+        failure = FailureInfo(exception_type="ExpressionEvaluationError", message="cannot compare str and int")
+        gate_outcome = GateOutcome(
+            result=GateResult(
+                row={"amount": "bad"},
+                action=RoutingAction.route(
+                    "__error_threshold__",
+                    mode=RoutingMode.DIVERT,
+                    reason={
+                        "condition": "row['amount'] > 500",
+                        "error_type": "ExpressionEvaluationError",
+                        "error": "cannot compare str and int",
+                    },
+                ),
+                contract=_make_contract(),
+            ),
+            updated_token=token,
+            discarded=True,
+            error=failure,
+        )
+        recorded: list[dict[str, object]] = []
+        emitted: list[tuple[TerminalOutcome, TerminalPath]] = []
+
+        def _discard(gate_config, node_id, token, ctx, token_manager=None):
+            return gate_outcome
+
+        processor._gate_executor.execute_config_gate = _discard  # type: ignore[method-assign]
+        processor._data_flow.record_token_outcome = lambda **kwargs: recorded.append(kwargs)  # type: ignore[method-assign, assignment]
+        processor._emit_token_completed = (  # type: ignore[method-assign]
+            lambda _token, *, outcome, path: emitted.append((outcome, path))
+        )
+
+        result, _child_items = processor._process_single_token(token=token, ctx=ctx, current_node_id=gate_node)
+
+        assert isinstance(result, RowResult)
+        assert (result.outcome, result.path) == (TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED)
+        assert recorded[0]["outcome"] == TerminalOutcome.FAILURE
+        assert recorded[0]["path"] == TerminalPath.GATE_ERROR_DISCARDED
+        assert recorded[0]["error_hash"] is not None
+        assert emitted == [(TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED)]
 
     def test_gate_jump_to_node_absent_from_step_map_raises(self) -> None:
         """A gate jump to a node not in the DAG step map is an invariant violation."""

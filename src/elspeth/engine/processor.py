@@ -516,9 +516,9 @@ class RowProcessor:
         )
         self._work_items = WorkItemFactory(self._nav)
 
-        # Build error edge map: transform node_id -> DIVERT edge_id.
-        # Scans edge_map for __error_{name}__ labels (created by dag.py for transforms
-        # with on_error pointing to a real sink, not "discard").
+        # Build error edge map: processing node_id -> DIVERT edge_id.
+        # Scans edge_map for __error_{name}__ labels created for transforms and
+        # config gates whose on_error points to a real sink, not "discard".
         _edge_map = edge_map or {}
         error_edge_ids: dict[NodeID, str] = {}
         for (node_id, label), edge_id in _edge_map.items():
@@ -538,7 +538,14 @@ class RowProcessor:
             error_edge_ids=error_edge_ids,
             data_flow=data_flow,
         )
-        self._gate_executor = GateExecutor(execution, span_factory, self._step_resolver, edge_map, route_resolution_map)
+        self._gate_executor = GateExecutor(
+            execution,
+            span_factory,
+            self._step_resolver,
+            edge_map,
+            route_resolution_map,
+            error_edge_ids=error_edge_ids,
+        )
         self._aggregation_executor = AggregationExecutor(
             execution,
             span_factory,

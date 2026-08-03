@@ -32,6 +32,7 @@ class TestTwoAxisMapping:
             (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW),
             (TerminalOutcome.SUCCESS, TerminalPath.GATE_ROUTED),
             (TerminalOutcome.SUCCESS, TerminalPath.GATE_DISCARDED),
+            (TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED),
             (TerminalOutcome.FAILURE, TerminalPath.ON_ERROR_ROUTED),
             (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED),
             (TerminalOutcome.SUCCESS, TerminalPath.COALESCED),
@@ -88,12 +89,13 @@ class TestTerminalOutcome:
 class TestTerminalPath:
     """Tests for TerminalPath enum (ADR-019)."""
 
-    def test_fourteen_values(self) -> None:
-        """TerminalPath has 14 values: 13 terminal paths + BUFFERED."""
+    def test_fifteen_values(self) -> None:
+        """TerminalPath has 15 values: 14 terminal paths + BUFFERED."""
         assert {p.value for p in TerminalPath} == {
             "default_flow",
             "gate_routed",
             "gate_discarded",
+            "gate_error_discarded",
             "on_error_routed",
             "filter_dropped",
             "coalesced",

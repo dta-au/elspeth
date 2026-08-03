@@ -391,6 +391,71 @@ sinks:
     assert state.nodes[0].on_success is None
 
 
+def test_composition_state_from_runtime_yaml_preserves_optional_gate_error_route() -> None:
+    state = composition_state_from_runtime_yaml(
+        """
+sources:
+  source:
+    plugin: csv
+    on_success: gate_in
+    options:
+      path: /data/blobs/input.csv
+      on_validation_failure: discard
+gates:
+  - name: threshold
+    input: gate_in
+    condition: row['amount'] > 500
+    routes:
+      true: high
+      false: standard
+    on_error: gate_errors
+sinks:
+  high:
+    plugin: csv
+    on_write_failure: discard
+  standard:
+    plugin: csv
+    on_write_failure: discard
+  gate_errors:
+    plugin: csv
+    on_write_failure: discard
+"""
+    )
+
+    assert state.nodes[0].node_type == "gate"
+    assert state.nodes[0].on_error == "gate_errors"
+
+
+def test_composition_state_from_runtime_yaml_defaults_omitted_gate_error_route_to_none() -> None:
+    state = composition_state_from_runtime_yaml(
+        """
+sources:
+  source:
+    plugin: csv
+    on_success: gate_in
+    options:
+      path: /data/blobs/input.csv
+      on_validation_failure: discard
+gates:
+  - name: threshold
+    input: gate_in
+    condition: row['amount'] > 500
+    routes:
+      true: high
+      false: standard
+sinks:
+  high:
+    plugin: csv
+    on_write_failure: discard
+  standard:
+    plugin: csv
+    on_write_failure: discard
+"""
+    )
+
+    assert state.nodes[0].on_error is None
+
+
 def test_composition_state_from_runtime_yaml_rejects_missing_transform_error_route() -> None:
     with pytest.raises(RuntimeYamlImportError, match=r"transforms\[0\]\.on_error"):
         composition_state_from_runtime_yaml(

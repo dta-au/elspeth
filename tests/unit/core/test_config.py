@@ -1176,7 +1176,38 @@ class TestGateSettings:
         assert gate.name == "quality_check"
         assert gate.condition == "row['confidence'] >= 0.85"
         assert gate.routes == {"true": "quality_ok", "false": "review_sink"}
+        assert gate.on_error is None
+        assert "on_error" not in gate.model_dump(mode="json")
         assert gate.fork_to is None
+
+    @pytest.mark.parametrize("on_error", ["discard", "gate_errors", "gate-errors"])
+    def test_gate_settings_accepts_row_error_policy(self, on_error: str) -> None:
+        """A gate may divert row-level expression failures or discard them."""
+        from elspeth.core.config import GateSettings
+
+        gate = GateSettings(
+            name="quality_check",
+            input="source_out",
+            condition="row['confidence'] >= 0.85",
+            routes={"true": "quality_ok", "false": "review_sink"},
+            on_error=f" {on_error} ",
+        )
+
+        assert gate.on_error == on_error
+        assert gate.model_dump(mode="json")["on_error"] == on_error
+
+    def test_gate_settings_rejects_blank_row_error_policy(self) -> None:
+        """A present policy must identify a sink or the discard sentinel."""
+        from elspeth.core.config import GateSettings
+
+        with pytest.raises(ValidationError, match="on_error must be"):
+            GateSettings(
+                name="quality_check",
+                input="source_out",
+                condition="row['confidence'] >= 0.85",
+                routes={"true": "quality_ok", "false": "review_sink"},
+                on_error="  ",
+            )
 
     def test_gate_settings_with_fork(self) -> None:
         """GateSettings with fork_to for parallel paths."""

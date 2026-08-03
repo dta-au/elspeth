@@ -138,7 +138,9 @@ def load_run_accounting_map_from_db(
                 routed_failure[run_id] += value
             elif outcome == TerminalOutcome.FAILURE.value and path == TerminalPath.QUARANTINED_AT_SOURCE.value:
                 quarantined[run_id] += value
-            elif outcome == TerminalOutcome.FAILURE.value and (path == TerminalPath.SINK_DISCARDED.value or sink_name == DISCARD_SINK_NAME):
+            elif outcome == TerminalOutcome.FAILURE.value and (
+                path in (TerminalPath.SINK_DISCARDED.value, TerminalPath.GATE_ERROR_DISCARDED.value) or sink_name == DISCARD_SINK_NAME
+            ):
                 discarded[run_id] += value
 
         completed_by_emitted_token = (

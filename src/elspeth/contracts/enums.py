@@ -219,6 +219,7 @@ class TerminalPath(StrEnum):
     DEFAULT_FLOW = "default_flow"
     GATE_ROUTED = "gate_routed"
     GATE_DISCARDED = "gate_discarded"
+    GATE_ERROR_DISCARDED = "gate_error_discarded"
     ON_ERROR_ROUTED = "on_error_routed"
     FILTER_DROPPED = "filter_dropped"
     COALESCED = "coalesced"
@@ -242,6 +243,7 @@ _LEGAL_TERMINAL_PAIRS: frozenset[tuple[TerminalOutcome, TerminalPath]] = frozens
         (TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW),
         (TerminalOutcome.SUCCESS, TerminalPath.GATE_ROUTED),
         (TerminalOutcome.SUCCESS, TerminalPath.GATE_DISCARDED),
+        (TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED),
         (TerminalOutcome.FAILURE, TerminalPath.ON_ERROR_ROUTED),
         (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED),
         (TerminalOutcome.SUCCESS, TerminalPath.COALESCED),
@@ -526,13 +528,13 @@ def is_llm_authored_creation_modality(modality: CreationModality) -> bool:
     return modality.requires_llm_provenance()
 
 
-def error_edge_label(transform_id: str) -> str:
-    """Canonical label for a transform error DIVERT edge.
+def error_edge_label(producer_id: str) -> str:
+    """Canonical label for a processing-node error DIVERT edge.
 
-    Shared between DAG construction (dag.py) and error-routing audit recording
-    (executors.py, processor.py) to prevent label drift.
+    Shared between DAG construction and transform/config-gate error-routing
+    audit recording to prevent label drift.
 
     Args:
-        transform_id: Stable transform name for error-route labels.
+        producer_id: Stable transform or config-gate name for error-route labels.
     """
-    return f"__error_{transform_id}__"
+    return f"__error_{producer_id}__"

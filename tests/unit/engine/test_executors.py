@@ -26,7 +26,8 @@ Transform Exception (plugin crash):
   → exception propagates → pipeline CRASH
 
 Gate Error:
-  Expression exception   → node_state=FAILED + re-raise → pipeline CRASH
+  Expression exception + no policy → node_state=FAILED + re-raise → pipeline CRASH
+  Expression exception + on_error  → node_state=FAILED + per-row DIVERT/discard
   Unknown route label    → node_state=FAILED + ValueError → pipeline CRASH
   Non-string/bool result → str() conversion, then route lookup (may fail as above)
   Missing edge           → node_state=FAILED + MissingEdgeError → pipeline CRASH
@@ -2069,6 +2070,70 @@ class TestGateExecutor:
                 "cg_1",
                 token,
                 ctx,
+            )
+
+        _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+
+    def test_config_gate_expression_error_routes_one_row_with_divert_evidence(self) -> None:
+        """A configured expression failure returns a per-row failure outcome."""
+        factory = _make_factory()
+        executor = GateExecutor(
+            factory.execution,
+            _make_span_factory(),
+            _make_step_resolver(),
+            error_edge_ids={NodeID("cg_1"): "edge_gate_error"},
+        )
+        config = GateSettings(
+            name="my_gate",
+            input="in_conn",
+            condition="row['nonexistent_field'] > 0",
+            routes={"true": "next_conn", "false": "error_sink"},
+            on_error="gate_errors",
+        )
+
+        outcome = executor.execute_config_gate(
+            config,
+            "cg_1",
+            _make_token(contract=_make_contract()),
+            make_context(),
+        )
+
+        assert outcome.sink_name == "gate_errors"
+        assert outcome.discarded is False
+        assert outcome.error is not None
+        assert outcome.error.exception_type == "ExpressionEvaluationError"
+        assert outcome.result.action.mode == RoutingMode.DIVERT
+        failed_kwargs = _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)
+        assert failed_kwargs["error"].exception_type == "ExpressionEvaluationError"
+        factory.execution.record_routing_event.assert_called_once_with(
+            state_id="state_001",
+            edge_id="edge_gate_error",
+            mode=RoutingMode.DIVERT,
+            reason={
+                "condition": "row['nonexistent_field'] > 0",
+                "error_type": "ExpressionEvaluationError",
+                "error": "Key 'nonexistent_field' not found in PipelineRow",
+            },
+        )
+
+    def test_config_gate_error_route_without_divert_edge_fails_closed(self) -> None:
+        """Missing structural audit evidence must not silently route the row."""
+        factory = _make_factory()
+        executor = GateExecutor(factory.execution, _make_span_factory(), _make_step_resolver())
+        config = GateSettings(
+            name="my_gate",
+            input="in_conn",
+            condition="row['nonexistent_field'] > 0",
+            routes={"true": "next_conn", "false": "error_sink"},
+            on_error="gate_errors",
+        )
+
+        with pytest.raises(OrchestrationInvariantError, match="no DIVERT edge registered"):
+            executor.execute_config_gate(
+                config,
+                "cg_1",
+                _make_token(contract=_make_contract()),
+                make_context(),
             )
 
         _single_complete_node_state_kwargs(factory, status=NodeStateStatus.FAILED)

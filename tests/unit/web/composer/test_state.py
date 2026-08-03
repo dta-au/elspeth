@@ -21,6 +21,7 @@ from elspeth.web.composer.state import (
     ValidationEntry,
     ValidationSummary,
     queue_node_contract_error,
+    route_destination_facts,
 )
 
 
@@ -6930,6 +6931,43 @@ def test_structural_node_shape_errors_carry_closed_error_codes() -> None:
         ("node:c_vocab", "coalesce_merge_invalid"),
     ):
         assert expected in codes, f"missing {expected}; got {sorted(c for c in codes if c[1])}"
+
+
+def test_gate_on_error_must_reference_declared_sink_or_discard() -> None:
+    gate = NodeSpec(
+        id="threshold",
+        node_type="gate",
+        plugin=None,
+        input="rows",
+        on_success=None,
+        on_error="missing_error_sink",
+        options={},
+        condition="row['amount'] > 500",
+        routes={"true": "high", "false": "standard"},
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    state = CompositionState(
+        source=SourceSpec(plugin="csv", on_success="rows", options={}, on_validation_failure="discard"),
+        nodes=(gate,),
+        edges=(),
+        outputs=(
+            OutputSpec(name="high", plugin="csv", options={}, on_write_failure="discard"),
+            OutputSpec(name="standard", plugin="csv", options={}, on_write_failure="discard"),
+        ),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+
+    result = state.validate()
+
+    assert ("node:threshold", "gate_on_error_unknown_sink") in {(entry.component, entry.error_code) for entry in result.errors}
+    assert route_destination_facts(state)["node:threshold"] == {
+        "dangling_on_error": "missing_error_sink",
+        "declared_sinks": ["high", "standard"],
+    }
 
 
 def test_gate_fork_branches_must_reach_a_coalesce_branch_or_sink() -> None:

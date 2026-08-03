@@ -16,8 +16,10 @@ import pytest
 
 from elspeth.contracts import RouteDestination
 from elspeth.contracts.types import GateName, NodeID, SinkName
+from elspeth.core.config import GateSettings
 from elspeth.engine.orchestrator.types import RouteValidationError
 from elspeth.engine.orchestrator.validation import (
+    validate_gate_error_sinks,
     validate_pipeline_route_targets,
     validate_route_destinations,
     validate_source_quarantine_destination,
@@ -51,6 +53,7 @@ class FakeSink:
 @dataclass
 class FakeConfigGate:
     name: str
+    on_error: str | None = None
 
 
 def _make_transform(*, node_id: str, name: str, on_error: str | None = None) -> FakeTransform:
@@ -181,6 +184,28 @@ class TestValidateTransformErrorSinks:
     def test_empty_transforms_passes(self) -> None:
         """Empty transform list means nothing to validate."""
         validate_transform_error_sinks([], {"output"})
+
+
+class TestValidateGateErrorSinks:
+    """Tests for optional config-gate row-error destinations."""
+
+    @staticmethod
+    def _gate(on_error: str | None) -> GateSettings:
+        return GateSettings(
+            name="threshold",
+            input="source_out",
+            condition="row['amount'] > 500",
+            routes={"true": "high", "false": "standard"},
+            on_error=on_error,
+        )
+
+    @pytest.mark.parametrize("on_error", [None, "discard", "gate_errors"])
+    def test_valid_policies_pass(self, on_error: str | None) -> None:
+        validate_gate_error_sinks([self._gate(on_error)], {"gate_errors"})
+
+    def test_unknown_sink_fails_before_rows_are_processed(self) -> None:
+        with pytest.raises(RouteValidationError, match=r"threshold.*missing.*gate_errors"):
+            validate_gate_error_sinks([self._gate("missing")], {"gate_errors"})
 
 
 # =============================================================================

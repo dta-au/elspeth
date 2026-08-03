@@ -443,6 +443,30 @@ class TestGenerateYaml:
         assert g["routes"]["high"] == "good_output"
         assert g["routes"]["low"] == "review_output"
 
+    def test_gate_on_error_round_trips_when_configured(self) -> None:
+        state = _make_gate_pipeline()
+        gate = state.nodes[0]
+        state = replace(
+            state,
+            nodes=(replace(gate, on_error="gate_errors"),),
+            outputs=(
+                *state.outputs,
+                OutputSpec(name="gate_errors", plugin="csv", options={"path": "/errors.csv"}, on_write_failure="discard"),
+            ),
+        )
+
+        yaml_str = generate_yaml(state)
+        parsed = yaml.safe_load(yaml_str)
+        imported = composition_state_from_runtime_yaml(yaml_str)
+
+        assert parsed["gates"][0]["on_error"] == "gate_errors"
+        assert imported.nodes[0].on_error == "gate_errors"
+
+    def test_gate_on_error_is_omitted_when_not_configured(self) -> None:
+        yaml_str = generate_yaml(_make_gate_pipeline())
+
+        assert "on_error" not in yaml.safe_load(yaml_str)["gates"][0]
+
     def test_gate_route_to_discard_is_exported_as_virtual_destination(self) -> None:
         from elspeth.core.config import load_settings_from_yaml_string
 

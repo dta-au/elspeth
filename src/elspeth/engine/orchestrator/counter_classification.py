@@ -69,6 +69,9 @@ TERMINAL_PAIR_COUNTER_EFFECTS: Mapping[TerminalPairKey, TerminalPairCounterEffec
         (TerminalOutcome.SUCCESS, TerminalPath.GATE_DISCARDED): TerminalPairCounterEffect(
             increments=("rows_succeeded",),
         ),
+        (TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED): TerminalPairCounterEffect(
+            increments=("rows_failed",),
+        ),
         (TerminalOutcome.SUCCESS, TerminalPath.FILTER_DROPPED): TerminalPairCounterEffect(
             increments=("rows_succeeded",),
         ),

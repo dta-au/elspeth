@@ -222,6 +222,8 @@ def _generate_pipeline_dict(
                 "condition": g["condition"],
                 "routes": g["routes"],
             }
+            if g["on_error"] is not None:
+                entry["on_error"] = g["on_error"]
             # fork_to is conditionally present — only on fork gates
             if "fork_to" in g:
                 entry["fork_to"] = g["fork_to"]

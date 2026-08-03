@@ -68,6 +68,7 @@ class PendingOutcome:
     _REQUIRES_ERROR_HASH_PATHS: ClassVar[frozenset[TerminalPath]] = frozenset(
         {
             TerminalPath.ON_ERROR_ROUTED,
+            TerminalPath.GATE_ERROR_DISCARDED,
             TerminalPath.UNROUTED,
             TerminalPath.QUARANTINED_AT_SOURCE,
             TerminalPath.SINK_FALLBACK_TO_FAILSINK,

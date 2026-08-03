@@ -29,7 +29,7 @@ class ProgressEvent:
         rows_failed: Rows that failed processing.
         rows_quarantined: Rows that were quarantined for investigation.
         rows_routed_success: Rows redirected by gate ``route_to_sink`` MOVE.
-        rows_routed_failure: Rows redirected by transform ``on_error`` DIVERT.
+        rows_routed_failure: Rows redirected by transform/config-gate ``on_error`` DIVERT.
         elapsed_seconds: Time elapsed since run started.
     """
 

@@ -265,7 +265,7 @@ def _nodes_from_runtime_list(section: Any, section_name: str, node_type: NodeTyp
                     plugin=None,
                     input=_require_str(entry, "input", path),
                     on_success=None,
-                    on_error=None,
+                    on_error=_optional_str(entry, "on_error"),
                     options={},
                     condition=_require_str(entry, "condition", path),
                     routes=_string_mapping(routes, f"{path}.routes") if routes is not None else None,

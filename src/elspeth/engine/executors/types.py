@@ -2,8 +2,8 @@
 
 from dataclasses import dataclass
 
-from elspeth.contracts import GateResult, TokenInfo
-from elspeth.contracts.enums import RoutingKind
+from elspeth.contracts import FailureInfo, GateResult, TokenInfo
+from elspeth.contracts.enums import RoutingKind, RoutingMode
 from elspeth.contracts.types import NodeID
 
 
@@ -45,6 +45,7 @@ class GateOutcome:
     sink_name: str | None = None
     next_node_id: NodeID | None = None
     discarded: bool = False
+    error: FailureInfo | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "child_tokens", tuple(self.child_tokens))
@@ -97,3 +98,7 @@ class GateOutcome:
                     "GateOutcome invariant: FORK_TO_PATHS action destinations "
                     f"({destination_count}) must match child_tokens ({len(self.child_tokens)})"
                 )
+
+        is_error_divert = self.error is not None
+        if is_error_divert != (self.result.action.mode == RoutingMode.DIVERT):
+            raise ValueError("GateOutcome invariant: error evidence and DIVERT routing mode must be present together")

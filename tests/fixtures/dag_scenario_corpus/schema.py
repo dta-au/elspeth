@@ -269,6 +269,7 @@ class StableTerminalDisposition(ClosedModel):
         "default_flow",
         "gate_routed",
         "gate_discarded",
+        "gate_error_discarded",
         "on_error_routed",
         "filter_dropped",
         "coalesced",

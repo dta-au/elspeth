@@ -1253,7 +1253,7 @@ def route_destination_facts(state: CompositionState) -> dict[str, RouteDestinati
 
     for node in state.nodes:
         component = f"node:{node.id}"
-        if node.node_type in ("transform", "aggregation", "row_union"):
+        if node.node_type in ("transform", "aggregation", "row_union", "gate"):
             if node.on_success is not None and node.on_success not in output_names and node.on_success not in consumer_connections:
                 _merge(
                     component,
@@ -1263,16 +1263,17 @@ def route_destination_facts(state: CompositionState) -> dict[str, RouteDestinati
                         "consumable_connections": consumable,
                     },
                 )
+            node_on_error = node.on_error
             if (
-                node.node_type == "transform"
-                and node.on_error is not None
-                and node.on_error != "discard"
-                and node.on_error not in output_names
+                node.node_type in ("transform", "gate")
+                and node_on_error is not None
+                and node_on_error != "discard"
+                and node_on_error not in output_names
             ):
                 _merge(
                     component,
                     {
-                        "dangling_on_error": node.on_error,
+                        "dangling_on_error": node_on_error,
                         "declared_sinks": declared_sinks,
                     },
                 )
@@ -1350,6 +1351,18 @@ def _validate_runtime_route_destinations(
                     )
 
     for node in nodes:
+        if node.node_type == "gate":
+            if node.on_error is not None and node.on_error != "discard" and node.on_error not in output_names:
+                errors.append(
+                    _err(
+                        f"node:{node.id}",
+                        f"Gate '{node.id}' on_error '{node.on_error}' references unknown sink.",
+                        "high",
+                        "gate_on_error_unknown_sink",
+                    )
+                )
+            continue
+
         if node.node_type == "transform":
             if node.on_success is not None and node.on_success not in output_names and node.on_success not in consumer_connections:
                 errors.append(

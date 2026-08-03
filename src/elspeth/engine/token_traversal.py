@@ -421,7 +421,16 @@ class TokenTraversalEngine:
             destinations=self._processor._get_gate_destinations(outcome),
         )
 
-        # 3. Check if gate routed to a sink
+        # 3. A configured row-level evaluation failure is terminal for this
+        # token only. The source loop can continue with unaffected rows.
+        if outcome.error is not None:
+            return self.handle_gate_error_outcome(
+                outcome,
+                current_token,
+                child_items,
+            )
+
+        # 4. Check if gate routed to a sink
         if outcome.sink_name is not None:
             # NOTE: Do NOT record ROUTED outcome here - the token hasn't been written yet.
             # SinkExecutor.write() records the outcome AFTER sink durability is achieved.
@@ -475,11 +484,11 @@ class TokenTraversalEngine:
                 return _GateTerminal(result=(current_result, *sibling_results))
             return _GateTerminal(result=current_result)
 
-        # 4. Fork to paths
+        # 5. Fork to paths
         if outcome.result.action.kind == RoutingKind.FORK_TO_PATHS:
             return self.handle_gate_fork(outcome, current_token, node_id, child_items)
 
-        # 5. Jump to specific node
+        # 6. Jump to specific node
         if outcome.next_node_id is not None:
             # Validate jump target exists in the DAG (our data — crash on invariant violation).
             # Without this check, a nonexistent target silently passes the coalesce ordering
@@ -525,7 +534,7 @@ class TokenTraversalEngine:
                 next_node_id=outcome.next_node_id,
             )
 
-        # 6. CONTINUE: config gate says "proceed to next structural node."
+        # 7. CONTINUE: config gate says "proceed to next structural node."
         if outcome.result.action.kind != RoutingKind.CONTINUE:
             raise OrchestrationInvariantError(
                 f"Unhandled config gate routing kind {outcome.result.action.kind!r} "
@@ -533,6 +542,68 @@ class TokenTraversalEngine:
                 f"Expected CONTINUE when no sink_name, fork, or next_node_id is set."
             )
         return _GateContinue(updated_token=current_token, updated_sink=current_on_success_sink)
+
+    def handle_gate_error_outcome(
+        self,
+        outcome: GateOutcome,
+        current_token: TokenInfo,
+        child_items: list[WorkItem],
+    ) -> _GateTerminal:
+        """Terminalize one gate-expression failure without aborting the run."""
+        failure = outcome.error
+        if failure is None:
+            raise OrchestrationInvariantError("Gate error handling requires FailureInfo evidence")
+
+        if outcome.discarded:
+            error_hash = compute_error_hash(
+                failure.message,
+                exception_type=failure.exception_type,
+            )
+            self._processor._data_flow.record_token_outcome(
+                ref=TokenRef(token_id=current_token.token_id, run_id=self._processor._run_id),
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.GATE_ERROR_DISCARDED,
+                error_hash=error_hash,
+            )
+            self._processor._emit_token_completed(
+                current_token,
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.GATE_ERROR_DISCARDED,
+            )
+            sibling_results = self._processor._notify_barrier_of_lost_branch(
+                current_token,
+                f"gate_error_discarded:{failure.exception_type}",
+                child_items,
+            )
+            current_result = RowResult(
+                token=current_token,
+                final_data=current_token.row_data,
+                outcome=TerminalOutcome.FAILURE,
+                path=TerminalPath.GATE_ERROR_DISCARDED,
+            )
+            if sibling_results:
+                return _GateTerminal(result=(current_result, *sibling_results))
+            return _GateTerminal(result=current_result)
+
+        error_sink = outcome.sink_name
+        if error_sink is None:
+            raise OrchestrationInvariantError("Gate DIVERT outcome requires a named error sink or discarded=True")
+        sibling_results = self._processor._notify_barrier_of_lost_branch(
+            current_token,
+            f"gate_error_routed:{failure.exception_type}",
+            child_items,
+        )
+        current_result = RowResult(
+            token=current_token,
+            final_data=current_token.row_data,
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.ON_ERROR_ROUTED,
+            sink_name=error_sink,
+            error=failure,
+        )
+        if sibling_results:
+            return _GateTerminal(result=(current_result, *sibling_results))
+        return _GateTerminal(result=current_result)
 
     def handle_gate_fork(
         self,

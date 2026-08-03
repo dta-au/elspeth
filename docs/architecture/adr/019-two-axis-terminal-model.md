@@ -103,6 +103,7 @@ mapping table below.
 | `COMPLETED` | `True` | `SUCCESS` | `DEFAULT_FLOW` | `rows_succeeded` | Yes |
 | `ROUTED` | `True` | `SUCCESS` | `GATE_ROUTED` | `rows_succeeded`, `rows_routed_success` | Yes |
 | Gate route target `"discard"` | `True` | `SUCCESS` | `GATE_DISCARDED` | `rows_succeeded` | Yes |
+| Gate expression failure with `on_error: "discard"` | `True` | `FAILURE` | `GATE_ERROR_DISCARDED` | `rows_failed` | Yes |
 | `ROUTED_ON_ERROR` | `True` | `FAILURE` | `ON_ERROR_ROUTED` | `rows_failed`, `rows_routed_failure` | Yes |
 | `DROPPED_BY_FILTER` | `True` | `SUCCESS` | `FILTER_DROPPED` | `rows_succeeded` | Yes |
 | `COALESCED` | `True` | `SUCCESS` | `COALESCED` | `rows_succeeded`, `rows_coalesced` (structural) | Predicate only (`rows_coalesced` not re-derived) |
@@ -658,6 +659,7 @@ The implementation surface, in order of dependency:
    | --- | --- |
    | `COMPLETED requires sink_name` | `(SUCCESS, DEFAULT_FLOW)` requires `sink_name` |
    | `ROUTED requires sink_name` | `(SUCCESS, GATE_ROUTED)` requires `sink_name` |
+   | Gate expression error discarded by configured policy | `(FAILURE, GATE_ERROR_DISCARDED)` requires `error_hash` and forbids `sink_name` |
    | `ROUTED_ON_ERROR requires sink_name AND error_hash` | `(FAILURE, ON_ERROR_ROUTED)` requires `sink_name` AND `error_hash` |
    | `FORKED requires fork_group_id` | `(TRANSIENT, FORK_PARENT)` requires `fork_group_id` |
    | `EXPANDED requires expand_group_id` | `(TRANSIENT, EXPAND_PARENT)` requires `expand_group_id` |

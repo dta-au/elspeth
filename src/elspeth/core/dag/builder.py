@@ -455,6 +455,8 @@ def build_execution_graph(
             "condition": gate_config.condition,
             "routes": dict(gate_config.routes),
         }
+        if gate_config.on_error is not None:
+            gate_node_config["on_error"] = gate_config.on_error
         if gate_config.fork_to:
             gate_node_config["fork_to"] = list(gate_config.fork_to)
 
@@ -1143,6 +1145,29 @@ def build_execution_graph(
                 label=error_edge_label(wired.settings.name),
                 mode=RoutingMode.DIVERT,
             )
+
+    # Config-gate row-error edges. These are structural audit markers, not
+    # normal route labels: GateExecutor emits the DIVERT event only when this
+    # row's expression evaluation fails and a named policy sink is configured.
+    for gate_config in gates:
+        gate_on_error = gate_config.on_error
+        if gate_on_error is None or gate_on_error == "discard":
+            continue
+        if SinkName(gate_on_error) not in sink_ids:
+            suggestions = _suggest_similar(gate_on_error, sorted(str(s) for s in sink_ids))
+            hint = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+            raise GraphValidationError(
+                f"Gate '{gate_config.name}' on_error '{gate_on_error}' references unknown sink.{hint} "
+                f"Available sinks: {', '.join(sorted(str(s) for s in sink_ids))}",
+                component_id=gate_config.name,
+                component_type="gate",
+            )
+        graph.add_edge(
+            config_gate_ids[GateName(gate_config.name)],
+            sink_ids[SinkName(gate_on_error)],
+            label=error_edge_label(gate_config.name),
+            mode=RoutingMode.DIVERT,
+        )
 
     # Sink failsink edges
     for sink_name_key, sink_node_id in sink_ids.items():

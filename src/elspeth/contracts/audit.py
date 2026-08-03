@@ -1479,6 +1479,10 @@ _TERMINAL_PAIR_FIELD_CONSTRAINTS: dict[
     (TerminalOutcome.SUCCESS, TerminalPath.GATE_DISCARDED): TerminalPairFieldConstraints(
         forbidden=_DISCRIMINATOR_FIELDS,
     ),
+    (TerminalOutcome.FAILURE, TerminalPath.GATE_ERROR_DISCARDED): TerminalPairFieldConstraints(
+        required=("error_hash",),
+        forbidden=_forbid_except("error_hash"),
+    ),
     (TerminalOutcome.FAILURE, TerminalPath.ON_ERROR_ROUTED): TerminalPairFieldConstraints(
         required=("sink_name", "error_hash"),
         forbidden=_forbid_except("sink_name", "error_hash"),

@@ -121,6 +121,10 @@ def validate_pipeline_route_targets(
         transforms=config.transforms,
         available_sinks=available_sinks,
     )
+    validate_gate_error_sinks(
+        gates=config.gates,
+        available_sinks=available_sinks,
+    )
     for source in config.sources.values():
         validate_source_quarantine_destination(
             source=source,
@@ -170,6 +174,24 @@ def validate_transform_error_sinks(
                 f"but no sink named '{on_error}' exists. "
                 f"Available sinks: {sorted(available_sinks)}. "
                 f"Use 'discard' to drop error rows without routing."
+            )
+
+
+def validate_gate_error_sinks(
+    gates: Sequence[GateSettings],
+    available_sinks: set[str],
+) -> None:
+    """Validate optional config-gate row-error destinations."""
+    for gate in gates:
+        on_error = gate.on_error
+        if on_error is None or on_error == "discard":
+            continue
+        if on_error not in available_sinks:
+            raise RouteValidationError(
+                f"Gate '{gate.name}' has on_error='{on_error}' "
+                f"but no sink named '{on_error}' exists. "
+                f"Available sinks: {sorted(available_sinks)}. "
+                "Use 'discard' to drop gate-error rows or omit on_error to fail fast."
             )
 
 

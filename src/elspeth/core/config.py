@@ -712,6 +712,14 @@ class GateSettings(BaseModel):
         max_length=32,
         description="Maps route labels to destinations (connection name, sink name, 'fork', or virtual 'discard')",
     )
+    on_error: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Optional per-row expression-evaluation failure policy: a sink name "
+            "to divert the row, or 'discard'. Omission preserves fail-fast execution."
+        ),
+    )
     fork_to: list[str] | None = Field(
         default=None,
         max_length=32,
@@ -795,6 +803,19 @@ class GateSettings(BaseModel):
                 field_label=f"Route destination for label '{label}'",
             )
         return v
+
+    @field_validator("on_error")
+    @classmethod
+    def validate_on_error(cls, v: str | None) -> str | None:
+        """Validate the optional row-error sink policy."""
+        if v is None:
+            return None
+        if not v.strip():
+            raise ValueError("on_error must be a sink name, 'discard', or omitted")
+        value = v.strip()
+        if value == "discard":
+            return value
+        return _validate_connection_or_sink_name(value, field_label="Gate on_error sink name")
 
     @field_validator("fork_to")
     @classmethod

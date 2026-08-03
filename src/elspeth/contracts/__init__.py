@@ -169,6 +169,7 @@ from elspeth.contracts.errors import (
     # Tier 1 guard tuple — single source of truth for "never catch" exceptions
     CoalesceFailureReason,
     CommencementGateFailedError,
+    ConfigGateErrorReason,
     ConfigGateReason,
     # Schema contract violations
     ContractMergeError,
@@ -389,6 +390,7 @@ __all__ = [  # Grouped by category for readability
     "RetrievalNotReadyError",
     "CoalesceFailureReason",
     "RowUnionFailureReason",
+    "ConfigGateErrorReason",
     "ConfigGateReason",
     "ErrorDetail",
     "ExecutionError",

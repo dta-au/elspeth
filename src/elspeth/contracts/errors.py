@@ -309,6 +309,19 @@ class ConfigGateReason(TypedDict):
     result: str
 
 
+class ConfigGateErrorReason(TypedDict):
+    """Reason for diverting a row whose config-gate expression failed.
+
+    This is row-scoped failure evidence, distinct from ``ConfigGateReason``:
+    the latter proves a successful routing decision, while this payload proves
+    why no configured route label could be produced for this row.
+    """
+
+    condition: str
+    error_type: str
+    error: str
+
+
 # RoutingReason union is defined after TransformErrorReason (see RoutingReason below)
 
 
@@ -835,10 +848,11 @@ class SinkDiversionReason(TypedDict):
 
 # Discriminated union - field presence distinguishes variants:
 # - ConfigGateReason has "condition" and "result"
+# - ConfigGateErrorReason has "condition", "error_type", and "error"
 # - TransformErrorReason has "reason" (error category string)
 # - SourceQuarantineReason has "quarantine_error"
 # - SinkDiversionReason has "diversion_reason"
-RoutingReason = ConfigGateReason | TransformErrorReason | SourceQuarantineReason | SinkDiversionReason
+RoutingReason = ConfigGateReason | ConfigGateErrorReason | TransformErrorReason | SourceQuarantineReason | SinkDiversionReason
 
 
 # =============================================================================

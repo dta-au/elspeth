@@ -314,7 +314,7 @@ def test_routing_subset_classification_counts_completed_terminal_pairs() -> None
     db = LandscapeDB.in_memory()
     try:
         _setup_run_with_row(db, run_id="run-3")
-        token_ids = ["gate", "error", "quarantine", "discard"]
+        token_ids = ["gate", "error", "quarantine", "discard", "gate-error-discard"]
         _insert_tokens(db, run_id="run-3", row_id="row-1", token_ids=token_ids)
         _insert_completed_outcomes(
             db,
@@ -344,17 +344,24 @@ def test_routing_subset_classification_counts_completed_terminal_pairs() -> None
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.SINK_DISCARDED,
         )
+        _insert_completed_outcomes(
+            db,
+            run_id="run-3",
+            token_ids=["gate-error-discard"],
+            outcome=TerminalOutcome.FAILURE,
+            path=TerminalPath.GATE_ERROR_DISCARDED,
+        )
 
         accounting = load_run_accounting_from_db(db, landscape_run_id="run-3")
 
-        assert accounting.tokens.emitted == 4
-        assert accounting.tokens.terminal == 4
+        assert accounting.tokens.emitted == 5
+        assert accounting.tokens.terminal == 5
         assert accounting.tokens.succeeded == 1
-        assert accounting.tokens.failed == 3
+        assert accounting.tokens.failed == 4
         assert accounting.routing.routed_success == 1
         assert accounting.routing.routed_failure == 1
         assert accounting.routing.quarantined == 1
-        assert accounting.routing.discarded == 1
+        assert accounting.routing.discarded == 2
         assert accounting.integrity.closure == "closed"
     finally:
         db.close()
