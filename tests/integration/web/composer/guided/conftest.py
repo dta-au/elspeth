@@ -216,10 +216,12 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
             supersedes_draft_hash,
             recorder,
             correction_target=None,
+            revision_authority=None,
             **_kwargs,
         ):
             output_names = [guided.reviewed_outputs[stable_id].name for stable_id in guided.output_order]
             corrected_source = correction_target is not None and correction_target.owner_kind == "source"
+            prose_revision = revision_authority is not None
             pipeline = {
                 "sources": {
                     guided.reviewed_sources[stable_id].name: {
@@ -228,7 +230,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
                         "on_success": (
                             f"{correction_target.owner_key}_corrected_rows"
                             if corrected_source and guided.reviewed_sources[stable_id].name == correction_target.owner_key
-                            else output_names[index % len(output_names)]
+                            else (f"guided_revision_{index}_rows" if prose_revision else output_names[index % len(output_names)])
                         ),
                         "on_validation_failure": guided.reviewed_sources[stable_id].on_validation_failure,
                     }
@@ -247,7 +249,22 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
                         }
                     ]
                     if corrected_source
-                    else []
+                    else (
+                        [
+                            {
+                                "id": f"guided_revision_{index}",
+                                "node_type": "transform",
+                                "plugin": "passthrough",
+                                "input": f"guided_revision_{index}_rows",
+                                "on_success": output_names[index % len(output_names)],
+                                "on_error": "discard",
+                                "options": {"schema": {"mode": "observed"}},
+                            }
+                            for index, _stable_id in enumerate(guided.source_order)
+                        ]
+                        if prose_revision
+                        else []
+                    )
                 ),
                 "edges": (
                     [
@@ -293,7 +310,7 @@ def composer_test_client(request: pytest.FixtureRequest, tmp_path: Path) -> Iter
                 ),
                 {
                     "source": frozenset(source.plugin for source in guided.reviewed_sources.values()),
-                    "transform": frozenset({"passthrough"}) if corrected_source else frozenset(),
+                    "transform": frozenset({"passthrough"}) if corrected_source or prose_revision else frozenset(),
                     "sink": frozenset(output.plugin for output in guided.reviewed_outputs.values()),
                 },
             )

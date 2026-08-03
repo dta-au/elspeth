@@ -530,6 +530,9 @@ def test_proposal_revision_keeps_verified_deferred_instruction_in_planner_intent
     )
 
     assert revised.status_code == 200, revised.json()
+    revised_payload = revised.json()["next_turn"]["payload"]
+    assert revised_payload["component_counts"]["nodes"] == 1
+    assert [node["plugin"]["id"] for node in revised_payload["nodes"]] == ["passthrough"]
     assert captured["intent"] == f"Later retain the topology constraint.\n\n{revision}"
 
 
@@ -1139,6 +1142,9 @@ def test_step3_chat_before_a_prose_revision_yields_one_ordered_transcript(
     )
 
     assert revised.status_code == 200, revised.json()
+    revised_payload = revised.json()["next_turn"]["payload"]
+    assert revised_payload["component_counts"]["nodes"] == 1
+    assert [node["plugin"]["id"] for node in revised_payload["nodes"]] == ["passthrough"]
     guided = _guided(client, session_id)
     assert [(turn.role.value, turn.seq, turn.step.value) for turn in guided.chat_history] == [
         ("user", 0, "step_1_source"),
