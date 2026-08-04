@@ -186,7 +186,35 @@ def walk_effective_guarantee_vote(
     # compose_propagation unions the gate's own (raw-inherited) fields with
     # its predecessors' effective vote, so the set can only grow.
     is_transparent_gate = node_info.node_type is NodeType.GATE
-    if node_info.passes_through_input or is_transparent_gate:
+    if node_info.node_type is NodeType.QUEUE:
+        # Queues are pass-through coordination (builder assigns them a bare
+        # observed schema), but they are also the sanctioned fan-in point for
+        # ordinary nodes (graph invariant 7), so stopping at the queue's own
+        # empty declaration falsely rejected runnable source → queue →
+        # consumer pipelines with "(none - dynamic schema)"
+        # (elspeth-5a372d3267) — sibling of the transparent-gate walk below.
+        # Fan-in aggregation is NOT compose_propagation: its abstainer-skip is
+        # sound only when every predecessor delivers the same row. Queue rows
+        # arrive from exactly one arm, so a field is guaranteed only if EVERY
+        # arm vouches for it, and one abstaining (dynamic) arm collapses the
+        # whole vote to abstention — preserving sink deferral of dynamic
+        # upstreams to per-row enforcement (elspeth-3283f2eaec).
+        predecessors = list(graph._graph.predecessors(node_id))
+        if not predecessors:
+            # The builder rejects unwired queues at construction; hand-built
+            # test graphs fall back to the queue's own (empty, abstaining)
+            # declaration rather than crashing.
+            result = EffectiveGuaranteeVote(fields=own_fields, participated=own_participates)
+        else:
+            arm_votes = [walk_effective_guarantee_vote(graph, pred_id, cache, field_cache) for pred_id in predecessors]
+            if all(vote.participated for vote in arm_votes):
+                result = EffectiveGuaranteeVote(
+                    fields=frozenset.intersection(*[vote.fields for vote in arm_votes]),
+                    participated=True,
+                )
+            else:
+                result = EffectiveGuaranteeVote(fields=frozenset(), participated=False)
+    elif node_info.passes_through_input or is_transparent_gate:
         predecessors = list(graph._graph.predecessors(node_id))
         if not predecessors and is_transparent_gate:
             # Hand-built test graphs may install a gate without wiring its

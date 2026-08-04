@@ -336,7 +336,10 @@ def build_execution_graph(
 
     # Build declared scheduling queues. V1 queue semantics are pass-through
     # coordination only: queues do not merge fields or synthesize guarantees
-    # across sources, so their schema contract is deliberately observed.
+    # of their own, so their schema contract is deliberately observed. The
+    # effective guarantee at a queue is computed by the propagation walk
+    # (walk_effective_guarantee_vote), which intersects the arms feeding it
+    # and abstains entirely if any arm abstains (elspeth-5a372d3267).
     queue_ids: dict[str, NodeID] = {}
     observed_queue_schema = SchemaConfig(mode="observed", fields=None)
     for queue_name, queue_config in queue_settings.items():
