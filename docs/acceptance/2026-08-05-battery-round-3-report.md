@@ -43,7 +43,7 @@ accounting internally contradictory.
 | g06 sink variety | `5c9964cb-974c-4f24-9198-45e087d4e47b` | `completed` | **INTEGRITY PASS** — no token accounting captured |
 | g07 profile-first Textract | `67d40936-2261-4b30-9b43-7058f7927e53` | `completed_with_failures` 1/1 | **PASS** — ADR-036 authoring + binding; custody NFR unverified |
 | g07 (first attempt) | `c69b6ab6-e462-46d8-bd9b-2c8a811bb02f` | failed at **source** | **NEW P1** `elspeth-47fa7c01eb` |
-| g08 two-LLM-arm `row_union` A/B | `dc689cfe-9f4b-47ba-bd04-abd04309debc` | `failed` | Compose fix holds; **NEW** `elspeth-902fc354b2` |
+| g08 two-LLM-arm `row_union` A/B ×4 | `dc689cfe` / `7c429b4f` / `0f6f9db0` (+1 compose-422) | `failed` / `completed_with_failures` 8/8 / `completed` 8/8 | **Compose fix CONFIRMED** (no raw 500 in 4); runtime intermittent 1-in-4 → `elspeth-902fc354b2` |
 | g09 four LLM nodes | `307c4e5c-0e5b-48b2-a64a-7142431e2c77` | `completed` 15/18, closure closed (serial re-drive) | **INTEGRITY PASS**; no cap wedge |
 | g10 LLM → fixed-schema mapper | `37caf1ee-00c2-48af-b3ca-2f5d39963154` | `completed` | **PASS** — `elspeth-ed2c2315d7` confirmed |
 | g11 `llm` source, dynamic schema | `a4f534df-2319-46be-95e0-453028375c13` | `failed` | Parity gap closed; **NEW P1** `elspeth-39118dd24f` |
@@ -92,13 +92,18 @@ accounting internally contradictory.
 
 Two entries were **withdrawn from this section** after an adversarial check:
 
-- **`elspeth-9c01c943a5` — NOT confirmed; 1 of 3 required samples clean.**
-  This round's own corpus records the defect as intermittent at 1-in-2 and
-  mandates three samples in three fresh sessions. One was taken, because
-  concurrency 422'd the others. Round 2 saw the raw 500 on 1 of 2 attempts, so
-  a single clean pass is fully consistent with the defect still being present.
-  Stochastic items never close on one pass. Remedy is cheap — re-drive
-  serially ×3; see the addendum.
+- **`elspeth-9c01c943a5` — withdrawn on one sample, then CONFIRMED on four.**
+  The corpus records the defect as intermittent at 1-in-2 and mandates three
+  samples in three fresh sessions; the first pass took one, because
+  concurrency 422'd the others, and a single clean pass is consistent with the
+  defect still being present. Re-driven serially: **four attempts, zero raw
+  500s** (`dc689cfe`, `7c429b4f`, `0f6f9db0`, plus one compose-422 which is a
+  coded envelope, not a raw 500). Against a round-2 rate of 1-in-2, four clean
+  composes is a real result. Confirmed.
+
+  The runtime picture on the same four is separate and *is* intermittent: one
+  `failed` on the extras defect, one `completed_with_failures` (8/8), one
+  `completed` (8/8). That 1-in-4 belongs to `elspeth-902fc354b2`, not here.
 - **`elspeth-03f5728c33` — retracted, then CONFIRMED on the missing read.**
   My original evidence (an empty `?status=pending` listing alongside a
   `/validate` that named reviews) was non-discriminating: that is *also* the
