@@ -80,7 +80,10 @@ async def test_bedrock_primary_uses_real_service_path_without_static_provider_en
     assert request["model"] == _BEDROCK_PRIMARY
     assert {tool["function"]["name"] for tool in request["tools"]} == expected_tool_names
     assert all(tool["type"] == "function" and set(tool["function"]) == {"name", "description", "parameters"} for tool in request["tools"])
-    assert set(request) == {"model", "messages", "tools"}
+    # reasoning_effort: Bedrock models carry the discovery knob
+    # (elspeth-dc459d438e); LiteLLM maps it to an Anthropic thinking budget.
+    assert set(request) == {"model", "messages", "tools", "reasoning_effort"}
+    assert request["reasoning_effort"] == "low"
     assert not (_FORBIDDEN_BEDROCK_KWARGS & set(request))
 
 
@@ -118,7 +121,10 @@ async def test_bedrock_advisor_uses_default_chain_without_tools_or_gateway_overr
     assert len(captured) == 1
     request = captured[0]
     assert request["model"] == _BEDROCK_ADVISOR
-    assert set(request) == {"model", "messages", "max_tokens"}
+    # reasoning_effort: the advisor knob rides Bedrock calls too
+    # (elspeth-dc459d438e).
+    assert set(request) == {"model", "messages", "max_tokens", "reasoning_effort"}
+    assert request["reasoning_effort"] == "medium"
     assert "tools" not in request
     assert not (_FORBIDDEN_BEDROCK_KWARGS & set(request))
     assert recorder.llm_calls[-1].model_requested == _BEDROCK_ADVISOR
