@@ -3289,3 +3289,74 @@ async def test_advisor_blocked_terminal_return_still_fails_closed_on_bare_token_
     assert preflight.is_valid is False
     assert preflight.readiness.execution_ready is False
     assert {blocker.code for blocker in preflight.readiness.blockers} == {"interpretation_review_orphaned"}
+
+
+@pytest.mark.asyncio
+async def test_stranded_prompt_template_requirements_surface_via_backstop(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """elspeth-03f5728c33: a compose that dies after persisting its mutating turn
+    (deferred cancellation, convergence timeout, plugin crash) never reaches the
+    finalize surfacer, leaving pending ``llm_prompt_template`` requirements with
+    ZERO events — /validate blocks while the review list renders empty. The
+    /validate backstop repairs the debt: ``surface_pending_interpretation_reviews``
+    in ``only_missing_evidence`` mode over the persisted head creates the missing
+    pending event, resolution unwedges the session, and re-running the pass
+    neither duplicates a live card nor resurrects resolved evidence."""
+
+    composer = _build_composer(tmp_path, sessions_service)
+    state = _state_with_prompt_template_review_node()
+    session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
+
+    # The strand: a persisted state carrying a pending PT requirement, no events.
+    assert await sessions_service.list_interpretation_events(session_id, status="all") == []
+
+    await composer.surface_pending_interpretation_reviews(
+        state,
+        session_id=str(session_id),
+        current_state_id=str(state_id),
+        only_missing_evidence=True,
+    )
+    pending = await sessions_service.list_interpretation_events(session_id, status="pending")
+    assert [event.kind for event in pending] == [InterpretationKind.LLM_PROMPT_TEMPLATE]
+
+    # Idempotent while the card is live: a second validate adds nothing.
+    await composer.surface_pending_interpretation_reviews(
+        state,
+        session_id=str(session_id),
+        current_state_id=str(state_id),
+        only_missing_evidence=True,
+    )
+    assert len(await sessions_service.list_interpretation_events(session_id, status="all")) == 1
+
+    _, resolved_state = await sessions_service.resolve_interpretation_event(
+        session_id=session_id,
+        event_id=pending[0].id,
+        choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+        amended_value=None,
+        actor="user:alice",
+    )
+
+    # Repair mode honours evidence in ANY status: no resurrection after resolve.
+    await composer.surface_pending_interpretation_reviews(
+        state,
+        session_id=str(session_id),
+        current_state_id=str(state_id),
+        only_missing_evidence=True,
+    )
+    assert await sessions_service.list_interpretation_events(session_id, status="pending") == []
+
+    head = CompositionState.from_dict(
+        {
+            "source": None,
+            "nodes": list(resolved_state.nodes or []),
+            "sources": dict(resolved_state.sources or {}),
+            "edges": [],
+            "outputs": [],
+            "metadata": resolved_state.metadata_ or {},
+            "version": resolved_state.version,
+        }
+    )
+    materialized = materialize_state_for_execution(head)
+    assert not isinstance(materialized, InterpretationReviewPending), materialized

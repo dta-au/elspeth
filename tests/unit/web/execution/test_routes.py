@@ -26,6 +26,7 @@ from starlette.requests import Request
 from starlette.routing import Route
 
 from elspeth.web.auth.models import UserIdentity
+from elspeth.web.composer.protocol import ComposerService
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.protocol import ExecutionService
 from elspeth.web.execution.schemas import (
@@ -217,7 +218,14 @@ def _create_test_app(
     mock_session_service = _session_service()
     mock_session_service.get_session.return_value = _session_record()
     mock_session_service.get_run.return_value = _run_record()
+    # The validate backstop probes the head state; None (no state yet) keeps
+    # tests that never stage a state on the pre-backstop delegation path.
+    mock_session_service.get_current_state.return_value = None
     app.state.session_service = mock_session_service
+
+    # The validate backstop surfaces stranded interpretation reviews through
+    # the app-level composer service (elspeth-03f5728c33).
+    app.state.composer_service = create_autospec(ComposerService, instance=True, spec_set=True)
 
     # Mock settings for ownership checks
     app.state.settings = _FakeWebSettings()
@@ -368,6 +376,92 @@ class TestValidateEndpoint:
             resp = await client.post(f"/api/sessions/{uuid4()}/validate")
             assert resp.status_code == 200
             svc.validate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_validate_backstops_stranded_interpretation_reviews(self) -> None:
+        """elspeth-03f5728c33: before delegating, the bare arm surfaces stranded
+        interpretation reviews over the head state in repair mode, so a compose
+        that died after persisting its mutating turn (deferred cancellation,
+        timeout, plugin crash) leaves the user resolvable cards, not a blocked
+        validation with an empty review list."""
+        session_id = uuid4()
+        state_id = uuid4()
+        svc = _execution_service()
+        call_order: list[str] = []
+
+        async def _record_validate(*args: Any, **kwargs: Any) -> ValidationResult:
+            call_order.append("validate")
+            return ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness())
+
+        svc.validate = AsyncMock(spec=ExecutionService.validate, side_effect=_record_validate)
+        app = _create_test_app(execution_service=svc)
+        app.state.session_service.get_current_state.return_value = _composition_state_record(session_id=session_id, state_id=state_id)
+
+        async def _record_surface(*args: Any, **kwargs: Any) -> None:
+            call_order.append("surface")
+
+        surfacer = app.state.composer_service.surface_pending_interpretation_reviews
+        surfacer.side_effect = _record_surface
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(f"/api/sessions/{session_id}/validate")
+            assert resp.status_code == 200
+
+        surfacer.assert_awaited_once()
+        assert call_order == ["surface", "validate"]
+        kwargs = surfacer.await_args.kwargs
+        assert kwargs["session_id"] == str(session_id)
+        assert kwargs["current_state_id"] == str(state_id)
+        assert kwargs["only_missing_evidence"] is True
+        surfaced_state = surfacer.await_args.args[0]
+        assert surfaced_state.version == 7
+
+    @pytest.mark.asyncio
+    async def test_validate_skips_backstop_without_current_state(self) -> None:
+        """No head state means nothing to surface — the route still delegates so
+        the service returns its canonical state_exists failure."""
+        svc = _execution_service()
+        svc.validate = AsyncMock(
+            spec=ExecutionService.validate, return_value=ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness())
+        )
+        app = _create_test_app(execution_service=svc)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(f"/api/sessions/{uuid4()}/validate")
+            assert resp.status_code == 200
+
+        app.state.composer_service.surface_pending_interpretation_reviews.assert_not_awaited()
+        svc.validate.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_validate_state_id_backstops_the_requested_state(self) -> None:
+        """The web UI always validates by explicit state_id (executionStore
+        passes the loaded head), so the state_id arm must run the same repair
+        pass over the requested snapshot."""
+        session_id = uuid4()
+        state_id = uuid4()
+        svc = _execution_service()
+        svc.validate_state = AsyncMock(
+            spec=ExecutionService.validate_state,
+            return_value=ValidationResult(is_valid=True, checks=[], errors=[], readiness=_ready_readiness()),
+        )
+        app = _create_test_app(execution_service=svc)
+        app.state.session_service.get_state = AsyncMock(
+            spec=SessionServiceProtocol.get_state, return_value=_composition_state_record(session_id=session_id, state_id=state_id)
+        )
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                f"/api/sessions/{session_id}/validate",
+                params={"state_id": str(state_id)},
+            )
+            assert resp.status_code == 200
+
+        surfacer = app.state.composer_service.surface_pending_interpretation_reviews
+        surfacer.assert_awaited_once()
+        kwargs = surfacer.await_args.kwargs
+        assert kwargs["session_id"] == str(session_id)
+        assert kwargs["current_state_id"] == str(state_id)
+        assert kwargs["only_missing_evidence"] is True
+        svc.validate_state.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_validate_state_id_delegates_to_validate_state(self) -> None:

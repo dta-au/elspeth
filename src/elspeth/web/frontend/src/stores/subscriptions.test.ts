@@ -271,7 +271,7 @@ describe("subscriptions — validation result side effects", () => {
             component_type: "transform",
             component_id: "rate_node",
             message: "Interpretation review is pending for 'cool'.",
-            suggestion: "Resolve the pending interpretation review before running.",
+            suggestion: "Resolve the pending interpretation review before running. If no review card is shown, send a composer message so the pending reviews are surfaced.",
             error_code: "interpretation_review_pending",
           },
         ],

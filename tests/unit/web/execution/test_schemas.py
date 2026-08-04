@@ -181,7 +181,10 @@ class TestValidationResult:
                     component_id="rate_coolness",
                     component_type="transform",
                     message="Interpretation review is pending for 'coolness'.",
-                    suggestion="Resolve the pending interpretation review before running.",
+                    suggestion=(
+                        "Resolve the pending interpretation review before running. "
+                        "If no review card is shown, send a composer message so the pending reviews are surfaced."
+                    ),
                     error_code="interpretation_review_pending",
                 )
             ],

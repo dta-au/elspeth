@@ -532,7 +532,7 @@ describe("PipelineValidationSummary", () => {
           component_id: "rater",
           component_type: "transform",
           message: rawDump,
-          suggestion: "Resolve the pending interpretation review before running.",
+          suggestion: "Resolve the pending interpretation review before running. If no review card is shown, send a composer message so the pending reviews are surfaced.",
           error_code: "interpretation_review_pending",
         },
       ],

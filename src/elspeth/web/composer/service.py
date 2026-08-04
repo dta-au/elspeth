@@ -2013,6 +2013,7 @@ class ComposerServiceImpl:
         *,
         session_id: str | None,
         current_state_id: str | None,
+        only_missing_evidence: bool = False,
     ) -> None:
         """Kind-general backend surfacer for the GUIDED commit path (B1).
 
@@ -2038,6 +2039,15 @@ class ComposerServiceImpl:
         records that no LLM tool call produced the event; the user still
         reviews it, so ``interpretation_source`` stays ``user_approved``.
         Idempotent and a no-op when there is no session/persisted state.
+
+        ``only_missing_evidence=True`` is the /validate backstop mode
+        (elspeth-03f5728c33): a compose that dies after persisting its mutating
+        turn (deferred cancellation, convergence timeout, plugin crash) never
+        reaches the finalize surfacer, stranding pending requirements with no
+        event rows. Repair mode surfaces only the genuinely missing sites and
+        leaves every site already carrying evidence — in any resolution
+        status — untouched, so re-running it over a partially reviewed state
+        neither duplicates live cards nor resurrects resolved ones.
         """
 
         if session_id is None or current_state_id is None:
@@ -2051,6 +2061,7 @@ class ComposerServiceImpl:
             model_version=self._model,
             provider=self._availability.provider or "unknown",
             composer_skill_hash=self._composer_skill_hash,
+            only_missing_evidence=only_missing_evidence,
         )
 
     @staticmethod

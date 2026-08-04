@@ -919,7 +919,10 @@ def review_interpretations(
                     component_id=site.component_id,
                     component_type=site.component_type,
                     message=_format_interpretation_site(site),
-                    suggestion="Resolve the pending interpretation review before running.",
+                    suggestion=(
+                        "Resolve the pending interpretation review before running. "
+                        "If no review card is shown, send a composer message so the pending reviews are surfaced."
+                    ),
                     error_code=INTERPRETATION_REVIEW_PENDING_CODE,
                 )
                 for site in materialized_state.sites

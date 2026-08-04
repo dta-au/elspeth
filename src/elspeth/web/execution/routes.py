@@ -844,9 +844,30 @@ def create_execution_router() -> APIRouter:
         service: ExecutionService = Depends(_get_execution_service),  # noqa: B008
         session_service: SessionServiceProtocol = Depends(_get_session_service),  # noqa: B008
     ) -> ValidationResult:
-        """Dry-run validation using real engine code paths."""
+        """Dry-run validation using real engine code paths.
+
+        Before delegating, both arms run the backend surfacer in repair mode
+        over the state they are about to validate (elspeth-03f5728c33): a
+        compose that dies after persisting its mutating turn (deferred
+        cancellation, convergence timeout, plugin crash) never reaches the
+        finalize surfacer, leaving pending interpretation requirements with
+        zero event rows — validation then blocks on interpretation_review
+        while the review list renders empty, with nothing the user can
+        resolve. The repair pass is idempotent and touches only sites with no
+        evidence in any resolution status, so it is a no-op on every state a
+        finalize already surfaced.
+        """
         await verify_session_ownership(session_id, user, request)
+        composer: ComposerService = request.app.state.composer_service
         if state_id is None:
+            current_record = await session_service.get_current_state(session_id)
+            if current_record is not None:
+                await composer.surface_pending_interpretation_reviews(
+                    state_from_record(current_record),
+                    session_id=str(session_id),
+                    current_state_id=str(current_record.id),
+                    only_missing_evidence=True,
+                )
             result = await service.validate(session_id, user_id=user.user_id)
             return result
         try:
@@ -855,8 +876,15 @@ def create_execution_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="State not found") from exc
         if state_record.session_id != session_id:
             raise HTTPException(status_code=404, detail="State not found")
+        composition_state = state_from_record(state_record)
+        await composer.surface_pending_interpretation_reviews(
+            composition_state,
+            session_id=str(session_id),
+            current_state_id=str(state_record.id),
+            only_missing_evidence=True,
+        )
         result = await service.validate_state(
-            state_from_record(state_record),
+            composition_state,
             user_id=user.user_id,
             session_id=session_id,
             completion_gates=parse_completion_gates(state_record.composer_meta),

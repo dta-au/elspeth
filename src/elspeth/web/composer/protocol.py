@@ -1262,6 +1262,7 @@ class ComposerService(Protocol):
         *,
         session_id: str | None,
         current_state_id: str | None,
+        only_missing_evidence: bool = False,
     ) -> None:
         """Kind-general backend surfacer for the GUIDED commit path (B1).
 
@@ -1270,9 +1271,14 @@ class ComposerService(Protocol):
         holds (all five ``InterpretationKind`` members). Called by the guided
         route persistence seam (``post_guided_respond``) after every committed
         source / transform / recipe-apply, because the guided dispatch path
-        never reaches the freeform fail-closed orphan gate. Advisory polarity:
-        the run-time ``UnresolvedInterpretationPlaceholderError`` gate stays the
-        hard backstop. Idempotent; a no-op when there is no session/persisted
+        never reaches the freeform fail-closed orphan gate, and by the
+        /validate backstop (elspeth-03f5728c33) with
+        ``only_missing_evidence=True`` to repair states stranded by a compose
+        that died after persisting its mutating turn — repair mode leaves every
+        site already carrying evidence in any resolution status alone.
+        Advisory polarity: the run-time
+        ``UnresolvedInterpretationPlaceholderError`` gate stays the hard
+        backstop. Idempotent; a no-op when there is no session/persisted
         state. See P3.1 for the concrete implementation.
         """
         ...

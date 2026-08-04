@@ -6368,7 +6368,10 @@ class TestComposerRuntimePreflightFinalGate:
                     component_id="rate_node",
                     component_type="transform",
                     message="Interpretation review is pending for 'cool'.",
-                    suggestion="Resolve the pending interpretation review before running.",
+                    suggestion=(
+                        "Resolve the pending interpretation review before running. "
+                        "If no review card is shown, send a composer message so the pending reviews are surfaced."
+                    ),
                     error_code=INTERPRETATION_REVIEW_PENDING_CODE,
                 )
             ],
