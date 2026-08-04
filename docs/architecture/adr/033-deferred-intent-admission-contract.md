@@ -306,9 +306,9 @@ stated option values possible.
   dropped; the retention requirement the rejection path must satisfy.
 - `elspeth-826765af90` — lane B: `StatedOptionValueConstraint`, prose
   grounding, projection, schema epoch 43→44.
-- `docs-archive/2026-08-04-grounded-scope-reset-panel-synthesis.md` —
-  the seven-lens panel synthesis (local evidence copy; `docs-archive/`
-  is untracked and does not survive a fresh clone).
+- The seven-lens panel synthesis is preserved in the maintainer-local
+  docs archive (untracked; it does not survive a fresh clone). The
+  durable record is the ticket comment trail on `elspeth-d293c5d139`.
 - `src/elspeth/web/composer/guided/deferred_intents.py` @ `ef73bfa70`
   (branch `codex/fix-grounded-option-constraints`) — the governed gate.
 - `src/elspeth/web/composer/guided/planning.py:2058`,
