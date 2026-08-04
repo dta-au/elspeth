@@ -2364,6 +2364,295 @@ async def test_pipeline_decision_disclosures_exempt_from_per_session_day_cap(ser
 
 
 @pytest.mark.asyncio
+async def test_exempt_pipeline_decision_events_do_not_consume_the_day_budget(service: SessionServiceImpl) -> None:
+    """elspeth-558fa5a321 review finding 2: exempting pipeline_decision from the
+    cap CHECK is not enough — its events must also skip the day COUNTER, or an
+    uncapped control fleet starves the shared per-day budget and the non-exempt
+    kinds wedge the same way."""
+    session_id = uuid4()
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Day-budget exemption test",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+    vague_node = _llm_node(node_id="rate_node", term="cool")
+    state = CompositionState(
+        source=None,
+        nodes=(
+            *(_required_control_disclosure_node(f"content_safety_auto_{i}", draft=f"Auto-wired control disclosure {i}.") for i in range(4)),
+            vague_node,
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    state_dict = state.to_dict()
+    persisted = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            nodes=state_dict["nodes"],
+            metadata_=state_dict["metadata"],
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    state_id = persisted.id
+
+    # Four exempt disclosure surfacings mint four events with populated user_term.
+    for i in range(4):
+        result = await _handle_request_interpretation_review(
+            arguments={
+                "affected_node_id": f"content_safety_auto_{i}",
+                "kind": "pipeline_decision",
+                "user_term": "required_control_auto_wired",
+                "llm_draft": f"Auto-wired control disclosure {i}.",
+            },
+            state=state,
+            session_id=session_id,
+            composition_state_id=state_id,
+            tool_call_id=f"call_disclosure_{i}",
+            now=_now(),
+            per_term_cap=3,
+            per_session_day_cap=3,
+            create_pending_interpretation_event=service.create_pending_interpretation_event,
+            list_interpretation_events=service.list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+        assert result.success is True
+
+    # The vague_term surfacing is the FIRST capped-kind invocation of the day;
+    # the four exempt events above must not count against its budget of 3.
+    result = await _handle_request_interpretation_review(
+        arguments={
+            "affected_node_id": "rate_node",
+            "kind": "vague_term",
+            "user_term": "cool",
+            "llm_draft": "Visually appealing and well-organized.",
+        },
+        state=state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_vague",
+        now=_now(),
+        per_term_cap=3,
+        per_session_day_cap=3,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+    assert result.success is True, "exempt pipeline_decision events must not consume the vague_term day budget"
+
+
+async def _seed_bare_session(service: SessionServiceImpl, session_id: UUID, *, title: str) -> None:
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title=title,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+
+
+async def _persist_state(service: SessionServiceImpl, session_id: UUID, state: CompositionState) -> UUID:
+    state_dict = state.to_dict()
+    persisted = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            nodes=state_dict["nodes"],
+            sources=state_dict["sources"],
+            metadata_=state_dict["metadata"],
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    return persisted.id
+
+
+@pytest.mark.asyncio
+async def test_model_choice_review_not_blocked_by_day_cap(service: SessionServiceImpl) -> None:
+    """elspeth-558fa5a321 (cap-coherence allow-list): llm_model_choice reviews are
+    server-shaped obligations — the user never authored the term and the LLM has
+    no bake fallback; an unresolvable pending requirement blocks execution
+    (freeform session 0c59fbca). The caps must not throttle them."""
+    session_id = uuid4()
+    await _seed_bare_session(service, session_id, title="Model-choice cap allow-list test")
+    vague_node = _llm_node(node_id="rate_node", term="cool")
+    mc_state, mc_node_id, mc_term = _event_liveness_state(
+        InterpretationKind.LLM_MODEL_CHOICE,
+        draft="openai/gpt-4o-mini",
+    )
+    state = CompositionState(
+        source=None,
+        nodes=(vague_node, *mc_state.nodes),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    state_id = await _persist_state(service, session_id, state)
+
+    # One prior LLM-authored vague_term row exhausts the day budget of 1.
+    await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_id,
+        affected_node_id="rate_node",
+        tool_call_id="tooluse_prior_vague",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Visually appealing.",
+        **_provenance_kwargs(),
+    )
+
+    result = await _handle_request_interpretation_review(
+        arguments={
+            "affected_node_id": mc_node_id,
+            "kind": "llm_model_choice",
+            "user_term": mc_term,
+            "llm_draft": "openai/gpt-4o-mini",
+        },
+        state=state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_model_choice",
+        now=_now(),
+        per_term_cap=1,
+        per_session_day_cap=1,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+    assert result.success is True, "llm_model_choice must surface despite an exhausted day budget"
+
+
+@pytest.mark.asyncio
+async def test_invented_source_review_not_blocked_by_day_cap(service: SessionServiceImpl) -> None:
+    """elspeth-558fa5a321 (cap-coherence allow-list): invented_source reviews ride
+    on source options, block validation, and have nothing to bake the fallback
+    into — capping them wedges the session the same way as pipeline_decision."""
+    session_id = uuid4()
+    await _seed_bare_session(service, session_id, title="Invented-source cap allow-list test")
+    src_state, src_component_id, src_term = _event_liveness_state(
+        InterpretationKind.INVENTED_SOURCE,
+        draft="https://example.com/a\nhttps://example.com/b",
+    )
+    vague_node = _llm_node(node_id="rate_node", term="cool")
+    state = replace(src_state, nodes=(vague_node,))
+    state_id = await _persist_state(service, session_id, state)
+
+    await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_id,
+        affected_node_id="rate_node",
+        tool_call_id="tooluse_prior_vague",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Visually appealing.",
+        **_provenance_kwargs(),
+    )
+
+    result = await _handle_request_interpretation_review(
+        arguments={
+            "affected_node_id": src_component_id,
+            "kind": "invented_source",
+            "user_term": src_term,
+            "llm_draft": "https://example.com/a\nhttps://example.com/b",
+        },
+        state=state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_invented_source",
+        now=_now(),
+        per_term_cap=1,
+        per_session_day_cap=1,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+    assert result.success is True, "invented_source must surface despite an exhausted day budget"
+
+
+@pytest.mark.asyncio
+async def test_backend_and_non_vague_rows_do_not_consume_the_day_budget(service: SessionServiceImpl) -> None:
+    """elspeth-558fa5a321 (comment 2311): the counters must measure what the cap
+    docstring claims — LLM surfacing invocations of the capped kind. A
+    backend-surfaced vague_term row (tool_call_id 'backend_auto_surface:*') and
+    an LLM-authored llm_model_choice row are server obligations / uncapped
+    kinds; neither may drain the vague_term day budget."""
+    session_id = uuid4()
+    await _seed_bare_session(service, session_id, title="Counter provenance test")
+    mc_state, mc_node_id, mc_term = _event_liveness_state(
+        InterpretationKind.LLM_MODEL_CHOICE,
+        draft="openai/gpt-4o-mini",
+    )
+    state = CompositionState(
+        source=None,
+        nodes=(
+            _llm_node(node_id="rate_node", term="cool"),
+            _llm_node(node_id="rate_node_2", term="fresh"),
+            *mc_state.nodes,
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    state_id = await _persist_state(service, session_id, state)
+
+    # Backend-surfaced vague_term row + LLM-authored model_choice row.
+    await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_id,
+        affected_node_id="rate_node",
+        tool_call_id="backend_auto_surface:00000000-0000-0000-0000-000000000000",
+        user_term="cool",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="Visually appealing.",
+        **_provenance_kwargs(),
+    )
+    await service.create_pending_interpretation_event(
+        session_id=session_id,
+        composition_state_id=state_id,
+        affected_node_id=mc_node_id,
+        tool_call_id="tooluse_model_choice",
+        user_term=mc_term,
+        kind=InterpretationKind.LLM_MODEL_CHOICE,
+        llm_draft="openai/gpt-4o-mini",
+        **_provenance_kwargs(),
+    )
+
+    result = await _handle_request_interpretation_review(
+        arguments={
+            "affected_node_id": "rate_node_2",
+            "kind": "vague_term",
+            "user_term": "fresh",
+            "llm_draft": "Recently updated content.",
+        },
+        state=state,
+        session_id=session_id,
+        composition_state_id=state_id,
+        tool_call_id="call_fresh",
+        now=_now(),
+        per_term_cap=2,
+        per_session_day_cap=2,
+        create_pending_interpretation_event=service.create_pending_interpretation_event,
+        list_interpretation_events=service.list_interpretation_events,
+        **_provenance_kwargs(),
+    )
+    assert result.success is True, "backend-surfaced and uncapped-kind rows must not drain the vague_term day budget"
+
+
+@pytest.mark.asyncio
 async def test_09_per_session_day_rate_cap_after_ten_calls(service: SessionServiceImpl) -> None:
     """Spec test 9: 11th call with distinct user_terms raises (per-day cap)."""
     session_id = uuid4()

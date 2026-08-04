@@ -312,19 +312,23 @@ class WebSettings(BaseModel):
         ge=1,
         description=(
             "Max times the composer LLM may surface the same (session, user_term, "
-            "composition_state_id) tuple for user review. Exceeding this cap "
-            "raises ToolArgumentError; the compose loop falls back to "
-            "AUTO_INTERPRETED_NO_SURFACES."
+            "composition_state_id) tuple for user review. Applies to vague_term "
+            "reviews only — every other kind is a server-shaped obligation with "
+            "no bake fallback, so capping it wedges the session "
+            "(elspeth-558fa5a321). Exceeding this cap raises ToolArgumentError; "
+            "the compose loop falls back to AUTO_INTERPRETED_NO_SURFACES."
         ),
     )
     composer_interpretation_rate_limit_per_session_day: int = Field(
         default=10,
         ge=1,
         description=(
-            "Max request_interpretation_review invocations per session per UTC day. "
-            "Window resets at UTC midnight (not a sliding 24-hour window). "
-            "Exceeding this cap raises ToolArgumentError; the compose loop falls "
-            "back to AUTO_INTERPRETED_NO_SURFACES."
+            "Max vague_term request_interpretation_review invocations per session "
+            "per UTC day (LLM-authored rows only; backend-surfaced rows and other "
+            "kinds neither consume nor are blocked by this budget). Window resets "
+            "at UTC midnight (not a sliding 24-hour window). Exceeding this cap "
+            "raises ToolArgumentError; the compose loop falls back to "
+            "AUTO_INTERPRETED_NO_SURFACES."
         ),
     )
     auth_rate_limit_per_minute: int = Field(default=20, ge=1)

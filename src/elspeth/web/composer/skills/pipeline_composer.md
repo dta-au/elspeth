@@ -219,10 +219,11 @@ result.
   `request_interpretation_review(kind="invented_source")`. For source-level
   review calls, use `affected_node_id="source"`; the source is not listed in
   `nodes[]`, and that is expected. A pending source requirement lives under
-  `source.options.interpretation_requirements`, not under a transform node. Use
-  a stable `user_term` that names the generated source artifact; derive it from
-  the user's source description when one is present. Do not leave the source
-  review with an empty or generic `user_term`. The review
+  `source.options.interpretation_requirements`, not under a transform node. The
+  `user_term` is server-derived and already staged on the pending requirement —
+  `inline_source_url_list` for a single-column `url` CSV, `inline_source_data`
+  for every other artifact. Copy the staged requirement's `user_term` exactly;
+  never invent or derive your own. The review
   `llm_draft` must be the exact staged source artifact text, including its
   framing and whitespace. Never summarize, reformat, or describe it as
   user-supplied. If the exact source artifact text is not in your immediate

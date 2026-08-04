@@ -195,6 +195,7 @@ from elspeth.web.execution.schemas import (
 )
 from elspeth.web.execution.validation import validate_pipeline
 from elspeth.web.interpretation_state import (
+    BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX,
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_SHIELD_USER_TERM,
     PROMPT_SHIELD_WARNING_DRAFT,
@@ -1296,7 +1297,7 @@ async def _auto_surface_prompt_template_reviews_for_state(
                 session_id=UUID(session_id),
                 composition_state_id=UUID(current_state_id),
                 affected_node_id=site.component_id,
-                tool_call_id=f"backend_auto_surface:{uuid4()}",  # (D1)
+                tool_call_id=f"{BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}{uuid4()}",  # (D1)
                 user_term=site.user_term,
                 kind=InterpretationKind.LLM_PROMPT_TEMPLATE,
                 llm_draft=prompt_template,
@@ -1473,7 +1474,7 @@ async def surface_pending_interpretation_reviews_for_state(
                 session_id=UUID(session_id),
                 composition_state_id=UUID(current_state_id),
                 affected_node_id=affected_node_id,
-                tool_call_id=f"backend_auto_surface:{uuid4()}",
+                tool_call_id=f"{BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX}{uuid4()}",
                 user_term=user_term,
                 kind=site.kind,
                 llm_draft=llm_draft,

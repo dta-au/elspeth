@@ -78,6 +78,8 @@ from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
     PROMPT_TEMPLATE_PARTS_KEY,
     SOURCE_AUTHORING_KEY,
+    InterpretationReviewPending,
+    materialize_state_for_execution,
 )
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import (
@@ -1464,6 +1466,133 @@ async def test_finalization_auto_surfaces_prompt_template_and_does_not_orphan_bl
     assert result is not None
     preflight = result.runtime_preflight
     assert preflight is None or all(blocker.code != "interpretation_review_orphaned" for blocker in preflight.readiness.blockers)
+
+
+def _auto_wired_disclosure_node(node_id: str, *, draft: str) -> NodeSpec:
+    """An auto-wired control node carrying its server-staged disclosure card
+    (constant ``required_control_auto_wired`` user_term, node-specific draft)."""
+    return NodeSpec(
+        id=node_id,
+        node_type="transform",
+        plugin="content_safety",
+        input=f"{node_id}_in",
+        on_success=f"{node_id}_out",
+        on_error=None,
+        options={
+            "fields": ["content"],
+            "schema": {"mode": "observed"},
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "id": f"{node_id}_disclosure",
+                    "kind": InterpretationKind.PIPELINE_DECISION.value,
+                    "user_term": "required_control_auto_wired",
+                    "status": "pending",
+                    "draft": draft,
+                    "event_id": None,
+                    "accepted_value": None,
+                    "accepted_artifact_hash": None,
+                    "resolved_prompt_template_hash": None,
+                }
+            ],
+        },
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_control_fleet_graph_reaches_validatable_state(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """elspeth-558fa5a321 review finding 3: a graph with FOUR auto-wired control
+    disclosures plus an llm node must be able to reach a state the execution
+    gate accepts. Every disclosure card surfaces in one compose turn despite the
+    shared constant user_term (the g08 wedge), the finalization backend-surfaces
+    the llm_prompt_template review, and after resolving every pending event the
+    gate's materializer reports zero pending interpretation sites — the two
+    surfacing-side tests alone could pass while the session stayed wedged."""
+    composer = _build_composer(tmp_path, sessions_service)
+    control_nodes = tuple(
+        _auto_wired_disclosure_node(f"content_safety_auto_{i}", draft=f"Auto-wired control disclosure {i}.") for i in range(4)
+    )
+    pt_state = _state_with_prompt_template_review_node()
+    state = CompositionState(
+        source=None,
+        nodes=(*control_nodes, *pt_state.nodes),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
+
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_calls(
+                tool_calls=[
+                    {
+                        "id": f"call_disclosure_{i}",
+                        "name": "request_interpretation_review",
+                        "arguments": {
+                            "affected_node_id": f"content_safety_auto_{i}",
+                            "kind": "pipeline_decision",
+                            "user_term": "required_control_auto_wired",
+                            "llm_draft": f"Auto-wired control disclosure {i}.",
+                        },
+                    }
+                    for i in range(4)
+                ]
+            ),
+            _fake_text_response("All disclosure cards staged for review."),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=str(state_id),
+        initial_state=state,
+    )
+    assert all(invocation.status.value == "success" for invocation in result.tool_invocations), [
+        (invocation.tool_name, invocation.status.value) for invocation in result.tool_invocations
+    ]
+
+    # Four disclosure cards + the backend-surfaced PT review are all pending.
+    pending = await sessions_service.list_interpretation_events(session_id, status="pending")
+    assert sum(1 for e in pending if e.kind is InterpretationKind.PIPELINE_DECISION) == 4
+    assert sum(1 for e in pending if e.kind is InterpretationKind.LLM_PROMPT_TEMPLATE) == 1
+
+    resolved_state = None
+    for event in pending:
+        _, resolved_state = await sessions_service.resolve_interpretation_event(
+            session_id=session_id,
+            event_id=event.id,
+            choice=InterpretationChoice.ACCEPTED_AS_DRAFTED,
+            amended_value=None,
+            actor="user:alice",
+        )
+
+    # The execution gate's materializer must see zero pending sites on the
+    # resolved head — the exact check /validate's interpretation_review runs.
+    assert resolved_state is not None
+    head = CompositionState.from_dict(
+        {
+            "source": None,
+            "nodes": list(resolved_state.nodes or []),
+            "sources": dict(resolved_state.sources or {}),
+            "edges": [],
+            "outputs": [],
+            "metadata": resolved_state.metadata_ or {},
+            "version": resolved_state.version,
+        }
+    )
+    materialized = materialize_state_for_execution(head)
+    assert not isinstance(materialized, InterpretationReviewPending), materialized
 
 
 @pytest.mark.asyncio

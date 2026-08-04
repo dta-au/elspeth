@@ -127,6 +127,15 @@ _RAW_HTML_CLEANUP_DRAFT_MARKERS: Final[tuple[str, ...]] = ("raw html", "fingerpr
 # 18b4cee7, 2026-07-22).
 RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX: Final[str] = "Raw-html cleanup review draft is malformed"
 
+# Honest-provenance sentinel prefix for interpretation event rows written by a
+# BACKEND surfacer (finalization PT auto-surface, kind-general settlement
+# surfacer, YAML-import surfacer) rather than an LLM tool call. Consumers use
+# it to tell server obligations apart from LLM surfacing invocations — e.g.
+# the interpretation rate-cap counters exclude backend-stamped rows because
+# the caps throttle LLM churn, never server-staged obligations
+# (elspeth-558fa5a321).
+BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX: Final[str] = "backend_auto_surface:"
+
 # Transform plugins whose output is externally-controlled remote content for
 # prompt-injection-defence purposes. web_scrape returns whatever the fetched
 # page served, which is by definition untrusted. Document extraction is the

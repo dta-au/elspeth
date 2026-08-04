@@ -116,6 +116,7 @@ from elspeth.web.composer.tools.sources import (
     _source_component_id,
 )
 from elspeth.web.interpretation_state import (
+    BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX,
     INTERPRETATION_REQUIREMENTS_KEY,
     RAW_HTML_CLEANUP_DRAFT_MALFORMED_PREFIX,
     SOURCE_AUTHORING_KEY,
@@ -2253,6 +2254,13 @@ async def _check_interpretation_rate_limits(
 ) -> None:
     """Enforce the two per-session interpretation-review rate limits (F-30/F-31).
 
+    Scope (elspeth-558fa5a321): the caller only invokes this for
+    ``vague_term`` — the one kind where the term is the user's own phrase and
+    the bake-into-the-prompt fallback exists — and the counters below measure
+    the same population: LLM-authored ``vague_term`` rows (backend-surfaced
+    rows carry the ``BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX`` sentinel and are
+    server obligations, not LLM churn).
+
     Two structural limits apply, in order:
 
     1. **Per-term cap (default 3):** the same ``(session_id, user_term)`` pair,
@@ -2282,7 +2290,19 @@ async def _check_interpretation_rate_limits(
     object. Production callers thread ``WebSettings.composer_interpretation_*``
     in.
     """
-    events = await list_events_fn(session_id, status="all")
+    # Count only what the caps govern (elspeth-558fa5a321): LLM surfacing
+    # invocations of the capped kind. The handler only calls this check for
+    # ``vague_term``, so rows of every other kind are uncapped obligations
+    # and must not drain the budgets. Backend-surfaced rows (the
+    # ``backend_auto_surface:`` provenance sentinel) are server obligations
+    # even when their kind is vague_term — measured on battery-r2 g08, a
+    # third of the consumed per-term budget had been spent by the server
+    # against an allowance documented as throttling the composer LLM.
+    events = [
+        event
+        for event in await list_events_fn(session_id, status="all")
+        if event.kind is InterpretationKind.VAGUE_TERM and not (event.tool_call_id or "").startswith(BACKEND_AUTO_SURFACE_TOOL_CALL_PREFIX)
+    ]
     # Per-term cap — count rows for this composition branch with matching user_term.
     per_term_count = sum(
         1
@@ -2447,19 +2467,20 @@ async def _handle_request_interpretation_review(
     # loop is expected to react by writing an AUTO_INTERPRETED_NO_SURFACES
     # event (handled in service.py — see ``record_auto_interpreted_no_surfaces_event``).
     #
-    # ``pipeline_decision`` is exempt from both caps (elspeth-558fa5a321).
-    # Its user_terms come from the closed registered vocabulary — often a
-    # server-staged constant shared by MANY nodes (``required_control_auto_wired``
-    # rides on every auto-wired control), so the per-term budget conflates
-    # unrelated review sites and a graph with more cards than the cap can
-    # never surface them all. The dedup gate above already bounds churn per
-    # (kind, user_term, affected_node_id) site, and the caps' fallback —
-    # "bake the interpretation into the prompt" — is impossible for
-    # node-staged, validation-blocking disclosures the LLM cannot remove:
-    # a cap hit writes a terminal AUTO_INTERPRETED_NO_SURFACES event while
-    # the node requirement stays pending, wedging the session permanently
-    # (validation fails forever; the review API has nothing to resolve).
-    if parsed.kind is not InterpretationKind.PIPELINE_DECISION:
+    # The caps apply ONLY to ``vague_term`` (elspeth-558fa5a321). A cap is
+    # coherent exactly where (1) the user authored the term — it is their
+    # own ambiguous phrase, so repeated cards are perceptible nagging — and
+    # (2) the documented fallback exists — the LLM can bake a direct
+    # interpretation into the prompt and drop the requirement. Only
+    # vague_term has both. Every other kind is a server-shaped obligation
+    # (registry-constant or auto-staged user_terms, validation-blocking
+    # requirements the LLM cannot remove): a cap hit there writes a
+    # terminal AUTO_INTERPRETED_NO_SURFACES event while the requirement
+    # stays pending, wedging the session permanently — validation fails
+    # forever and the review API has nothing to resolve (battery-r2 g08).
+    # Churn on the uncapped kinds is bounded by the per-site dedup gate
+    # above and by the graph itself.
+    if parsed.kind is InterpretationKind.VAGUE_TERM:
         await _check_interpretation_rate_limits(
             session_id=session_id,
             user_term=parsed.user_term,
