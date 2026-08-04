@@ -99,6 +99,44 @@ def test_build_set_pipeline_candidate_constructs_without_publishing(tmp_path: Pa
     assert state == _empty_state()
 
 
+def test_rejected_candidate_reports_only_the_real_error_not_stale_state(tmp_path: Path) -> None:
+    """elspeth-e89e6bf47a: a candidate with valid source/outputs whose llm node
+    omits ``provider`` is rejected with ``plugin_options_invalid`` alone — not
+    the empty pre-mutation state's ``no_source_configured`` /
+    ``no_sinks_configured``, which misroute repair loops on the raw-result
+    surfaces (freeform chat tool messages, composer MCP responses).
+    """
+    args = _linear_args(tmp_path)
+    args["nodes"] = [
+        {
+            "id": "enrich",
+            "node_type": "transform",
+            "plugin": "llm",
+            "input": "rows",
+            "on_success": "main",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}},
+        }
+    ]
+    args["edges"] = [
+        {
+            "id": "source_to_enrich",
+            "from_node": "source",
+            "to_node": "enrich",
+            "edge_type": "on_success",
+            "label": None,
+        }
+    ]
+
+    candidate = build_set_pipeline_candidate(args, _empty_state(), _trained_context(data_dir=tmp_path))
+    result = candidate.result
+
+    assert candidate.acceptable is False
+    assert result.data["error_code"] == "plugin_options_invalid"
+    assert [entry.component for entry in result.validation.errors] == ["rejected_mutation"]
+    assert [entry.error_code for entry in result.validation.errors] == ["plugin_options_invalid"]
+
+
 def _trained_context(*, data_dir: Path | None = None, **kwargs: Any) -> ToolContext:
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
@@ -1163,16 +1201,26 @@ def test_public_set_pipeline_validates_current_and_candidate_exactly_once(
     )
 
     assert result.success is not rejected
-    assert len(catalog.validated_states) == (2 if rejected else 3)
+    assert len(catalog.validated_states) == (1 if rejected else 3)
     assert catalog.validated_states[0] is state
     if rejected:
-        assert catalog.validated_states[1] is result.updated_state
+        # The withheld rejection envelope is never re-derived from the
+        # unchanged state (elspeth-e89e6bf47a), so only the entry-time
+        # current-state validation runs.
+        assert [entry.component for entry in result.validation.errors] == ["rejected_mutation"]
     else:
         assert set(catalog.validated_states[1].sources) == {"source"}
         assert catalog.validated_states[2] is result.updated_state
 
 
-def test_normalizer_revalidates_for_a_different_snapshot_and_preserves_rejection(tmp_path: Path) -> None:
+def test_normalizer_skips_revalidation_for_a_withheld_rejection_across_snapshots(tmp_path: Path) -> None:
+    """A snapshot change must not reattach the withheld stale-state errors.
+
+    elspeth-e89e6bf47a: the set_pipeline rejection envelope deliberately
+    withholds the unchanged state's validate() entries, so the normalizer
+    honors ``_state_validation_withheld`` instead of re-deriving validation
+    from the untouched ``updated_state`` under the new snapshot.
+    """
     args = _linear_args(tmp_path)
     args["sources"] = {}
     state = _empty_state()
@@ -1203,8 +1251,9 @@ def test_normalizer_revalidates_for_a_different_snapshot_and_preserves_rejection
     assert revalidated is not candidate.result
     assert revalidated == candidate.result
     assert revalidated.updated_state is candidate.result.updated_state
-    assert other_catalog.validated_states == [candidate.result.updated_state]
+    assert other_catalog.validated_states == []
     assert tuple(entry for entry in revalidated.validation.errors if entry.component == "rejected_mutation") == (rejection,)
+    assert [entry.component for entry in revalidated.validation.errors] == ["rejected_mutation"]
     assert revalidated._validation_snapshot_hash == other_snapshot.snapshot_hash
 
 

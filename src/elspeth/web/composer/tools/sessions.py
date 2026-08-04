@@ -459,7 +459,17 @@ def build_set_pipeline_candidate(
         *,
         error_code: str | None = None,
     ) -> SetPipelineCandidate:
-        return _candidate(_tool_failure_result(rejected_state, error_msg, error_code=error_code))
+        # set_pipeline authors a full replacement: the pre-mutation state's
+        # validate() entries are phantom repair targets for this candidate
+        # and are withheld from the failure envelope (elspeth-e89e6bf47a).
+        return _candidate(
+            _tool_failure_result(
+                rejected_state,
+                error_msg,
+                error_code=error_code,
+                with_state_validation=False,
+            )
+        )
 
     def _plugin_policy_failure(
         rejected_state: CompositionState,
@@ -467,7 +477,14 @@ def build_set_pipeline_candidate(
         *,
         component: str | None = None,
     ) -> SetPipelineCandidate:
-        return _candidate(_tool_plugin_policy_failure(rejected_state, violation, component=component))
+        return _candidate(
+            _tool_plugin_policy_failure(
+                rejected_state,
+                violation,
+                component=component,
+                with_state_validation=False,
+            )
+        )
 
     def _reviewed_source_options(
         *,
@@ -533,10 +550,10 @@ def build_set_pipeline_candidate(
     if validated.source is not None and validated.sources is not None:
         return _failure_result(state, "set_pipeline must use either source or sources, not both.")
     if validated.source is None and validated.sources is None:
-        # Carries the same closed code the state-level check would emit so the
-        # planner's redacted feedback resolves to the "include a source block"
-        # guidance (the stale-state rider that used to smuggle this code in is
-        # gated out of planner feedback — see _rejection_entries).
+        # Carries the same closed code the state-level check would emit so
+        # repair feedback on every surface resolves to the "include a source
+        # block" guidance (the stale-state riders themselves are withheld
+        # from set_pipeline failure envelopes — elspeth-e89e6bf47a).
         return _failure_result(state, "set_pipeline requires source or sources.", error_code="no_source_configured")
 
     source_specs: dict[str, SourceSpec] = {}
@@ -633,6 +650,7 @@ def build_set_pipeline_candidate(
                 plugin_type="source",
                 plugin_name=src_plugin,
                 options=src_options,
+                with_state_validation=False,
             )
             if credential_error is not None:
                 return _candidate(credential_error)
@@ -817,6 +835,7 @@ def build_set_pipeline_candidate(
             plugin_type="source",
             plugin_name=src_plugin,
             options=legacy_src_options,
+            with_state_validation=False,
         )
         if credential_error is not None:
             return _candidate(credential_error)
@@ -908,6 +927,7 @@ def build_set_pipeline_candidate(
             plugin_type="transform" if node_plugin is not None else None,
             plugin_name=node_plugin,
             options=review_options,
+            with_state_validation=False,
         )
         if credential_error is not None:
             return _candidate(credential_error)
@@ -1046,6 +1066,7 @@ def build_set_pipeline_candidate(
             plugin_type="sink",
             plugin_name=out_plugin,
             options=out_options,
+            with_state_validation=False,
         )
         if credential_error is not None:
             return _candidate(credential_error)

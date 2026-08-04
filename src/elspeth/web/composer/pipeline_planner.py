@@ -1270,23 +1270,27 @@ def _missing_source_rejection(state: CompositionState) -> ToolResult:
         updated_state=state,
         validation=ValidationSummary(is_valid=False, errors=(entry,), warnings=(), suggestions=()),
         affected_nodes=(),
+        _state_validation_withheld=True,
     )
 
 
 def _rejection_entries(result: ToolResult) -> tuple[Any, ...]:
     """Return the entries the planner should actually repair against.
 
-    A pre-application semantic rejection (``_failure_result``) prepends a
-    ``rejected_mutation`` entry naming the real reason and then appends
-    ``state.validate()`` of the UNCHANGED current state. On the guided and
-    tutorial surfaces that current state is the empty seed, so every such
-    rejection also carried ``no_source_configured`` + ``no_sinks_configured``
-    — red herrings describing a state the planner is not editing (set_pipeline
-    authors a full replacement). Tutorial session 38e3e7f8 (op 1152d7e3,
-    2026-07-22) burned its repair budget on exactly that noise and "converged"
-    by dropping every node. When rejection entries are present, they are the
-    ONLY entries feedback and trail may carry; validated-candidate rejections
-    (no ``rejected_mutation`` entry) pass through untouched.
+    A pre-application semantic rejection (``_failure_result``) leads with a
+    ``rejected_mutation`` entry naming the real reason. Historically the
+    UNCHANGED current state's ``state.validate()`` entries followed it — on
+    the guided and tutorial surfaces that state is the empty seed, so every
+    such rejection also carried ``no_source_configured`` +
+    ``no_sinks_configured``, red herrings describing a state the planner is
+    not editing (set_pipeline authors a full replacement). Tutorial session
+    38e3e7f8 (op 1152d7e3, 2026-07-22) burned its repair budget on exactly
+    that noise and "converged" by dropping every node. The set_pipeline
+    producers now withhold those riders at the source (elspeth-e89e6bf47a);
+    this gate stays as defense-in-depth for the planner surface. When
+    rejection entries are present, they are the ONLY entries feedback and
+    trail may carry; validated-candidate rejections (no ``rejected_mutation``
+    entry) pass through untouched.
     """
     rejection = tuple(entry for entry in result.validation.errors if entry.component == "rejected_mutation")
     return rejection if rejection else tuple(result.validation.errors)

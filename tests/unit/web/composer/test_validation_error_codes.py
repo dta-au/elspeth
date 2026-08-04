@@ -606,6 +606,66 @@ class TestPlannerFeedbackCarriesStructuralFacts:
         assert codes == ("validation_error", "schema_contract_violation")
 
 
+class TestFullReplacementRejectionsWithholdStaleStateEntries:
+    """set_pipeline rejections carry no stale pre-mutation state entries.
+
+    elspeth-e89e6bf47a: the planner-side ``_rejection_entries`` gate protects
+    only the planner surface. The freeform chat loop (``serialize_tool_result``)
+    and the composer MCP server both serialize ``ToolResult.to_dict()``
+    verbatim, so for the full-replacement tool the pre-mutation state's errors
+    (``no_source_configured`` / ``no_sinks_configured`` on an empty session)
+    must not exist at the producer — a repair loop reading error codes is
+    otherwise told to fix a source/sink the rejected candidate configured
+    correctly. Discovery tools and incremental mutations keep the default
+    disclosure: there the standing state is what survives the rejection, and
+    restricted surfaces read its errors through failure results (see the
+    pipeline-state disclosure tests).
+    """
+
+    def test_failure_result_withholds_state_entries_only_when_asked(self) -> None:
+        from elspeth.web.composer.tools._common import _failure_result
+
+        withheld = _failure_result(
+            _empty_state(),
+            "Node 'enrich': Invalid options for transform 'llm': provider: Field required",
+            error_code="plugin_options_invalid",
+            with_state_validation=False,
+        )
+
+        assert not withheld.validation.is_valid
+        assert [entry.component for entry in withheld.validation.errors] == ["rejected_mutation"]
+        assert [entry.error_code for entry in withheld.validation.errors] == ["plugin_options_invalid"]
+        assert withheld.validation.warnings == ()
+        assert withheld.validation.suggestions == ()
+
+        disclosed = _failure_result(
+            _empty_state(),
+            "Component 'missing-component' not found.",
+        )
+        disclosed_codes = {entry.error_code for entry in disclosed.validation.errors}
+        assert {"no_source_configured", "no_sinks_configured"} <= disclosed_codes
+
+    def test_normalization_does_not_reattach_withheld_stale_state_errors(self) -> None:
+        from elspeth.web.catalog.policy_view import PolicyCatalogView
+        from elspeth.web.composer.tools._common import _failure_result, normalize_tool_result_validation
+        from elspeth.web.dependencies import create_catalog_service
+        from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+
+        catalog_service = create_catalog_service()
+        snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog_service)
+        catalog = PolicyCatalogView.for_trained_operator(catalog_service, snapshot)
+
+        result = _failure_result(
+            _empty_state(),
+            "Node 'enrich': Invalid options for transform 'llm': provider: Field required",
+            error_code="plugin_options_invalid",
+            with_state_validation=False,
+        )
+        normalized = normalize_tool_result_validation(result, catalog)
+
+        assert [entry.component for entry in normalized.validation.errors] == ["rejected_mutation"]
+
+
 def _make_gate(id: str, input: str, fork_to: tuple[str, ...]) -> NodeSpec:
     return NodeSpec(
         id=id,

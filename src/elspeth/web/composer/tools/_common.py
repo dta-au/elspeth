@@ -4,7 +4,7 @@ Centralises:
 
 - ``ToolResult`` (the canonical response shape every handler returns) and the
   leaf response helpers (``_failure_result`` / ``_discovery_result`` /
-  ``_mutation_result`` / ``_prepend_rejection_entry`` / ``_attach_post_call_hints``).
+  ``_mutation_result`` / ``_rejection_only_validation`` / ``_attach_post_call_hints``).
 - Validation-delta and graph-repair-suggestion synthesis used by
   ``ToolResult.to_dict`` and the high-level ``diff_states`` reporter.
 - The Pydantic mutation-argument validator and merge-patch helper used by every
@@ -799,6 +799,12 @@ class ToolResult:
     post_call_hints: tuple[str, ...] = ()
     plugin_schemas: Mapping[str, Mapping[str, Any]] | None = None
     _validation_snapshot_hash: str | None = field(default=None, compare=False, repr=False)
+    # True when this failure envelope deliberately withheld the pre-mutation
+    # state's validate() entries (full-replacement rejections,
+    # elspeth-e89e6bf47a). normalize_tool_result_validation honors it so a
+    # snapshot change cannot reattach the withheld stale-state errors.
+    # Private framing — never serialized by to_dict().
+    _state_validation_withheld: bool = field(default=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         freeze_fields(self, "affected_nodes", "post_call_hints")
@@ -1013,22 +1019,30 @@ def _failure_result(
     error_msg: str,
     *,
     error_code: str | None = None,
+    with_state_validation: bool = True,
 ) -> ToolResult:
     """Build a ToolResult for a failed mutation.
 
-    The rejection reason (``error_msg``) is also prepended to
-    ``validation.errors`` as a synthetic ``ValidationEntry`` with
-    component ``"rejected_mutation"``. State-level errors from
-    ``state.validate()`` (e.g. "No source configured.") describe the
-    *unchanged* state and follow the rejection reason. This puts the
-    action-rejection signal ahead of the stale-state signal for any
-    consumer that reads ``validation.errors`` in array order — closing
-    the convergence gap surfaced by composer session 58d7ede3 where the
-    LLM repeated a near-identical ``set_pipeline`` because the array led
-    with "No source configured." instead of the real option-shape
-    error.
+    The rejection reason (``error_msg``) leads ``validation.errors`` as a
+    synthetic ``ValidationEntry`` with component ``"rejected_mutation"``.
+
+    ``with_state_validation`` decides whether ``state.validate()`` of the
+    *unchanged* state follows it. Default True: for discovery tools and
+    incremental mutations the standing state is what survives the rejection,
+    and restricted planner surfaces rely on failure results to disclose its
+    errors (see the pipeline-state disclosure tests). Full-replacement
+    rejections (``set_pipeline``) pass False: there the unchanged state's
+    errors are phantom repair targets — on an empty session they read
+    ``no_source_configured`` / ``no_sinks_configured`` for a candidate whose
+    source and sinks were configured correctly, and the raw-result surfaces
+    (freeform chat tool messages, composer MCP responses) serialize
+    ``ToolResult.to_dict()`` verbatim (elspeth-e89e6bf47a; tutorial session
+    38e3e7f8 burned its repair budget on exactly that noise).
     """
-    validation = _prepend_rejection_entry(state.validate(), error_msg, error_code=error_code)
+    if with_state_validation:
+        validation = _prepend_rejection_entry(state.validate(), error_msg, error_code=error_code)
+    else:
+        validation = _rejection_only_validation(error_msg, error_code=error_code)
     data = {_DATA_ERROR_KEY: error_msg}
     if error_code is not None:
         data["error_code"] = error_code
@@ -1038,6 +1052,7 @@ def _failure_result(
         validation=validation,
         affected_nodes=(),
         data=data,
+        _state_validation_withheld=not with_state_validation,
     )
 
 
@@ -1130,6 +1145,29 @@ def _prepend_rejection_entry(
         edge_contracts=base.edge_contracts,
         semantic_contracts=base.semantic_contracts,
     )
+
+
+def _rejection_only_validation(
+    error_msg: str,
+    *,
+    error_code: str | None = None,
+) -> ValidationSummary:
+    """Return a ValidationSummary holding only a rejected_mutation entry.
+
+    Full-replacement rejections leave the state untouched AND replace it
+    wholesale on success, so every field derived from validating that state
+    (errors, warnings, suggestions, contracts) describes a state the caller
+    is not editing and is withheld (elspeth-e89e6bf47a). ``is_valid`` is
+    False because a rejection entry is by construction a high-severity
+    error.
+    """
+    rejection = ValidationEntry(
+        component="rejected_mutation",
+        message=error_msg,
+        severity="high",
+        error_code=error_code,
+    )
+    return ValidationSummary(is_valid=False, errors=(rejection,))
 
 
 def _mutation_result(
@@ -1330,6 +1368,7 @@ def _credential_wiring_contract_failure(
     plugin_type: PluginKind | None = None,
     plugin_name: str | None = None,
     options: Any,
+    with_state_validation: bool = True,
 ) -> ToolResult | None:
     """Reject literal credentials before a mutation writes them into state.
 
@@ -1384,15 +1423,20 @@ def _credential_wiring_contract_failure(
         f"Literal credential values were not stored. {inline_instruction} "
         f"{post_hoc_instruction}"
     )
-    # Symmetric with _failure_result: lead validation.errors with the
-    # rejection reason so LLMs reading the array in order see the
-    # actionable message before any stale-state errors.
-    validation = _prepend_rejection_entry(state.validate(), error_msg)
+    # Symmetric with _failure_result: the rejection reason leads
+    # validation.errors; with_state_validation decides whether the unchanged
+    # state's errors follow it (False for full-replacement set_pipeline,
+    # elspeth-e89e6bf47a).
+    if with_state_validation:
+        validation = _prepend_rejection_entry(state.validate(), error_msg)
+    else:
+        validation = _rejection_only_validation(error_msg)
     return ToolResult(
         success=False,
         updated_state=state,
         validation=validation,
         affected_nodes=(),
+        _state_validation_withheld=not with_state_validation,
         data={
             _DATA_ERROR_KEY: error_msg,
             "credential_fields": credential_fields,
@@ -1552,9 +1596,15 @@ def _plugin_policy_failure(
     violation: PluginPolicyViolation,
     *,
     component: str | None = None,
+    with_state_validation: bool = True,
 ) -> ToolResult:
     message = violation.message if component is None else f"{component}: {violation.message}"
-    return _failure_result(state, message, error_code=violation.error_code.value)
+    return _failure_result(
+        state,
+        message,
+        error_code=violation.error_code.value,
+        with_state_validation=with_state_validation,
+    )
 
 
 def _validate_aggregation_trigger(trigger: Any) -> str | None:
@@ -2729,8 +2779,19 @@ def normalize_tool_result_validation(
     snapshot_hash = catalog.snapshot.snapshot_hash
     if result._validation_snapshot_hash == snapshot_hash:
         return result
-    shared = catalog.validate_composition_state(result.updated_state).validation
     rejections = tuple(entry for entry in result.validation.errors if entry.component == "rejected_mutation")
+    if rejections and result._state_validation_withheld:
+        # Full-replacement rejection: updated_state is the untouched input
+        # state whose validate() entries the producer deliberately withheld,
+        # so re-validating it here would reattach exactly those stale-state
+        # errors (elspeth-e89e6bf47a). The rejection entries are
+        # snapshot-independent.
+        return replace(
+            result,
+            validation=ValidationSummary(is_valid=False, errors=rejections),
+            _validation_snapshot_hash=snapshot_hash,
+        )
+    shared = catalog.validate_composition_state(result.updated_state).validation
     if rejections:
         shared = replace(
             shared,

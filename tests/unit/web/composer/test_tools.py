@@ -9156,10 +9156,13 @@ class TestSetPipeline:
 
         When ``set_pipeline`` rejects a mutation, ``validation.errors[0]``
         must carry the actionable rejection reason (component
-        ``rejected_mutation``) ahead of any state-snapshot errors like
-        ``"No source configured."``. In the live session, the LLM read
-        the stale-state errors first and burned a full round retrying
-        with only a cosmetic change.
+        ``rejected_mutation``). In the live session, the LLM read the
+        stale-state errors first and burned a full round retrying with only
+        a cosmetic change. Since elspeth-e89e6bf47a those state-snapshot
+        errors (``"No source configured."`` etc.) are withheld from the
+        full-replacement rejection envelope entirely — they described the
+        pre-mutation state the candidate was not editing and misrouted
+        repair loops reading error codes on the raw-result surfaces.
         """
         state = _empty_state()
         catalog = self._catalog_with_json_sink()
@@ -9178,11 +9181,9 @@ class TestSetPipeline:
         # data.error mirrors the leading entry's message verbatim so the
         # two channels stay in sync.
         assert first.message == result.data["error"]
-        # Stale state-level errors remain in the array — they must not
-        # vanish, only be demoted from the leading slot.
-        components = [e.component for e in result.validation.errors[1:]]
-        assert "source" in components
-        assert "pipeline" in components
+        # The rejection entry is the WHOLE envelope: the unchanged state's
+        # errors are withheld, not merely demoted.
+        assert [e.component for e in result.validation.errors] == ["rejected_mutation"]
 
     def test_set_pipeline_accepts_two_json_sinks_with_explicit_file_options(self, tmp_path: Path) -> None:
         state = _empty_state()
