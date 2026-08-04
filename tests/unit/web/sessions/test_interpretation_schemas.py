@@ -17,7 +17,7 @@ contract types:
   route.
 
 The shared content-check helpers (``_validate_accepted_value_content``
-and ``_reject_credential_shaped_content``) live in
+and ``reject_credential_shaped_content``) live in
 ``elspeth.web.validation`` per Phase 5b spec F-34.  They are tested
 indirectly via ``InterpretationResolveRequest`` (the schema-layer
 defense-in-depth) and directly in ``test_validation_helpers.py`` where

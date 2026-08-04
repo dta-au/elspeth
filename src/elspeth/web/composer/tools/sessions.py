@@ -135,8 +135,8 @@ from elspeth.web.provider_config_policy import (
 )
 from elspeth.web.sessions.protocol import InterpretationResolveError
 from elspeth.web.validation import (
-    _reject_credential_shaped_content,
     _validate_accepted_value_content,
+    reject_credential_shaped_content,
 )
 
 ADVISOR_TRIGGER_PROACTIVE_SECURITY: Final[str] = "proactive_security_safety"
@@ -206,7 +206,7 @@ def _validate_source_artifact_review_content(value: str) -> None:
     for line in value.splitlines():
         if len(line) > 1024:
             raise ValueError("source artifact review content has a line exceeding the 1024-character limit")
-    _reject_credential_shaped_content(value)
+    reject_credential_shaped_content(value)
 
 
 def _options_with_inline_blob_source_review(
@@ -2413,13 +2413,13 @@ async def _handle_request_interpretation_review(
             actual_type=("llm_prompt_template — surfaced automatically by the backend at turn finalization; do not request it"),
         )
     # F-34 credential prefilter: Tier-3 boundary check before any DB write.
-    # ``_reject_credential_shaped_content`` raises ``ValueError``; we wrap
+    # ``reject_credential_shaped_content`` raises ``ValueError``; we wrap
     # as ToolArgumentError so the compose loop's ARG_ERROR routing catches
     # it (a bare ValueError would land in the plugin-crash catch-all and
     # mis-classify the failure as a Tier-1 plugin bug).
     for field_name, field_value in (("user_term", parsed.user_term), ("llm_draft", parsed.llm_draft)):
         try:
-            _reject_credential_shaped_content(field_value)
+            reject_credential_shaped_content(field_value)
         except ValueError as exc:
             raise ToolArgumentError(
                 argument=field_name,

@@ -6,7 +6,7 @@ validation also live here so config loading, request validation, and runtime
 secret stores share one contract instead of drifting independently.
 
 Phase 5b (F-34) — the interpretation-event helpers
-(``_validate_accepted_value_content``, ``_reject_credential_shaped_content``,
+(``_validate_accepted_value_content``, ``reject_credential_shaped_content``,
 ``_warn_pii_shaped_content``) live in this module rather than a new
 ``_validation_helpers.py`` so that
 ``elspeth.web.sessions.schemas`` (request schema validation) and
@@ -156,7 +156,7 @@ _PII_WARNING_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 _CREDENTIAL_REJECTION_MESSAGE = "That looks like a credential — please re-enter without secrets."
 
 
-def _reject_credential_shaped_content(value: str) -> None:
+def reject_credential_shaped_content(value: str) -> None:
     """Raise ``ValueError`` if ``value`` matches any credential-shape regex.
 
     Used at two boundaries:
@@ -189,7 +189,7 @@ def _redact_sensitive_content(value: str) -> str:
 
     This is for egress surfaces that should preserve surrounding diagnostic
     prose while removing sensitive tokens. Rejection boundaries should keep
-    using :func:`_reject_credential_shaped_content`.
+    using :func:`reject_credential_shaped_content`.
     """
 
     redacted = value
@@ -264,7 +264,7 @@ def _validate_accepted_value_content(value: str) -> None:
       8192-character cap is enforced by the field's ``max_length`` on
       the schema; this is the per-line cap.
     * Credential-shaped content (delegates to
-      :func:`_reject_credential_shaped_content`).
+      :func:`reject_credential_shaped_content`).
 
     Applied at two distinct boundaries (defense-in-depth for F-2):
 
@@ -281,4 +281,4 @@ def _validate_accepted_value_content(value: str) -> None:
     for line in value.splitlines() or [value]:
         if len(line) > 1024:
             raise ValueError("accepted_value has a line exceeding the 1024-character per-line limit")
-    _reject_credential_shaped_content(value)
+    reject_credential_shaped_content(value)

@@ -92,6 +92,12 @@ def test_sessions_and_composer_use_explicit_attribute_contracts() -> None:
             "content",
         ),
         _AttributeProbe(
+            "src/elspeth/web/sessions/_auto_title.py",
+            "_admit_auto_title_completion",
+            "getattr",
+            "finish_reason",
+        ),
+        _AttributeProbe(
             "src/elspeth/web/composer/guided/chat_solver.py",
             "_admit_deferred_intent_repair_thread",
             "getattr",
