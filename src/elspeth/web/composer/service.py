@@ -87,7 +87,7 @@ from elspeth.web.composer.audit import (
 )
 from elspeth.web.composer.audit_storage import redacted_tool_invocation_content_and_envelope
 from elspeth.web.composer.availability import ComposerAvailability as ComposerAvailability  # re-export; genuine home is availability.py
-from elspeth.web.composer.control_messages import anti_anchor_control_envelope
+from elspeth.web.composer.control_messages import advisor_signoff_withheld_control_envelope, anti_anchor_control_envelope
 from elspeth.web.composer.discovery_cache import (
     CachedDiscoveryPayload as _CachedDiscoveryPayload,
 )
@@ -4756,6 +4756,22 @@ class ComposerServiceImpl:
                     advisor_passes_delta=passes_delta,
                     advisor_review_state=review_state,
                 )
+            # elspeth-2306940c70: the blocked result below withholds the
+            # model's prose (raw_assistant_content=""), so this turn replays
+            # into later model context as an EMPTY assistant message — the
+            # next turn's model would read the withhold as silent compliance
+            # and assert the refused instruction is live. Persist a durable
+            # user-role disclosure before returning; like the anti-anchor
+            # hint, audit publication is a precondition of the
+            # provider-visible intervention.
+            if session_id is not None:
+                await self._require_sessions_service().add_message(
+                    UUID(session_id),
+                    "audit",
+                    _ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE,
+                    writer_principal="compose_loop",
+                    tool_calls=[advisor_signoff_withheld_control_envelope(_ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE)],
+                )
             # R2-F14: ``failure_class`` is READ here rather than every
             # ``ok=False`` being labelled "unavailable". Only the EXACT value
             # ``"unavailable"`` maps to the outage wording; ``"malformed"``,
@@ -8036,6 +8052,19 @@ _ADVISOR_OUTPUT_CONTRACT_CLAUSE: Final[str] = (
     "Fix the findings via tool calls. The end user has NOT seen these "
     "findings; your final reply is shown to them and must state only "
     "the outcome — never reference, quote, or rebut the advisor."
+)
+
+# elspeth-2306940c70: durable provider-visible disclosure persisted on every
+# terminal END-gate withhold. Fixed backend copy only — no advisor findings
+# ride this string, so replaying it into later turns cannot re-introduce the
+# repair-cohort contamination that forced the prose withhold in the first
+# place.
+_ADVISOR_SIGNOFF_WITHHELD_DISCLOSURE: Final[str] = (
+    "[composer-system] The completion advisory review did not clear, so "
+    "ELSPETH withheld composer completion for the preceding request. Do not "
+    "assume that request was applied: the pipeline state supplied in the "
+    "current context is the authoritative record. Verify against it before "
+    "describing any earlier instruction as applied or in effect."
 )
 
 
