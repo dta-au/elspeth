@@ -137,3 +137,171 @@ diagnosable rather than merely alarming. Treat any failure here as a
   diagnostics; blocked without the Textract profile grant in the same task-def
   revision), `elspeth-308d1e0831` (counter is CloudWatch),
   `elspeth-eca48c1e31` (bypass is visible only as provider-call volume).
+
+---
+
+# g08 triage — reopen or sibling?
+
+**Recommendation: FILE SIBLING.**
+
+Proposed title: **"Compose-time locked-input extras check is structurally blind
+to pass-through fields, and is bypassed by any resolvable node between a
+`row_union` and the locked consumer"**
+
+The **pass-through blindness is the primary mechanism** — it is proven without
+confound and is proven to be *a* live cause of this run regardless of what else
+fired (the run rejected `complaint_text`, which this rule cannot predict under
+any topology). The bypass is a proven-reachable secondary.
+
+**A necessary clarification on "reopen".** `elspeth-9d13900064` is at
+`verifying`, **not `closed`** — so there is nothing to reopen. `verifying`
+means exactly "locally fixed; live acceptance remains", and this run *is* that
+live acceptance. It **failed**. So the disposition has two parts, and the
+second is not optional:
+
+1. **File the sibling** for the newly-proven wider mechanism (below).
+2. **`elspeth-9d13900064` must NOT advance to `closed`.** Add this run as a
+   dated negative datum on the ticket. Its narrow root cause is genuinely
+   cured and its regression test passes, but the ticket's own headline symptom
+   — an LLM provenance side-field breaking a downstream fixed-schema consumer
+   at runtime — reproduced verbatim on the deployed fix.
+
+This is the honest reading of the tension: the *mechanism* the ticket
+root-caused is fixed, while the *symptom* the ticket is named for is still
+live through a different path. Calling it a sibling is a statement about cause,
+not a discharge of the ticket.
+
+Evidence: round-3 run `dc689cfe-9f4b-47ba-bd04-abd04309debc`, session
+`04ff99fb-4147-4405-878d-c70a9be68e02`, graph g08, on the deployed fix.
+Compose succeeded, `/validate` returned `is_valid=true`, run status `failed`
+with `PluginContractViolation` (5 × `extra_forbidden`) at
+`transform_final_cleanup_3981d1107594`.
+
+## The deduction that settles it
+
+`elspeth-9d13900064` is **fixed** and its own regression test
+(`test_row_union_extras_reach_a_fixed_mode_field_mapper_consumer`, added by
+`3d77d15bd`) still passes. The live failure did not travel the fixed path:
+
+1. The runtime rejected `one_sentence_summary_usage` with `extra_forbidden`.
+   A generated input model gets `extra="forbid"` only when `config.mode` is
+   not `flexible`/`observed` — `schema_factory.py:167`, with `is_observed`
+   short-circuiting to `extra="allow"` at `:119-121`. So the consumer's
+   `schema.mode` was **`fixed` with declared fields**.
+2. That is exactly the predicate `_locked_input_field_set` tests
+   (`web/composer/state.py:1955`), so `consumer_locked_input` was **not None**
+   — the consumer-side gate of Rule A was satisfied. **Confirmed empirically,
+   closing the "maybe field_mapper derives its input model from something else"
+   escape**: `field_mapper` builds `FieldMapperInput` via `_create_schemas` →
+   `create_schema_from_config(cfg.schema_config, "FieldMapperInput")`
+   (`plugins/infrastructure/base.py:663`) from the *same* declaration
+   `_locked_input_field_set` reads. Probed across four option shapes — runtime
+   `extra` is `forbid` **only** in `fixed` mode, and in exactly that case the
+   composer returns the identical field set; `flexible`/`observed` give
+   `allow`/`None` on both sides. `select_only` changes neither. There is no
+   third mechanism here.
+3. `one_sentence_summary_usage` **is** in the composer's predicted emit set for
+   an `llm` arm. Verified empirically by constructing the probe transform the
+   walker uses (`_producer_emit_set` → `_output_schema_config.guaranteed_fields`,
+   `state.py:2815-2818`): under **every** authored schema mode the arm predicts
+   `('one_sentence_summary', 'one_sentence_summary_model', 'one_sentence_summary_usage')`.
+4. Therefore, had the fixed boundary path run with the arm emit set,
+   `extras = producer_emit - consumer_locked_input` would have been non-empty,
+   `_locked_input_extras_error` would have returned an entry, and `/validate`
+   would have failed.
+
+`/validate` returned `is_valid=true`. **So the arm emit set never reached the
+Rule A comparison.** This is not the boundary `3d77d15bd` covers.
+
+## Answers to the four questions
+
+**1. What does the check cover, and where is it invoked?**
+`3d77d15bd` adds an extras-polarity walker to `_check_schema_contracts` in
+`web/composer/state.py` — one function, reached by the ordinary
+`CompositionState.validate()` path, so it *does* run on freeform compose.
+It unions `row_union` arm emit sets (`_row_union_definite_emits`), traverses
+**gates only** (`_connection_definite_emits`), recurses nested unions, and
+contributes **∅ for `queue` and `coalesce`** — the fix's own comment calls
+extending it to queues "a drop-in branch here, left to the track that owns
+queue contract semantics." Rule A's boundary path is entered **only when the
+presence walk abstained** (`if actual_producer is None:`, `state.py:3189`);
+`_producer_entry_row_union_boundary` returns `None` for any intermediate node
+that is neither a `gate` nor a `row_union`.
+
+**2. Does the provenance-vs-ordinary-field distinction explain it? Partly —
+and this is the PRIMARY mechanism (no confound).**
+The subtraction itself is kind-agnostic. But its *input* is not:
+`_producer_emit_set` returns the transform's own `guaranteed_fields`, never the
+fields it passes through from upstream. Reproduced locally — with the source
+declaring `complaint_id`/`complaint_text` as guaranteed and the mapper
+accepting only `verdict`, the reported extras were still exactly
+`('verdict_model', 'verdict_usage')`. Even an `llm` arm authored in `fixed`
+mode *declaring* `complaint_id`/`complaint_text` predicts only the trio.
+**So the live rejection of `complaint_text` could never have been predicted by
+this rule under any topology.** That is a gap `3d77d15bd` never claimed to
+close, and it is wider than the ticket.
+
+**3. Is the failing node across a `row_union` boundary? (secondary mechanism)**
+Not determinable from the evidence supplied — the authored graph is live-only
+and no round-3 artifact exists in the repo. But it does not need to be: step 4
+of the deduction proves the union's arm emits never reached the check, which
+means the mapper is **not** a gate-only-chained direct consumer of the union.
+The masking mechanism is reproduced: inserting **one** non-locked
+(`mode: observed`) `field_mapper` between the `row_union` and the fixed-mode
+consumer takes `actual_producer is None` to False, so the boundary path is
+skipped and `_producer_emit_set` returns only the relay's own guarantees —
+`locked_input_extras` went from `[('verdict_model','verdict_usage')]` in the
+control to **`[]`**. g08's graph carries auto-wired safety controls
+(`prompt_shield_auto_*`, `safety_arm_*`), so an intervening resolvable node is
+the expected shape, not an exotic one.
+
+**Confound — read this before citing the reproduction.** That repro also
+emitted a `transform_contract_violation` on the downstream mapper ("with
+`select_only: true` the mapping will only emit [(none)]"): the observed-mode
+relay did not merely bypass the extras rule, it made `verdict`'s arrival
+unprovable, collapsing the downstream contract picture more broadly. The live
+g08 validated **fully green** — no `transform_contract_violation` — so the
+reproduction demonstrates that the bypass is **reachable**, *not* that it is
+what fired live. The pass-through blindness of Q2 — the primary mechanism —
+carries no such confound and needs no assumption about the live topology.
+
+**4. `integrity.closure: "open"` — a second finding, not yet decided.**
+`closure` is `"closed"` only when `emitted == terminal` and
+`missing_terminal_outcomes == 0` (`web/execution/accounting.py:194-200`).
+Here emitted=4, terminal=3, missing=1, and notably **failed=0** — the row that
+hit the mapper failure recorded *no* terminal outcome at all: not
+`(FAILURE, ON_ERROR_ROUTED)`, not the enumerated `(FAILURE, UNROUTED)` pair.
+The accounting is *honest* about it (that is the fail-closed posture working),
+so this is not a data-integrity breach. Whether abort-with-stranded-tokens is
+the intended contract for a fatal transform input-validation failure is a
+separate question from this triage; **track it as its own observation** rather
+than folding it into the reopen/sibling call.
+
+**Independently corroborated.** The parallel g11 triage (appended to
+`round3-graph-corpus.md`, run `a4f534df`, session `11abed43`) reached the same
+conclusion from a different graph and proposes it as its **F2**: *"Input-validation
+`PluginContractViolation` raises without recording a terminal outcome, leaving
+the token pending and run integrity `open`"* (P2), noting it is an **engine**
+defect at the raise site and not llm-specific. Two independent graphs on two
+different builds exhibiting it settles the "is this expected?" question: **it is
+a defect, not the intended abort contract.** File it once — do not duplicate
+across the two triages.
+
+## Distinguishing mechanism, stated for the sibling ticket
+
+| | `elspeth-9d13900064` (fixed) | Proposed sibling |
+|---|---|---|
+| **Fields at issue** *(primary — no confound)* | plugin-`guaranteed_fields` only: the LLM provenance trio | additionally **pass-through** upstream fields, which `_producer_emit_set` structurally omits under *every* authored schema mode — so they are unpredictable by this rule at any topology |
+| **Presence walk** *(secondary — reachable, not proven live)* | **abstains** at the `row_union`, so the new boundary path is entered | **resolves** to an intermediate node, so the boundary path at `state.py:3189` is never entered at all |
+| Cure shape | re-resolve the union boundary in the extras polarity | thread an accumulated pass-through emit set through resolvable intermediates, and enter the boundary walk independently of whether the presence walk abstained |
+
+## The one experiment that would pin which arm fired
+
+Fetch the authored composition state for session
+`04ff99fb-4147-4405-878d-c70a9be68e02` and read two things: **(a)** the node
+type and plugin of whatever produces `final_cleanup`'s input connection, and
+**(b)** `final_cleanup`'s `schema.fields`. If (a) is anything other than the
+`row_union` reached through gates only, the masking arm fired; if (a) *is* the
+union, then the pass-through arm fired alone and the sibling narrows to the
+emit-set model. Either way the recommendation is unchanged — both mechanisms
+sit outside `3d77d15bd`.

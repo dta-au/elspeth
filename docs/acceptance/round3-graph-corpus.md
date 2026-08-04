@@ -709,3 +709,204 @@ reconstructing another one.
 The stack's `CleanupDeadline` is `2026-08-06T00:00:00Z`. Capture ticket evidence
 (event listings, node requirement JSON, diagnostics) **while the instance is
 up** — round 2 learned that a live repro expires.
+
+---
+
+# g11 triage — new seam member?
+
+Date: 2026-08-05. Build `90d5508fd` / `web:10`. Run
+`a4f534df-2319-46be-95e0-453028375c13`, session
+`11abed43-406c-4460-9754-0f4a7b4ed5ea`. Read-only analysis; no code, AWS or
+tracker state was touched.
+
+**Recommendation: FILE NEW BUG (two findings).** Neither is a member of the
+restamp family, and no open ticket covers either.
+
+| | Proposed title | Priority |
+|---|---|---|
+| **F1** (primary) | `llm` transform validates its own declared output field as a required *input*, so any fixed/flexible-schema llm node fails every row | **P2** (borderline P1 — see below) |
+| **F2** (adjacent) | Input-validation `PluginContractViolation` raises without recording a terminal outcome, leaving the token pending and run integrity `open` | **P2** |
+
+**F1 mechanism, one sentence:** `LLMTransform` builds `input_schema` from the
+*whole* authored `schema_config` without subtracting its own
+`declared_output_fields`, so when the Composer authors `schema.mode: fixed` (or
+`flexible`) with the response field among `schema.fields`, the engine demands
+that field be present on the row *before* the transform that creates it has run.
+
+## 1. What plugin was `split_sentences`?
+
+It is an **`llm` transform**, not a text-splitting transform.
+
+- The registry has **no sentence splitter**. `line_explode` splits on line
+  delimiters and `json_explode` explodes an array field
+  (`src/elspeth/plugins/transforms/line_explode.py:233`,
+  `json_explode.py:151`, both `creates_tokens = True`); neither splits prose.
+  With nothing in the catalogue that does the job, using an LLM is a reasonable
+  authoring choice, not a Composer error.
+- The error's schema name proves the plugin. `input_schema` is named
+  `f"{self.name}Schema"` (`llm/transform.py:1414-1418`), and the run reported
+  `llmSchema` — i.e. `self.name == "llm"`, the `llm` plugin, carried on node
+  `transform_split_sentences_1d949217ec64`.
+
+**Does it declare an output field contract, and does the name match?** Yes, and
+yes — `declared_output_fields` is populated on both strategy branches
+(`llm/transform.py:1477`, `:1514`). The failure is **not** a name mismatch.
+`sentences` is declared correctly; the defect is which *side* of the transform
+the declaration binds to. The same authored `schema_config` feeds **both**
+`input_schema` (`:1414`) and, via the strategy dispatch, the output schema — the
+code comment at `:1419-1421` states the split explicitly. One authored schema
+serving as both contracts is only coherent if the output-only fields are
+subtracted from the input half, and they are not.
+
+The row confirms it: `{'announcement': …, …_model: 'anthropic/claude-sonnet-4-6'}`
+is exactly the `llm` **source**'s output — its response field plus the
+auto-appended `*_usage`/`*_model` provenance side-fields. The row travelled
+source → llm transform correctly. Nothing upstream was broken.
+
+## 1b. Fix site: the engine, not the authoring surface
+
+Declaring a transform's own response field in `schema.fields` is **legal
+authoring** — nothing anywhere rejects it:
+
+- `declared_output_fields` is consumed **only** by ADR-011 runtime *output*
+  verification (`engine/executors/declared_output_fields.py:70-124`, which
+  checks `declared - runtime_observed` on emitted rows). It is never compared
+  against `input_schema` or `schema_config`, at config time or at web-validate
+  time.
+- No config validator compares `response_field` to `schema_config.fields` for
+  the transform.
+
+So the Composer did nothing illegal, and the fix belongs in `input_schema`
+construction — not in a new composer guard.
+
+**Prior art exists, on the source side.** The llm **source** already performs
+exactly this reconciliation:
+`build_llm_source_output_schema_config(schema_config, response_field)`
+(`plugins/transforms/llm/__init__.py:168-193`, called from
+`plugins/sources/llm/config.py:107`) reconciles authored fields against the
+response field and the guaranteed suffixes, and its docstring records that
+`required_fields` are "rejected outright because a source has no input row to
+require fields of (**elspeth-fb202d3793**)".
+
+That is the *same confusion* — authored fields wrongly treated as required
+inputs — already diagnosed and fixed once, on the source. The transform never
+got the equivalent. `52beec400`'s own commit message says as much: "the llm
+SOURCE validates authored fields, the transform never did." **F1 is the
+transform-side half of `elspeth-fb202d3793`**, and that ticket is the model the
+fixer should mirror.
+
+**What the fix is *not*.** Blanket-relaxing `input_schema` — dropping required
+fields, or widening to `extra="allow"` — would silently permit a *genuinely
+missing declared input* field, the exact masking `0e960ef0e` wrote tests to
+prevent. The correct subtraction is narrow: remove only the fields **this node
+produces**, which is precisely `declared_output_fields`, already computed at
+`llm/transform.py:1477`/`:1514`. Getting this backwards would repeat the
+sweep's mistake in reverse.
+
+## 2. Is this the next member of the restamp family? **No.**
+
+The four restamps all fix the **emit** path — `post_emission_check` firing
+`SchemaConfigModeViolation` because *inferred* output metadata diverged from
+*declared* metadata on the required / nullable / `python_type` axes. Every
+commit message says so (`0e960ef0e`, `39e419c24`, `52beec400`, `090ba13e8`).
+
+This failure is on the **input** path, is raised by a different check
+(`transform.input_schema.model_validate(input_dict, strict=True)`,
+`engine/executors/transform.py:373`), throws a different exception
+(`PluginContractViolation`, not `SchemaConfigModeViolation`), and the field is
+**genuinely absent** rather than present-with-wrong-metadata.
+
+That distinction is not incidental — the restamp family deliberately excludes
+it. `0e960ef0e`'s own message pins that its tests assert "the restamp never
+masks a genuinely absent declared field." A restamp here would be the wrong
+fix; it would paper over a real absence.
+
+Note also that `llm` **did** receive its restamp (`52beec400`), so this is not a
+skipped-plugin gap. Sibling construction is uniform: `blob_csv_expand:210`,
+`blob_fetch:319`, `type_coerce:317`, `web_scrape:554`,
+`azure/document_intelligence:376` all build `input_schema` from the authored
+config the same way. `llm` is not an outlier in *construction* — it is the
+plugin where the pattern bites hardest, because its declared output field is
+its whole purpose.
+
+## 3. Considered and excluded, or missed?
+
+**Neither — out of frame.** The parity sweep and `fae0599e2`'s registry shapes
+14–16 characterise emit-side and graph-build-side agreement. The input-schema
+seam was never in the sweep's scope, so there was no decision to exclude it.
+Recording it as "missed by the sweep" would misattribute; it is a *new* seam
+adjacent to the one the sweep closed, and it is the sweep's natural next
+question: *the emit side now agrees with the declaration — does the input side?*
+
+## 4. Blast radius and why P2
+
+Confined to `fixed` and `flexible` schema modes. `create_schema_from_config`
+short-circuits observed mode to `extra="allow"` with no required fields
+(`plugins/infrastructure/schema_factory.py:108-110`), so observed-mode llm nodes
+— the Composer's documented default — are immune. Fixed (`extra="forbid"`) and
+flexible (`extra="allow"`, still requires declared fields) both fail.
+
+When it bites it is total: **every** row fails, run output is nil. Both
+authoring gates pass first — compose succeeded and `/validate` returned
+`is_valid=true` — so the user gets a green light and an empty result with an
+internal-sounding error. That is the battery's central theme (compose's
+authoring-time model diverging from runtime enforcement) in a **new** location,
+which is why it is borderline P1. Filed P2 for consistency with the family's
+precedent (`elspeth-5a372d3267`, `elspeth-ed2c2315d7` are both P2); raise to P1
+if the Composer authors fixed/flexible on llm nodes routinely rather than rarely.
+
+**One fact precedent does not cover, for the lead to weigh:** `5a372d3267` was
+*caught* — execution validation rejected the graph before it ran. F1 is caught by
+**nothing**. Compose succeeds, `/validate` returns `is_valid=true`, execute
+returns 202, and the failure surfaces only as a runtime crash with an
+internal-sounding message. There is no gate between the user and the broken run,
+which is a materially worse posture than the P2 precedent it is being filed
+alongside.
+
+**Confirmed pass, worth recording separately:** `/validate` returning
+`is_valid=true` on this graph means round-2's `graph_structure` rejection
+(`elspeth-5a372d3267`, llm source vs dynamic-schema producer) **no longer
+fires** on this build. Round-3 g11 should record that as the ticket's live
+evidence — the new failure is downstream of it and does not undermine it.
+
+## 5. Finding F2 — the pending token is a second defect
+
+Accounting shows `tokens emitted=1 terminal=0 succeeded=0 failed=0 structural=0
+pending=1`, `integrity.closure="open"`, `missing_terminal_outcomes=1`.
+
+**F2 is not llm-specific and is not a sibling of F1.** The unrecorded raise sits
+in the **shared transform executor** (`engine/executors/transform.py:373`), not
+in any plugin. *Any* transform whose input validation fails strands its token the
+same way, whatever the plugin. File it against the executor with its own owner;
+g11 is merely the run that exposed it.
+
+This is **not** expected for a mid-graph transform failure, and it is visible in
+the same file. `_record_terminal_contract_failure` has exactly two call sites,
+`engine/executors/transform.py:358` (declaration-contract violations, pre-exec)
+and `:489` (post-emission contract violations). The input-validation block at
+`:372-377` sits **between** them and raises `PluginContractViolation` with **no
+terminal-outcome recording at all**. A token that dies there is never stamped,
+so the run closes with a token in `pending` — precisely the observed shape.
+
+The adjacent declaration path documents the intent (`:369-371`: "missing declared
+fields stay on the declaration-contract audit surface"), which makes the omission
+at `:373` look like an oversight rather than a design choice.
+
+**Overlap with `elspeth-47fa7c01eb`: adjacent, not duplicate.** That P1 is a
+*web projection* defect — `web/execution/schemas.py:491-492` re-derives the
+terminal-clean predicate and drops the quarantine disjunct, so a
+`completed_with_failures` run with `succeeded == 0` 500s every observability
+endpoint. F2 is an *engine* defect one layer down: a raise site that fails to
+record a terminal outcome at all. Different file, different layer, different
+mechanism. They interact — F2 manufactures exactly the zero-succeeded runs that
+trip 47fa7c01eb's 500 — so cross-link them, but do not fold F2 into it. Fixing
+the web projection would leave the token still unaccounted for.
+
+## Suggested next evidence
+
+Before filing, confirm F1's trigger directly from the session's authored
+pipeline: read the `split_sentences` node's `options.schema` and check that
+`mode` is `fixed`/`flexible` and that `fields` contains `sentences`. That single
+read converts the mechanism from strongly-inferred to observed. The session is
+on a stack with a `CleanupDeadline` of `2026-08-06T00:00:00Z` — capture the node
+JSON into the ticket while the instance is up.
