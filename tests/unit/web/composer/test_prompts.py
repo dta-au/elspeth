@@ -441,21 +441,23 @@ class TestBuildContextString:
             assert private not in context
 
     def test_context_includes_discovery_time_composer_hints(self) -> None:
-        """The LLM sees JIT hints even when it does not call list_* first."""
+        """The LLM sees JIT hints even when it does not call list_* first.
+
+        The discovery digest is the sole carrier: the duplicate top-level
+        ``plugin_hints`` block was deleted (elspeth-8c457883c2), so this
+        guarantee now rests entirely on the digest entries.
+        """
         catalog = _stub_catalog()
 
         context = build_catalog_context_string(catalog)
         parsed = json.loads(context.split("\n", 1)[1])
 
-        assert parsed["plugin_hints"] == {
-            "sources": {
-                "csv": ["Declare headerless CSV columns before routing by field."],
-            },
-            "transforms": {},
-            "sinks": {
-                "csv": ["Prefer json format=jsonl when the user asks for one record per line."],
-            },
-        }
+        digest = parsed["authoring_aids"]["discovery_digest"]["plugins"]
+        hints = {kind: {entry["name"]: entry["composer_hints"] for entry in entries} for kind, entries in digest.items()}
+
+        assert hints["sources"]["csv"] == ["Declare headerless CSV columns before routing by field."]
+        assert hints["sinks"]["csv"] == ["Prefer json format=jsonl when the user asks for one record per line."]
+        assert "plugin_hints" not in parsed
 
     def test_snapshot_unavailable_prompt_shield_is_hidden_from_dynamic_context(self) -> None:
         catalog: CatalogService = PromptShieldCatalog()
@@ -477,7 +479,10 @@ class TestBuildContextString:
         parsed = json.loads(context.split("\n", 1)[1])
 
         assert parsed["available_plugins"]["transforms"] == ["web_scrape"]
-        assert "azure_prompt_shield" not in parsed["plugin_hints"]["transforms"]
+        # The discovery digest is the only hints carrier since
+        # elspeth-8c457883c2, so it owns the hints-specific leak path.
+        digest_transforms = parsed["authoring_aids"]["discovery_digest"]["plugins"]["transforms"]
+        assert [entry["name"] for entry in digest_transforms] == ["web_scrape"]
 
     def test_includes_validation_summary(self) -> None:
         state = _empty_state()

@@ -29,7 +29,10 @@ from tests.unit.web.composer.test_prompts import (
     build_messages,
 )
 
-_CATALOG_KEYS = ('"available_plugins"', '"plugin_hints"', '"plugin_policy"', '"authoring_aids"')
+# Per-plugin composer hints ride inside "authoring_aids" (discovery digest);
+# the duplicate top-level "plugin_hints" block was deleted in
+# elspeth-8c457883c2.
+_CATALOG_KEYS = ('"available_plugins"', '"plugin_policy"', '"authoring_aids"')
 _STATE_KEYS = ('"current_state"', '"composer_progress"', '"schema_contract_evidence"')
 
 
