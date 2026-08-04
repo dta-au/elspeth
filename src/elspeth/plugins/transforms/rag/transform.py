@@ -55,7 +55,7 @@ class RAGRetrievalTransform(BaseTransform):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:87388d91eed894cc"
+    source_file_hash: str | None = "sha256:68c81d582151d7be"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
@@ -359,6 +359,7 @@ class RAGRetrievalTransform(BaseTransform):
                 output_row=output,
                 transform_adds_fields=True,
             )
+            output_contract = self._apply_declared_output_field_contracts(output_contract)
             output_contract = self._align_output_contract(output_contract)
             no_results_success_metadata: dict[str, Any] = {"chunk_count": 0, "no_results": True}
             if skipped_count > 0:
@@ -410,6 +411,7 @@ class RAGRetrievalTransform(BaseTransform):
             output_row=output,
             transform_adds_fields=True,
         )
+        output_contract = self._apply_declared_output_field_contracts(output_contract)
         output_contract = self._align_output_contract(output_contract)
 
         success_metadata: dict[str, Any] = {

@@ -12,9 +12,42 @@ import pytest
 from elspeth.contracts.errors import RetrievalNotReadyError
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.security.web import SSRFSafeRequest
+from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.retrieval.base import RetrievalError, RetrievalProvider
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
+from elspeth.testing import make_field
+
+# Observed mode forbids explicit field definitions, so author-declared output
+# field metadata reaches the emitted contract only under fixed/flexible mode.
+# The retrieval outputs are declared optional because the same field list also
+# builds the transform's INPUT schema, and no input row carries them yet.
+DECLARED_SCHEMA = {
+    "mode": "flexible",
+    "fields": [
+        "question: str",
+        "policy__rag_context: str?",
+        "policy__rag_score: float?",
+        "policy__rag_count: int",
+        "policy__rag_sources: str",
+    ],
+}
+
+
+def _run_post_emission_check(transform: BaseTransform, emitted_row: PipelineRow) -> None:
+    """Run the ADR-014 post-emission check that the transform executor runs on emission."""
+    from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
+
+    assert transform._output_schema_config is not None
+    verify_schema_config_mode(
+        output_schema_config=transform._output_schema_config,
+        emitted_rows=(emitted_row,),
+        plugin_name=transform.name,
+        node_id="rag_retrieval-1",
+        run_id="run-1",
+        row_id="row-1",
+        token_id="token-1",
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -213,6 +246,16 @@ def _safe_request_fake() -> SSRFSafeRequest:
 def _make_row(data: dict[str, Any]) -> PipelineRow:
     """Create a real PipelineRow."""
     contract = SchemaContract(mode="OBSERVED", fields=())
+    return PipelineRow(data, contract)
+
+
+def _make_declared_row(data: dict[str, Any]) -> PipelineRow:
+    """Create a PipelineRow whose query field already carries a declared contract."""
+    contract = SchemaContract(
+        mode="FLEXIBLE",
+        fields=(make_field("question", str, required=True, source="declared"),),
+        locked=True,
+    )
     return PipelineRow(data, contract)
 
 
@@ -843,6 +886,76 @@ class TestRAGTransformReadinessGuard:
                 count=-1,
                 message="corrupted",
             )
+
+
+class TestRAGDeclaredOutputFieldContracts:
+    """Tests for declared output field metadata on emitted contracts (elspeth-1f6493861b).
+
+    RAG creates its four retrieval fields, so contract propagation infers their
+    metadata from the runtime values it just wrote. When the author also declares
+    those fields in ``schema.fields``, the declaration flows into
+    ``_output_schema_config``, and ADR-014's post-emission check compares declared
+    ``python_type``/``required``/``nullable`` against the inferred metadata. Both
+    emit paths must therefore restamp the declaration the way the sibling
+    field-adding transforms do.
+    """
+
+    def test_results_present_emission_restamps_declared_optional_metadata(self) -> None:
+        """A declared-optional retrieval field emits nullable, not inferred non-nullable."""
+        chunks = [RetrievalChunk(content="Result 1", score=0.9, source_id="doc1", metadata={})]
+        transform, _ = _setup_transform_with_mock_provider(chunks, schema_config=DECLARED_SCHEMA)
+        row = _make_declared_row({"question": "What is RAG?"})
+
+        result = transform.process(row, _mock_ctx())
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        _run_post_emission_check(transform, result.row)
+        context_field = result.row.contract.get_field("policy__rag_context")
+        assert context_field.python_type is str
+        assert context_field.required is False
+        assert context_field.nullable is True
+        score_field = result.row.contract.get_field("policy__rag_score")
+        assert score_field.python_type is float
+        assert score_field.nullable is True
+
+    def test_no_results_continue_emission_restamps_declared_field_types(self) -> None:
+        """None sentinels infer as untyped, so the declared type must be restamped."""
+        transform, _ = _setup_transform_with_mock_provider(
+            chunks=[],
+            on_no_results="continue",
+            schema_config=DECLARED_SCHEMA,
+        )
+        row = _make_declared_row({"question": "obscure query"})
+
+        result = transform.process(row, _mock_ctx())
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        assert result.row["policy__rag_context"] is None
+        _run_post_emission_check(transform, result.row)
+        # The declared narrow type is stamped over a None sentinel. That is
+        # honest here because the declaration is nullable, and the wider
+        # created-field value-vs-declaration gap is tracked as elspeth-f1e7679e2a.
+        context_field = result.row.contract.get_field("policy__rag_context")
+        assert context_field.python_type is str
+        assert context_field.nullable is True
+        assert result.row.contract.get_field("policy__rag_count").python_type is int
+
+    def test_observed_mode_emission_keeps_inferred_metadata(self) -> None:
+        """Observed mode declares no fields, so emission stays purely inferred."""
+        chunks = [RetrievalChunk(content="Result 1", score=0.9, source_id="doc1", metadata={})]
+        transform, _ = _setup_transform_with_mock_provider(chunks)
+        row = _make_row({"question": "What is RAG?"})
+
+        result = transform.process(row, _mock_ctx())
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        assert transform._output_schema_config is not None
+        assert transform._output_schema_config.fields is None
+        _run_post_emission_check(transform, result.row)
+        assert result.row.contract.get_field("policy__rag_context").source == "inferred"
 
 
 def test_plugin_discoverable():
