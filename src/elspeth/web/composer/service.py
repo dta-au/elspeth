@@ -151,7 +151,7 @@ from elspeth.web.composer.protocol import (
     ToolArgumentError,
 )
 from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
-from elspeth.web.composer.reasoning import warn_if_not_reasoning_capable
+from elspeth.web.composer.reasoning import apply_reasoning_kwargs, warn_if_not_reasoning_capable
 from elspeth.web.composer.recipe_intent_routing import match_freeform_recipe_intent
 from elspeth.web.composer.recipes import (
     RecipeValidationError,
@@ -5547,6 +5547,9 @@ class ComposerServiceImpl:
                 kwargs["temperature"] = self._settings.composer_temperature
             if self._settings.composer_seed is not None:
                 kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
+            # Freeform tool-loop and prose calls are interactive tool
+            # choreography — discovery class (elspeth-dc459d438e).
+            apply_reasoning_kwargs(kwargs, model=self._model, effort=self._settings.composer_discovery_reasoning_effort)
             _apply_endpoint_kwargs(kwargs, base_url=self._endpoint_base_url, api_key=self._endpoint_api_key)
             response = await _litellm_acompletion(
                 **kwargs,
@@ -5580,6 +5583,9 @@ class ComposerServiceImpl:
                 kwargs["temperature"] = self._settings.composer_temperature
             if self._settings.composer_seed is not None:
                 kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
+            # Freeform tool-loop and prose calls are interactive tool
+            # choreography — discovery class (elspeth-dc459d438e).
+            apply_reasoning_kwargs(kwargs, model=self._model, effort=self._settings.composer_discovery_reasoning_effort)
             _apply_endpoint_kwargs(kwargs, base_url=self._endpoint_base_url, api_key=self._endpoint_api_key)
             response = await _litellm_acompletion(
                 **kwargs,
@@ -6090,6 +6096,7 @@ class ComposerServiceImpl:
             kwargs["temperature"] = self._settings.composer_temperature
         if self._settings.composer_seed is not None:
             kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
+        apply_reasoning_kwargs(kwargs, model=advisor_model, effort=self._settings.composer_advisor_reasoning_effort)
         _apply_endpoint_kwargs(kwargs, base_url=self._advisor_endpoint_base_url, api_key=self._advisor_endpoint_api_key)
         try:
             response = await asyncio.wait_for(
