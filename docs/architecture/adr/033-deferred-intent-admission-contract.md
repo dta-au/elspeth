@@ -314,3 +314,17 @@ stated option values possible.
 - `src/elspeth/web/composer/guided/planning.py:2058`,
   `src/elspeth/web/sessions/routes/composer/guided.py:3043-3051` — the
   independent fail-closed net at wire confirmation.
+
+## Erratum (2026-08-04)
+
+The rejection-path clause above requires contradiction rejections to
+route through `apply_deferred_clarification` and records the
+`DeferredRequestUnchanged` return as a regression to correct. As
+adopted (lane A, release merge `50d57e07d`), the EDIT path stands
+corrected against that clause: on the EDIT path a contradiction
+returns `DeferredRequestUnchanged` with a distinct named refusal, and
+the original deferred intent is retained intact. The retention-net
+routing clause's anti-model was the silent drop of the new
+instruction (R2-F15); an EDIT-path refusal that leaves the targeted
+intent exactly as it was and names the conflict drops nothing. This
+is the adopted form.
