@@ -227,6 +227,7 @@ def resolve_deferred_intent_management(
             catalog=catalog,
             guided=guided,
             originating_message_content=originating_message_content,
+            replacing_intent_id=existing.intent_id,
         )
         if type(disposition) is not DeferredIntentAccepted:
             return disposition
