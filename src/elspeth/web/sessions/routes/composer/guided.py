@@ -2523,6 +2523,7 @@ async def post_guided_respond(
     body: GuidedRespondRequest,
     request: Request,
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
+    _inflight_tally: None = Depends(_track_compose_inflight),
 ) -> GuidedRespondResponse:
     """Settle one schema-8 guided response as a fenced atomic cohort."""
     owned_session = await _verify_session_ownership(session_id, user, request)
