@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import uuid
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -51,6 +52,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.execution.schemas import ValidationError, ValidationReadiness, ValidationResult
+from elspeth.web.sessions.protocol import SessionServiceProtocol
 
 _ROOT = Path(__file__).resolve().parents[4]
 
@@ -2158,6 +2160,11 @@ async def drive_try_terminate(
             )
         )
     )
+    # elspeth-2306940c70: a terminal END-gate block persists a durable
+    # withheld-turn disclosure, so the gate needs a sessions service and a
+    # UUID-shaped session id even in this advisor-focused harness.
+    if service._sessions_service is None:
+        service._sessions_service = MagicMock(spec=SessionServiceProtocol, add_message=_AsyncRecorder(return_value=None))
     kwargs = {}
     if deadline is not None:
         kwargs["deadline"] = deadline
@@ -2166,7 +2173,7 @@ async def drive_try_terminate(
         message=message,
         llm_messages=[] if llm_messages is None else llm_messages,
         state=state,
-        session_id="s1",
+        session_id=str(uuid.uuid4()),
         current_state_id="cs1",
         initial_version=initial_version,
         user_id="alice",
@@ -2346,6 +2353,7 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
     )
     blocked_result = MagicMock(wraps=service._advisor_blocked_result)
     service._advisor_blocked_result = blocked_result
+    service._sessions_service = MagicMock(spec=SessionServiceProtocol, add_message=_AsyncRecorder(return_value=None))
     runtime_preflight = ValidationResult(
         is_valid=True,
         checks=[],
@@ -2355,7 +2363,7 @@ async def test_end_gate_first_flag_without_repair_continue_has_distinct_reason(m
 
     outcome = await service._evaluate_terminal_no_tool_advisor_gate(
         state=clean_runnable_state,
-        session_id="s1",
+        session_id=str(uuid.uuid4()),
         current_state_id="cs1",
         assistant_message=_AssistantMessage(),
         llm_messages=[],
@@ -3292,3 +3300,240 @@ def test_end_checkpoint_problem_summary_carries_degeneracy_rubric(make_service, 
 
     assert "visible prompt_template excerpt" not in early_summary
     assert "fabricate" not in early_summary
+
+
+# ---------------------------------------------------------------------------
+# elspeth-2306940c70: a terminal END-gate withhold must leave a durable,
+# provider-visible disclosure so LATER turns' model context knows the
+# preceding request was not confirmed as applied. Without it the withheld
+# turn replays as an EMPTY assistant message (raw_assistant_content="") and
+# the next-turn model reconstructs the refusal as silent compliance —
+# telling the user their refused instruction is live.
+# ---------------------------------------------------------------------------
+
+
+def test_advisor_withheld_control_envelope_round_trips_to_user_role() -> None:
+    from elspeth.web.composer.control_messages import (
+        advisor_signoff_withheld_control_envelope,
+        replay_composer_control_message,
+    )
+
+    content = "[composer-system] The completion advisory review did not clear."
+    replayed = replay_composer_control_message(
+        stored_role="audit",
+        writer_principal="compose_loop",
+        content=content,
+        tool_calls=[advisor_signoff_withheld_control_envelope(content)],
+    )
+
+    assert replayed == {"role": "user", "content": content}
+
+
+@pytest.mark.parametrize("tamper", ("content", "stored_role", "writer_principal", "provider_role", "origin"))
+def test_advisor_withheld_control_replay_fails_closed_on_provenance_tamper(tamper: str) -> None:
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.composer.control_messages import (
+        advisor_signoff_withheld_control_envelope,
+        replay_composer_control_message,
+    )
+
+    content = "[composer-system] The completion advisory review did not clear."
+    envelope = advisor_signoff_withheld_control_envelope(content)
+    stored_role = "audit"
+    writer_principal = "compose_loop"
+    if tamper == "content":
+        content += " altered"
+    elif tamper == "stored_role":
+        stored_role = "user"
+    elif tamper == "writer_principal":
+        writer_principal = "route_user_message"
+    elif tamper == "provider_role":
+        envelope["provider_role"] = "system"
+    else:
+        envelope["origin"] = "not_a_registered_origin"
+
+    with pytest.raises(AuditIntegrityError):
+        replay_composer_control_message(
+            stored_role=stored_role,
+            writer_principal=writer_principal,
+            content=content,
+            tool_calls=[envelope],
+        )
+
+
+@pytest.mark.asyncio
+async def test_end_gate_terminal_block_persists_withheld_disclosure_before_returning(make_service, clean_runnable_state):
+    from elspeth.web.composer.control_messages import replay_composer_control_message
+
+    service = make_service()
+    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: contradictory revision")
+    )
+    sessions = MagicMock(spec=SessionServiceProtocol, add_message=_AsyncRecorder(return_value=None))
+    service._sessions_service = sessions
+    session_id = str(uuid.uuid4())
+    runtime_preflight = ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+
+    outcome = await service._evaluate_terminal_no_tool_advisor_gate(
+        state=clean_runnable_state,
+        session_id=session_id,
+        current_state_id="cs1",
+        assistant_message=_AssistantMessage(),
+        llm_messages=[],
+        recorder=make_recorder(),
+        progress=None,
+        advisor_checkpoint_passes_used=0,
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_tool_call_turn=False,
+        allow_repair_continue=False,
+        runtime_preflight=runtime_preflight,
+        user_message="remove the gate entirely but keep the guarantee",
+    )
+
+    assert outcome.action == "return"
+    assert sessions.add_message.await_count == 1
+    persist = sessions.add_message.await_args
+    assert persist.args[1] == "audit"
+    disclosure = persist.args[2]
+    assert "withheld" in disclosure
+    assert "Do not assume that request was applied" in disclosure
+    assert persist.kwargs["writer_principal"] == "compose_loop"
+    (envelope,) = persist.kwargs["tool_calls"]
+    assert envelope["origin"] == "advisor_signoff_withheld"
+    # The durable row must replay to a user-role provider message.
+    replayed = replay_composer_control_message(
+        stored_role="audit",
+        writer_principal="compose_loop",
+        content=disclosure,
+        tool_calls=[envelope],
+    )
+    assert replayed == {"role": "user", "content": disclosure}
+
+
+@pytest.mark.asyncio
+async def test_end_gate_terminal_block_skips_disclosure_without_session(make_service, clean_runnable_state):
+    """No durable store exists without a session — the gate must still block cleanly."""
+    service = make_service()
+    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: contradictory revision")
+    )
+    runtime_preflight = ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+
+    outcome = await service._evaluate_terminal_no_tool_advisor_gate(
+        state=clean_runnable_state,
+        session_id=None,
+        current_state_id=None,
+        assistant_message=_AssistantMessage(),
+        llm_messages=[],
+        recorder=make_recorder(),
+        progress=None,
+        advisor_checkpoint_passes_used=0,
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_tool_call_turn=False,
+        allow_repair_continue=False,
+        runtime_preflight=runtime_preflight,
+        user_message="remove the gate entirely but keep the guarantee",
+    )
+
+    assert outcome.action == "return"
+    assert outcome.result.runtime_preflight.readiness.completion_ready is False
+
+
+@pytest.mark.asyncio
+async def test_withheld_turn_replays_disclosure_into_next_turn_model_history(tmp_path: Path, make_service, clean_runnable_state):
+    """Battery-round-2 repro (session b2ad4da8): the model-facing history for
+    the turn AFTER an advisor withhold must disclose the non-completion.
+
+    Pre-fix the withheld turn contributed only an empty assistant message, so
+    the recovery-turn model saw silent compliance and told the user the
+    refused instruction was live.
+    """
+    from elspeth.web.sessions.routes._helpers import _composer_chat_history
+
+    from .conftest import build_test_sessions_service
+
+    sessions = build_test_sessions_service(data_dir=tmp_path)
+    session = await sessions.create_session("battery-user", "Withheld disclosure", "local")
+    contradiction = "Remove the gate entirely but keep the guarantee that only amounts>100 reach big_amounts."
+    await sessions.add_message(
+        session.id,
+        "user",
+        contradiction,
+        writer_principal="route_user_message",
+    )
+
+    service = make_service()
+    service._sessions_service = sessions
+    service._missing_pending_interpretation_review_sites = _AsyncRecorder(return_value=())
+    service._surface_pt_and_gate_orphans_or_none = _AsyncRecorder(return_value=None)
+    service._run_advisor_checkpoint = _AsyncRecorder(
+        return_value=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: contradictory revision")
+    )
+    runtime_preflight = ValidationResult(
+        is_valid=True,
+        checks=[],
+        errors=[],
+        readiness=ValidationReadiness(authoring_valid=True, execution_ready=True, completion_ready=True, blockers=[]),
+    )
+
+    outcome = await service._evaluate_terminal_no_tool_advisor_gate(
+        state=clean_runnable_state,
+        session_id=str(session.id),
+        current_state_id=None,
+        assistant_message=_AssistantMessage(),
+        llm_messages=[],
+        recorder=make_recorder(),
+        progress=None,
+        advisor_checkpoint_passes_used=0,
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_tool_call_turn=False,
+        allow_repair_continue=False,
+        runtime_preflight=runtime_preflight,
+        user_message=contradiction,
+    )
+    assert outcome.action == "return"
+    result = outcome.result
+    # Persist the terminal assistant row exactly as the route does
+    # (sessions/routes/composer/compose.py): content=message, raw_content="".
+    await sessions.add_message(
+        session.id,
+        "assistant",
+        result.message,
+        raw_content=result.raw_assistant_content,
+        writer_principal="compose_loop",
+    )
+
+    history = _composer_chat_history(await sessions.get_messages(session.id, limit=None))
+
+    # The withheld turn still replays the model's withheld prose as empty —
+    # the attribution rule pinned by
+    # test_augmented_assistant_history_treats_empty_raw_content_as_augmentation
+    # is unchanged.
+    assert history[-1] == {"role": "assistant", "content": ""}
+    # But the refusal is no longer invisible: a backend-attributed user-role
+    # disclosure sits between the refused instruction and the empty reply.
+    disclosures = [
+        message for message in history if message["role"] == "user" and "Do not assume that request was applied" in message["content"]
+    ]
+    assert len(disclosures) == 1
+    instruction_index = next(index for index, message in enumerate(history) if message["content"] == contradiction)
+    assert instruction_index < history.index(disclosures[0]) < len(history) - 1
+    # The disclosure must not be misattributed to the human user.
+    assert disclosures[0].get("_elspeth_user_authored") is not True
