@@ -74,15 +74,22 @@ diagnostics were sufficient to root-cause each from the run API alone.
   future F14-class exhaustion is diagnosable from CloudWatch by
   component + code without validator messages leaving the process.
 
-## Close recommendations (operator sign-off required)
+## Close dispositions
 
-- `elspeth-5904b1683a` (F14) — **recommend close**: 10/10 on the deployed
-  wave-3 tip, `fix_verification` satisfied.
-- `elspeth-1033d97b6c` (D6 Textract region) — **recommend close**: both
-  enforcement arms observed live.
-- `elspeth-454892147c` (retry exhaustion) — **keep open**: unsampled this
-  round.
-- `elspeth-49b467d91a` (prompt retention) — **keep in verifying**: unsampled
-  live; unit coverage green.
+Operator authorized the two recommended closes on 2026-08-04; both were
+executed with `close_commit release/0.7.2@dc79b5127`.
+
+- `elspeth-5904b1683a` (F14) — **CLOSED**: 10/10 on the deployed wave-3 tip,
+  `fix_verification` satisfied.
+- `elspeth-1033d97b6c` (D6 Textract region) — **CLOSED**: both enforcement
+  arms observed live.
+- `elspeth-454892147c` (retry exhaustion) — **open**: unsampled this round.
+- `elspeth-49b467d91a` (prompt retention) — **verifying**: unsampled live;
+  unit coverage green.
 
 Stochastic items are not closed on a single pass.
+
+Both battery P1s (`elspeth-9c01c943a5`, `elspeth-558fa5a321`) are assigned to
+one fixer as a single seam. The stranded session for the second remains live
+on the acceptance instance (`e445e8e2-9ccf-48a5-8fd8-10ffdc68b5f9`) for direct
+inspection; the API-level divergence is recorded on that ticket.
