@@ -555,6 +555,8 @@ def _model(completion: _ScriptedCompletion, **overrides: object) -> PlannerModel
         "max_tool_calls_per_turn": 3,
         "max_api_attempts": 1,
         "api_retry_base_seconds": 0.0,
+        "discovery_reasoning_effort": "none",
+        "candidate_reasoning_effort": "none",
     }
     values.update(overrides)
     return PlannerModelConfig(**values)  # type: ignore[arg-type]
@@ -6582,3 +6584,77 @@ async def test_threshold_guard_reads_the_current_stage_intent_not_the_message_tr
     )
 
     assert proposal.proposal.repair_count == 0
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_rides_planner_phases(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Discovery/ordinary turns carry the discovery knob; repair turns carry
+    the candidate knob (elspeth-dc459d438e).
+
+    Request 2 — the first-shot candidate submission on a full-surface turn —
+    DELIBERATELY rides the discovery knob: the validation gates catch a
+    shallow first shot and the repair round (request 3) re-thinks at
+    candidate effort. See PlannerModelConfig's field comment.
+    """
+    completion = _ScriptedCompletion(
+        _response(("list_sources", {})),
+        _response(("emit_pipeline_proposal", {"pipeline": _invalid_pipeline(tmp_path)})),
+        _response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})),
+    )
+
+    proposal = await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        model_overrides={
+            "discovery_reasoning_effort": "low",
+            "candidate_reasoning_effort": "high",
+        },
+    )
+
+    assert proposal.proposal.repair_count == 1
+    efforts = [request.get("reasoning_effort") for request in completion.requests]
+    assert efforts == ["low", "low", "high"]
+    assert all("reasoning" not in request for request in completion.requests), (
+        "non-openrouter models must use LiteLLM's reasoning_effort, never the OpenRouter-native object"
+    )
+
+
+@pytest.mark.asyncio
+async def test_openrouter_models_get_the_native_reasoning_object(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        model_overrides={
+            "model_identifier": "openrouter/anthropic/claude-sonnet-5",
+            "discovery_reasoning_effort": "low",
+            "candidate_reasoning_effort": "high",
+        },
+    )
+
+    (sent,) = completion.requests
+    assert sent["reasoning"] == {"effort": "low"}
+    assert "reasoning_effort" not in sent
+
+
+@pytest.mark.asyncio
+async def test_none_reasoning_effort_leaves_planner_kwargs_unhinted(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    completion = _ScriptedCompletion(_response(("emit_pipeline_proposal", {"pipeline": _pipeline(tmp_path)})))
+
+    await _plan(tmp_path=tmp_path, tool_context=tool_context, completion=completion)
+
+    (sent,) = completion.requests
+    assert "reasoning" not in sent
+    assert "reasoning_effort" not in sent

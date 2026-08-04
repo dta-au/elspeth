@@ -71,6 +71,8 @@ async def test_call_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
     assert "api_key" not in captured
     # Byte-identical no-regression guarantee: the full kwargs dict is exactly
     # what pre-affordance code sent for this call, no more, no less.
+    # No reasoning key either: bare OpenAI-surface aliases stay unhinted
+    # (elspeth-dc459d438e / elspeth-9a46553771).
     assert captured == {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}], "tools": []}
 
 

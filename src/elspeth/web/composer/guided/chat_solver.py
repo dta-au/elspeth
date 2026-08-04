@@ -72,6 +72,7 @@ from elspeth.web.composer.llm_response_parsing import (
     supports_anthropic_prompt_cache_markers,
 )
 from elspeth.web.composer.progress import emit_progress, model_call_progress_event, tool_batch_progress_event
+from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.service import _apply_endpoint_kwargs, _litellm_acompletion
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.composer.tools._dispatch import get_discovery_tool_definitions
@@ -1930,6 +1931,7 @@ class DeferredIntentManagementChatRequest:
     # dataclass repr that might land in a log line.
     api_base: str | None = None
     api_key: str | None = field(default=None, repr=False)
+    reasoning_effort: str | None = None
 
 
 def _deferred_management_outcome_from_message(message: Any) -> DeferredIntentManagementChatOutcome:
@@ -1978,6 +1980,7 @@ async def maybe_manage_deferred_intent_chat(
         kwargs["temperature"] = request.temperature
     if request.seed is not None:
         kwargs["seed"] = request.seed
+    apply_reasoning_kwargs(kwargs, model=request.model, effort=request.reasoning_effort)
     _apply_endpoint_kwargs(kwargs, base_url=request.api_base, api_key=request.api_key)
     started_at = datetime.now(UTC)
     started_ns = time.monotonic_ns()
@@ -2271,6 +2274,7 @@ async def maybe_resolve_step_1_source_chat(
     # the advisor's. None/None reproduces the exact pre-affordance kwargs.
     api_base: str | None = None,
     api_key: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> Step1SourceChatOutcome:
     """Try to resolve a Step-1 schema-form chat message into source data.
 
@@ -2376,6 +2380,7 @@ async def maybe_resolve_step_1_source_chat(
             kwargs["temperature"] = temperature
         if seed is not None:
             kwargs["seed"] = seed
+        apply_reasoning_kwargs(kwargs, model=model, effort=reasoning_effort)
         _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
@@ -2934,6 +2939,7 @@ async def maybe_resolve_step_2_sink_chat(
     # the advisor's. None/None reproduces the exact pre-affordance kwargs.
     api_base: str | None = None,
     api_key: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> Step2SinkChatOutcome:
     """Resolve a Step-2 chat message into a sink config via a discovery loop.
 
@@ -3042,6 +3048,7 @@ async def maybe_resolve_step_2_sink_chat(
             kwargs["temperature"] = temperature
         if seed is not None:
             kwargs["seed"] = seed
+        apply_reasoning_kwargs(kwargs, model=model, effort=reasoning_effort)
         _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
         started_at = datetime.now(UTC)
         started_ns = time.monotonic_ns()
@@ -3350,6 +3357,7 @@ async def solve_step_chat(
     # the advisor's. None/None reproduces the exact pre-affordance kwargs.
     api_base: str | None = None,
     api_key: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     """Send a user chat message to the LLM scoped to *step*; return the assistant reply.
 
@@ -3413,6 +3421,7 @@ async def solve_step_chat(
         kwargs["temperature"] = temperature
     if seed is not None:
         kwargs["seed"] = seed
+    apply_reasoning_kwargs(kwargs, model=model, effort=reasoning_effort)
     _apply_endpoint_kwargs(kwargs, base_url=api_base, api_key=api_key)
     started_at = datetime.now(UTC)
     started_ns = time.monotonic_ns()

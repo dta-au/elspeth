@@ -151,6 +151,7 @@ from elspeth.web.composer.protocol import (
     ToolArgumentError,
 )
 from elspeth.web.composer.provider_config import infer_provider_from_model_name, infer_provider_from_unprefixed_model_name
+from elspeth.web.composer.reasoning import apply_reasoning_kwargs, warn_if_not_reasoning_capable
 from elspeth.web.composer.recipe_intent_routing import match_freeform_recipe_intent
 from elspeth.web.composer.recipes import (
     RecipeValidationError,
@@ -1562,6 +1563,19 @@ class ComposerServiceImpl:
         self._catalog = catalog
         self._sessions_service = sessions_service
         self._model = settings.composer_model
+        # Boot advisory only — the litellm registry has known gaps (see
+        # elspeth.web.composer.reasoning), so a False here is a log line for
+        # operators, never a gate.
+        warn_if_not_reasoning_capable(
+            model=settings.composer_model,
+            role="primary",
+            effort=settings.composer_candidate_reasoning_effort,
+        )
+        warn_if_not_reasoning_capable(
+            model=settings.composer_advisor_model,
+            role="advisor",
+            effort=settings.composer_advisor_reasoning_effort,
+        )
         # Endpoint affordance (Phase 3 Task 2): resolved once here, not
         # re-derived per call. The bearer is unwrapped from SecretStr exactly
         # at this boundary and held only as a plain attribute on this
@@ -2901,6 +2915,8 @@ class ComposerServiceImpl:
                 max_tool_calls_per_turn=self._max_tool_calls_per_turn,
                 max_api_attempts=_LLM_API_MAX_ATTEMPTS,
                 api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
+                discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
+                candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
                 escape_hatch_model=self._settings.composer_advisor_model,
                 escape_hatch_provider=self._advisor_provider,
                 api_base=self._endpoint_base_url,
@@ -3308,6 +3324,8 @@ class ComposerServiceImpl:
                 max_tool_calls_per_turn=self._max_tool_calls_per_turn,
                 max_api_attempts=_LLM_API_MAX_ATTEMPTS,
                 api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
+                discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
+                candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
                 escape_hatch_model=self._settings.composer_advisor_model,
                 escape_hatch_provider=self._advisor_provider,
                 api_base=self._endpoint_base_url,
@@ -3605,6 +3623,8 @@ class ComposerServiceImpl:
                         max_tool_calls_per_turn=self._max_tool_calls_per_turn,
                         max_api_attempts=_LLM_API_MAX_ATTEMPTS,
                         api_retry_base_seconds=_LLM_API_RETRY_BASE_DELAY_SECONDS,
+                        discovery_reasoning_effort=self._settings.composer_discovery_reasoning_effort,
+                        candidate_reasoning_effort=self._settings.composer_candidate_reasoning_effort,
                         escape_hatch_model=self._settings.composer_advisor_model,
                         escape_hatch_provider=self._advisor_provider,
                         api_base=self._endpoint_base_url,
@@ -5543,6 +5563,9 @@ class ComposerServiceImpl:
                 kwargs["temperature"] = self._settings.composer_temperature
             if self._settings.composer_seed is not None:
                 kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
+            # Freeform tool-loop and prose calls are interactive tool
+            # choreography — discovery class (elspeth-dc459d438e).
+            apply_reasoning_kwargs(kwargs, model=self._model, effort=self._settings.composer_discovery_reasoning_effort)
             _apply_endpoint_kwargs(kwargs, base_url=self._endpoint_base_url, api_key=self._endpoint_api_key)
             response = await _litellm_acompletion(
                 **kwargs,
@@ -5576,6 +5599,9 @@ class ComposerServiceImpl:
                 kwargs["temperature"] = self._settings.composer_temperature
             if self._settings.composer_seed is not None:
                 kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
+            # Freeform tool-loop and prose calls are interactive tool
+            # choreography — discovery class (elspeth-dc459d438e).
+            apply_reasoning_kwargs(kwargs, model=self._model, effort=self._settings.composer_discovery_reasoning_effort)
             _apply_endpoint_kwargs(kwargs, base_url=self._endpoint_base_url, api_key=self._endpoint_api_key)
             response = await _litellm_acompletion(
                 **kwargs,
@@ -6086,6 +6112,7 @@ class ComposerServiceImpl:
             kwargs["temperature"] = self._settings.composer_temperature
         if self._settings.composer_seed is not None:
             kwargs[_COMPOSER_LLM_SEED_PARAM] = self._settings.composer_seed
+        apply_reasoning_kwargs(kwargs, model=advisor_model, effort=self._settings.composer_advisor_reasoning_effort)
         _apply_endpoint_kwargs(kwargs, base_url=self._advisor_endpoint_base_url, api_key=self._advisor_endpoint_api_key)
         try:
             response = await asyncio.wait_for(

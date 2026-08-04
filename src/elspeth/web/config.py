@@ -32,6 +32,7 @@ from elspeth.web.auth.urls import (
     validate_oidc_browser_origins,
     validate_oidc_issuer,
 )
+from elspeth.web.composer.reasoning import ReasoningEffort
 from elspeth.web.plugin_policy.profiles import AWSS3SourceProfileSettings, AWSTextractProfileSettings
 from elspeth.web.validation import (
     SERVER_SECRET_RESERVED_PREFIX,
@@ -193,6 +194,19 @@ class WebSettings(BaseModel):
     # server injects no allowlist. Set this only to host your own copy (a fork).
     tutorial_sample_base_url: str | None = Field(default=None)
     composer_model: str = "gpt-5.5"
+    # Reasoning-effort hints for the composer plane (elspeth-dc459d438e).
+    # All composer roles run reasoning-capable models; these knobs bound the
+    # thinking budget per call class instead of letting the model pick an
+    # unhinted budget that grows with the transcript (measured 120s tails on
+    # the tutorial planner, journal 2026-07-27..08-05). "none" sends no hint
+    # — the pre-feature behaviour and the opt-out for non-reasoning
+    # deployments. openrouter/ models are hinted via OpenRouter's native
+    # reasoning object, everything else via LiteLLM's reasoning_effort
+    # (Bedrock -> Anthropic thinking budgets, Azure -> native effort); see
+    # elspeth.web.composer.reasoning for the carve-out rationale.
+    composer_discovery_reasoning_effort: ReasoningEffort = "low"
+    composer_candidate_reasoning_effort: ReasoningEffort = "high"
+    composer_advisor_reasoning_effort: ReasoningEffort = "medium"
     # Operator affordance: point the PRIMARY composer role at any
     # OpenAI-compatible endpoint (a self-hosted gateway, a local dev proxy,
     # an agency-run translation layer) instead of the provider LiteLLM would
@@ -296,7 +310,10 @@ class WebSettings(BaseModel):
         ),
     )
     composer_advisor_max_prompt_tokens: int = Field(default=4000, ge=1)
-    composer_advisor_max_completion_tokens: int = Field(default=1500, ge=1)
+    # 8192 (was 1500): with advisor reasoning enabled the thinking budget
+    # shares max_tokens, and Anthropic thinking has a 1024-token floor that
+    # must fit inside it — 1500 left medium effort illegal or starved.
+    composer_advisor_max_completion_tokens: int = Field(default=8192, ge=1)
     composer_advisor_timeout_seconds: float = Field(default=60.0, gt=0)
     # Phase 5b Task 5 — interpretation-event rate limits (F-30/F-31).
     #

@@ -469,6 +469,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
     allow_plugin_reselection: bool = False,
     api_base: str | None = None,
     api_key: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> Step1SourceChatResult:
     """Wrap Step-1 ``resolve_source`` chat with the guided-chat fallback contract.
 
@@ -495,6 +496,7 @@ async def resolve_step_1_source_chat_with_auto_drop(
             allow_plugin_reselection=allow_plugin_reselection,
             api_base=api_base,
             api_key=api_key,
+            reasoning_effort=reasoning_effort,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         if type(outcome) is Step1SourceResolvedOutcome:
@@ -707,6 +709,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
     revision_target_index: int | None = None,
     api_base: str | None = None,
     api_key: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> Step2SinkChatResult:
     """Wrap Step-2 ``resolve_sink`` chat with the guided-chat fallback contract.
 
@@ -745,6 +748,7 @@ async def resolve_step_2_sink_chat_with_auto_drop(
             revision_target_index=revision_target_index,
             api_base=api_base,
             api_key=api_key,
+            reasoning_effort=reasoning_effort,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         if type(outcome) is Step2SinkResolvedOutcome:
@@ -933,6 +937,7 @@ async def solve_step_chat_with_auto_drop(
     context_block: StepChatContextInput | None = None,
     api_base: str | None = None,
     api_key: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> StepChatResult:
     """Wrap ``solve_step_chat`` with the synthetic-message-on-transient contract.
 
@@ -1012,6 +1017,7 @@ async def solve_step_chat_with_auto_drop(
             context_block=context_block,
             api_base=api_base,
             api_key=api_key,
+            reasoning_effort=reasoning_effort,
         )
         latency_ms = int((time.perf_counter() - started) * 1000)
         return StepChatResult(

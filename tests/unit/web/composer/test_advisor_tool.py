@@ -373,7 +373,10 @@ async def test_advisor_call_records_outer_invocation_and_inner_llm_call() -> Non
     assert mock_acompletion.call_count == 1
     advisor_call_kwargs = mock_acompletion.call_args.kwargs
     assert advisor_call_kwargs["model"] == "anthropic/claude-sonnet-4-6"
-    assert advisor_call_kwargs["max_tokens"] == 1500  # default completion cap
+    # 8192 (was 1500): advisor reasoning shares max_tokens and Anthropic
+    # thinking has a 1024-token floor that must fit inside it
+    # (elspeth-dc459d438e).
+    assert advisor_call_kwargs["max_tokens"] == 8192  # default completion cap
 
     # Outer ComposerToolInvocation should be present in the recorder.
     invocations = [inv for inv in result.tool_invocations if inv.tool_name == "request_advisor_hint"]
