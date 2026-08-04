@@ -192,6 +192,73 @@ reports "This indicates an upstream transform/source schema bug" for a row
 whose upstream behaved correctly. Two of this round's five findings needed the
 composed graph JSON, not the error message, to locate the real cause.
 
+## Compose-loop efficiency profile
+
+Measured from the authoritative record — `chat_messages` via
+`GET /api/sessions/{id}/messages`, corroborated by a read-only query against
+the session store (`ops-local/acceptance/{analyse_compose,make_inspect_override}.py`).
+17 sessions, 162 assistant turns, **193 tool calls**.
+
+**The loop is not bloated.** 6–12 assistant turns per compose at ~1.0–1.5 tool
+calls per turn. There is no call explosion and no runaway turn count.
+
+**Model reasoning is not persisted at all.** `chat_messages` has no reasoning
+column (`id, session_id, role, content, raw_content, tool_calls, tool_call_id,
+sequence_no, writer_principal, created_at, composition_state_id,
+parent_assistant_id`). `raw_content` is populated on only 60 of 542 rows, all
+assistant, 63–8462 chars, mean ~1000. So reasoning volume cannot be measured
+from the store — only its wall-clock effect is visible.
+
+**Tool histogram across every session:**
+
+| Tool | Calls | | Tool | Calls |
+|---|---:|---|---|---:|
+| `get_plugin_schema` | 60 | | `get_blob_content` | 4 |
+| `set_pipeline` | 52 | | `preview_pipeline` | 4 |
+| `patch_node_options` | 23 | | `get_plugin_assistance` | 4 |
+| `request_interpretation_review` | 17 | | `patch_output_options` | 3 |
+| `get_pipeline_state` | 14 | | `upsert_node` | 3 |
+
+`get_plugin_schema` + `set_pipeline` are **58% of all tool calls** — 3.5 schema
+lookups per compose.
+
+**Identical repeated calls track compose time almost monotonically.** Grouping
+on `(session, tool, byte-identical arguments)`:
+
+| Session | Compose | Identical repeats |
+|---|---|---|
+| g02 | 43s | 0 |
+| g10 | 69s | 0 |
+| g08-s2 | 106s | 1 |
+| g08-s3 | 151s | 1 |
+| g01 | 197s | 2 (`set_pipeline` ×3) |
+| g08-s1 | **271s → 422** | 3 (`set_pipeline` ×4) |
+
+Store-wide, `set_pipeline` is repeated byte-identically in six sessions
+(×3 twice, ×2 four times) and `patch_node_options` in four. The slow session's
+turn trace is the shape: `set_pipeline` at seq 7, 11, 13, 15, 18 with a single
+`get_pipeline_state` between, each rendering the same user-visible line —
+*"ELSPETH is applying a pipeline correction."* The model is re-issuing a
+rejected mutation unchanged rather than converging.
+
+Note this metric only catches **byte-identical** arguments, so it is a floor:
+near-identical repair retries are not counted.
+
+**Two ambient costs worth naming:**
+
+- **The advisor early checkpoint flagged 14 of 16 composes**
+  (`composer.advisor_checkpoint_pass ... phase=early verdict=flagged`). Whatever
+  its per-case merit, a ~88% flag rate is a near-constant repair tax rather
+  than an exception path.
+- **97 LiteLLM warnings** of *"Potential consecutive user/tool blocks. Trying
+  to merge"* on Bedrock calls, i.e. the conversation handed to the provider
+  repeatedly needs reshaping before it can be sent.
+
+**Reading:** the win is not in trimming turns or tools — it is in (a) not
+re-issuing rejected mutations unchanged, and (b) the advisor flag rate. A
+per-task reasoning budget should also compress the 43–272s spread directly,
+since turn *count* barely moves while wall-clock varies six-fold.
+
 ## Two things this round learned
 
 1. **Re-drive before concluding.** The first g07 attempt looked like a Textract
