@@ -117,7 +117,7 @@ class FieldMapper(BaseTransform):
     name = "field_mapper"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:41696d2528368d40"
+    source_file_hash: str | None = "sha256:801d37e5d5962e5c"
     config_model = FieldMapperConfig
     usage_when_to_use: str = (
         "Use to rename, select, or drop known row fields into a stable downstream shape, including "
@@ -361,6 +361,7 @@ class FieldMapper(BaseTransform):
             output_row=output,
             renamed_fields=renamed_fields,
         )
+        output_contract = self._apply_declared_output_field_contracts(output_contract)
         output_contract = self._align_output_contract(output_contract)
 
         return TransformResult.success(

@@ -4,11 +4,32 @@ import pytest
 
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.testing import make_field, make_pipeline_row
 from tests.fixtures.factories import make_context
 
 # Common schema config for dynamic field handling (accepts any fields)
 DYNAMIC_SCHEMA = {"mode": "observed"}
+
+# Observed mode forbids explicit field definitions, so declared output field
+# metadata reaches the emitted contract only under fixed/flexible mode.
+DECLARED_SCHEMA = {"mode": "fixed", "fields": ["dish: str", "cuisine: str"]}
+
+
+def _run_post_emission_check(transform: BaseTransform, emitted_row: PipelineRow) -> None:
+    """Run the ADR-014 post-emission check that the transform executor runs on emission."""
+    from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
+
+    assert transform._output_schema_config is not None
+    verify_schema_config_mode(
+        output_schema_config=transform._output_schema_config,
+        emitted_rows=(emitted_row,),
+        plugin_name=transform.name,
+        node_id="field_mapper-1",
+        run_id="run-1",
+        row_id="row-1",
+        token_id="token-1",
+    )
 
 
 class TestFieldMapper:
@@ -835,6 +856,125 @@ class TestFieldMapperOutputSchemaContract:
         guaranteed = frozenset(transform._output_schema_config.guaranteed_fields)
         assert "id" in guaranteed
         assert "name" in guaranteed
+
+
+class TestFieldMapperDeclaredOutputFieldContracts:
+    """Tests for declared output field metadata on emitted contracts (elspeth-ed2c2315d7).
+
+    Contract propagation infers a field created by an upstream transform as
+    ``required=False, source="inferred"``. When the author also declares that
+    field in ``schema.fields``, FieldMapper copies the declaration into its
+    output schema config, so ADR-014's post-emission check compares declared
+    ``required``/``nullable``/``python_type`` against the inferred metadata and
+    fails the run unless FieldMapper restamps the declaration on emission.
+    """
+
+    @pytest.fixture
+    def ctx(self) -> PluginContext:
+        """Create minimal plugin context."""
+        return make_context()
+
+    def test_select_only_restamps_declared_metadata_over_inferred_upstream_field(self, ctx: PluginContext) -> None:
+        """A declared field created upstream emits with its declared metadata."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DECLARED_SCHEMA,
+                "mapping": {"dish": "dish", "cuisine": "cuisine"},
+                "select_only": True,
+            }
+        )
+        row = PipelineRow(
+            {"dish": "laksa", "cuisine": "Malaysian"},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("dish", str, required=True, source="declared"),
+                    # An upstream LLM transform created 'cuisine', so contract
+                    # propagation inferred it as optional.
+                    make_field("cuisine", str, required=False, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        _run_post_emission_check(transform, result.row)
+        emitted = result.row.contract.get_field("cuisine")
+        assert emitted.required is True
+        assert emitted.nullable is False
+        assert emitted.python_type is str
+
+    def test_rename_without_select_only_restamps_declared_metadata(self, ctx: PluginContext) -> None:
+        """Renames carry source metadata forward, so they need the same restamp."""
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DECLARED_SCHEMA,
+                "mapping": {"raw_cuisine": "cuisine"},
+            }
+        )
+        row = PipelineRow(
+            {"dish": "laksa", "raw_cuisine": "Malaysian"},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("dish", str, required=True, source="declared"),
+                    make_field("raw_cuisine", str, required=False, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        _run_post_emission_check(transform, result.row)
+        assert result.row.contract.get_field("cuisine").required is True
+
+    def test_restamp_does_not_mask_a_declared_field_missing_from_the_row(self, ctx: PluginContext) -> None:
+        """Restamping declared metadata must not invent an absent declared field."""
+        from elspeth.contracts.errors import SchemaConfigModeViolation
+        from elspeth.plugins.transforms.field_mapper import FieldMapper
+
+        transform = FieldMapper(
+            {
+                "schema": DECLARED_SCHEMA,
+                "mapping": {"dish": "dish"},
+                "select_only": True,
+            }
+        )
+        row = PipelineRow(
+            {"dish": "laksa", "cuisine": "Malaysian"},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("dish", str, required=True, source="declared"),
+                    make_field("cuisine", str, required=False, source="inferred"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert isinstance(result.row, PipelineRow)
+        assert "cuisine" not in result.row.to_dict()
+
+        with pytest.raises(SchemaConfigModeViolation) as exc_info:
+            _run_post_emission_check(transform, result.row)
+
+        assert tuple(exc_info.value.payload["missing_required_fields"]) == ("cuisine",)
+        # Absence is reported as a missing guarantee, not as metadata drift:
+        # the mismatch collector only inspects fields the row actually carries.
+        assert "field_metadata_mismatches" not in exc_info.value.payload
 
 
 def test_select_only_assistance_requires_every_downstream_field() -> None:
