@@ -2116,6 +2116,72 @@ class TestComposerMultiTurnToolCalls:
         assert not any("Completion advisory review" in (m.get("content") or "") for m in captured_messages[2])
 
 
+def test_advisor_repair_none_preflight_publishes_unverified_not_ready() -> None:
+    """elspeth-88592f5be7 regression (repro_88592f5be7.py): a no-mutation
+    advisor-repair turn carries ``runtime_preflight=None`` — validation never
+    ran this turn — and used to ride the success disjunct, publishing and
+    persisting "The pipeline is configured and ready." while discarding the
+    model's contradicting prose. ``None`` is UNKNOWN readiness: the published
+    wording must not assert readiness, and the repair-cohort prose stays
+    withheld."""
+    from elspeth.web.composer.service import (
+        _ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE,
+        _replace_advisor_repair_public_result,
+    )
+
+    state = CompositionState(nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=7, sources={})
+    prose = "I did not change anything; the pipeline still has no output wired the way you asked."
+
+    out = _replace_advisor_repair_public_result(ComposerResult(message=prose, state=state, runtime_preflight=None))
+
+    assert out.message == _ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE
+    assert "configured and ready" not in out.message
+    assert prose not in out.message
+    assert out.raw_assistant_content is None
+
+
+def test_none_preflight_reads_unknown_fail_closed_in_both_advisor_consumers() -> None:
+    """elspeth-88592f5be7 disagreement test: ONE sentinel,
+    ``runtime_preflight is None``, has two consumers thousands of lines
+    apart. The END advisor gate documents ``None`` as "unknown for this turn;
+    fails closed to the fully blocking shape", and the advisor-repair public
+    substitution must read the SAME sentinel in the SAME direction — never as
+    an affirmative readiness claim. If a future unification flips either
+    consumer, this fails loudly."""
+    from elspeth.web.composer.service import (
+        _ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE,
+        _ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE,
+        _replace_advisor_repair_public_result,
+    )
+
+    # Consumer 1 — the END advisor gate: None preflight fails closed to the
+    # fully blocking validation shape (every readiness axis withheld).
+    service = ComposerServiceImpl.for_trained_operator(catalog=_mock_catalog(), settings=_make_settings())
+    blocked = service._advisor_blocked_result(
+        reason="flagged_final_pass",
+        verdict=AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text="FLAGGED: still wrong"),
+        state=_empty_state(),
+        assistant_message=None,
+        recorder=BufferingRecorder(),
+        repair_turns_used=0,
+        persisted_assistant_message_id=None,
+        persisted_tool_call_turn=False,
+        runtime_preflight=None,
+    )
+    blocked_preflight = blocked.runtime_preflight
+    assert blocked_preflight is not None
+    assert blocked_preflight.is_valid is False
+    assert blocked_preflight.readiness.authoring_valid is False
+    assert blocked_preflight.readiness.execution_ready is False
+    assert blocked_preflight.readiness.completion_ready is False
+
+    # Consumer 2 — the advisor-repair public substitution: the same None
+    # sentinel must not publish the affirmative readiness assertion.
+    out = _replace_advisor_repair_public_result(ComposerResult(message="model prose", state=_empty_state(), runtime_preflight=None))
+    assert out.message == _ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE
+    assert out.message != _ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
+
+
 class TestComposerConvergence:
     @pytest.mark.asyncio
     async def test_discovery_budget_exceeded_raises(self) -> None:
