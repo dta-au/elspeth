@@ -291,7 +291,12 @@ class TextractClient(AuditedClientBase):
         feature_types: tuple[str, ...],
         queries: Sequence[Mapping[str, Any]],
         client_request_token: str,
+        audit_identity: Mapping[str, str] | None = None,
     ) -> StartAnalysisReceipt:
+        # ``audit_identity`` substitutes the operator-safe location identity
+        # (e.g. {"profile": alias, "key": relative_key}) for the literal
+        # bucket/key pair in the persisted call record; the SDK request itself
+        # always uses the real bucket and executable key.
         canonical_features = tuple(sorted(feature_types))
         query_requests = _query_request(queries)
         s3_object: dict[str, str] = {"Bucket": bucket, "Name": key}
@@ -306,12 +311,12 @@ class TextractClient(AuditedClientBase):
             sdk_request["QueriesConfig"] = {"Queries": query_requests}
 
         call_index = self._next_call_index()
+        location_identity: Mapping[str, str | None] = {"bucket": bucket, "key": key} if audit_identity is None else dict(audit_identity)
         request_payload = RawCallPayload(
             {
                 "operation": "start_document_analysis",
                 "region": self._region,
-                "bucket": bucket,
-                "key": key,
+                **location_identity,
                 "version": version,
                 "feature_types": canonical_features,
                 "queries": query_requests,

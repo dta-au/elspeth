@@ -261,9 +261,13 @@ class HeadBucketClient(AuditedClientBase):
                 exc_info=True,
             )
 
-    def verify_bucket_region(self, bucket: str) -> BucketRegionProof:
+    def verify_bucket_region(self, bucket: str, *, audit_identity: Mapping[str, str] | None = None) -> BucketRegionProof:
+        # ``audit_identity`` substitutes the operator-safe location identity
+        # (e.g. {"profile": alias}) for the literal bucket in the persisted
+        # call record; the SDK request itself always uses the real bucket.
         call_index = self._next_call_index()
-        request_payload = RawCallPayload({"operation": "head_bucket_region", "configured_region": self._region, "bucket": bucket})
+        location_identity: Mapping[str, str | None] = {"bucket": bucket} if audit_identity is None else dict(audit_identity)
+        request_payload = RawCallPayload({"operation": "head_bucket_region", "configured_region": self._region, **location_identity})
         started = time.perf_counter()
         proof: BucketRegionProof | None = None
         terminal_error: BucketRegionUnverifiedError | None = None

@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import re
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -16,10 +15,12 @@ from typing import TYPE_CHECKING, Any, Protocol
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from elspeth.contracts.aws_s3 import (
+    S3_MAX_KEY_BYTES,
     S3_PRIVATE_BINDING_OPTION_NAMES,
     S3_PROFILED_AUTHOR_OPTION_NAMES,
     S3ProfiledAuditIdentity,
     s3_profiled_binding_fingerprint,
+    validate_relative_s3_path,
 )
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -42,27 +43,6 @@ if TYPE_CHECKING:
 
 
 _S3_MAX_BUCKET_CHARS = 2048
-_S3_MAX_KEY_BYTES = 1024
-
-
-def _validate_relative_s3_path(value: str, *, field_name: str) -> str:
-    """Validate one canonical relative S3 path without normalizing attacker input."""
-    if not value or value != value.strip():
-        raise ValueError(f"{field_name} must be a non-blank canonical relative S3 path")
-    if value.startswith("/") or value.endswith("/") or "\\" in value:
-        raise ValueError(f"{field_name} must be a canonical relative S3 path")
-    if re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", value) is not None:
-        raise ValueError(f"{field_name} must not use an absolute drive or URI scheme")
-    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
-        raise ValueError(f"{field_name} must not contain control characters")
-    parts = value.split("/")
-    if any(part in {"", ".", ".."} for part in parts):
-        raise ValueError(f"{field_name} must not contain empty or traversal segments")
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        raise ValueError(f"{field_name} must be valid UTF-8") from None
-    return value
 
 
 class AWSS3SourceProfileSettings(BaseModel):
@@ -94,8 +74,8 @@ class AWSS3SourceProfileSettings(BaseModel):
     def _validate_prefix(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        validated = _validate_relative_s3_path(value, field_name="prefix")
-        if len(validated.encode("utf-8")) > _S3_MAX_KEY_BYTES - 2:
+        validated = validate_relative_s3_path(value, field_name="prefix")
+        if len(validated.encode("utf-8")) > S3_MAX_KEY_BYTES - 2:
             raise ValueError("prefix must leave room for a relative S3 object key")
         return validated
 
@@ -703,11 +683,11 @@ class _S3SourceProfileResolver:
         if type(relative_key) is not str:
             raise ValueError("unsafe_s3_object_key")
         try:
-            relative_key = _validate_relative_s3_path(relative_key, field_name="key")
+            relative_key = validate_relative_s3_path(relative_key, field_name="key")
         except ValueError:
             raise ValueError("unsafe_s3_object_key") from None
         executable_key = f"{profile.prefix}/{relative_key}" if profile.prefix is not None else relative_key
-        if len(executable_key.encode("utf-8")) > _S3_MAX_KEY_BYTES:
+        if len(executable_key.encode("utf-8")) > S3_MAX_KEY_BYTES:
             raise ValueError("unsafe_s3_object_key")
         executable = {
             **safe_options,
@@ -771,6 +751,8 @@ _TEXTRACT_PRIVATE_OPTIONS = frozenset(
         "aws_access_key_id",
         "aws_secret_access_key",
         "aws_session_token",
+        "bucket",
+        "key_prefix",
     }
 )
 

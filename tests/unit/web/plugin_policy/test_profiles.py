@@ -258,10 +258,11 @@ def test_textract_deployment_profile_exposes_only_alias_and_ordinary_options() -
         "aws_access_key_id",
         "aws_secret_access_key",
         "aws_session_token",
+        "bucket",
+        "key_prefix",
     }
     assert set(public.json_schema["required"]) == {
         "profile",
-        "bucket_field",
         "key_field",
         "feature_types",
         "schema",

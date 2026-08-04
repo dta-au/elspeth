@@ -69,12 +69,31 @@
         "required": false
       },
       {
-        "description": "Input row field containing the S3 bucket name.",
+        "default": null,
+        "description": "Static S3 bucket holding every document; mutually exclusive with bucket_field.",
+        "kind": "text",
+        "label": "Bucket",
+        "name": "bucket",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "default": null,
+        "description": "Canonical relative prefix joined ahead of each row's object key; requires the static bucket option.",
+        "kind": "text",
+        "label": "Key Prefix",
+        "name": "key_prefix",
+        "nullable": true,
+        "required": false
+      },
+      {
+        "default": null,
+        "description": "Input row field containing the S3 bucket name; mutually exclusive with the static bucket option.",
         "kind": "text",
         "label": "Bucket Field",
         "name": "bucket_field",
-        "nullable": false,
-        "required": true
+        "nullable": true,
+        "required": false
       },
       {
         "description": "Input row field containing the S3 object key.",
