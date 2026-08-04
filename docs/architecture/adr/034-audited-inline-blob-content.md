@@ -1,4 +1,4 @@
-# ADR-025: Audited Inline Blob Content
+# ADR-034: Audited Inline Blob Content
 
 **Date:** 2026-05-24
 **Status:** Accepted

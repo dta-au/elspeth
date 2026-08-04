@@ -1,4 +1,4 @@
-# ADR-026: Audit Hashes Fingerprint What Arrived vs What Was Stored — the Raw/Sanitized Asymmetry Is Deliberate
+# ADR-035: Audit Hashes Fingerprint What Arrived vs What Was Stored — the Raw/Sanitized Asymmetry Is Deliberate
 
 **Date:** 2026-05-30
 **Status:** Accepted

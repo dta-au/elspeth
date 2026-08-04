@@ -44,9 +44,7 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [022](022-shareable-reviews.md) | Shareable Reviews — Completion Gestures, Signed Tokens, and the Composer Completion Events Table | 2026-05-19 | **Accepted** |
 | [023](023-custom-python-ci-analyzer.md) | Custom Python Static Analyzer for ELSPETH-Specific CI Invariants (the `elspeth-lints` Package) | 2026-05-19 | **Accepted** |
 | [024](024-delivery-governance-for-single-maintainer-mode.md) | Delivery Governance for Single-Maintainer Mode | 2026-05-19 | **Accepted** |
-| [025](025-audited-inline-blob-content.md) | Audited Inline Blob Content | 2026-05-24 | **Accepted** |
 | [025](025-multi-source-ingestion.md) | Multi-Source Ingestion — Source Surface Is Plural | 2026-05-23 | **Accepted** |
-| [026](026-audit-hash-raw-vs-stored-asymmetry.md) | Audit Hashes Fingerprint What Arrived vs What Was Stored — the Raw/Sanitized Asymmetry Is Deliberate | 2026-05-30 | **Accepted** |
 | [026](026-durable-token-scheduler.md) | Durable Token Scheduler | 2026-05-23 | **Accepted** (with stated preconditions) |
 | [027](027-composer-operator-set-sampling.md) | Composer Sampling Is Operator-Set Configuration | 2026-06-04 | **Accepted** |
 | [028](028-queue-vs-coalesce-not-duplicates.md) | QUEUE and COALESCE Are Not Duplicates — Leave Them Separate | 2026-06-11 | **Accepted** |
@@ -54,6 +52,9 @@ We use a modified version of Michael Nygard's ADR template. See `000-template.md
 | [030](030-multi-worker-deployment-shape.md) | Multi-Worker Deployment Shape — One-Host WAL Pack | 2026-06-11 | **Accepted** |
 | [031](031-tutorial-is-a-fixed-script-canary.md) | The Tutorial Is a Fixed-Script Canary for the General Guided Surface | 2026-07-22 | **Accepted** |
 | [032](032-validate-by-trust-domain.md) | Boundary Validation Splits by Trust Domain — Parse External Input, Nominally Type Internal Input | 2026-07-31 | **Accepted** |
+| [033](033-deferred-intent-admission-contract.md) | Deferred-Intent Admission Decides Closed Contradiction, Not Satisfiability | 2026-08-04 | **Accepted** |
+| [034](034-audited-inline-blob-content.md) | Audited Inline Blob Content | 2026-05-24 | **Accepted** |
+| [035](035-audit-hash-raw-vs-stored-asymmetry.md) | Audit Hashes Fingerprint What Arrived vs What Was Stored — the Raw/Sanitized Asymmetry Is Deliberate | 2026-05-30 | **Accepted** |
 
 ## Status Definitions
 

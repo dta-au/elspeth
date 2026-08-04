@@ -308,7 +308,7 @@ def _handle_list_composer_blobs(
     state: CompositionState,
     context: ToolContext,
 ) -> ToolResult:
-    """List blobs using the ADR-025 composer-LLM visibility shape.
+    """List blobs using the ADR-034 composer-LLM visibility shape.
 
     The LLM sees only metadata needed to author a pinned inline-content
     marker. Bytes, previews, storage paths, and free-text descriptions stay

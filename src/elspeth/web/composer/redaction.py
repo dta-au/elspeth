@@ -2765,7 +2765,7 @@ _LIST_COMPOSER_BLOBS_REASON = HandlesNoSensitiveDataReason(
         "the session-scoped inventory."
     ),
     why_responses_safe=(
-        "Response is the ADR-025 H4 visibility shape — blob_id, mime_type, "
+        "Response is the ADR-034 H4 visibility shape — blob_id, mime_type, "
         "size_bytes, content_hash, and filename. It deliberately excludes "
         "source_description, preview, content bytes, and storage_path so the LLM "
         "can author a pinned ref without seeing the referenced text."
