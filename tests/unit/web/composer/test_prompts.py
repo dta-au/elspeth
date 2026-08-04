@@ -593,9 +593,9 @@ class TestBuildSystemPrompt:
         assert "the source is not listed in `nodes[]`, and that is expected" in flattened
         assert "A pending source requirement lives under" in flattened
         assert "source.options.interpretation_requirements" in result
-        assert "Use a stable `user_term` that names the generated source artifact" in flattened
-        assert "derive it from the user's source description" in flattened
-        assert "Do not leave the source review with an empty or generic `user_term`" in flattened
+        assert "`user_term` is server-derived and already staged on the pending requirement" in flattened
+        assert "`inline_source_url_list` for a single-column `url` CSV" in flattened
+        assert "Copy the staged requirement's `user_term` exactly; never invent or derive your own" in flattened
         assert "llm_draft` must be the exact staged source artifact text" in flattened
         assert "If the exact source artifact text is not in your immediate context" in flattened
         assert "use the staged requirement's exact `draft`" in flattened
