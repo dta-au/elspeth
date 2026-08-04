@@ -59,6 +59,8 @@ _TEXTRACT_DETAIL_FIELDS = frozenset(
         "client_constructed",
         "start_document_analysis_invocable",
         "get_document_analysis_invocable",
+        "profiles_configured",
+        "profile_locations_invocable",
     }
 )
 
@@ -215,7 +217,10 @@ def _validate_bedrock_receipt_details(details: Mapping[str, object]) -> None:
 def _validate_textract_receipt_details(details: Mapping[str, object]) -> None:
     if set(details) != _TEXTRACT_DETAIL_FIELDS:
         raise AcceptanceCheckError("exec_receipt_schema")
-    if any(details[field] is not True for field in _TEXTRACT_DETAIL_FIELDS):
+    if any(details[field] is not True for field in _TEXTRACT_DETAIL_FIELDS - {"profiles_configured"}):
+        raise AcceptanceCheckError("exec_receipt_schema")
+    profiles_configured = details["profiles_configured"]
+    if type(profiles_configured) is not int or profiles_configured < 0:
         raise AcceptanceCheckError("exec_receipt_schema")
 
 

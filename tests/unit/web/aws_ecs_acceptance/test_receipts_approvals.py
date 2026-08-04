@@ -44,6 +44,8 @@ def _textract_receipt_details() -> dict[str, object]:
         "client_constructed": True,
         "start_document_analysis_invocable": True,
         "get_document_analysis_invocable": True,
+        "profiles_configured": 1,
+        "profile_locations_invocable": True,
     }
 
 

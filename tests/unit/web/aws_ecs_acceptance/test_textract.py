@@ -106,6 +106,8 @@ def test_verify_textract_proves_registration_client_and_both_probe_actions() -> 
         "client_constructed": True,
         "start_document_analysis_invocable": True,
         "get_document_analysis_invocable": True,
+        "profiles_configured": 0,
+        "profile_locations_invocable": True,
     }
     assert client.closed is True
     assert client.start_calls == [
@@ -123,6 +125,66 @@ def test_verify_textract_proves_registration_client_and_both_probe_actions() -> 
     assert len(client.get_calls[0]["JobId"]) == 64
     rendered = json.dumps(details)
     assert "raw provider message sentinel" not in rendered
+
+
+def test_verify_textract_probes_each_operator_document_profile_location() -> None:
+    """F8 (elspeth-cd0f6a6cd9): the harness must exercise the operator profile
+    path, not only the raw SDK — each configured profile's binding must satisfy
+    the engine's own bucket-mode rules and its granted location must be
+    invocable by the task role."""
+    client = _FakeSDKClient(
+        start_error=_client_error("InvalidS3ObjectException", "StartDocumentAnalysis"),
+        get_error=_client_error("InvalidJobIdException", "GetDocumentAnalysis"),
+    )
+    env = _textract_env(
+        ELSPETH_WEB__AWS_TEXTRACT_PROFILES=json.dumps(
+            [{"alias": "acceptance-docs", "bucket": "operator-owned-docs", "key_prefix": "org/acme"}]
+        )
+    )
+
+    details = _verify(env, client)
+
+    assert details["profiles_configured"] == 1
+    assert details["profile_locations_invocable"] is True
+    profile_probe = client.start_calls[1]
+    assert profile_probe["DocumentLocation"]["S3Object"]["Bucket"] == "operator-owned-docs"
+    assert profile_probe["DocumentLocation"]["S3Object"]["Name"] == f"org/acme/verify-textract-{'0' * 32}.probe"
+
+
+@pytest.mark.parametrize(
+    "raw_profiles",
+    [
+        "not-json",
+        "{}",
+        "[]",
+        '[{"alias": "acceptance-docs"}]',
+        '[{"alias": "acceptance-docs", "bucket": "b", "key_prefix": "../up"}]',
+    ],
+)
+def test_verify_textract_rejects_malformed_profile_settings(raw_profiles: str) -> None:
+    client = _FakeSDKClient(
+        start_error=_client_error("InvalidS3ObjectException", "StartDocumentAnalysis"),
+        get_error=_client_error("InvalidJobIdException", "GetDocumentAnalysis"),
+    )
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="textract_profile_settings"):
+        _verify(_textract_env(ELSPETH_WEB__AWS_TEXTRACT_PROFILES=raw_profiles), client)
+
+
+def test_verify_textract_maps_denied_profile_location_to_static_check() -> None:
+    class _ProfileDeniedClient(_FakeSDKClient):
+        def start_document_analysis(self, **kwargs: Any) -> object:
+            self.start_calls.append(kwargs)
+            if len(self.start_calls) == 1:
+                raise _client_error("InvalidS3ObjectException", "StartDocumentAnalysis")
+            raise _client_error("AccessDeniedException", "StartDocumentAnalysis")
+
+    client = _ProfileDeniedClient(get_error=_client_error("InvalidJobIdException", "GetDocumentAnalysis"))
+    env = _textract_env(ELSPETH_WEB__AWS_TEXTRACT_PROFILES=json.dumps([{"alias": "acceptance-docs", "bucket": "operator-owned-docs"}]))
+
+    with pytest.raises(acceptance.AcceptanceCheckError, match="textract_profile_start_document_analysis"):
+        _verify(env, client)
+    assert client.closed is True
 
 
 def test_verify_textract_rejects_aws_credential_overrides_before_any_call() -> None:
@@ -246,6 +308,8 @@ def _textract_details() -> dict[str, object]:
         "client_constructed": True,
         "start_document_analysis_invocable": True,
         "get_document_analysis_invocable": True,
+        "profiles_configured": 1,
+        "profile_locations_invocable": True,
     }
 
 

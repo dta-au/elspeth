@@ -172,6 +172,32 @@ and topologies — at minimum one fork/merge, one gate with named routing +
 an `on_error` path exercised by a poisoned row, one linear multi-transform,
 one sink-variety graph. Randomise within that coverage.
 
+## Addendum — round-3 redeploy additions (2026-08-04, ADR-036)
+
+The Textract profile-bound bucket fix (`elspeth-cd0f6a6cd9`, ADR-036) changes
+the round-3 task definition and store discipline:
+
+- **New env ADDITION** `ELSPETH_WEB__AWS_TEXTRACT_PROFILES` — JSON array of
+  operator document grants, e.g.
+  `[{"alias": "acceptance-docs", "bucket": "<app bucket>", "key_prefix": "<org prefix>"}]`
+  (same bucket + prefix as the existing S3 source grant; the alias *name* may
+  be shared because grants are kind-qualified). Without it the Textract
+  transform is honestly unauthorable on the web surface
+  (`profile_unavailable`) — the old region-only `deployment` alias no longer
+  exists.
+- **Session store epoch is now 45** (was 44): the projection flip invalidates
+  sessions authored against the old public schema. Delete `sessions.db` / RDS
+  session stores before the round-3 run; `auth.db` is never touched.
+- `verify-textract` now also proves each configured profile: binding validity
+  against the engine's bucket-mode rules and a negative-space
+  StartDocumentAnalysis probe against the profile's granted location. Its
+  exec receipt gains `profiles_configured` + `profile_locations_invocable`.
+- The round-3 Textract anchor (#2 above) must be authored profile-first:
+  select `profile: acceptance-docs`, rows carry **relative object keys
+  only** — `bucket_field` is no longer web-authorable. The custody check is
+  falsifiable: after the run, zero persisted call records may contain the
+  bucket literal (query the Landscape `calls` request payloads).
+
 Per-graph verification: the **Landscape audit trail** (run status, row/token
 counts, node states, sink effects) — never output-file mtimes. Capture run
 ids in the report.

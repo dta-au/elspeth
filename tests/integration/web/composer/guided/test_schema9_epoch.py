@@ -14,7 +14,7 @@ from elspeth.web.sessions.schema import SessionSchemaError, initialize_session_s
 def test_current_schema_epoch_pair_is_deliberately_pinned() -> None:
     # Deliberate literal pin: an epoch bump must consciously update this test
     # (and the release docs the docs tests check), not slide through.
-    assert SESSION_SCHEMA_EPOCH == 44
+    assert SESSION_SCHEMA_EPOCH == 45
     assert SQLITE_SCHEMA_EPOCH == 30
 
 

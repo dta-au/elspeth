@@ -415,6 +415,217 @@ def test_profiled_s3_runtime_uses_private_binding_only_for_boto_call(tmp_path: P
     assert executable_key not in persisted_projection
 
 
+def test_profiled_textract_runtime_uses_private_binding_only_for_aws_calls(tmp_path: Path) -> None:
+    """Custody NFR (ADR-036, elspeth-cd0f6a6cd9): a profiled Textract run must
+    persist ZERO call records containing the operator bucket literal."""
+    import yaml
+
+    from elspeth.contracts.call_data import RawCallPayload
+    from elspeth.contracts.freeze import deep_thaw
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+    from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
+    from elspeth.testing import make_pipeline_row
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    private_bucket = "operator-private-bucket-marker"
+    private_prefix = "operator-private-prefix-marker"
+    profile_alias = "acceptance-docs"
+    transform_id = PluginId("transform", "aws_textract_document_analysis")
+    web_settings = WebSettings.model_validate(
+        {
+            **_web_settings(tmp_path).model_dump(),
+            "plugin_allowlist": ["transform:aws_textract_document_analysis"],
+            "deployment_aws_region": "ap-southeast-1",
+            "aws_textract_profiles": [
+                {
+                    "alias": profile_alias,
+                    "bucket": private_bucket,
+                    "key_prefix": private_prefix,
+                }
+            ],
+        }
+    )
+    runtime_config = RuntimeWebPluginConfig.from_settings(web_settings)
+    profiles = OperatorProfileRegistry(
+        policy=compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime_config),
+        settings=runtime_config,
+    )
+    lowered = profiles.lower_options(
+        transform_id,
+        alias=profile_alias,
+        safe_options={
+            "key_field": "document_key",
+            "feature_types": ["FORMS"],
+            "text_field": "textract_text",
+            "schema": {"mode": "observed"},
+        },
+    )
+    blobs_dir = tmp_path / "blobs"
+    outputs_dir = tmp_path / "outputs"
+    blobs_dir.mkdir(exist_ok=True)
+    outputs_dir.mkdir(exist_ok=True)
+    input_path = blobs_dir / "manifest.csv"
+    input_path.write_text("document_key\ninvoice.pdf\n", encoding="utf-8")
+    executable_config = {
+        "sources": {
+            "primary": {
+                "plugin": "csv",
+                "on_success": "docs_in",
+                "options": {"path": str(input_path), "on_validation_failure": "discard", "schema": {"mode": "observed"}},
+            }
+        },
+        "transforms": [
+            {
+                "name": "textract_1",
+                "plugin": "aws_textract_document_analysis",
+                "input": "docs_in",
+                "on_success": "output",
+                "on_error": "discard",
+                "options": deep_thaw(lowered.executable_options),
+            }
+        ],
+        "sinks": {
+            "output": {
+                "plugin": "csv",
+                "on_write_failure": "discard",
+                "options": {"path": str(outputs_dir / "profiled-textract.csv"), "schema": {"mode": "observed"}},
+            }
+        },
+    }
+    audit_safe_config = {
+        **executable_config,
+        "transforms": [
+            {
+                "name": "textract_1",
+                "plugin": "aws_textract_document_analysis",
+                "input": "docs_in",
+                "on_success": "output",
+                "on_error": "discard",
+                "options": deep_thaw(lowered.audit_safe_options),
+            }
+        ],
+    }
+    settings = load_settings_from_yaml_string(yaml.safe_dump(executable_config))
+    snapshot = _snapshot_with_profiles((transform_id, profile_alias))
+    identity = lowered.profiled_textract_audit_identity
+    assert identity is not None
+
+    with pytest.raises(ValueError, match="profiled Textract runtime requires audit-safe settings"):
+        build_validated_runtime_graph(
+            settings,
+            plugin_snapshot=snapshot,
+            profiled_textract_audit_identities=(("textract_1", identity),),
+        )
+
+    with pytest.raises(KeyError, match="audit identities have no transform"):
+        build_validated_runtime_graph(
+            settings,
+            plugin_snapshot=snapshot,
+            audit_safe_settings=audit_safe_config,
+        )
+
+    runtime = build_validated_runtime_graph(
+        settings,
+        plugin_snapshot=snapshot,
+        audit_safe_settings=audit_safe_config,
+        profiled_textract_audit_identities=(("textract_1", identity),),
+    )
+    transform = next(wired.plugin for wired in runtime.plugin_bundle.transforms if wired.settings.name == "textract_1")
+    assert isinstance(transform, AWSTextractDocumentAnalysis)
+    assert transform.config == deep_thaw(lowered.audit_safe_options)
+
+    class _HeadBucketSDK:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def head_bucket(self, **kwargs: object) -> object:
+            self.calls.append(kwargs)
+            return {
+                "BucketRegion": "ap-southeast-1",
+                "ResponseMetadata": {"HTTPStatusCode": 200, "HTTPHeaders": {}, "RetryAttempts": 0},
+            }
+
+        def close(self) -> None:
+            return None
+
+    class _TextractSDK:
+        def __init__(self) -> None:
+            self.start_calls: list[dict[str, object]] = []
+
+        def start_document_analysis(self, **kwargs: object) -> object:
+            self.start_calls.append(kwargs)
+            return {"JobId": "job-1", "ResponseMetadata": {"RequestId": "r", "RetryAttempts": 0, "HTTPStatusCode": 200}}
+
+        def get_document_analysis(self, **kwargs: object) -> object:
+            return {
+                "JobStatus": "SUCCEEDED",
+                "DocumentMetadata": {"Pages": 1},
+                "AnalyzeDocumentModelVersion": "1.0",
+                "Blocks": [
+                    {"BlockType": "PAGE", "Id": "page-1", "Page": 1},
+                    {"BlockType": "LINE", "Id": "line-1", "Page": 1, "Text": "hello", "Confidence": 99.0},
+                ],
+                "ResponseMetadata": {"RequestId": "r", "RetryAttempts": 0, "HTTPStatusCode": 200},
+            }
+
+        def close(self) -> None:
+            return None
+
+    class _Recorder:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def allocate_call_index(self, state_id: str) -> int:
+            del state_id
+            return len(self.calls)
+
+        def record_call(self, **kwargs: object) -> SimpleNamespace:
+            self.calls.append(kwargs)
+            return SimpleNamespace(id=f"call-{len(self.calls)}")
+
+    recorder = _Recorder()
+    telemetry_events: list[object] = []
+    head_bucket_sdk = _HeadBucketSDK()
+    textract_sdk = _TextractSDK()
+    transform._recorder = cast(Any, recorder)
+    transform._run_id = "run-1"
+    transform._node_id = "textract_1"
+    transform._telemetry_emit = telemetry_events.append
+    transform._s3_sdk_client = head_bucket_sdk
+    transform._sdk_client = textract_sdk
+    transform._poll_interval_seconds = 0.001
+    transform._poll_max_interval_seconds = 0.001
+
+    result = transform._process_single_with_state(
+        make_pipeline_row({"document_key": "invoice.pdf"}),
+        "state-1",
+        token_id="token-1",
+    )
+
+    executable_key = f"{private_prefix}/invoice.pdf"
+    assert result.status == "success"
+    assert head_bucket_sdk.calls == [{"Bucket": private_bucket}]
+    assert textract_sdk.start_calls[0]["DocumentLocation"] == {"S3Object": {"Bucket": private_bucket, "Name": executable_key}}
+
+    graph_configs = [runtime.graph.get_node_info(node_id).config for node_id in runtime.graph.topological_order()]
+    persisted_projection = json.dumps(
+        {
+            "transform_config": transform.config,
+            "graph_configs": graph_configs,
+            "call_audit": recorder.calls,
+            "telemetry": telemetry_events,
+            "result_reason": result.success_reason,
+        },
+        default=lambda value: value.to_dict() if isinstance(value, RawCallPayload) else str(value),
+    )
+    assert profile_alias in persisted_projection
+    assert '"key": "invoice.pdf"' in persisted_projection
+    assert private_bucket not in persisted_projection
+    assert private_prefix not in persisted_projection
+    assert executable_key not in persisted_projection
+
+
 def test_unprofiled_s3_runtime_without_audit_safe_carrier_retains_raw_cli_identity(tmp_path: Path) -> None:
     import yaml
 

@@ -371,7 +371,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:41d9f6f8223869ef"
+    source_file_hash: str | None = "sha256:692ad007183fbb41"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -1135,7 +1135,9 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 "all result pages validate. Configure AWS identity through the default chain or ELSPETH secret refs."
             ),
             composer_hints=(
-                "Provide bucket_field and key_field, choose one or more Textract feature_types, and map at least one output.",
+                "Locate documents with a static bucket (plus optional key_prefix) and per-row keys in key_field, "
+                "or with per-row bucket_field and key_field; the two location modes are mutually exclusive.",
+                "In static bucket mode rows carry relative object keys only — never bucket names or locations.",
                 "QUERIES requires query definitions; inline document bytes belong in the separate synchronous plugin.",
                 "For explicit AWS credentials, use ELSPETH markers such as {secret_ref: AWS_ACCESS_KEY_ID}.",
             ),

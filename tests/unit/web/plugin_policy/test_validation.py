@@ -257,6 +257,57 @@ def test_validate_plugin_policy_rejects_textract_identity_from_a_non_textract_co
         )
 
 
+def test_textract_alias_as_literal_bucket_value_names_the_confusion() -> None:
+    """F10 guard (elspeth-cd0f6a6cd9): battery run e41d0e6b authored the operator
+    profile alias as a literal bucket value; the generic 'not authorable'
+    rejection never names that confusion, so the repair loop reattempts bucket
+    shapes instead of selecting the profile."""
+    from typing import cast
+
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+    from elspeth.web.plugin_policy.validation import validate_plugin_policy
+
+    registry, snapshot, catalog = _textract_policy_context()
+    node = NodeSpec(
+        id="textract_1",
+        node_type="transform",
+        plugin="aws_textract_document_analysis",
+        input="transform_in",
+        on_success="results",
+        on_error="discard",
+        options={
+            "bucket": "acceptance-docs",
+            "key_field": "document_key",
+            "feature_types": ["FORMS"],
+            "text_field": "textract_text",
+            "schema": {"mode": "observed"},
+        },
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    state = CompositionState(source=None, nodes=(node,), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+
+    result = validate_plugin_policy(
+        state,
+        snapshot=cast(PluginAvailabilitySnapshot, snapshot),
+        profile_registry=cast(OperatorProfileRegistry, registry),
+        catalog=cast(CatalogService, catalog),
+    )
+
+    finding = next(item for item in result.findings if item.error_code == "profile_alias_used_as_bucket")
+    assert "acceptance-docs" in finding.message
+    assert "alias" in finding.message
+    assert finding.suggestion is not None
+    assert "profile" in finding.suggestion
+
+
 def test_plugin_policy_returns_typed_finding_for_malformed_rehydrated_source() -> None:
     from typing import Any, cast
 

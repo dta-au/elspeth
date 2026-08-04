@@ -211,7 +211,15 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        ALTER a CHECK constraint in place, so pre-release policy remains
 #        delete-and-recreate for stale session databases (sessions.db only —
 #        auth.db is never touched).
-SESSION_SCHEMA_EPOCH = 44
+#   45 -> Textract web authoring moves to operator document profiles
+#        (ADR-036, elspeth-cd0f6a6cd9): the public projection drops
+#        bucket_field entirely and the ``deployment`` alias is replaced by
+#        named ``aws_textract_profiles`` aliases. No table shape changed,
+#        but stored sessions authored against the old public schema
+#        (bucket_field / ``deployment``) can no longer validate or replay,
+#        so pre-release policy applies: delete stale session databases
+#        (sessions.db only — auth.db is never touched).
+SESSION_SCHEMA_EPOCH = 45
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"

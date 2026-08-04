@@ -90,6 +90,34 @@ def _s3_source_endpoint_override_finding(component: _Component) -> PluginPolicyF
     )
 
 
+def _textract_alias_as_bucket_finding(component: _Component, alias_inventory: frozenset[str]) -> PluginPolicyFinding | None:
+    """Name the alias-as-bucket confusion before the generic schema rejection.
+
+    Battery evidence (elspeth-cd0f6a6cd9, run e41d0e6b): a planner asked to use
+    an operator profile authored its alias as a literal bucket value. The
+    generic "option not authorable" rejection never names the confusion, so
+    the repair loop reattempts bucket shapes instead of selecting the profile.
+    Aliases are public enum values, so echoing one is value-safe.
+    """
+    if component.plugin_id != PluginId("transform", "aws_textract_document_analysis") or not alias_inventory:
+        return None
+    for option_name in ("bucket", "bucket_field"):
+        value = component.options.get(option_name)
+        if type(value) is str and value in alias_inventory:
+            return PluginPolicyFinding(
+                stage="operator_profile_options",
+                component_id=component.component_id,
+                component_type=component.component_type,
+                error_code="profile_alias_used_as_bucket",
+                message=(
+                    f"Option '{option_name}' carries the operator profile alias '{value}' as a literal "
+                    "document-location value. Profile aliases are not bucket names or row columns."
+                ),
+                suggestion="Select the alias with the 'profile' option; rows carry relative object keys in key_field.",
+            )
+    return None
+
+
 def validate_plugin_policy(
     state: CompositionState,
     *,
@@ -133,6 +161,10 @@ def validate_plugin_policy(
 
     if not snapshot.is_trained_operator:
         findings.extend(finding for component in components if (finding := _s3_source_endpoint_override_finding(component)) is not None)
+        alias_inventory = frozenset(alias for _plugin_id, aliases in snapshot.usable_profile_aliases for alias in aliases)
+        findings.extend(
+            finding for component in components if (finding := _textract_alias_as_bucket_finding(component, alias_inventory)) is not None
+        )
 
     executable_state = state
     profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
