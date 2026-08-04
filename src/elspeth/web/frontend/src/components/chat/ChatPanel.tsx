@@ -802,19 +802,28 @@ export function ChatPanel({
       const sessionAtSend = before.activeSessionId;
       const hadDurableCheckpoint = before.compositionState !== null;
       const seqFloor = before.guidedSession?.chat_turn_seq ?? 0;
-      await sendGuidedChat(content, revisionMode);
-      const after = useSessionStore.getState();
-      if (after.activeSessionId !== sessionAtSend) return;
-      const delivered = hadDurableCheckpoint
-        ? (after.guidedSession?.chat_history.some(
-            (turn) =>
-              turn.role === "user" &&
-              turn.seq >= seqFloor &&
-              turn.content === content,
-          ) ?? false)
-        : after.compositionState !== null;
-      if (delivered) return;
-      setGuidedDraft((current) => (current === "" ? content : current));
+      try {
+        await sendGuidedChat(content, revisionMode);
+      } finally {
+        // finally, not a bare await: chatGuided's offensive-programming
+        // guards THROW (precondition violations), and a thrown send
+        // delivered nothing — the draft must still be restored before the
+        // rejection propagates (review finding on elspeth-49b467d91a).
+        const after = useSessionStore.getState();
+        if (after.activeSessionId === sessionAtSend) {
+          const delivered = hadDurableCheckpoint
+            ? (after.guidedSession?.chat_history.some(
+                (turn) =>
+                  turn.role === "user" &&
+                  turn.seq >= seqFloor &&
+                  turn.content === content,
+              ) ?? false)
+            : after.compositionState !== null;
+          if (!delivered) {
+            setGuidedDraft((current) => (current === "" ? content : current));
+          }
+        }
+      }
     },
     [sendGuidedChat],
   );
@@ -2157,10 +2166,14 @@ export function ChatPanel({
                     guidedRevisionSelection.identity === liveProposalRevisionIdentity
                       ? guidedRevisionSelection.mode
                       : "amend";
-                  setGuidedRevisionSelection({
-                    identity: liveProposalRevisionIdentity,
-                    mode: "amend",
-                  });
+                  // No eager reset-to-amend here: a DELIVERED revision
+                  // advances the proposal identity, and the identity-keyed
+                  // effect above already resets the selector; an eager reset
+                  // made a FAILED send restore the prompt but silently flip
+                  // the user's "replace" choice back to "amend", so the
+                  // retry resubmitted a semantically different request
+                  // (review finding on elspeth-49b467d91a). Draft and scope
+                  // now retain or clear together.
                   void sendGuidedChatRetainingDraft(content, selectedMode);
                   return;
                 }

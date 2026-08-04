@@ -1427,7 +1427,15 @@ describe("ChatPanel mode discriminator", () => {
     },
   );
 
-  it("makes replace explicit for proposal prose and resets the selector to amend after send", async () => {
+  it("makes replace explicit for proposal prose and keeps the scope when the send does not deliver", async () => {
+    // The stubbed chatGuided resolves without advancing any store state, so
+    // under the retention doctrine (elspeth-49b467d91a) this send did NOT
+    // deliver: the typed prompt is restored AND the chosen scope must
+    // survive with it — an eager reset here made the retry silently
+    // resubmit "amend" after the user chose "replace". A DELIVERED revision
+    // advances the proposal identity, and the identity-keyed effect resets
+    // the selector (pinned by the "does not carry a selected replace scope"
+    // test below).
     const chatGuidedSpy = vi.fn().mockResolvedValue(undefined);
     useSessionStore.setState({
       activeSessionId: "session-guided",
@@ -1455,7 +1463,11 @@ describe("ChatPanel mode discriminator", () => {
         "replace",
       );
     });
-    expect(scope).toHaveValue("amend");
+    expect(scope).toHaveValue("replace");
+    // The undelivered prompt is restored alongside the retained scope.
+    expect(screen.getByTestId("chat-input").getAttribute("data-value")).toBe(
+      "test-chat-message",
+    );
   });
 
   it("does not carry a selected replace scope into another proposal or session", async () => {
