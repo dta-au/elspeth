@@ -249,8 +249,16 @@ trap that gated the Textract grant).
 `get_plugin_schema` + `set_pipeline` are **58% of all tool calls** — 3.5 schema
 lookups per compose.
 
-**Identical repeated calls track compose time almost monotonically.** Grouping
-on `(session, tool, byte-identical arguments)`:
+**CORRECTION — "byte-identical" was a measurement artifact.** The table below
+was built from an API-side signature that truncated tool arguments to their
+first 400 characters, so payloads differing only after that point were counted
+as identical. A store-side query over the *full* arguments finds far fewer:
+`set_pipeline` repeated byte-identically twice in the worst session, not four
+times. The session store settles it directly — the system's own drift hint
+(quoted below) states the failed calls carried **different** arguments. Read
+the table as "repeated attempts at the same mutation", not "identical bytes".
+
+**Repeated repair attempts track compose time almost monotonically.**
 
 | Session | Compose | Identical repeats |
 |---|---|---|
@@ -281,10 +289,67 @@ near-identical repair retries are not counted.
   to merge"* on Bedrock calls, i.e. the conversation handed to the provider
   repeatedly needs reshaping before it can be sent.
 
-**Reading:** the win is not in trimming turns or tools — it is in (a) not
-re-issuing rejected mutations unchanged, and (b) the advisor flag rate. A
-per-task reasoning budget should also compress the 43–272s spread directly,
-since turn *count* barely moves while wall-clock varies six-fold. Measure it from `ComposerLLMCall.reasoning_content` in Landscape.
+## What the repair path actually does — and what the cost really is
+
+The messages API projects only `user` and `assistant` turns. The session store
+holds four roles — **`tool` 193, `audit` 170, `assistant` 162, `user` 17** — so
+the tool *responses* and the audit trail are both present and were simply
+invisible to the earlier analysis.
+
+**The repair path is not silent. It already detects drift and intervenes.**
+In the worst session, after three consecutive failed `set_pipeline` calls, an
+`[ELSPETH-SYSTEM-HINT]` audit turn fired:
+
+> Your last 3 calls to `set_pipeline` all failed while sending different
+> arguments. This is drift without convergence: small payload variations are
+> not escaping the validator failure. Before the next attempt, stop varying
+> fields opportunistically and choose a new repair strategy … When the goal is
+> a one-node linear insertion, switch to `splice_transform` instead of varying
+> full-replacement payloads.
+
+The very next `set_pipeline` succeeded, with 12 affected nodes. So the earlier
+hypothesis in this report — that the repair path fails to surface why a
+mutation was rejected — is **wrong on both counts**: the validator errors come
+back in full on every call (`error_code`, `component`, and a `contract` block
+naming `producer`, `consumer` and `missing_fields`), and there is a
+second-order drift detector on top that worked. It fired once across the whole
+round.
+
+**The actual cost driver is context accumulation, not reasoning.** Across 17
+compose sessions:
+
+| | |
+|---|---:|
+| LLM calls | **168** |
+| Total tokens | **10,908,494** |
+| Provider cost | **USD 22.77** |
+| **`reasoning_tokens`** | **0** |
+| Largest single call | 103,695 tokens |
+| Worst session | 18 calls, 1.39M tokens, **USD 3.09** |
+
+Mean ≈ 10 calls, ~640k tokens and **~USD 1.34 per compose**. Sonnet carries 151
+calls / USD 22.41; Haiku (the advisor) 17 calls / USD 0.36.
+
+Within a single session the per-call token count climbs monotonically —
+49k → 65k → 69k → 75k → 83k → 90k — because every turn re-sends the whole
+accumulated transcript, and the tool responses in that transcript are large
+(562–2817 chars each, dominated by repeated validation-error structures). That
+is where the ten million tokens go.
+
+**Consequence for the reasoning-effort change.** `reasoning_tokens` is **0 on
+every one of the 168 calls** on this build, so reasoning is currently unused
+entirely. Setting `discovery=low` / `candidate=high` will *add* reasoning
+tokens where there were none. It will only "claw back time" if the extra
+thinking removes enough turns to offset both its own tokens and the re-sent
+context they ride on — plausible, since a turn removed is a whole ~65k-token
+call removed, but it is a hypothesis this round cannot pre-judge. **Measure
+turns-per-compose and USD-per-compose, not just wall-clock**, or a latency win
+could hide a cost regression.
+
+**Reading:** the leverage is (1) transcript size — trimming or summarising
+repeated validation payloads attacks the 10.9M directly; (2) firing the drift
+hint *earlier* than three failures, since it demonstrably works; and (3) the
+advisor flag rate at 14 of 16, which makes repair the normal path.
 
 ## Two things this round learned
 
