@@ -186,8 +186,10 @@ startup cutover instead of allowing epoch-39 guided payloads to fail during
 replay, and session epoch 41 does the same for the projected node option
 summary the review cards render. Session epoch 42 retains the reviewed output-field
 gap needed to replay a failed guided operation with the same actionable HTTP
-response, and session epoch 43 attributes run-diagnostics LLM audit rows to
-their own chat writer principal. Archive or export evidence as required, stop the old service, recreate
+response, session epoch 43 attributes run-diagnostics LLM audit rows to
+their own chat writer principal, and session epoch 44 settles planner repair
+exhaustion under its own honest failure code instead of a provider-blaming
+invalid-response envelope. Archive or export evidence as required, stop the old service, recreate
 a stale session store and a Landscape store left at epoch 29, and install 0.7.2.
 Do not roll older code back over the recreated databases.
 `data/auth.db` remains separate; recreating the session store does not remove

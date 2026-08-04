@@ -85,9 +85,9 @@ reset requirement and database-operator approval; previous release identity
 and epochs; forward and backward compatibility decisions; and an explicit
 `rollback_permitted` decision with evidence. Older code is not compatible with
 the freshly recreated current databases. Rollback across this boundary is
-unsupported: keep the service drained, repair the epoch-43 release forward,
+unsupported: keep the service drained, repair the epoch-44 release forward,
 recreate fresh state, and retry. The release acceptance record must cite the
-session-epoch-43/Landscape-epoch-30 record when binding candidate and rollback
+session-epoch-44/Landscape-epoch-30 record when binding candidate and rollback
 decisions.
 
 Deployments crossing the 0.7.0 boundary from an older release must also account
