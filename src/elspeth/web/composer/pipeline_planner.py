@@ -87,7 +87,7 @@ from elspeth.web.composer.tools._dispatch import (
     execute_discovery_tool_with_context,
     get_tool_definitions,
 )
-from elspeth.web.composer.tools.generation import explain_validation_code
+from elspeth.web.composer.tools.generation import explain_validation_code, explain_withheld_validation_code
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -401,6 +401,130 @@ class PlannerOriginatingMessage:
             raise ValueError("user_id must be a non-empty exact string or None")
 
 
+# Routing-destination keys a finalizer pass may rewire on an EXISTING
+# component while leaving the component's configuration exactly what the
+# model authored. The auto-wire pass (``wire_required_controls``) splices
+# control nodes by retargeting the neighbour's ``input``/``on_success`` onto
+# the inserted control's streams; the guided binder can likewise rebind a
+# component's routing to a reviewed PRIVATE destination without touching its
+# options. The two change kinds feed different projections — validator
+# ``detail`` quotes a component's OPTIONS, ``connectivity`` facts quote its
+# ROUTING values — so ownership is tracked per kind
+# (:class:`_FinalizerOwnedRefs`): collapsing them either re-creates the
+# repair blindness this seam repairs (elspeth-5904b1683a) on any auto-wired
+# candidate, or leaks a finalizer-written private routing association through
+# the connectivity facts.
+_FINALIZER_ROUTING_KEYS: Final[frozenset[str]] = frozenset({"input", "on_success", "on_error"})
+
+
+def _component_config_identity(block: Mapping[str, Any]) -> str:
+    """Canonical identity of one component block minus routing destinations."""
+    return canonical_json({key: value for key, value in block.items() if key not in _FINALIZER_ROUTING_KEYS})
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalizerOwnedRefs:
+    """Validation-component refs the candidate finalizer owns, by change kind.
+
+    ``config`` names components whose non-routing content the finalizer wrote
+    (guided reviewed-authority source/output binding, correction-restored
+    predecessor nodes, inserted REQUIRED controls): validator messages about
+    them can quote reviewed private option values, so their entries are
+    masked to component ``"pipeline"`` and stripped of every candidate fact.
+    ``routing`` names components whose routing destinations alone the
+    finalizer retargeted: their options — and therefore validator ``detail``
+    about their options — remain exactly what the model authored, but their
+    ``connectivity`` facts would quote the finalizer-written routing values,
+    so only those facts are suppressed.
+    """
+
+    config: frozenset[str] = frozenset()
+    routing: frozenset[str] = frozenset()
+
+    def owns_anything(self) -> bool:
+        return bool(self.config) or bool(self.routing)
+
+
+_FINALIZER_OWNS_NOTHING: Final[_FinalizerOwnedRefs] = _FinalizerOwnedRefs()
+
+
+def _candidate_component_blocks(candidate: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    """Map validation-component refs to their raw blocks in one candidate.
+
+    The ref vocabulary matches state validation exactly (``source`` /
+    ``source:<name>`` / ``node:<id>`` / ``output:<name>`` — see
+    ``composer.state``'s component naming). Tolerant by design: a block that
+    cannot carry a well-formed ref (non-mapping, missing/empty id) is skipped,
+    because validation can never attribute an error entry to it either — such
+    candidates resolve through the canonical-schema complaint, not through
+    entry-scoped withholding.
+    """
+    blocks: dict[str, Mapping[str, Any]] = {}
+    raw_source = candidate.get("source")
+    if isinstance(raw_source, Mapping):
+        blocks["source"] = raw_source
+    raw_sources = candidate.get("sources")
+    if isinstance(raw_sources, Mapping):
+        for name, block in raw_sources.items():
+            if type(name) is str and name and isinstance(block, Mapping):
+                blocks["source" if name == "source" else f"source:{name}"] = block
+    raw_nodes = candidate.get("nodes")
+    if type(raw_nodes) is list:
+        for node in raw_nodes:
+            if isinstance(node, Mapping):
+                node_id = node.get("id")
+                if type(node_id) is str and node_id:
+                    blocks[f"node:{node_id}"] = node
+    raw_outputs = candidate.get("outputs")
+    if type(raw_outputs) is list:
+        for output in raw_outputs:
+            if isinstance(output, Mapping):
+                sink_name = output.get("sink_name")
+                if type(sink_name) is str and sink_name:
+                    blocks[f"output:{sink_name}"] = output
+    return blocks
+
+
+def _derive_finalizer_owned_refs(
+    candidate: Mapping[str, Any],
+    finalized: Mapping[str, Any],
+) -> _FinalizerOwnedRefs:
+    """Component refs the candidate finalizer owns, derived by structural diff.
+
+    Derived at the planner call site rather than self-reported through the
+    finalizer protocol (the seam decision for elspeth-5904b1683a): the planner
+    already holds both the authored candidate and the finalized result, and a
+    diff cannot under-report — a finalizer pass that forgets to declare a
+    mutation would keep validator detail for a server-bound component, the
+    custody leak this boundary exists to prevent. A component the finalizer
+    introduced is config-owned (auto-wired REQUIRED controls); one whose
+    non-routing content changed is config-owned (guided reviewed-authority
+    binding, correction-restored predecessor nodes); one whose ONLY change is
+    a routing retarget (see ``_FINALIZER_ROUTING_KEYS``) is routing-owned. A
+    byte-identical component is owned in neither sense: everything a
+    projection about it can quote, the model already emitted itself.
+
+    The identity fast path mirrors ``wire_required_controls``'s no-op
+    contract (returns the candidate object ITSELF unchanged).
+    """
+    if finalized is candidate:
+        return _FINALIZER_OWNS_NOTHING
+    authored = _candidate_component_blocks(candidate)
+    config_owned: set[str] = set()
+    routing_owned: set[str] = set()
+    for ref, block in _candidate_component_blocks(finalized).items():
+        original = authored.get(ref)
+        if original is None:
+            config_owned.add(ref)
+        elif original is block:
+            continue
+        elif _component_config_identity(original) != _component_config_identity(block):
+            config_owned.add(ref)
+        elif canonical_json(original) != canonical_json(block):
+            routing_owned.add(ref)
+    return _FinalizerOwnedRefs(config=frozenset(config_owned), routing=frozenset(routing_owned))
+
+
 type PipelineCandidateFinalizer = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 type PipelineCandidateAcceptance = Callable[[CompositionState], None]
 type PipelineClaimEvaluator = Callable[[CompositionState, tuple[str, ...]], tuple[str, ...]]
@@ -453,7 +577,9 @@ class _PlannerAttemptTrail:
       guard_fired | budget_exhausted | declined | accepted
     - ``led_to``: continue | repair | hatch | terminal | done
     - ``planner_code``: the closed loop-control code when a guard or budget
-      resolved the attempt (e.g. DISCOVERY_CYCLE, REPAIR_EXHAUSTED)
+      resolved the attempt (e.g. DISCOVERY_CYCLE, REPAIR_EXHAUSTED, or
+      REPAIR_BLIND_REPEAT when the repeat-while-blind short-circuit fired —
+      the raised error still carries code REPAIR_EXHAUSTED)
     """
 
     def __init__(self, *, session_id: str, operation_id: str | None, surface: str) -> None:
@@ -1215,12 +1341,107 @@ _REPEAT_NOTICE = (
     "other part of your last candidate byte-identical, and re-emit."
 )
 
+# Honest variant for a repeat whose facts are (partly) withheld: the ordinary
+# notice's "change ONLY the fields the errors below name" is unsatisfiable when
+# no field is named. Static text, never per-request data.
+_REPEAT_NOTICE_WITHHELD = (
+    "This candidate failed with EXACTLY the same rejection set (same components, same codes) "
+    "as an earlier candidate in this request. At least one failing component is configured "
+    "server-side for this surface and its validator detail is withheld, so re-emitting a "
+    "near-identical candidate cannot succeed. Only a structurally different candidate — or an "
+    "honest decline — can resolve this."
+)
+
+# Subject prefix of a ``rejected_mutation`` entry's message. These prefixes are
+# authored by our own ``build_set_pipeline_candidate`` failure sites
+# (``Source '<name>': …`` / ``Node '<id>': …`` / ``Output '<name>': …``), the
+# same first-party format ``_INVALID_OPTIONS_PLUGIN_RE`` already parses for
+# schema augmentation — Tier-1 parsing of ELSPETH-authored text, not a
+# provider boundary.
+_REJECTED_MUTATION_SUBJECT_RE: Final[re.Pattern[str]] = re.compile(r"^(Source|Node|Output) '([^']+)': ")
+
+
+def _entry_component_ref(entry: Any) -> str | None:
+    """Canonical validation-component ref a rejection entry is about.
+
+    State-validation entries already carry the canonical vocabulary
+    (``source`` / ``source:<name>`` / ``node:<id>`` / ``output:<name>`` /
+    ``pipeline``). ``rejected_mutation`` entries name their subject in the
+    message prefix instead; an unprefixed rejected_mutation message has no
+    attributable subject and returns ``None`` (the withholding decision then
+    fails closed whenever the finalizer owns anything).
+    """
+    component = entry.component
+    if component != "rejected_mutation":
+        return cast(str, component)
+    match = _REJECTED_MUTATION_SUBJECT_RE.match(entry.message)
+    if match is None:
+        return None
+    kind, name = match.groups()
+    if kind == "Node":
+        return f"node:{name}"
+    if kind == "Source":
+        return "source" if name == "source" else f"source:{name}"
+    return f"output:{name}"
+
+
+# Codes whose projection attaches instance ``connectivity`` facts — the only
+# projection that quotes a component's ROUTING values, so it is additionally
+# suppressed for routing-owned components.
+_CONNECTIVITY_FACT_CODES: Final[frozenset[str]] = _ROUTE_DESTINATION_FACT_CODES | {"coalesce_branch_unreachable"}
+
+
+@dataclass(frozen=True, slots=True)
+class _EntryWithholding:
+    """Per-entry withholding decision (elspeth-5904b1683a).
+
+    ``config`` masks the entry to component ``"pipeline"``, swaps in the
+    honest blind-mode guidance, and strips validator ``detail`` and every
+    structured candidate fact — the entry is about a component whose
+    configuration the finalizer wrote, so any of those could quote reviewed
+    private values. ``connectivity`` strips only the connectivity facts — the
+    component's options (and so its ``detail``) are still exactly what the
+    model authored, but its routing destinations were finalizer-written.
+    ``withheld`` is the honesty signal: True when this entry was actually
+    projected with something suppressed, feeding the withheld repeat notice
+    and the repeat-while-blind short-circuit.
+    """
+
+    config: bool
+    connectivity: bool
+    withheld: bool
+
+
+def _entry_withholding(entry: Any, finalizer_owned: _FinalizerOwnedRefs) -> _EntryWithholding:
+    """Withholding decision for one rejection entry.
+
+    Entry-scoped custody (elspeth-5904b1683a): withhold exactly the entries
+    about components the candidate finalizer owns, per change kind (see
+    :class:`_FinalizerOwnedRefs`). Entries whose subject cannot be attributed
+    fail closed while any server ownership exists. Entries on components the
+    model authored — untouched by the finalizer — disclose nothing the model
+    does not already hold.
+    """
+    if not finalizer_owned.owns_anything():
+        return _EntryWithholding(config=False, connectivity=False, withheld=False)
+    ref = _entry_component_ref(entry)
+    config = ref is None or ref in finalizer_owned.config
+    connectivity = config or ref in finalizer_owned.routing
+    code = entry.error_code or "validation_error"
+    withheld = config or (connectivity and code in _CONNECTIVITY_FACT_CODES)
+    return _EntryWithholding(config=config, connectivity=connectivity, withheld=withheld)
+
+
+def _rejection_facts_withheld(result: ToolResult, finalizer_owned: _FinalizerOwnedRefs) -> bool:
+    """Whether ANY entry of one rejection was projected in withheld form."""
+    return any(_entry_withholding(entry, finalizer_owned).withheld for entry in _rejection_entries(result))
+
 
 def _allowlisted_candidate_feedback(
     result: ToolResult,
     *,
     repeated_fingerprint: bool = False,
-    withhold_candidate_facts: bool = False,
+    finalizer_owned: _FinalizerOwnedRefs = _FINALIZER_OWNS_NOTHING,
 ) -> dict[str, Any]:
     """Project only structured validation fields already safe for tool output.
 
@@ -1245,13 +1466,35 @@ def _allowlisted_candidate_feedback(
     one-line patch, the planner never saw either, burned every repair on
     the static enrichment's profile-alias hypothesis, and declined with a
     confabulated cause — twice, in two sessions.
+
+    ``finalizer_owned`` scopes that custody judgment PER ENTRY and PER
+    CHANGE KIND (elspeth-5904b1683a). Entries about config-owned components
+    (guided reviewed sources/outputs, correction-restored nodes, auto-wired
+    controls) are masked to component ``"pipeline"`` and stripped of detail
+    and every instance fact, because their validator messages can quote
+    reviewed private values redacted from the provider context. Entries
+    about routing-owned components keep their true component id and detail
+    — their options are exactly what the model authored — but lose only
+    their ``connectivity`` facts, the one projection that quotes
+    finalizer-written routing destinations. The predecessor candidate-global
+    predicate (any finalizer mutation withholds every entry) made guided
+    repair permanently blind — the guided binder ALWAYS mutates the
+    candidate — and drove deterministic REPAIR_EXHAUSTED on any
+    first-candidate option mistake. Cross-component identifiers inside kept
+    facts (``declared_sinks``, contract producer/consumer ids) are
+    structural labels, never option values, and remain the repair
+    vocabulary the model must use.
     """
     validation = result.validation
     errors: list[dict[str, Any]] = []
     reachability_facts: dict[str, dict[str, Any]] | None = None
     destination_facts: dict[str, RouteDestinationFactDict] | None = None
+    any_facts_withheld = False
     for entry in _rejection_entries(result):
         code = entry.error_code or "validation_error"
+        withholding = _entry_withholding(entry, finalizer_owned)
+        withhold_candidate_facts = withholding.config
+        any_facts_withheld = any_facts_withheld or withholding.withheld
         component = "pipeline" if withhold_candidate_facts else entry.component
         projected: dict[str, Any] = {
             "component": component,
@@ -1259,7 +1502,7 @@ def _allowlisted_candidate_feedback(
             "error_code": code,
             "error_class": "ValidationError",
         }
-        guidance = explain_validation_code(code)
+        guidance = explain_withheld_validation_code(code) if withhold_candidate_facts else explain_validation_code(code)
         if guidance is not None:
             projected["explanation"], projected["suggested_fix"] = guidance
         if (
@@ -1277,7 +1520,7 @@ def _allowlisted_candidate_feedback(
             # instruction its own prompt was built from, or the reviewed output
             # field names already in its ``reviewed_planner_context``.
             projected["detail"] = entry.message
-        if code in _ROUTE_DESTINATION_FACT_CODES and not withhold_candidate_facts:
+        if code in _ROUTE_DESTINATION_FACT_CODES and not withholding.connectivity:
             # Instance wiring facts derived from the REJECTED candidate state
             # the result carries — the dangling value and the exact valid
             # destinations (sink names / consumable connections) the planner
@@ -1290,7 +1533,7 @@ def _allowlisted_candidate_feedback(
             if destination_facts is None:
                 destination_facts = route_destination_facts(result.updated_state)
             projected["connectivity"] = destination_facts[entry.component]
-        if code == "coalesce_branch_unreachable" and not withhold_candidate_facts:
+        if code == "coalesce_branch_unreachable" and not withholding.connectivity:
             # Instance wiring facts derived from the REJECTED state the result
             # carries — same redaction class as the contract facts below (node
             # ids + connection names the planner itself authored). Without
@@ -1337,8 +1580,11 @@ def _allowlisted_candidate_feedback(
     if repeated_fingerprint:
         # Static text, never per-request data: names the repetition the model
         # cannot see on its own (it has no attempt counter) so budget stops
-        # burning on byte-identical failures without the model knowing.
-        feedback["repeat_notice"] = _REPEAT_NOTICE
+        # burning on byte-identical failures without the model knowing. The
+        # withheld variant is honest about WHY re-emitting cannot succeed —
+        # the ordinary notice's "change ONLY the fields the errors below
+        # name" names no field when facts are withheld.
+        feedback["repeat_notice"] = _REPEAT_NOTICE_WITHHELD if any_facts_withheld else _REPEAT_NOTICE
     return feedback
 
 
@@ -2396,9 +2642,12 @@ async def _plan_pipeline_inner(
     # on any resulting exhaustion so the durable disposition names the wall.
     last_rejection_codes: tuple[str, ...] = ()
 
-    def _rejection_exhausted() -> PipelinePlannerError:
+    def _rejection_exhausted(message: str = "planner repair budget exhausted") -> PipelinePlannerError:
+        # The blind-repeat short-circuit passes its own honest message; the
+        # CODE stays REPAIR_EXHAUSTED either way — one downstream envelope
+        # (``planner_repair_exhausted``) covers every repair non-convergence.
         return PipelinePlannerError(
-            "planner repair budget exhausted",
+            message,
             code="REPAIR_EXHAUSTED",
             detail_codes=last_rejection_codes,
             # Carried whenever the request HAD a gap, not only when the final
@@ -2562,6 +2811,7 @@ async def _plan_pipeline_inner(
                     if not set(claimed_deferred_intent_ids).issubset(eligible_deferred_intent_ids):
                         terminal_feedback = _deferred_intent_claim_feedback()
             finalized_pipeline: Mapping[str, Any] | None = None
+            finalizer_owned_refs: _FinalizerOwnedRefs = _FINALIZER_OWNS_NOTHING
             if terminal_feedback is None:
                 assert pipeline is not None
                 if pipeline.get("source") is None and pipeline.get("sources") is None:
@@ -2603,6 +2853,11 @@ async def _plan_pipeline_inner(
                                 raise hatch_error from None
                             raise AuditIntegrityError("pipeline candidate finalizer must return an exact dict")
                         finalized_pipeline = finalizer_result
+                        # Entry-scoped custody attribution (elspeth-5904b1683a):
+                        # derived by diff HERE, not self-reported by the
+                        # finalizer, so a pass that mutates without declaring
+                        # can never leak server-bound validator detail.
+                        finalizer_owned_refs = _derive_finalizer_owned_refs(pipeline, finalizer_result)
             if terminal_feedback is not None:
                 last_rejection_codes = _feedback_error_codes(terminal_feedback)
                 if is_hatch_turn:
@@ -2848,10 +3103,11 @@ async def _plan_pipeline_inner(
                 rejection_fingerprint = _rejection_fingerprint(exc.result)
                 repeated_fingerprint = rejection_fingerprint in seen_rejection_fingerprints
                 seen_rejection_fingerprints.add(rejection_fingerprint)
+                candidate_facts_withheld = _rejection_facts_withheld(exc.result, finalizer_owned_refs)
                 candidate_feedback = _allowlisted_candidate_feedback(
                     exc.result,
                     repeated_fingerprint=repeated_fingerprint,
-                    withhold_candidate_facts=canonical_json(finalized_pipeline) != canonical_json(pipeline),
+                    finalizer_owned=finalizer_owned_refs,
                 )
                 if os.environ.get("ELSPETH_PLANNER_REJECTION_DETAIL_LOG") == "1":
                     # Operator-opted diagnostic seam. Validator messages are never
@@ -2876,6 +3132,48 @@ async def _plan_pipeline_inner(
                     trail.log_attempt("hatch", "candidate_rejected", codes=last_rejection_codes, led_to="terminal")
                     assert hatch_error is not None
                     raise hatch_error from None
+                if repeated_fingerprint and candidate_facts_withheld:
+                    # Repeat-while-blind short-circuit (elspeth-5904b1683a): the
+                    # identical rejection set has already been answered once,
+                    # and at least one entry's candidate facts are withheld —
+                    # the model cannot see, and can never fix, the server-bound
+                    # configuration behind it. Burning the remaining budget on
+                    # near-identical candidates is deterministic waste, so this
+                    # resolves straight to the terminal path (hatch first, as
+                    # the budget-exhaustion path does). Budget semantics are
+                    # unchanged whenever every entry carries its facts.
+                    if _hatch_available():
+                        trail.log_attempt(
+                            attempt_phase,
+                            "candidate_rejected",
+                            codes=last_rejection_codes,
+                            planner_code="REPAIR_BLIND_REPEAT",
+                            led_to="hatch",
+                            repeated_fingerprint=True,
+                        )
+                        _retain_terminal_rejection(
+                            provider_message=message,
+                            parsed_calls=calls,
+                            terminal_call=call,
+                            feedback=candidate_feedback,
+                        )
+                        _engage_escape_hatch(
+                            _rejection_exhausted(
+                                "planner repair short-circuited: repeated rejection with withheld candidate facts cannot converge"
+                            )
+                        )
+                        continue
+                    trail.log_attempt(
+                        attempt_phase,
+                        "candidate_rejected",
+                        codes=last_rejection_codes,
+                        planner_code="REPAIR_BLIND_REPEAT",
+                        led_to="terminal",
+                        repeated_fingerprint=True,
+                    )
+                    raise _rejection_exhausted(
+                        "planner repair short-circuited: repeated rejection with withheld candidate facts cannot converge"
+                    ) from None
                 repair_count += 1
                 if repair_count > repair_budget:
                     if _hatch_available():

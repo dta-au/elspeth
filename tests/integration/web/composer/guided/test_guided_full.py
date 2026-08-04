@@ -1102,7 +1102,9 @@ def test_guided_full_blob_failures_keep_custody_and_integrity_distinct() -> None
         ("PROVIDER_CALLS_EXHAUSTED", "invalid_provider_response"),
         ("TOOL_CALLS_EXHAUSTED", "invalid_provider_response"),
         ("COMPOSITION_EXHAUSTED", "invalid_provider_response"),
-        ("REPAIR_EXHAUSTED", "invalid_provider_response"),
+        # Planner-owned non-convergence answers its own honest code
+        # (elspeth-5904b1683a): the provider responded every repair turn.
+        ("REPAIR_EXHAUSTED", "planner_repair_exhausted"),
         ("DISCOVERY_ONLY", "invalid_provider_response"),
         ("DISCOVERY_EXHAUSTED", "invalid_provider_response"),
         ("DISCOVERY_CYCLE", "invalid_provider_response"),
@@ -1133,9 +1135,12 @@ def test_guided_full_policy_refusal_outranks_the_planner_code(code: str, policy_
     exc = PipelinePlannerError("safe", code=code, detail_codes=(policy_code,))
 
     assert _guided_full_failure_code(exc) == "policy_blocked"
-    # Without the policy code the same planner code stays a retryable provider
-    # fault — the split must not swallow ordinary exhaustion.
-    assert _guided_full_failure_code(PipelinePlannerError("safe", code=code)) == "invalid_provider_response"
+    # Without the policy code the same planner code stays retryable — the
+    # split must not swallow ordinary exhaustion. REPAIR_EXHAUSTED keeps its
+    # own honest planner-owned code (elspeth-5904b1683a); the rest remain a
+    # provider fault.
+    bare_expected = "planner_repair_exhausted" if code == "REPAIR_EXHAUSTED" else "invalid_provider_response"
+    assert _guided_full_failure_code(PipelinePlannerError("safe", code=code)) == bare_expected
 
 
 @pytest.mark.parametrize(

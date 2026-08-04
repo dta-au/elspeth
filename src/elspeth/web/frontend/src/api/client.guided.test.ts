@@ -987,6 +987,9 @@ describe("api/client guided functions", () => {
       [{ status: "failed", failure_code: "request_cancelled" }],
       // F13-D: the permanent policy failure code is in the closed vocabulary.
       [{ status: "failed", failure_code: "policy_blocked" }],
+      // elspeth-5904b1683a: honest planner-exhaustion code is in the closed
+      // vocabulary (transient — retry affordances stay enabled).
+      [{ status: "failed", failure_code: "planner_repair_exhausted" }],
       [{ status: "completed", composition_state_id: "00000000-0000-4000-8000-000000000321" }],
     ])("POSTs without request content and decodes the exact closed result %#", async (body) => {
       fetchSpy.mockResolvedValue({ ok: true, status: 200, json: async () => body } as Response);

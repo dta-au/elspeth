@@ -5083,8 +5083,9 @@ async def post_guided_respond(
             except Exception as exc:
                 # Planner failures route through the shared /guided/plan
                 # mapper so both endpoints answer the same closed envelope
-                # (REPAIR_EXHAUSTED-family -> invalid_provider_response 502
-                # with a retry instruction). Tutorial op 18b4cee7 fell to
+                # (REPAIR_EXHAUSTED -> planner_repair_exhausted 500, the
+                # residual invalid-response family -> 502, each with a retry
+                # instruction). Tutorial op 18b4cee7 fell to
                 # 'operation_failed' here — a generic 500 banner with no
                 # affordance — while the identical failure on /guided/plan
                 # was already coded.

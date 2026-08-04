@@ -302,6 +302,9 @@ export type ComposerProgressReason =
   | "provider_unavailable"
   | "plugin_crash"
   | "runtime_preflight_failed"
+  // Planner repair exhaustion (elspeth-5904b1683a): planner-owned and
+  // retryable — deliberately not part of the provider_* family.
+  | "planner_repair_exhausted"
   | "service_setup_failed"
   // Required when phase === "cancelled" — distinguishes a client disconnect
   // from a future operator-initiated cancel without parsing the headline.

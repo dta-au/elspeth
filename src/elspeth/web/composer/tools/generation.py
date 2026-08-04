@@ -1142,6 +1142,41 @@ def explain_validation_code(code: str) -> tuple[str, str] | None:
     return None
 
 
+# Static text, never per-request data — the same public-constant posture as
+# every catalogue entry above, so it cannot re-open the message boundary the
+# planner's allowlist protects.
+_WITHHELD_VALIDATION_GUIDANCE: Final[tuple[str, str]] = (
+    "This error is on a component whose configuration is bound server-side for this surface. "
+    "Its true component id and validator detail are deliberately withheld: the message could "
+    "quote reviewed private values that are redacted from this conversation.",
+    "Do not guess at the withheld configuration — you cannot see or edit it. Re-verify only the "
+    "components you authored yourself: call get_plugin_schema(<plugin_type>, <plugin_name>) for "
+    "the exact option shapes and allowed values, and change only fields the other errors name. "
+    "If this exact rejection set repeats, a near-identical candidate cannot succeed: restructure "
+    "the pipeline, or decline honestly.",
+)
+
+
+def explain_withheld_validation_code(code: str) -> tuple[str, str] | None:
+    """Blind-mode ``(explanation, suggested_fix)`` for a withheld rejection entry.
+
+    The planner's repair feedback withholds a rejection entry's component id
+    and validator detail when the entry is about a finalizer-owned component
+    (guided reviewed sources/outputs, correction-restored nodes, auto-wired
+    controls — elspeth-5904b1683a). The ordinary catalogue guidance is
+    dishonest in that mode: ``plugin_options_invalid``'s fix opens with
+    "Apply exactly what 'detail' names" when no detail is present, which
+    sent live planners chasing a field that does not exist and burned the
+    repair budget on re-emissions. This accessor returns guidance that is
+    honest about the blindness for EVERY code — unlike
+    :func:`explain_validation_code` it never returns ``None`` for a
+    well-formed code, because naming the withholding is precisely the point.
+    """
+    if type(code) is not str or not code:
+        return None
+    return _WITHHELD_VALIDATION_GUIDANCE
+
+
 def _execute_explain_validation_error(
     args: dict[str, Any],
     state: CompositionState,

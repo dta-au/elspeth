@@ -2146,6 +2146,7 @@ export function decodeGuidedStartOperationReconciliation(
         case "provider_unavailable":
         case "provider_timeout":
         case "invalid_provider_response":
+        case "planner_repair_exhausted":
         case "policy_blocked":
         case "stale_conflict":
         case "integrity_error":
