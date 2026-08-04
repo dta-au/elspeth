@@ -765,8 +765,10 @@ def attach_llm_calls(
 # Anthropic-family providers (Anthropic direct, OpenRouter Anthropic routing,
 # AWS Bedrock Anthropic, Google Vertex Anthropic) use explicit
 # ``cache_control: {"type": "ephemeral"}`` markers placed on the system
-# message and on the trailing function tool to indicate the static prefix
-# that should be cached for follow-up requests within a session.
+# message, the deployment-constant catalog context message, the trailing
+# function tool, and (opt-in, freeform loop only) the last message — so the
+# static prefix AND the append-only conversation are cached for follow-up
+# requests (elspeth-4e79436719, extended by elspeth-a79f1b2e6b).
 #
 # OpenAI / OpenRouter OpenAI / Azure OpenAI providers use *automatic* prefix
 # caching above a 1024-token threshold and do NOT honor the ``cache_control``
@@ -810,17 +812,31 @@ def supports_anthropic_prompt_cache_markers(model: str | None) -> bool:
 def apply_anthropic_cache_markers(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None,
+    *,
+    mark_history_tail: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
     """Return new messages/tools lists with Anthropic ``cache_control`` markers.
 
-    Behavior:
+    Behavior (at most four breakpoints total — Anthropic's limit):
     - The first message with ``role == "system"`` receives a top-level
       ``cache_control: {"type": "ephemeral"}`` field. ``build_messages()``
-      keeps this first system message to the stable skill/deployment prompt;
-      the dynamic current-state JSON is emitted as a later ``role: "user"``
-      message, not a second system message. LiteLLM's Anthropic transform
-      recognizes this marker and propagates it onto the corresponding
-      ``AnthropicSystemMessageContent`` block on the wire.
+      keeps this first system message to the stable skill/deployment prompt.
+      LiteLLM's Anthropic transform recognizes this marker and propagates it
+      onto the corresponding ``AnthropicSystemMessageContent`` block on the
+      wire.
+    - A ``role == "user"`` message whose content starts with
+      ``CATALOG_CONTEXT_PREFIX`` (the deployment-constant catalog context
+      from ``build_catalog_context_string``) receives the same marker: the
+      block is byte-stable per deployment, so it is written to the cache
+      once and read at ~10% price on every later call of every session
+      (elspeth-a79f1b2e6b). Surfaces whose message lists carry no catalog
+      message (guided solver, planner) are unaffected.
+    - When ``mark_history_tail`` is True, the LAST message receives the
+      marker — the sliding-breakpoint pattern for append-only agentic
+      loops: each call re-reads the previously written conversation prefix
+      and writes only the new tail. Opt-in because on single-shot calls it
+      pays the cache-write premium with no follow-up call to redeem it;
+      only the freeform tool loop (``_call_llm_with_audit``) opts in.
     - The LAST tool in ``tools`` receives the same marker at the tool
       level. Anthropic caches all tools up to and including the marker,
       so marking the trailing tool covers the full tools array.
@@ -830,7 +846,13 @@ def apply_anthropic_cache_markers(
     contents are not deep-copied) — this keeps the transform cheap and
     is safe because the receiver (LiteLLM) does not mutate them.
     """
+    # Local import: prompts.py has no import back into this module, but the
+    # header contract is authored there next to the builders that emit it.
+    from elspeth.web.composer.prompts import CATALOG_CONTEXT_PREFIX
+
     new_messages: list[dict[str, Any]] = list(messages)
+    system_marked = False
+    catalog_marked = False
     for index, message in enumerate(new_messages):
         # ``messages`` is our outbound request payload built by
         # ``build_messages()`` (prompts.py), not an external response object.
@@ -839,9 +861,24 @@ def apply_anthropic_cache_markers(
         # directly and let ``KeyError`` surface it rather than masking it
         # with ``.get()``. This is Tier-2 data we authored, not the Tier-3
         # provider responses the rest of this module normalizes.
-        if message["role"] == "system":
+        if not system_marked and message["role"] == "system":
             new_messages[index] = {**message, "cache_control": {"type": "ephemeral"}}
+            system_marked = True
+        elif (
+            not catalog_marked
+            and message["role"] == "user"
+            and isinstance(message.get("content"), str)
+            and message["content"].startswith(CATALOG_CONTEXT_PREFIX)
+        ):
+            new_messages[index] = {**message, "cache_control": {"type": "ephemeral"}}
+            catalog_marked = True
+        if system_marked and catalog_marked:
             break
+
+    if mark_history_tail and new_messages:
+        last = new_messages[-1]
+        if "cache_control" not in last:
+            new_messages[-1] = {**last, "cache_control": {"type": "ephemeral"}}
 
     new_tools: list[dict[str, Any]] | None = None
     if tools:

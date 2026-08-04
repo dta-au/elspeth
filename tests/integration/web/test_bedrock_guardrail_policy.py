@@ -14,7 +14,7 @@ from pydantic import ValidationError
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
-from elspeth.web.composer.prompts import build_context_string
+from elspeth.web.composer.prompts import build_catalog_context_string, build_context_string
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.yaml_generator import generate_public_yaml
@@ -446,7 +446,13 @@ def test_private_bindings_never_enter_authored_prompt_snapshot_or_policy_evidenc
     policy, profiles, snapshot = _policy_context(_guardrail_settings())
     state = _guarded_state()
     view = PolicyCatalogView(create_catalog_service(), snapshot, profiles)
-    prompt = build_context_string(state, view, plugin_snapshot=snapshot, schemas_loaded=frozenset())
+    # Both authored context messages: the profile-alias inventory rides in the
+    # catalog message, the authored state in the session message.
+    prompt = (
+        build_catalog_context_string(view, plugin_snapshot=snapshot)
+        + "\n"
+        + build_context_string(state, view, plugin_snapshot=snapshot, schemas_loaded=frozenset())
+    )
     evidence = _build_web_plugin_policy_evidence(snapshot=snapshot, policy=policy)
     surfaces = {
         "authored_state": json.dumps(state.to_dict(), sort_keys=True),

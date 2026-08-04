@@ -138,7 +138,7 @@ def _three_plugin_state() -> CompositionState:
 def _composer_progress(context_str: str) -> dict[str, Any]:
     """Extract the ``composer_progress`` block from a context string payload."""
     prefix, _, json_text = context_str.partition("\n")
-    assert prefix.startswith("Current pipeline state and available plugins")
+    assert prefix.startswith("Current pipeline state and session progress")
     parsed = json.loads(json_text)
     return parsed["composer_progress"]
 

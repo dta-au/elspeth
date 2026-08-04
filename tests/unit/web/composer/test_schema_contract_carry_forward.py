@@ -14,7 +14,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService, PluginKind
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer.planner_authoring_aids import build_schema_contract_evidence
-from elspeth.web.composer.prompts import build_context_string, build_messages
+from elspeth.web.composer.prompts import build_catalog_context_string, build_context_string, build_messages
 from elspeth.web.composer.protocol import ComposerHistoryMessage
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.config import WebSettings
@@ -454,7 +454,9 @@ def test_injection_shaped_enum_is_exact_but_free_text_metadata_is_absent() -> No
         schemas_loaded=frozenset({("source", "csv")}),
     )
     assert injection not in cast(str, messages[0]["content"])
-    assert injection in cast(str, messages[1]["content"])
+    # The evidence rides in the session-varying state context, which sits
+    # after chat history (cache-layout contract), not in the catalog message.
+    assert injection in cast(str, messages[-2]["content"])
 
 
 def test_unions_defs_patterns_bounds_and_conditional_knobs_survive_projection() -> None:
@@ -545,14 +547,7 @@ def test_unions_defs_patterns_bounds_and_conditional_knobs_survive_projection() 
 
 def test_discovery_digest_declares_itself_selection_only() -> None:
     view, snapshot = _policy_view()
-    payload = _payload(
-        build_context_string(
-            _csv_state(),
-            view,
-            plugin_snapshot=snapshot,
-            schemas_loaded=frozenset(),
-        )
-    )
+    payload = _payload(build_catalog_context_string(view, plugin_snapshot=snapshot))
 
     authoring_aids = cast(dict[str, object], payload["authoring_aids"])
     digest = cast(dict[str, object], authoring_aids["discovery_digest"])
@@ -855,7 +850,7 @@ def test_followup_evidence_does_not_duplicate_discovery_or_rewrite_history() -> 
     assert messages[2:4] == history
     assert messages[-1] == {"role": "user", "content": "Continue."}
     assert all(message["role"] != "tool" for message in messages)
-    assert len(messages) == 5
+    assert len(messages) == 6
     assert catalog.get_schema_calls == [("source", "csv")]
-    payload = _payload(cast(str, messages[1]["content"]))
+    payload = _payload(cast(str, messages[-2]["content"]))
     assert [entry["plugin_id"] for entry in _schema_entries(payload)] == ["source/csv"]

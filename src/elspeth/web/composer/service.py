@@ -6673,20 +6673,23 @@ class ComposerServiceImpl:
         """Call the composer LLM once and record an audit sidecar.
 
         For Anthropic-family providers, ``cache_control`` markers are
-        applied to the stable first system message and the trailing tool
-        before the call. Dynamic composer state lives in the later context
-        message (``build_messages`` appends it with ``role: "user"``, not
-        ``"system"`` — see ``prompts.py``), outside the stable prompt-cache
-        breakpoint. The transformed payload is what flows to LiteLLM and what
-        the audit ``messages_hash`` / ``tools_spec_hash`` record — the hash is
-        over the bytes actually sent, so the audit row is truthful about the
+        applied before the call: the stable first system message, the
+        deployment-constant catalog context message, the trailing tool, and
+        — because this loop is append-only and calls repeatedly — a sliding
+        marker on the last message, so each call re-reads the previously
+        cached conversation and writes only the new tail
+        (elspeth-a79f1b2e6b). Session-varying composer state rides after the
+        chat history (see ``build_messages``), outside the stable prefix.
+        The transformed payload is what flows to LiteLLM and what the audit
+        ``messages_hash`` / ``tools_spec_hash`` record — the hash is over
+        the bytes actually sent, so the audit row is truthful about the
         wire payload (elspeth-4e79436719).
         """
         from litellm.exceptions import APIError as LiteLLMAPIError
         from litellm.exceptions import AuthenticationError as LiteLLMAuthError
 
         if supports_anthropic_prompt_cache_markers(self._model):
-            messages, tools_or_none = apply_anthropic_cache_markers(messages, tools)
+            messages, tools_or_none = apply_anthropic_cache_markers(messages, tools, mark_history_tail=True)
             tools = tools_or_none if tools_or_none is not None else tools
 
         started_at = datetime.now(UTC)

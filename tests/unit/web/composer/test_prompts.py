@@ -28,9 +28,14 @@ from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
 from elspeth.web.composer.planner_authoring_aids import build_planner_authoring_aids
 from elspeth.web.composer.prompts import (
+    CATALOG_CONTEXT_PREFIX,
+    STATE_CONTEXT_PREFIX,
     SYSTEM_PROMPT,
     build_run_diagnostics_messages,
     build_system_prompt,
+)
+from elspeth.web.composer.prompts import (
+    build_catalog_context_string as _build_catalog_context_string,
 )
 from elspeth.web.composer.prompts import (
     build_context_string as _build_context_string,
@@ -104,6 +109,11 @@ def build_context_string(state: CompositionState, catalog: CatalogService, **kwa
     kwargs.pop("user_id", None)
     view, snapshot = _trained_policy_context(catalog)
     return _build_context_string(state, view, plugin_snapshot=snapshot, **kwargs)
+
+
+def build_catalog_context_string(catalog: CatalogService) -> str:
+    view, snapshot = _trained_policy_context(catalog)
+    return _build_catalog_context_string(view, plugin_snapshot=snapshot)
 
 
 def build_messages(
@@ -195,8 +205,9 @@ class TestBuildMessages:
         roles = [m["role"] for m in list2]
         assert "assistant" not in roles
 
-    def test_message_ordering_system_context_history_user(self) -> None:
-        """Messages must be: stable system, dynamic context, history, then user."""
+    def test_message_ordering_system_catalog_history_state_user(self) -> None:
+        """Messages must be: stable system, constant catalog context, history,
+        varying state context, then user (the cache-layout contract)."""
         state = _empty_state()
         catalog = _stub_catalog()
         history = [
@@ -208,12 +219,15 @@ class TestBuildMessages:
 
         assert messages[0]["role"] == "system"
         assert messages[1]["role"] == "user"
-        assert messages[1]["content"].startswith("Current pipeline state and available plugins")
+        assert messages[1]["content"].startswith(CATALOG_CONTEXT_PREFIX)
         assert "UNTRUSTED DATA" in messages[1]["content"]
         assert messages[2]["role"] == "user"
         assert messages[2]["content"] == "previous question"
         assert messages[3]["role"] == "assistant"
         assert messages[3]["content"] == "previous answer"
+        assert messages[-2]["role"] == "user"
+        assert messages[-2]["content"].startswith(STATE_CONTEXT_PREFIX)
+        assert "UNTRUSTED DATA" in messages[-2]["content"]
         assert messages[-1]["role"] == "user"
         assert messages[-1]["content"] == "new question"
 
@@ -233,17 +247,20 @@ class TestBuildMessages:
         assert messages[2] == {"role": "user", "content": "Build the requested pipeline."}
         assert all(COMPOSER_HISTORY_USER_AUTHORED_KEY not in message for message in messages)
 
-    def test_empty_history_produces_system_context_and_user_only(self) -> None:
+    def test_empty_history_produces_system_catalog_state_and_user_only(self) -> None:
         state = _empty_state()
         catalog = _stub_catalog()
 
         messages = build_messages([], state, "my question", catalog)
 
-        assert len(messages) == 3
+        assert len(messages) == 4
         assert messages[0]["role"] == "system"
         assert messages[1]["role"] == "user"
+        assert messages[1]["content"].startswith(CATALOG_CONTEXT_PREFIX)
         assert messages[2]["role"] == "user"
-        assert messages[2]["content"] == "my question"
+        assert messages[2]["content"].startswith(STATE_CONTEXT_PREFIX)
+        assert messages[3]["role"] == "user"
+        assert messages[3]["content"] == "my question"
 
     def test_system_prompt_and_dynamic_context_are_split_for_prompt_cache(self) -> None:
         state = _empty_state()
@@ -252,16 +269,19 @@ class TestBuildMessages:
         messages = build_messages([], state, "test", catalog)
 
         stable_system_content = messages[0]["content"]
-        dynamic_context_content = messages[1]["content"]
+        catalog_context_content = messages[1]["content"]
+        state_context_content = messages[-2]["content"]
 
         assert SYSTEM_PROMPT in stable_system_content
         assert "Current pipeline state" not in stable_system_content
-        assert dynamic_context_content.startswith("Current pipeline state and available plugins")
-        assert "UNTRUSTED DATA" in dynamic_context_content
-        assert "csv" in dynamic_context_content
-        assert "passthrough" in dynamic_context_content
+        assert catalog_context_content.startswith(CATALOG_CONTEXT_PREFIX)
+        assert "UNTRUSTED DATA" in catalog_context_content
+        assert "csv" in catalog_context_content
+        assert "passthrough" in catalog_context_content
+        assert state_context_content.startswith(STATE_CONTEXT_PREFIX)
+        assert "UNTRUSTED DATA" in state_context_content
 
-    def test_first_system_message_is_stable_when_state_changes(self) -> None:
+    def test_system_and_catalog_messages_are_stable_when_state_changes(self) -> None:
         catalog = _stub_catalog()
 
         empty_messages = build_messages([], _empty_state(), "test", catalog)
@@ -272,7 +292,10 @@ class TestBuildMessages:
         assert empty_messages[0]["content"] == sourced_messages[0]["content"]
         assert empty_messages[1]["role"] == "user"
         assert sourced_messages[1]["role"] == "user"
-        assert empty_messages[1]["content"] != sourced_messages[1]["content"]
+        assert empty_messages[1]["content"] == sourced_messages[1]["content"]
+        assert empty_messages[-2]["role"] == "user"
+        assert sourced_messages[-2]["role"] == "user"
+        assert empty_messages[-2]["content"] != sourced_messages[-2]["content"]
 
     def test_untrusted_state_is_not_emitted_as_system_message(self) -> None:
         catalog = _stub_catalog()
@@ -299,31 +322,27 @@ class TestBuildMessages:
 class TestBuildContextString:
     """Context construction for the untrusted dynamic data message."""
 
-    def test_contains_state_and_plugins(self) -> None:
+    def test_state_and_plugins_are_split_across_context_messages(self) -> None:
         state = _empty_state()
         catalog = _stub_catalog()
 
-        context = build_context_string(state, catalog)
-        parsed = json.loads(context.split("\n", 1)[1])  # Skip header line
+        state_context = json.loads(build_context_string(state, catalog).split("\n", 1)[1])  # Skip header line
+        catalog_context = json.loads(build_catalog_context_string(catalog).split("\n", 1)[1])
 
-        assert "current_state" in parsed
-        assert "available_plugins" in parsed
-        plugins = parsed["available_plugins"]
+        assert "current_state" in state_context
+        assert "available_plugins" not in state_context
+        plugins = catalog_context["available_plugins"]
         assert "csv" in plugins["sources"]
         assert "passthrough" in plugins["transforms"]
         assert "csv" in plugins["sinks"]
+        assert "current_state" not in catalog_context
 
     def test_context_includes_the_live_planner_authoring_aids(self) -> None:
         """The ordinary compose loop gets the same live aid payload as the planner."""
         catalog = _stub_catalog()
         view, snapshot = _trained_policy_context(catalog)
 
-        context = _build_context_string(
-            _empty_state(),
-            view,
-            plugin_snapshot=snapshot,
-            schemas_loaded=frozenset(),
-        )
+        context = _build_catalog_context_string(view, plugin_snapshot=snapshot)
         parsed = json.loads(context.split("\n", 1)[1])
 
         assert parsed["authoring_aids"] == build_planner_authoring_aids(view)
@@ -357,7 +376,7 @@ class TestBuildContextString:
         )
         view = PolicyCatalogView.for_trained_operator(catalog, snapshot)
 
-        context = _build_context_string(_empty_state(), view, plugin_snapshot=snapshot, schemas_loaded=frozenset())
+        context = _build_catalog_context_string(view, plugin_snapshot=snapshot)
         policy = json.loads(context.split("\n", 1)[1])["plugin_policy"]
 
         assert policy["capability_groups"] == {"llm": ["transform:llm"]}
@@ -405,12 +424,7 @@ class TestBuildContextString:
         catalog = create_catalog_service()
         view = PolicyCatalogView(catalog, snapshot, profiles)
 
-        context = _build_context_string(
-            _empty_state(),
-            view,
-            plugin_snapshot=snapshot,
-            schemas_loaded=frozenset(),
-        )
+        context = _build_catalog_context_string(view, plugin_snapshot=snapshot)
         policy = json.loads(context.split("\n", 1)[1])["plugin_policy"]
 
         assert policy["usable_profile_aliases"] == {"transform:aws_bedrock_prompt_shield": ["prompt-default"]}
@@ -428,10 +442,9 @@ class TestBuildContextString:
 
     def test_context_includes_discovery_time_composer_hints(self) -> None:
         """The LLM sees JIT hints even when it does not call list_* first."""
-        state = _empty_state()
         catalog = _stub_catalog()
 
-        context = build_context_string(state, catalog)
+        context = build_catalog_context_string(catalog)
         parsed = json.loads(context.split("\n", 1)[1])
 
         assert parsed["plugin_hints"] == {
@@ -445,7 +458,6 @@ class TestBuildContextString:
         }
 
     def test_snapshot_unavailable_prompt_shield_is_hidden_from_dynamic_context(self) -> None:
-        state = _empty_state()
         catalog: CatalogService = PromptShieldCatalog()
         unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
         shield_id = PluginId("transform", "azure_prompt_shield")
@@ -461,7 +473,7 @@ class TestBuildContextString:
         )
         view = PolicyCatalogView(catalog, snapshot, MagicMock(spec=OperatorProfileRegistry))
 
-        context = _build_context_string(state, view, plugin_snapshot=snapshot)
+        context = _build_catalog_context_string(view, plugin_snapshot=snapshot)
         parsed = json.loads(context.split("\n", 1)[1])
 
         assert parsed["available_plugins"]["transforms"] == ["web_scrape"]
@@ -934,10 +946,11 @@ class TestBuildMessagesWithDataDir:
         messages = build_messages([], state, "test", catalog, data_dir=None)
         system_content = messages[0]["content"]
 
-        # Stable system message is only the prompt prefix; dynamic context is separate.
+        # Stable system message is only the prompt prefix; context messages are separate.
         assert system_content == SYSTEM_PROMPT
-        assert messages[1]["content"].startswith("Current pipeline state and available plugins")
+        assert messages[1]["content"].startswith(CATALOG_CONTEXT_PREFIX)
         assert "UNTRUSTED DATA" in messages[1]["content"]
+        assert messages[-2]["content"].startswith(STATE_CONTEXT_PREFIX)
 
     def test_data_dir_with_deployment_skill_injects_it(self, tmp_path: Path) -> None:
         """When data_dir has a deployment skill, it appears in the system message."""

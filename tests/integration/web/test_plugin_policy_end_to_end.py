@@ -30,7 +30,7 @@ from elspeth.web.catalog import routes as catalog_routes
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginKind, PluginPolicyResponse, PluginSchemaInfo, PluginSummary
-from elspeth.web.composer.prompts import build_context_string
+from elspeth.web.composer.prompts import build_catalog_context_string, build_context_string
 from elspeth.web.composer.recipes import get_recipe
 from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
 from elspeth.web.composer.tools._common import ToolContext
@@ -421,7 +421,7 @@ def test_policy_surface_parity_matrix(case: _MatrixCase, tmp_path: Path) -> None
     guided_discovery = frozenset(
         str(PluginId(item.plugin_type, item.name)) for result in guided_results for item in result.data["available"]
     )
-    prompt = build_context_string(empty_state, view, plugin_snapshot=snapshot, schemas_loaded=frozenset())
+    prompt = build_catalog_context_string(view, plugin_snapshot=snapshot)
     freeform_policy = json.loads(prompt.partition("\n")[2])["plugin_policy"]
     freeform_prompt = frozenset(freeform_policy["available_ids"])
     evidence = _build_web_plugin_policy_evidence(snapshot=snapshot, policy=policy)
@@ -731,10 +731,11 @@ def test_core_and_cli_layers_do_not_import_web_policy() -> None:
 
 
 def test_prompt_builder_has_no_environment_or_profile_binding_access() -> None:
-    source = inspect.getsource(build_context_string)
-    assert "os.environ" not in source
-    assert "credential_ref" not in source
-    assert "provider_options" not in source
+    for builder in (build_context_string, build_catalog_context_string):
+        source = inspect.getsource(builder)
+        assert "os.environ" not in source
+        assert "credential_ref" not in source
+        assert "provider_options" not in source
 
 
 def test_web_dispatch_policy_context_has_no_allow_all_defaults() -> None:
