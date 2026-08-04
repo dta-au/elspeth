@@ -1574,6 +1574,11 @@ async def post_guided_chat_schema8(
                                 "DeferredIntentClarification",
                                 "DeferredIntentUnsupported",
                                 "DeferredIntentRejected",
+                                # ADR-033: a contradiction rejection is a
+                                # deliberate not-applied verdict (the
+                                # instruction is retained as clarification
+                                # debt), never provider weather.
+                                "DeferredIntentContradiction",
                                 "DeferredIntentModelCatalogIdentity",
                                 # The model's sink config failed plugin
                                 # validation and was deliberately not staged —

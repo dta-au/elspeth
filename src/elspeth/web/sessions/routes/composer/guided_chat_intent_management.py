@@ -190,6 +190,40 @@ def _guided_stage_name(step: GuidedStep) -> StageName:
     raise AuditIntegrityError("Guided Chat step is outside the closed stage vocabulary")
 
 
+def _contradiction_chat(rejection: DeferredIntentRejected, *, latency_ms: int, retained: bool) -> StepChatResult:
+    """Render one distinct, actionable contradiction rejection (ADR-033).
+
+    The message names the exact conflicting retained intent and its
+    edit/cancel recourse (model: the planning blocker message), never the
+    collapsed catch-all.  ``retained`` selects the wording for the R2-F15
+    clarification-retention path versus a rejected edit of an existing
+    intent, which leaves the original saved instruction in place.
+    """
+
+    contradiction = rejection.contradiction
+    if contradiction is not None and contradiction.conflicting_intent_id is not None:
+        conflict = (
+            f"It contradicts saved instruction {contradiction.conflicting_intent_id} "
+            f"({contradiction.conflicting_intent_summary}) under the closed rule {contradiction.rule!r}."
+        )
+        recourse = f"Edit or cancel exact intent {contradiction.conflicting_intent_id}, or restate this instruction so the two agree."
+    else:
+        rule = "constraint_contradiction" if contradiction is None else contradiction.rule
+        conflict = f"Its structural constraints contradict each other under the closed rule {rule!r}."
+        recourse = "Restate it as one consistent structural requirement."
+    retention = (
+        "I kept your instruction as a pending clarification instead of applying it. "
+        if retained
+        else "I did not change your saved instructions. "
+    )
+    return StepChatResult(
+        assistant_message=f"{retention}{conflict} {recourse}",
+        status=ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE,
+        latency_ms=latency_ms,
+        error_class="DeferredIntentContradiction",
+    )
+
+
 def _deferred_disposition_chat(
     disposition: DeferredIntentAccepted | DeferredIntentClarification | DeferredIntentUnsupported | DeferredIntentRejected,
     *,
@@ -224,6 +258,9 @@ def _deferred_disposition_chat(
         status = ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
         error_class = "DeferredIntentUnsupported"
     else:
+        rejected = cast(DeferredIntentRejected, disposition)
+        if rejected.reason == "constraint_contradiction":
+            return _contradiction_chat(rejected, latency_ms=latency_ms, retained=False)
         message = "I couldn't safely retain that as a future-stage instruction. Please clarify the target stage and structural requirement."
         status = ComposerChatTurnStatus.SYNTHETIC_UNAVAILABLE
         error_class = "DeferredIntentRejected"
@@ -423,6 +460,15 @@ def apply_deferred_request(
             guided=authority.guided,
             originating_message_content=authority.originating_message.content,
         )
+        if type(disposition) is DeferredIntentRejected and disposition.reason == "constraint_contradiction":
+            # ADR-033 rejection path: a contradiction rejection routes through
+            # the R2-F15 retention net — the instruction is kept as
+            # clarification debt, never silently dropped — and the chat names
+            # the exact conflicting retained intent with edit/cancel recourse.
+            return apply_deferred_clarification(
+                authority=authority,
+                chat=_contradiction_chat(disposition, latency_ms=chat.latency_ms, retained=True),
+            )
         resolved_chat = _deferred_disposition_chat(disposition, catalog=authority.catalog, latency_ms=chat.latency_ms)
         if type(disposition) is not DeferredIntentAccepted:
             return DeferredRequestUnchanged(guided=authority.guided, chat=resolved_chat)

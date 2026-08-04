@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, Protocol, cast
@@ -212,12 +212,63 @@ DeferredIntentRejectionReason = Literal[
     "malformed_catalog_identity",
     "option_value_unproven",
     "stated_fact_unproven",
+    "constraint_contradiction",
 ]
+
+DeferredContradictionRule = Literal[
+    "conflicting_subject_facts",
+    "empty_count_bounds",
+    "count_group_subsumption",
+    "predicate_gate_capacity",
+    "required_subject_absent",
+    "option_path_collapse",
+    "option_domain_exhausted",
+]
+
+_CONTRADICTION_RULES: frozenset[str] = frozenset(
+    {
+        "conflicting_subject_facts",
+        "empty_count_bounds",
+        "count_group_subsumption",
+        "predicate_gate_capacity",
+        "required_subject_absent",
+        "option_path_collapse",
+        "option_domain_exhausted",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class DeferredIntentContradiction:
+    """Closed diagnosis for one rejected contradictory conjunction.
+
+    ``rule`` names the ADR-033 closed rule that fired.  When one retained
+    intent's removal restores consistency, its stable identity and durable
+    (value-free) summary are carried so the operator-facing rejection can name
+    the exact conflicting saved instruction and its edit/cancel recourse.
+    """
+
+    rule: DeferredContradictionRule
+    conflicting_intent_id: str | None
+    conflicting_intent_summary: str | None
+
+    def __post_init__(self) -> None:
+        if self.rule not in _CONTRADICTION_RULES:
+            raise InvariantError("DeferredIntentContradiction.rule is unsupported")
+        if (self.conflicting_intent_id is None) != (self.conflicting_intent_summary is None):
+            raise InvariantError("DeferredIntentContradiction conflicting-intent fields must be paired")
+        if self.conflicting_intent_id is not None:
+            _canonical_uuid_text(self.conflicting_intent_id, "DeferredIntentContradiction.conflicting_intent_id")
+            _require_nonempty_exact_str(
+                self.conflicting_intent_summary,
+                "DeferredIntentContradiction.conflicting_intent_summary",
+            )
 
 
 @dataclass(frozen=True, slots=True)
 class DeferredIntentRejected:
     reason: DeferredIntentRejectionReason
+    contradiction: DeferredIntentContradiction | None = None
 
     def __post_init__(self) -> None:
         if self.reason not in {
@@ -227,8 +278,15 @@ class DeferredIntentRejected:
             "malformed_catalog_identity",
             "option_value_unproven",
             "stated_fact_unproven",
+            "constraint_contradiction",
         }:
             raise InvariantError("DeferredIntentRejected.reason is unsupported")
+        if self.contradiction is not None and (
+            type(self.contradiction) is not DeferredIntentContradiction or self.reason != "constraint_contradiction"
+        ):
+            raise InvariantError("DeferredIntentRejected.contradiction requires the constraint_contradiction reason")
+        if self.reason == "constraint_contradiction" and self.contradiction is None:
+            raise InvariantError("DeferredIntentRejected constraint_contradiction requires a closed contradiction diagnosis")
 
 
 type DeferredIntentValidation = DeferredIntentAccepted | DeferredIntentClarification | DeferredIntentUnsupported | DeferredIntentRejected
@@ -1154,6 +1212,504 @@ def _validate_option_value_constraint(
     return None
 
 
+def _constraint_subject_key(
+    subject: StableSubject | PluginSubject,
+    guided: GuidedSession,
+) -> str:
+    """Canonicalize reviewed stable/plugin aliases for conjunction checks."""
+
+    if type(subject) is StableSubject:
+        return canonical_json(subject.to_dict())
+    plugin_subject = cast(PluginSubject, subject)
+    if plugin_subject.plugin_kind == "transform":
+        # ``subject_id`` is an exact-match preference during candidate
+        # coverage, not proof that this future plugin subject is the same node.
+        # If X is absent, coverage may still resolve a unique normalize node Y.
+        # Keep transform identities existential here (ADR-033: the aliasing
+        # applies to sources and sinks only).
+        return canonical_json(plugin_subject.to_dict())
+    if plugin_subject.plugin_kind == "source":
+        component_kind: Literal["source", "output"] = "source"
+        components: dict[str, str | None] = {stable_id: item.plugin for stable_id, item in guided.reviewed_sources.items()}
+        components.update({stable_id: item.plugin for stable_id, item in guided.pending_source_intents.items()})
+    else:
+        component_kind = "output"
+        components = {stable_id: item.plugin for stable_id, item in guided.reviewed_outputs.items()}
+        components.update({stable_id: item.plugin for stable_id, item in guided.pending_output_intents.items()})
+    exact_plugin = components.get(plugin_subject.subject_id)
+    if exact_plugin == plugin_subject.plugin_name:
+        stable_id = plugin_subject.subject_id
+    else:
+        matches = [stable_id for stable_id, plugin_name in components.items() if plugin_name == plugin_subject.plugin_name]
+        if len(matches) != 1:
+            return canonical_json(plugin_subject.to_dict())
+        stable_id = matches[0]
+    return canonical_json(StableSubject(kind="stable", component_kind=component_kind, stable_id=stable_id).to_dict())
+
+
+type _ExactScalarSignature = tuple[str, str]
+type _GatePredicateSignature = tuple[str, str, _ExactScalarSignature]
+
+
+def _exact_scalar_signature(value: object) -> _ExactScalarSignature:
+    if value is None:
+        return ("null", "")
+    if type(value) is bool:
+        return ("bool", "true" if value else "false")
+    if type(value) is int:
+        return ("int", str(value))
+    if type(value) is float:
+        # JSON/Python numeric equality treats both signed zeros as the same
+        # exact float value; gate-expression coverage does the same.
+        return ("float", (0.0).hex() if value == 0.0 else value.hex())
+    if type(value) is str:
+        return ("str", value)
+    raise InvariantError("stated predicate value is not an exact JSON scalar")
+
+
+_COMPONENT_KIND_BY_PLUGIN: dict[PluginKind, Literal["source", "node", "output"]] = {
+    "source": "source",
+    "transform": "node",
+    "sink": "output",
+}
+_UNRESOLVED_ROUTE_TARGET_PREFIX = "output-name:"
+
+
+def _count_group_lower_bound(group: list[ComponentCountConstraint]) -> int:
+    exacts = [constraint.count for constraint in group if constraint.operator == "equals"]
+    if exacts:
+        return exacts[0]
+    return max((constraint.count for constraint in group if constraint.operator == "at_least"), default=0)
+
+
+def _count_group_upper_bound(group: list[ComponentCountConstraint]) -> int | None:
+    uppers = [constraint.count for constraint in group if constraint.operator in {"equals", "at_most"}]
+    return min(uppers) if uppers else None
+
+
+def _constraint_conjunction_contradiction(
+    constraints: tuple[DeferredConstraint, ...],
+    *,
+    guided: GuidedSession,
+) -> DeferredContradictionRule | None:
+    """Decide the ADR-033 closed contradiction rules over one conjunction.
+
+    Returns the first closed rule proven violated, or ``None`` when the
+    conjunction is admitted.  The checker is sound and deliberately
+    incomplete: it decides contradiction within (i) a single exact subject
+    identity and (ii) closed count-bound arithmetic, and explicitly declines
+    existential subject resolution — no witness partitioning, no proof
+    budget, no counting of ambiguous plugin-subject hints against
+    cardinality caps.  Sets unsatisfiable outside these rules stay admitted
+    and are caught fail-closed at wire confirmation.
+    """
+
+    option_groups: dict[tuple[str, tuple[str, ...]], list[OptionValueConstraint]] = {}
+    count_groups: dict[tuple[str, PluginKind | None, str | None], list[ComponentCountConstraint]] = {}
+    presence_groups: dict[str, set[bool]] = {}
+    presence_plugin_identities: dict[str, set[tuple[PluginKind, str]]] = {}
+    globally_absent_plugin_identities: set[tuple[PluginKind, str]] = set()
+    required_subjects: dict[str, StableSubject | PluginSubject] = {}
+    required_component_kinds: dict[str, set[str]] = {}
+    required_plugin_identities: dict[str, set[tuple[PluginKind, str]]] = {}
+    edge_groups: dict[tuple[str, str, str], set[bool]] = {}
+    failure_groups: dict[tuple[str, str], list[FailureRouteConstraint]] = {}
+    predicate_groups: dict[str, set[_GatePredicateSignature]] = {}
+    routing_groups: dict[tuple[str, str, str, _ExactScalarSignature], set[tuple[str, str]]] = {}
+    required_routing_outputs: set[str] = set()
+    exact_subject_keys: set[str] = set()
+    node_predicate_signatures: set[_GatePredicateSignature] = set()
+    node_keys_with_predicates: set[str] = set()
+    exact_nonnode_predicate_signatures: set[_GatePredicateSignature] = set()
+
+    def subject_identity(subject: StableSubject | PluginSubject) -> tuple[str, str, tuple[PluginKind, str] | None]:
+        subject_key = _constraint_subject_key(subject, guided)
+        if type(subject) is StableSubject:
+            exact_subject_keys.add(subject_key)
+            return subject_key, subject.component_kind, _stable_option_plugin_identity(subject, guided)
+        plugin_subject = cast(PluginSubject, subject)
+        if subject_key != canonical_json(plugin_subject.to_dict()):
+            # The single-match source/sink aliasing resolved this plugin-name
+            # subject to one reviewed stable identity.
+            exact_subject_keys.add(subject_key)
+        component_kind = _COMPONENT_KIND_BY_PLUGIN[plugin_subject.plugin_kind]
+        return subject_key, component_kind, (plugin_subject.plugin_kind, plugin_subject.plugin_name)
+
+    def require_subject(subject: StableSubject | PluginSubject) -> tuple[str, str, tuple[PluginKind, str] | None]:
+        subject_key, component_kind, plugin_identity = subject_identity(subject)
+        required_subjects.setdefault(subject_key, subject)
+        required_component_kinds.setdefault(subject_key, set()).add(component_kind)
+        if plugin_identity is not None:
+            required_plugin_identities.setdefault(subject_key, set()).add(plugin_identity)
+        return subject_key, component_kind, plugin_identity
+
+    for constraint in constraints:
+        if type(constraint) is SubjectPresenceConstraint:
+            subject_key, _component_kind, plugin_identity = subject_identity(constraint.subject)
+            presence_groups.setdefault(subject_key, set()).add(constraint.present)
+            if type(constraint.subject) is PluginSubject and plugin_identity is not None:
+                presence_plugin_identities.setdefault(subject_key, set()).add(plugin_identity)
+                if not constraint.present:
+                    globally_absent_plugin_identities.add(plugin_identity)
+            if constraint.present:
+                require_subject(constraint.subject)
+        elif type(constraint) is OptionValueConstraint:
+            option_subject_key, _component_kind, _identity = require_subject(constraint.subject)
+            option_groups.setdefault((option_subject_key, constraint.option_path), []).append(constraint)
+        elif type(constraint) is ComponentCountConstraint:
+            count_key = (constraint.component_kind, constraint.plugin_kind, constraint.plugin_name)
+            count_groups.setdefault(count_key, []).append(constraint)
+        elif type(constraint) in {StatedPredicateConstraint, StatedGateRoutingConstraint}:
+            stated = cast(StatedPredicateConstraint | StatedGateRoutingConstraint, constraint)
+            subject_key, component_kind, _identity = require_subject(stated.subject)
+            predicate_value_signature = _exact_scalar_signature(stated.value)
+            predicate_signature = (stated.column, stated.operator, predicate_value_signature)
+            predicate_groups.setdefault(subject_key, set()).add(predicate_signature)
+            if subject_key in exact_subject_keys:
+                # ADR-033 rule 4 counts predicate-implied gates for exact
+                # subjects only; a gate implied by an unresolved plugin-name
+                # hint is declined, never counted.
+                if component_kind == "node":
+                    node_predicate_signatures.add(predicate_signature)
+                    node_keys_with_predicates.add(subject_key)
+                else:
+                    exact_nonnode_predicate_signatures.add(predicate_signature)
+            if type(stated) is StatedGateRoutingConstraint:
+                predicate_key = (subject_key, stated.column, stated.operator, predicate_value_signature)
+                routing_groups.setdefault(predicate_key, set()).add((stated.true_target, stated.false_target))
+                reviewed_targets = {output.name: stable_id for stable_id, output in guided.reviewed_outputs.items()}
+                reviewed_targets.update({intent.name: stable_id for stable_id, intent in guided.pending_output_intents.items()})
+                for target in (stated.true_target, stated.false_target):
+                    stable_id = reviewed_targets.get(target)
+                    if stable_id is not None:
+                        target_key, _target_kind, _target_identity = require_subject(
+                            StableSubject(kind="stable", component_kind="output", stable_id=stable_id)
+                        )
+                        required_routing_outputs.add(target_key)
+                    else:
+                        required_routing_outputs.add(f"{_UNRESOLVED_ROUTE_TARGET_PREFIX}{target}")
+        elif type(constraint) is EdgeRouteConstraint:
+            # Coverage proves both positive and negative edges only between
+            # resolved endpoints.  Admission must require the same endpoint
+            # existence or it accepts conjunctions coverage can never satisfy.
+            from_key, _from_kind, _from_identity = require_subject(constraint.from_subject)
+            to_key, _to_kind, _to_identity = require_subject(constraint.to_subject)
+            edge_groups.setdefault((from_key, constraint.edge_type, to_key), set()).add(constraint.present)
+        elif type(constraint) is FailureRouteConstraint:
+            subject_key, _component_kind, _identity = require_subject(constraint.subject)
+            failure_groups.setdefault((subject_key, constraint.failure_kind), []).append(constraint)
+            if constraint.target != "discard":
+                require_subject(constraint.target)
+
+    # Rule 1: functional-dependency conflicts on one subject key; rule 5 fixes
+    # the reach of the requirement relation the required-but-absent check uses.
+    if any(len(values) > 1 for values in presence_groups.values()):
+        return "conflicting_subject_facts"
+    if any(presence_groups.get(subject_key) == {False} for subject_key in required_subjects):
+        return "required_subject_absent"
+    if any(len(values) > 1 for values in edge_groups.values()):
+        return "conflicting_subject_facts"
+    if any(len(signatures) > 1 for signatures in predicate_groups.values()):
+        return "conflicting_subject_facts"
+    if any(len(targets) > 1 for targets in routing_groups.values()):
+        return "conflicting_subject_facts"
+    if any(len(kinds) > 1 for kinds in required_component_kinds.values()):
+        return "conflicting_subject_facts"
+    if any(len(identities) > 1 for identities in required_plugin_identities.values()):
+        return "conflicting_subject_facts"
+    if any(globally_absent_plugin_identities.intersection(identities) for identities in required_plugin_identities.values()):
+        return "required_subject_absent"
+
+    for failure_group in failure_groups.values():
+        equals_targets: set[str] = set()
+        not_equals_targets: set[str] = set()
+        for failure_constraint in failure_group:
+            target_key = "discard" if failure_constraint.target == "discard" else _constraint_subject_key(failure_constraint.target, guided)
+            (equals_targets if failure_constraint.operator == "equals" else not_equals_targets).add(target_key)
+        if len(equals_targets) > 1 or equals_targets.intersection(not_equals_targets):
+            return "conflicting_subject_facts"
+
+    def option_group_is_consistent(option_group: list[OptionValueConstraint]) -> bool:
+        equals_values: list[object] = []
+        not_equals_values: list[object] = []
+        for option_constraint in option_group:
+            values = equals_values if option_constraint.operator == "equals" else not_equals_values
+            if not any(_exact_json_scalar(option_constraint.value, existing) for existing in values):
+                values.append(option_constraint.value)
+        if len(equals_values) > 1:
+            return False
+        return not (equals_values and any(_exact_json_scalar(equals_values[0], excluded) for excluded in not_equals_values))
+
+    if any(not option_group_is_consistent(option_group) for option_group in option_groups.values()):
+        return "conflicting_subject_facts"
+
+    # Rule 6: single-subject option-path prefix/descendant collapse.  Deferred
+    # option literals are scalars; an exact scalar equals at a parent path
+    # cannot simultaneously own a descendant path on the same subject.
+    paths_by_subject: dict[str, set[tuple[str, ...]]] = {}
+    for option_subject_key, option_path in option_groups:
+        paths_by_subject.setdefault(option_subject_key, set()).add(option_path)
+    for option_subject_key, subject_paths in paths_by_subject.items():
+        for parent_path in subject_paths:
+            if not any(option_constraint.operator == "equals" for option_constraint in option_groups[(option_subject_key, parent_path)]):
+                continue
+            if any(len(child_path) > len(parent_path) and child_path[: len(parent_path)] == parent_path for child_path in subject_paths):
+                return "option_path_collapse"
+
+    # Rule 2: empty intersection within one count key.
+    for count_group in count_groups.values():
+        equals = {count_constraint.count for count_constraint in count_group if count_constraint.operator == "equals"}
+        if len(equals) > 1:
+            return "empty_count_bounds"
+        lower = max((count_constraint.count for count_constraint in count_group if count_constraint.operator == "at_least"), default=0)
+        upper_values = [count_constraint.count for count_constraint in count_group if count_constraint.operator == "at_most"]
+        upper = min(upper_values) if upper_values else None
+        if upper is not None and lower > upper:
+            return "empty_count_bounds"
+        if equals:
+            exact = next(iter(equals))
+            if exact < lower or (upper is not None and exact > upper):
+                return "empty_count_bounds"
+
+    # Rule 2: a plugin identity asserted globally absent while a count
+    # requires at least one member of that identity.
+    for subject_key, presence_values in presence_groups.items():
+        if presence_values != {False}:
+            continue
+        for plugin_kind, plugin_name in presence_plugin_identities.get(subject_key, set()):
+            count_group = count_groups.get((_COMPONENT_KIND_BY_PLUGIN[plugin_kind], plugin_kind, plugin_name), [])
+            if any(count_constraint.operator in {"equals", "at_least"} and count_constraint.count > 0 for count_constraint in count_group):
+                return "empty_count_bounds"
+
+    # Rule 2: an upper bound of zero on a component kind or plugin identity
+    # that a required subject inhabits.
+    zero_upper_count_keys = {
+        count_key
+        for count_key, count_group in count_groups.items()
+        if min(
+            (count_constraint.count for count_constraint in count_group if count_constraint.operator in {"equals", "at_most"}),
+            default=1,
+        )
+        == 0
+    }
+    for subject_key, component_kinds in required_component_kinds.items():
+        component_kind = next(iter(component_kinds))
+        if (component_kind, None, None) in zero_upper_count_keys:
+            return "empty_count_bounds"
+        if any(
+            (component_kind, plugin_kind, plugin_name) in zero_upper_count_keys
+            for plugin_kind, plugin_name in required_plugin_identities.get(subject_key, set())
+        ):
+            return "empty_count_bounds"
+
+    # Rules 3 and 4: closed identity-free count subsumption.  Contained-group
+    # minima — distinct exact required subjects, per-plugin-identity minima,
+    # and exact-subject predicate-implied gates — sum against containing caps.
+    # No witness partitioning and no alias resolution: an ambiguous
+    # plugin-name subject contributes at most one member to its identity
+    # minimum, and identity or gate obligations that a provably-distinct
+    # required component could absorb are credited before comparison, so the
+    # arithmetic never rejects a set a merged construction could satisfy.
+    for arithmetic_kind in ("source", "node", "edge", "output"):
+        required_keys = {
+            subject_key for subject_key, component_kinds in required_component_kinds.items() if arithmetic_kind in component_kinds
+        }
+        if arithmetic_kind == "output":
+            required_keys |= required_routing_outputs
+        exact_keys = {
+            subject_key
+            for subject_key in required_keys
+            if subject_key in exact_subject_keys or subject_key.startswith(_UNRESOLVED_ROUTE_TARGET_PREFIX)
+        }
+        ambiguous_keys = required_keys - exact_keys
+
+        exact_identity_counts: dict[tuple[PluginKind, str], int] = {}
+        unidentified_exact_count = 0
+        for subject_key in exact_keys:
+            identities = required_plugin_identities.get(subject_key, set())
+            if identities:
+                (identity,) = identities
+                exact_identity_counts[identity] = exact_identity_counts.get(identity, 0) + 1
+            else:
+                unidentified_exact_count += 1
+        ambiguous_identities = {
+            identity for subject_key in ambiguous_keys for identity in required_plugin_identities.get(subject_key, set())
+        }
+
+        relevant_identities = set(exact_identity_counts) | ambiguous_identities
+        relevant_identities.update(
+            (count_plugin_kind, count_plugin_name)
+            for (count_kind, count_plugin_kind, count_plugin_name) in count_groups
+            if count_kind == arithmetic_kind and count_plugin_kind is not None and count_plugin_name is not None
+        )
+        identity_deficit = 0
+        for identity in relevant_identities:
+            identity_plugin_kind, identity_plugin_name = identity
+            identity_group = count_groups.get((arithmetic_kind, identity_plugin_kind, identity_plugin_name), [])
+            exact_members = exact_identity_counts.get(identity, 0)
+            identity_upper = _count_group_upper_bound(identity_group)
+            if identity_upper is not None and exact_members > identity_upper:
+                return "count_group_subsumption"
+            required_members = max(
+                _count_group_lower_bound(identity_group),
+                exact_members,
+                1 if identity in ambiguous_identities else 0,
+            )
+            identity_deficit += required_members - exact_members
+
+        global_upper = _count_group_upper_bound(count_groups.get((arithmetic_kind, None, None), []))
+        if global_upper is None:
+            continue
+        if arithmetic_kind == "node":
+            implied_gate_count = len(exact_nonnode_predicate_signatures - node_predicate_signatures)
+            free_absorbers = sum(1 for subject_key in exact_keys if subject_key not in node_keys_with_predicates)
+        else:
+            implied_gate_count = 0
+            free_absorbers = unidentified_exact_count
+        if len(exact_keys) + max(0, identity_deficit - free_absorbers) > global_upper:
+            return "count_group_subsumption"
+        if len(exact_keys) + max(0, identity_deficit + implied_gate_count - free_absorbers) > global_upper:
+            return "predicate_gate_capacity"
+
+    return None
+
+
+def _fully_validated_finite_scalar_domain(
+    schema: _ResolvedSchemaNode,
+    *,
+    validator: Draft202012Validator,
+) -> _FiniteScalarDomain | None:
+    domain = _finite_scalar_domain(schema)
+    if domain is None:
+        return None
+    try:
+        return tuple(
+            candidate for candidate in domain if next(validator.descend(candidate, schema.schema, resolver=schema.resolver), None) is None
+        )
+    except (RecursionError, Unresolvable) as exc:
+        raise InvariantError("plugin option schema could not resolve during Draft 2020-12 validation") from exc
+
+
+def _validated_option_finite_domain(
+    constraint: OptionValueConstraint,
+    *,
+    guided: GuidedSession,
+    catalog: PolicyCatalogView,
+) -> _FiniteScalarDomain | None:
+    """Return the schema's finite domain after individual validation passed.
+
+    Every constraint reaching this helper was individually admitted against a
+    live reviewed identity and schema.  If that authority is no longer
+    resolvable — the subject's reviewed component or the plugin's availability
+    changed since admission — there is no live finite domain to exhaust, so no
+    exhaustion proof exists and the conjunction stays admitted.
+    """
+
+    subject = constraint.subject
+    identity = (
+        (subject.plugin_kind, subject.plugin_name)
+        if type(subject) is PluginSubject
+        else _stable_option_plugin_identity(cast(StableSubject, subject), guided)
+    )
+    if identity is None:
+        return None
+    plugin_kind, plugin_name = identity
+    if catalog.unavailable_reason(PluginId(plugin_kind, plugin_name)) is not None:
+        return None
+    schema = catalog.get_schema(plugin_kind, plugin_name)
+    if type(schema.json_schema) is not dict:  # pragma: no cover - individual validation owns this guard
+        raise InvariantError("validated option constraint lost its schema root")
+    root = cast(dict[str, object], schema.json_schema)
+    root_context = _root_schema_context(root)
+    _preflight_schema_refs(root_context)
+    option_schema = _option_schema_node(root_context, constraint.option_path)
+    if option_schema is None:  # pragma: no cover - individual validation owns this guard
+        raise InvariantError("validated option constraint lost its option schema")
+    return _fully_validated_finite_scalar_domain(option_schema, validator=Draft202012Validator(root))
+
+
+def _option_schema_conjunction_is_consistent(
+    constraints: tuple[DeferredConstraint, ...],
+    *,
+    guided: GuidedSession,
+    catalog: PolicyCatalogView,
+) -> bool:
+    """Rule 7: a not_equals set must not exhaust a validated finite domain."""
+
+    groups: dict[tuple[str, tuple[str, ...]], list[OptionValueConstraint]] = {}
+    for constraint in constraints:
+        if type(constraint) is not OptionValueConstraint:
+            continue
+        option_subject_key = _constraint_subject_key(constraint.subject, guided)
+        groups.setdefault((option_subject_key, constraint.option_path), []).append(constraint)
+    for group in groups.values():
+        if any(constraint.operator == "equals" for constraint in group):
+            continue
+        domain = _validated_option_finite_domain(group[0], guided=guided, catalog=catalog)
+        if domain is None:
+            continue
+        excluded = [constraint.value for constraint in group]
+        if all(any(_exact_json_scalar(candidate, value) for value in excluded) for candidate in domain):
+            return False
+    return True
+
+
+def _prospective_deferred_constraints(
+    guided: GuidedSession,
+    action: DeferredIntentAction,
+    replacing_intent_id: str | None,
+) -> tuple[DeferredConstraint, ...]:
+    return (
+        tuple(
+            constraint for intent in guided.deferred_intents if intent.intent_id != replacing_intent_id for constraint in intent.constraints
+        )
+        + action.constraints
+    )
+
+
+def _contradiction_rejection(
+    *,
+    rule: DeferredContradictionRule,
+    guided: GuidedSession,
+    action: DeferredIntentAction,
+    replacing_intent_id: str | None,
+    conjunction_is_consistent: Callable[[tuple[DeferredConstraint, ...]], bool],
+) -> DeferredIntentRejected:
+    """Build one diagnosable contradiction rejection naming a retained culprit.
+
+    The culprit is found leave-one-out: the first retained intent whose
+    removal restores consistency of the remaining prospective conjunction.
+    When no single retained intent restores consistency — the new action
+    contradicts itself, or only a joint removal would help — the rejection
+    carries the rule without a named intent.
+    """
+
+    conflicting: DeferredStageIntent | None = None
+    for candidate in guided.deferred_intents:
+        if candidate.intent_id == replacing_intent_id:
+            continue
+        remaining = (
+            tuple(
+                constraint
+                for intent in guided.deferred_intents
+                if intent.intent_id not in {replacing_intent_id, candidate.intent_id}
+                for constraint in intent.constraints
+            )
+            + action.constraints
+        )
+        if conjunction_is_consistent(remaining):
+            conflicting = candidate
+            break
+    return DeferredIntentRejected(
+        reason="constraint_contradiction",
+        contradiction=DeferredIntentContradiction(
+            rule=rule,
+            conflicting_intent_id=None if conflicting is None else conflicting.intent_id,
+            conflicting_intent_summary=None if conflicting is None else conflicting.redacted_summary,
+        ),
+    )
+
+
 def validate_deferred_intent_structure(
     action: DeferredIntentAction,
     *,
@@ -1186,6 +1742,7 @@ def validate_deferred_intent_action(
     catalog: PolicyCatalogView,
     guided: GuidedSession,
     originating_message_content: str | None = None,
+    replacing_intent_id: str | None = None,
 ) -> DeferredIntentValidation:
     """Validate a typed suggestion against live stage and policy authority."""
 
@@ -1194,6 +1751,17 @@ def validate_deferred_intent_action(
         raise TypeError("guided must be an exact GuidedSession")
     if structural_rejection is not None:
         return structural_rejection
+
+    prospective_constraints = _prospective_deferred_constraints(guided, action, replacing_intent_id)
+    contradiction_rule = _constraint_conjunction_contradiction(prospective_constraints, guided=guided)
+    if contradiction_rule is not None:
+        return _contradiction_rejection(
+            rule=contradiction_rule,
+            guided=guided,
+            action=action,
+            replacing_intent_id=replacing_intent_id,
+            conjunction_is_consistent=lambda remaining: _constraint_conjunction_contradiction(remaining, guided=guided) is None,
+        )
 
     stated_requirement = (
         _message_requires_stated_constraint(originating_message_content) if type(originating_message_content) is str else None
@@ -1225,6 +1793,14 @@ def validate_deferred_intent_action(
             invalid_option = _validate_option_value_constraint(constraint, guided=guided, catalog=catalog)
             if invalid_option is not None:
                 return invalid_option
+    if not _option_schema_conjunction_is_consistent(prospective_constraints, guided=guided, catalog=catalog):
+        return _contradiction_rejection(
+            rule="option_domain_exhausted",
+            guided=guided,
+            action=action,
+            replacing_intent_id=replacing_intent_id,
+            conjunction_is_consistent=lambda remaining: _option_schema_conjunction_is_consistent(remaining, guided=guided, catalog=catalog),
+        )
     return DeferredIntentAccepted(action=action)
 
 
