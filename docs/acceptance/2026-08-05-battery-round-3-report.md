@@ -346,10 +346,73 @@ call removed, but it is a hypothesis this round cannot pre-judge. **Measure
 turns-per-compose and USD-per-compose, not just wall-clock**, or a latency win
 could hide a cost regression.
 
-**Reading:** the leverage is (1) transcript size — trimming or summarising
-repeated validation payloads attacks the 10.9M directly; (2) firing the drift
-hint *earlier* than three failures, since it demonstrably works; and (3) the
-advisor flag rate at 14 of 16, which makes repair the normal path.
+### Where the tokens actually are
+
+The per-session cost is **not** driven by the loop misbehaving. It is driven by
+a large fixed prefix plus a deliberate carry-forward.
+
+**The baseline is fixed and enormous.** The first Sonnet call of every session
+is 49,091–49,645 tokens — a ±0.6% spread across all 17 sessions, i.e. a
+constant. It decomposes as:
+
+| Component | Size | ≈ tokens |
+|---|---:|---:|
+| `SYSTEM_PROMPT` (`pipeline_composer.md` + `pipeline_capabilities.md`) | 72,534 chars | ~19,600 |
+| Tool definitions — **43 tools** | 41,314 chars | ~11,200 |
+| Dynamic context (untrusted state + plugin summary), empty pipeline | — | ~18,500 (residual) |
+| **Total before any work** | | **~49,300** |
+
+For scale: at Sonnet input pricing, **10 cents ≈ 33k tokens**. The fixed prefix
+alone is 1.5× a whole ten-cent compose, so no amount of loop tuning can reach
+that figure while the prefix stands.
+
+Two details worth naming:
+
+- **43 tool definitions are sent on every call; 16 distinct tools were used in
+  the entire round.** `set_pipeline` alone is 8,537 chars of schema, `upsert_node`
+  5,224.
+- The skill file is **not** the regression: `pipeline_composer.md` was *larger*
+  in July (76,935 bytes on 2026-07-16) and was cut to 52,124 on 2026-07-20. It
+  is 57,871 today.
+
+**The growth curve is schema carry-forward.** Average Sonnet tokens by call
+index: 49.3k → 62.9k → 66.5k → 69.2k → 72.1k → 75.8k → 78.2k → 79.9k → 84.2k →
+86.7k → 88.2k. The first step is the largest (+13.6k) and lands immediately
+after the opening `get_plugin_schema` burst, because
+`build_context_string`'s docstring states the contract plainly: every schema
+identity the session has ever loaded is *"rehydrated through `catalog` on every
+request into `schema_contract_evidence`"*. Whole contracts, re-sent each turn.
+
+That mechanism arrived in **`bb5a81213` (2026-08-04, "fix composer schema
+contract carry-forward")** — 394 added lines in `planner_authoring_aids.py`,
+36 in `prompts.py` — **two days before this battery**. It is the strongest
+single candidate for a recent step-change in per-compose cost, and it is worth
+checking against whatever build the ten-cent figure was measured on. Note the
+carry-forward was deliberate and fixed a real defect (progress reporting
+"satisfied" while the schema was absent); the question is its *bounding*, not
+its existence.
+
+**Caching is working and is not the problem.** `supports_anthropic_prompt_cache_markers`
+matches the deployed model via its `"claude-"` clause, and the cost data
+confirms hits: call 2 costs **less** than call 1 ($0.152 vs $0.176) despite
+carrying 31% more tokens.
+
+**Leverage, in order:**
+
+1. **Trim the tool payload.** 43 definitions, 16 used. This is ~11.2k on every
+   one of 168 calls and needs no model-quality trade.
+2. **Bound the schema carry-forward** (`bb5a81213`). Re-sending whole contracts
+   every turn is what bends the growth curve; a digest or a
+   most-recently-referenced window would keep the fix's guarantee at a
+   fraction of the tokens.
+3. **Audit the ~18.5k dynamic context** — it is the least-documented component
+   and is present even with an empty pipeline.
+4. Transcript/validation-payload size, the drift hint firing earlier than three
+   failures, and the advisor flag rate at 14 of 16.
+
+**Reasoning is orthogonal.** `reasoning_tokens` is 0 on all 168 calls, so the
+reasoning-effort change adds tokens rather than removing them; it pays only by
+removing turns. None of the four levers above depend on it.
 
 ## Two things this round learned
 
