@@ -6,6 +6,7 @@ thread pool executor to avoid blocking the async event loop.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import shutil
@@ -38,6 +39,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationKind,
     InterpretationSource,
 )
+from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import canonical_json, is_lower_sha256_hex, stable_hash
@@ -54,6 +56,10 @@ from elspeth.web.composer.pipeline_proposal import (
     is_owned_composition_state_authority,
     owned_composition_state_review_arguments,
     reviewed_anchor_hash,
+)
+from elspeth.web.composer.provider_telemetry import (
+    record_settled_composer_audit_message,
+    record_settled_composer_provider_calls,
 )
 from elspeth.web.composer.redaction import normalize_set_pipeline_redacted_arguments, redact_tool_call_arguments
 from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
@@ -3446,6 +3452,48 @@ class SessionServiceImpl:
         """Run a synchronous callable in the thread pool executor."""
         return await run_sync_in_worker(func, *args, **kwargs)
 
+    async def _run_sync_with_post_commit_projection[T](
+        self,
+        func: Callable[[], T],
+        *,
+        project: Callable[[T], None],
+    ) -> T:
+        """Drain one worker through cancellation, then project iff it committed."""
+
+        worker = asyncio.create_task(self._run_sync(func))
+        cancellation: asyncio.CancelledError | None = None
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError as exc:
+                if cancellation is None:
+                    cancellation = exc
+            except BaseException:
+                break
+        try:
+            result = cast("T", worker.result())
+        except BaseException as failure:
+            if cancellation is not None:
+                raise cancellation from failure
+            raise
+        project(result)
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    async def _run_guided_sync_with_provider_projection[T](
+        self,
+        func: Callable[[], T],
+        *,
+        llm_calls: tuple[ComposerLLMCall, ...],
+    ) -> T:
+        """Run one atomic settlement, then project only its committed calls."""
+
+        return await self._run_sync_with_post_commit_projection(
+            func,
+            project=lambda _result: record_settled_composer_provider_calls(llm_calls, surface="guided"),
+        )
+
     def _now(self) -> datetime:
         return datetime.now(UTC)
 
@@ -4742,7 +4790,13 @@ class SessionServiceImpl:
                     unproducible_output_fields=command.unproducible_output_fields,
                 )
 
-        return cast("GuidedOperationFailed", await self._run_sync(_sync))
+        return cast(
+            "GuidedOperationFailed",
+            await self._run_guided_sync_with_provider_projection(
+                _sync,
+                llm_calls=command.audit_evidence.llm_calls,
+            ),
+        )
 
     def _reserve_sequence_range(self, conn: Connection, session_id: str, *, count: int) -> int:
         """Reserve ``count`` consecutive sequence numbers for ``session_id``.
@@ -7961,7 +8015,14 @@ class SessionServiceImpl:
                     )
                 conn.execute(update(sessions_table).where(sessions_table.c.id == sid).values(updated_at=now))
 
-        await self._run_sync(_sync)
+        await self._run_sync_with_post_commit_projection(
+            _sync,
+            project=lambda _result: record_settled_composer_audit_message(
+                role=role,
+                writer_principal=writer_principal,
+                tool_calls=tool_calls,
+            ),
+        )
 
         return ChatMessageRecord(
             id=UUID(msg_id_holder["id"]),
@@ -9539,8 +9600,9 @@ class SessionServiceImpl:
         integrity failure is interpreted as convergence.
         """
 
+        settled_audit_evidence = audit_evidence if audit_evidence is not None else GuidedAuditEvidence()
         audit_rows = self._prepare_guided_audit_cohort(
-            audit_evidence=audit_evidence if audit_evidence is not None else GuidedAuditEvidence(),
+            audit_evidence=settled_audit_evidence,
             payloads=payloads,
             payload_store=payload_store,
         )
@@ -9639,7 +9701,17 @@ class SessionServiceImpl:
                 )
                 return outcome
 
-        return cast("GuidedStartStateOutcome", await self._run_sync(_sync))
+        def _project_seeded_calls(outcome: GuidedStartStateOutcome) -> None:
+            if type(outcome) is GuidedStartStateSeeded:
+                record_settled_composer_provider_calls(
+                    settled_audit_evidence.llm_calls,
+                    surface="guided",
+                )
+
+        return await self._run_sync_with_post_commit_projection(
+            _sync,
+            project=_project_seeded_calls,
+        )
 
     async def save_state_for_guided_operation(
         self,
@@ -9660,8 +9732,9 @@ class SessionServiceImpl:
 
         if system_message is not None and (type(system_message) is not str or not system_message):
             raise ValueError("guided operation system_message must be a non-empty string or None")
+        settled_audit_evidence = audit_evidence if audit_evidence is not None else GuidedAuditEvidence()
         audit_rows = self._prepare_guided_audit_cohort(
-            audit_evidence=audit_evidence if audit_evidence is not None else GuidedAuditEvidence(),
+            audit_evidence=settled_audit_evidence,
             payloads=payloads,
             payload_store=payload_store,
         )
@@ -9728,7 +9801,13 @@ class SessionServiceImpl:
                 )
                 return record
 
-        return cast("CompositionStateRecord", await self._run_sync(_sync))
+        return cast(
+            "CompositionStateRecord",
+            await self._run_guided_sync_with_provider_projection(
+                _sync,
+                llm_calls=settled_audit_evidence.llm_calls,
+            ),
+        )
 
     async def settle_guided_state_operation(
         self,
@@ -9970,7 +10049,13 @@ class SessionServiceImpl:
                     response_hash=response_hash,
                 )
 
-        return cast("GuidedStateOperationSettlement", await self._run_sync(_sync))
+        return cast(
+            "GuidedStateOperationSettlement",
+            await self._run_guided_sync_with_provider_projection(
+                _sync,
+                llm_calls=command.audit_evidence.llm_calls,
+            ),
+        )
 
     async def stage_guided_full_pipeline_proposal(
         self,
@@ -10190,7 +10275,13 @@ class SessionServiceImpl:
                     response_hash=response_hash,
                 )
 
-        settlement = cast("GuidedFullPipelineProposalStageSettlement", await self._run_sync(_sync))
+        settlement = cast(
+            "GuidedFullPipelineProposalStageSettlement",
+            await self._run_guided_sync_with_provider_projection(
+                _sync,
+                llm_calls=command.audit_evidence.llm_calls,
+            ),
+        )
         _PIPELINE_PLANNER_COUNTER.add(1, {"surface": "guided_full", "result": "proposal_created"})
         _PIPELINE_CUSTODY_COUNTER.add(1, {"surface": "guided_full", "result": command.plan.custody_result})
         return settlement
@@ -10346,7 +10437,13 @@ class SessionServiceImpl:
                     response_hash=response_hash,
                 )
 
-        settlement = cast("GuidedFullPipelineDeclineSettlement", await self._run_sync(_sync))
+        settlement = cast(
+            "GuidedFullPipelineDeclineSettlement",
+            await self._run_guided_sync_with_provider_projection(
+                _sync,
+                llm_calls=command.audit_evidence.llm_calls,
+            ),
+        )
         _PIPELINE_PLANNER_COUNTER.add(1, {"surface": "guided_full", "result": "declined"})
         return settlement
 
@@ -10830,7 +10927,13 @@ class SessionServiceImpl:
                     response_hash=response_hash,
                 )
 
-        settlement = cast("GuidedPipelineProposalStageSettlement", await self._run_sync(_sync))
+        settlement = cast(
+            "GuidedPipelineProposalStageSettlement",
+            await self._run_guided_sync_with_provider_projection(
+                _sync,
+                llm_calls=command.audit_evidence.llm_calls,
+            ),
+        )
         _PIPELINE_PLANNER_COUNTER.add(1, {"surface": proposal.surface.value, "result": "proposal_created"})
         _PIPELINE_CUSTODY_COUNTER.add(1, {"surface": proposal.surface.value, "result": command.plan.custody_result})
         return settlement
@@ -11112,7 +11215,13 @@ class SessionServiceImpl:
                     response_hash=response_hash,
                 )
 
-        settlement = cast("GuidedPipelineProposalStageSettlement", await self._run_sync(_sync))
+        settlement = cast(
+            "GuidedPipelineProposalStageSettlement",
+            await self._run_guided_sync_with_provider_projection(
+                _sync,
+                llm_calls=command.audit_evidence.llm_calls,
+            ),
+        )
         _PIPELINE_SETTLEMENT_COUNTER.add(1, {"surface": "guided_staged", "result": "superseded_for_component_edit"})
         return settlement
 
@@ -11672,7 +11781,13 @@ class SessionServiceImpl:
                     response_hash=response_hash,
                 )
 
-        settlement = cast("GuidedPipelineProposalStageSettlement", await self._run_sync(_sync))
+        settlement = cast(
+            "GuidedPipelineProposalStageSettlement",
+            await self._run_guided_sync_with_provider_projection(
+                _sync,
+                llm_calls=command.audit_evidence.llm_calls,
+            ),
+        )
         _PIPELINE_SETTLEMENT_COUNTER.add(1, {"surface": "guided_staged", "result": "accepted"})
         return settlement
 

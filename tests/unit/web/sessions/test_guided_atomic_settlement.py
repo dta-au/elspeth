@@ -1498,7 +1498,10 @@ def service_and_engine(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_respond_settlement_commits_state_audit_and_operation_as_one_cohort(service_and_engine) -> None:
+async def test_respond_settlement_commits_state_audit_and_operation_as_one_cohort(
+    service_and_engine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     service, engine = service_and_engine
     session_id = (await service.create_session("alice", "guided atomic", "local")).id
     claimed = await service.reserve_guided_operation(
@@ -1536,6 +1539,16 @@ async def test_respond_settlement_commits_state_audit_and_operation_as_one_cohor
             chat_turns=(chat_turn,),
         ),
     )
+    projected: list[tuple[tuple[ComposerLLMCall, ...], int]] = []
+
+    def capture_provider_calls(calls: tuple[ComposerLLMCall, ...], *, surface: str) -> None:
+        assert surface == "guided"
+        with engine.connect() as conn:
+            durable_count = conn.execute(select(func.count()).select_from(chat_messages_table)).scalar_one()
+        projected.append((calls, durable_count))
+
+    service_module = importlib.import_module("elspeth.web.sessions.service")
+    monkeypatch.setattr(service_module, "record_settled_composer_provider_calls", capture_provider_calls)
 
     settlement = await service.settle_guided_state_operation(command)
 
@@ -1553,6 +1566,7 @@ async def test_respond_settlement_commits_state_audit_and_operation_as_one_cohor
         operation = conn.execute(select(guided_operations_table).where(guided_operations_table.c.session_id == str(session_id))).one()
     assert [row.id for row in states] == [str(state_id)]
     assert [row.role for row in messages] == ["audit", "audit", "audit"]
+    assert projected == [((llm_call,), 3)]
     assert [row.composition_state_id for row in messages] == [str(state_id)] * 3
     assert operation.status == "completed"
     assert operation.result_state_id == str(state_id)
@@ -1701,6 +1715,12 @@ async def test_late_projection_failure_rolls_back_inserted_cohort_and_same_fence
     )
     service_module = importlib.import_module("elspeth.web.sessions.service")
     projector = service_module.project_guided_response
+    projected: list[tuple[ComposerLLMCall, ...]] = []
+    monkeypatch.setattr(
+        service_module,
+        "record_settled_composer_provider_calls",
+        lambda calls, *, surface: projected.append(calls),
+    )
 
     def _wrong_purpose_after_writes(*_args, **_kwargs):
         raise AuditIntegrityError("injected next-turn purpose=turn_response failure")
@@ -1717,10 +1737,12 @@ async def test_late_projection_failure_rolls_back_inserted_cohort_and_same_fence
     assert operation.status == "in_progress"
     assert operation.result_state_id is None
     assert operation.response_hash is None
+    assert projected == []
 
     monkeypatch.setattr(service_module, "project_guided_response", projector)
     settlement = await service.settle_guided_state_operation(command)
     assert settlement.result_state.id == command.state_id
+    assert projected == [(llm_call,)]
 
 
 @pytest.mark.asyncio

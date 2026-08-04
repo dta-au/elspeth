@@ -91,7 +91,7 @@ def test_cloudwatch_metric_dimensions_exclude_unbounded_identity_and_content() -
     }
 
     assert SAFE_CLOUDWATCH_METRIC_ATTRIBUTES.isdisjoint(forbidden)
-    assert {"reason", "operation", "status"} <= SAFE_CLOUDWATCH_METRIC_ATTRIBUTES
+    assert {"reason", "operation", "status", "surface"} <= SAFE_CLOUDWATCH_METRIC_ATTRIBUTES
 
 
 @pytest.mark.parametrize(
@@ -226,6 +226,7 @@ def test_aws_metric_export_preserves_only_bounded_acceptance_correlation() -> No
             attributes={
                 "elspeth.acceptance.namespace": "acceptance-run-a",
                 "elspeth.acceptance.sentinel": "17",
+                "surface": "guided",
                 "run_id": "must-not-become-a-metric-dimension",
             },
         )
@@ -236,6 +237,7 @@ def test_aws_metric_export_preserves_only_bounded_acceptance_correlation() -> No
         assert point.attributes == {
             "elspeth.acceptance.namespace": "acceptance-run-a",
             "elspeth.acceptance.sentinel": "17",
+            "surface": "guided",
         }
     finally:
         provider.shutdown()

@@ -111,6 +111,11 @@ from elspeth.web.composer.protocol import (
     ComposerService,
     ComposerServiceError,
 )
+from elspeth.web.composer.provider_telemetry import (
+    begin_composer_request_metrics,
+    finish_composer_request_metrics,
+    mark_composer_request_terminal,
+)
 from elspeth.web.composer.redaction import redact_guided_snapshot_storage_paths, redact_source_storage_path
 from elspeth.web.composer.service import _BadRequestLLMError
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_blob_content
@@ -1042,6 +1047,7 @@ def _record_composer_request_terminal(
     *,
     endpoint: _ComposerRequestEndpoint,
 ) -> None:
+    mark_composer_request_terminal(status)
     _COMPOSER_REQUEST_TERMINAL_COUNTER.add(1, {"endpoint": endpoint, "status": status})
 
 
@@ -1755,11 +1761,36 @@ async def _track_compose_inflight(
     """
     registry = _get_composer_progress_registry(request)
     sid = str(session_id)
+    # This dependency is mounted only on Composer endpoints. Collapse the
+    # route family to a closed surface label; never export the raw path.
+    surface: Literal["freeform", "guided"] = "guided" if "/guided/" in request.url.path else "freeform"
+    metrics_token = begin_composer_request_metrics(surface=surface)
+    terminal_status: _ComposerRequestTerminalStatus = "completed"
     registry.begin_request(sid)
     try:
         yield
+    except asyncio.CancelledError:
+        terminal_status = "cancelled"
+        raise
+    except TimeoutError:
+        terminal_status = "timed_out"
+        raise
+    except HTTPException as exc:
+        if exc.status_code in {408, 504}:
+            terminal_status = "timed_out"
+        elif exc.status_code == 499:
+            terminal_status = "cancelled"
+        else:
+            terminal_status = "failed"
+        raise
+    except Exception:
+        terminal_status = "failed"
+        raise
     finally:
-        registry.end_request(sid)
+        try:
+            registry.end_request(sid)
+        finally:
+            finish_composer_request_metrics(metrics_token, status=terminal_status)
 
 
 async def _state_data_from_composer_state(
