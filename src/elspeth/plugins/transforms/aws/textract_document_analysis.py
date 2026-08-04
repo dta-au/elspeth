@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import math
 import re
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
-from typing import Any, ClassVar, Literal, Self
+from typing import Any, ClassVar, Literal, Self, cast
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from elspeth.contracts import Determinism
 from elspeth.contracts.audit_protocols import PluginAuditWriter
+from elspeth.contracts.aws_s3 import S3_MAX_KEY_BYTES, validate_relative_s3_path
+from elspeth.contracts.aws_textract import (
+    TEXTRACT_PRIVATE_BINDING_OPTION_NAMES,
+    TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES,
+    TextractProfiledAuditIdentity,
+    textract_profiled_binding_fingerprint,
+)
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
@@ -189,7 +197,20 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
         description="Optional resolved AWS session token for temporary secret_refs credentials.",
     )
 
-    bucket_field: str = Field(min_length=1, max_length=256, description="Input row field containing the S3 bucket name.")
+    bucket: str | None = Field(
+        default=None,
+        description="Static S3 bucket holding every document; mutually exclusive with bucket_field.",
+    )
+    key_prefix: str | None = Field(
+        default=None,
+        description="Canonical relative prefix joined ahead of each row's object key; requires the static bucket option.",
+    )
+    bucket_field: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=256,
+        description="Input row field containing the S3 bucket name; mutually exclusive with the static bucket option.",
+    )
     key_field: str = Field(min_length=1, max_length=256, description="Input row field containing the S3 object key.")
     version_field: str | None = Field(
         default=None,
@@ -247,6 +268,25 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
             raise ValueError("region must be a supported Amazon Textract region")
         return value
 
+    @field_validator("bucket")
+    @classmethod
+    def _static_bucket(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not 3 <= len(value) <= 255 or _BUCKET_PATTERN.fullmatch(value) is None:
+            raise ValueError("bucket must be a well-formed S3 bucket name")
+        return value
+
+    @field_validator("key_prefix")
+    @classmethod
+    def _key_prefix(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        validated = validate_relative_s3_path(value, field_name="key_prefix")
+        if len(validated.encode("utf-8")) > S3_MAX_KEY_BYTES - 2:
+            raise ValueError("key_prefix must leave room for a relative S3 object key")
+        return validated
+
     @field_validator("bucket_field", "key_field", "version_field", "text_field", "page_count_field", "metadata_field", "result_field")
     @classmethod
     def _field_name(cls, value: str | None, info: object) -> str | None:
@@ -266,6 +306,13 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
     def _consistency(self) -> Self:
         for facet_name in _FACET_NAMES:
             _require_non_whitespace(getattr(self.extract, facet_name), field_name=f"extract.{facet_name}")
+
+        if self.bucket is not None and self.bucket_field is not None:
+            raise ValueError("bucket and bucket_field are mutually exclusive document-location modes")
+        if self.bucket is None and self.bucket_field is None:
+            raise ValueError("one of bucket or bucket_field is required to locate documents")
+        if self.key_prefix is not None and self.bucket is None:
+            raise ValueError("key_prefix requires the static bucket option")
 
         has_queries = bool(self.queries)
         has_query_feature = "QUERIES" in self.feature_types
@@ -310,7 +357,9 @@ class AWSTextractDocumentAnalysisConfig(TransformDataConfig):
 
     @property
     def declared_input_fields(self) -> frozenset[str]:
-        fields = {self.bucket_field, self.key_field}
+        fields = {self.key_field}
+        if self.bucket_field is not None:
+            fields.add(self.bucket_field)
         if self.version_field is not None:
             fields.add(self.version_field)
         return super().declared_input_fields | frozenset(fields)
@@ -322,7 +371,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:b1722897f229612a"
+    source_file_hash: str | None = "sha256:692ad007183fbb41"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -374,6 +423,8 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._aws_access_key_id = cfg.aws_access_key_id
         self._aws_secret_access_key = cfg.aws_secret_access_key
         self._aws_session_token = cfg.aws_session_token
+        self._static_bucket = cfg.bucket
+        self._key_prefix = cfg.key_prefix
         self._bucket_field = cfg.bucket_field
         self._key_field = cfg.key_field
         self._version_field = cfg.version_field
@@ -413,6 +464,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         )
         self._output_schema_config = self._build_output_schema_config(cfg.schema_config)
 
+        self._profiled_audit_identity: TextractProfiledAuditIdentity | None = None
         self._recorder: PluginAuditWriter | None = None
         self._run_id = ""
         self._node_id = ""
@@ -425,6 +477,50 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._row_clients_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._batch_initialized = False
+
+    def _bind_profiled_audit_identity(
+        self,
+        identity: object,
+        *,
+        audit_safe_config: object,
+    ) -> None:
+        """Bind Web-only audit authority without adding a forgeable config field."""
+        if not isinstance(identity, TextractProfiledAuditIdentity):
+            raise TypeError("profiled Textract audit authority must be a TextractProfiledAuditIdentity")
+        if self._profiled_audit_identity is not None:
+            raise RuntimeError("profiled Textract audit authority is already bound")
+        if type(audit_safe_config) is not dict:
+            raise TypeError("profiled Textract audit-safe config must be an exact dict")
+        safe_config = cast(dict[str, object], audit_safe_config)
+        if set(safe_config) & TEXTRACT_PRIVATE_BINDING_OPTION_NAMES:
+            raise ValueError("profiled Textract audit-safe config contains a private binding field")
+        if set(safe_config) - TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES:
+            raise ValueError("profiled Textract audit-safe config contains a private binding field")
+        if safe_config.get("profile") != identity.profile_alias:
+            raise ValueError("profiled Textract audit-safe config does not match its nominal identity")
+        if self._static_bucket is None:
+            raise ValueError("profiled Textract audit authority requires the static bucket document-location mode")
+        actual_binding_fingerprint = textract_profiled_binding_fingerprint(
+            bucket=self._static_bucket,
+            region=self._region,
+            key_prefix=self._key_prefix,
+        )
+        if not hmac.compare_digest(identity.binding_fingerprint, actual_binding_fingerprint):
+            raise ValueError("profiled Textract executable binding does not match its nominal identity")
+        self._profiled_audit_identity = identity
+        self.config = dict(safe_config)
+
+    def _audit_location_identity(self, executable_key: str | None) -> Mapping[str, str] | None:
+        identity = self._profiled_audit_identity
+        if identity is None:
+            return None
+        projected: dict[str, str] = {"profile": identity.profile_alias}
+        if executable_key is not None:
+            relative_key = executable_key
+            if self._key_prefix is not None:
+                relative_key = executable_key.removeprefix(f"{self._key_prefix}/")
+            projected["key"] = relative_key
+        return projected
 
     def on_start(self, ctx: LifecycleContext) -> None:
         super().on_start(ctx)
@@ -541,17 +637,21 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 self._row_clients.pop(ctx.state_id, None)
 
     def _read_document_location(self, row: PipelineRow) -> tuple[str, str, str | None] | TransformResult:
-        required_fields = (self._bucket_field, self._key_field)
+        if self._static_bucket is not None:
+            return self._read_static_bucket_location(row)
+        bucket_field = self._bucket_field
+        assert bucket_field is not None
+        required_fields = (bucket_field, self._key_field)
         for field_name in required_fields:
             if field_name not in row:
                 return TransformResult.error({"reason": "missing_field", "field": field_name}, retryable=False)
         if self._version_field is not None and self._version_field not in row:
             return TransformResult.error({"reason": "missing_field", "field": self._version_field}, retryable=False)
 
-        bucket = row[self._bucket_field]
+        bucket = row[bucket_field]
         key = row[self._key_field]
         version = row[self._version_field] if self._version_field is not None else None
-        for field_name, value in ((self._bucket_field, bucket), (self._key_field, key)):
+        for field_name, value in ((bucket_field, bucket), (self._key_field, key)):
             if type(value) is not str:
                 return TransformResult.error(
                     {"reason": "invalid_input", "field": field_name, "actual_type": type(value).__name__},
@@ -567,7 +667,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         assert version is None or isinstance(version, str)
         if not 3 <= len(bucket) <= 255 or _BUCKET_PATTERN.fullmatch(bucket) is None:
             return TransformResult.error(
-                {"reason": "invalid_input", "field": self._bucket_field, "error_type": "invalid_s3_bucket"},
+                {"reason": "invalid_input", "field": bucket_field, "error_type": "invalid_s3_bucket"},
                 retryable=False,
             )
         if not 1 <= len(key) <= 1024 or not key.strip() or "#" in key:
@@ -582,6 +682,48 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 retryable=False,
             )
         return bucket, key, version
+
+    def _read_static_bucket_location(self, row: PipelineRow) -> tuple[str, str, str | None] | TransformResult:
+        assert self._static_bucket is not None
+        if self._key_field not in row:
+            return TransformResult.error({"reason": "missing_field", "field": self._key_field}, retryable=False)
+        if self._version_field is not None and self._version_field not in row:
+            return TransformResult.error({"reason": "missing_field", "field": self._version_field}, retryable=False)
+
+        key = row[self._key_field]
+        version = row[self._version_field] if self._version_field is not None else None
+        if type(key) is not str:
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": self._key_field, "actual_type": type(key).__name__},
+                retryable=False,
+            )
+        if self._version_field is not None and type(version) is not str:
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": self._version_field, "actual_type": type(version).__name__},
+                retryable=False,
+            )
+        assert isinstance(key, str)
+        assert version is None or isinstance(version, str)
+        try:
+            relative_key = validate_relative_s3_path(key, field_name=self._key_field)
+        except ValueError:
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": self._key_field, "error_type": "invalid_s3_relative_key"},
+                retryable=False,
+            )
+        executable_key = f"{self._key_prefix}/{relative_key}" if self._key_prefix is not None else relative_key
+        if len(executable_key.encode("utf-8")) > S3_MAX_KEY_BYTES or "#" in executable_key:
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": self._key_field, "error_type": "invalid_s3_key"},
+                retryable=False,
+            )
+        if version is not None and (not 1 <= len(version) <= 1024 or not version.strip()):
+            assert self._version_field is not None
+            return TransformResult.error(
+                {"reason": "invalid_input", "field": self._version_field, "error_type": "invalid_s3_version"},
+                retryable=False,
+            )
+        return self._static_bucket, executable_key, version
 
     def _client_request_token(
         self,
@@ -683,6 +825,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 feature_types=self._feature_types,
                 queries=self._query_requests,
                 client_request_token=request_token,
+                audit_identity=self._audit_location_identity(key),
             )
         except TextractIdempotencyInvariantError as error:
             raise FrameworkBugError("Amazon Textract idempotency invariant failed") from error
@@ -762,7 +905,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             region=self._region,
             sdk_client=self._s3_sdk_client,
             token_id=token_id,
-        ).verify_bucket_region(bucket)
+        ).verify_bucket_region(bucket, audit_identity=self._audit_location_identity(None))
 
     def _poll_and_collect(
         self,
@@ -895,7 +1038,9 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         )
 
     def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
-        row = self._augment_invariant_probe_row(probe, field_name=self._bucket_field, value="probe-bucket")
+        row = probe
+        if self._bucket_field is not None:
+            row = self._augment_invariant_probe_row(row, field_name=self._bucket_field, value="probe-bucket")
         row = self._augment_invariant_probe_row(row, field_name=self._key_field, value="probe-document.pdf")
         return [row]
 
@@ -990,7 +1135,9 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 "all result pages validate. Configure AWS identity through the default chain or ELSPETH secret refs."
             ),
             composer_hints=(
-                "Provide bucket_field and key_field, choose one or more Textract feature_types, and map at least one output.",
+                "Locate documents with a static bucket (plus optional key_prefix) and per-row keys in key_field, "
+                "or with per-row bucket_field and key_field; the two location modes are mutually exclusive.",
+                "In static bucket mode rows carry relative object keys only — never bucket names or locations.",
                 "QUERIES requires query definitions; inline document bytes belong in the separate synchronous plugin.",
                 "For explicit AWS credentials, use ELSPETH markers such as {secret_ref: AWS_ACCESS_KEY_ID}.",
             ),

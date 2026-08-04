@@ -14,6 +14,7 @@ import yaml
 
 from elspeth.contracts import SinkProtocol
 from elspeth.contracts.aws_s3 import S3_PROFILED_AUDIT_SAFE_OPTION_NAMES, S3ProfiledAuditIdentities
+from elspeth.contracts.aws_textract import TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES, TextractProfiledAuditIdentities
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.sink_effects import SinkEffectRuntimeBinding
 from elspeth.contracts.trust_boundary import trust_boundary
@@ -352,6 +353,58 @@ def bind_profiled_s3_source_audit_identities(
         raise ValueError("profiled S3 audit identities do not match the runtime S3 source set")
 
 
+def bind_profiled_textract_audit_identities(
+    bundle: PluginBundle,
+    *,
+    authored_options_by_node: Mapping[str, object],
+    plugin_snapshot: PluginAvailabilitySnapshot,
+    profiled_textract_audit_identities: TextractProfiledAuditIdentities,
+) -> None:
+    """Bind nominal safe evidence identities to Web-profiled Textract transforms."""
+    transform_id = PluginId("transform", "aws_textract_document_analysis")
+    if transform_id not in _profiled_plugin_ids(plugin_snapshot):
+        if profiled_textract_audit_identities:
+            raise ValueError("profiled Textract audit identities require a matching frozen plugin profile")
+        return
+
+    from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
+
+    allowed_aliases = dict(plugin_snapshot.usable_profile_aliases)[transform_id]
+    identities_by_node = dict(profiled_textract_audit_identities)
+    if len(identities_by_node) != len(profiled_textract_audit_identities):
+        raise ValueError("profiled Textract audit identities contain duplicate node names")
+    bound_node_names: set[str] = set()
+    for wired in bundle.transforms:
+        if wired.settings.plugin != "aws_textract_document_analysis":
+            continue
+        node_name = wired.settings.name
+        runtime_transform: object = wired.plugin
+        if not isinstance(runtime_transform, AWSTextractDocumentAnalysis):
+            raise TypeError("profiled aws_textract_document_analysis transform must be the owned implementation")
+        try:
+            raw_options = authored_options_by_node[node_name]
+        except KeyError:
+            raise KeyError(f"audit-safe settings have no transform named {node_name!r}") from None
+        if type(raw_options) is not dict:
+            raise TypeError(f"audit-safe options for transform {node_name!r} must be an exact dict")
+        options = cast(dict[str, object], raw_options)
+        if set(options) - TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES:
+            raise ValueError(f"audit-safe options for transform {node_name!r} contain a private binding field")
+        alias = options.get("profile")
+        if type(alias) is not str or alias not in allowed_aliases:
+            raise ValueError(f"audit-safe options for transform {node_name!r} do not select an available profile")
+        try:
+            identity = identities_by_node[node_name]
+        except KeyError:
+            raise KeyError(f"profiled Textract audit identities have no transform named {node_name!r}") from None
+        if identity.profile_alias != alias:
+            raise ValueError(f"audit-safe options for transform {node_name!r} do not match their nominal identity")
+        runtime_transform._bind_profiled_audit_identity(identity, audit_safe_config=options)
+        bound_node_names.add(node_name)
+    if bound_node_names != set(identities_by_node):
+        raise ValueError("profiled Textract audit identities do not match the runtime transform set")
+
+
 def _required_component_mapping(
     config: Mapping[str, Any],
     key: str,
@@ -568,6 +621,7 @@ def build_validated_runtime_graph(
     plugin_snapshot: PluginAvailabilitySnapshot,
     audit_safe_settings: Mapping[str, Any] | None = None,
     profiled_s3_audit_identities: S3ProfiledAuditIdentities = (),
+    profiled_textract_audit_identities: TextractProfiledAuditIdentities = (),
 ) -> RuntimeGraphBundle:
     """Instantiate runtime plugins, build the graph, and run both runtime graph checks.
 
@@ -577,6 +631,9 @@ def build_validated_runtime_graph(
     profiled_s3_source = PluginId("source", "aws_s3") in _profiled_plugin_ids(plugin_snapshot)
     if profiled_s3_source and audit_safe_settings is None:
         raise ValueError("profiled S3 runtime requires audit-safe settings")
+    profiled_textract = PluginId("transform", "aws_textract_document_analysis") in _profiled_plugin_ids(plugin_snapshot)
+    if profiled_textract and audit_safe_settings is None:
+        raise ValueError("profiled Textract runtime requires audit-safe settings")
     bundle = instantiate_runtime_plugins(settings, plugin_snapshot=plugin_snapshot)
     if profiled_s3_source:
         authored_sources = _authored_sources(cast(Mapping[str, Any], audit_safe_settings))
@@ -585,6 +642,14 @@ def build_validated_runtime_graph(
             authored_options_by_source={name: _authored_options(component) for name, component in authored_sources.items()},
             plugin_snapshot=plugin_snapshot,
             profiled_s3_audit_identities=profiled_s3_audit_identities,
+        )
+    if profiled_textract:
+        authored_transforms = _authored_named_components(cast(Mapping[str, Any], audit_safe_settings), "transforms")
+        bind_profiled_textract_audit_identities(
+            bundle,
+            authored_options_by_node={name: _authored_options(component) for name, component in authored_transforms.items()},
+            plugin_snapshot=plugin_snapshot,
+            profiled_textract_audit_identities=profiled_textract_audit_identities,
         )
     if audit_safe_settings is None:
         graph = build_runtime_graph(settings, bundle)

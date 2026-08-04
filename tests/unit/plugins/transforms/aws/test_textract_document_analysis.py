@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from elspeth.contracts import AuditCharacteristic, Determinism
+from elspeth.contracts.aws_textract import TextractProfiledAuditIdentity, textract_profiled_binding_fingerprint
 from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.contracts.schema_contract import PipelineRow
@@ -1145,3 +1146,293 @@ def test_assistance_distinguishes_async_s3_and_secret_refs_from_inline_plugin() 
     assert "asynchronously" in rendered
     assert "secret_ref" in rendered
     assert "inline" in rendered
+
+
+def _bucket_config(**overrides: object) -> dict[str, object]:
+    config = _config(bucket="operator-owned-docs", key_prefix="scans/incoming")
+    config.pop("bucket_field")
+    config.update(overrides)
+    return config
+
+
+def _load_bucket_mode(**overrides: object) -> AWSTextractDocumentAnalysisConfig:
+    return AWSTextractDocumentAnalysisConfig.from_dict(
+        _bucket_config(**overrides),
+        plugin_name="aws_textract_document_analysis",
+    )
+
+
+def test_static_bucket_mode_loads_and_declares_key_only() -> None:
+    cfg = _load_bucket_mode()
+
+    assert cfg.bucket == "operator-owned-docs"
+    assert cfg.key_prefix == "scans/incoming"
+    assert cfg.bucket_field is None
+    assert cfg.declared_input_fields == frozenset({"document_key"})
+
+
+def test_static_bucket_and_bucket_field_are_mutually_exclusive() -> None:
+    with pytest.raises(PluginConfigError, match="mutually exclusive"):
+        _load(bucket="operator-owned-docs")
+
+
+def test_one_of_static_bucket_or_bucket_field_is_required() -> None:
+    config = _config()
+    config.pop("bucket_field")
+
+    with pytest.raises(PluginConfigError, match="bucket or bucket_field"):
+        AWSTextractDocumentAnalysisConfig.from_dict(config, plugin_name="aws_textract_document_analysis")
+
+
+def test_key_prefix_requires_static_bucket() -> None:
+    with pytest.raises(PluginConfigError, match="key_prefix requires"):
+        _load(key_prefix="scans/incoming")
+
+
+@pytest.mark.parametrize("bucket", ["ab", "scans/incoming", "bad bucket", "x" * 256])
+def test_static_bucket_must_be_a_well_formed_s3_bucket_name(bucket: str) -> None:
+    with pytest.raises(PluginConfigError, match="well-formed S3 bucket name"):
+        _load_bucket_mode(bucket=bucket)
+
+
+@pytest.mark.parametrize("prefix", ["/absolute", "trailing/", "a//b", "../up", "a\\b", ".", "s3:scheme"])
+def test_key_prefix_must_be_a_canonical_relative_path(prefix: str) -> None:
+    with pytest.raises(PluginConfigError, match="key_prefix must"):
+        _load_bucket_mode(key_prefix=prefix)
+
+
+def _bucket_mode_transform_for_client(client: FakeTextractClient, **overrides: object) -> AWSTextractDocumentAnalysis:
+    transform = AWSTextractDocumentAnalysis(_bucket_config(**overrides))
+    transform._run_id = "run-1"
+    transform._node_id = "node-1"
+    transform._poll_interval_seconds = 0.001
+    transform._poll_max_interval_seconds = 0.001
+    transform._row_clients["state-1"] = client
+    transform._bucket_region_coordinator = FakeBucketRegionCoordinator()  # type: ignore[assignment]
+    return transform
+
+
+def test_bucket_mode_joins_row_key_under_prefix() -> None:
+    client = FakeTextractClient(pages=[_page(blocks=_basic_blocks())])
+    transform = _bucket_mode_transform_for_client(client)
+
+    result = transform._process_single_with_state(
+        make_pipeline_row({"document_key": "invoice.pdf"}),
+        "state-1",
+        token_id="token-1",
+    )
+
+    assert result.status == "success"
+    assert client.start_calls[0]["bucket"] == "operator-owned-docs"
+    assert client.start_calls[0]["key"] == "scans/incoming/invoice.pdf"
+
+
+def test_bucket_mode_without_prefix_uses_row_key_directly() -> None:
+    client = FakeTextractClient(pages=[_page(blocks=_basic_blocks())])
+    transform = _bucket_mode_transform_for_client(client, key_prefix=None)
+
+    result = transform._process_single_with_state(
+        make_pipeline_row({"document_key": "invoice.pdf"}),
+        "state-1",
+        token_id="token-1",
+    )
+
+    assert result.status == "success"
+    assert client.start_calls[0]["bucket"] == "operator-owned-docs"
+    assert client.start_calls[0]["key"] == "invoice.pdf"
+
+
+@pytest.mark.parametrize(
+    "row_key",
+    [
+        "/absolute.pdf",
+        "../escape.pdf",
+        "a//b.pdf",
+        "scans/",
+        "s3:scheme.pdf",
+        "s3://other-bucket/secret.pdf",
+        "C:\\secret.pdf",
+        "records\\secret.pdf",
+        "records/../secret.pdf",
+        "records/./secret.pdf",
+        " leading-space.pdf",
+        "trailing-space.pdf ",
+        "control\x1fchar.pdf",
+        "delete\x7fchar.pdf",
+        "",
+        ".",
+        "..",
+    ],
+)
+def test_bucket_mode_rejects_non_relative_row_keys(row_key: str) -> None:
+    client = FakeTextractClient(pages=[])
+    transform = _bucket_mode_transform_for_client(client)
+
+    result = transform._process_single_with_state(
+        make_pipeline_row({"document_key": row_key}),
+        "state-1",
+        token_id="token-1",
+    )
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "invalid_input"
+    assert result.reason["field"] == "document_key"
+    assert client.start_calls == []
+
+
+def test_bucket_mode_rejects_overlong_joined_key() -> None:
+    client = FakeTextractClient(pages=[])
+    transform = _bucket_mode_transform_for_client(client, key_prefix="p" * 1000)
+
+    result = transform._process_single_with_state(
+        make_pipeline_row({"document_key": "k" * 30}),
+        "state-1",
+        token_id="token-1",
+    )
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "invalid_input"
+    assert result.reason["field"] == "document_key"
+    assert client.start_calls == []
+
+
+def test_bucket_mode_does_not_require_a_bucket_column_and_missing_key_fails() -> None:
+    client = FakeTextractClient(pages=[])
+    transform = _bucket_mode_transform_for_client(client)
+
+    result = transform._process_single_with_state(
+        make_pipeline_row({"unrelated": "value"}),
+        "state-1",
+        token_id="token-1",
+    )
+
+    assert result.status == "error"
+    assert result.reason is not None
+    assert result.reason["reason"] == "missing_field"
+    assert result.reason["field"] == "document_key"
+
+
+def _profiled_identity(**overrides: object) -> TextractProfiledAuditIdentity:
+    binding: dict[str, object] = {"bucket": "operator-owned-docs", "region": "ap-southeast-2", "key_prefix": "scans/incoming"}
+    binding.update(overrides)
+    return TextractProfiledAuditIdentity(
+        profile_alias="acceptance-docs",
+        binding_fingerprint=textract_profiled_binding_fingerprint(
+            bucket=str(binding["bucket"]),
+            region=str(binding["region"]),
+            key_prefix=None if binding["key_prefix"] is None else str(binding["key_prefix"]),
+        ),
+    )
+
+
+def _profiled_safe_config() -> dict[str, object]:
+    return {
+        "profile": "acceptance-docs",
+        "key_field": "document_key",
+        "feature_types": ["FORMS", "TABLES"],
+        "text_field": "textract_text",
+        "schema": {"mode": "observed"},
+    }
+
+
+def test_profiled_bind_projects_call_record_identity_with_relative_key() -> None:
+    client = FakeTextractClient(pages=[_page(blocks=_basic_blocks())])
+    transform = _bucket_mode_transform_for_client(client)
+    transform._bind_profiled_audit_identity(_profiled_identity(), audit_safe_config=_profiled_safe_config())
+
+    result = transform._process_single_with_state(
+        make_pipeline_row({"document_key": "invoice.pdf"}),
+        "state-1",
+        token_id="token-1",
+    )
+
+    assert result.status == "success"
+    assert client.start_calls[0]["bucket"] == "operator-owned-docs"
+    assert client.start_calls[0]["key"] == "scans/incoming/invoice.pdf"
+    assert client.start_calls[0]["audit_identity"] == {"profile": "acceptance-docs", "key": "invoice.pdf"}
+    assert transform.config == _profiled_safe_config()
+
+
+def test_profiled_bind_rejects_binding_fingerprint_mismatch() -> None:
+    client = FakeTextractClient(pages=[])
+    transform = _bucket_mode_transform_for_client(client)
+
+    with pytest.raises(ValueError, match="does not match"):
+        transform._bind_profiled_audit_identity(
+            _profiled_identity(bucket="a-different-bucket"),
+            audit_safe_config=_profiled_safe_config(),
+        )
+
+
+def test_profiled_bind_requires_static_bucket_mode() -> None:
+    client = FakeTextractClient(pages=[])
+    transform = _transform_for_client(client)
+
+    with pytest.raises(ValueError, match="static bucket"):
+        transform._bind_profiled_audit_identity(_profiled_identity(), audit_safe_config=_profiled_safe_config())
+
+
+def test_profiled_bind_rejects_private_binding_field_in_safe_config() -> None:
+    client = FakeTextractClient(pages=[])
+    transform = _bucket_mode_transform_for_client(client)
+    poisoned = {**_profiled_safe_config(), "bucket": "leaked"}
+
+    with pytest.raises(ValueError, match="private binding field"):
+        transform._bind_profiled_audit_identity(_profiled_identity(), audit_safe_config=poisoned)
+
+
+def test_profiled_bind_rejects_nominal_type_impostor() -> None:
+    client = FakeTextractClient(pages=[])
+    transform = _bucket_mode_transform_for_client(client)
+
+    class _Impostor:
+        profile_alias = "acceptance-docs"
+        binding_fingerprint = "0" * 64
+
+    with pytest.raises(TypeError, match="TextractProfiledAuditIdentity"):
+        transform._bind_profiled_audit_identity(_Impostor(), audit_safe_config=_profiled_safe_config())
+
+
+def test_preflight_binder_binds_every_profiled_textract_transform_or_refuses() -> None:
+    from types import SimpleNamespace
+
+    from elspeth.web.execution.preflight import bind_profiled_textract_audit_identities
+    from elspeth.web.plugin_policy.models import PluginId
+
+    transform = AWSTextractDocumentAnalysis(_bucket_config())
+    bundle = SimpleNamespace(
+        transforms=(
+            SimpleNamespace(plugin=transform, settings=SimpleNamespace(plugin="aws_textract_document_analysis", name="textract_1")),
+        )
+    )
+    plugin_id = PluginId("transform", "aws_textract_document_analysis")
+    snapshot = SimpleNamespace(usable_profile_aliases=((plugin_id, ("acceptance-docs",)),))
+    identity = _profiled_identity()
+
+    bind_profiled_textract_audit_identities(
+        bundle,  # type: ignore[arg-type]
+        authored_options_by_node={"textract_1": _profiled_safe_config()},
+        plugin_snapshot=snapshot,  # type: ignore[arg-type]
+        profiled_textract_audit_identities=(("textract_1", identity),),
+    )
+    assert transform._profiled_audit_identity is identity
+
+    empty_bundle = SimpleNamespace(transforms=())
+    with pytest.raises(ValueError, match="do not match the runtime transform set"):
+        bind_profiled_textract_audit_identities(
+            empty_bundle,  # type: ignore[arg-type]
+            authored_options_by_node={},
+            plugin_snapshot=snapshot,  # type: ignore[arg-type]
+            profiled_textract_audit_identities=(("textract_1", identity),),
+        )
+
+    unprofiled_snapshot = SimpleNamespace(usable_profile_aliases=())
+    with pytest.raises(ValueError, match="matching frozen plugin profile"):
+        bind_profiled_textract_audit_identities(
+            empty_bundle,  # type: ignore[arg-type]
+            authored_options_by_node={},
+            plugin_snapshot=unprofiled_snapshot,  # type: ignore[arg-type]
+            profiled_textract_audit_identities=(("textract_1", identity),),
+        )

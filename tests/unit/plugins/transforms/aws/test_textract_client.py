@@ -580,3 +580,31 @@ def test_builder_omits_all_explicit_credentials_for_default_chain(monkeypatch: p
     assert "aws_access_key_id" not in captured
     assert "aws_secret_access_key" not in captured
     assert "aws_session_token" not in captured
+
+
+def test_start_audit_identity_projects_request_payload_without_bucket() -> None:
+    sdk = FakeSDK()
+    client, recorder, _events, _limiter = _client(sdk)
+
+    client.start_document_analysis(
+        bucket="operator-owned-docs",
+        key="org-prefix/scans/invoice.pdf",
+        version=None,
+        feature_types=("FORMS",),
+        queries=(),
+        client_request_token="c" * 64,
+        audit_identity={"profile": "acceptance-docs", "key": "scans/invoice.pdf"},
+    )
+
+    assert sdk.start_requests == [
+        {
+            "DocumentLocation": {"S3Object": {"Bucket": "operator-owned-docs", "Name": "org-prefix/scans/invoice.pdf"}},
+            "FeatureTypes": ["FORMS"],
+            "ClientRequestToken": "c" * 64,
+        }
+    ]
+    request_payload = recorder.calls[0]["request_data"].to_dict()
+    assert request_payload["profile"] == "acceptance-docs"
+    assert request_payload["key"] == "scans/invoice.pdf"
+    assert "bucket" not in request_payload
+    assert "operator-owned-docs" not in repr(recorder.calls[0])

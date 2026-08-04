@@ -9,6 +9,7 @@ from typing import Literal
 from jsonschema import Draft202012Validator
 
 from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities, S3ProfiledAuditIdentity
+from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities, TextractProfiledAuditIdentity
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.plugin_capabilities import ControlMode, WebConfigAuthority
 from elspeth.web.catalog.protocol import CatalogService
@@ -34,6 +35,14 @@ PolicyValidationStage = Literal[
 
 _PROFILE_LOWERING_METADATA_OPTION_KEYS = AUTHORING_METADATA_OPTION_KEYS | {"resolved_prompt_template_hash"}
 
+# Profiled plugins whose operator binding is a STORAGE location rather than an
+# LLM-family provider/model/credential set — their rejection prose must speak
+# storage-binding repair language or the planner repair loop cannot converge.
+_STORAGE_PROFILED_COMPONENT_KINDS: dict[PluginId, str] = {
+    PluginId("source", "aws_s3"): "source",
+    PluginId("transform", "aws_textract_document_analysis"): "node",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class PluginPolicyFinding:
@@ -54,6 +63,7 @@ class PluginPolicyValidationResult:
     executable_state: CompositionState = field(repr=False)
     findings: tuple[PluginPolicyFinding, ...]
     profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
+    profiled_textract_audit_identities: TextractProfiledAuditIdentities = ()
 
     def findings_for(self, stage: PolicyValidationStage) -> tuple[PluginPolicyFinding, ...]:
         return tuple(finding for finding in self.findings if finding.stage == stage)
@@ -86,6 +96,34 @@ def _s3_source_endpoint_override_finding(component: _Component) -> PluginPolicyF
         message=message,
         suggestion="Remove endpoint_url and use operator-controlled AWS configuration.",
     )
+
+
+def _textract_alias_as_bucket_finding(component: _Component, alias_inventory: frozenset[str]) -> PluginPolicyFinding | None:
+    """Name the alias-as-bucket confusion before the generic schema rejection.
+
+    Battery evidence (elspeth-cd0f6a6cd9, run e41d0e6b): a planner asked to use
+    an operator profile authored its alias as a literal bucket value. The
+    generic "option not authorable" rejection never names the confusion, so
+    the repair loop reattempts bucket shapes instead of selecting the profile.
+    Aliases are public enum values, so echoing one is value-safe.
+    """
+    if component.plugin_id != PluginId("transform", "aws_textract_document_analysis") or not alias_inventory:
+        return None
+    for option_name in ("bucket", "bucket_field"):
+        value = component.options.get(option_name)
+        if type(value) is str and value in alias_inventory:
+            return PluginPolicyFinding(
+                stage="operator_profile_options",
+                component_id=component.component_id,
+                component_type=component.component_type,
+                error_code="profile_alias_used_as_bucket",
+                message=(
+                    f"Option '{option_name}' carries the operator profile alias '{value}' as a literal "
+                    "document-location value. Profile aliases are not bucket names or row columns."
+                ),
+                suggestion="Select the alias with the 'profile' option; rows carry relative object keys in key_field.",
+            )
+    return None
 
 
 def validate_plugin_policy(
@@ -131,11 +169,16 @@ def validate_plugin_policy(
 
     if not snapshot.is_trained_operator:
         findings.extend(finding for component in components if (finding := _s3_source_endpoint_override_finding(component)) is not None)
+        alias_inventory = frozenset(alias for _plugin_id, aliases in snapshot.usable_profile_aliases for alias in aliases)
+        findings.extend(
+            finding for component in components if (finding := _textract_alias_as_bucket_finding(component, alias_inventory)) is not None
+        )
 
     executable_state = state
     profiled_s3_audit_identities: S3ProfiledAuditIdentities = ()
+    profiled_textract_audit_identities: TextractProfiledAuditIdentities = ()
     if not findings and not snapshot.is_trained_operator:
-        executable_state, profile_findings, profiled_s3_audit_identities = _lower_profiled_components(
+        executable_state, profile_findings, profiled_s3_audit_identities, profiled_textract_audit_identities = _lower_profiled_components(
             state,
             snapshot=snapshot,
             profile_registry=profile_registry,
@@ -167,6 +210,7 @@ def validate_plugin_policy(
         executable_state=executable_state,
         findings=tuple(findings),
         profiled_s3_audit_identities=profiled_s3_audit_identities,
+        profiled_textract_audit_identities=profiled_textract_audit_identities,
     )
 
 
@@ -383,11 +427,12 @@ def _lower_profiled_components(
     snapshot: PluginAvailabilitySnapshot,
     profile_registry: OperatorProfileRegistry | None,
     catalog: CatalogService,
-) -> tuple[CompositionState, tuple[PluginPolicyFinding, ...], S3ProfiledAuditIdentities]:
+) -> tuple[CompositionState, tuple[PluginPolicyFinding, ...], S3ProfiledAuditIdentities, TextractProfiledAuditIdentities]:
     aliases_by_plugin = dict(snapshot.usable_profile_aliases)
     components = _components(state)
     lowered_options: dict[tuple[str, str], dict[str, object]] = {}
     s3_audit_identities_by_component: dict[str, S3ProfiledAuditIdentity] = {}
+    textract_audit_identities_by_component: dict[str, TextractProfiledAuditIdentity] = {}
     findings: list[PluginPolicyFinding] = []
     lowering_registry = profile_registry
     lowering_catalog = catalog
@@ -443,9 +488,10 @@ def _lower_profiled_components(
             allowed_properties = set(public_schema.get("properties") or ())
             unexpected = sorted(set(public_options) - allowed_properties)
             if unexpected:
-                if plugin_id == PluginId("source", "aws_s3"):
+                storage_component_kind = _STORAGE_PROFILED_COMPONENT_KINDS.get(plugin_id)
+                if storage_component_kind is not None:
                     detail = (
-                        f"option(s) not authorable on a profile-bound source: {unexpected}. "
+                        f"option(s) not authorable on a profile-bound {storage_component_kind}: {unexpected}. "
                         "Remove them; the operator profile supplies the private storage binding."
                     )
                 else:
@@ -481,7 +527,7 @@ def _lower_profiled_components(
             # real defect was an operator-private option in their node — a
             # message no planner can repair from.
             if str(exc) == "private_profile_option":
-                if plugin_id == PluginId("source", "aws_s3"):
+                if plugin_id in _STORAGE_PROFILED_COMPONENT_KINDS:
                     message = (
                         f"Plugin '{plugin_id}' profile-bound options include operator-private storage settings. "
                         "Remove them; the operator profile supplies the private binding."
@@ -527,13 +573,17 @@ def _lower_profiled_components(
             if component.component_type != "source" or plugin_id != PluginId("source", "aws_s3"):
                 raise TypeError("profile resolver returned an S3 audit identity for a non-S3 source")
             s3_audit_identities_by_component[component.component_id] = lowered.profiled_s3_audit_identity
+        if lowered.profiled_textract_audit_identity is not None:
+            if component.component_type != "transform" or plugin_id != PluginId("transform", "aws_textract_document_analysis"):
+                raise TypeError("profile resolver returned a Textract audit identity for a non-Textract component")
+            textract_audit_identities_by_component[component.component_id] = lowered.profiled_textract_audit_identity
         lowered_options[(component.component_type, component.component_id)] = {
             **executable_options,
             **authoring_metadata,
         }
 
     if findings:
-        return state, _normalized_profile_findings(findings), ()
+        return state, _normalized_profile_findings(findings), (), ()
 
     sources: dict[str, SourceSpec] = {}
     for source_name, source in state.sources.items():
@@ -553,7 +603,17 @@ def _lower_profiled_components(
         for source_name in sources
         if (identity := s3_audit_identities_by_component.get("source" if source_name == "source" else f"source:{source_name}")) is not None
     )
-    return replace(state, sources=sources, nodes=tuple(nodes), outputs=tuple(outputs)), (), profiled_s3_audit_identities
+    profiled_textract_audit_identities = tuple(
+        (node.id, textract_identity)
+        for node in state.nodes
+        if (textract_identity := textract_audit_identities_by_component.get(node.id)) is not None
+    )
+    return (
+        replace(state, sources=sources, nodes=tuple(nodes), outputs=tuple(outputs)),
+        (),
+        profiled_s3_audit_identities,
+        profiled_textract_audit_identities,
+    )
 
 
 def _profile_unavailable_finding(

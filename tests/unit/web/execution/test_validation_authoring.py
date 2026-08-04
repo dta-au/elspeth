@@ -114,6 +114,7 @@ def _policy(state: CompositionState) -> PolicyLoweredState:
         authored_state=state,
         state=state,
         profiled_s3_audit_identities=(),
+        profiled_textract_audit_identities=(),
         operator_resolved_model_node_ids=frozenset(),
     )
 

@@ -89,6 +89,7 @@ def _required_textract_policy(tmp_path: Path) -> tuple[PolicyCatalogView, Plugin
         composer_rate_limit_per_minute=10,
         shareable_link_signing_key=SecretBytes(b"0" * 32),
         deployment_aws_region="ap-southeast-2",
+        aws_textract_profiles=({"alias": "acceptance-docs", "bucket": "operator-owned-docs", "key_prefix": "org/acme"},),
         llm_profiles={
             "sonnet": {
                 "provider": "openrouter",
@@ -155,14 +156,14 @@ def _textract_llm_mapper_args(tmp_path: Path) -> dict[str, Any]:
             "options": {
                 "schema": {
                     "mode": "fixed",
-                    "fields": ["doc_bucket: str", "doc_key: str"],
+                    "fields": ["doc_key: str"],
                 }
             },
             "on_validation_failure": "discard",
             "inline_blob": {
                 "filename": "manifest.csv",
                 "mime_type": "text/csv",
-                "content": "doc_bucket,doc_key\ninput-bucket,inbox/document.pdf\n",
+                "content": "doc_key\ninbox/document.pdf\n",
                 "description": "One document manifest row",
             },
         },
@@ -175,16 +176,14 @@ def _textract_llm_mapper_args(tmp_path: Path) -> dict[str, Any]:
                 "on_success": "extracted_rows",
                 "on_error": "discard",
                 "options": {
-                    "profile": "deployment",
+                    "profile": "acceptance-docs",
                     "schema": {
                         "mode": "flexible",
                         "fields": [
-                            {"name": "doc_bucket", "field_type": "str", "required": True},
                             {"name": "doc_key", "field_type": "str", "required": True},
                         ],
                     },
-                    "required_input_fields": ["doc_bucket", "doc_key"],
-                    "bucket_field": "doc_bucket",
+                    "required_input_fields": ["doc_key"],
                     "key_field": "doc_key",
                     "feature_types": ["TABLES", "FORMS"],
                     "text_field": "document_text",
@@ -254,7 +253,7 @@ async def _incremental_textract_state(
     blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
         UUID(harness.session_id),
         "manifest.csv",
-        b"doc_bucket,doc_key\ninput-bucket,inbox/document.pdf\n",
+        b"doc_key\ninbox/document.pdf\n",
         "text/csv",
     )
     args["source"] = {
@@ -264,7 +263,7 @@ async def _incremental_textract_state(
         "options": {
             "schema": {
                 "mode": "fixed",
-                "fields": ["doc_bucket: str", "doc_key: str"],
+                "fields": ["doc_key: str"],
             },
         },
         "on_validation_failure": "discard",
@@ -312,7 +311,7 @@ async def _incremental_named_blob_state(
         extra_blob = await BlobServiceImpl(harness.engine, tmp_path).create_blob(
             UUID(harness.session_id),
             "secondary.csv",
-            b"doc_bucket,doc_key\ninput-bucket,inbox/secondary.pdf\n",
+            b"doc_key\ninbox/secondary.pdf\n",
             "text/csv",
         )
         sources["secondary"] = SourceSpec(

@@ -277,3 +277,23 @@ def test_s3_builder_uses_textract_retry_timeout_and_credentials(monkeypatch: pyt
     assert config.read_timeout == 30
     assert config.retries["mode"] == "standard"
     assert config.retries["total_max_attempts"] == 3
+
+
+def test_head_bucket_audit_identity_projects_request_payload() -> None:
+    response = {
+        "BucketRegion": "ap-southeast-2",
+        "ResponseMetadata": {"HTTPStatusCode": 200, "HTTPHeaders": {}, "RetryAttempts": 0},
+    }
+    client, execution, _events, sdk = _client(response)
+
+    proof = client.verify_bucket_region("operator-owned-docs", audit_identity={"profile": "acceptance-docs"})
+
+    assert proof.region == "ap-southeast-2"
+    assert sdk.requests == [{"Bucket": "operator-owned-docs"}]
+    request_payload = execution.calls[0]["request_data"].to_dict()
+    assert request_payload == {
+        "operation": "head_bucket_region",
+        "configured_region": "ap-southeast-2",
+        "profile": "acceptance-docs",
+    }
+    assert "operator-owned-docs" not in repr(execution.calls[0])

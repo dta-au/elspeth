@@ -4,7 +4,31 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
+
+S3_MAX_KEY_BYTES = 1024
+
+
+def validate_relative_s3_path(value: str, *, field_name: str) -> str:
+    """Validate one canonical relative S3 path without normalizing attacker input."""
+    if not value or value != value.strip():
+        raise ValueError(f"{field_name} must be a non-blank canonical relative S3 path")
+    if value.startswith("/") or value.endswith("/") or "\\" in value:
+        raise ValueError(f"{field_name} must be a canonical relative S3 path")
+    if re.match(r"[A-Za-z][A-Za-z0-9+.-]*:", value) is not None:
+        raise ValueError(f"{field_name} must not use an absolute drive or URI scheme")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise ValueError(f"{field_name} must not contain control characters")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"{field_name} must not contain empty or traversal segments")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{field_name} must be valid UTF-8") from None
+    return value
+
 
 S3_PROFILED_AUTHOR_OPTION_NAMES: tuple[str, ...] = (
     "key",

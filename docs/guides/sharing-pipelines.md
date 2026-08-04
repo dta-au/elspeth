@@ -68,14 +68,15 @@ accept this trade-off.
 ## First-deploy operator action
 
 For 0.7.2, shareable-review state is part of the broader web session database
-contract. The release expects `SESSION_SCHEMA_EPOCH=44` and
+contract. The release expects `SESSION_SCHEMA_EPOCH=45` and
 `SQLITE_SCHEMA_EPOCH=30`. Session epoch 29 introduced durable guided
 operations, session epoch 30 added the closed `quota_exceeded` terminal failure
 code used for stable HTTP 413 fork replay, and later session epochs completed
 proposal admission, retryable blob cleanup, ordinary guided-plan decline
 settlement, the decline replay message locator, the eager cutovers for
 persisted coalesce timeout metadata and the projected node option summary, and
-run-diagnostics writer-principal attribution. Landscape epoch 30 adds
+run-diagnostics writer-principal attribution and operator-profiled
+Textract document authoring. Landscape epoch 30 adds
 durable row_union barrier attribution, so a
 Landscape store left at epoch 29 is stale and must be recreated. When
 upgrading from an older pre-1.0 build, stop and

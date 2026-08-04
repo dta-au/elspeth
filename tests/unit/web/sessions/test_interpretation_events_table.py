@@ -196,9 +196,9 @@ def _surface_opt_out_row(*, row_id: str, session_id: str, state_id: str) -> dict
     }
 
 
-def test_current_session_schema_epoch_is_44() -> None:
+def test_current_session_schema_epoch_is_45() -> None:
     # 44: guided_operations.failure_code gains planner_repair_exhausted (elspeth-5904b1683a).
-    assert SESSION_SCHEMA_EPOCH == 44
+    assert SESSION_SCHEMA_EPOCH == 45
 
 
 def test_composition_proposal_composer_provenance_is_all_or_none(engine) -> None:

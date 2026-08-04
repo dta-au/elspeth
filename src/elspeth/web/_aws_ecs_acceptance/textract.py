@@ -14,14 +14,18 @@ uploaded, read, or emitted.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Callable, Mapping
+from functools import partial
 from typing import Any
 
 from botocore.exceptions import ClientError
 
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.plugins.transforms.aws.textract_client import build_textract_sdk_client
+from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysisConfig
+from elspeth.web.plugin_policy.profiles import AWSTextractProfileSettings
 
 from .contracts import (
     FORBIDDEN_AWS_OVERRIDE_ENV,
@@ -59,6 +63,63 @@ def _probe_invocable(invoke: Callable[[], object], *, invocable_codes: frozenset
         raise AcceptanceCheckError(check) from None
     # An outright success also proves the action is invocable (it can only
     # happen if something already exists at the probe identity).
+
+
+def _verify_textract_profiles(
+    env: Mapping[str, str],
+    *,
+    client: Any,
+    region: str,
+    probe_suffix_factory: Callable[[], str],
+) -> dict[str, object]:
+    """Exercise each operator Textract document profile without processing a document.
+
+    Two proofs per profile: the binding satisfies the engine's own bucket-mode
+    configuration rules (so web lowering cannot produce an unbuildable node),
+    and the granted document location is invocable by the task role via the
+    same negative-space StartDocumentAnalysis probe as the raw-SDK lane.
+    """
+    raw = env.get("ELSPETH_WEB__AWS_TEXTRACT_PROFILES")
+    if raw is None or not raw.strip():
+        return {"profiles_configured": 0, "profile_locations_invocable": True}
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        raise AcceptanceCheckError("textract_profile_settings") from None
+    if type(parsed) is not list or not parsed:
+        raise AcceptanceCheckError("textract_profile_settings")
+    try:
+        profiles = tuple(AWSTextractProfileSettings.model_validate(entry) for entry in parsed)
+    except Exception:
+        raise AcceptanceCheckError("textract_profile_settings") from None
+
+    for profile in profiles:
+        binding_options: dict[str, object] = {
+            "region": region,
+            "bucket": profile.bucket,
+            "key_field": "document_key",
+            "feature_types": ["TABLES"],
+            "text_field": "textract_text",
+            "schema": {"mode": "observed"},
+        }
+        if profile.key_prefix is not None:
+            binding_options["key_prefix"] = profile.key_prefix
+        try:
+            AWSTextractDocumentAnalysisConfig.from_dict(binding_options, plugin_name=_TEXTRACT_TRANSFORM_NAME)
+        except Exception:
+            raise AcceptanceCheckError("textract_profile_binding") from None
+
+        probe_name = f"verify-textract-{probe_suffix_factory()}.probe"
+        probe_key = probe_name if profile.key_prefix is None else f"{profile.key_prefix}/{probe_name}"
+        if len(probe_key.encode("utf-8")) > 1024:
+            raise AcceptanceCheckError("textract_profile_binding")
+        probe_location = {"S3Object": {"Bucket": profile.bucket, "Name": probe_key}}
+        _probe_invocable(
+            partial(client.start_document_analysis, DocumentLocation=probe_location, FeatureTypes=["TABLES"]),
+            invocable_codes=_START_INVOCABLE_CODES,
+            check="textract_profile_start_document_analysis",
+        )
+    return {"profiles_configured": len(profiles), "profile_locations_invocable": True}
 
 
 def verify_textract(
@@ -110,6 +171,12 @@ def verify_textract(
             invocable_codes=_GET_INVOCABLE_CODES,
             check="textract_get_document_analysis",
         )
+        profile_details = _verify_textract_profiles(
+            env,
+            client=client,
+            region=region,
+            probe_suffix_factory=probe_suffix_factory,
+        )
     finally:
         try:
             client.close()
@@ -123,4 +190,5 @@ def verify_textract(
         "client_constructed": True,
         "start_document_analysis_invocable": True,
         "get_document_analysis_invocable": True,
+        **profile_details,
     }

@@ -3,7 +3,15 @@
 **Date:** 2026-08-04 · **Branch:** release/0.7.2 · **Tree at review:** `b06fcd5b1`
 **Ticket:** `elspeth-cd0f6a6cd9` (P2 bug, battery-2026-08-04)
 **Decision record:** [ADR-036](../../architecture/adr/036-textract-profile-bound-bucket.md)
-**Status:** approved for build (three-seat design review, 2026-08-04); build not started
+**Status:** BUILT 2026-08-05 (branch `fix/textract-profile-bound-bucket`, four
+slice commits per §5; custody NFR verified by
+`test_profiled_textract_runtime_uses_private_binding_only_for_aws_calls`).
+Step-2/step-4 sequencing deviation: `bucket_field` left the web projection
+with the Step-2 resolver rewrite rather than in Step 4, because the new
+resolver's lowering injects the profile bucket and a still-authorable
+`bucket_field` would have guaranteed an engine mutual-exclusion conflict in
+the interim state. Live acceptance rides the round-3 redeploy (operator: new
+`ELSPETH_WEB__AWS_TEXTRACT_PROFILES` grant + session-store wipe at epoch 45).
 
 All file:line references were verified against `b06fcd5b1`; the panel read at
 `9ef9c894c` and `git diff --stat` confirms none of the cited files changed
