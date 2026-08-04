@@ -103,6 +103,14 @@ GuidedOperationFailureCode = Literal[
     "provider_unavailable",
     "provider_timeout",
     "invalid_provider_response",
+    # The planner ran out of repair budget (or short-circuited a blind repeat)
+    # without converging on a valid pipeline (elspeth-5904b1683a). Transient —
+    # the first candidate is model-stochastic, so a retry can win. Distinct
+    # from ``invalid_provider_response`` because the provider answered every
+    # turn; it was the planner loop that could not satisfy validation, and
+    # presenting that as a provider fault (502) blamed the wrong actor and
+    # hid a diagnosable planning failure.
+    "planner_repair_exhausted",
     # Permanent refusal from a deployment security policy (e.g. a source plugin
     # prohibited on the web authoring surface). Distinct from
     # ``invalid_provider_response`` precisely because there is nothing to retry:

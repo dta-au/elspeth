@@ -105,6 +105,11 @@ type ComposerProgressReason = Literal[
     # Runtime preflight failure (cached path-1 or post-compose path-2 —
     # users cannot act on the path distinction, so a single code).
     "runtime_preflight_failed",
+    # Planner repair exhaustion (elspeth-5904b1683a): the provider answered
+    # every turn but the planner loop never converged on a valid pipeline.
+    # Planner-owned, retryable — kept distinct from the provider_* family so
+    # the failed progress event stops blaming the provider.
+    "planner_repair_exhausted",
     # Generic ComposerServiceError — prompt prep / availability / catch-all.
     "service_setup_failed",
     # Client closed the HTTP connection or operator cancelled the request

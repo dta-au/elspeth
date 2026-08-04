@@ -1124,12 +1124,13 @@ class TestStep2IntraStep:
         else:
             # Every zero-transform candidate is refused while the gap stands,
             # so the planner burns its budget and the request terminates. The
-            # 502 is the planner loop's exhaustion SURFACE, not the contract
+            # 500 is the planner loop's exhaustion SURFACE
+            # (planner_repair_exhausted, elspeth-5904b1683a), not the contract
             # under test; what is pinned is that the operator is handed the
             # missing field names instead of a bare retry instruction.
-            assert settled.status_code == 502, settled.json()
+            assert settled.status_code == 500, settled.json()
             failure_detail = settled.json()["detail"]
-            assert failure_detail["failure_code"] == "invalid_provider_response"
+            assert failure_detail["failure_code"] == "planner_repair_exhausted"
             assert failure_detail["unproducible_output_fields"] == ["amount_aud", "client"]
             assert "amount_aud" in failure_detail["detail"] and "client" in failure_detail["detail"]
             replayed = _post_current_response(
@@ -1138,7 +1139,7 @@ class TestStep2IntraStep:
                 operation_id=operation_id,
                 component_action={"action": "finish", "component_kind": "output"},
             )
-            assert replayed.status_code == 502, replayed.json()
+            assert replayed.status_code == 500, replayed.json()
             assert replayed.json() == settled.json()
             # The guided surface records its planner disposition as a
             # structured log rather than a durable audit row
@@ -3224,10 +3225,11 @@ class TestStep2IntraStep:
         assert detail["code"] == "operation_in_progress"
         assert elapsed < 3, f"competing respond took {elapsed:.1f}s; must answer well under the planner runtime"
         # The in-flight owner is unaffected: it settles through its own path
-        # (coded planner-failure envelope from the stubbed exhaustion).
-        assert owner.status_code == 502, owner.text
+        # (coded planner-failure envelope from the stubbed exhaustion —
+        # planner_repair_exhausted 500, elspeth-5904b1683a).
+        assert owner.status_code == 500, owner.text
 
-    def test_prose_revision_planner_exhaustion_is_coded_502_not_500(
+    def test_prose_revision_planner_exhaustion_is_coded_not_generic(
         self,
         composer_test_client: TestClient,
         monkeypatch: pytest.MonkeyPatch,
@@ -3238,9 +3240,11 @@ class TestStep2IntraStep:
         on the step-3 replan fell through post_guided_respond's failure-code
         selection to 'operation_failed' — the generic 500 banner — while the
         sibling /guided/plan route already maps PipelinePlannerError through
-        _guided_full_failure_code to 'invalid_provider_response' (502, with a
-        retry instruction). The respond route must answer the same closed
-        shape for the same failure class.
+        _guided_full_failure_code. The respond route must answer the same
+        closed shape for the same failure class: since elspeth-5904b1683a
+        that shape is ``planner_repair_exhausted`` (HTTP 500, retry offered),
+        distinguished from the generic banner by its closed failure_code and
+        actionable copy, not by the status number.
         """
         from elspeth.web.composer.pipeline_planner import PipelinePlannerError
 
@@ -3273,10 +3277,10 @@ class TestStep2IntraStep:
             },
         )
 
-        assert response.status_code == 502, response.text
+        assert response.status_code == 500, response.text
         detail = response.json()["detail"]
         assert detail["error_type"] == "guided_operation_terminal_failure"
-        assert detail["failure_code"] == "invalid_provider_response"
+        assert detail["failure_code"] == "planner_repair_exhausted"
         assert "retry" in detail["detail"].lower()  # actionable, no planner internals
 
     def test_policy_refusal_answers_422_policy_blocked_not_a_provider_fault(

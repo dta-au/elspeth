@@ -204,7 +204,14 @@ from elspeth.core.schema_identity import create_schema_identity_table
 #        constraint in place, so pre-release policy remains delete-and-
 #        recreate for stale session databases (sessions.db only — auth.db is
 #        never touched).
-SESSION_SCHEMA_EPOCH = 43
+#   44 -> ``guided_operations.failure_code`` closed enum gains
+#        ``planner_repair_exhausted`` so planner repair exhaustion settles
+#        under its own honest classification instead of the provider-blaming
+#        ``invalid_provider_response`` (elspeth-5904b1683a). SQLite cannot
+#        ALTER a CHECK constraint in place, so pre-release policy remains
+#        delete-and-recreate for stale session databases (sessions.db only —
+#        auth.db is never touched).
+SESSION_SCHEMA_EPOCH = 44
 
 _SQLITE_ASCII_WHITESPACE = "char(9) || char(10) || char(11) || char(12) || char(13) || char(32)"
 _POSTGRESQL_ASCII_WHITESPACE = "chr(9) || chr(10) || chr(11) || chr(12) || chr(13) || chr(32)"
@@ -816,7 +823,7 @@ guided_operations_table = Table(
     ),
     CheckConstraint(
         "failure_code IS NULL OR failure_code IN ('provider_unavailable', 'provider_timeout', "
-        "'invalid_provider_response', 'policy_blocked', 'stale_conflict', 'integrity_error', 'custody_error', "
+        "'invalid_provider_response', 'planner_repair_exhausted', 'policy_blocked', 'stale_conflict', 'integrity_error', 'custody_error', "
         "'quota_exceeded', 'operation_failed', 'request_cancelled')",
         name="ck_guided_operations_failure_code",
     ),

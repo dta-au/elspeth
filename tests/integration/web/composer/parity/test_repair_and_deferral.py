@@ -12,9 +12,10 @@ cannot express as a committed graph:
   same committed graph the reference derives, carrying ``repair_count == 1``.
 * **repair exhaustion** — every terminal proposal stays malformed; the planner
   exhausts its repair budget (2) and raises ``REPAIR_EXHAUSTED``, which the
-  freeform ``/messages`` route (Task 0) translates into a deliberate ``502`` and
-  one durable, redacted ``planner_failure_disposition`` audit row — NOT a guided
-  lease terminalization.
+  freeform ``/messages`` route (Task 0) translates into the deliberate coded
+  ``planner_repair_exhausted`` 500 (elspeth-5904b1683a) and one durable,
+  redacted ``planner_failure_disposition`` audit row — NOT a guided lease
+  terminalization.
 * **policy rejection** — a first terminal names a policy-denied plugin
   (installed but absent from this operator's allowlist); candidate validation
   rejects it and the planner is handed the *allowlisted structured* candidate
@@ -275,7 +276,7 @@ async def test_freeform_one_repair_converges_to_reference_graph(parity_env: Pari
 
 @pytest.mark.asyncio
 async def test_freeform_repair_exhaustion_is_translated_to_a_safe_disposition(parity_env: ParityEnv) -> None:
-    """Every terminal malformed: REPAIR_EXHAUSTED → 502 + one closed disposition row."""
+    """Every terminal malformed: REPAIR_EXHAUSTED → planner_repair_exhausted 500 + one closed disposition row."""
     async with parity_env._client() as client:
         created = await client.post("/api/sessions", json={"title": "freeform repair exhaustion"})
         assert created.status_code == 201, created.text
@@ -290,20 +291,20 @@ async def test_freeform_repair_exhaustion_is_translated_to_a_safe_disposition(pa
         parity_env.monkeypatch.setattr("elspeth.web.composer.service._litellm_acompletion", completion)
         response = await client.post(f"/api/sessions/{session_id}/messages", json={"content": _LINEAR["intent"]})
 
-    assert response.status_code == 502, response.text
+    assert response.status_code == 500, response.text
     detail = response.json()["detail"]
     assert detail["error_type"] == "composer_planner_failure"
-    assert detail["failure_code"] == "invalid_provider_response"
+    assert detail["failure_code"] == "planner_repair_exhausted"
     assert len(completion.requests) == 4, "repair_budget + 1 primary calls, then the spent escape-hatch turn"
     assert completion.requests[3]["model"] != completion.requests[0]["model"], "overtime turn runs on the advisor model"
 
     rows = _disposition_rows(parity_env.app.state.session_engine)
     assert len(rows) == 1, "exactly one durable closed failure-disposition audit row"
     envelope = rows[0].tool_calls[0]
-    assert envelope["failure_code"] == "invalid_provider_response"
+    assert envelope["failure_code"] == "planner_repair_exhausted"
     assert envelope["surface"] == "freeform"
     # The disposition names the wall: the last rejection's closed validation
-    # codes, so a live 502 is diagnosable from the DB alone.
+    # codes, so a live exhaustion 500 is diagnosable from the DB alone.
     assert envelope["rejection_codes"], "exhaustion disposition must carry the last rejection codes"
 
 

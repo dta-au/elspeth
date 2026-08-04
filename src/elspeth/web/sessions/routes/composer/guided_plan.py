@@ -109,6 +109,17 @@ def _guided_full_complete_progress_event(*, declined: bool = False) -> ComposerP
 
 
 def _guided_full_failed_progress_event(failure_code: GuidedOperationFailureCode) -> ComposerProgressEvent:
+    if failure_code == "planner_repair_exhausted":
+        # Planner-owned non-convergence (elspeth-5904b1683a): honest about WHO
+        # failed (the planner loop, not the provider) and honest that a retry
+        # can win — the first candidate is model-stochastic.
+        return ComposerProgressEvent(
+            phase="failed",
+            headline="The guided planner could not produce a valid pipeline within its repair budget.",
+            evidence=("The guided operation was settled with a safe failure classification.",),
+            likely_next="Retry the request, or revise it if repeated attempts exhaust the planner again.",
+            reason="planner_repair_exhausted",
+        )
     provider_failure = failure_code in {
         "invalid_provider_response",
         "provider_timeout",
@@ -211,6 +222,14 @@ def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
             return "provider_timeout"
         if exc.code == "PROVIDER_ERROR":
             return "provider_unavailable"
+        if exc.code == "REPAIR_EXHAUSTED":
+            # Honest exhaustion envelope (elspeth-5904b1683a): the provider
+            # answered every repair turn — it was the planner loop that could
+            # not converge on a valid candidate. Presenting that as
+            # ``invalid_provider_response`` (502, "the provider returned an
+            # invalid response") blamed the wrong actor and hid a diagnosable
+            # planning failure behind a retry instruction.
+            return "planner_repair_exhausted"
         if exc.code in {
             "COMPLETION_TOKENS_EXCEEDED",
             "COMPOSITION_EXHAUSTED",
@@ -220,7 +239,6 @@ def _guided_full_failure_code(exc: BaseException) -> GuidedOperationFailureCode:
             "DISCOVERY_ONLY",
             "MALFORMED_RESPONSE",
             "PROVIDER_CALLS_EXHAUSTED",
-            "REPAIR_EXHAUSTED",
             "RESPONSE_TRUNCATED",
             "TOOL_CALLS_EXHAUSTED",
             "VALIDATION_FAILED",

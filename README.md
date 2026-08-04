@@ -180,7 +180,7 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   ECS; provider and tool data remain bounded and redacted.
 
 **Operational:** 0.7.2 is a pre-1.0 database cutover. The session store moves
-from epoch 35 to 43; guided schema remains at 10, and Landscape moves from epoch
+from epoch 35 to 44; guided schema remains at 10, and Landscape moves from epoch
 29 to 30. Session epoch 40 makes the required coalesce timeout field an eager
 startup cutover instead of allowing epoch-39 guided payloads to fail during
 replay, and session epoch 41 does the same for the projected node option

@@ -2019,7 +2019,6 @@ _FREEFORM_PLANNER_INVALID_PROVIDER_CODES: Final[frozenset[str]] = frozenset(
         "DISCOVERY_ONLY",
         "MALFORMED_RESPONSE",
         "PROVIDER_CALLS_EXHAUSTED",
-        "REPAIR_EXHAUSTED",
         "RESPONSE_TRUNCATED",
         "TOOL_CALLS_EXHAUSTED",
         "VALIDATION_FAILED",
@@ -2051,6 +2050,15 @@ _FREEFORM_PLANNER_FAILURE_HTTP: Final[dict[str, tuple[int, str]]] = {
     "provider_timeout": (504, "The composer model timed out before producing a pipeline. Retry the request."),
     "provider_unavailable": (503, "The composer model is unavailable. Retry the request."),
     "invalid_provider_response": (502, "The composer model returned an unusable pipeline plan. Retry the request."),
+    # Planner-owned non-convergence (elspeth-5904b1683a): the model answered
+    # every repair turn; the planner loop could not produce a candidate that
+    # passed validation. 500 (our loop, not a gateway fault) with an honest
+    # retry offer — the first candidate is model-stochastic. Kept in lockstep
+    # with the guided ``_SAFE_FAILURES["planner_repair_exhausted"]`` copy.
+    "planner_repair_exhausted": (
+        500,
+        "The composer could not produce a valid pipeline within its repair budget. Retry the request, or revise it if this recurs.",
+    ),
     # Same status and same message shape as the guided
     # ``_SAFE_FAILURES["policy_blocked"]`` copy — a policy refusal is a
     # property of the deployment and the pipeline, not of the authoring
@@ -2092,6 +2100,11 @@ def _freeform_planner_failure_code(exc: PipelinePlannerError) -> str:
         return "provider_timeout"
     if exc.code == "PROVIDER_ERROR":
         return "provider_unavailable"
+    if exc.code == "REPAIR_EXHAUSTED":
+        # Honest exhaustion envelope (elspeth-5904b1683a) — byte-parity with
+        # the guided branch: the provider answered every repair turn; the
+        # planner loop is the actor that could not converge.
+        return "planner_repair_exhausted"
     if exc.code in _FREEFORM_PLANNER_INVALID_PROVIDER_CODES:
         return "invalid_provider_response"
     return "operation_failed"

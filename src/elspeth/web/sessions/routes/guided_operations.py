@@ -85,6 +85,16 @@ _SAFE_FAILURES: dict[str, tuple[int, str]] = {
     # client already mints a fresh operation id on every re-click, so naming the
     # id taught the reader an internal protocol detail they cannot act on.
     "invalid_provider_response": (502, "The provider returned an invalid response. Retry the request."),
+    # Planner-owned non-convergence (elspeth-5904b1683a): the provider
+    # answered every repair turn — presenting exhaustion as the 502 above
+    # blamed the wrong actor. 500 (our planning loop, not a gateway fault)
+    # with an honest retry offer, since the first candidate is
+    # model-stochastic. Kept in lockstep with the freeform mirror
+    # (``routes/_helpers.py::_FREEFORM_PLANNER_FAILURE_HTTP``).
+    "planner_repair_exhausted": (
+        500,
+        "The composer could not produce a valid pipeline within its repair budget. Retry the request, or revise it if this recurs.",
+    ),
     # PERMANENT by construction — a deployment policy refused this pipeline, so
     # the copy must not offer a retry and must not blame the provider. Kept in
     # lockstep with the freeform mirror

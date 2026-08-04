@@ -39,7 +39,9 @@ from elspeth.web.composer.guided.planning import guided_redacted_current_state_c
 from elspeth.web.composer.guided.prompts import load_step_planner_skill
 from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.pipeline_planner import (
+    _FINALIZER_OWNS_NOTHING,
     _REPEAT_NOTICE,
+    _REPEAT_NOTICE_WITHHELD,
     PLANNER_DISCOVERY_TOOL_NAMES,
     PipelineCandidatePolicyRejection,
     PipelinePlannerError,
@@ -52,7 +54,9 @@ from elspeth.web.composer.pipeline_planner import (
     PlannerPriorUserRequest,
     PlannerRequestLifecycle,
     _allowlisted_candidate_feedback,
+    _derive_finalizer_owned_refs,
     _feedback_error_codes,
+    _FinalizerOwnedRefs,
     _parse_response_tool_calls,
     _ParsedToolCall,
     _serialize_provider_discovery_result,
@@ -75,12 +79,16 @@ from elspeth.web.composer.state import (
     NodeSpec,
     OutputSpec,
     PipelineMetadata,
+    RowUnionBranchSchemaDetail,
+    RowUnionFieldSchemaDetail,
+    RowUnionSchemaDetail,
+    SchemaContractDetail,
     SourceSpec,
     ValidationEntry,
     ValidationSummary,
 )
 from elspeth.web.composer.tools._common import ToolContext, ToolResult
-from elspeth.web.composer.tools.generation import explain_validation_code
+from elspeth.web.composer.tools.generation import explain_validation_code, explain_withheld_validation_code
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.sessions import canonicalize_authored_node_review_requirements
 from elspeth.web.config import WebSettings
@@ -2888,6 +2896,363 @@ def test_coalesce_feedback_rejects_missing_internal_reachability_fact(monkeypatc
                 ),
             )
         )
+
+
+def test_derive_finalizer_owned_refs_splits_config_from_routing_ownership(tmp_path: Path) -> None:
+    """Ownership is diff-derived per change kind (elspeth-5904b1683a).
+
+    Routing-only rewires (the auto-wire splice pattern) must NOT claim the
+    component's configuration — that is exactly the candidate-global
+    over-withholding that made guided repair blind — while introduced
+    components and non-routing content changes must.
+    """
+    candidate = _pipeline(tmp_path)
+    candidate["nodes"] = [
+        {
+            "id": "clean_rows",
+            "node_type": "transform",
+            "plugin": "field_mapper",
+            "input": "rows",
+            "on_success": "cleaned",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}, "mapping": {"name": "name"}},
+        }
+    ]
+
+    finalized = deepcopy(candidate)
+    # Auto-wire shape: retarget routing only, insert a control node.
+    finalized["source"]["on_success"] = "ctrl_in"
+    finalized["nodes"].insert(
+        0,
+        {
+            "id": "ctrl",
+            "node_type": "transform",
+            "plugin": "field_mapper",
+            "input": "ctrl_in",
+            "on_success": "rows",
+            "on_error": "discard",
+            "options": {"schema": {"mode": "observed"}, "mapping": {"name": "name"}},
+        },
+    )
+    # Binder shape: replace the output's options wholesale.
+    finalized["outputs"][0]["options"] = {**finalized["outputs"][0]["options"], "path": "reviewed/private.jsonl"}
+
+    owned = _derive_finalizer_owned_refs(candidate, finalized)
+    assert owned.config == frozenset({"node:ctrl", "output:rows"})
+    assert owned.routing == frozenset({"source"})
+    # Identity is the no-op contract: nothing owned.
+    assert _derive_finalizer_owned_refs(candidate, candidate) == _FINALIZER_OWNS_NOTHING
+    # An equal-content copy (non-identity) owns nothing either.
+    assert _derive_finalizer_owned_refs(candidate, deepcopy(candidate)) == _FINALIZER_OWNS_NOTHING
+
+
+def test_allowlisted_candidate_feedback_scopes_withholding_per_entry() -> None:
+    """Entry-scoped custody (elspeth-5904b1683a): the disagreement projection.
+
+    One rejection carrying a finalizer-owned entry, a model-authored entry,
+    and a routing-owned entry must withhold each according to its OWN
+    ownership: masking everything (the regressed candidate-global predicate)
+    left the model blind to its own repairable mistake; masking nothing leaks
+    reviewed private values.
+    """
+    summary = ValidationSummary(
+        is_valid=False,
+        errors=(
+            ValidationEntry(
+                component="output:rows",
+                message="Output 'rows': option path REVIEWED-PRIVATE-PATH-CANARY is invalid",
+                severity="error",
+                error_code="plugin_options_invalid",
+            ),
+            ValidationEntry(
+                component="node:clean_rows",
+                message="Node 'clean_rows': unknown option bogus_toggle",
+                severity="error",
+                error_code="plugin_options_invalid",
+            ),
+            ValidationEntry(
+                component="source",
+                message="Source on_success 'PRIVATE-ROUTING-CANARY' is neither a sink nor a known connection",
+                severity="error",
+                error_code="source_on_success_dangling",
+            ),
+        ),
+    )
+    owned = _FinalizerOwnedRefs(config=frozenset({"output:rows"}), routing=frozenset({"source"}))
+
+    feedback = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        repeated_fingerprint=True,
+        finalizer_owned=owned,
+    )
+
+    withheld_entry, model_entry, routing_entry = feedback["validation"]["errors"]
+    # Finalizer-owned output: masked, stripped, honestly blind.
+    assert withheld_entry["component"] == "pipeline"
+    assert "detail" not in withheld_entry
+    assert withheld_entry["explanation"] == explain_withheld_validation_code("plugin_options_invalid")[0]
+    # Model-authored node: true component id, validator detail, ordinary guidance.
+    assert model_entry["component"] == "node:clean_rows"
+    assert model_entry["detail"] == "Node 'clean_rows': unknown option bogus_toggle"
+    assert model_entry["explanation"] == explain_validation_code("plugin_options_invalid")[0]
+    # Routing-owned source: true component id kept, but the connectivity
+    # projection — the only one that quotes routing values — is suppressed.
+    assert routing_entry["component"] == "source"
+    assert "connectivity" not in routing_entry
+    # The repeat notice is the honest withheld variant, and no private value
+    # crosses the boundary.
+    assert feedback["repeat_notice"] == _REPEAT_NOTICE_WITHHELD
+    serialized = canonical_json(feedback)
+    assert "REVIEWED-PRIVATE-PATH-CANARY" not in serialized
+    assert "PRIVATE-ROUTING-CANARY" not in serialized
+
+    # The same rejection with no finalizer ownership discloses everything.
+    open_feedback = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=summary, updated_state=_dangling_destination_state())),
+        repeated_fingerprint=True,
+    )
+    assert [entry["component"] for entry in open_feedback["validation"]["errors"]] == [
+        "output:rows",
+        "node:clean_rows",
+        "source",
+    ]
+    assert open_feedback["repeat_notice"] == _REPEAT_NOTICE
+
+
+def test_allowlisted_candidate_feedback_withholds_cross_component_fact_payloads() -> None:
+    """Fact payloads deriving from a config-owned component are suppressed
+    even on a disclosed model-authored entry (elspeth-5904b1683a review
+    finding): contract ``extra_fields`` are computed from the PRODUCER's live
+    guarantees, and row_union branch declarations from unattributed upstream
+    connections — entry-own attribution alone would leak a bound private
+    source's real field names through the consumer's entry.
+    """
+    contract_entry = ValidationEntry(
+        component="node:consumer",
+        message="Schema contract violation: 'source' -> 'consumer'.",
+        severity="high",
+        error_code="schema_contract_violation",
+        contract=SchemaContractDetail(
+            producer="source",
+            consumer="consumer",
+            extra_fields=("PRIVATE-BOUND-COLUMN",),
+        ),
+    )
+    row_union_entry = ValidationEntry(
+        component="node:union",
+        message="row_union 'union' has incompatible branch schemas",
+        severity="high",
+        error_code="row_union_schema_incompatible",
+        row_union_schema=RowUnionSchemaDetail(
+            branches=(
+                RowUnionBranchSchemaDetail(
+                    branch="a",
+                    mode="fixed",
+                    fields=(RowUnionFieldSchemaDetail(name="PRIVATE-UPSTREAM-FIELD", field_type="str", required=True, nullable=False),),
+                ),
+            ),
+            conflicting_fields=("PRIVATE-UPSTREAM-FIELD",),
+        ),
+    )
+    summary = ValidationSummary(is_valid=False, errors=(contract_entry, row_union_entry))
+    owned = _FinalizerOwnedRefs(config=frozenset({"source"}))
+
+    feedback = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        finalizer_owned=owned,
+    )
+    contract_projected, union_projected = feedback["validation"]["errors"]
+    # Entries stay attributed to their model-authored components...
+    assert contract_projected["component"] == "node:consumer"
+    assert union_projected["component"] == "node:union"
+    # ...but the cross-component fact payloads are suppressed.
+    assert "contract" not in contract_projected
+    assert "row_union_schema" not in union_projected
+    serialized = canonical_json(feedback)
+    assert "PRIVATE-BOUND-COLUMN" not in serialized
+    assert "PRIVATE-UPSTREAM-FIELD" not in serialized
+
+    # The same rejection with no finalizer ownership discloses both payloads.
+    open_feedback = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+    )
+    assert open_feedback["validation"]["errors"][0]["contract"]["extra_fields"] == ["PRIVATE-BOUND-COLUMN"]
+    assert open_feedback["validation"]["errors"][1]["row_union_schema"]["conflicting_fields"] == ["PRIVATE-UPSTREAM-FIELD"]
+
+    # A node-producer contract uses BARE node ids: normalization must match
+    # ownership refs in both directions.
+    node_contract = ValidationEntry(
+        component="node:consumer",
+        message="Schema contract violation: 'producer_node' -> 'consumer'.",
+        severity="high",
+        error_code="schema_contract_violation",
+        contract=SchemaContractDetail(producer="producer_node", consumer="consumer", missing_fields=("needed",)),
+    )
+    node_summary = ValidationSummary(is_valid=False, errors=(node_contract,))
+    kept = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=node_summary, updated_state=object())),
+        finalizer_owned=_FinalizerOwnedRefs(config=frozenset({"output:rows"})),
+    )
+    assert kept["validation"]["errors"][0]["contract"]["missing_fields"] == ["needed"]
+    suppressed = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=node_summary, updated_state=object())),
+        finalizer_owned=_FinalizerOwnedRefs(config=frozenset({"node:producer_node"})),
+    )
+    assert "contract" not in suppressed["validation"]["errors"][0]
+
+
+@pytest.mark.asyncio
+async def test_finalizer_mutation_keeps_model_authored_component_detail(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """The F14 disagreement regression (elspeth-5904b1683a).
+
+    The finalizer mutates a server-owned component's OPTIONS (the guided
+    binder pattern — here a VALID private replacement, since candidate
+    validation fails fast on the first bad component) while the model's own
+    node carries an invalid option. The repair feedback must keep the node's
+    true component id and validator detail — the regressed candidate-global
+    predicate withheld both because the binder always mutates the candidate,
+    so every guided repair turn was blind and exhaustion was deterministic.
+    With its own mistake visible, the model's second candidate converges, and
+    the private bound value never crosses into the transcript.
+    """
+    private_value = "PRIVATE-REVIEWED-OPTION-CANARY"
+
+    def finalize(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        finalized = deepcopy(dict(candidate))
+        # Reviewed-authority binding: a valid, private replacement value the
+        # provider context deliberately redacts (the guided binder pattern).
+        finalized["source"]["options"]["path"] = str(tmp_path / "blobs" / _TEST_SESSION_ID / f"{private_value}.csv")
+        return finalized
+
+    def _candidate_with_node(*, bogus: bool) -> dict[str, Any]:
+        candidate = _pipeline(tmp_path)
+        options: dict[str, Any] = {"schema": {"mode": "observed"}, "mapping": {"name": "name"}}
+        if bogus:
+            # Type-invalid value for a known option: reliably rejected as
+            # plugin_options_invalid attributed to this node.
+            options["mapping"] = True
+        candidate["nodes"] = [
+            {
+                "id": "clean_rows",
+                "node_type": "transform",
+                "plugin": "field_mapper",
+                "input": "rows",
+                "on_success": "cleaned",
+                "on_error": "discard",
+                "options": options,
+            }
+        ]
+        candidate["outputs"][0]["sink_name"] = "cleaned"
+        return candidate
+
+    completion = _ScriptedCompletion(
+        _response_with_call_id("f14-first", "emit_pipeline_proposal", {"pipeline": _candidate_with_node(bogus=True)}),
+        _response_with_call_id("f14-repaired", "emit_pipeline_proposal", {"pipeline": _candidate_with_node(bogus=False)}),
+    )
+
+    await _plan(
+        tmp_path=tmp_path,
+        tool_context=tool_context,
+        completion=completion,
+        repair_budget=1,
+        surface=PlannerSurface.GUIDED_STAGED,
+        candidate_finalizer=finalize,
+    )
+
+    assert len(completion.requests) == 2, "one rejection, one converging repair turn"
+    repair_messages = completion.requests[1]["messages"]
+    feedback = json.loads(repair_messages[-1]["content"])
+    entries = {entry["component"]: entry for entry in feedback["validation"]["errors"]}
+    # Pre-application rejections surface as ``rejected_mutation`` with the
+    # subject in the message prefix; the prefix parser attributes it to the
+    # model-authored node, so the entry keeps its true component and detail.
+    assert "rejected_mutation" in entries, feedback
+    node_entry = entries["rejected_mutation"]
+    assert node_entry["error_code"] == "plugin_options_invalid"
+    assert node_entry["detail"].startswith("Node 'clean_rows':")
+    assert "mapping" in node_entry["detail"]
+    # Nothing about this entry is withheld, so no blind-mode notice appears.
+    assert "repeat_notice" not in feedback
+    # The private server-bound value never crosses into the transcript.
+    assert private_value not in canonical_json(completion.requests[1])
+
+
+@pytest.mark.asyncio
+async def test_repeated_rejection_with_withheld_facts_short_circuits_budget(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Repeat-while-blind fails fast to the terminal path (elspeth-5904b1683a).
+
+    When the finalizer's own (server-bound) configuration is what fails
+    validation, no candidate the model emits can converge — burning the rest
+    of the repair budget on near-identical candidates is deterministic waste.
+    """
+
+    def finalize(candidate: Mapping[str, Any]) -> Mapping[str, Any]:
+        finalized = deepcopy(dict(candidate))
+        finalized["source"]["options"]["private_flag"] = True
+        return finalized
+
+    candidate = _pipeline(tmp_path)
+    completion = _ScriptedCompletion(
+        _response_with_call_id("blind-first", "emit_pipeline_proposal", {"pipeline": deepcopy(candidate)}),
+        _response_with_call_id("blind-repeat", "emit_pipeline_proposal", {"pipeline": deepcopy(candidate)}),
+    )
+
+    with pytest.raises(PipelinePlannerError) as excinfo:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            repair_budget=5,
+            surface=PlannerSurface.GUIDED_STAGED,
+            candidate_finalizer=finalize,
+        )
+
+    assert excinfo.value.code == "REPAIR_EXHAUSTED"
+    assert "short-circuited" in str(excinfo.value)
+    # Exactly two provider calls: the first rejection buys ONE blind repair
+    # turn; its identical rejection terminates instead of burning the
+    # remaining budget of 5.
+    assert len(completion.requests) == 2
+    first_feedback = json.loads(completion.requests[1]["messages"][-1]["content"])
+    assert [entry["component"] for entry in first_feedback["validation"]["errors"]] == ["pipeline"]
+    assert "detail" not in first_feedback["validation"]["errors"][0]
+
+
+@pytest.mark.asyncio
+async def test_repeated_rejection_with_full_disclosure_burns_budget_normally(
+    tmp_path: Path,
+    tool_context: ToolContext,
+) -> None:
+    """Budget semantics are unchanged when every entry carries its facts.
+
+    A model that re-emits its own fully-disclosed mistake keeps its whole
+    repair budget — the short-circuit is scoped to withheld facts only.
+    """
+    candidate = _pipeline(tmp_path)
+    candidate["source"]["options"]["bogus_toggle"] = True
+    completion = _ScriptedCompletion(
+        _response_with_call_id("open-first", "emit_pipeline_proposal", {"pipeline": deepcopy(candidate)}),
+        _response_with_call_id("open-second", "emit_pipeline_proposal", {"pipeline": deepcopy(candidate)}),
+        _response_with_call_id("open-third", "emit_pipeline_proposal", {"pipeline": deepcopy(candidate)}),
+    )
+
+    with pytest.raises(PipelinePlannerError) as excinfo:
+        await _plan(
+            tmp_path=tmp_path,
+            tool_context=tool_context,
+            completion=completion,
+            repair_budget=2,
+        )
+
+    assert excinfo.value.code == "REPAIR_EXHAUSTED"
+    assert "short-circuited" not in str(excinfo.value)
+    assert len(completion.requests) == 3, "repair_budget + 1 attempts despite the repeated fingerprint"
 
 
 def _dangling_destination_state() -> CompositionState:
