@@ -68,7 +68,7 @@ accept this trade-off.
 ## First-deploy operator action
 
 For 0.7.2, shareable-review state is part of the broader web session database
-contract. The release expects `SESSION_SCHEMA_EPOCH=43` and
+contract. The release expects `SESSION_SCHEMA_EPOCH=44` and
 `SQLITE_SCHEMA_EPOCH=30`. Session epoch 29 introduced durable guided
 operations, session epoch 30 added the closed `quota_exceeded` terminal failure
 code used for stable HTTP 413 fork replay, and later session epochs completed

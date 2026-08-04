@@ -79,6 +79,10 @@ from elspeth.web.composer.state import (
     NodeSpec,
     OutputSpec,
     PipelineMetadata,
+    RowUnionBranchSchemaDetail,
+    RowUnionFieldSchemaDetail,
+    RowUnionSchemaDetail,
+    SchemaContractDetail,
     SourceSpec,
     ValidationEntry,
     ValidationSummary,
@@ -3013,6 +3017,88 @@ def test_allowlisted_candidate_feedback_scopes_withholding_per_entry() -> None:
         "source",
     ]
     assert open_feedback["repeat_notice"] == _REPEAT_NOTICE
+
+
+def test_allowlisted_candidate_feedback_withholds_cross_component_fact_payloads() -> None:
+    """Fact payloads deriving from a config-owned component are suppressed
+    even on a disclosed model-authored entry (elspeth-5904b1683a review
+    finding): contract ``extra_fields`` are computed from the PRODUCER's live
+    guarantees, and row_union branch declarations from unattributed upstream
+    connections — entry-own attribution alone would leak a bound private
+    source's real field names through the consumer's entry.
+    """
+    contract_entry = ValidationEntry(
+        component="node:consumer",
+        message="Schema contract violation: 'source' -> 'consumer'.",
+        severity="high",
+        error_code="schema_contract_violation",
+        contract=SchemaContractDetail(
+            producer="source",
+            consumer="consumer",
+            extra_fields=("PRIVATE-BOUND-COLUMN",),
+        ),
+    )
+    row_union_entry = ValidationEntry(
+        component="node:union",
+        message="row_union 'union' has incompatible branch schemas",
+        severity="high",
+        error_code="row_union_schema_incompatible",
+        row_union_schema=RowUnionSchemaDetail(
+            branches=(
+                RowUnionBranchSchemaDetail(
+                    branch="a",
+                    mode="fixed",
+                    fields=(RowUnionFieldSchemaDetail(name="PRIVATE-UPSTREAM-FIELD", field_type="str", required=True, nullable=False),),
+                ),
+            ),
+            conflicting_fields=("PRIVATE-UPSTREAM-FIELD",),
+        ),
+    )
+    summary = ValidationSummary(is_valid=False, errors=(contract_entry, row_union_entry))
+    owned = _FinalizerOwnedRefs(config=frozenset({"source"}))
+
+    feedback = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+        finalizer_owned=owned,
+    )
+    contract_projected, union_projected = feedback["validation"]["errors"]
+    # Entries stay attributed to their model-authored components...
+    assert contract_projected["component"] == "node:consumer"
+    assert union_projected["component"] == "node:union"
+    # ...but the cross-component fact payloads are suppressed.
+    assert "contract" not in contract_projected
+    assert "row_union_schema" not in union_projected
+    serialized = canonical_json(feedback)
+    assert "PRIVATE-BOUND-COLUMN" not in serialized
+    assert "PRIVATE-UPSTREAM-FIELD" not in serialized
+
+    # The same rejection with no finalizer ownership discloses both payloads.
+    open_feedback = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=summary, updated_state=object())),
+    )
+    assert open_feedback["validation"]["errors"][0]["contract"]["extra_fields"] == ["PRIVATE-BOUND-COLUMN"]
+    assert open_feedback["validation"]["errors"][1]["row_union_schema"]["conflicting_fields"] == ["PRIVATE-UPSTREAM-FIELD"]
+
+    # A node-producer contract uses BARE node ids: normalization must match
+    # ownership refs in both directions.
+    node_contract = ValidationEntry(
+        component="node:consumer",
+        message="Schema contract violation: 'producer_node' -> 'consumer'.",
+        severity="high",
+        error_code="schema_contract_violation",
+        contract=SchemaContractDetail(producer="producer_node", consumer="consumer", missing_fields=("needed",)),
+    )
+    node_summary = ValidationSummary(is_valid=False, errors=(node_contract,))
+    kept = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=node_summary, updated_state=object())),
+        finalizer_owned=_FinalizerOwnedRefs(config=frozenset({"output:rows"})),
+    )
+    assert kept["validation"]["errors"][0]["contract"]["missing_fields"] == ["needed"]
+    suppressed = _allowlisted_candidate_feedback(
+        cast(Any, SimpleNamespace(validation=node_summary, updated_state=object())),
+        finalizer_owned=_FinalizerOwnedRefs(config=frozenset({"node:producer_node"})),
+    )
+    assert "contract" not in suppressed["validation"]["errors"][0]
 
 
 @pytest.mark.asyncio

@@ -1402,14 +1402,47 @@ class _EntryWithholding:
     private values. ``connectivity`` strips only the connectivity facts — the
     component's options (and so its ``detail``) are still exactly what the
     model authored, but its routing destinations were finalizer-written.
-    ``withheld`` is the honesty signal: True when this entry was actually
-    projected with something suppressed, feeding the withheld repeat notice
-    and the repeat-while-blind short-circuit.
+    ``contract`` and ``row_union`` strip their structured facts when the fact
+    PAYLOAD derives from a config-owned component even though the entry
+    itself is attributed to a model-authored consumer — contract
+    ``extra_fields`` are computed from the PRODUCER's live guarantees, and
+    row_union branch declarations are read from upstream connections'
+    schemas, so entry-own attribution alone would leak a bound private
+    source's real field names. ``withheld`` is the honesty signal: True when
+    this entry was actually projected with something suppressed, feeding the
+    withheld repeat notice and the repeat-while-blind short-circuit.
     """
 
     config: bool
     connectivity: bool
+    contract: bool
+    row_union: bool
     withheld: bool
+
+
+_ENTRY_DISCLOSED: Final[_EntryWithholding] = _EntryWithholding(
+    config=False, connectivity=False, contract=False, row_union=False, withheld=False
+)
+
+
+def _contract_participant_refs(contract: Any) -> tuple[str, ...]:
+    """Validation-component refs of a contract fact's producer and consumer.
+
+    ``SchemaContractDetail`` carries producer/consumer in the producer-id
+    vocabulary: ``source`` / ``source:<name>`` for sources, ``output:<name>``
+    for sinks, and BARE node ids for nodes (see ``_producer_owner`` in
+    ``composer.state``) — normalize the bare form so the ownership check
+    compares like with like.
+    """
+    refs: list[str] = []
+    for participant in (contract.producer, contract.consumer):
+        if type(participant) is not str or not participant:
+            continue
+        if participant == "source" or participant.startswith(("source:", "output:", "node:")):
+            refs.append(participant)
+        else:
+            refs.append(f"node:{participant}")
+    return tuple(refs)
 
 
 def _entry_withholding(entry: Any, finalizer_owned: _FinalizerOwnedRefs) -> _EntryWithholding:
@@ -1418,18 +1451,32 @@ def _entry_withholding(entry: Any, finalizer_owned: _FinalizerOwnedRefs) -> _Ent
     Entry-scoped custody (elspeth-5904b1683a): withhold exactly the entries
     about components the candidate finalizer owns, per change kind (see
     :class:`_FinalizerOwnedRefs`). Entries whose subject cannot be attributed
-    fail closed while any server ownership exists. Entries on components the
-    model authored — untouched by the finalizer — disclose nothing the model
-    does not already hold.
+    fail closed while any server ownership exists, as do fact payloads whose
+    content derives from another component that is config-owned (contract
+    producer/consumer cross-refs) or cannot be attributed at all (row_union
+    branch schemas, which are read from upstream connections' declarations
+    the detail does not name — suppressed whenever any config ownership
+    exists). Entries on components the model authored — untouched by the
+    finalizer — disclose nothing the model does not already hold.
     """
     if not finalizer_owned.owns_anything():
-        return _EntryWithholding(config=False, connectivity=False, withheld=False)
+        return _ENTRY_DISCLOSED
     ref = _entry_component_ref(entry)
     config = ref is None or ref in finalizer_owned.config
     connectivity = config or ref in finalizer_owned.routing
+    contract = config or (
+        entry.contract is not None
+        and any(participant in finalizer_owned.config for participant in _contract_participant_refs(entry.contract))
+    )
+    row_union = config or (entry.row_union_schema is not None and bool(finalizer_owned.config))
     code = entry.error_code or "validation_error"
-    withheld = config or (connectivity and code in _CONNECTIVITY_FACT_CODES)
-    return _EntryWithholding(config=config, connectivity=connectivity, withheld=withheld)
+    withheld = (
+        config
+        or (connectivity and code in _CONNECTIVITY_FACT_CODES)
+        or (contract and entry.contract is not None)
+        or (row_union and entry.row_union_schema is not None)
+    )
+    return _EntryWithholding(config=config, connectivity=connectivity, contract=contract, row_union=row_union, withheld=withheld)
 
 
 def _rejection_facts_withheld(result: ToolResult, finalizer_owned: _FinalizerOwnedRefs) -> bool:
@@ -1545,7 +1592,7 @@ def _allowlisted_candidate_feedback(
             if reachability_facts is None:
                 reachability_facts = coalesce_reachability_facts(result.updated_state)
             projected["connectivity"] = reachability_facts[entry.component.removeprefix("node:")]
-        if entry.contract is not None and not withhold_candidate_facts:
+        if entry.contract is not None and not withholding.contract:
             # Structured contract facts: producer/consumer component ids and
             # schema FIELD NAMES from validated contract config — pipeline
             # metadata the session owner authored, never user row content
@@ -1553,15 +1600,25 @@ def _allowlisted_candidate_feedback(
             # schema-contract rejection is a bare code the planner cannot
             # repair within budget: it must know WHICH edge failed and WHICH
             # fields are missing. This stays inside the message-redaction
-            # boundary this allowlist protects.
+            # boundary this allowlist protects — but ONLY when neither
+            # participant is finalizer-config-owned: ``extra_fields`` are
+            # computed from the PRODUCER's live guarantees, so a contract
+            # entry attributed to a model-authored consumer can still carry a
+            # bound private source's real field names
+            # (``withholding.contract``, elspeth-5904b1683a review finding).
             projected["contract"] = entry.contract.to_dict()
-        if entry.row_union_schema is not None and not withhold_candidate_facts:
+        if entry.row_union_schema is not None and not withholding.row_union:
             # Structured row-union branch declarations: branch aliases,
             # schema modes, field names, and declared field properties from
             # the REJECTED candidate the planner authored. These are the
             # row-union equivalent of the safe contract facts above, never
             # runtime row content, and make the incompatibility repairable
-            # without exposing the free-form validation message.
+            # without exposing the free-form validation message. Branch
+            # schemas are read from upstream connections' declarations the
+            # detail does NOT name, so they cannot be attributed per
+            # participant — suppressed whenever any config ownership exists
+            # (``withholding.row_union``, elspeth-5904b1683a; precise branch
+            # attribution is tracked as follow-up work).
             projected["row_union_schema"] = entry.row_union_schema.to_dict()
         errors.append(projected)
     feedback: dict[str, Any] = {
