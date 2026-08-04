@@ -219,6 +219,7 @@ def lower_plugin_policy(
             authored_state=state,
             state=policy_result.executable_state,
             profiled_s3_audit_identities=policy_result.profiled_s3_audit_identities,
+            profiled_textract_audit_identities=policy_result.profiled_textract_audit_identities,
             operator_resolved_model_node_ids=operator_resolved_model_node_ids,
         ),
         checks=tuple(passed_checks),

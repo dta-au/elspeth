@@ -217,7 +217,10 @@ def validate_runtime_plugins(
     semantic_contracts = _semantic_contracts(loaded.materialized)
     try:
         bundle = instantiate_plugins(loaded.settings, plugin_snapshot=plugin_snapshot)
-        from elspeth.web.execution.preflight import bind_profiled_s3_source_audit_identities
+        from elspeth.web.execution.preflight import (
+            bind_profiled_s3_source_audit_identities,
+            bind_profiled_textract_audit_identities,
+        )
 
         bind_profiled_s3_source_audit_identities(
             bundle,
@@ -227,6 +230,15 @@ def validate_runtime_plugins(
             },
             plugin_snapshot=plugin_snapshot,
             profiled_s3_audit_identities=loaded.materialized.authored.policy.profiled_s3_audit_identities,
+        )
+        bind_profiled_textract_audit_identities(
+            bundle,
+            authored_options_by_node={
+                node.id: deep_thaw(strip_authoring_options(node.options))
+                for node in loaded.materialized.authored.policy.authored_state.nodes
+            },
+            plugin_snapshot=plugin_snapshot,
+            profiled_textract_audit_identities=loaded.materialized.authored.policy.profiled_textract_audit_identities,
         )
     except ValueSourceValidationError as exc:
         errors = tuple(

@@ -20,6 +20,243 @@ def test_profile_unavailable_finding_enumerates_available_aliases() -> None:
     assert "sonnet" not in unconfigured.message
 
 
+def _textract_policy_context() -> tuple[object, object, object]:
+    """Real registry + snapshot + catalog for one profiled Textract transform."""
+    from elspeth.web.config import WebSettings
+    from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+
+    settings = WebSettings.model_validate(
+        {
+            "composer_max_composition_turns": 4,
+            "composer_max_discovery_turns": 4,
+            "composer_timeout_seconds": 60,
+            "composer_rate_limit_per_minute": 20,
+            "shareable_link_signing_key": b"0123456789abcdef0123456789abcdef",
+            "plugin_allowlist": ["transform:aws_textract_document_analysis"],
+            "deployment_aws_region": "ap-southeast-1",
+            "aws_textract_profiles": [
+                {
+                    "alias": "acceptance-docs",
+                    "bucket": "operator-private-bucket-marker",
+                    "key_prefix": "org/acme",
+                }
+            ],
+        }
+    )
+    runtime_config = RuntimeWebPluginConfig.from_settings(settings)
+    catalog = create_catalog_service()
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime_config)
+    registry = OperatorProfileRegistry(policy=policy, settings=runtime_config)
+    plugin_id = PluginId("transform", "aws_textract_document_analysis")
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash=policy.policy_hash,
+        principal_scope="local:alice",
+        available=unrestricted.available,
+        unavailable=(),
+        selected=unrestricted.selected,
+        usable_profile_aliases=((plugin_id, ("acceptance-docs",)),),
+        selected_profile_aliases=((plugin_id, "acceptance-docs"),),
+        binding_generation_fingerprint="textract-profile-lowering-generation",
+    )
+    return registry, snapshot, catalog
+
+
+def _textract_node_state() -> object:
+    from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
+
+    node = NodeSpec(
+        id="textract_1",
+        node_type="transform",
+        plugin="aws_textract_document_analysis",
+        input="transform_in",
+        on_success="results",
+        on_error="discard",
+        options={
+            "profile": "acceptance-docs",
+            "key_field": "document_key",
+            "feature_types": ["FORMS"],
+            "text_field": "textract_text",
+            "schema": {"mode": "observed"},
+        },
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    return CompositionState(source=None, nodes=(node,), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+
+
+def test_validate_plugin_policy_lowers_profiled_textract_node_and_threads_identity() -> None:
+    from typing import cast
+
+    from elspeth.contracts.aws_textract import textract_profiled_binding_fingerprint
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.state import CompositionState
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+    from elspeth.web.plugin_policy.validation import validate_plugin_policy
+
+    registry, snapshot, catalog = _textract_policy_context()
+    state = _textract_node_state()
+
+    result = validate_plugin_policy(
+        cast(CompositionState, state),
+        snapshot=cast(PluginAvailabilitySnapshot, snapshot),
+        profile_registry=cast(OperatorProfileRegistry, registry),
+        catalog=cast(CatalogService, catalog),
+    )
+
+    assert result.findings == ()
+    executable_options = dict(result.executable_state.nodes[0].options)
+    assert executable_options["bucket"] == "operator-private-bucket-marker"
+    assert executable_options["key_prefix"] == "org/acme"
+    assert executable_options["region"] == "ap-southeast-1"
+    assert executable_options["auth_mode"] == "default_chain"
+    assert "profile" not in executable_options
+    assert dict(cast(CompositionState, state).nodes[0].options)["profile"] == "acceptance-docs"
+    assert "bucket" not in dict(cast(CompositionState, state).nodes[0].options)
+
+    assert len(result.profiled_textract_audit_identities) == 1
+    node_id, identity = result.profiled_textract_audit_identities[0]
+    assert node_id == "textract_1"
+    assert identity.profile_alias == "acceptance-docs"
+    assert identity.binding_fingerprint == textract_profiled_binding_fingerprint(
+        bucket="operator-private-bucket-marker",
+        region="ap-southeast-1",
+        key_prefix="org/acme",
+    )
+    assert result.profiled_s3_audit_identities == ()
+
+
+def test_validate_plugin_policy_rejects_s3_identity_from_a_non_s3_component(monkeypatch) -> None:
+    from typing import cast
+
+    import pytest as _pytest
+
+    from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentity
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.state import CompositionState
+    from elspeth.web.plugin_policy import profiles as profiles_module
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+    from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry
+    from elspeth.web.plugin_policy.validation import validate_plugin_policy
+
+    registry, snapshot, catalog = _textract_policy_context()
+    state = _textract_node_state()
+    impostor_identity = S3ProfiledAuditIdentity(
+        profile_alias="acceptance-docs",
+        relative_key="fabricated.csv",
+        binding_fingerprint="0" * 64,
+    )
+
+    def lower_with_wrong_kind(self: object, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
+        return LoweredPluginConfig(
+            executable_options={"bucket": "b", **safe_options},
+            audit_safe_options={"profile": alias, **safe_options},
+            profiled_s3_audit_identity=impostor_identity,
+        )
+
+    monkeypatch.setattr(profiles_module._TextractProfileResolver, "lower_options", lower_with_wrong_kind)
+
+    with _pytest.raises(TypeError, match="non-S3 source"):
+        validate_plugin_policy(
+            cast(CompositionState, state),
+            snapshot=cast(PluginAvailabilitySnapshot, snapshot),
+            profile_registry=cast(OperatorProfileRegistry, registry),
+            catalog=cast(CatalogService, catalog),
+        )
+
+
+def test_validate_plugin_policy_rejects_textract_identity_from_a_non_textract_component(monkeypatch) -> None:
+    from typing import cast
+
+    import pytest as _pytest
+
+    from elspeth.contracts.aws_textract import TextractProfiledAuditIdentity, textract_profiled_binding_fingerprint
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.state import CompositionState, PipelineMetadata, SourceSpec
+    from elspeth.web.config import WebSettings
+    from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.plugin_policy import profiles as profiles_module
+    from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot, PluginId
+    from elspeth.web.plugin_policy.profiles import LoweredPluginConfig, OperatorProfileRegistry, RuntimeWebPluginConfig
+    from elspeth.web.plugin_policy.validation import validate_plugin_policy
+
+    settings = WebSettings.model_validate(
+        {
+            "composer_max_composition_turns": 4,
+            "composer_max_discovery_turns": 4,
+            "composer_timeout_seconds": 60,
+            "composer_rate_limit_per_minute": 20,
+            "shareable_link_signing_key": b"0123456789abcdef0123456789abcdef",
+            "plugin_allowlist": ["source:aws_s3"],
+            "deployment_aws_region": "ap-southeast-1",
+            "aws_s3_source_profiles": [{"alias": "demo-input", "bucket": "operator-private-bucket-marker", "prefix": "incoming"}],
+        }
+    )
+    runtime_config = RuntimeWebPluginConfig.from_settings(settings)
+    catalog = create_catalog_service()
+    from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+    policy = compile_web_plugin_policy(registry=get_shared_plugin_manager(), settings=runtime_config)
+    registry = OperatorProfileRegistry(policy=policy, settings=runtime_config)
+    source_id = PluginId("source", "aws_s3")
+    unrestricted = PluginAvailabilitySnapshot.for_trained_operator(catalog)
+    snapshot = PluginAvailabilitySnapshot.create(
+        policy_hash=policy.policy_hash,
+        principal_scope="local:alice",
+        available=unrestricted.available,
+        unavailable=(),
+        selected=unrestricted.selected,
+        usable_profile_aliases=((source_id, ("demo-input",)),),
+        selected_profile_aliases=((source_id, "demo-input"),),
+        binding_generation_fingerprint="s3-profile-lowering-generation",
+    )
+    state = CompositionState(
+        source=SourceSpec(
+            plugin="aws_s3",
+            on_success="unused",
+            options={"profile": "demo-input", "key": "records/input.csv", "format": "csv", "schema": {"mode": "observed"}},
+            on_validation_failure="discard",
+        ),
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    impostor_identity = TextractProfiledAuditIdentity(
+        profile_alias="demo-input",
+        binding_fingerprint=textract_profiled_binding_fingerprint(bucket="b", region="ap-southeast-1", key_prefix=None),
+    )
+
+    def lower_with_wrong_kind(self: object, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
+        return LoweredPluginConfig(
+            executable_options={"bucket": "b", **safe_options},
+            audit_safe_options={"profile": alias, **safe_options},
+            profiled_textract_audit_identity=impostor_identity,
+        )
+
+    monkeypatch.setattr(profiles_module._S3SourceProfileResolver, "lower_options", lower_with_wrong_kind)
+
+    with _pytest.raises(TypeError, match="non-Textract"):
+        validate_plugin_policy(
+            state,
+            snapshot=cast(PluginAvailabilitySnapshot, snapshot),
+            profile_registry=cast(OperatorProfileRegistry, registry),
+            catalog=cast(CatalogService, catalog),
+        )
+
+
 def test_plugin_policy_returns_typed_finding_for_malformed_rehydrated_source() -> None:
     from typing import Any, cast
 

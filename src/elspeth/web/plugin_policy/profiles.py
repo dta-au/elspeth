@@ -25,6 +25,8 @@ from elspeth.contracts.aws_s3 import (
 from elspeth.contracts.aws_textract import (
     TEXTRACT_PRIVATE_BINDING_OPTION_NAMES,
     TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES,
+    TextractProfiledAuditIdentity,
+    textract_profiled_binding_fingerprint,
 )
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
@@ -183,6 +185,7 @@ class LoweredPluginConfig:
     executable_options: Mapping[str, object] = field(repr=False)
     audit_safe_options: Mapping[str, object]
     profiled_s3_audit_identity: S3ProfiledAuditIdentity | None = None
+    profiled_textract_audit_identity: TextractProfiledAuditIdentity | None = None
 
     def __post_init__(self) -> None:
         freeze_fields(self, "executable_options", "audit_safe_options")
@@ -902,6 +905,14 @@ class _TextractProfileResolver:
         return LoweredPluginConfig(
             executable_options=MappingProxyType(executable),
             audit_safe_options=MappingProxyType({"profile": alias, **safe_options}),
+            profiled_textract_audit_identity=TextractProfiledAuditIdentity(
+                profile_alias=alias,
+                binding_fingerprint=textract_profiled_binding_fingerprint(
+                    bucket=profile.bucket,
+                    region=self._region,
+                    key_prefix=profile.key_prefix,
+                ),
+            ),
         )
 
     def profile_availability(

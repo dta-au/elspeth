@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import math
 import re
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from types import MappingProxyType
-from typing import Any, ClassVar, Literal, Self
+from typing import Any, ClassVar, Literal, Self, cast
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -17,6 +18,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from elspeth.contracts import Determinism
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.aws_s3 import S3_MAX_KEY_BYTES, validate_relative_s3_path
+from elspeth.contracts.aws_textract import (
+    TEXTRACT_PRIVATE_BINDING_OPTION_NAMES,
+    TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES,
+    TextractProfiledAuditIdentity,
+    textract_profiled_binding_fingerprint,
+)
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
 from elspeth.contracts.contract_propagation import narrow_contract_to_output
 from elspeth.contracts.enums import AuditCharacteristic
@@ -364,7 +371,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3d53d57292ac07f4"
+    source_file_hash: str | None = "sha256:41d9f6f8223869ef"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -457,6 +464,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         )
         self._output_schema_config = self._build_output_schema_config(cfg.schema_config)
 
+        self._profiled_audit_identity: TextractProfiledAuditIdentity | None = None
         self._recorder: PluginAuditWriter | None = None
         self._run_id = ""
         self._node_id = ""
@@ -469,6 +477,50 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         self._row_clients_lock = threading.Lock()
         self._shutdown = threading.Event()
         self._batch_initialized = False
+
+    def _bind_profiled_audit_identity(
+        self,
+        identity: object,
+        *,
+        audit_safe_config: object,
+    ) -> None:
+        """Bind Web-only audit authority without adding a forgeable config field."""
+        if not isinstance(identity, TextractProfiledAuditIdentity):
+            raise TypeError("profiled Textract audit authority must be a TextractProfiledAuditIdentity")
+        if self._profiled_audit_identity is not None:
+            raise RuntimeError("profiled Textract audit authority is already bound")
+        if type(audit_safe_config) is not dict:
+            raise TypeError("profiled Textract audit-safe config must be an exact dict")
+        safe_config = cast(dict[str, object], audit_safe_config)
+        if set(safe_config) & TEXTRACT_PRIVATE_BINDING_OPTION_NAMES:
+            raise ValueError("profiled Textract audit-safe config contains a private binding field")
+        if set(safe_config) - TEXTRACT_PROFILED_AUDIT_SAFE_OPTION_NAMES:
+            raise ValueError("profiled Textract audit-safe config contains a private binding field")
+        if safe_config.get("profile") != identity.profile_alias:
+            raise ValueError("profiled Textract audit-safe config does not match its nominal identity")
+        if self._static_bucket is None:
+            raise ValueError("profiled Textract audit authority requires the static bucket document-location mode")
+        actual_binding_fingerprint = textract_profiled_binding_fingerprint(
+            bucket=self._static_bucket,
+            region=self._region,
+            key_prefix=self._key_prefix,
+        )
+        if not hmac.compare_digest(identity.binding_fingerprint, actual_binding_fingerprint):
+            raise ValueError("profiled Textract executable binding does not match its nominal identity")
+        self._profiled_audit_identity = identity
+        self.config = dict(safe_config)
+
+    def _audit_location_identity(self, executable_key: str | None) -> Mapping[str, str] | None:
+        identity = self._profiled_audit_identity
+        if identity is None:
+            return None
+        projected: dict[str, str] = {"profile": identity.profile_alias}
+        if executable_key is not None:
+            relative_key = executable_key
+            if self._key_prefix is not None:
+                relative_key = executable_key.removeprefix(f"{self._key_prefix}/")
+            projected["key"] = relative_key
+        return projected
 
     def on_start(self, ctx: LifecycleContext) -> None:
         super().on_start(ctx)
@@ -773,6 +825,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
                 feature_types=self._feature_types,
                 queries=self._query_requests,
                 client_request_token=request_token,
+                audit_identity=self._audit_location_identity(key),
             )
         except TextractIdempotencyInvariantError as error:
             raise FrameworkBugError("Amazon Textract idempotency invariant failed") from error
@@ -852,7 +905,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
             region=self._region,
             sdk_client=self._s3_sdk_client,
             token_id=token_id,
-        ).verify_bucket_region(bucket)
+        ).verify_bucket_region(bucket, audit_identity=self._audit_location_identity(None))
 
     def _poll_and_collect(
         self,

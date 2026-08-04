@@ -13,6 +13,7 @@ from elspeth.contracts.aws_s3 import (
     S3ProfiledAuditIdentity,
     s3_profiled_binding_fingerprint,
 )
+from elspeth.contracts.aws_textract import textract_profiled_binding_fingerprint
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.plugin_capabilities import WebConfigAuthority
 from elspeth.engine.orchestrator.preflight import check_config_value_sources
@@ -317,6 +318,15 @@ def test_textract_profile_lowering_injects_operator_binding() -> None:
     assert executable["auth_mode"] == "default_chain"
     assert "bucket_field" not in executable
     assert deep_thaw(lowered.audit_safe_options) == {"profile": "acceptance-docs", **safe_options}
+    identity = lowered.profiled_textract_audit_identity
+    assert identity is not None
+    assert identity.profile_alias == "acceptance-docs"
+    assert identity.binding_fingerprint == textract_profiled_binding_fingerprint(
+        bucket="operator-owned-docs",
+        region="ap-southeast-1",
+        key_prefix="org/acme",
+    )
+    assert lowered.profiled_s3_audit_identity is None
 
 
 def test_textract_profile_lowering_without_prefix_omits_key_prefix() -> None:

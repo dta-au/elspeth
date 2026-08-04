@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Never
 
 from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
+from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
 from elspeth.contracts.secrets import SecretScope
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import (
@@ -123,6 +124,7 @@ class PolicyLoweredState:
     authored_state: CompositionState
     state: CompositionState
     profiled_s3_audit_identities: S3ProfiledAuditIdentities
+    profiled_textract_audit_identities: TextractProfiledAuditIdentities
     operator_resolved_model_node_ids: frozenset[str]
 
 

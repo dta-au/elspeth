@@ -135,7 +135,13 @@ def _record_all_core_passes(ledger: ValidationLedger) -> None:
     [
         (
             PolicyLoweredState,
-            ("authored_state", "state", "profiled_s3_audit_identities", "operator_resolved_model_node_ids"),
+            (
+                "authored_state",
+                "state",
+                "profiled_s3_audit_identities",
+                "profiled_textract_audit_identities",
+                "operator_resolved_model_node_ids",
+            ),
         ),
         (SecretValidatedState, ("policy", "all_secret_refs", "env_ref_names")),
         (AuthoredValidatedState, ("policy", "all_secret_refs", "env_ref_names", "semantic_contracts")),

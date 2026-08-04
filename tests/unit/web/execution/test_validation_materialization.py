@@ -109,6 +109,7 @@ def _interpretation(
             authored_state=policy_state,
             state=policy_state,
             profiled_s3_audit_identities=(),
+            profiled_textract_audit_identities=(),
             operator_resolved_model_node_ids=frozenset(),
         ),
         all_secret_refs=(),
