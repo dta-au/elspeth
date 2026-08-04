@@ -1759,20 +1759,54 @@ async def run_tool_batch(
         # ``_SESSION_AWARE_TOOL_HANDLERS`` and the per-tool
         # kwarg-build dict below; no new dispatch branch is needed.
         if is_session_aware_tool(tool_name):
-            session_aware_outcome = await ctx.service._dispatch_session_aware_tool(
-                tool_name=tool_name,
-                tool_call_id=tool_call.id,
-                arguments=arguments,
-                state=state,
-                audit=audit,
-                recorder=recorder,
-                session_id=session_id,
-                current_state_id=current_state_id,
-                response=response,
-                llm_messages=llm_messages,
-                anti_anchor=anti_anchor,
-                policy_catalog=ctx.policy_catalog,
-            )
+            try:
+                session_aware_outcome = await ctx.service._dispatch_session_aware_tool(
+                    tool_name=tool_name,
+                    tool_call_id=tool_call.id,
+                    arguments=arguments,
+                    state=state,
+                    audit=audit,
+                    recorder=recorder,
+                    session_id=session_id,
+                    current_state_id=current_state_id,
+                    response=response,
+                    llm_messages=llm_messages,
+                    anti_anchor=anti_anchor,
+                    policy_catalog=ctx.policy_catalog,
+                )
+            except (AssertionError, MemoryError, RecursionError, SystemError):
+                # Same narrow-class discipline as the sync execute_tool
+                # handler below: interpreter/Tier-1 invariant states must
+                # unwind, never be laundered into a recoverable envelope.
+                raise
+            except AuditIntegrityError:
+                # Tier-1 audit invariant — same passthrough as the sync path.
+                raise
+            except Exception as tool_exc:
+                # elspeth-9c01c943a5: the session-aware dispatch converts
+                # ToolArgumentError internally, so any exception reaching
+                # here is a plugin/service bug. Without this capture it
+                # escaped run_tool_batch and surfaced as an uncoded 500
+                # with the accumulated turn state silently dropped. Route
+                # it through the same plugin-crash carrier as the sync
+                # path so the turn persists and the route layer answers
+                # with the coded envelope.
+                recorder.record(finish_plugin_crash(audit, exc=tool_exc))
+                _append_tool_outcome(
+                    response=None,
+                    error_class=type(tool_exc).__name__,
+                    error_message=type(tool_exc).__name__,
+                    post_version=state.version,
+                )
+                plugin_crash = ComposerPluginCrashError.capture(
+                    tool_exc,
+                    state=state,
+                    initial_version=initial_version,
+                    tool_invocations=recorder.invocations,
+                    llm_calls=recorder.llm_calls,
+                )
+                plugin_crash_cause = tool_exc
+                break
             all_cache_hits = False
             _append_tool_outcome(
                 response=session_aware_outcome.result,

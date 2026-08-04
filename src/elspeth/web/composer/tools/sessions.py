@@ -132,7 +132,7 @@ from elspeth.web.plugin_policy.models import PluginId, PluginUnavailableReason
 from elspeth.web.provider_config_policy import (
     web_aws_s3_endpoint_url_policy_error,
 )
-from elspeth.web.sessions.protocol import InterpretationPlaceholderConsumedError
+from elspeth.web.sessions.protocol import InterpretationResolveError
 from elspeth.web.validation import (
     _reject_credential_shaped_content,
     _validate_accepted_value_content,
@@ -1951,6 +1951,12 @@ def _assert_affected_component(
                     draft_value = requirement.get("draft")
                     draft = draft_value if isinstance(draft_value, str) else None
                     break
+        if llm_draft is not None and draft is not None and draft != llm_draft:
+            raise ToolArgumentError(
+                argument="llm_draft",
+                expected="the exact node review requirement draft staged in options.interpretation_requirements",
+                actual_type="pipeline_decision event draft does not match the node review requirement draft",
+            )
         try:
             validate_pipeline_decision_node_semantics(
                 node=node,
@@ -2467,12 +2473,14 @@ async def _handle_request_interpretation_review(
             provider=provider,
             composer_skill_hash=composer_skill_hash,
         )
-    except InterpretationPlaceholderConsumedError as exc:
+    except InterpretationResolveError as exc:
         # The compose snapshot passed the Tier-3 component check above, but
         # the service re-checks the persisted head under the session write
-        # lock.  A mismatch there is an expected stale-argument race: tell the
-        # model to rebuild from the latest state instead of letting the typed
-        # service conflict fall into the dispatcher's plugin-crash path.
+        # lock.  Any typed resolve conflict there — placeholder consumed,
+        # draft no longer matching, site removed — is an expected
+        # stale-argument race: tell the model to rebuild from the latest
+        # state instead of letting the typed service conflict fall into
+        # the dispatcher's plugin-crash path (elspeth-9c01c943a5).
         raise ToolArgumentError(
             argument="composition_state_id",
             expected="the current composition state with matching reviewed content; reload the latest state and retry",

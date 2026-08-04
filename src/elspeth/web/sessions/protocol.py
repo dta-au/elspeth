@@ -2351,6 +2351,17 @@ class InterpretationPlaceholderConsumedError(InterpretationResolveError):
     """The affected LLM node no longer carries the expected placeholder."""
 
 
+class InterpretationDraftMismatchError(InterpretationResolveError):
+    """The pending requirement exists but its draft is not the surfaced draft.
+
+    Raised by the ``create_pending_interpretation_event`` writer when the
+    under-lock re-read of the persisted head finds the review site's staged
+    draft differs from the ``llm_draft`` the caller asserted. The tool
+    handler converts it to ARG_ERROR (stale composition state or reviewed
+    content); it must never surface as a raw 500 (elspeth-9c01c943a5).
+    """
+
+
 class InterpretationUnsupportedChoiceError(InterpretationResolveError):
     """The requested choice is valid generally but unsupported for this kind."""
 

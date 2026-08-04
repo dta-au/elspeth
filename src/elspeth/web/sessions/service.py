@@ -197,6 +197,7 @@ from elspeth.web.sessions.protocol import (
     GuidedStateOperationCommand,
     GuidedStateOperationSettlement,
     IllegalRunTransitionError,
+    InterpretationDraftMismatchError,
     InterpretationEventAlreadyResolvedError,
     InterpretationEventNotFoundError,
     InterpretationNodeMissingError,
@@ -6736,9 +6737,14 @@ class SessionServiceImpl:
         Called from the compose-loop tool handler for
         ``request_interpretation_review``. Acquires the session write lock
         for the duration of the insert. Validates ``affected_node_id``
-        exists in ``composition_states.nodes`` BEFORE committing the row
-        (raises :class:`ValueError` otherwise; the tool handler converts to
-        ARG_ERROR).
+        exists in ``composition_states.nodes`` BEFORE committing the row.
+        Expected under-lock re-check failures — a consumed/absent pending
+        requirement or a staged draft that no longer matches ``llm_draft`` —
+        raise :class:`InterpretationResolveError` subclasses
+        (:class:`InterpretationPlaceholderConsumedError`,
+        :class:`InterpretationDraftMismatchError`), which the tool handler
+        converts to ARG_ERROR. Genuine audit anomalies (missing state row,
+        malformed structures) raise bare :class:`ValueError` and crash.
 
         Per CLAUDE.md offensive-programming rules, the writer-boundary
         validation reads the parent composition_states row inside the
@@ -6823,14 +6829,14 @@ class SessionServiceImpl:
                             context="create_pending_interpretation_event",
                         )
                     except InterpretationPlaceholderConsumedError as exc:
-                        raise ValueError(
+                        raise InterpretationPlaceholderConsumedError(
                             "create_pending_interpretation_event: source.options.interpretation_requirements "
                             f"must contain exactly one pending {kind.value!r} requirement for {user_term!r}"
                         ) from exc
                     requirement = requirements[matching_index]
                     draft = requirement["draft"] if "draft" in requirement else None
                     if isinstance(draft, str) and draft != llm_draft:
-                        raise ValueError(
+                        raise InterpretationDraftMismatchError(
                             "create_pending_interpretation_event: invented_source event draft does not match the source review requirement draft"
                         )
                 elif kind is InterpretationKind.PIPELINE_DECISION:
@@ -6857,14 +6863,14 @@ class SessionServiceImpl:
                             context="create_pending_interpretation_event",
                         )
                     except InterpretationPlaceholderConsumedError as exc:
-                        raise ValueError(
+                        raise InterpretationPlaceholderConsumedError(
                             "create_pending_interpretation_event: node options.interpretation_requirements "
                             f"must contain exactly one pending {kind.value!r} requirement for {user_term!r}"
                         ) from exc
                     requirement = requirements[matching_index]
                     draft = requirement["draft"] if "draft" in requirement else None
                     if isinstance(draft, str) and draft != llm_draft:
-                        raise ValueError(
+                        raise InterpretationDraftMismatchError(
                             "create_pending_interpretation_event: pipeline_decision event draft does not match the node review requirement draft"
                         )
                     _validate_pipeline_decision_semantics_from_state_record(
@@ -6911,7 +6917,7 @@ class SessionServiceImpl:
                             )
                             current_draft = requirements[matching_index].get("draft")
                             if not isinstance(current_draft, str) or current_draft != llm_draft:
-                                raise ValueError(
+                                raise InterpretationDraftMismatchError(
                                     "create_pending_interpretation_event: vague_term event draft does not match "
                                     "the current review requirement draft"
                                 )
@@ -6922,7 +6928,7 @@ class SessionServiceImpl:
                             )
                         prompt_template = options["prompt_template"]
                         if llm_draft != prompt_template:
-                            raise ValueError(
+                            raise InterpretationDraftMismatchError(
                                 "create_pending_interpretation_event: llm_prompt_template event draft must match current options.prompt_template"
                             )
                         try:
@@ -6933,7 +6939,7 @@ class SessionServiceImpl:
                                 context="create_pending_interpretation_event",
                             )
                         except InterpretationPlaceholderConsumedError as exc:
-                            raise ValueError(
+                            raise InterpretationPlaceholderConsumedError(
                                 "create_pending_interpretation_event: node options.interpretation_requirements "
                                 f"must contain exactly one pending {kind.value!r} requirement for {user_term!r}"
                             ) from exc

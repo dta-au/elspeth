@@ -83,7 +83,11 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import sessions_table
 from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
-from elspeth.web.sessions.service import InterpretationPlaceholderConsumedError, SessionServiceImpl
+from elspeth.web.sessions.service import (
+    InterpretationDraftMismatchError,
+    InterpretationPlaceholderConsumedError,
+    SessionServiceImpl,
+)
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 
 # --------------------------------------------------------------------------- #
@@ -1220,6 +1224,55 @@ def test_structured_vague_term_boundary_rejects_noncurrent_draft() -> None:
             InterpretationKind.VAGUE_TERM,
             user_term,
             "an older definition",
+        )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_decision_writer_rejects_noncurrent_draft_as_typed_resolve_error(
+    service: SessionServiceImpl,
+) -> None:
+    """elspeth-9c01c943a5: the writer's under-lock draft re-check must raise the
+    typed stale-content error the tool handler converts to ARG_ERROR. A bare
+    ``ValueError`` here escaped the compose route as an uncoded 500."""
+    state, affected_node_id, user_term = _event_liveness_state(
+        InterpretationKind.PIPELINE_DECISION,
+        draft="the staged disclosure",
+    )
+    session_id = uuid4()
+    state_id = await _seed_event_liveness_session(service, session_id, state)
+
+    with pytest.raises(InterpretationDraftMismatchError, match="event draft"):
+        await service.create_pending_interpretation_event(
+            session_id=session_id,
+            composition_state_id=state_id,
+            affected_node_id=affected_node_id,
+            tool_call_id="stale-at-create",
+            user_term=user_term,
+            kind=InterpretationKind.PIPELINE_DECISION,
+            llm_draft="a paraphrased disclosure",
+            **_provenance_kwargs(),
+        )
+
+    assert await service.list_interpretation_events(session_id, status="all") == []
+
+
+def test_pipeline_decision_boundary_rejects_noncurrent_draft() -> None:
+    """elspeth-9c01c943a5 defect 1: ``pipeline_decision`` was the only reviewable
+    kind whose Tier-3 boundary never compared the LLM-echoed draft against the
+    staged requirement draft, so an echo error crashed at the writer instead of
+    returning a recoverable ARG_ERROR."""
+    state, affected_node_id, user_term = _event_liveness_state(
+        InterpretationKind.PIPELINE_DECISION,
+        draft="the staged disclosure",
+    )
+
+    with pytest.raises(ToolArgumentError, match="does not match the node review requirement draft"):
+        _assert_affected_component(
+            state,
+            affected_node_id,
+            InterpretationKind.PIPELINE_DECISION,
+            user_term,
+            "a paraphrased disclosure",
         )
 
 

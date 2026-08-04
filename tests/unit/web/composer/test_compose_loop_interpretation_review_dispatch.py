@@ -53,7 +53,7 @@ from elspeth.contracts.composer_interpretation import (
 )
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.prompts import render_system_prompt
-from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.protocol import ComposerPluginCrashError, ToolArgumentError
 from elspeth.web.composer.service import (
     AdvisorCheckpointVerdict,
     ComposerAvailability,
@@ -756,6 +756,95 @@ async def test_compose_loop_dispatches_request_interpretation_review(
     # The event carries the exact prompt bytes used by this no-overlay service.
     expected_hash = hashlib.sha256(render_system_prompt(None).encode("utf-8")).hexdigest()
     assert event.composer_skill_hash == expected_hash
+
+
+@pytest.mark.asyncio
+async def test_pipeline_decision_draft_mismatch_returns_arg_error_not_crash(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+) -> None:
+    """elspeth-9c01c943a5 incident shape: an echoed ``pipeline_decision`` draft
+    that mismatches the staged requirement draft must settle as ARG_ERROR so the
+    LLM can re-echo the staged text — not escape the compose loop as a raw
+    ``ValueError`` 500."""
+    composer = _build_composer(tmp_path, sessions_service)
+    state = _state_with_pipeline_decision_review()
+    session_id, state_id = await _seed_session_and_state(sessions_service, state=state)
+
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_pd_mismatch",
+                tool_name="request_interpretation_review",
+                arguments={
+                    "affected_node_id": "drop_raw_html",
+                    "kind": "pipeline_decision",
+                    "user_term": "drop_raw_html_fields",
+                    # Paraphrase of the staged draft — same meaning, different text.
+                    "llm_draft": "Remove the raw HTML and fingerprint fields before writing the JSON output.",
+                },
+            ),
+            _fake_text_response("Understood — I will re-echo the staged draft."),
+        ]
+    )
+
+    result = await composer._run_one_turn_for_test(
+        llm=llm,
+        session_id=str(session_id),
+        current_state_id=str(state_id),
+        initial_state=state,
+    )
+
+    invocations = result.tool_invocations
+    assert len(invocations) == 1
+    assert invocations[0].tool_name == "request_interpretation_review"
+    assert invocations[0].status.value == "arg_error"
+    # No pending row was minted for the mismatched echo.
+    assert await sessions_service.list_interpretation_events(session_id, status="all") == []
+
+
+@pytest.mark.asyncio
+async def test_session_aware_tool_crash_is_captured_as_plugin_crash_envelope(
+    tmp_path: Path,
+    sessions_service: SessionServiceImpl,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """elspeth-9c01c943a5 defect 2: a non-ToolArgumentError exception escaping a
+    session-aware handler must be captured into ``ComposerPluginCrashError`` —
+    the same coded-envelope discipline as the sync ``execute_tool`` path — not
+    propagate raw through the compose route as an uncoded 500."""
+    composer = _build_composer(tmp_path, sessions_service)
+    state = _state_with_llm_node()
+    session_id, state_id = await _seed_session_and_state(sessions_service)
+
+    async def _boom(**kwargs: Any) -> None:
+        raise RuntimeError("simulated sessions-service failure")
+
+    monkeypatch.setattr(sessions_service, "create_pending_interpretation_event", _boom)
+
+    llm = _ScriptedLLM(
+        [
+            _fake_response_with_tool_call(
+                tool_call_id="call_boom",
+                tool_name="request_interpretation_review",
+                arguments={
+                    "affected_node_id": "rate_node",
+                    "kind": "vague_term",
+                    "user_term": "cool",
+                    "llm_draft": "Visually appealing and well-organized.",
+                },
+            ),
+        ]
+    )
+
+    with pytest.raises(ComposerPluginCrashError) as exc_info:
+        await composer._run_one_turn_for_test(
+            llm=llm,
+            session_id=str(session_id),
+            current_state_id=str(state_id),
+            initial_state=state,
+        )
+    assert isinstance(exc_info.value.original_exc, RuntimeError)
 
 
 @pytest.mark.asyncio
