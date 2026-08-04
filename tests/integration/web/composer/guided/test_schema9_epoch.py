@@ -26,7 +26,7 @@ def test_epoch_40_session_store_fails_before_schema_use(tmp_path: Path) -> None:
         connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 40 WHERE store_kind = 'session'"))
         connection.execute(text("PRAGMA user_version = 40"))
 
-    with pytest.raises(SessionSchemaError, match=r"SESSION_SCHEMA_EPOCH=44.*Delete the session DB file and restart"):
+    with pytest.raises(SessionSchemaError, match=r"SESSION_SCHEMA_EPOCH=45.*Delete the session DB file and restart"):
         initialize_session_schema(engine)
 
 
@@ -38,5 +38,5 @@ def test_epoch_35_session_store_fails_before_schema_use(tmp_path: Path) -> None:
         connection.execute(text("UPDATE elspeth_schema_identity SET schema_epoch = 35 WHERE store_kind = 'session'"))
         connection.execute(text("PRAGMA user_version = 35"))
 
-    with pytest.raises(SessionSchemaError, match=r"SESSION_SCHEMA_EPOCH=44.*Delete the session DB file and restart"):
+    with pytest.raises(SessionSchemaError, match=r"SESSION_SCHEMA_EPOCH=45.*Delete the session DB file and restart"):
         initialize_session_schema(engine)
