@@ -6129,7 +6129,11 @@ class ComposerServiceImpl:
           validity, and execution readiness, withholding only completion.
 
         The provider's findings and the primary model's terminal prose remain
-        internal. Every public field is synthesized from fixed backend copy.
+        internal. Every public field is synthesized from fixed backend copy —
+        except the backend-authored deterministic pre-scan finding, which is
+        itself fixed backend copy naming the triggering key/field and rides
+        the wording when ``verdict.findings_backend_authored`` is set
+        (elspeth-cd9af8e61d).
         """
         del assistant_message
         raw_content = ""
@@ -6139,10 +6143,15 @@ class ComposerServiceImpl:
                 validated_base,
                 reason=reason,
                 findings=verdict.findings_text,
+                findings_backend_authored=verdict.findings_backend_authored,
             )
             augmented = _compose_advisor_signoff_pending_message("")
         else:
-            runtime_result = _advisor_signoff_blocked_validation(reason=reason, findings=verdict.findings_text)
+            runtime_result = _advisor_signoff_blocked_validation(
+                reason=reason,
+                findings=verdict.findings_text,
+                findings_backend_authored=verdict.findings_backend_authored,
+            )
             augmented = _compose_preflight_failure_message("", runtime_result=runtime_result)
         _enforce_augmentation_prefix_invariant(
             branch="advisor_signoff_blocked_augmentation",
@@ -6252,7 +6261,14 @@ class ComposerServiceImpl:
         if phase == "end":
             prompt_injection_finding = _advisor_prompt_template_injection_finding(state, user_message=user_message)
             if prompt_injection_finding is not None:
-                return completed(AdvisorCheckpointVerdict(ok=True, blocking=True, findings_text=prompt_injection_finding))
+                return completed(
+                    AdvisorCheckpointVerdict(
+                        ok=True,
+                        blocking=True,
+                        findings_text=prompt_injection_finding,
+                        findings_backend_authored=True,
+                    )
+                )
         arguments = self._build_checkpoint_arguments(
             phase=phase,
             state=state,
@@ -7049,6 +7065,13 @@ class AdvisorCheckpointVerdict:
     ok: bool
     blocking: bool
     findings_text: str
+    # elspeth-cd9af8e61d (c): True only when ``findings_text`` is the
+    # backend-authored deterministic pre-scan finding
+    # (:func:`_advisor_prompt_template_injection_finding`) — fixed shape,
+    # names the exact key/field that triggered, carries no provider text —
+    # and is therefore safe on human wire surfaces. Advisor-MODEL findings
+    # stay False and are never surfaced raw (R2-F13).
+    findings_backend_authored: bool = False
     # P5.3/D13: distinguishes the two ``ok=False`` failure CLASSES the gate must
     # treat differently. ``_run_advisor_checkpoint`` collapses every exception to
     # ``ok=False``, so ``(ok, blocking)`` alone cannot tell a malformed/parse
@@ -7143,6 +7166,55 @@ def _looks_like_advisor_prompt_injection(value: str) -> bool:
     return _ADVISOR_PROMPT_INJECTION_IGNORE_RE.search(value) is not None or _ADVISOR_PROMPT_INJECTION_CLEAN_RE.search(value) is not None
 
 
+# Structural delimiters for the shape-aware injection scan
+# (elspeth-cd9af8e61d). A rendered structural value — an identifier list, a
+# mapping, the owned schema projection, a gate expression — is split on these
+# before scanning so the prose-tuned proximity regexes cannot assemble a
+# "phrase" ACROSS separate elements; see
+# :func:`_structural_value_contains_advisor_prompt_injection`.
+_ADVISOR_STRUCTURAL_TOKEN_DELIMITER_RE: Final[re.Pattern[str]] = re.compile(r"[\[\]{}()'\",:]")
+
+
+def _structural_value_contains_advisor_prompt_injection(value: str) -> bool:
+    """Injection scan for STRUCTURAL (non-prose) advisor evidence values.
+
+    The injection regexes are prose-tuned proximity patterns spanning up to
+    120 characters, so run directly over a rendered identifier list such as
+    ``['output', 'clean']`` they assemble a verb+CLEAN "phrase" across the
+    ``', '`` separator between two elements the author never wrote as prose
+    (elspeth-cd9af8e61d: ``output`` is itself one of the twelve verb tokens,
+    so an entirely ordinary data-cleaning column list force-FLAGs the END
+    sign-off deterministically). Structural values are therefore scanned one
+    delimiter-free segment at a time: a match must fall entirely within a
+    single contiguous run containing no structural delimiter (quotes,
+    brackets, braces, parens, commas, colons) — i.e. within one embedded
+    string, which is where a genuine injection sentence necessarily lives. A
+    real payload smuggled into a single list element, mapping value, schema
+    field, or gate expression still fires; adjacent bare identifiers cannot.
+    """
+    return any(_looks_like_advisor_prompt_injection(segment) for segment in _ADVISOR_STRUCTURAL_TOKEN_DELIMITER_RE.split(value))
+
+
+def _advisor_prose_shaped_option_value(key: str) -> bool:
+    """Whether an option key's value is prose the model is told to follow.
+
+    SCAN-side shape rule, split from the RENDER-side admission predicate
+    :func:`_advisor_summary_renders_option_value` (elspeth-cd9af8e61d): one
+    predicate must not serve two opposite-safety contexts. Render admission
+    decides what the advisor may SEE; this decides which injection scan a
+    rendered value receives — the full prose scan for free-text prompt
+    values, the per-segment structural scan for everything else.
+    """
+    return key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS
+
+
+def _advisor_option_value_contains_injection(value: str, *, prose_shaped: bool) -> bool:
+    """Apply the shape-appropriate injection scan to one evidence value."""
+    if prose_shaped:
+        return _looks_like_advisor_prompt_injection(value)
+    return _structural_value_contains_advisor_prompt_injection(value)
+
+
 @observation_boundary(
     tier=3,
     source="web-authored plugin options mapping (untrusted composer-author values)",
@@ -7150,29 +7222,39 @@ def _looks_like_advisor_prompt_injection(value: str) -> bool:
     suppresses=("R1", "R5"),
     invariant=(
         "collects the exact untrusted values rendered by the advisor summary after "
-        "owned schema projection, plus nested prompt aliases; absent values are skipped"
+        "owned schema projection, plus nested prompt aliases, each tagged prose- or "
+        "structural-shaped for the injection scan; absent values are skipped"
     ),
 )
-def _advisor_prompt_option_values(options: Mapping[str, Any]) -> list[tuple[str, str]]:
-    """Collect every option value that can contribute text to advisor evidence."""
-    values: list[tuple[str, str]] = []
+def _advisor_prompt_option_values(options: Mapping[str, Any]) -> list[tuple[str, str, bool]]:
+    """Collect every option value that can contribute text to advisor evidence.
+
+    Yields ``(key, text, prose_shaped)`` triples (elspeth-cd9af8e61d).
+    ``prose_shaped`` is True for free-text prompt values
+    (``prompt_template``/``template``), which receive the full prose
+    injection scan; every other rendered value is structural — identifier
+    lists, mappings, the owned schema projection — and receives the
+    per-segment scan of
+    :func:`_structural_value_contains_advisor_prompt_injection`.
+    """
+    values: list[tuple[str, str, bool]] = []
     for key in sorted(options):
         if not _advisor_summary_renders_option_value(key):
             continue
         raw = options[key]
         if key == "schema":
-            values.append((key, _render_schema_for_advisor(raw)))
+            values.append((key, _render_schema_for_advisor(raw), False))
         else:
             # Scan the complete value rather than the display-truncated form:
             # an instruction suffix beyond the compact evidence cap is still
             # attacker-controlled text and future render budgets may expose it.
-            values.append((key, raw if isinstance(raw, str) else str(raw)))
+            values.append((key, raw if isinstance(raw, str) else str(raw), _advisor_prose_shaped_option_value(key)))
     nested = options.get("options")
     if isinstance(nested, Mapping):
         for key in _ADVISOR_SUMMARY_PROMPT_VALUE_KEYS:
             raw = nested.get(key)
             if isinstance(raw, str):
-                values.append((key, raw))
+                values.append((key, raw, True))
     return values
 
 
@@ -7187,6 +7269,17 @@ def _advisor_prompt_template_injection_finding(state: CompositionState, *, user_
     it reachable from ORDINARY CHAT input too, so the same deterministic
     scan covers it rather than relying solely on the advisor's own judgment
     of fenced-and-labeled untrusted text.
+
+    elspeth-cd9af8e61d: the scan is SHAPE-AWARE and covers every free-text
+    surface the advisor summary renders. Prose-shaped values (the user
+    message, ``prompt_template``/``template``, metadata name/description)
+    get the full prose scan; structural values (identifier lists, mappings,
+    the owned schema projection, gate conditions and routes) get the
+    per-segment structural scan so a phrase cannot assemble across adjacent
+    identifiers. Coverage now includes ``state.metadata.name`` /
+    ``description``, ``NodeSpec.condition``, and ``NodeSpec.routes`` — all
+    rendered verbatim by :func:`_summarize_pipeline_for_advisor` and
+    previously never scanned.
     """
     # Scan the RAW message — never a quote-elided view. Quotes do not
     # create a trusted data channel for an LLM: the quoted text is still
@@ -7200,27 +7293,43 @@ def _advisor_prompt_template_injection_finding(state: CompositionState, *, user_
     if user_message and _looks_like_advisor_prompt_injection(user_message):
         return "FLAGGED: the user's message contains advisor-instruction injection text; remove it before the completion advisory review."
 
+    # Pipeline metadata is genuinely free text and is rendered verbatim at the
+    # top of the advisor summary — prose scan (elspeth-cd9af8e61d).
+    if state.metadata.name and _looks_like_advisor_prompt_injection(state.metadata.name):
+        return (
+            "FLAGGED: pipeline metadata name contains advisor-instruction injection text; remove it before the completion advisory review."
+        )
+    if state.metadata.description and _looks_like_advisor_prompt_injection(state.metadata.description):
+        return "FLAGGED: pipeline metadata description contains advisor-instruction injection text; remove it before the completion advisory review."
+
     for source_name, source in state.sources.items():
         if _looks_like_advisor_prompt_injection(source.on_validation_failure):
             label = "source" if source_name == "source" else f"source '{source_name}'"
             return f"FLAGGED: {label} route on_validation_failure contains advisor-instruction injection text; remove it before the completion advisory review."
-        for key, value in _advisor_prompt_option_values(source.options):
-            if _looks_like_advisor_prompt_injection(value):
+        for key, value, prose_shaped in _advisor_prompt_option_values(source.options):
+            if _advisor_option_value_contains_injection(value, prose_shaped=prose_shaped):
                 label = "source" if source_name == "source" else f"source '{source_name}'"
                 return f"FLAGGED: {label} option {key} contains advisor-instruction injection text; remove it before the completion advisory review."
 
     for node in state.nodes:
         if node.on_error is not None and _looks_like_advisor_prompt_injection(node.on_error):
             return f"FLAGGED: node '{node.id}' route on_error contains advisor-instruction injection text; remove it before the completion advisory review."
-        for key, value in _advisor_prompt_option_values(node.options):
-            if _looks_like_advisor_prompt_injection(value):
+        # Gate condition and routes are rendered verbatim by
+        # ``_render_node_control_flow`` — expression/identifier shaped, so the
+        # structural scan applies (elspeth-cd9af8e61d).
+        if node.condition is not None and _structural_value_contains_advisor_prompt_injection(node.condition):
+            return f"FLAGGED: node '{node.id}' gate condition contains advisor-instruction injection text; remove it before the completion advisory review."
+        if node.routes is not None and _structural_value_contains_advisor_prompt_injection(str(dict(node.routes))):
+            return f"FLAGGED: node '{node.id}' gate routes contain advisor-instruction injection text; remove it before the completion advisory review."
+        for key, value, prose_shaped in _advisor_prompt_option_values(node.options):
+            if _advisor_option_value_contains_injection(value, prose_shaped=prose_shaped):
                 return f"FLAGGED: node '{node.id}' option {key} contains advisor-instruction injection text; remove it before the completion advisory review."
 
     for output in state.outputs:
         if _looks_like_advisor_prompt_injection(output.on_write_failure):
             return f"FLAGGED: sink '{output.name}' route on_write_failure contains advisor-instruction injection text; remove it before the completion advisory review."
-        for key, value in _advisor_prompt_option_values(output.options):
-            if _looks_like_advisor_prompt_injection(value):
+        for key, value, prose_shaped in _advisor_prompt_option_values(output.options):
+            if _advisor_option_value_contains_injection(value, prose_shaped=prose_shaped):
                 return f"FLAGGED: sink '{output.name}' option {key} contains advisor-instruction injection text; remove it before the completion advisory review."
 
     return None
@@ -7654,7 +7763,7 @@ _ADVISOR_UNAVAILABLE_USER_DETAIL: Final[str] = "advisor model was unavailable af
 _ADVISOR_MALFORMED_USER_DETAIL: Final[str] = "advisor response was malformed"
 
 
-def _advisor_signoff_blocked_validation(*, reason: str, findings: str) -> ValidationResult:
+def _advisor_signoff_blocked_validation(*, reason: str, findings: str, findings_backend_authored: bool = False) -> ValidationResult:
     """Build the fully-red shape for a red or absent runtime preflight.
 
     Returned (not raised) by the END authoritative advisor gate
@@ -7667,9 +7776,16 @@ def _advisor_signoff_blocked_validation(*, reason: str, findings: str) -> Valida
     ``completion_ready`` all ``False``) so the UI cannot advance regardless of
     which flag it gates on. FLAGGED reasons use one fixed sign-off notice;
     unavailable and malformed reasons retain their fixed backend wording.
-    Raw findings never enter this wire shape.
+    Raw advisor-MODEL findings never enter this wire shape; the one exception
+    is the backend-authored deterministic pre-scan finding, which names the
+    triggering key/field so the operator can act (elspeth-cd9af8e61d,
+    ``findings_backend_authored``).
     """
-    detail, suggestion = _advisor_signoff_blocked_wording(reason=reason, findings=findings)
+    detail, suggestion = _advisor_signoff_blocked_wording(
+        reason=reason,
+        findings=findings,
+        findings_backend_authored=findings_backend_authored,
+    )
     return ValidationResult(
         is_valid=False,
         checks=[
@@ -7836,7 +7952,7 @@ def _advisor_arguments_with_format_reprompt(arguments: Mapping[str, Any]) -> dic
     return retry
 
 
-def _advisor_signoff_blocked_wording(*, reason: str, findings: str) -> tuple[str, str]:
+def _advisor_signoff_blocked_wording(*, reason: str, findings: str, findings_backend_authored: bool = False) -> tuple[str, str]:
     """Return the (detail, suggestion) pair for one blocked-sign-off reason.
 
     Shared by the fully-blocking result (:func:`_advisor_signoff_blocked_validation`)
@@ -7849,8 +7965,23 @@ def _advisor_signoff_blocked_wording(*, reason: str, findings: str) -> tuple[str
     malformed" — a note that contradicted itself in the same sentence. The
     reason parenthetical is dropped from the could-not-be-obtained branches
     entirely: ``findings`` already names the class in plain language.
+
+    elspeth-cd9af8e61d (c): the FLAGGED branches used to discard ``findings``
+    entirely, so a deterministic pre-scan force-FLAG — byte-identical on
+    every pass, no advisor call at all — blocked completion without ever
+    telling the operator which key/field triggered. When
+    ``findings_backend_authored`` is True (the deterministic pre-scan
+    string: fixed shape, names the triggering surface, carries no provider
+    text) the finding is appended so the operator can act. Advisor-MODEL
+    findings remain withheld on these branches (R2-F13: raw provider
+    findings never reach a human surface).
     """
     if reason in {"flagged_final_pass", "flagged_no_repair"}:
+        if findings_backend_authored and findings:
+            return (
+                f"{_ADVISOR_SIGNOFF_PENDING_NOTICE} {findings}",
+                "Remove the flagged text from the named field and retry the evidence-scoped advisor review.",
+            )
         return (
             _ADVISOR_SIGNOFF_PENDING_NOTICE,
             "Review the pipeline and retry the evidence-scoped advisor review.",
@@ -7866,7 +7997,13 @@ def _advisor_signoff_blocked_wording(*, reason: str, findings: str) -> tuple[str
     )
 
 
-def _advisor_signoff_pending_validation(base: ValidationResult, *, reason: str, findings: str) -> ValidationResult:
+def _advisor_signoff_pending_validation(
+    base: ValidationResult,
+    *,
+    reason: str,
+    findings: str,
+    findings_backend_authored: bool = False,
+) -> ValidationResult:
     """Gate COMPLETION only, on a pipeline whose validation genuinely passed.
 
     R2-F14 (elspeth-5403f346c0). ``_advisor_signoff_blocked_validation`` zeroes
@@ -7887,7 +8024,11 @@ def _advisor_signoff_pending_validation(base: ValidationResult, *, reason: str, 
     Applies to every advisor reason. This release's authority decision is
     completion-only: an advisor FLAG does not make execution unsafe.
     """
-    detail, _suggestion = _advisor_signoff_blocked_wording(reason=reason, findings=findings)
+    detail, _suggestion = _advisor_signoff_blocked_wording(
+        reason=reason,
+        findings=findings,
+        findings_backend_authored=findings_backend_authored,
+    )
     return base.model_copy(
         update={
             "checks": [
