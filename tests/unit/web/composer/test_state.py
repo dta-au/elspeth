@@ -7109,6 +7109,45 @@ class TestCompositionStateRowUnion:
             merge=None,
         )
 
+    def _llm(
+        self,
+        node_id: str,
+        input_connection: str,
+        on_success: str,
+        *,
+        response_field: str,
+    ) -> NodeSpec:
+        """An llm arm emitting its guaranteed provenance trio.
+
+        ``llm`` guarantees ``<response_field>`` plus the ``_usage``/``_model``
+        side-fields (``LLM_GUARANTEED_SUFFIXES``). Those are row data, not
+        audit-only provenance, so they reach a downstream consumer's input
+        contract — the shape that produced elspeth-9d13900064.
+        """
+        return NodeSpec(
+            id=node_id,
+            node_type="transform",
+            plugin="llm",
+            input=input_connection,
+            on_success=on_success,
+            on_error="discard",
+            options={
+                "schema": {"mode": "observed"},
+                "provider": "openrouter",
+                "model": "anthropic/claude-sonnet-4.6",
+                "prompt_template": "Judge this row.",
+                "api_key": "env:OPENROUTER_API_KEY",
+                "response_field": response_field,
+                "required_input_fields": [],
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
     def _aggregation(
         self,
         node_id: str,
@@ -7161,11 +7200,11 @@ class TestCompositionStateRowUnion:
         defaults.update(overrides)
         return NodeSpec(**defaults)
 
-    def _output(self, name: str = "output") -> OutputSpec:
+    def _output(self, name: str = "output", *, options: dict[str, Any] | None = None) -> OutputSpec:
         return OutputSpec(
             name=name,
             plugin="json",
-            options={"schema": {"mode": "observed"}},
+            options=options or {"schema": {"mode": "observed"}},
             on_write_failure="discard",
         )
 
@@ -7174,6 +7213,7 @@ class TestCompositionStateRowUnion:
         *,
         row_union: NodeSpec | None = None,
         gate: NodeSpec | None = None,
+        arms: tuple[NodeSpec, ...] | None = None,
         extra_nodes: tuple[NodeSpec, ...] = (),
         tail_options: dict[str, Any] | None = None,
     ) -> CompositionState:
@@ -7181,8 +7221,13 @@ class TestCompositionStateRowUnion:
             source=self._source(),
             nodes=(
                 gate or self._gate(),
-                self._transform("control", "control_branch", "control_done"),
-                self._transform("treatment", "treatment_branch", "treatment_done"),
+                *(
+                    arms
+                    or (
+                        self._transform("control", "control_branch", "control_done"),
+                        self._transform("treatment", "treatment_branch", "treatment_done"),
+                    )
+                ),
                 row_union or self._row_union(),
                 self._transform("after_union", "union_out", "output", options=tail_options),
                 *extra_nodes,
@@ -8007,3 +8052,202 @@ class TestCompositionStateRowUnion:
         assert result.is_valid, result.errors
         assert not any(contract.to_id == "after_union" for contract in result.edge_contracts)
         assert any("row_union" in warning.message and "observed schema" in warning.message for warning in result.warnings)
+
+    def _union_arm_queue(self, connection_name: str) -> NodeSpec:
+        """An in-place queue on a branch connection: an arm Composer cannot resolve."""
+        return NodeSpec(
+            id=connection_name,
+            node_type="queue",
+            plugin=None,
+            input=connection_name,
+            on_success=None,
+            on_error=None,
+            options={},
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+
+    def _locked_tail_options(self, fields: list[str]) -> dict[str, Any]:
+        return {"schema": {"mode": "fixed", "fields": fields}}
+
+    def _llm_arms(self, *, control_field: str = "verdict", treatment_field: str = "verdict") -> tuple[NodeSpec, ...]:
+        return (
+            self._llm("control", "control_branch", "control_done", response_field=control_field),
+            self._llm("treatment", "treatment_branch", "treatment_done", response_field=treatment_field),
+        )
+
+    def test_row_union_arm_emits_reach_a_locked_input_consumer(self) -> None:
+        """elspeth-9d13900064: Rule A must not fail open across a row_union.
+
+        The presence direction abstains at a row_union (an arm's guarantees
+        cannot be promoted to the union's), but the extras direction is the
+        opposite polarity: a field guaranteed by an arm WILL arrive on that
+        arm's rows, so a fixed-mode consumer forbidding it is a definite
+        runtime PluginContractViolation, not a maybe.
+        """
+        state = self._state(
+            arms=self._llm_arms(),
+            tail_options=self._locked_tail_options(["verdict: str"]),
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        assert entry.component == "node:after_union"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "variant_union"
+        assert detail.consumer == "after_union"
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+
+    def test_row_union_extras_reach_a_fixed_mode_field_mapper_consumer(self) -> None:
+        """The ticket's literal graph: llm x2 -> row_union -> fixed field_mapper.
+
+        A field_mapper consumer also selects the plugin-specific repair
+        wording, which the boundary path must carry like the resolved-producer
+        path does.
+        """
+        field_mapper = NodeSpec(
+            id="after_union",
+            node_type="transform",
+            plugin="field_mapper",
+            input="union_out",
+            on_success="output",
+            on_error="discard",
+            options={
+                "schema": {"mode": "fixed", "fields": ["verdict: str"]},
+                "mapping": {"verdict": "verdict"},
+                "select_only": True,
+            },
+            condition=None,
+            routes=None,
+            fork_to=None,
+            branches=None,
+            policy=None,
+            merge=None,
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(self._gate(), *self._llm_arms(), self._row_union(), field_mapper),
+            edges=(),
+            outputs=(self._output(),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "variant_union"
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+        assert "consumer's schema.fields" in entry.message
+
+    def test_row_union_arm_emits_union_rather_than_intersect(self) -> None:
+        """A field guaranteed by ONE arm only is still a definite extra.
+
+        Intersection math (the presence-direction merge) would clear this
+        graph: the arms share no guaranteed field. Rows from the treatment arm
+        still carry its trio, so the union is the sound set here.
+        """
+        state = self._state(
+            arms=self._llm_arms(treatment_field="tone"),
+            tail_options=self._locked_tail_options(["verdict: str", "verdict_usage: any", "verdict_model: str"]),
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.extra_fields == ("tone", "tone_model", "tone_usage")
+
+    def test_row_union_locked_input_accepting_every_arm_emit_is_clean(self) -> None:
+        state = self._state(
+            arms=self._llm_arms(treatment_field="tone"),
+            tail_options=self._locked_tail_options(
+                [
+                    "verdict: str",
+                    "verdict_usage: any",
+                    "verdict_model: str",
+                    "tone: str",
+                    "tone_usage: any",
+                    "tone_model: str",
+                ]
+            ),
+        )
+
+        result = state.validate()
+
+        assert result.is_valid, result.errors
+
+    def test_row_union_unresolvable_arm_does_not_invent_locked_input_extras(self) -> None:
+        """An arm Composer cannot resolve contributes no fields, and no error."""
+        state = self._state(
+            arms=self._llm_arms(treatment_field="tone"),
+            extra_nodes=(self._union_arm_queue("treatment_done"),),
+            tail_options=self._locked_tail_options(["verdict: str", "verdict_usage: any", "verdict_model: str"]),
+        )
+
+        result = state.validate()
+
+        assert not any(error.error_code == "locked_input_extras" for error in result.errors), result.errors
+        assert any("row_union" in warning.message and "observed schema" in warning.message for warning in result.warnings)
+
+    def test_row_union_known_arm_extras_survive_an_unresolvable_sibling(self) -> None:
+        """Partial knowledge still errors on what IS known.
+
+        The queued treatment arm is opaque, but the control arm's guarantees
+        are proven — so its extras are reported while the abstention warning
+        stays for the part Composer cannot see.
+        """
+        state = self._state(
+            arms=self._llm_arms(treatment_field="tone"),
+            extra_nodes=(self._union_arm_queue("treatment_done"),),
+            tail_options=self._locked_tail_options(["verdict: str"]),
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "locked_input_extras")
+        detail = entry.contract
+        assert detail is not None
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")
+        assert any("row_union" in warning.message and "observed schema" in warning.message for warning in result.warnings)
+
+    def test_row_union_arm_emits_reach_a_locked_sink_through_a_gate(self) -> None:
+        """Rule B shares Rule A's walker, so it shares the row_union hole.
+
+        A row_union cannot feed a sink directly (its on_success must be a
+        processing connection), so the sink boundary is only reachable through
+        an intervening routing gate.
+        """
+        release_gate = self._gate(
+            id="release",
+            input="union_out",
+            routes={"true": "output", "false": "output"},
+            fork_to=None,
+        )
+        state = CompositionState(
+            source=self._source(),
+            nodes=(self._gate(), *self._llm_arms(), self._row_union(), release_gate),
+            edges=(),
+            outputs=(self._output(options={"schema": {"mode": "fixed", "fields": ["verdict: str"]}}),),
+            metadata=PipelineMetadata(),
+            version=1,
+        )
+
+        result = state.validate()
+
+        entry = next(error for error in result.errors if error.error_code == "sink_locked_extras")
+        assert entry.component == "output:output"
+        detail = entry.contract
+        assert detail is not None
+        assert detail.producer == "variant_union"
+        assert detail.consumer == "output:output"
+        assert detail.extra_fields == ("verdict_model", "verdict_usage")

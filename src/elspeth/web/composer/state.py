@@ -2820,6 +2820,218 @@ def _check_schema_contracts(
         finally:
             transform.close()
 
+    def _arm_emit_set(producer: ProducerEntry) -> frozenset[str]:
+        """Return one resolved row_union arm's predicted emit set.
+
+        Tier-3 parse boundary. At the Rule A/B call sites the producer's
+        contract config was already parsed earlier in the same iteration, so a
+        ValueError there would be a bug in our own code. An arm is different:
+        it may sit later in ``nodes`` than the consumer under check, so its
+        options are parsed here for the first time and a malformed declaration
+        is ordinary recoverable external input. The arm's own node iteration
+        reports it as ``contract_config_invalid`` against the right owner —
+        re-raising here would instead crash /validate, and re-reporting here
+        would duplicate the entry once per downstream consumer. An unparseable
+        arm is simply knowledge Composer does not have.
+        """
+        try:
+            return _producer_emit_set(producer)
+        except ValueError:
+            return frozenset()
+
+    def _connection_definite_emits(
+        connection_name: str,
+        *,
+        visited_connections: frozenset[str],
+    ) -> frozenset[str]:
+        """Return the fields that will DEFINITELY arrive on ``connection_name``.
+
+        The extras-direction twin of ``_connection_propagation_vote``, and
+        deliberately not sharing its math: the two ask questions with opposite
+        safety polarities. The presence direction asks "is every required field
+        guaranteed?" and must abstain at a fan-in rather than promote one arm's
+        guarantee to the whole stream. The extras direction asks "does any
+        field arrive that a locked consumer forbids?" — and a field guaranteed
+        by ONE arm definitely arrives on that arm's rows, so this UNIONS arm
+        emit sets where ``merge_guaranteed_fields`` would intersect them.
+
+        The result is a lower bound: an arm Composer cannot resolve contributes
+        nothing. That makes it sound to raise an error ON this set but never
+        sound to clear a graph WITH it, which is why the presence walk's
+        abstention warning stays unconditional.
+
+        Gates are traversed because routing changes which rows travel an edge,
+        never which fields a row carries.
+        """
+        if connection_name in visited_connections:
+            return frozenset()
+        producer = resolver.find_producer_for(connection_name)
+        if producer is None:
+            return frozenset()
+        if is_source_producer_id(producer.producer_id):
+            return _arm_emit_set(producer)
+
+        producer_node = node_by_id[producer.producer_id]
+        if producer_node.node_type == "gate":
+            return _connection_definite_emits(
+                producer_node.input,
+                visited_connections=visited_connections | {connection_name},
+            )
+        if producer_node.node_type == "row_union":
+            return _row_union_definite_emits(
+                producer_node,
+                visited_connections=visited_connections | {connection_name},
+            )
+        if producer_node.node_type in ("queue", "coalesce"):
+            # Opaque to Composer preview: a queue publishes an observed schema
+            # and never merges its predecessors' guarantees, and a coalesce's
+            # merged output is strategy-specific. Contributing nothing keeps
+            # the lower bound honest. Extending the extras rule to a queue
+            # producer is a drop-in branch here, left to the track that owns
+            # queue contract semantics.
+            return frozenset()
+        return _arm_emit_set(producer)
+
+    def _row_union_definite_emits(
+        row_union_node: NodeSpec,
+        *,
+        visited_connections: frozenset[str],
+    ) -> frozenset[str]:
+        """Union every arm's definite emits; a nested row_union arm recurses."""
+        branch_connections = _coalesce_branch_connections(row_union_node.branches)
+        if not branch_connections:
+            return frozenset()
+        return frozenset().union(
+            *(
+                _connection_definite_emits(branch_connection, visited_connections=visited_connections)
+                for branch_connection in branch_connections
+            )
+        )
+
+    def _producer_entry_row_union_boundary(producer: ProducerEntry) -> tuple[NodeSpec, frozenset[str]] | None:
+        """Resolve a row_union the presence walk abstained at, and what it emits.
+
+        Returns ``(row_union node, definite emit fields)``, or None when this
+        producer has no row_union behind it — including when the presence walk
+        abstained at some other boundary (coalesce, queue, routing loop) that
+        tells Composer nothing about emitted fields.
+        """
+        visited_connections: frozenset[str] = frozenset()
+        current_producer = producer
+        while True:
+            if is_source_producer_id(current_producer.producer_id):
+                return None
+            # ``resolver.get_node`` rather than indexing ``node_by_id``: like
+            # ``_walk_producer_entry_to_real_producer`` — the walker this
+            # mirrors — this one is also handed ``direct_sink_producers``
+            # entries, which are minted separately from the producer map and so
+            # are not guaranteed to name a registered NodeSpec.
+            producer_node = resolver.get_node(current_producer.producer_id)
+            if producer_node is None:
+                return None
+            if producer_node.node_type == "row_union":
+                return producer_node, _row_union_definite_emits(
+                    producer_node,
+                    visited_connections=visited_connections,
+                )
+            if producer_node.node_type != "gate" or producer_node.input in visited_connections:
+                return None
+            visited_connections |= {producer_node.input}
+            next_producer = resolver.find_producer_for(producer_node.input)
+            if next_producer is None:
+                return None
+            current_producer = next_producer
+
+    def _row_union_boundary_emits(connection_name: str) -> tuple[NodeSpec, frozenset[str]] | None:
+        """Connection-level entry point for ``_producer_entry_row_union_boundary``."""
+        producer = resolver.find_producer_for(connection_name)
+        if producer is None:
+            return None
+        return _producer_entry_row_union_boundary(producer)
+
+    def _locked_input_extras_error(
+        node: NodeSpec,
+        *,
+        producer_id: str,
+        producer_label: str,
+        producer_emit: frozenset[str],
+        consumer_locked_input: frozenset[str],
+    ) -> ValidationEntry | None:
+        """Build Rule A's entry, or None when nothing extra is emitted.
+
+        Shared by the resolved-producer path and the row_union boundary path so
+        both report one wording, one error code and one fact shape.
+        """
+        extras = producer_emit - consumer_locked_input
+        if not extras:
+            return None
+        # When consumer is itself a field_mapper, suggesting "insert a
+        # field_mapper upstream" is degenerate — the operator is already
+        # at one. The same applies to declared `fields` expansion: for
+        # field_mapper, the input contract IS the declared output schema,
+        # so widening fields means widening the schema declaration too.
+        if node.plugin == "field_mapper":
+            fix_suggestion = (
+                f"Fix by adding {sorted(extras)!r} to the consumer's schema.fields, "
+                f"OR by setting schema.mode: flexible on the consumer, "
+                f"OR by adjusting upstream config so the extra field(s) are not emitted."
+            )
+        else:
+            fix_suggestion = (
+                "Fix by relaxing the consumer schema (mode: flexible) or by inserting a "
+                "field_mapper with select_only: true to drop the extras before this consumer."
+            )
+        return _err(
+            f"node:{node.id}",
+            f"Schema contract violation: '{producer_id}' -> '{node.id}'. "
+            f"Consumer ({node.plugin or node.node_type}) input is locked (mode: fixed) and accepts: "
+            f"[{_format_fields(consumer_locked_input)}]. "
+            f"Producer ({producer_label}) will emit: "
+            f"[{_format_fields(producer_emit)}]. "
+            f"Extra fields rejected by consumer input contract: [{_format_fields(extras)}]. "
+            f"{fix_suggestion}",
+            "high",
+            "locked_input_extras",
+            # Identifiers + field names only (see SchemaContractDetail).
+            contract=SchemaContractDetail(
+                producer=producer_id,
+                consumer=node.id,
+                extra_fields=tuple(sorted(extras)),
+            ),
+        )
+
+    def _sink_locked_extras_error(
+        output: OutputSpec,
+        *,
+        producer_id: str,
+        producer_label: str,
+        producer_emit: frozenset[str],
+        sink_locked_input: frozenset[str],
+    ) -> ValidationEntry | None:
+        """Build Rule B's entry, or None when nothing extra is emitted."""
+        extras = producer_emit - sink_locked_input
+        if not extras:
+            return None
+        return _err(
+            f"output:{output.name}",
+            f"Schema contract violation: '{producer_id}' -> 'output:{output.name}'. "
+            f"Sink '{output.name}' input is locked (mode: fixed) and accepts: "
+            f"[{_format_fields(sink_locked_input)}]. "
+            f"Producer ({producer_label}) will emit: "
+            f"[{_format_fields(producer_emit)}]. "
+            f"Extra fields rejected by sink input contract: [{_format_fields(extras)}]. "
+            f"Fix by relaxing the sink schema (mode: flexible) or by inserting a "
+            f"field_mapper with select_only: true to drop the extras before this sink.",
+            "high",
+            "sink_locked_extras",
+            # Identifiers + field names only (see SchemaContractDetail).
+            contract=SchemaContractDetail(
+                producer=producer_id,
+                consumer=f"output:{output.name}",
+                extra_fields=tuple(sorted(extras)),
+            ),
+        )
+
     # Tier-3 contract-config parse boundary. node.options / output.options are
     # composer/LLM/user-authored config read back from session state, so a
     # malformed schema declaration is recoverable external input, not an
@@ -2974,7 +3186,26 @@ def _check_schema_contracts(
             node.input,
             warnings=contract_warnings,
         )
-        if actual_producer is None or actual_producer.producer_id in parse_failed_producers:
+        if actual_producer is None:
+            # The presence walk abstained. That is right for the direction it
+            # checks — an arm's guarantee is not the union's — but Rule A runs
+            # the opposite polarity, where an arm's guarantee IS decisive
+            # (elspeth-9d13900064). Re-resolve the extras direction only.
+            if consumer_locked_input is not None:
+                boundary = _row_union_boundary_emits(node.input)
+                if boundary is not None:
+                    boundary_node, boundary_emits = boundary
+                    extras_error = _locked_input_extras_error(
+                        node,
+                        producer_id=boundary_node.id,
+                        producer_label=boundary_node.node_type,
+                        producer_emit=boundary_emits,
+                        consumer_locked_input=consumer_locked_input,
+                    )
+                    if extras_error is not None:
+                        errors.append(extras_error)
+            continue
+        if actual_producer.producer_id in parse_failed_producers:
             continue
 
         producer_guaranteed, producer_error = _parse_producer_guarantees(actual_producer)
@@ -3073,45 +3304,15 @@ def _check_schema_contracts(
             # on the same options, deterministically — any ValueError here would be
             # a non-determinism bug in our own code, not a fresh Tier-3 parse fault,
             # so it is left to crash rather than silently swallowed.
-            producer_emit = _producer_emit_set(actual_producer)
-            extras = producer_emit - consumer_locked_input
-            if extras:
-                # When consumer is itself a field_mapper, suggesting "insert a
-                # field_mapper upstream" is degenerate — the operator is already
-                # at one. The same applies to declared `fields` expansion: for
-                # field_mapper, the input contract IS the declared output schema,
-                # so widening fields means widening the schema declaration too.
-                if node.plugin == "field_mapper":
-                    fix_suggestion = (
-                        f"Fix by adding {sorted(extras)!r} to the consumer's schema.fields, "
-                        f"OR by setting schema.mode: flexible on the consumer, "
-                        f"OR by adjusting upstream config so the extra field(s) are not emitted."
-                    )
-                else:
-                    fix_suggestion = (
-                        "Fix by relaxing the consumer schema (mode: flexible) or by inserting a "
-                        "field_mapper with select_only: true to drop the extras before this consumer."
-                    )
-                errors.append(
-                    _err(
-                        f"node:{node.id}",
-                        f"Schema contract violation: '{actual_producer.producer_id}' -> '{node.id}'. "
-                        f"Consumer ({node.plugin or node.node_type}) input is locked (mode: fixed) and accepts: "
-                        f"[{_format_fields(consumer_locked_input)}]. "
-                        f"Producer ({_producer_label(actual_producer)}) will emit: "
-                        f"[{_format_fields(producer_emit)}]. "
-                        f"Extra fields rejected by consumer input contract: [{_format_fields(extras)}]. "
-                        f"{fix_suggestion}",
-                        "high",
-                        "locked_input_extras",
-                        # Identifiers + field names only (see SchemaContractDetail).
-                        contract=SchemaContractDetail(
-                            producer=actual_producer.producer_id,
-                            consumer=node.id,
-                            extra_fields=tuple(sorted(extras)),
-                        ),
-                    )
-                )
+            extras_error = _locked_input_extras_error(
+                node,
+                producer_id=actual_producer.producer_id,
+                producer_label=_producer_label(actual_producer),
+                producer_emit=_producer_emit_set(actual_producer),
+                consumer_locked_input=consumer_locked_input,
+            )
+            if extras_error is not None:
+                errors.append(extras_error)
 
     for output in outputs:
         sink_required, sink_required_error = _parse_sink_required_fields(output)
@@ -3135,6 +3336,30 @@ def _check_schema_contracts(
                 warnings=contract_warnings,
             )
             sink_producers = () if actual_producer is None else (actual_producer,)
+
+        # Rule B shares Rule A's walker and therefore shared its row_union
+        # fail-open (elspeth-9d13900064). Deduplicated on the boundary node:
+        # several routes from one gate converge on a sink as separate producer
+        # entries, and all of them resolve back to the same row_union.
+        if sink_locked_input is not None:
+            seen_sink_boundaries: set[str] = set()
+            for sink_producer in sink_producers:
+                sink_boundary = _producer_entry_row_union_boundary(sink_producer)
+                if sink_boundary is None:
+                    continue
+                boundary_node, boundary_emits = sink_boundary
+                if boundary_node.id in seen_sink_boundaries:
+                    continue
+                seen_sink_boundaries.add(boundary_node.id)
+                sink_extras_error = _sink_locked_extras_error(
+                    output,
+                    producer_id=boundary_node.id,
+                    producer_label=boundary_node.node_type,
+                    producer_emit=boundary_emits,
+                    sink_locked_input=sink_locked_input,
+                )
+                if sink_extras_error is not None:
+                    errors.append(sink_extras_error)
 
         seen_sink_contract_producers: set[str] = set()
         for sink_producer in sink_producers:
@@ -3212,30 +3437,15 @@ def _check_schema_contracts(
                 # deterministic parse paths on the same options — a ValueError here
                 # would be a non-determinism bug in our own code, not a fresh Tier-3
                 # fault, so it is left to crash rather than silently swallowed.
-                producer_emit = _producer_emit_set(actual_producer)
-                extras = producer_emit - sink_locked_input
-                if extras:
-                    errors.append(
-                        _err(
-                            f"output:{output.name}",
-                            f"Schema contract violation: '{actual_producer.producer_id}' -> 'output:{output.name}'. "
-                            f"Sink '{output.name}' input is locked (mode: fixed) and accepts: "
-                            f"[{_format_fields(sink_locked_input)}]. "
-                            f"Producer ({_producer_label(actual_producer)}) will emit: "
-                            f"[{_format_fields(producer_emit)}]. "
-                            f"Extra fields rejected by sink input contract: [{_format_fields(extras)}]. "
-                            f"Fix by relaxing the sink schema (mode: flexible) or by inserting a "
-                            f"field_mapper with select_only: true to drop the extras before this sink.",
-                            "high",
-                            "sink_locked_extras",
-                            # Identifiers + field names only (see SchemaContractDetail).
-                            contract=SchemaContractDetail(
-                                producer=actual_producer.producer_id,
-                                consumer=f"output:{output.name}",
-                                extra_fields=tuple(sorted(extras)),
-                            ),
-                        )
-                    )
+                sink_extras_error = _sink_locked_extras_error(
+                    output,
+                    producer_id=actual_producer.producer_id,
+                    producer_label=_producer_label(actual_producer),
+                    producer_emit=_producer_emit_set(actual_producer),
+                    sink_locked_input=sink_locked_input,
+                )
+                if sink_extras_error is not None:
+                    errors.append(sink_extras_error)
 
     # Rule C: per-transform self-consistency between declared output schema
     # and the *actual* predicted emit set, scoped to plugins whose emit set
