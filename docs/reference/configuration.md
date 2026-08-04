@@ -1099,10 +1099,20 @@ the two conforming shapes and what each does to a failed row.
 document-analysis job over a document already stored in S3, and adds the
 extracted text, tables, forms, and layout to the row.
 
-Unlike most transforms, it takes its S3 references **from row data, not from
-static options**: `bucket_field` and `key_field` name the input fields holding
-the bucket and key, so one manifest row drives one document. `version_field` is
-optional and pins a specific S3 object version.
+Documents are located in one of two mutually exclusive modes:
+
+- **Static bucket mode**: `bucket` names the S3 bucket directly and rows carry
+  only relative object keys in `key_field`. An optional `key_prefix` (a
+  canonical relative path) is joined ahead of every row key, and row keys are
+  rejected if they are absolute, contain traversal segments, or overflow the
+  joined 1024-byte S3 key bound. This is the mode the Web Composer's operator
+  document profiles lower into: rows carry keys, never locations.
+- **Row-data mode**: `bucket_field` and `key_field` name the input fields
+  holding the bucket and key, so one manifest row supplies both halves of the
+  document location.
+
+In both modes `version_field` is optional and pins a specific S3 object
+version.
 
 Because those references come from row data, the manifest source must
 **guarantee** `doc_bucket`/`doc_key` as required declared fields.
