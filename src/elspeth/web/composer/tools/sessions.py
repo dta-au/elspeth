@@ -2446,15 +2446,29 @@ async def _handle_request_interpretation_review(
     # Rate-limit gate. Cap-exceeded raises ToolArgumentError; the compose
     # loop is expected to react by writing an AUTO_INTERPRETED_NO_SURFACES
     # event (handled in service.py — see ``record_auto_interpreted_no_surfaces_event``).
-    await _check_interpretation_rate_limits(
-        session_id=session_id,
-        user_term=parsed.user_term,
-        composition_state_id=composition_state_id,
-        list_events_fn=list_interpretation_events,
-        per_term_cap=per_term_cap,
-        per_session_day_cap=per_session_day_cap,
-        now=now,
-    )
+    #
+    # ``pipeline_decision`` is exempt from both caps (elspeth-558fa5a321).
+    # Its user_terms come from the closed registered vocabulary — often a
+    # server-staged constant shared by MANY nodes (``required_control_auto_wired``
+    # rides on every auto-wired control), so the per-term budget conflates
+    # unrelated review sites and a graph with more cards than the cap can
+    # never surface them all. The dedup gate above already bounds churn per
+    # (kind, user_term, affected_node_id) site, and the caps' fallback —
+    # "bake the interpretation into the prompt" — is impossible for
+    # node-staged, validation-blocking disclosures the LLM cannot remove:
+    # a cap hit writes a terminal AUTO_INTERPRETED_NO_SURFACES event while
+    # the node requirement stays pending, wedging the session permanently
+    # (validation fails forever; the review API has nothing to resolve).
+    if parsed.kind is not InterpretationKind.PIPELINE_DECISION:
+        await _check_interpretation_rate_limits(
+            session_id=session_id,
+            user_term=parsed.user_term,
+            composition_state_id=composition_state_id,
+            list_events_fn=list_interpretation_events,
+            per_term_cap=per_term_cap,
+            per_session_day_cap=per_session_day_cap,
+            now=now,
+        )
     # Persist the pending row. The service method re-validates affected_node_id
     # under the session write lock (defence in depth — the compose-state could
     # in principle race with another writer; the service is the authoritative

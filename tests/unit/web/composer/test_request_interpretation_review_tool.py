@@ -2210,6 +2210,159 @@ async def test_08_per_term_rate_cap_after_three_surfacings(service: SessionServi
     assert sensitive_term not in exc_info.value.actual_type
 
 
+def _required_control_disclosure_node(node_id: str, *, draft: str) -> NodeSpec:
+    """An auto-wired control node carrying its server-staged disclosure card.
+
+    Mirrors ``required_controls._control_options``: every such node shares the
+    constant ``required_control_auto_wired`` user_term with a node-specific
+    disclosure draft (elspeth-558fa5a321).
+    """
+    return NodeSpec(
+        id=node_id,
+        node_type="transform",
+        plugin="content_safety",
+        input=f"{node_id}_in",
+        on_success=f"{node_id}_out",
+        on_error=None,
+        options={
+            "fields": ["content"],
+            "schema": {"mode": "observed"},
+            INTERPRETATION_REQUIREMENTS_KEY: [
+                {
+                    "id": f"{node_id}_disclosure",
+                    "kind": InterpretationKind.PIPELINE_DECISION.value,
+                    "user_term": "required_control_auto_wired",
+                    "status": "pending",
+                    "draft": draft,
+                    "event_id": None,
+                    "accepted_value": None,
+                    "accepted_artifact_hash": None,
+                    "resolved_prompt_template_hash": None,
+                }
+            ],
+        },
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+
+
+async def _seed_required_control_fleet(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    node_count: int,
+) -> tuple[CompositionState, UUID]:
+    """Persist a state carrying ``node_count`` auto-wired disclosure nodes."""
+    with service._engine.begin() as conn:
+        conn.execute(
+            insert(sessions_table).values(
+                id=str(session_id),
+                user_id="alice",
+                auth_provider_type="local",
+                title="Required-control cap exemption test",
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
+        )
+    state = CompositionState(
+        source=None,
+        nodes=tuple(
+            _required_control_disclosure_node(f"content_safety_auto_{i}", draft=f"Auto-wired control disclosure {i}.")
+            for i in range(node_count)
+        ),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    state_dict = state.to_dict()
+    persisted = await service.save_composition_state(
+        session_id,
+        CompositionStateData(
+            nodes=state_dict["nodes"],
+            metadata_=state_dict["metadata"],
+            is_valid=True,
+        ),
+        provenance="tool_call",
+    )
+    return state, persisted.id
+
+
+@pytest.mark.asyncio
+async def test_pipeline_decision_disclosures_exempt_from_per_term_cap(service: SessionServiceImpl) -> None:
+    """elspeth-558fa5a321: every auto-wired control disclosure shares the constant
+    ``required_control_auto_wired`` user_term, so the per-term cap (default 3)
+    made graphs with more than three such cards structurally unsurfaceable —
+    the 4th+ card became a terminal AUTO_INTERPRETED_NO_SURFACES row while its
+    node requirement stayed pending, wedging validation forever. pipeline_decision
+    reviews are bounded by the closed term registry and the per-site dedup gate,
+    and have no bake-into-the-prompt fallback, so the caps must not apply."""
+    session_id = uuid4()
+    state, state_id = await _seed_required_control_fleet(service, session_id, 6)
+
+    for i in range(6):
+        result = await _handle_request_interpretation_review(
+            arguments={
+                "affected_node_id": f"content_safety_auto_{i}",
+                "kind": "pipeline_decision",
+                "user_term": "required_control_auto_wired",
+                "llm_draft": f"Auto-wired control disclosure {i}.",
+            },
+            state=state,
+            session_id=session_id,
+            composition_state_id=state_id,
+            tool_call_id=f"call_disclosure_{i}",
+            now=_now(),
+            per_term_cap=3,
+            per_session_day_cap=10,
+            create_pending_interpretation_event=service.create_pending_interpretation_event,
+            list_interpretation_events=service.list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+        assert result.success is True, f"disclosure {i} must surface despite the per-term cap"
+        assert result.data["_kind"] == "interpretation_review_pending"
+
+    pending = await service.list_interpretation_events(session_id, status="pending")
+    assert len(pending) == 6
+
+
+@pytest.mark.asyncio
+async def test_pipeline_decision_disclosures_exempt_from_per_session_day_cap(service: SessionServiceImpl) -> None:
+    """elspeth-558fa5a321: same wedge via the per-session-day cap — a correction
+    whose graph carries more disclosure cards than the remaining day budget
+    permanently strands the overflow. pipeline_decision surfacing must not
+    consume or be blocked by the day budget."""
+    session_id = uuid4()
+    state, state_id = await _seed_required_control_fleet(service, session_id, 4)
+
+    for i in range(4):
+        result = await _handle_request_interpretation_review(
+            arguments={
+                "affected_node_id": f"content_safety_auto_{i}",
+                "kind": "pipeline_decision",
+                "user_term": "required_control_auto_wired",
+                "llm_draft": f"Auto-wired control disclosure {i}.",
+            },
+            state=state,
+            session_id=session_id,
+            composition_state_id=state_id,
+            tool_call_id=f"call_disclosure_{i}",
+            now=_now(),
+            per_term_cap=10,
+            per_session_day_cap=3,
+            create_pending_interpretation_event=service.create_pending_interpretation_event,
+            list_interpretation_events=service.list_interpretation_events,
+            **_provenance_kwargs(),
+        )
+        assert result.success is True, f"disclosure {i} must surface despite the per-day cap"
+
+    pending = await service.list_interpretation_events(session_id, status="pending")
+    assert len(pending) == 4
+
+
 @pytest.mark.asyncio
 async def test_09_per_session_day_rate_cap_after_ten_calls(service: SessionServiceImpl) -> None:
     """Spec test 9: 11th call with distinct user_terms raises (per-day cap)."""
