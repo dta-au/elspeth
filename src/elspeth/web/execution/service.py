@@ -286,6 +286,61 @@ def _merge_authoritative_proof_diagnostics(
     )
 
 
+def _merge_unavailable_authoritative_proof(result: ValidationResult) -> ValidationResult:
+    """Record a FAILED proof check when no bounded source proof could run.
+
+    Fail-closed counterpart to ``_merge_authoritative_proof_diagnostics`` for
+    states whose retained guided review custody cannot be bound to the live
+    sources (elspeth-3b45cdb41e): admission must never record a passing
+    ``proof_diagnostics`` check without actually running the proof.
+    """
+    if not result.is_valid:
+        return result
+
+    detail = "Bounded source proof unavailable for this state: retained guided review custody could not be bound to the live sources."
+    proof_check = ValidationCheck(
+        name=CHECK_PROOF_DIAGNOSTICS,
+        passed=False,
+        detail=detail,
+        affected_nodes=(),
+        outcome_code=None,
+    )
+    checks = _insert_proof_check(result.checks, proof_check)
+    return result.model_copy(
+        update={
+            "is_valid": False,
+            "checks": checks,
+            "errors": [
+                *result.errors,
+                ValidationError(
+                    component_id=None,
+                    component_type="source",
+                    message=detail,
+                    suggestion=(
+                        "Re-select or re-upload the source and re-run validation, or "
+                        "re-enter guided review so the reviewed custody binds again."
+                    ),
+                    error_code="source_inspection_failed",
+                ),
+            ],
+            "readiness": ValidationReadiness(
+                authoring_valid=False,
+                execution_ready=False,
+                completion_ready=False,
+                blockers=[
+                    *result.readiness.blockers,
+                    ValidationReadinessBlocker(
+                        code="source_inspection_failed",
+                        component_id=None,
+                        component_type="source",
+                        detail="Bounded source proof was unavailable; execution fails closed.",
+                    ),
+                ],
+            ),
+        }
+    )
+
+
 def _build_web_plugin_policy_evidence(
     *,
     snapshot: PluginAvailabilitySnapshot,
@@ -750,15 +805,20 @@ class ExecutionServiceImpl:
         session_id: UUID | None,
     ) -> Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None]:
         """Resolve only exact, session-owned, ready blob bindings for proof."""
-        from elspeth.web.composer.guided.state_machine import TerminalKind
         from elspeth.web.composer.guided_blob_refs import validate_guided_reviewed_blob_binding
         from elspeth.web.composer.tools.blobs import BlobToolRecord
         from elspeth.web.composer.tools.generation import ResolvedProofBlob, UnresolvedClaimedProofBlob
         from elspeth.web.paths import SOURCE_LOCAL_PATH_OPTION_KEYS
 
+        # Admission direction (elspeth-3b45cdb41e): the sentinel-claim census
+        # deliberately includes EXITED_TO_FREEFORM history. A retained review
+        # claim whose live binding cannot be resolved must surface as the
+        # blocking UnresolvedClaimedProofBlob diagnostic, not silently abstain
+        # — excluding exited history here (39c7f) mirrored the export-family
+        # skip, whose failure direction is wrong for admission.
         claimed_sentinel_blob_ids: set[str] = set()
         guided = state.guided_session
-        if guided is not None and (guided.terminal is None or guided.terminal.kind is not TerminalKind.EXITED_TO_FREEFORM):
+        if guided is not None:
             for reviewed_source in guided.reviewed_sources.values():
                 binding = validate_guided_reviewed_blob_binding(reviewed_source.options)
                 if binding is not None and binding.is_sentinel:
@@ -871,7 +931,7 @@ class ExecutionServiceImpl:
     ) -> ValidationResult:
         """Run the canonical 24 checks and bounded source proof in one worker."""
         from elspeth.web.composer.tools.generation import compute_proof_diagnostics
-        from elspeth.web.composer.yaml_generator import reattach_guided_blob_refs_for_public_export
+        from elspeth.web.composer.yaml_generator import derive_guided_blob_refs_for_admission_proof
         from elspeth.web.execution.validation import validate_pipeline
 
         def _blob_get_metadata(blob_id: UUID) -> BlobRecord | None:
@@ -902,7 +962,14 @@ class ExecutionServiceImpl:
         if not result.is_valid:
             return result
 
-        proof_state = reattach_guided_blob_refs_for_public_export(state)
+        # Admission-direction derivation (elspeth-3b45cdb41e): unlike the
+        # export-family consumers, an EXITED_TO_FREEFORM terminal must not
+        # skip the retained review custody — that skip fabricated a passing
+        # proof check for exactly the pipeline guided confirmation blocked.
+        derivation = derive_guided_blob_refs_for_admission_proof(state)
+        if derivation.custody_unavailable:
+            return _merge_unavailable_authoritative_proof(result)
+        proof_state = derivation.proof_state
         diagnostics = compute_proof_diagnostics(
             proof_state,
             session_id=str(session_id) if session_id is not None else None,

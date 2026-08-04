@@ -27,7 +27,7 @@ local paths after ownership checks pass.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, TypedDict, cast
 
 import yaml
@@ -332,12 +332,84 @@ def reattach_guided_blob_refs_for_public_export(state: CompositionState) -> Comp
     possible re-entry, but it is no longer current source authority. Completed
     guided sessions remain authoritative until an explicit exit records that
     lifecycle boundary.
+
+    Direction note (elspeth-3b45cdb41e): this identity return is correct for
+    EXPORT consumers only — exported YAML must not shadow a replaced freeform
+    source with stale guided history. The run-admission proof needs the
+    opposite failure direction; it must use
+    :func:`derive_guided_blob_refs_for_admission_proof`, never this function.
     """
     guided = state.guided_session
     if guided is None or not guided.reviewed_sources:
         return state
     if guided.terminal is not None and guided.terminal.kind is TerminalKind.EXITED_TO_FREEFORM:
         return state
+    return _reattach_guided_reviewed_blob_bindings(state)
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionProofDerivation:
+    """Admission-direction proof-state derivation outcome.
+
+    ``custody_unavailable=True`` means retained guided review custody exists
+    but could not be bound to the live sources; the admission consumer must
+    record a FAILED (blocking) proof check — never a pass without a proof run.
+    ``proof_state`` is then the untouched input state, provided only so the
+    caller has a coherent state object; it carries no derived custody.
+    """
+
+    proof_state: CompositionState
+    custody_unavailable: bool
+
+
+def derive_guided_blob_refs_for_admission_proof(state: CompositionState) -> AdmissionProofDerivation:
+    """Derive the source-proof state for run admission, failing closed.
+
+    Export and admission consume the same reviewed-source history with
+    OPPOSITE safety directions (epic elspeth-c1b8b26d32).
+    :func:`reattach_guided_blob_refs_for_public_export` keeps its
+    ``EXITED_TO_FREEFORM`` identity return — exited history is no longer
+    authoring authority and must not shadow a replaced freeform source in an
+    export. The admission proof must NOT inherit that skip: for admission the
+    retained review history is still proof custody, and skipping it recorded a
+    fabricated passing ``proof_diagnostics`` check for exactly the pipeline
+    guided confirmation had just blocked (elspeth-3b45cdb41e).
+
+    Non-exited states derive byte-identically to the export path, including
+    letting :class:`AuditIntegrityError` propagate. Exited states run the same
+    strict binding; when the diverged freeform state can no longer bind the
+    retained custody (renamed/removed sources, re-pointed carriers, or a
+    conflicting live ``blob_ref``), the derivation reports
+    ``custody_unavailable=True`` so admission blocks instead of admitting an
+    unproven source.
+
+    Never mutates ``state``; the derived custody exists only for the proof
+    computation and is not persisted.
+    """
+    guided = state.guided_session
+    if guided is None or not guided.reviewed_sources:
+        return AdmissionProofDerivation(proof_state=state, custody_unavailable=False)
+    if guided.terminal is not None and guided.terminal.kind is TerminalKind.EXITED_TO_FREEFORM:
+        try:
+            derived = _reattach_guided_reviewed_blob_bindings(state)
+        except AuditIntegrityError:
+            return AdmissionProofDerivation(proof_state=state, custody_unavailable=True)
+        return AdmissionProofDerivation(proof_state=derived, custody_unavailable=False)
+    return AdmissionProofDerivation(
+        proof_state=_reattach_guided_reviewed_blob_bindings(state),
+        custody_unavailable=False,
+    )
+
+
+def _reattach_guided_reviewed_blob_bindings(state: CompositionState) -> CompositionState:
+    """Bind retained reviewed-source custody onto a working copy of ``state``.
+
+    Shared binding body for both directions above; callers own the terminal
+    gating. Raises :class:`AuditIntegrityError` when the retained history and
+    the live sources disagree.
+    """
+    guided = state.guided_session
+    assert guided is not None  # callers gate on a populated guided session
 
     reviewed_bindings: list[tuple[str, frozenset[str], str]] = []
     sentinel_bindings: list[tuple[str, GuidedReviewedBlobBinding]] = []
