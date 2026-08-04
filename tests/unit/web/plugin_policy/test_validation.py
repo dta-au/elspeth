@@ -257,6 +257,56 @@ def test_validate_plugin_policy_rejects_textract_identity_from_a_non_textract_co
         )
 
 
+def test_textract_unexpected_location_option_gets_storage_binding_prose() -> None:
+    """A web-authored bucket_field on a profiled Textract node must draw the
+    storage-binding repair message, not the LLM-family provider/model prose —
+    the planner repairs from this message, and wrong guidance cannot converge."""
+    from typing import cast
+
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+    from elspeth.web.plugin_policy.validation import validate_plugin_policy
+
+    registry, snapshot, catalog = _textract_policy_context()
+    node = NodeSpec(
+        id="textract_1",
+        node_type="transform",
+        plugin="aws_textract_document_analysis",
+        input="transform_in",
+        on_success="results",
+        on_error="discard",
+        options={
+            "profile": "acceptance-docs",
+            "bucket_field": "doc_bucket",
+            "key_field": "document_key",
+            "feature_types": ["FORMS"],
+            "text_field": "textract_text",
+            "schema": {"mode": "observed"},
+        },
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+    )
+    state = CompositionState(source=None, nodes=(node,), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+
+    result = validate_plugin_policy(
+        state,
+        snapshot=cast(PluginAvailabilitySnapshot, snapshot),
+        profile_registry=cast(OperatorProfileRegistry, registry),
+        catalog=cast(CatalogService, catalog),
+    )
+
+    finding = next(item for item in result.findings if item.stage == "operator_profile_options")
+    assert "bucket_field" in finding.message
+    assert "private storage binding" in finding.message
+    assert "provider/model" not in finding.message
+
+
 def test_textract_alias_as_literal_bucket_value_names_the_confusion() -> None:
     """F10 guard (elspeth-cd0f6a6cd9): battery run e41d0e6b authored the operator
     profile alias as a literal bucket value; the generic 'not authorable'

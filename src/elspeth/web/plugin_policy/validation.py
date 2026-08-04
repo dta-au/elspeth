@@ -35,6 +35,14 @@ PolicyValidationStage = Literal[
 
 _PROFILE_LOWERING_METADATA_OPTION_KEYS = AUTHORING_METADATA_OPTION_KEYS | {"resolved_prompt_template_hash"}
 
+# Profiled plugins whose operator binding is a STORAGE location rather than an
+# LLM-family provider/model/credential set — their rejection prose must speak
+# storage-binding repair language or the planner repair loop cannot converge.
+_STORAGE_PROFILED_COMPONENT_KINDS: dict[PluginId, str] = {
+    PluginId("source", "aws_s3"): "source",
+    PluginId("transform", "aws_textract_document_analysis"): "node",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class PluginPolicyFinding:
@@ -480,9 +488,10 @@ def _lower_profiled_components(
             allowed_properties = set(public_schema.get("properties") or ())
             unexpected = sorted(set(public_options) - allowed_properties)
             if unexpected:
-                if plugin_id == PluginId("source", "aws_s3"):
+                storage_component_kind = _STORAGE_PROFILED_COMPONENT_KINDS.get(plugin_id)
+                if storage_component_kind is not None:
                     detail = (
-                        f"option(s) not authorable on a profile-bound source: {unexpected}. "
+                        f"option(s) not authorable on a profile-bound {storage_component_kind}: {unexpected}. "
                         "Remove them; the operator profile supplies the private storage binding."
                     )
                 else:
@@ -518,7 +527,7 @@ def _lower_profiled_components(
             # real defect was an operator-private option in their node — a
             # message no planner can repair from.
             if str(exc) == "private_profile_option":
-                if plugin_id == PluginId("source", "aws_s3"):
+                if plugin_id in _STORAGE_PROFILED_COMPONENT_KINDS:
                     message = (
                         f"Plugin '{plugin_id}' profile-bound options include operator-private storage settings. "
                         "Remove them; the operator profile supplies the private binding."

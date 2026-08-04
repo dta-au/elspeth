@@ -1977,6 +1977,55 @@ def test_settings_from_env_parses_s3_source_profiles_without_repr_leaking_privat
     assert private_prefix not in repr(settings.aws_s3_source_profiles[0])
 
 
+def test_settings_from_env_parses_textract_profiles_without_repr_leaking_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_bucket = "operator-private-bucket-marker"
+    private_prefix = "operator-private-prefix-marker"
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-1")
+    monkeypatch.setenv(
+        "ELSPETH_WEB__AWS_TEXTRACT_PROFILES",
+        json.dumps(
+            [
+                {
+                    "alias": "acceptance-docs",
+                    "bucket": private_bucket,
+                    "key_prefix": private_prefix,
+                }
+            ]
+        ),
+    )
+
+    settings = web_config.settings_from_env()
+
+    assert settings.aws_textract_profiles[0].alias == "acceptance-docs"
+    assert settings.aws_textract_profiles[0].bucket == private_bucket
+    assert settings.aws_textract_profiles[0].key_prefix == private_prefix
+    assert private_bucket not in repr(settings.aws_textract_profiles[0])
+    assert private_prefix not in repr(settings.aws_textract_profiles[0])
+
+
+def test_settings_from_env_rejects_invalid_textract_profiles_without_echoing_private_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_bucket = "operator-private-bucket-marker"
+    monkeypatch.setenv(
+        "ELSPETH_WEB__AWS_TEXTRACT_PROFILES",
+        json.dumps(
+            [
+                {"alias": "acceptance-docs", "bucket": private_bucket},
+                {"alias": "acceptance-docs", "bucket": "other-private-bucket-marker"},
+            ]
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        web_config.settings_from_env()
+
+    assert "AWS_TEXTRACT_PROFILES" in str(exc_info.value).upper()
+    assert private_bucket not in str(exc_info.value)
+
+
 def test_settings_from_env_rejects_duplicate_s3_profile_aliases_without_echoing_private_binding(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

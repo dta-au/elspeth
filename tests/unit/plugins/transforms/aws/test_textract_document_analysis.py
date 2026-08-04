@@ -1242,7 +1242,28 @@ def test_bucket_mode_without_prefix_uses_row_key_directly() -> None:
     assert client.start_calls[0]["key"] == "invoice.pdf"
 
 
-@pytest.mark.parametrize("row_key", ["/absolute.pdf", "../escape.pdf", "a//b.pdf", "scans/", "s3:scheme.pdf"])
+@pytest.mark.parametrize(
+    "row_key",
+    [
+        "/absolute.pdf",
+        "../escape.pdf",
+        "a//b.pdf",
+        "scans/",
+        "s3:scheme.pdf",
+        "s3://other-bucket/secret.pdf",
+        "C:\\secret.pdf",
+        "records\\secret.pdf",
+        "records/../secret.pdf",
+        "records/./secret.pdf",
+        " leading-space.pdf",
+        "trailing-space.pdf ",
+        "control\x1fchar.pdf",
+        "delete\x7fchar.pdf",
+        "",
+        ".",
+        "..",
+    ],
+)
 def test_bucket_mode_rejects_non_relative_row_keys(row_key: str) -> None:
     client = FakeTextractClient(pages=[])
     transform = _bucket_mode_transform_for_client(client)
