@@ -121,7 +121,7 @@ describe("ChatPanel cold guided-start recovery with the real ChatInput", () => {
     });
   });
 
-  it("loses the submitted text immediately, then permits revised text after authoritative cancellation", async () => {
+  it("restores the submitted text after authoritative cancellation, then permits revised text", async () => {
     const user = userEvent.setup();
     apiMocks.startGuidedSession
       .mockImplementationOnce(
@@ -143,8 +143,10 @@ describe("ChatPanel cold guided-start recovery with the real ChatInput", () => {
 
     // The input keeps its place while the start is pending (the old pending
     // swap that unmounted it is retired — operator 2026-07-23); the box
-    // cleared on send and the text is nowhere client-persisted, so the
-    // submitted prompt is still unrecoverable-by-design.
+    // clears on send and stays empty while the operation is in flight. The
+    // text is never client-PERSISTED (no storage), but since
+    // elspeth-49b467d91a it is retained in component state and restored
+    // when the send verifiably fails to deliver.
     expect(screen.getByLabelText("Message input")).toHaveValue("");
     expect(screen.getByRole("status")).toHaveTextContent("Guided setup running");
     expect(window.sessionStorage.getItem("elspeth_guided_operation_retries_v2")).not.toContain(
@@ -153,9 +155,17 @@ describe("ChatPanel cold guided-start recovery with the real ChatInput", () => {
 
     await user.click(screen.getByRole("button", { name: "Stop" }));
     const recoveredTextarea = await screen.findByLabelText("Message input");
-    expect(recoveredTextarea).toHaveValue("");
+    // Authoritative cancellation settled with no durable checkpoint — the
+    // typed prompt comes back instead of being lost (elspeth-49b467d91a).
+    await waitFor(() =>
+      expect(recoveredTextarea).toHaveValue("Original prompt that is not persisted"),
+    );
     expect(useSessionStore.getState().error).toMatch(/revise your request and send it again/i);
+    expect(window.sessionStorage.getItem("elspeth_guided_operation_retries_v2") ?? "").not.toContain(
+      "Original prompt that is not persisted",
+    );
 
+    await user.clear(recoveredTextarea);
     await user.type(recoveredTextarea, "Revised prompt");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
