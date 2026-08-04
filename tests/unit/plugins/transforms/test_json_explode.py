@@ -13,12 +13,33 @@ import pytest
 
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import PluginConfigError
 from elspeth.testing import make_field, make_pipeline_row
 from tests.fixtures.factories import make_context
 
 # Common schema config for dynamic field handling (accepts any fields)
 DYNAMIC_SCHEMA = {"mode": "observed"}
+
+# Observed mode forbids explicit field definitions, so the synthesized
+# output_field/item_index declarations only exist under fixed/flexible mode.
+DECLARED_SCHEMA = {"mode": "fixed", "fields": ["id: int", "payload: any"]}
+
+
+def _run_post_emission_check(transform: BaseTransform, emitted_row: PipelineRow) -> None:
+    """Run the ADR-014 post-emission check that the transform executor runs on emission."""
+    from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
+
+    assert transform._output_schema_config is not None
+    verify_schema_config_mode(
+        output_schema_config=transform._output_schema_config,
+        emitted_rows=(emitted_row,),
+        plugin_name=transform.name,
+        node_id="json_explode-1",
+        run_id="run-1",
+        row_id="row-1",
+        token_id="token-1",
+    )
 
 
 class TestJSONExplodeHappyPath:
@@ -781,6 +802,126 @@ class TestJSONExplodeHeterogeneousTypes:
         item_field = result.rows[0].contract.get_field("item")
         assert item_field is not None
         assert item_field.python_type is object
+
+
+class TestJSONExplodeDeclaredOutputFieldContracts:
+    """Tests for declared output field metadata on emitted contracts (elspeth-38aae1498d).
+
+    Under fixed/flexible mode ``_build_json_explode_output_schema_config``
+    synthesizes required declarations for ``output_field`` and ``item_index``,
+    but the emit path infers both from runtime values as ``required=False``.
+    ADR-014's post-emission check compares the two, so JSONExplode must restamp
+    the declaration on emission the way its sibling LineExplode does.
+    """
+
+    @pytest.fixture
+    def ctx(self) -> PluginContext:
+        """Create minimal plugin context."""
+        return make_context()
+
+    def test_fixed_mode_restamps_synthesized_output_field_declarations(self, ctx: PluginContext) -> None:
+        """Synthesized output_field/item_index declarations reach the emitted contract."""
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        transform = JSONExplode(
+            {
+                "schema": DECLARED_SCHEMA,
+                "array_field": "payload",
+                "output_field": "item",
+                "include_index": True,
+            }
+        )
+        row = PipelineRow(
+            {"id": 1, "payload": ["a", "b"]},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("id", int, required=True, source="declared"),
+                    make_field("payload", object, required=True, source="declared"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert result.rows is not None
+        for emitted in result.rows:
+            _run_post_emission_check(transform, emitted)
+        contract = result.rows[0].contract
+        assert contract.get_field("item").required is True
+        assert contract.get_field("item_index").required is True
+        assert contract.get_field("item_index").python_type is int
+
+    def test_fixed_mode_without_item_index_restamps_only_the_output_field(self, ctx: PluginContext) -> None:
+        """include_index=False synthesizes no item_index, so none is declared or emitted."""
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        transform = JSONExplode(
+            {
+                "schema": DECLARED_SCHEMA,
+                "array_field": "payload",
+                "output_field": "item",
+                "include_index": False,
+            }
+        )
+        row = PipelineRow(
+            {"id": 1, "payload": ["a", "b"]},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("id", int, required=True, source="declared"),
+                    make_field("payload", object, required=True, source="declared"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert result.rows is not None
+        assert transform._output_schema_config is not None
+        assert all(field.name != "item_index" for field in transform._output_schema_config.fields)
+        for emitted in result.rows:
+            _run_post_emission_check(transform, emitted)
+        contract = result.rows[0].contract
+        assert contract.get_field("item").required is True
+        assert contract.find_field("item_index") is None
+
+    def test_fixed_mode_heterogeneous_array_still_types_output_field_as_object(self, ctx: PluginContext) -> None:
+        """Restamping the declaration must not undo the heterogeneous-type widening."""
+        from elspeth.plugins.transforms.json_explode import JSONExplode
+
+        transform = JSONExplode(
+            {
+                "schema": DECLARED_SCHEMA,
+                "array_field": "payload",
+                "output_field": "item",
+            }
+        )
+        row = PipelineRow(
+            {"id": 1, "payload": ["a", {"k": 1}]},
+            SchemaContract(
+                mode="FIXED",
+                fields=(
+                    make_field("id", int, required=True, source="declared"),
+                    make_field("payload", object, required=True, source="declared"),
+                ),
+                locked=True,
+            ),
+        )
+
+        result = transform.process(row, ctx)
+
+        assert result.status == "success"
+        assert result.rows is not None
+        for emitted in result.rows:
+            _run_post_emission_check(transform, emitted)
+        # The synthesized declaration is 'any', which is object — the same
+        # widening the heterogeneity branch applies, so the two agree.
+        assert result.rows[0].contract.get_field("item").python_type is object
 
 
 class TestJSONExplodeCopyIsolation:

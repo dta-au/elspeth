@@ -177,7 +177,7 @@ class JSONExplode(BaseTransform):
     name = "json_explode"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:f6306457e6405ce6"
+    source_file_hash: str | None = "sha256:7ab4c0d936735f9d"
     config_model = JSONExplodeConfig
     usage_when_to_use: str = (
         "Use when one JSON array field in each row must become multiple rows, with the surrounding "
@@ -466,6 +466,7 @@ class JSONExplode(BaseTransform):
                 fields=patched_fields,
                 locked=True,
             )
+        output_contract = self._apply_declared_output_field_contracts(output_contract)
         output_contract = self._align_output_contract(output_contract)
 
         return TransformResult.success_multi(
