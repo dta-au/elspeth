@@ -91,6 +91,12 @@ ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE: Final = "The pipeline is configured and r
 ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE: Final = (
     "The pipeline update is ready for the required review. Resolve the pending review before running it."
 )
+# elspeth-88592f5be7: published when the advisor-repair turn ends with
+# ``runtime_preflight=None`` — no deterministic validation ran this turn, so
+# readiness is UNKNOWN, not ready. ``None`` is documented as fail-closed
+# unknown by the END advisor gate; this surface must not read the same
+# sentinel as an affirmative readiness claim.
+ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE: Final = "ELSPETH completed the advisor repair turn. Pipeline readiness was not determined this turn; run validation to confirm the pipeline state."
 
 _MAX_INTENT_CLASSIFICATION_CHARS: Final = 4_096
 _MUTATION_ACTION_PATTERN: Final = (

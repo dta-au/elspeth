@@ -352,6 +352,7 @@ _ADVISOR_SIGNOFF_PENDING_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTIC
 _ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE
 _ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
 _ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE
+_ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE
 _compose_empty_state_message = _no_tool_policy.compose_empty_state_message
 _compose_preflight_failure_message = _no_tool_policy.compose_preflight_failure_message
 _enforce_augmentation_prefix_invariant = _no_tool_policy.enforce_augmentation_prefix_invariant
@@ -878,9 +879,25 @@ def _replace_advisor_repair_public_result(result: ComposerResult) -> ComposerRes
     is replaced: it was generated after the model received an internal advisor
     finding, so it is not safe as a human or persisted transcript surface even
     when the next checkpoint returns CLEAN.
+
+    elspeth-88592f5be7: ``runtime_preflight is None`` means the preflight was
+    NOT COMPUTED this turn (``_turn_runtime_preflight`` returns the initial
+    ``None`` when no mutation landed) — the same tri-state sentinel the END
+    advisor gate documents as "unknown, fail closed". It previously rode the
+    success disjunct here, publishing and persisting "The pipeline is
+    configured and ready." for a turn in which nothing validated. Unknown
+    readiness now publishes the fixed unverified wording instead; the model's
+    own prose stays withheld because it was produced inside the repair cohort.
+    Only a preflight that actually ran and passed may assert readiness.
     """
     runtime_result = result.runtime_preflight
-    if runtime_result is None or (runtime_result.is_valid and runtime_result.readiness.completion_ready):
+    if runtime_result is None:
+        return replace(
+            result,
+            message=_ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE,
+            raw_assistant_content=None,
+        )
+    if runtime_result.is_valid and runtime_result.readiness.completion_ready:
         return replace(
             result,
             message=_ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE,
