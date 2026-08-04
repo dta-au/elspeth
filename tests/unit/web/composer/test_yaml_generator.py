@@ -1628,3 +1628,138 @@ sinks:
         assert dict(reimported_queue.options) == {"description": "interleave point"}
         assert dict(reimported_queue.options) == dict(original_queue.options)
         assert [source.on_success for source in reimported.sources.values()] == ["inbound", "inbound"]
+
+
+class TestGuidedTerminalProofDirectionSplit:
+    """Export and admission consume reviewed history in OPPOSITE directions.
+
+    elspeth-3b45cdb41e (epic elspeth-c1b8b26d32): the EXITED_TO_FREEFORM
+    identity return is correct for export-family consumers and a fail-open for
+    the run-admission proof. These tests pin the export direction unchanged
+    and assert the two directions DISAGREE for an exited session, so a future
+    re-unification fails loudly.
+    """
+
+    _BLOB_REF = "20b944e3-fd46-434f-b9a2-4fb508db30f0"
+    _STABLE_ID = "11111111-1111-4111-8111-111111111111"
+
+    def _guided_state(self, terminal: object) -> CompositionState:
+        from elspeth.web.composer.guided.state_machine import GuidedSession as _GuidedSession
+
+        storage_path = f"/home/john/elspeth/data/blobs/session/{self._BLOB_REF}.csv"
+        guided_session = replace(
+            _GuidedSession.initial(),
+            source_order=(self._STABLE_ID,),
+            reviewed_sources={
+                self._STABLE_ID: SourceResolved(
+                    name="source",
+                    plugin="csv",
+                    options={
+                        "path": f"blob:{self._BLOB_REF}",
+                        "schema": {"mode": "observed"},
+                    },
+                    observed_columns=("amount",),
+                    sample_rows=(),
+                    on_validation_failure="discard",
+                )
+            },
+            terminal=terminal,
+        )
+        return CompositionState(
+            sources={
+                "source": SourceSpec(
+                    plugin="csv",
+                    on_success="out",
+                    options={"path": storage_path, "schema": {"mode": "observed"}},
+                    on_validation_failure="discard",
+                )
+            },
+            nodes=(),
+            edges=(),
+            outputs=(OutputSpec(name="out", plugin="json", options={}, on_write_failure="discard"),),
+            metadata=PipelineMetadata(),
+            version=1,
+            guided_session=guided_session,
+        )
+
+    @staticmethod
+    def _exited_terminal() -> object:
+        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalReason, TerminalState
+
+        return TerminalState(
+            kind=TerminalKind.EXITED_TO_FREEFORM,
+            reason=TerminalReason.USER_PRESSED_EXIT,
+            pipeline_yaml=None,
+        )
+
+    @staticmethod
+    def _completed_terminal() -> object:
+        from elspeth.web.composer.guided.state_machine import TerminalKind, TerminalState
+
+        return TerminalState(kind=TerminalKind.COMPLETED, reason=None, pipeline_yaml="pipeline: {}")
+
+    def test_export_reattach_keeps_exited_identity_return(self) -> None:
+        from elspeth.web.composer.yaml_generator import reattach_guided_blob_refs_for_public_export
+
+        state = self._guided_state(self._exited_terminal())
+        assert reattach_guided_blob_refs_for_public_export(state) is state
+
+    def test_sessions_route_export_wrapper_keeps_exited_identity_return(self) -> None:
+        from elspeth.web.sessions.routes.composer.state import _reattach_guided_blob_refs
+
+        state = self._guided_state(self._exited_terminal())
+        assert _reattach_guided_blob_refs(state) is state
+
+    def test_admission_derivation_disagrees_with_export_for_exited_terminal(self) -> None:
+        from elspeth.web.composer.yaml_generator import (
+            derive_guided_blob_refs_for_admission_proof,
+            reattach_guided_blob_refs_for_public_export,
+        )
+
+        state = self._guided_state(self._exited_terminal())
+
+        derivation = derive_guided_blob_refs_for_admission_proof(state)
+
+        assert reattach_guided_blob_refs_for_public_export(state) is state
+        assert derivation.custody_unavailable is False
+        assert derivation.proof_state is not state
+        assert derivation.proof_state.sources["source"].options["blob_ref"] == self._BLOB_REF
+        # The durable state is never mutated by the admission derivation.
+        assert "blob_ref" not in state.sources["source"].options
+
+    @pytest.mark.parametrize("terminal_kind", ["live", "completed"])
+    def test_admission_derivation_matches_export_for_non_exited_terminals(self, terminal_kind: str) -> None:
+        from elspeth.web.composer.yaml_generator import (
+            derive_guided_blob_refs_for_admission_proof,
+            reattach_guided_blob_refs_for_public_export,
+        )
+
+        terminal = None if terminal_kind == "live" else self._completed_terminal()
+        state = self._guided_state(terminal)
+
+        derivation = derive_guided_blob_refs_for_admission_proof(state)
+        export_state = reattach_guided_blob_refs_for_public_export(state)
+
+        assert derivation.custody_unavailable is False
+        assert derivation.proof_state.to_dict() == export_state.to_dict()
+        assert derivation.proof_state.sources["source"].options["blob_ref"] == self._BLOB_REF
+
+    def test_admission_derivation_fails_closed_when_exited_history_cannot_bind(self) -> None:
+        from elspeth.web.composer.yaml_generator import derive_guided_blob_refs_for_admission_proof
+
+        base = self._guided_state(self._exited_terminal())
+        state = replace(base, sources={"renamed": base.sources["source"]})
+
+        derivation = derive_guided_blob_refs_for_admission_proof(state)
+
+        assert derivation.custody_unavailable is True
+        assert derivation.proof_state is state
+
+    def test_admission_derivation_propagates_binding_failure_for_non_exited_terminals(self) -> None:
+        from elspeth.web.composer.yaml_generator import derive_guided_blob_refs_for_admission_proof
+
+        base = self._guided_state(None)
+        state = replace(base, sources={"renamed": base.sources["source"]})
+
+        with pytest.raises(AuditIntegrityError, match="guided blob source mapping"):
+            derive_guided_blob_refs_for_admission_proof(state)
