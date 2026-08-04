@@ -15,6 +15,7 @@ Layer: L3 (application).
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import re
@@ -353,6 +354,8 @@ _ADVISOR_SIGNOFF_PENDING_NOTICE = _no_tool_policy._ADVISOR_SIGNOFF_PENDING_NOTIC
 _ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_INTERMEDIATE_PUBLIC_MESSAGE
 _ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE
 _ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE
+_ADVISOR_REPAIR_REVIEW_WITH_FINDINGS_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_REVIEW_WITH_FINDINGS_PUBLIC_MESSAGE
+_first_validation_objection = _no_tool_policy.first_validation_objection
 _ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE = _no_tool_policy.ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE
 _compose_empty_state_message = _no_tool_policy.compose_empty_state_message
 _compose_preflight_failure_message = _no_tool_policy.compose_preflight_failure_message
@@ -849,10 +852,25 @@ def _tool_batch_staged_terminal_interpretation_review_handoff(tool_outcomes: tup
     return handoff_seen
 
 
-def _append_interpretation_review_handoff_message(result: ComposerResult, raw_content: str | None) -> ComposerResult:
-    """Append the review-handoff suffix while preserving LLM-history provenance."""
+def _append_interpretation_review_handoff_message(
+    result: ComposerResult,
+    raw_content: str | None,
+    *,
+    outstanding_findings: ValidationResult | None = None,
+) -> ComposerResult:
+    """Append the review-handoff suffix while preserving LLM-history provenance.
+
+    ``outstanding_findings`` carries the authoring-masked re-validation result
+    when it found failures behind the pending-review handoff
+    (elspeth-5a372d3267); the suffix must then say so instead of implying the
+    review is the only remaining step.
+    """
 
     suffix = "Interpretation review cards are ready for this pipeline. Review the pending assumptions to continue."
+    if outstanding_findings is not None:
+        objection = _first_validation_objection(outstanding_findings)
+        detail = objection if objection is not None else "run validation for details."
+        suffix = f"{suffix} Validation also found issues that must be fixed before this pipeline can run: {detail}"
     if result.raw_assistant_content is not None:
         augmented = f"{result.message}\n\n{suffix}" if result.message else suffix
         _enforce_augmentation_prefix_invariant(
@@ -872,7 +890,11 @@ def _append_interpretation_review_handoff_message(result: ComposerResult, raw_co
     return replace(result, message=augmented, raw_assistant_content=raw)
 
 
-def _replace_advisor_repair_public_result(result: ComposerResult) -> ComposerResult:
+def _replace_advisor_repair_public_result(
+    result: ComposerResult,
+    *,
+    outstanding_findings: ValidationResult | None = None,
+) -> ComposerResult:
     """Publish fixed prose after hidden advisor repair context was introduced.
 
     The returned state, tool/audit evidence, and deterministic validation
@@ -905,6 +927,18 @@ def _replace_advisor_repair_public_result(result: ComposerResult) -> ComposerRes
             raw_assistant_content=None,
         )
     if _is_pending_interpretation_handoff(runtime_result):
+        if outstanding_findings is not None:
+            # elspeth-5a372d3267: the strict ledger stopped at
+            # interpretation_review, so "ready for the required review" is
+            # unverified — the masked re-validation found failures in the
+            # stages that never ran. Name them instead of claiming ready.
+            objection = _first_validation_objection(outstanding_findings)
+            detail = objection if objection is not None else "run validation for details."
+            return replace(
+                result,
+                message=_ADVISOR_REPAIR_REVIEW_WITH_FINDINGS_PUBLIC_MESSAGE.format(detail=detail),
+                raw_assistant_content=None,
+            )
         return replace(
             result,
             message=_ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE,
@@ -1877,6 +1911,8 @@ class ComposerServiceImpl:
         user_id: str | None,
         session_id: str | None,
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+        *,
+        allow_pending_interpretation_placeholders: bool = False,
     ) -> ValidationResult:
         if plugin_snapshot is None:
             plugin_snapshot, _policy_catalog = self._plugin_policy_context(user_id)
@@ -1887,6 +1923,7 @@ class ComposerServiceImpl:
             secret_service=self._secret_service,
             user_id=user_id,
             session_id=session_id,
+            allow_pending_interpretation_placeholders=allow_pending_interpretation_placeholders,
             plugin_snapshot=plugin_snapshot,
             profile_registry=self._operator_profile_registry,
             catalog=self._catalog,
@@ -2133,6 +2170,7 @@ class ComposerServiceImpl:
         session_scope: str,
         llm_calls: tuple[ComposerLLMCall, ...] = (),
         plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+        interpretation_tolerant: bool = False,
     ) -> ValidationResult:
         settings_hash = runtime_preflight_settings_hash(self._settings)
         if plugin_snapshot is not None:
@@ -2142,6 +2180,7 @@ class ComposerServiceImpl:
             state_version=state.version,
             state_content_hash=composition_content_hash(state),
             settings_hash=settings_hash,
+            interpretation_tolerant=interpretation_tolerant,
         )
         # A cache miss is the normal, expected state on the first preflight for
         # this key — absence is not a missing-key bug, so membership-test then
@@ -2158,9 +2197,14 @@ class ComposerServiceImpl:
             )
 
         async def worker() -> ValidationResult:
+            preflight: Callable[..., ValidationResult] = (
+                functools.partial(self._runtime_preflight, allow_pending_interpretation_placeholders=True)
+                if interpretation_tolerant
+                else self._runtime_preflight
+            )
             args = (state, user_id, session_id) if plugin_snapshot is None else (state, user_id, session_id, plugin_snapshot)
             return await asyncio.wait_for(
-                run_sync_in_worker(self._runtime_preflight, *args),
+                run_sync_in_worker(preflight, *args),
                 timeout=self._runtime_preflight_timeout_seconds,
             )
 
@@ -2181,6 +2225,79 @@ class ComposerServiceImpl:
             )
         _RUNTIME_PREFLIGHT_COUNTER.add(1, {"outcome": "success"})
         return entry
+
+    async def _pending_handoff_outstanding_findings(
+        self,
+        state: CompositionState,
+        *,
+        user_id: str | None,
+        session_id: str | None,
+        cache: _RuntimePreflightCache,
+        initial_version: int,
+        session_scope: str,
+        llm_calls: tuple[ComposerLLMCall, ...] = (),
+        plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+    ) -> ValidationResult | None:
+        """Verify a pending-review handoff before it is announced (elspeth-5a372d3267).
+
+        ``review_interpretations`` fails the strict ledger at canonical index
+        10, stamping every later stage — including ``graph_structure`` at 21 —
+        ``SKIPPED_AFTER_FAILURE``, yet its readiness asserts
+        ``completion_ready=True``. Announcing "ready for the required review"
+        from that truncated result is an unverified claim (battery-2026-08-04
+        g08: compose published ready, the operator resolved the reviews, and
+        only then did /validate fail graph_structure). Re-run the preflight
+        with pending interpretation placeholders masked so the structural
+        stages actually execute; return the tolerant result when it is
+        invalid so the announce sites can qualify the handoff message. The
+        repair loop is deliberately NOT engaged — the staged-review handoff
+        contract returns to the user without extra model turns.
+        """
+        tolerant = await self._cached_runtime_preflight(
+            state,
+            user_id=user_id,
+            session_id=session_id,
+            cache=cache,
+            initial_version=initial_version,
+            session_scope=session_scope,
+            llm_calls=llm_calls,
+            plugin_snapshot=plugin_snapshot,
+            interpretation_tolerant=True,
+        )
+        return None if tolerant.is_valid else tolerant
+
+    async def _qualified_advisor_repair_public_result(
+        self,
+        result: ComposerResult,
+        *,
+        user_id: str | None,
+        session_id: str | None,
+        cache: _RuntimePreflightCache,
+        initial_version: int,
+        session_scope: str,
+        plugin_snapshot: PluginAvailabilitySnapshot | None = None,
+    ) -> ComposerResult:
+        """Advisor-repair prose replacement with a verified handoff claim.
+
+        Wraps ``_replace_advisor_repair_public_result``: when the turn ends in
+        the pending-review handoff shape, run the masked re-validation first
+        so the published message never claims "ready for the required review"
+        over stages the strict ledger skipped (elspeth-5a372d3267).
+        """
+        outstanding_findings: ValidationResult | None = None
+        runtime_result = result.runtime_preflight
+        if runtime_result is not None and _is_pending_interpretation_handoff(runtime_result):
+            outstanding_findings = await self._pending_handoff_outstanding_findings(
+                result.state,
+                user_id=user_id,
+                session_id=session_id,
+                cache=cache,
+                initial_version=initial_version,
+                session_scope=session_scope,
+                llm_calls=result.llm_calls,
+                plugin_snapshot=plugin_snapshot,
+            )
+        return _replace_advisor_repair_public_result(result, outstanding_findings=outstanding_findings)
 
     async def _attempt_empty_state_uploaded_blob_repair(
         self,
@@ -3900,8 +4017,24 @@ class ComposerServiceImpl:
                     mutation_success_seen=mutation_success_seen,
                     plugin_snapshot=plugin_snapshot,
                 )
+                outstanding_findings: ValidationResult | None = None
+                if result.runtime_preflight is not None and _is_pending_interpretation_handoff(result.runtime_preflight):
+                    outstanding_findings = await self._pending_handoff_outstanding_findings(
+                        result.state,
+                        user_id=user_id,
+                        session_id=session_id,
+                        cache=runtime_preflight_cache,
+                        initial_version=initial_version,
+                        session_scope=session_scope,
+                        llm_calls=recorder.llm_calls,
+                        plugin_snapshot=plugin_snapshot,
+                    )
                 handoff_result = (
-                    _append_interpretation_review_handoff_message(result, dispatch.raw_assistant_content)
+                    _append_interpretation_review_handoff_message(
+                        result,
+                        dispatch.raw_assistant_content,
+                        outstanding_findings=outstanding_findings,
+                    )
                     if (
                         result.runtime_preflight is None
                         or result.runtime_preflight.is_valid
@@ -4922,9 +5055,17 @@ class ComposerServiceImpl:
                             "the terminate-phase contract requires result to be set whenever the "
                             "phase signals a return."
                         )
-                    return (
-                        _replace_advisor_repair_public_result(terminate.result) if advisor_repair_context_introduced else terminate.result
-                    )
+                    if advisor_repair_context_introduced:
+                        return await self._qualified_advisor_repair_public_result(
+                            terminate.result,
+                            user_id=user_id,
+                            session_id=session_id,
+                            cache=runtime_preflight_cache,
+                            initial_version=initial_version,
+                            session_scope=session_scope,
+                            plugin_snapshot=plugin_snapshot,
+                        )
+                    return terminate.result
                 repair_turns_used += terminate.repair_turns_delta
                 advisor_checkpoint_passes_used += terminate.advisor_passes_delta
                 if terminate.advisor_injection_index is not None:
@@ -5210,7 +5351,17 @@ class ComposerServiceImpl:
                         "the classify-phase contract requires result to be set whenever the "
                         "phase signals a return."
                     )
-                return _replace_advisor_repair_public_result(classify.result) if advisor_repair_context_introduced else classify.result
+                if advisor_repair_context_introduced:
+                    return await self._qualified_advisor_repair_public_result(
+                        classify.result,
+                        user_id=user_id,
+                        session_id=session_id,
+                        cache=runtime_preflight_cache,
+                        initial_version=initial_version,
+                        session_scope=session_scope,
+                        plugin_snapshot=plugin_snapshot,
+                    )
+                return classify.result
             continue
 
     def _persist_crashed_session(self, session_id: str) -> None:

@@ -91,6 +91,14 @@ ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE: Final = "The pipeline is configured and r
 ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE: Final = (
     "The pipeline update is ready for the required review. Resolve the pending review before running it."
 )
+# elspeth-5a372d3267: published instead of the bare review message when the
+# authoring-masked re-validation behind a pending-review handoff found
+# failures in the stages the strict ledger never reached — "ready for the
+# required review" would falsely imply the review is the only thing between
+# the user and execution.
+ADVISOR_REPAIR_REVIEW_WITH_FINDINGS_PUBLIC_MESSAGE: Final = (
+    "A required interpretation review is pending. Validation also found issues that must be fixed before this pipeline can run: {detail}"
+)
 # elspeth-88592f5be7: published when the advisor-repair turn ends with
 # ``runtime_preflight=None`` — no deterministic validation ran this turn, so
 # readiness is UNKNOWN, not ready. ``None`` is documented as fail-closed
@@ -439,6 +447,16 @@ def compose_empty_state_message(content: str, *, blocker: str | None = None) -> 
     if not content:
         return suffix.lstrip("\n").lstrip("-").lstrip()
     return content + suffix
+
+
+def first_validation_objection(runtime_result: ValidationResult) -> str | None:
+    """Name the leading error (or failed check) from a validation result."""
+    if runtime_result.errors:
+        return runtime_result.errors[0].message
+    failed_checks = [check for check in runtime_result.checks if not check.passed]
+    if failed_checks:
+        return failed_checks[0].detail
+    return None
 
 
 def compose_preflight_failure_message(content: str, *, runtime_result: ValidationResult) -> str:

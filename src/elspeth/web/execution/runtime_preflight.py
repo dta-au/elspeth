@@ -21,6 +21,10 @@ class RuntimePreflightKey:
     state_version: int
     state_content_hash: str
     settings_hash: str
+    # True for the authoring-masked re-validation that verifies a pending
+    # interpretation-review handoff (elspeth-5a372d3267). Keyed separately so
+    # a tolerant entry never satisfies a strict lookup or vice versa.
+    interpretation_tolerant: bool = False
 
 
 @dataclass(frozen=True, slots=True)

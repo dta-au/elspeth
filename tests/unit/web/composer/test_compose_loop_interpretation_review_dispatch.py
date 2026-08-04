@@ -670,7 +670,13 @@ def test_composer_runtime_preflight_uses_backend_readiness_contract(
     tmp_path: Path,
     sessions_service: SessionServiceImpl,
 ) -> None:
-    """Composer preflight relies on typed readiness, not placeholder masking."""
+    """The STRICT composer preflight relies on typed readiness, not placeholder masking.
+
+    Placeholder masking is reserved for the pending-review handoff
+    verification pass (elspeth-5a372d3267), which requests it explicitly via
+    ``allow_pending_interpretation_placeholders=True``. The default preflight
+    — the readiness authority — must keep masking off.
+    """
 
     composer = _build_composer(tmp_path, sessions_service)
     state = _state_with_llm_node()
@@ -681,7 +687,7 @@ def test_composer_runtime_preflight_uses_backend_readiness_contract(
 
     assert result is expected
     validate.assert_called_once()
-    assert "allow_pending_interpretation_placeholders" not in validate.call_args.kwargs
+    assert validate.call_args.kwargs["allow_pending_interpretation_placeholders"] is False
 
 
 # ---------------------------------------------------------------------------
