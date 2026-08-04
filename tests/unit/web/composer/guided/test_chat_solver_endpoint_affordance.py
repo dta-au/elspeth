@@ -303,6 +303,7 @@ async def test_guided_chat_route_uses_primary_endpoint_not_advisor(monkeypatch: 
         settings=SimpleNamespace(
             composer_model="test/model",
             composer_temperature=None,
+            composer_discovery_reasoning_effort="none",
             composer_seed=None,
             composer_max_discovery_turns=1,
             composer_max_tool_calls_per_turn=16,
@@ -323,3 +324,103 @@ async def test_guided_chat_route_uses_primary_endpoint_not_advisor(monkeypatch: 
 
     assert captured["api_base"] == "https://primary-gateway.example.test/v1"
     assert captured["api_key"] == _SENTINEL_CREDENTIAL
+
+
+# --- reasoning-effort threading (elspeth-dc459d438e) --------------------------
+
+
+@pytest.mark.asyncio
+async def test_solve_step_chat_threads_the_discovery_reasoning_knob(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_acompletion(**kwargs: Any) -> _FakeResponse:
+        captured.update(kwargs)
+        return _text_response("reply")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+
+    await chat_solver.solve_step_chat(
+        model="gpt-5",
+        step=GuidedStep.STEP_1_SOURCE,
+        user_message="hi",
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+        reasoning_effort="low",
+    )
+
+    assert captured["reasoning_effort"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_solve_step_chat_uses_the_native_object_for_openrouter_models(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_acompletion(**kwargs: Any) -> _FakeResponse:
+        captured.update(kwargs)
+        return _text_response("reply")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+
+    await chat_solver.solve_step_chat(
+        model="openrouter/anthropic/claude-sonnet-5",
+        step=GuidedStep.STEP_1_SOURCE,
+        user_message="hi",
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+        reasoning_effort="low",
+    )
+
+    assert captured["reasoning"] == {"effort": "low"}
+    assert "reasoning_effort" not in captured
+
+
+@pytest.mark.asyncio
+async def test_solve_step_chat_default_is_unhinted(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_acompletion(**kwargs: Any) -> _FakeResponse:
+        captured.update(kwargs)
+        return _text_response("reply")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+
+    await chat_solver.solve_step_chat(
+        model="gpt-5",
+        step=GuidedStep.STEP_1_SOURCE,
+        user_message="hi",
+        temperature=None,
+        seed=None,
+        timeout_seconds=30.0,
+    )
+
+    assert "reasoning_effort" not in captured
+    assert "reasoning" not in captured
+
+
+@pytest.mark.asyncio
+async def test_deferred_intent_management_request_carries_the_reasoning_knob(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_acompletion(**kwargs: Any) -> _FakeResponse:
+        captured.update(kwargs)
+        return _text_response("ok")
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
+
+    await chat_solver.maybe_manage_deferred_intent_chat(
+        request=DeferredIntentManagementChatRequest(
+            model="gpt-4o",
+            step=GuidedStep.STEP_3_TRANSFORMS,
+            user_message="cancel one saved instruction",
+            temperature=None,
+            seed=None,
+            timeout_seconds=30.0,
+            context_block="safe context",
+            reasoning_effort="low",
+        ),
+        recorder=None,
+    )
+
+    assert captured["reasoning_effort"] == "low"

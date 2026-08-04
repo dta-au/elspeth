@@ -406,6 +406,7 @@ async def run_guided_chat_provider_attempt(
             allow_plugin_reselection=allow_plugin_reselection,
             api_base=endpoint_base_url,
             api_key=endpoint_api_key,
+            reasoning_effort=settings.composer_discovery_reasoning_effort,
         )
         if not isinstance(source_outcome, GuidedStepChatEmptyResult):
             if revision_form == "source":
@@ -447,6 +448,7 @@ async def run_guided_chat_provider_attempt(
             revision_target_index=revision_target_index,
             api_base=endpoint_base_url,
             api_key=endpoint_api_key,
+            reasoning_effort=settings.composer_discovery_reasoning_effort,
         )
         if not isinstance(sink_outcome, GuidedStepChatEmptyResult):
             if revision_form == "output":
@@ -478,6 +480,7 @@ async def run_guided_chat_provider_attempt(
                 context_block=context_block,
                 api_base=endpoint_base_url,
                 api_key=endpoint_api_key,
+                reasoning_effort=settings.composer_discovery_reasoning_effort,
             ),
             recorder=recorder,
         )
@@ -499,6 +502,7 @@ async def run_guided_chat_provider_attempt(
         context_block=context_block,
         api_base=endpoint_base_url,
         api_key=endpoint_api_key,
+        reasoning_effort=settings.composer_discovery_reasoning_effort,
     )
     if revision_form is not None:
         advisory = _replace(

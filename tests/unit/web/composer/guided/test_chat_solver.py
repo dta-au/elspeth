@@ -2152,6 +2152,7 @@ async def test_guided_chat_route_selects_active_output_for_revision_and_keeps_al
         settings=SimpleNamespace(
             composer_model="test/model",
             composer_temperature=None,
+            composer_discovery_reasoning_effort="none",
             composer_seed=None,
             composer_max_discovery_turns=1,
             composer_max_tool_calls_per_turn=16,
@@ -2228,6 +2229,7 @@ async def test_guided_chat_route_preserves_gapped_index_for_single_advisory_outp
         settings=SimpleNamespace(
             composer_model="test/model",
             composer_temperature=None,
+            composer_discovery_reasoning_effort="none",
             composer_seed=None,
             composer_max_discovery_turns=1,
             composer_max_tool_calls_per_turn=16,
@@ -2325,6 +2327,7 @@ async def test_applied_component_chat_revision_is_form_directed_without_mutation
         settings=SimpleNamespace(
             composer_model="test/model",
             composer_temperature=None,
+            composer_discovery_reasoning_effort="none",
             composer_seed=None,
             composer_max_discovery_turns=1,
             composer_max_tool_calls_per_turn=16,
