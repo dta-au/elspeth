@@ -61,21 +61,25 @@ def _capture(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 @pytest.mark.asyncio
 async def test_tool_loop_call_carries_the_discovery_knob(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured = _capture(monkeypatch)
-    await _service(tmp_path)._call_llm([{"role": "user", "content": "hi"}], tools=[])
+    await _service(tmp_path, composer_model="anthropic/claude-sonnet-5")._call_llm([{"role": "user", "content": "hi"}], tools=[])
     assert captured["reasoning_effort"] == "low"
 
 
 @pytest.mark.asyncio
 async def test_text_call_carries_the_discovery_knob(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured = _capture(monkeypatch)
-    await _service(tmp_path, composer_discovery_reasoning_effort="medium")._call_text_llm([{"role": "user", "content": "hi"}])
+    await _service(tmp_path, composer_model="anthropic/claude-sonnet-5", composer_discovery_reasoning_effort="medium")._call_text_llm(
+        [{"role": "user", "content": "hi"}]
+    )
     assert captured["reasoning_effort"] == "medium"
 
 
 @pytest.mark.asyncio
 async def test_none_opt_out_leaves_calls_unhinted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     captured = _capture(monkeypatch)
-    await _service(tmp_path, composer_discovery_reasoning_effort="none")._call_llm([{"role": "user", "content": "hi"}], tools=[])
+    await _service(tmp_path, composer_model="anthropic/claude-sonnet-5", composer_discovery_reasoning_effort="none")._call_llm(
+        [{"role": "user", "content": "hi"}], tools=[]
+    )
     assert "reasoning_effort" not in captured
     assert "reasoning" not in captured
 
@@ -115,3 +119,15 @@ async def test_advisor_call_carries_the_advisor_knob(
         recorder=None,
     )
     assert captured[expected_key] == expected_value
+
+
+@pytest.mark.asyncio
+async def test_bare_openai_surface_models_stay_unhinted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """litellm bridges GPT-5.4+ chat calls with tools + reasoning_effort to
+    /v1/responses, which chat-completions-only gateways (including ELSPETH's
+    own, extra="forbid") do not serve — so OpenAI-surface models go unhinted
+    until the gateway contract carries the field (elspeth-9a46553771)."""
+    captured = _capture(monkeypatch)
+    await _service(tmp_path)._call_llm([{"role": "user", "content": "hi"}], tools=[])
+    assert "reasoning_effort" not in captured
+    assert "reasoning" not in captured

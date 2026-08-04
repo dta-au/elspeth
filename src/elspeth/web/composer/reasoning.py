@@ -42,6 +42,18 @@ def apply_reasoning_kwargs(kwargs: dict[str, object], *, model: str, effort: str
     if model.startswith("openrouter/"):
         kwargs["reasoning"] = {"effort": effort}
         return
+    if "/" not in model or model.startswith("openai/"):
+        # OpenAI-surface models (bare aliases like "gpt-5.5" and openai/
+        # prefixes) are the OpenAI-compatible-endpoint lever: they ride
+        # either direct OpenAI or a chat-completions gateway. litellm
+        # bridges GPT-5.4+ chat calls with tools + reasoning_effort to
+        # /v1/responses (main.py responses_api_bridge_check), which
+        # chat-completions-only gateways — including ELSPETH's own, whose
+        # contract is deliberately extra="forbid" — do not serve. Until the
+        # gateway's compatibility contract carries reasoning_effort
+        # (elspeth-9a46553771), these models go unhinted: fail-safe, not
+        # fail-broken.
+        return
     kwargs["reasoning_effort"] = effort
 
 

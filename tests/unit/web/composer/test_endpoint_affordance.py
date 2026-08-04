@@ -71,14 +71,9 @@ async def test_call_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
     assert "api_key" not in captured
     # Byte-identical no-regression guarantee: the full kwargs dict is exactly
     # what pre-affordance code sent for this call, no more, no less.
-    assert captured == {
-        "model": "gpt-5.5",
-        "messages": [{"role": "user", "content": "hi"}],
-        "tools": [],
-        # Default discovery reasoning knob (elspeth-dc459d438e) — hinted
-        # via LiteLLM's standard param for non-openrouter models.
-        "reasoning_effort": "low",
-    }
+    # No reasoning key either: bare OpenAI-surface aliases stay unhinted
+    # (elspeth-dc459d438e / elspeth-9a46553771).
+    assert captured == {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}], "tools": []}
 
 
 @pytest.mark.asyncio
@@ -139,12 +134,7 @@ async def test_text_llm_omits_endpoint_kwargs_when_unset(monkeypatch: pytest.Mon
 
     assert "api_base" not in captured
     assert "api_key" not in captured
-    assert captured == {
-        "model": "gpt-5.5",
-        "messages": [{"role": "user", "content": "hi"}],
-        # Default discovery reasoning knob (elspeth-dc459d438e).
-        "reasoning_effort": "low",
-    }
+    assert captured == {"model": "gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}
 
 
 @pytest.mark.asyncio

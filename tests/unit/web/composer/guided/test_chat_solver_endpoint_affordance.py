@@ -340,7 +340,7 @@ async def test_solve_step_chat_threads_the_discovery_reasoning_knob(monkeypatch:
     monkeypatch.setattr(chat_solver, "_litellm_acompletion", fake_acompletion)
 
     await chat_solver.solve_step_chat(
-        model="gpt-5",
+        model="anthropic/claude-sonnet-5",
         step=GuidedStep.STEP_1_SOURCE,
         user_message="hi",
         temperature=None,
@@ -411,7 +411,7 @@ async def test_deferred_intent_management_request_carries_the_reasoning_knob(mon
 
     await chat_solver.maybe_manage_deferred_intent_chat(
         request=DeferredIntentManagementChatRequest(
-            model="gpt-4o",
+            model="anthropic/claude-sonnet-5",
             step=GuidedStep.STEP_3_TRANSFORMS,
             user_message="cancel one saved instruction",
             temperature=None,

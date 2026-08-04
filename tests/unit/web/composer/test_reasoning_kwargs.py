@@ -66,3 +66,14 @@ def test_litellm_preserves_the_native_reasoning_object_for_openrouter() -> None:
     assert params.get("reasoning") == {"effort": "low"}, (
         f"litellm no longer forwards a top-level reasoning object for openrouter models; got {params!r}"
     )
+
+
+@pytest.mark.parametrize("model", ["gpt-5.5", "openai/gpt-5.5"], ids=["bare-alias", "openai-prefixed"])
+def test_openai_surface_models_stay_unhinted(model: str) -> None:
+    """litellm's responses_api_bridge_check routes GPT-5.4+ chat calls with
+    tools + reasoning_effort to /v1/responses; chat-completions-only
+    gateways (ELSPETH's own is extra="forbid") do not serve it. Unhinted
+    until elspeth-9a46553771 lands the gateway contract field."""
+    kwargs: dict[str, object] = {}
+    apply_reasoning_kwargs(kwargs, model=model, effort="high")
+    assert kwargs == {}

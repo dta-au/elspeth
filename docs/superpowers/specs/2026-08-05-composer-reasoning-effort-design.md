@@ -52,10 +52,20 @@ def _apply_reasoning_kwargs(kwargs, *, model: str, effort: str | None) -> None
   `openrouter/anthropic/claude-sonnet-5` (verified False on litellm 1.85.0
   while the native-route `anthropic/claude-sonnet-5` is True) — the standard
   param would be silently dropped for exactly our configured model.
+- OpenAI-surface models (bare aliases like `gpt-5.5` and `openai/`
+  prefixes) → **no hint** (implementation deviation, 2026-08-05): litellm's
+  `responses_api_bridge_check` routes GPT-5.4+ chat calls carrying
+  `tools` + `reasoning_effort` to `/v1/responses`, which
+  chat-completions-only gateways — including ELSPETH's own, whose
+  `ChatRequest` contract is deliberately `extra="forbid"` — do not serve
+  (404 reproduced by `tests/integration/web/composer/test_composer_against_gateway.py`).
+  These models stay unhinted until the gateway contract carries the field
+  (elspeth-9a46553771).
 - otherwise → `kwargs["reasoning_effort"] = effort`. litellm translates per
-  provider: Bedrock → Anthropic `thinking` budgets, Azure/OpenAI → native
-  effort, `anthropic/` → thinking. This is the entire Bedrock/Azure
-  enablement — no provider-specific code beyond the openrouter carve-out.
+  provider: Bedrock → Anthropic `thinking` budgets, Azure → native effort
+  (Azure serves the Responses API, so the same bridge is harmless there),
+  `anthropic/` → thinking. This is the entire Bedrock/Azure enablement —
+  no provider-specific code beyond the two carve-outs above.
 
 A transform-level unit test pins that the hint survives litellm's OpenRouter
 request mapping (`OpenrouterConfig.map_openai_params` must not clobber or
