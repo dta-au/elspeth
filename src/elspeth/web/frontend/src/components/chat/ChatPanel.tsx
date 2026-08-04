@@ -771,6 +771,53 @@ export function ChatPanel({
       ),
     [chatGuided, composeTimeoutReady],
   );
+  // Plain-guided prompt draft (elspeth-49b467d91a). The docked guided composer
+  // is CONTROLLED on this state — the same ChatInput controlled mode the
+  // tutorial (frozen per-step prompt) and freeform (`inputText`) already use;
+  // the plain guided surface was the one uncontrolled instance, so its typed
+  // prompt lived only inside ChatInput and was unrecoverable after the
+  // clear-on-send. ChatInput still clears this on Send (onChange("")); the
+  // retention wrapper below restores it when the send did not deliver.
+  const [guidedDraft, setGuidedDraft] = useState("");
+  // Parity with the tutorial frame (elspeth-49b467d91a): the tutorial retains
+  // its locked prompt until the server-authoritative chat_history carries the
+  // user turn (tutorialPromptSentForStep). The live composer gets the same
+  // doctrine — retain unless verifiably delivered — by checking, after the
+  // send settles, whether the prompt actually landed:
+  //   - chat path (a durable checkpoint existed): success appends the user
+  //     turn verbatim to chat_history — /guided/chat directly, and the step-3
+  //     propose_pipeline prose revision via /guided/respond (R2-F6 transcript
+  //     custody). An HTTP failure (5xx/4xx/network), 409 step-conflict resync,
+  //     Stop, or client timeout leaves chat_history without it
+  //     (sessionStore.chatGuided catch), so the draft is restored for retry.
+  //   - start path (compositionState was null → /guided/start): the intent is
+  //     durably rooted as a session MESSAGE, not a chat turn, so delivery is
+  //     the durable checkpoint chatGuided demands (compositionState non-null).
+  // Restore is skipped when the session changed mid-flight (a draft must not
+  // leak across sessions) and never clobbers newer typing — the textarea
+  // stays editable while the send is pending.
+  const sendGuidedChatRetainingDraft = useCallback(
+    async (content: string, revisionMode?: GuidedRevisionMode) => {
+      const before = useSessionStore.getState();
+      const sessionAtSend = before.activeSessionId;
+      const hadDurableCheckpoint = before.compositionState !== null;
+      const seqFloor = before.guidedSession?.chat_turn_seq ?? 0;
+      await sendGuidedChat(content, revisionMode);
+      const after = useSessionStore.getState();
+      if (after.activeSessionId !== sessionAtSend) return;
+      const delivered = hadDurableCheckpoint
+        ? (after.guidedSession?.chat_history.some(
+            (turn) =>
+              turn.role === "user" &&
+              turn.seq >= seqFloor &&
+              turn.content === content,
+          ) ?? false)
+        : after.compositionState !== null;
+      if (delivered) return;
+      setGuidedDraft((current) => (current === "" ? content : current));
+    },
+    [sendGuidedChat],
+  );
   const cancelGuidedChat = useCallback(() => {
     guidedChatControllerRef.current?.abort(COMPOSE_USER_CANCEL_ABORT_REASON);
   }, []);
@@ -2090,7 +2137,15 @@ export function ChatPanel({
             ) : null}
             <ChatInput
               onSend={(content) => {
-                if (isProposalRevisionComposer && !isTutorial) {
+                // Tutorial sends keep the plain action: retention is the
+                // frozen locked-prompt value itself, and writing a tutorial
+                // prompt into guidedDraft would leak it into a later live
+                // guided surface on the same session.
+                if (isTutorial === true) {
+                  void sendGuidedChat(content);
+                  return;
+                }
+                if (isProposalRevisionComposer) {
                   const liveState = useSessionStore.getState();
                   const liveTurn = liveState.guidedNextTurn;
                   const liveProposalRevisionIdentity =
@@ -2106,10 +2161,10 @@ export function ChatPanel({
                     identity: liveProposalRevisionIdentity,
                     mode: "amend",
                   });
-                  void sendGuidedChat(content, selectedMode);
+                  void sendGuidedChatRetainingDraft(content, selectedMode);
                   return;
                 }
-                void sendGuidedChat(content);
+                void sendGuidedChatRetainingDraft(content);
               }}
             onBlobUploadStarted={handleGuidedBlobUploadStarted}
             onBlobUploadCompleted={handleGuidedBlobUploadCompleted}
@@ -2138,12 +2193,16 @@ export function ChatPanel({
             // Tutorial: the box is locked read-only and prefilled with the
             // CURRENT phase's per-stage prompt (wire has none → empty,
             // confirm-only). Kept controlled (value defined) across all phases
-            // to avoid controlled↔uncontrolled flips. Normal session: undefined
-            // value → editable freeform-intent box.
+            // to avoid controlled↔uncontrolled flips. Normal session:
+            // controlled on guidedDraft (elspeth-49b467d91a) so the typed
+            // prompt is parent-owned and sendGuidedChatRetainingDraft can
+            // restore it when a send fails to deliver — never uncontrolled.
             value={
-              isTutorial ? (lockedChatPrompt?.[guidedSession.step] ?? "") : undefined
+              isTutorial
+                ? (lockedChatPrompt?.[guidedSession.step] ?? "")
+                : guidedDraft
             }
-            onChange={isTutorial ? () => undefined : undefined}
+            onChange={isTutorial ? () => undefined : setGuidedDraft}
             readOnly={isTutorial === true}
             />
           </>
