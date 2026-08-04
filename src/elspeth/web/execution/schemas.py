@@ -488,8 +488,13 @@ def _check_status_accounting_invariant(status: str, accounting: RunAccounting | 
         assert accounting is not None
         if accounting.integrity.closure != "closed":
             raise ValueError("status='completed_with_failures' requires closed token accounting")
-        if accounting.tokens.succeeded <= 0:
-            raise ValueError("status='completed_with_failures' requires tokens.succeeded > 0")
+        # Mirrors terminal_clean_indicator in contracts/run_result.py:
+        # quarantine is a clean terminal outcome, so an all-quarantined run
+        # (succeeded == 0) is legal COMPLETED_WITH_FAILURES, not FAILED.
+        if accounting.tokens.succeeded <= 0 and accounting.routing.quarantined <= 0:
+            raise ValueError(
+                "status='completed_with_failures' requires a clean terminal indicator (tokens.succeeded > 0 or routing.quarantined > 0)"
+            )
         if accounting.tokens.failed <= 0:
             raise ValueError("status='completed_with_failures' requires tokens.failed > 0")
         return
