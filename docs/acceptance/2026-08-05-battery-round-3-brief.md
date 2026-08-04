@@ -36,11 +36,51 @@ than assumed.
    store must be recreated in the same window. The runtime role has no
    CREATEDB, so recreation runs through the `database-bootstrap` task
    definition, not ECS Exec. Landscape stays epoch 30 and is untouched.
-4. **Operator owes a task-definition grant**: `ELSPETH_WEB__AWS_TEXTRACT_PROFILES`
-   (ADR-036 binds Textract document buckets through an operator profile rather
-   than row data). Without it the Textract graph cannot compose. Carry forward
-   the round-2 additions too — `ELSPETH_WEB__AWS_S3_SOURCE_PROFILES` and
-   `ELSPETH_PLANNER_REJECTION_DETAIL_LOG=1`.
+4. **The Textract grant rides the same task-definition revision as the image.**
+   ADR-036 binds Textract document buckets through an operator profile rather
+   than row data, so `ELSPETH_WEB__AWS_TEXTRACT_PROFILES` must be present or
+   the transform is honestly unauthorable (`profile_unavailable`). It cannot
+   be added ahead of the redeploy: `WebSettings` refuses unknown prefixed
+   variables (`src/elspeth/web/config.py:1134`, `Unknown ELSPETH_WEB__
+   setting`), and `aws_textract_profiles` does not exist before `1efeae10d`.
+   Registering it against the current `web:9` image crashes the container at
+   boot. Register it **in the same revision** as the post-ADR-036 image.
+   Verified value for run `cf548430` (bucket + prefix copied from the live S3
+   source grant; `prefix` becomes `key_prefix`, and the alias name is shared
+   legitimately because grants are kind-qualified):
+
+   ```
+   ELSPETH_WEB__AWS_TEXTRACT_PROFILES=[{"alias":"acceptance-docs","bucket":"elspeth-a-fa1b99c60192978b10f7-cf548430ae8b","key_prefix":"a-fa1b99c60192978b10f7/cf548430-ae8b-48bc-bcc2-9dcf1b57a10e"}]
+   ```
+
+   Carry forward the round-2 additions too — `ELSPETH_WEB__AWS_S3_SOURCE_PROFILES`
+   and `ELSPETH_PLANNER_REJECTION_DETAIL_LOG=1`.
+
+   Checked 2026-08-05, so the round-3 session need not re-derive any of it:
+
+   - **No IAM work is outstanding.** The task role already carries
+     `textract:StartDocumentAnalysis` + `textract:GetDocumentAnalysis` on
+     `*`, `s3:GetObject` on the granted prefix, and `s3:ListBucket` on the
+     bucket — the last being what authorises the HeadBucket that 404'd in
+     round 2. No admin/root (`elspeth-acceptance`) action is required.
+   - **A real document is already in place** at
+     `…/cf548430-…/docs/exec-summary.pdf`, so the Textract anchor can carry
+     the relative key `docs/exec-summary.pdf` with no upload step.
+   - **The value validates against the shipped code** — it round-trips
+     `AWSTextractProfileSettings.model_validate` and builds a legal engine
+     bucket-mode `AWSTextractDocumentAnalysisConfig`, which are the first two
+     proofs `verify-textract` runs in-container. Neither `repr` leaks the
+     bucket or the prefix.
+   - **The extra variable is verifier-safe.** `plugin_policy_binding_sha256`
+     hashes only `PLUGIN_POLICY_ASSIGNMENT_NAMES` (the protected seven), and
+     the task-definition check compares named keys as a subset rather than
+     asserting an exact env set (`task_definition.py:408-412`). Round 2's two
+     additions are the precedent.
+
+   Durability gap worth knowing: neither profile grant lives in the Terraform
+   module — `plugin_policy_projection` covers only the protected seven — so
+   both are operator deploy-time inputs and a cold install starts without
+   them.
 
 ## Driver
 
