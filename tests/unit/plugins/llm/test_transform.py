@@ -19,6 +19,7 @@ from elspeth.contracts.errors import RuntimePreflightFailedError
 from elspeth.contracts.results import TransformResult
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.token_usage import TokenUsage
+from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.clients.llm import (
     ContentPolicyError,
     ContextLengthError,
@@ -34,7 +35,7 @@ from elspeth.plugins.transforms.llm.provider import (
     LLMQueryResult,
     UnrecognizedFinishReason,
 )
-from elspeth.testing import make_pipeline_row
+from elspeth.testing import make_field, make_pipeline_row
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,6 +43,10 @@ from elspeth.testing import make_pipeline_row
 
 # Common observed schema config
 DYNAMIC_SCHEMA = {"mode": "observed"}
+
+# Observed mode forbids explicit field definitions, so declared output field
+# metadata reaches the emitted contract only under fixed/flexible mode.
+DECLARED_SCHEMA = {"mode": "fixed", "fields": ["text: str", "cuisine: str"]}
 
 
 class _CallRecorder:
@@ -110,6 +115,37 @@ def _identity_contract(contract: SchemaContract) -> SchemaContract:
 def _identity_row(row: PipelineRow) -> PipelineRow:
     """Mirror the transform's no-op row alignment in focused strategy tests."""
     return row
+
+
+def _run_post_emission_check(transform: BaseTransform, emitted_row: PipelineRow) -> None:
+    """Run the ADR-014 post-emission check that the transform executor runs on emission."""
+    from elspeth.engine.executors.schema_config_mode import verify_schema_config_mode
+
+    assert transform._output_schema_config is not None
+    verify_schema_config_mode(
+        output_schema_config=transform._output_schema_config,
+        emitted_rows=(emitted_row,),
+        plugin_name=transform.name,
+        node_id="llm-1",
+        run_id="run-1",
+        row_id="row-1",
+        token_id="token-1",
+    )
+
+
+def _declared_input_row() -> PipelineRow:
+    """Input row whose declared 'cuisine' field arrived inferred from an upstream node."""
+    return PipelineRow(
+        {"text": "hello", "cuisine": "Malaysian"},
+        SchemaContract(
+            mode="FIXED",
+            fields=(
+                make_field("text", str, required=True, source="declared"),
+                make_field("cuisine", str, required=False, source="inferred"),
+            ),
+            locked=True,
+        ),
+    )
 
 
 def _make_config(*, provider: str = "azure", **overrides: Any) -> dict[str, Any]:
@@ -2948,6 +2984,7 @@ class TestParallelErrorReasonNotFabricated:
             response_field="llm_response",
             align_output_contract=_identity_contract,
             align_output_row_contract=_identity_row,
+            apply_declared_output_field_contracts=_identity_contract,
             executor=mock_executor,
         )
 
@@ -3031,6 +3068,7 @@ class TestParallelAuditMetadataThreadSafety:
             response_field="llm_response",
             align_output_contract=_identity_contract,
             align_output_row_contract=_identity_row,
+            apply_declared_output_field_contracts=_identity_contract,
             executor=mock_executor,
         )
 
@@ -3112,6 +3150,7 @@ class TestParallelAuditMetadataThreadSafety:
             response_field="llm_response",
             align_output_contract=_identity_contract,
             align_output_row_contract=_identity_row,
+            apply_declared_output_field_contracts=_identity_contract,
             executor=mock_executor,
         )
 
@@ -3199,6 +3238,7 @@ class TestMultiQueryFinishReasonAudit:
             response_field="llm_response",
             align_output_contract=_identity_contract,
             align_output_row_contract=_identity_row,
+            apply_declared_output_field_contracts=_identity_contract,
             executor=None,  # Sequential mode
         )
 
@@ -3245,6 +3285,7 @@ class TestMultiQueryFinishReasonAudit:
             response_field="llm_response",
             align_output_contract=_identity_contract,
             align_output_row_contract=_identity_row,
+            apply_declared_output_field_contracts=_identity_contract,
             executor=None,
         )
 
@@ -3296,6 +3337,7 @@ class TestSequentialErrorReasonNotFabricated:
             response_field="llm_response",
             align_output_contract=_identity_contract,
             align_output_row_contract=_identity_row,
+            apply_declared_output_field_contracts=_identity_contract,
             executor=None,  # Sequential mode
         )
 
@@ -3432,3 +3474,113 @@ class TestComposerInterpolationGuidance:
         assert any("{{ row.content }}" in t for t in templates), (
             "no published example prompt_template interpolates the per-row fetched content field"
         )
+
+
+class TestLLMDeclaredOutputFieldContracts:
+    """Tests for declared output field metadata on emitted contracts (elspeth-d1f20e8385).
+
+    ``_build_llm_output_schema_config`` passes the authored ``schema.fields``
+    straight into the transform's output declaration, but every emit path builds
+    its contract with ``propagate_contract``, which preserves whatever metadata
+    an upstream node attached. A declared field that arrived inferred therefore
+    reaches ADR-014's post-emission check as ``required=False`` against a
+    declared ``required=True``, failing the run unless the declaration is
+    restamped on emission.
+
+    There is no output-side backstop: ``output_schema`` is built with
+    ``adds_fields=True``, so it carries no model fields and ``extra="allow"``.
+    These tests are the only guard.
+    """
+
+    def test_single_query_restamps_declared_metadata_over_inferred_upstream_field(self) -> None:
+        """SingleQueryStrategy emits declared fields with their declared metadata."""
+        transform, mock_provider = _make_transform_with_mock_provider(
+            _make_config(schema=DECLARED_SCHEMA),
+        )
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content="a response",
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_declared_input_row(), _make_ctx())
+
+        assert result.status == "success"
+        assert result.row is not None
+        _run_post_emission_check(transform, result.row)
+        assert result.row.contract.get_field("cuisine").required is True
+
+    def test_multi_query_sequential_restamps_declared_metadata(self) -> None:
+        """The sequential multi-query emit path restamps the declaration too."""
+        transform, mock_provider = _make_transform_with_mock_provider(
+            _make_multi_query_config(schema=DECLARED_SCHEMA, pool_size=1),
+        )
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 1}',
+            usage=TokenUsage.known(1, 1),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+        assert transform._query_executor is None
+
+        result = transform._process_row(_declared_input_row(), _make_ctx())
+
+        assert result.status == "success"
+        assert result.row is not None
+        _run_post_emission_check(transform, result.row)
+        assert result.row.contract.get_field("cuisine").required is True
+
+    def test_multi_query_parallel_restamps_declared_metadata(self) -> None:
+        """The parallel multi-query emit path restamps the declaration too."""
+        transform, mock_provider = _make_transform_with_mock_provider(
+            _make_multi_query_config(schema=DECLARED_SCHEMA, pool_size=4),
+        )
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content='{"score": 1}',
+            usage=TokenUsage.known(1, 1),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+        assert transform._query_executor is not None
+
+        try:
+            result = transform._process_row(_declared_input_row(), _make_ctx())
+
+            assert result.status == "success"
+            assert result.row is not None
+            _run_post_emission_check(transform, result.row)
+            assert result.row.contract.get_field("cuisine").required is True
+        finally:
+            transform._query_executor.shutdown(wait=True)
+
+    def test_provenance_side_fields_are_not_restamped(self) -> None:
+        """Auto-appended usage/model side fields keep their inferred contracts.
+
+        They reach the output schema config as guaranteed_fields, never as
+        declared ``fields``, and _apply_declared_output_field_contracts only
+        consults declared fields — so the restamp cannot reach them.
+        """
+        transform, mock_provider = _make_transform_with_mock_provider(
+            _make_config(schema=DECLARED_SCHEMA),
+        )
+        mock_provider.execute_query.return_value = LLMQueryResult(
+            content="a response",
+            usage=TokenUsage.known(10, 5),
+            model="gpt-4o",
+            finish_reason=FinishReason.STOP,
+        )
+
+        result = transform._process_row(_declared_input_row(), _make_ctx())
+
+        assert result.status == "success"
+        assert result.row is not None
+        assert transform._output_schema_config is not None
+        declared_names = {field.name for field in transform._output_schema_config.fields}
+        for side_field in ("llm_response", "llm_response_usage", "llm_response_model"):
+            assert side_field not in declared_names
+            emitted = result.row.contract.get_field(side_field)
+            assert emitted.source == "inferred"
+            assert emitted.required is False
+        # Guarantees still admit them, so fixed mode reports no undeclared extras.
+        assert {"llm_response", "llm_response_usage", "llm_response_model"} <= set(transform._output_schema_config.guaranteed_fields)

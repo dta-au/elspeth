@@ -252,6 +252,7 @@ class SingleQueryStrategy:
     max_tokens: int | None
     response_field: str
     align_output_contract: Callable[[SchemaContract], SchemaContract]
+    apply_declared_output_field_contracts: Callable[[SchemaContract], SchemaContract]
 
     def execute(
         self,
@@ -401,6 +402,7 @@ class SingleQueryStrategy:
             output_row=output,
             transform_adds_fields=True,
         )
+        output_contract = self.apply_declared_output_field_contracts(output_contract)
         output_contract = self.align_output_contract(output_contract)
 
         return TransformResult.success(
@@ -442,6 +444,7 @@ class MultiQueryStrategy:
     response_field: str
     align_output_contract: Callable[[SchemaContract], SchemaContract]
     align_output_row_contract: Callable[[PipelineRow], PipelineRow]
+    apply_declared_output_field_contracts: Callable[[SchemaContract], SchemaContract]
     executor: PooledExecutor | None = None
     max_capacity_retry_seconds: int = 3600
     _query_templates: Mapping[str, PromptTemplate] = field(init=False, default_factory=dict)
@@ -950,6 +953,7 @@ class MultiQueryStrategy:
             output_row=output,
             transform_adds_fields=True,
         )
+        output_contract = self.apply_declared_output_field_contracts(output_contract)
         output_contract = self.align_output_contract(output_contract)
 
         return TransformResult.success(
@@ -1110,6 +1114,7 @@ class MultiQueryStrategy:
             output_row=output,
             transform_adds_fields=True,
         )
+        output_contract = self.apply_declared_output_field_contracts(output_contract)
         output_contract = self.align_output_contract(output_contract)
 
         return TransformResult.success(
@@ -1150,7 +1155,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:57af6147b08f4655"
+    source_file_hash: str | None = "sha256:61627311cc1fc02d"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True
@@ -1454,6 +1459,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 response_field=self._response_field,
                 align_output_contract=self._align_output_contract,
                 align_output_row_contract=self._align_output_row_contract,
+                apply_declared_output_field_contracts=self._apply_declared_output_field_contracts,
                 executor=self._query_executor,
                 max_capacity_retry_seconds=self._max_capacity_retry_seconds,
             )
@@ -1500,6 +1506,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
                 max_tokens=self._max_tokens,
                 response_field=self._response_field,
                 align_output_contract=self._align_output_contract,
+                apply_declared_output_field_contracts=self._apply_declared_output_field_contracts,
             )
 
             # Single-query emits unprefixed fields (operational only — audit goes to success_reason)

@@ -160,6 +160,7 @@ def _make_multi_query_strategy(*, executor: _PooledExecutorDouble | None = None)
         response_field="llm_response",
         align_output_contract=_identity_contract,
         align_output_row_contract=_identity_row,
+        apply_declared_output_field_contracts=_identity_contract,
         executor=executor,
     )
 
@@ -181,6 +182,7 @@ def single_query_result() -> TransformResult:
         max_tokens=None,
         response_field="llm_response",
         align_output_contract=_identity_contract,
+        apply_declared_output_field_contracts=_identity_contract,
     )
 
     mock_provider = Mock(spec=LLMProvider)
