@@ -42,6 +42,7 @@ def _build_view(
     plugin_allowlist: tuple[str, ...] = (),
     deployment_aws_region: str | None = None,
     aws_s3_source_profiles: tuple[dict[str, str], ...] = (),
+    aws_textract_profiles: tuple[dict[str, str], ...] = (),
 ) -> PolicyCatalogView:
     settings = WebSettings(
         composer_max_composition_turns=4,
@@ -52,6 +53,7 @@ def _build_view(
         plugin_allowlist=plugin_allowlist,
         deployment_aws_region=deployment_aws_region,
         aws_s3_source_profiles=aws_s3_source_profiles,
+        aws_textract_profiles=aws_textract_profiles,
         llm_profiles={
             "task-role": {
                 "provider": "bedrock",
@@ -99,32 +101,43 @@ def test_profiled_list_summary_is_projected_from_public_schema(view: PolicyCatal
     assert llm.secret_requirements == ()
 
 
-def test_textract_web_summary_schema_and_digest_use_deployment_profile() -> None:
+def test_textract_web_summary_schema_and_digest_use_operator_profile() -> None:
     from elspeth.web.composer.planner_authoring_aids import discovery_digest
 
     view = _build_view(
         plugin_allowlist=("transform:aws_textract_document_analysis",),
         deployment_aws_region="ap-southeast-1",
+        aws_textract_profiles=({"alias": "acceptance-docs", "bucket": "operator-owned-docs", "key_prefix": "org/acme"},),
     )
 
     summary = next(item for item in view.list_transforms() if item.name == "aws_textract_document_analysis")
     field_names = {field.name for field in summary.config_fields}
     assert "profile" in field_names
-    assert not field_names & {"region", "auth_mode", "aws_access_key_id", "aws_secret_access_key", "aws_session_token"}
+    assert not field_names & {
+        "region",
+        "auth_mode",
+        "aws_access_key_id",
+        "aws_secret_access_key",
+        "aws_session_token",
+        "bucket",
+        "bucket_field",
+        "key_prefix",
+    }
     assert summary.example_use is not None
-    assert "profile: deployment" in summary.example_use
+    assert "profile: acceptance-docs" in summary.example_use
     assert "region:" not in summary.example_use
     assert "auth_mode" not in summary.example_use
+    assert "bucket" not in summary.example_use
     rendered_hints = " ".join(summary.composer_hints)
     assert "profile" in rendered_hints
     assert "credentials" not in rendered_hints.casefold()
 
     schema = view.get_schema("transform", "aws_textract_document_analysis")
-    assert schema.json_schema["properties"]["profile"]["enum"] == ["deployment"]
+    assert schema.json_schema["properties"]["profile"]["enum"] == ["acceptance-docs"]
     digest_entry = next(item for item in discovery_digest(view)["transforms"] if item["name"] == "aws_textract_document_analysis")
-    assert digest_entry["profile_aliases"] == ["deployment"]
+    assert digest_entry["profile_aliases"] == ["acceptance-docs"]
     assert "profile" in digest_entry["required_options"]
-    assert not set(digest_entry["required_options"]) & {"region", "auth_mode"}
+    assert not set(digest_entry["required_options"]) & {"region", "auth_mode", "bucket_field"}
 
 
 def test_trained_operator_textract_summary_retains_explicit_raw_config() -> None:
@@ -139,10 +152,11 @@ def test_trained_operator_textract_summary_retains_explicit_raw_config() -> None
     assert "auth_mode: default_chain" in summary.example_use
 
 
-def test_textract_web_assistance_uses_only_deployment_profile_guidance() -> None:
+def test_textract_web_assistance_uses_only_profile_guidance() -> None:
     view = _build_view(
         plugin_allowlist=("transform:aws_textract_document_analysis",),
         deployment_aws_region="ap-southeast-1",
+        aws_textract_profiles=({"alias": "acceptance-docs", "bucket": "operator-owned-docs", "key_prefix": "org/acme"},),
     )
     result = _execute_get_plugin_assistance(
         {"plugin_type": "transform", "plugin_name": "aws_textract_document_analysis"},
@@ -154,7 +168,6 @@ def test_textract_web_assistance_uses_only_deployment_profile_guidance() -> None
     payload = result.to_dict()["data"]
     guidance = " ".join((payload["summary"], *payload["composer_hints"]))
     assert "profile" in guidance.casefold()
-    assert "deployment" in guidance.casefold()
     for private_name in (
         "region",
         "auth_mode",
@@ -162,6 +175,7 @@ def test_textract_web_assistance_uses_only_deployment_profile_guidance() -> None
         "aws_access_key_id",
         "aws_secret_access_key",
         "aws_session_token",
+        "bucket",
     ):
         assert private_name not in guidance
 

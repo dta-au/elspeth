@@ -32,7 +32,7 @@ from elspeth.web.auth.urls import (
     validate_oidc_browser_origins,
     validate_oidc_issuer,
 )
-from elspeth.web.plugin_policy.profiles import AWSS3SourceProfileSettings
+from elspeth.web.plugin_policy.profiles import AWSS3SourceProfileSettings, AWSTextractProfileSettings
 from elspeth.web.validation import (
     SERVER_SECRET_RESERVED_PREFIX,
     is_reserved_server_secret_name,
@@ -354,6 +354,7 @@ class WebSettings(BaseModel):
     bedrock_guardrail_profiles: tuple[BedrockGuardrailProfileSettings, ...] = ()
     bedrock_guardrail_default_profiles: Mapping[str, str] = Field(default_factory=dict)
     aws_s3_source_profiles: tuple[AWSS3SourceProfileSettings, ...] = ()
+    aws_textract_profiles: tuple[AWSTextractProfileSettings, ...] = ()
     orphan_run_max_age_seconds: int = Field(default=3600, ge=60)
     orphan_run_check_interval_seconds: int = Field(default=300, ge=30)
 
@@ -736,6 +737,17 @@ class WebSettings(BaseModel):
             raise ValueError("AWS S3 source profile aliases must be unique")
         return profiles
 
+    @field_validator("aws_textract_profiles")
+    @classmethod
+    def _validate_aws_textract_profiles(
+        cls,
+        profiles: tuple[AWSTextractProfileSettings, ...],
+    ) -> tuple[AWSTextractProfileSettings, ...]:
+        aliases = [profile.alias for profile in profiles]
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("AWS Textract profile aliases must be unique")
+        return profiles
+
     @field_validator("operator_telemetry_service_name")
     @classmethod
     def _validate_operator_telemetry_service_name(cls, value: str) -> str:
@@ -1059,6 +1071,7 @@ _JSON_COLLECTION_FIELDS: frozenset[str] = frozenset(
         "plugin_allowlist",
         "bedrock_guardrail_profiles",
         "aws_s3_source_profiles",
+        "aws_textract_profiles",
     }
 )
 _JSON_OBJECT_FIELDS: frozenset[str] = frozenset(
@@ -1156,6 +1169,7 @@ def settings_from_env() -> WebSettings:
             "bedrock_guardrail_profiles",
             "bedrock_guardrail_default_profiles",
             "aws_s3_source_profiles",
+            "aws_textract_profiles",
         }
         safe_paths = {
             str(item) for detail in error.errors(include_input=False) for item in detail.get("loc", ()) if isinstance(item, (str, int))

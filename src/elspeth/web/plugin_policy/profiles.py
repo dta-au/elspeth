@@ -22,6 +22,10 @@ from elspeth.contracts.aws_s3 import (
     s3_profiled_binding_fingerprint,
     validate_relative_s3_path,
 )
+from elspeth.contracts.aws_textract import (
+    TEXTRACT_PRIVATE_BINDING_OPTION_NAMES,
+    TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES,
+)
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.plugin_assistance import PluginAssistance
 from elspeth.contracts.plugin_capabilities import ControlMode, PluginCapability
@@ -80,6 +84,41 @@ class AWSS3SourceProfileSettings(BaseModel):
         return validated
 
 
+class AWSTextractProfileSettings(BaseModel):
+    """Operator-owned binding for one Web-authorable Textract document location."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    alias: str
+    bucket: str = Field(repr=False)
+    key_prefix: str | None = Field(default=None, repr=False)
+
+    @field_validator("alias")
+    @classmethod
+    def _validate_alias(cls, value: str) -> str:
+        validate_profile_alias(value)
+        return value
+
+    @field_validator("bucket")
+    @classmethod
+    def _validate_bucket(cls, value: str) -> str:
+        if not value or value != value.strip() or len(value) > _S3_MAX_BUCKET_CHARS:
+            raise ValueError("bucket must be non-blank, canonical, and at most 2048 characters")
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+            raise ValueError("bucket must not contain control characters")
+        return reject_operator_required_placeholder_value(value, field_name="bucket")
+
+    @field_validator("key_prefix")
+    @classmethod
+    def _validate_key_prefix(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        validated = validate_relative_s3_path(value, field_name="key_prefix")
+        if len(validated.encode("utf-8")) > S3_MAX_KEY_BYTES - 2:
+            raise ValueError("key_prefix must leave room for a relative S3 object key")
+        return validated
+
+
 @dataclass(frozen=True, slots=True)
 class RuntimeWebPluginConfig:
     plugin_allowlist: tuple[str, ...]
@@ -90,6 +129,7 @@ class RuntimeWebPluginConfig:
     bedrock_guardrail_profiles: tuple[BedrockGuardrailProfileSettings, ...] = field(repr=False)
     bedrock_guardrail_default_profiles: tuple[tuple[str, str], ...]
     aws_s3_source_profiles: tuple[AWSS3SourceProfileSettings, ...] = field(repr=False)
+    aws_textract_profiles: tuple[AWSTextractProfileSettings, ...] = field(repr=False)
     deployment_aws_region: str | None
 
     @property
@@ -113,6 +153,7 @@ class RuntimeWebPluginConfig:
             bedrock_guardrail_profiles=tuple(sorted(settings.bedrock_guardrail_profiles, key=lambda profile: profile.alias)),
             bedrock_guardrail_default_profiles=tuple(sorted(settings.bedrock_guardrail_default_profiles.items())),
             aws_s3_source_profiles=tuple(sorted(settings.aws_s3_source_profiles, key=lambda profile: profile.alias)),
+            aws_textract_profiles=tuple(sorted(settings.aws_textract_profiles, key=lambda profile: profile.alias)),
             deployment_aws_region=settings.deployment_aws_region,
         )
 
@@ -744,25 +785,11 @@ class _S3SourceProfileResolver:
         return usable_aliases[0] if len(usable_aliases) == 1 else None
 
 
-_TEXTRACT_PRIVATE_OPTIONS = frozenset(
-    {
-        "region",
-        "auth_mode",
-        "aws_access_key_id",
-        "aws_secret_access_key",
-        "aws_session_token",
-        "bucket",
-        "key_prefix",
-    }
-)
-
-
-class _TextractDeploymentProfileResolver:
-    _ALIAS = "deployment"
-
-    def __init__(self, region: str) -> None:
-        if not is_supported_textract_region(region):
+class _TextractProfileResolver:
+    def __init__(self, profiles: tuple[AWSTextractProfileSettings, ...], *, region: str) -> None:
+        if not profiles or not is_supported_textract_region(region):
             raise ValueError("profile_unavailable")
+        self._profiles = {profile.alias: profile for profile in profiles}
         self._region = region
 
     def public_schema(self, full_schema: PluginSchemaInfo, available_aliases: tuple[str, ...]) -> PluginSchemaInfo:
@@ -771,22 +798,27 @@ class _TextractDeploymentProfileResolver:
         raw_properties = full_schema.json_schema.get("properties", {})
         if not isinstance(raw_properties, dict):
             raise ValueError("malformed_profile_schema")
-        safe_properties = {
+        safe_properties: dict[str, Any] = {
             "profile": {
                 "type": "string",
                 "enum": list(available_aliases),
-                "description": "Deployment-owned Amazon Textract profile alias",
-            },
-            **{
-                name: deepcopy(schema)
-                for name, schema in raw_properties.items()
-                if name not in _TEXTRACT_PRIVATE_OPTIONS and isinstance(schema, dict)
-            },
+                "description": "Operator-approved Textract document profile alias",
+            }
         }
+        for name in TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES:
+            raw_schema = raw_properties.get(name)
+            if not isinstance(raw_schema, dict):
+                raise ValueError("malformed_profile_schema")
+            safe_properties[name] = deepcopy(raw_schema)
+        safe_properties["key_field"].update(
+            {
+                "description": ("Input row field containing the relative S3 object key within the operator-approved document location"),
+            }
+        )
         raw_required = full_schema.json_schema.get("required", ())
         required = [
             "profile",
-            *(name for name in raw_required if isinstance(name, str) and name not in _TEXTRACT_PRIVATE_OPTIONS),
+            *(name for name in raw_required if isinstance(name, str) and name in TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES),
         ]
         public_json_schema: dict[str, Any] = {
             "type": "object",
@@ -809,22 +841,30 @@ class _TextractDeploymentProfileResolver:
             public_json_schema["$defs"] = referenced_definitions
 
         raw_fields = full_schema.knob_schema.get("fields", ())
+        canonical_fields = {
+            raw_field["name"]: raw_field
+            for raw_field in raw_fields
+            if isinstance(raw_field, dict) and isinstance(raw_field.get("name"), str)
+        }
         fields: list[dict[str, Any]] = [
             {
                 "name": "profile",
                 "type": "string",
                 "required": True,
-                "description": "Deployment-owned Amazon Textract profile alias",
+                "description": "Operator-approved Textract document profile alias",
                 "choices": list(available_aliases),
             }
         ]
-        for raw_field in raw_fields:
-            if not isinstance(raw_field, dict) or raw_field.get("name") in _TEXTRACT_PRIVATE_OPTIONS:
-                continue
-            field_projection = deepcopy(raw_field)
-            field_name = field_projection.get("name")
-            if isinstance(field_name, str):
-                field_projection["required"] = field_name in required
+        for name in TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES:
+            try:
+                field_projection = deepcopy(canonical_fields[name])
+            except KeyError as exc:
+                raise ValueError("malformed_profile_schema") from exc
+            field_projection["required"] = name in required
+            if name == "key_field":
+                field_projection["description"] = (
+                    "Input row field containing the relative S3 object key within the operator-approved document location"
+                )
             fields.append(field_projection)
         return PluginSchemaInfo(
             name=full_schema.name,
@@ -833,9 +873,9 @@ class _TextractDeploymentProfileResolver:
             json_schema=public_json_schema,
             knob_schema={"fields": fields},
             composer_hints=(
-                "Set profile to deployment; the server owns Amazon Textract region and default-chain authentication.",
-                "Provide bucket_field and key_field, choose feature_types, and map at least one output field.",
-                "The S3 bucket is verified against the deployment region before document analysis starts.",
+                "Select an operator-approved Textract document profile; the server supplies the private storage binding.",
+                "Rows carry relative object keys in key_field — never bucket names or document locations.",
+                "Choose feature_types and map at least one output field.",
             ),
             secret_requirements=(),
             web_config_authority=full_schema.web_config_authority,
@@ -843,11 +883,22 @@ class _TextractDeploymentProfileResolver:
         )
 
     def lower_options(self, alias: str, safe_options: dict[str, object]) -> LoweredPluginConfig:
-        if alias != self._ALIAS:
-            raise ValueError("profile_unavailable")
-        if set(safe_options) & _TEXTRACT_PRIVATE_OPTIONS:
+        try:
+            profile = self._profiles[alias]
+        except KeyError:
+            raise ValueError("profile_unavailable") from None
+        if set(safe_options) & TEXTRACT_PRIVATE_BINDING_OPTION_NAMES:
             raise ValueError("private_profile_option")
-        executable = {**safe_options, "region": self._region, "auth_mode": "default_chain"}
+        if set(safe_options) - set(TEXTRACT_PROFILED_AUTHOR_OPTION_NAMES):
+            raise ValueError("private_profile_option")
+        executable: dict[str, object] = {
+            **safe_options,
+            "bucket": profile.bucket,
+            "region": self._region,
+            "auth_mode": "default_chain",
+        }
+        if profile.key_prefix is not None:
+            executable["key_prefix"] = profile.key_prefix
         return LoweredPluginConfig(
             executable_options=MappingProxyType(executable),
             audit_safe_options=MappingProxyType({"profile": alias, **safe_options}),
@@ -859,20 +910,32 @@ class _TextractDeploymentProfileResolver:
         inventory: ProfileCredentialInventory,
     ) -> tuple[ProfileAvailability, ...]:
         del principal, inventory
-        generation = hashlib.sha256(
-            json.dumps(
-                {"region": self._region, "auth_mode": "default_chain"},
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
-        return (ProfileAvailability(alias=self._ALIAS, credential_scope=None, usable=True, generation=generation),)
+        return tuple(
+            ProfileAvailability(
+                alias=alias,
+                credential_scope=None,
+                usable=True,
+                generation=hashlib.sha256(
+                    json.dumps(
+                        {
+                            "bucket": profile.bucket,
+                            "key_prefix": profile.key_prefix,
+                            "region": self._region,
+                            "auth_mode": "default_chain",
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest(),
+            )
+            for alias, profile in self._profiles.items()
+        )
 
     def check_local_requirements(self, alias: str) -> LocalRequirementResult:
-        return LocalRequirementResult(available=alias == self._ALIAS)
+        return LocalRequirementResult(available=alias in self._profiles)
 
     def selected_alias(self, usable_aliases: tuple[str, ...]) -> str | None:
-        return self._ALIAS if self._ALIAS in usable_aliases else None
+        return usable_aliases[0] if len(usable_aliases) == 1 else None
 
 
 def _schema_refs(value: object) -> set[str]:
@@ -926,10 +989,15 @@ class OperatorProfileRegistry:
                 settings.aws_s3_source_profiles,
                 region=settings.deployment_aws_region,
             )
-        if is_supported_textract_region(settings.deployment_aws_region) and importlib.util.find_spec("boto3") is not None:
+        if (
+            settings.aws_textract_profiles
+            and is_supported_textract_region(settings.deployment_aws_region)
+            and importlib.util.find_spec("boto3") is not None
+        ):
             assert settings.deployment_aws_region is not None
-            self._resolvers[PluginId("transform", "aws_textract_document_analysis")] = _TextractDeploymentProfileResolver(
-                settings.deployment_aws_region
+            self._resolvers[PluginId("transform", "aws_textract_document_analysis")] = _TextractProfileResolver(
+                settings.aws_textract_profiles,
+                region=settings.deployment_aws_region,
             )
 
     def public_schema(
@@ -1003,13 +1071,13 @@ class OperatorProfileRegistry:
                 "      schema: {mode: observed}\n"
                 "      on_validation_failure: discard"
             )
-        elif isinstance(resolver, _TextractDeploymentProfileResolver):
+        elif isinstance(resolver, _TextractProfileResolver):
+            example_alias = available_aliases[0] if available_aliases else "operator-approved-profile"
             updates["example_use"] = (
                 "transform:\n"
                 "  plugin: aws_textract_document_analysis\n"
                 "  options:\n"
-                "    profile: deployment\n"
-                "    bucket_field: document_bucket\n"
+                f"    profile: {example_alias}\n"
                 "    key_field: document_key\n"
                 "    feature_types: [TABLES, FORMS]\n"
                 "    text_field: textract_text\n"
@@ -1035,15 +1103,15 @@ class OperatorProfileRegistry:
                     "Use a different approved profile when the object belongs to a different operator-managed location.",
                 ),
             )
-        if isinstance(resolver, _TextractDeploymentProfileResolver):
+        if isinstance(resolver, _TextractProfileResolver):
             return PluginAssistance(
                 plugin_name=full_assistance.plugin_name,
                 issue_code=full_assistance.issue_code,
-                summary="Analyze S3-backed documents asynchronously through the deployment-owned Amazon Textract profile.",
+                summary="Analyze S3-backed documents asynchronously through an operator-approved Textract document profile.",
                 composer_hints=(
-                    "Set profile to deployment; the server owns the Amazon Textract runtime binding.",
-                    "Provide bucket_field and key_field, choose feature_types, and map at least one output field.",
-                    "The S3 bucket location is verified against the deployment before document analysis starts.",
+                    "Select an available profile; the server supplies the private document storage binding.",
+                    "Rows carry relative object keys in key_field; choose feature_types and map at least one output field.",
+                    "The bound document location is verified against the deployment before analysis starts.",
                 ),
             )
         return full_assistance

@@ -336,18 +336,32 @@ def test_operator_profiled_llm_is_unavailable_without_usable_alias() -> None:
     assert dict(snapshot.usable_profile_aliases)[PluginId("transform", "llm")] == ()
 
 
-def test_textract_is_available_only_with_supported_deployment_region_profile() -> None:
+def test_textract_is_available_only_with_configured_profile_and_supported_region() -> None:
     plugin_id = PluginId("transform", "aws_textract_document_analysis")
     available = _build(
+        _settings(
+            plugin_allowlist=(str(plugin_id),),
+            deployment_aws_region="ap-southeast-1",
+            aws_textract_profiles=({"alias": "acceptance-docs", "bucket": "operator-owned-docs", "key_prefix": "org/acme"},),
+        )
+    )
+
+    assert plugin_id in available.available
+    assert dict(available.usable_profile_aliases)[plugin_id] == ("acceptance-docs",)
+    assert dict(available.selected_profile_aliases)[plugin_id] == "acceptance-docs"
+
+
+def test_textract_without_a_profile_table_is_hidden_even_in_a_supported_region() -> None:
+    plugin_id = PluginId("transform", "aws_textract_document_analysis")
+    snapshot = _build(
         _settings(
             plugin_allowlist=(str(plugin_id),),
             deployment_aws_region="ap-southeast-1",
         )
     )
 
-    assert plugin_id in available.available
-    assert dict(available.usable_profile_aliases)[plugin_id] == ("deployment",)
-    assert dict(available.selected_profile_aliases)[plugin_id] == "deployment"
+    assert plugin_id not in snapshot.available
+    assert [item.reason for item in snapshot.unavailable if item.plugin_id == plugin_id] == [PluginUnavailableReason.PROFILE_UNAVAILABLE]
 
 
 @pytest.mark.parametrize("region", [None, "moon-east-1"])

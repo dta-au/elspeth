@@ -19,6 +19,7 @@ from elspeth.engine.orchestrator.preflight import check_config_value_sources
 from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl
 from elspeth.plugins.infrastructure.manager import PluginManager
 from elspeth.plugins.sources.llm import LLMSource
+from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
 from elspeth.plugins.transforms.llm.providers.azure import AzureOpenAIConfig
 from elspeth.plugins.transforms.llm.providers.gateway import GatewayConfig
 from elspeth.web.catalog.schemas import PluginSchemaInfo
@@ -222,6 +223,7 @@ def test_runtime_conversion_consumes_every_universal_setting_field() -> None:
         "bedrock_guardrail_profiles",
         "bedrock_guardrail_default_profiles",
         "aws_s3_source_profiles",
+        "aws_textract_profiles",
         "deployment_aws_region",
     }
     runtime_fields = set(RuntimeWebPluginConfig.__dataclass_fields__)
@@ -229,38 +231,47 @@ def test_runtime_conversion_consumes_every_universal_setting_field() -> None:
     assert settings_fields == runtime_fields
 
 
-def test_textract_deployment_profile_exposes_only_alias_and_ordinary_options() -> None:
-    runtime = RuntimeWebPluginConfig.from_settings(_settings(deployment_aws_region="ap-southeast-1"))
-    policy = compile_web_plugin_policy(
-        registry=_isolated_manager_with_llm_source(),
-        settings=RuntimeWebPluginConfig.from_settings(
-            _settings(
-                deployment_aws_region="ap-southeast-1",
-                plugin_allowlist=("transform:aws_textract_document_analysis",),
-            )
-        ),
+def _textract_runtime(**overrides: object) -> RuntimeWebPluginConfig:
+    defaults: dict[str, object] = {
+        "deployment_aws_region": "ap-southeast-1",
+        "plugin_allowlist": ("transform:aws_textract_document_analysis",),
+        "aws_textract_profiles": ({"alias": "acceptance-docs", "bucket": "operator-owned-docs", "key_prefix": "org/acme"},),
+    }
+    defaults.update(overrides)
+    return RuntimeWebPluginConfig.from_settings(_settings(**defaults))
+
+
+def _textract_registry(**overrides: object) -> tuple[OperatorProfileRegistry, PluginId]:
+    runtime = _textract_runtime(**overrides)
+    registry = OperatorProfileRegistry(
+        policy=compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime),
+        settings=runtime,
     )
-    registry = OperatorProfileRegistry(policy=policy, settings=runtime)
-    plugin_id = PluginId("transform", "aws_textract_document_analysis")
+    return registry, PluginId("transform", "aws_textract_document_analysis")
+
+
+def test_textract_profile_projection_is_allowlist_with_location_private() -> None:
+    registry, plugin_id = _textract_registry()
 
     public = registry.public_schema(
         plugin_id,
         create_catalog_service().get_schema("transform", "aws_textract_document_analysis"),
-        available_aliases=("deployment",),
+        available_aliases=("acceptance-docs",),
     )
 
     properties = public.json_schema["properties"]
-    assert properties["profile"]["enum"] == ["deployment"]
-    assert {"bucket_field", "key_field", "feature_types", "text_field", "schema"} <= set(properties)
+    assert properties["profile"]["enum"] == ["acceptance-docs"]
     assert not set(properties) & {
+        "bucket",
+        "bucket_field",
+        "key_prefix",
         "region",
         "auth_mode",
         "aws_access_key_id",
         "aws_secret_access_key",
         "aws_session_token",
-        "bucket",
-        "key_prefix",
     }
+    assert {"key_field", "version_field", "feature_types", "queries", "text_field", "extract", "schema"} <= set(properties)
     assert set(public.json_schema["required"]) == {
         "profile",
         "key_field",
@@ -270,6 +281,148 @@ def test_textract_deployment_profile_exposes_only_alias_and_ordinary_options() -
     assert public.json_schema["additionalProperties"] is False
     assert public.secret_requirements == ()
     assert "SchemaConfig" in public.json_schema["$defs"]
+    field_names = [knob_field["name"] for knob_field in public.knob_schema["fields"]]
+    assert field_names[0] == "profile"
+    assert set(field_names) == set(properties)
+
+
+def test_textract_availability_requires_a_configured_profile_table() -> None:
+    registry, plugin_id = _textract_registry(aws_textract_profiles=())
+
+    assert (
+        registry.profile_availability(
+            plugin_id,
+            principal="local:alice",
+            inventory=cast(Any, object()),
+        )
+        == ()
+    )
+
+
+def test_textract_profile_lowering_injects_operator_binding() -> None:
+    registry, plugin_id = _textract_registry()
+    safe_options: dict[str, object] = {
+        "key_field": "document_key",
+        "feature_types": ["FORMS"],
+        "text_field": "textract_text",
+        "schema": {"mode": "observed"},
+    }
+
+    lowered = registry.lower_options(plugin_id, alias="acceptance-docs", safe_options=dict(safe_options))
+
+    executable = deep_thaw(lowered.executable_options)
+    assert executable["bucket"] == "operator-owned-docs"
+    assert executable["key_prefix"] == "org/acme"
+    assert executable["region"] == "ap-southeast-1"
+    assert executable["auth_mode"] == "default_chain"
+    assert "bucket_field" not in executable
+    assert deep_thaw(lowered.audit_safe_options) == {"profile": "acceptance-docs", **safe_options}
+
+
+def test_textract_profile_lowering_without_prefix_omits_key_prefix() -> None:
+    registry, plugin_id = _textract_registry(
+        aws_textract_profiles=({"alias": "acceptance-docs", "bucket": "operator-owned-docs"},),
+    )
+
+    lowered = registry.lower_options(
+        plugin_id,
+        alias="acceptance-docs",
+        safe_options={"key_field": "document_key", "feature_types": ["FORMS"], "text_field": "t", "schema": {"mode": "observed"}},
+    )
+
+    executable = deep_thaw(lowered.executable_options)
+    assert executable["bucket"] == "operator-owned-docs"
+    assert "key_prefix" not in executable
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["bucket", "bucket_field", "key_prefix", "region", "auth_mode", "aws_secret_access_key"],
+)
+def test_textract_profile_lowering_rejects_location_and_deployment_options(option: str) -> None:
+    registry, plugin_id = _textract_registry()
+
+    with pytest.raises(ValueError, match="private_profile_option"):
+        registry.lower_options(
+            plugin_id,
+            alias="acceptance-docs",
+            safe_options={
+                option: "attacker-chosen",
+                "key_field": "document_key",
+                "feature_types": ["FORMS"],
+                "text_field": "t",
+                "schema": {"mode": "observed"},
+            },
+        )
+
+
+def test_textract_profile_binding_generation_rotates_for_bucket_prefix_and_region() -> None:
+    def generation(*, bucket: str, key_prefix: str, region: str) -> str | None:
+        registry, plugin_id = _textract_registry(
+            deployment_aws_region=region,
+            aws_textract_profiles=({"alias": "acceptance-docs", "bucket": bucket, "key_prefix": key_prefix},),
+        )
+        return registry.profile_availability(
+            plugin_id,
+            principal="local:alice",
+            inventory=cast(Any, object()),
+        )[0].generation
+
+    baseline = generation(bucket="first-bucket", key_prefix="org/acme", region="ap-southeast-1")
+
+    assert baseline is not None
+    assert baseline != generation(bucket="second-bucket", key_prefix="org/acme", region="ap-southeast-1")
+    assert baseline != generation(bucket="first-bucket", key_prefix="org/other", region="ap-southeast-1")
+    assert baseline != generation(bucket="first-bucket", key_prefix="org/acme", region="eu-west-1")
+
+
+def test_textract_profile_selection_promotes_only_a_sole_usable_alias() -> None:
+    registry, plugin_id = _textract_registry(
+        aws_textract_profiles=(
+            {"alias": "acceptance-docs", "bucket": "operator-owned-docs"},
+            {"alias": "archive-docs", "bucket": "operator-archive-docs"},
+        ),
+    )
+
+    assert registry.selected_profile_alias(plugin_id, usable_aliases=("acceptance-docs",)) == "acceptance-docs"
+    assert registry.selected_profile_alias(plugin_id, usable_aliases=("acceptance-docs", "archive-docs")) is None
+
+
+def test_textract_profile_settings_reject_duplicates_and_malformed_bindings() -> None:
+    with pytest.raises(ValidationError, match="aliases must be unique"):
+        _settings(
+            aws_textract_profiles=(
+                {"alias": "acceptance-docs", "bucket": "first-bucket"},
+                {"alias": "acceptance-docs", "bucket": "second-bucket"},
+            )
+        )
+    with pytest.raises(ValidationError, match="key_prefix"):
+        _settings(aws_textract_profiles=({"alias": "acceptance-docs", "bucket": "b", "key_prefix": "../up"},))
+    with pytest.raises(ValidationError, match="placeholder"):
+        _settings(aws_textract_profiles=({"alias": "acceptance-docs", "bucket": "OPERATOR_REQUIRED"},))
+
+
+def test_textract_profile_summary_and_assistance_speak_profile_and_relative_keys() -> None:
+    registry, plugin_id = _textract_registry()
+    catalog = create_catalog_service()
+    full_schema = catalog.get_schema("transform", "aws_textract_document_analysis")
+    full_summary = next(summary for summary in catalog.list_transforms() if summary.name == "aws_textract_document_analysis")
+
+    summary = registry.public_summary(plugin_id, full_summary, full_schema, available_aliases=("acceptance-docs",))
+    assistance = registry.public_assistance(
+        plugin_id,
+        AWSTextractDocumentAnalysis.get_agent_assistance() or _fail_missing_assistance(),
+    )
+
+    assert "profile: acceptance-docs" in (summary.example_use or "")
+    assert "bucket_field" not in (summary.example_use or "")
+    rendered_hints = " ".join(assistance.composer_hints)
+    assert "bucket_field" not in rendered_hints
+    assert "key" in rendered_hints
+
+
+def _fail_missing_assistance() -> Any:
+    raise AssertionError("textract assistance must exist")
 
 
 def test_s3_source_profile_constrains_bucket_prefix_region_and_auth() -> None:
@@ -657,44 +810,7 @@ def test_s3_source_profile_has_no_implicit_selection_when_multiple_profiles_are_
     assert registry.selected_profile_alias(PluginId("source", "aws_s3"), usable_aliases=("second",)) == "second"
 
 
-def test_textract_deployment_profile_lowers_and_rotates_binding_with_region() -> None:
-    def registry_for(region: str) -> OperatorProfileRegistry:
-        runtime = RuntimeWebPluginConfig.from_settings(_settings(deployment_aws_region=region))
-        policy = compile_web_plugin_policy(
-            registry=_isolated_manager_with_llm_source(),
-            settings=RuntimeWebPluginConfig.from_settings(
-                _settings(
-                    deployment_aws_region=region,
-                    plugin_allowlist=("transform:aws_textract_document_analysis",),
-                )
-            ),
-        )
-        return OperatorProfileRegistry(policy=policy, settings=runtime)
-
-    plugin_id = PluginId("transform", "aws_textract_document_analysis")
-    safe = {
-        "bucket_field": "bucket",
-        "key_field": "key",
-        "feature_types": ["FORMS"],
-        "text_field": "text",
-        "schema": {"mode": "observed"},
-    }
-    first = registry_for("ap-southeast-1")
-    second = registry_for("eu-west-1")
-    lowered = first.lower_options(plugin_id, alias="deployment", safe_options=safe)
-
-    assert deep_thaw(lowered.executable_options) == {
-        **safe,
-        "region": "ap-southeast-1",
-        "auth_mode": "default_chain",
-    }
-    assert deep_thaw(lowered.audit_safe_options) == {"profile": "deployment", **safe}
-    assert first.profile_availability(plugin_id, principal="local:alice", inventory=cast(Any, object()))[0].generation != (
-        second.profile_availability(plugin_id, principal="local:alice", inventory=cast(Any, object()))[0].generation
-    )
-
-
-def test_textract_deployment_profile_requires_local_boto3(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_textract_profile_requires_local_boto3(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib.util
 
     real_find_spec = importlib.util.find_spec
@@ -702,43 +818,16 @@ def test_textract_deployment_profile_requires_local_boto3(monkeypatch: pytest.Mo
         "elspeth.web.plugin_policy.profiles.importlib.util.find_spec",
         lambda name: None if name == "boto3" else real_find_spec(name),
     )
-    runtime = RuntimeWebPluginConfig.from_settings(_settings(deployment_aws_region="ap-southeast-1"))
-    policy = compile_web_plugin_policy(registry=_isolated_manager_with_llm_source(), settings=runtime)
-    registry = OperatorProfileRegistry(policy=policy, settings=runtime)
+    registry, plugin_id = _textract_registry()
 
     assert (
         registry.profile_availability(
-            PluginId("transform", "aws_textract_document_analysis"),
+            plugin_id,
             principal="local:alice",
             inventory=cast(Any, object()),
         )
         == ()
     )
-
-
-@pytest.mark.parametrize(
-    "private",
-    ["region", "auth_mode", "aws_access_key_id", "aws_secret_access_key", "aws_session_token"],
-)
-def test_textract_deployment_profile_rejects_private_or_mixed_options(private: str) -> None:
-    runtime = RuntimeWebPluginConfig.from_settings(_settings(deployment_aws_region="ap-southeast-1"))
-    policy = compile_web_plugin_policy(
-        registry=_isolated_manager_with_llm_source(),
-        settings=RuntimeWebPluginConfig.from_settings(
-            _settings(
-                deployment_aws_region="ap-southeast-1",
-                plugin_allowlist=("transform:aws_textract_document_analysis",),
-            )
-        ),
-    )
-    registry = OperatorProfileRegistry(policy=policy, settings=runtime)
-
-    with pytest.raises(ValueError, match="private_profile_option"):
-        registry.lower_options(
-            PluginId("transform", "aws_textract_document_analysis"),
-            alias="deployment",
-            safe_options={"bucket_field": "bucket", private: "attacker"},
-        )
 
 
 def test_llm_profiles_without_a_standard_profile_start_in_degraded_mode() -> None:
