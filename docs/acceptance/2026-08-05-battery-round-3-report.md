@@ -202,12 +202,34 @@ the session store (`ops-local/acceptance/{analyse_compose,make_inspect_override}
 **The loop is not bloated.** 6–12 assistant turns per compose at ~1.0–1.5 tool
 calls per turn. There is no call explosion and no runaway turn count.
 
-**Model reasoning is not persisted at all.** `chat_messages` has no reasoning
-column (`id, session_id, role, content, raw_content, tool_calls, tool_call_id,
-sequence_no, writer_principal, created_at, composition_state_id,
-parent_assistant_id`). `raw_content` is populated on only 60 of 542 rows, all
-assistant, 63–8462 chars, mean ~1000. So reasoning volume cannot be measured
-from the store — only its wall-clock effect is visible.
+**Model reasoning is persisted — but not in the session store.** An earlier
+draft of this section claimed it was not persisted at all; that was wrong, and
+wrong in a way that mattered, because it implied the reasoning-effort change
+could not be measured before/after. The correction:
+
+- `chat_messages` has no reasoning column (`id, session_id, role, content,
+  raw_content, tool_calls, tool_call_id, sequence_no, writer_principal,
+  created_at, composition_state_id, parent_assistant_id`), and `raw_content`
+  is populated on only 60 of 542 rows (assistant only, 63–8462 chars, mean
+  ~1000). That is what my session-store query saw.
+- Reasoning lives on the **`ComposerLLMCall` record** instead:
+  `reasoning_content: str | None` (`contracts/composer_llm_audit.py:167`),
+  parsed from the provider response (`llm_response_parsing.py:625`), alongside
+  `reasoning_details` and `thinking_blocks`. `guided_audit.py:207-209` nulls
+  those three **only when `call.status is not SUCCESS`** — successful calls
+  retain them.
+- Those records go to the audit trail (Landscape), which is the acceptance
+  RDS and was not queryable from this session. So reasoning volume *is*
+  measurable; it just needs a Landscape-side query, not a session-store one.
+
+**Implication for the reasoning-effort change** (`elspeth-dc459d438e`, merged
+after this round's deployed build): a before/after on reasoning volume is
+available from `ComposerLLMCall.reasoning_content` lengths. The new settings
+default to `discovery=low`, `candidate=high`, `advisor=medium` and all carry
+defaults, so no task-definition change is required — but they are new
+`ELSPETH_WEB__` names, so if any are set explicitly they must land in the same
+task-definition revision as the image that knows them (the `config.py:1134`
+trap that gated the Textract grant).
 
 **Tool histogram across every session:**
 
@@ -257,7 +279,7 @@ near-identical repair retries are not counted.
 **Reading:** the win is not in trimming turns or tools — it is in (a) not
 re-issuing rejected mutations unchanged, and (b) the advisor flag rate. A
 per-task reasoning budget should also compress the 43–272s spread directly,
-since turn *count* barely moves while wall-clock varies six-fold.
+since turn *count* barely moves while wall-clock varies six-fold. Measure it from `ComposerLLMCall.reasoning_content` in Landscape.
 
 ## Two things this round learned
 
