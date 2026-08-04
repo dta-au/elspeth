@@ -117,6 +117,48 @@ where the architectural fix landed:
   ``row_unions`` shape without a synthetic input, and regenerated settings
   rebuild the same production graph as the shipped A/B example. Pinned by
   ``TestComposerRuntimeRowUnionAgreement``.
+* Shape 14 — queue effective-guarantee propagation (battery-2026-08-04 g08,
+  ``elspeth-5a372d3267``). A queue node carried a hardcoded observed/no-fields
+  schema and ``walk_effective_guarantee_vote`` stopped there, so a
+  source-guaranteed field never reached a queue consumer's
+  ``required_input_fields`` check: runtime graph build rejected the runnable
+  source → queue → consumer topology with ``GraphValidationError``
+  "guarantees: (none - dynamic schema)" while composer Stage-1 abstained with
+  a medium warning (validate green / runtime red at the /validate boundary).
+  Fixed in ``core/dag/guarantees.py``: the walk now propagates through QUEUE
+  nodes — intersection of arm guarantees when every arm participates, total
+  abstention when any arm abstains (fan-in soundness; ``compose_propagation``'s
+  abstainer-skip applies only to same-row pass-throughs). Engine-level pinning
+  in ``tests/unit/core/test_dag_queue_guarantee_propagation.py``; this suite
+  pins the cross-surface agreement via
+  ``TestComposerRuntimeQueueGuaranteeAgreement``.
+* Shape 15 — row_union locked-input extras (battery-2026-08-04 g02b, run
+  ``f6bbca45``, ``elspeth-9d13900064``). The composer's Rule A/Rule B extras
+  checks were skipped whenever the producer walk-back hit a row_union
+  (medium-warning abstention), so llm x2 → row_union → fixed-mode consumer
+  validated green and failed at the executor input preflight with
+  ``PluginContractViolation`` (``extra_forbidden`` on the llm provenance
+  side-fields). Fixed in ``web/composer/state.py`` by a dedicated
+  extras-polarity walker (union of arm emit sets — a lower bound: sound to
+  error on, never to clear with); presence-direction abstention untouched.
+  The runtime half of this shape is the executor-level per-row input
+  validation, not a graph-build check, so the pin lives at the composer unit
+  layer: ``tests/unit/web/composer/test_state.py::TestCompositionStateRowUnion``
+  (7 tests incl. the ticket's literal graph and the Rule B gate→sink
+  topology), per the Shape 6 precedent for coverage housed outside this file.
+* Shape 16 — pending-review handoff announce truncation (battery-2026-08-04
+  g08, ``elspeth-5a372d3267``). ``review_interpretations`` fails the strict
+  ledger at canonical index 10 asserting ``completion_ready=True``, stamping
+  every later stage — ``graph_structure`` at 21 included —
+  ``SKIPPED_AFTER_FAILURE``; the composer then announced "ready for the
+  required review" from that truncated result. Fixed in
+  ``web/composer/service.py``: announce sites verify the handoff with an
+  authoring-masked re-validation (``allow_pending_interpretation_placeholders``,
+  previously zero production callers) and qualify the published message when
+  it is red; the self-repair loop is deliberately not engaged (staged-review
+  no-extra-turns contract). Pinned at the unit layer:
+  ``tests/unit/web/composer/test_runtime_preflight_pending_review_verification.py``,
+  per the Shape 4 precedent that this suite carries no LLM-loop scaffolding.
 
 Adding a new shape: file the eval-finding issue, land the structural fix,
 then extend this docstring with the shape's number, the originating eval
@@ -4652,3 +4694,110 @@ class TestComposerRuntimeRowUnionAgreement:
 
         with pytest.raises(ValidationError):
             load_settings_from_yaml_string(invalid_yaml)
+
+
+class TestComposerRuntimeQueueGuaranteeAgreement:
+    """Shape 14 — queue consumers see upstream guarantees on both surfaces.
+
+    The battery g08 topology in plugin-neutral form: a source explicitly
+    guaranteeing ``llm_response`` feeds a declared queue, and the queue's
+    consumer names ``required_input_fields: [llm_response]``. Runtime graph
+    build must accept it (the guarantee propagates through the queue), and the
+    composer must import and validate the same YAML green. The negative
+    control proves fail-closed retention: requiring a field NO arm guarantees
+    is still rejected at graph build with the same actionable message.
+
+    Bug-verification protocol (mandatory per this file's header): the shape is
+    pinned on the ``NodeType.QUEUE`` branch of
+    ``core/dag/guarantees.walk_effective_guarantee_vote``. Manually replacing
+    that branch's condition with ``if False:`` restores the pre-fix walk (the
+    queue reports its own empty observed schema) and
+    ``test_both_accept_queue_consumer_requiring_arm_guaranteed_field`` fails at
+    graph build with ``GraphValidationError: Schema contract violation: edge
+    'queue_inbound_…' → 'transform_consumer_…' … Producer (queue:inbound)
+    guarantees: (none - dynamic schema)``. Verified by manual revert on
+    2026-08-05; restored. The negative control passes both pre- and post-fix
+    by design — it pins that the fix did not fail open.
+    """
+
+    def _yaml(self, *, required_field: str) -> str:
+        import yaml
+
+        doc = {
+            "sources": {
+                "responses": {
+                    "plugin": "csv",
+                    "on_success": "inbound",
+                    "options": {
+                        "path": "examples/multi_source_queue/input/orders.csv",
+                        "schema": {"mode": "observed", "guaranteed_fields": ["llm_response"]},
+                        "on_validation_failure": "discard",
+                    },
+                },
+            },
+            "queues": {"inbound": {}},
+            "transforms": [
+                {
+                    "name": "consumer",
+                    "plugin": "passthrough",
+                    "input": "inbound",
+                    "on_success": "combined",
+                    "on_error": "discard",
+                    "options": {
+                        "schema": {"mode": "observed"},
+                        "required_input_fields": [required_field],
+                    },
+                }
+            ],
+            "sinks": {
+                "combined": {
+                    "plugin": "json",
+                    "on_write_failure": "discard",
+                    "options": {
+                        "path": "examples/multi_source_queue/output/combined.jsonl",
+                        "format": "jsonl",
+                        "collision_policy": "auto_increment",
+                        "schema": {"mode": "observed"},
+                    },
+                }
+            },
+            "landscape": {"url": "sqlite:///examples/multi_source_queue/runs/audit.db"},
+        }
+        return yaml.safe_dump(doc, sort_keys=False)
+
+    def _build_runtime_graph(self, settings_yaml: str) -> ExecutionGraph:
+        from elspeth.core.config import load_settings_from_yaml_string
+
+        settings = load_settings_from_yaml_string(settings_yaml)
+        bundle = instantiate_plugins_from_config(settings, preflight_mode=True)
+        return ExecutionGraph.from_plugin_instances(
+            sources=bundle.sources,
+            source_settings_map=bundle.source_settings_map,
+            transforms=bundle.transforms,
+            sinks=bundle.sinks,
+            aggregations=bundle.aggregations,
+            gates=list(settings.gates),
+            coalesce_settings=list(settings.coalesce),
+            queues=settings.queues,
+        )
+
+    def test_both_accept_queue_consumer_requiring_arm_guaranteed_field(self) -> None:
+        from elspeth.contracts import NodeType
+        from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
+
+        settings_yaml = self._yaml(required_field="llm_response")
+
+        graph = self._build_runtime_graph(settings_yaml)
+        queue_nodes = [n for n in graph.get_nodes() if n.node_type == NodeType.QUEUE]
+        assert len(queue_nodes) == 1
+        assert "llm_response" in graph.get_effective_guaranteed_fields(queue_nodes[0].node_id)
+
+        composer_result = composition_state_from_runtime_yaml(settings_yaml).validate()
+        assert composer_result.is_valid, [error.message for error in composer_result.errors]
+
+    def test_runtime_still_rejects_queue_consumer_requiring_unguaranteed_field(self) -> None:
+        settings_yaml = self._yaml(required_field="never_guaranteed")
+
+        with pytest.raises(GraphValidationError) as exc_info:
+            self._build_runtime_graph(settings_yaml)
+        assert "never_guaranteed" in str(exc_info.value)
