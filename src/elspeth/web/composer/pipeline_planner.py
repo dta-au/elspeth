@@ -70,6 +70,7 @@ from elspeth.web.composer.progress import (
     tool_started_progress_event,
 )
 from elspeth.web.composer.protocol import ToolArgumentError
+from elspeth.web.composer.reasoning import apply_reasoning_kwargs
 from elspeth.web.composer.redaction import SetPipelineArgumentsModel
 from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.reviewed_source_authority import resolve_reviewed_source_authority
@@ -304,6 +305,15 @@ class PlannerModelConfig:
     max_tool_calls_per_turn: int
     max_api_attempts: int
     api_retry_base_seconds: float
+    # Reasoning-effort hints (elspeth-dc459d438e). Discovery effort rides
+    # ordinary full-surface turns; candidate effort rides hatch and repair
+    # turns. A first-shot candidate submitted on a full-surface turn is
+    # DELIBERATELY generated at discovery effort: the validation gates catch
+    # a shallow first shot and every repair round re-thinks at candidate
+    # effort, so quality is protected without paying candidate-level
+    # latency on every tool-choreography turn.
+    discovery_reasoning_effort: str
+    candidate_reasoning_effort: str
     # Senior advisor model for the one-shot escape-hatch overtime turn.
     # None disables the hatch: budget exhaustion raises exactly as before.
     escape_hatch_model: str | None = None
@@ -2429,6 +2439,7 @@ async def _plan_pipeline_inner(
         model_override: str | None = None,
         tools_override: list[dict[str, Any]] | None = None,
         allow_text_reply: bool = False,
+        reasoning_effort: str | None = None,
     ) -> tuple[Any, tuple[_ParsedToolCall, ...], ComposerLLMCall]:
         nonlocal total_calls, total_cost
         effective_model = model_override or model_config.model_identifier
@@ -2517,6 +2528,7 @@ async def _plan_pipeline_inner(
                 kwargs["temperature"] = model_config.temperature
             if model_config.seed is not None:
                 kwargs["seed"] = model_config.seed
+            apply_reasoning_kwargs(kwargs, model=effective_model, effort=reasoning_effort)
             # Endpoint affordance: select by the SAME condition that selects
             # effective_model above (model_override set == hatch turn), so
             # the escape-hatch call never lands on the primary's endpoint —
@@ -2759,9 +2771,14 @@ async def _plan_pipeline_inner(
                     model_override=model_config.escape_hatch_model,
                     tools_override=[planner_terminal_tool_definition()],
                     allow_text_reply=True,
+                    reasoning_effort=model_config.candidate_reasoning_effort,
                 )
             else:
-                message, calls, audited_call = await call_model()
+                message, calls, audited_call = await call_model(
+                    reasoning_effort=(
+                        model_config.candidate_reasoning_effort if repair_count > 0 else model_config.discovery_reasoning_effort
+                    ),
+                )
         except PipelinePlannerError as exc:
             if exc.code == "PROSE_REPLY":
                 # A no-tool-call reply (thinking aloud) mid-plan: nudge the
