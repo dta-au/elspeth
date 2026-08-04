@@ -12,7 +12,12 @@ section). Graph corpus and intents: `round3-graph-corpus.md`.
 
 ## Headline
 
-The redeploy discharged its purpose: **ADR-036 is confirmed live, both halves.**
+The redeploy discharged its purpose: **ADR-036's authoring projection and its
+runtime binding are both confirmed live.** Its custody NFR is *not* — that
+assertion is over Landscape call records, and the web-API search I first
+offered as evidence turned out to be non-probative (see the addendum). So the
+bug class is proven inexpressible and the binding proven correct; what remains
+unverified is that no persisted call record carries the bucket literal.
 
 The round's substantive finding is that the **compose-vs-runtime schema seam is
 wider than the fix wave addressed**. Four restamp fixes landed on specific
@@ -36,7 +41,7 @@ accounting internally contradictory.
 | g04 `json` source + explode | `57cc5039-0567-4edf-a4df-dee0c912c15e` | `completed` 6/0/0 | **INTEGRITY PASS** |
 | g05 `text` source + `text` sink | `adf0b6c6-bdcb-4e29-ba23-b953bae5366c` | `failed` | **NEW** `elspeth-cfcd333f83` |
 | g06 sink variety | `5c9964cb-974c-4f24-9198-45e087d4e47b` | `completed` | **INTEGRITY PASS** — no token accounting captured |
-| g07 profile-first Textract | `67d40936-2261-4b30-9b43-7058f7927e53` | `completed_with_failures` 1/1 | **PASS** — ADR-036 confirmed |
+| g07 profile-first Textract | `67d40936-2261-4b30-9b43-7058f7927e53` | `completed_with_failures` 1/1 | **PASS** — ADR-036 authoring + binding; custody NFR unverified |
 | g07 (first attempt) | `c69b6ab6-e462-46d8-bd9b-2c8a811bb02f` | failed at **source** | **NEW P1** `elspeth-47fa7c01eb` |
 | g08 two-LLM-arm `row_union` A/B | `dc689cfe-9f4b-47ba-bd04-abd04309debc` | `failed` | Compose fix holds; **NEW** `elspeth-902fc354b2` |
 | g09 four LLM nodes | `307c4e5c-0e5b-48b2-a64a-7142431e2c77` | `completed` 15/18, closure closed (serial re-drive) | **INTEGRITY PASS**; no cap wedge |
@@ -94,16 +99,25 @@ Two entries were **withdrawn from this section** after an adversarial check:
   a single clean pass is fully consistent with the defect still being present.
   Stochastic items never close on one pass. Remedy is cheap — re-drive
   serially ×3; see the addendum.
-- **`elspeth-03f5728c33` — NOT confirmed; the evidence cannot distinguish fix
-  from defect.** I recorded that on g01 `/validate` named two pending reviews
-  the `?status=pending` listing reported as empty, and read that as the
-  backstop working. But that is *also* the ticket's defect signature verbatim.
-  Which one it is depends entirely on query order, and
-  `ops-local/acceptance/drive_graph.py` reads `?status=pending` strictly
-  **before** `/validate` and never re-reads afterwards. An empty listing
-  pre-surfacing is expected and proves nothing either way; with no
-  post-`/validate` read, the claim is unsupported. Settling it needs a driver
-  that re-queries after `/validate`.
+- **`elspeth-03f5728c33` — retracted, then CONFIRMED on the missing read.**
+  My original evidence (an empty `?status=pending` listing alongside a
+  `/validate` that named reviews) was non-discriminating: that is *also* the
+  ticket's defect signature verbatim, and the driver reads the listing strictly
+  **before** `/validate` and never re-reads. Retracted on those grounds. The
+  g08 sampling then stranded a fresh session (`6fc8b619-3602-4510-90c1-8470f385a750`,
+  compose 422 at 271s) and I took the read that was missing:
+
+  | | `?status=pending` |
+  |---|---|
+  | before `/validate` | **0 events** |
+  | after `/validate` | **7 events**, all user-actionable |
+
+  The seven carry real terms — `llm_prompt_template:llm_sentence`,
+  `inline_source_data`, `required_control_auto_wired` ×2, `drop_raw_html_fields`
+  — across `invented_source`, `llm_prompt_template` and `pipeline_decision`.
+  That is the fix: `/validate` runs the surfacer in repair mode before
+  delegating, so the listing is populated by it rather than left empty.
+  Recorded on the ticket as comment 2345.
 - **Operator grant** — `transform:aws_textract_document_analysis` appears in
   `/api/catalog/policy` `available_plugin_ids`. Per
   `test_textract_without_a_profile_table_is_hidden_even_in_a_supported_region`,
@@ -143,19 +157,35 @@ from the API. The real failed node was recoverable only from CloudWatch.
 
 ## Methodology findings
 
-**Do not parallelise composes on this deployment.** Six concurrent composes
-against a single 1 vCPU / 2 GB task pushed two of them past the 270s
-wall-clock budget into `convergence_wall_clock_timeout` 422s. The serial
-control settles it: g01 alone composes in **197s / HTTP 200**; the same graph
-under load returned 422 at 271s. No defect was filed.
+**Compose wall-clock is the round's dominant operational constraint, and it is
+variance, not load.** This finding was revised twice; the final reading rests
+on the full sample.
 
-The residual datum is the margin, and it is thin: the *simplest* graph in the
-corpus consumes 73% of the wall-clock budget on a completely idle instance.
-Observed serial-ish compose times ranged 43s–238s with no clear relation to
-graph complexity — g02 (gate, named routing, poisoned row) took 43s while g01
-(linear) took 197s. A per-task reasoning-budget change was landing as this
-round ran and is expected to move these numbers; round 4 should re-measure
-rather than treat these as a baseline.
+I first attributed three `convergence_wall_clock_timeout` 422s to my own
+six-way concurrency, on the strength of one control (g01: 422 at 271s under
+load, **197s / HTTP 200** alone). That correction was itself wrong. Re-driving
+g08 **serially** produced a 422 at 271s — for a graph that had composed
+successfully at 238s *under* the same load I blamed.
+
+The full distribution over 15 composes:
+
+- succeeded (12): 43, 61, 69, 75, 95, 96, 119, 128, 133, 151, 197, 238 s
+- hit the wall (3): 271, 271, 272 s
+
+The same graph swings enormously: g09 ran 96s and 272s; g01 197s and 271s; g08
+238s and 271s. There is no clear relation to graph complexity either — g02
+(gate, named routing, poisoned row) composed in 43s while g01 (linear
+multi-transform) took 197s.
+
+**Conclusion: compose duration is highly variable across the whole 43–272s
+range, and the 270s budget truncates the tail. Roughly 1 in 5 composes dies at
+the wall.** Concurrency plausibly adds some load but does not determine the
+outcome, and no defect was filed for it. A per-task reasoning-budget change was
+landing as this round ran; it targets exactly this variance, and round 4 should
+re-measure rather than treat these numbers as a baseline.
+
+Operationally the tail is not wasted: a 422 leaves a genuinely stranded
+session, and that is how `elspeth-03f5728c33` got its live confirmation.
 
 **The engine's error text can point the wrong way.** `elspeth-39118dd24f`
 reports "This indicates an upstream transform/source schema bug" for a row
