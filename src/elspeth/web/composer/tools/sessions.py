@@ -2479,7 +2479,11 @@ async def _handle_request_interpretation_review(
     # stays pending, wedging the session permanently — validation fails
     # forever and the review API has nothing to resolve (battery-r2 g08).
     # Churn on the uncapped kinds is bounded by the per-site dedup gate
-    # above and by the graph itself.
+    # above and by the graph itself — that argument is load-bearing now that
+    # the caps no longer carry it, so it is recorded with its failure
+    # conditions in ADR-037 (docs/architecture/adr/
+    # 037-interpretation-caps-govern-llm-churn-only.md). Re-derive it before
+    # adding an InterpretationKind member or changing the dedup key.
     if parsed.kind is InterpretationKind.VAGUE_TERM:
         await _check_interpretation_rate_limits(
             session_id=session_id,
