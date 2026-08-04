@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ChatPanel,
   deriveRowCount,
@@ -33,6 +33,7 @@ import type {
   Session,
 } from "@/types/api";
 import type {
+  GuidedChatResponse,
   GuidedProposalReviewState,
   GuidedSession,
   SingleSelectPayload,
@@ -40,6 +41,7 @@ import type {
   TurnPayload,
   TurnRecord,
 } from "@/types/guided";
+import { COMPOSE_TIMEOUT_ABORT_REASON } from "@/config/composer";
 import type { InterpretationEvent } from "@/types/interpretation";
 
 vi.mock("@/hooks/useComposer", () => ({
@@ -170,9 +172,27 @@ vi.mock("./ChatInput", () => ({
         data-max-length={maxLength ?? ""}
         data-value={value ?? ""}
         data-read-only={readOnly ? "true" : "false"}
-        onClick={() => onSend?.("test-chat-message")}
+        onClick={() => {
+          onSend?.("test-chat-message");
+          // Mirror the real ChatInput.handleSend contract for controlled
+          // consumers: the box is cleared through the parent's onChange
+          // immediately after onSend (the tutorial's no-op onChange ignores
+          // it; the plain guided draft is cleared and may be restored by the
+          // failure-retention path — elspeth-49b467d91a).
+          onChange?.("");
+        }}
       >
         {placeholder ?? ""}
+      </button>
+      <button
+        type="button"
+        data-testid="chat-input-type"
+        // Simulate the operator typing into the (never-disabled) textarea —
+        // used by the prompt-retention tests to prove a restore never
+        // clobbers newer typing entered while a send is in flight.
+        onClick={() => onChange?.("retyped while pending")}
+      >
+        simulate typing
       </button>
       <button
         type="button"
@@ -1407,7 +1427,15 @@ describe("ChatPanel mode discriminator", () => {
     },
   );
 
-  it("makes replace explicit for proposal prose and resets the selector to amend after send", async () => {
+  it("makes replace explicit for proposal prose and keeps the scope when the send does not deliver", async () => {
+    // The stubbed chatGuided resolves without advancing any store state, so
+    // under the retention doctrine (elspeth-49b467d91a) this send did NOT
+    // deliver: the typed prompt is restored AND the chosen scope must
+    // survive with it — an eager reset here made the retry silently
+    // resubmit "amend" after the user chose "replace". A DELIVERED revision
+    // advances the proposal identity, and the identity-keyed effect resets
+    // the selector (pinned by the "does not carry a selected replace scope"
+    // test below).
     const chatGuidedSpy = vi.fn().mockResolvedValue(undefined);
     useSessionStore.setState({
       activeSessionId: "session-guided",
@@ -1435,7 +1463,11 @@ describe("ChatPanel mode discriminator", () => {
         "replace",
       );
     });
-    expect(scope).toHaveValue("amend");
+    expect(scope).toHaveValue("replace");
+    // The undelivered prompt is restored alongside the retained scope.
+    expect(screen.getByTestId("chat-input").getAttribute("data-value")).toBe(
+      "test-chat-message",
+    );
   });
 
   it("does not carry a selected replace scope into another proposal or session", async () => {
@@ -3215,6 +3247,222 @@ describe("ChatPanel mode discriminator", () => {
         "test-chat-message",
         expect.any(AbortSignal),
       );
+    });
+  });
+
+  describe("plain guided prompt retention on failed sends (elspeth-49b467d91a)", () => {
+    // These tests drive the REAL sessionStore.chatGuided against api-level
+    // failures (vi.spyOn on the partially-mocked @/api/client namespace) so
+    // retention is proven against the store's true failure contract — an
+    // HTTP failure leaves chat_history untouched — rather than a hand-rolled
+    // fake of it. Progress polling is stubbed at the store-action seam:
+    // startComposerProgressPolling returns a generation that can never match
+    // the module counter, which short-circuits the abort-path resync
+    // (superseded) and the finally-block progress reload. Distinct session
+    // ids per test keep guided-retry custody records (sessionStorage) from
+    // conflicting across tests — an ambiguous 5xx retains custody by design.
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    function seedLiveGuidedChatSession(sessionId: string): void {
+      useSessionStore.setState({
+        activeSessionId: sessionId,
+        sessions: [{ ...guidedSessionFixture, id: sessionId }],
+        messages: [],
+        guidedSession: activeGuidedSession(),
+        guidedNextTurn: singleSelectTurn(),
+        compositionState: makeComposition(1),
+        // Sibling tests replace the chatGuided ACTION via setState and the
+        // store's reset() only merges the data fields back — reinstall the
+        // real action so these tests exercise the genuine failure contract.
+        chatGuided: useSessionStore.getInitialState().chatGuided,
+        startComposerProgressPolling: vi.fn(() => -1),
+        stopComposerProgressPolling: vi.fn(),
+        loadComposerProgress: vi.fn().mockResolvedValue(undefined),
+      });
+    }
+
+    it.each([
+      [
+        "502 provider failure",
+        "00000000-0000-4000-8000-0000000049b1",
+        { status: 502, detail: "The provider returned an invalid response" },
+      ],
+      [
+        "generic 500",
+        "00000000-0000-4000-8000-0000000049b2",
+        { status: 500, detail: "Internal error" },
+      ],
+      ["network failure", "00000000-0000-4000-8000-0000000049b3", new TypeError("fetch failed")],
+    ])(
+      "restores the typed prompt after a %s so retry needs no retyping",
+      async (_label, sessionId, rejection) => {
+        vi.spyOn(apiClient, "chatGuided").mockRejectedValueOnce(rejection);
+        seedLiveGuidedChatSession(sessionId);
+
+        render(<ChatPanel />);
+        await act(async () => {
+          screen.getByTestId("chat-input").click();
+        });
+
+        await waitFor(() => {
+          expect(
+            screen.getByTestId("chat-input").getAttribute("data-value"),
+          ).toBe("test-chat-message");
+        });
+        // The failure surfaced, and the prompt verifiably did NOT land in the
+        // server-authoritative transcript (the retention predicate).
+        expect(useSessionStore.getState().error).not.toBeNull();
+        expect(
+          useSessionStore.getState().guidedSession?.chat_history ?? [],
+        ).toHaveLength(0);
+      },
+    );
+
+    it("restores the typed prompt after a client-timeout abort (same as the 502 case)", async () => {
+      // Per WHATWG fetch semantics an abort(reason) rejects with the RAW
+      // reason — the compose-timeout guard aborts with this bare string.
+      vi.spyOn(apiClient, "chatGuided").mockRejectedValueOnce(
+        COMPOSE_TIMEOUT_ABORT_REASON,
+      );
+      seedLiveGuidedChatSession("00000000-0000-4000-8000-0000000049b4");
+
+      render(<ChatPanel />);
+      await act(async () => {
+        screen.getByTestId("chat-input").click();
+      });
+
+      await waitFor(() => {
+        expect(
+          screen.getByTestId("chat-input").getAttribute("data-value"),
+        ).toBe("test-chat-message");
+      });
+      expect(useSessionStore.getState().guidedChatPending).toBe(false);
+    });
+
+    it("keeps the intentional clear on success (user turn delivered to chat_history)", async () => {
+      const deliveredResponse: GuidedChatResponse = {
+        assistant_message: "Understood — CSV it is.",
+        assistant_message_kind: "assistant",
+        guided_session: {
+          ...activeGuidedSession(),
+          chat_history: [
+            {
+              role: "user",
+              content: "test-chat-message",
+              seq: 0,
+              step: "step_1_source",
+              ts_iso: "2026-08-04T00:00:00Z",
+              assistant_message_kind: null,
+              synthetic_failure_reason: null,
+            },
+            {
+              role: "assistant",
+              content: "Understood — CSV it is.",
+              seq: 1,
+              step: "step_1_source",
+              ts_iso: "2026-08-04T00:00:00Z",
+              assistant_message_kind: "assistant",
+              synthetic_failure_reason: null,
+            },
+          ],
+          chat_turn_seq: 2,
+        },
+        next_turn: singleSelectTurn("b".repeat(64)),
+        terminal: null,
+        composition_state: makeComposition(1),
+      };
+      vi.spyOn(apiClient, "chatGuided").mockResolvedValueOnce(deliveredResponse);
+      seedLiveGuidedChatSession("00000000-0000-4000-8000-0000000049b5");
+
+      render(<ChatPanel />);
+      await act(async () => {
+        screen.getByTestId("chat-input").click();
+      });
+
+      await waitFor(() => {
+        expect(useSessionStore.getState().guidedSession?.chat_turn_seq).toBe(2);
+      });
+      expect(
+        screen.getByTestId("chat-input").getAttribute("data-value"),
+      ).toBe("");
+    });
+
+    it("restores the typed intent when the cold /guided/start fails (no durable checkpoint)", async () => {
+      // The live F14 presentation (session ff3abea3): first prompt of a plain
+      // guided session routes through /guided/start, which 502s. Ambiguous-5xx
+      // custody reconciliation is stubbed to report the operation failed
+      // server-side, mirroring a genuine REPAIR_EXHAUSTED outcome.
+      const startSpy = vi
+        .spyOn(apiClient, "startGuidedSession")
+        .mockRejectedValueOnce({
+          status: 502,
+          detail: "The provider returned an invalid response",
+        });
+      vi.spyOn(apiClient, "reconcileGuidedStartOperation").mockResolvedValue({
+        status: "failed",
+        failure_code: "invalid_provider_response",
+      });
+      useSessionStore.setState({
+        activeSessionId: "00000000-0000-4000-8000-0000000049b6",
+        sessions: [
+          { ...guidedSessionFixture, id: "00000000-0000-4000-8000-0000000049b6" },
+        ],
+        messages: [],
+        guidedSession: activeGuidedSession(),
+        guidedNextTurn: singleSelectTurn(),
+        compositionState: null,
+        chatGuided: useSessionStore.getInitialState().chatGuided,
+        startComposerProgressPolling: vi.fn(() => -1),
+        stopComposerProgressPolling: vi.fn(),
+        loadComposerProgress: vi.fn().mockResolvedValue(undefined),
+      });
+
+      render(<ChatPanel />);
+      await act(async () => {
+        screen.getByTestId("chat-input").click();
+      });
+
+      await waitFor(() => {
+        expect(
+          screen.getByTestId("chat-input").getAttribute("data-value"),
+        ).toBe("test-chat-message");
+      });
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      // No durable checkpoint was established — the delivery predicate for
+      // the cold-start path.
+      expect(useSessionStore.getState().compositionState).toBeNull();
+    });
+
+    it("a restore never clobbers newer typing entered while the send was in flight", async () => {
+      const pendingChat = deferred<GuidedChatResponse>();
+      vi.spyOn(apiClient, "chatGuided").mockReturnValueOnce(pendingChat.promise);
+      seedLiveGuidedChatSession("00000000-0000-4000-8000-0000000049b7");
+
+      render(<ChatPanel />);
+      await act(async () => {
+        screen.getByTestId("chat-input").click();
+      });
+      // The operator retypes while the request is in flight — the textarea
+      // never disables (only Send does), so this is a live path.
+      await act(async () => {
+        screen.getByTestId("chat-input-type").click();
+      });
+      await act(async () => {
+        pendingChat.reject({
+          status: 502,
+          detail: "The provider returned an invalid response",
+        });
+        await pendingChat.promise.catch(() => undefined);
+      });
+
+      await waitFor(() => {
+        expect(useSessionStore.getState().guidedChatPending).toBe(false);
+      });
+      expect(
+        screen.getByTestId("chat-input").getAttribute("data-value"),
+      ).toBe("retyped while pending");
     });
   });
 
