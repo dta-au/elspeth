@@ -73,7 +73,7 @@ does not spend budget re-testing them.
 | Ticket | Priority | Filigree status | Fix commit(s) | What must be observably TRUE on the live instance | Concrete repro shape to drive it | Composer web API alone? |
 |---|---|---|---|---|---|---|
 | `elspeth-38aae1498d` | P2 | `verifying` | `39e419c24` | Nothing new required live. `json_explode` restamps its synthesized `item`/`item_index` declarations, curing a `SchemaConfigModeViolation` that needed no author cooperation. Ships with a DAG corpus manifest hash + case-registry digest refresh — so the **corpus regression watch** in section C covers the ripple. | Only if opportunistically cheap: `json` source → `json_explode` in **fixed/flexible** mode → sink. Otherwise rely on the unit + corpus coverage. | yes (but unnecessary) |
-| `elspeth-d1f20e8385` | P2 | `verifying` | `52beec400` | Nothing new required live. All three `llm` transform emit paths restamp declared output field contracts. Provenance side-field (`*_usage`/`*_model`) emission is **pinned unchanged** — so this must not perturb `elspeth-9d13900064`'s observable above. | Incidentally exercised by any authored fixed/flexible `llm` transform in the A1 rows. | yes (incidental) |
+| `elspeth-d1f20e8385` | P2 | `verifying` | `52beec400` | Nothing new required live. All three `llm` transform emit paths restamp declared output field contracts. Provenance side-field (`*_usage`/`*_model`) emission is **pinned unchanged** — so this must not perturb `elspeth-9d13900064`'s observable above. | **Superseded by round-3 finding `elspeth-39118dd24f`** (see the adversarial check, item 3): a fixed/flexible `llm` node whose `schema.fields` include its own response field fails **every row at input validation**, so the emit path this fix touches is never reached. That configuration cannot exercise it at all. The fixed-mode-**without**-response-field configuration remains reachable and is the only live route. Cross-link the two tickets. | **no** for the common configuration — blocked behind `39118dd24f` |
 | `elspeth-1f6493861b` | P2 | `verifying` | `090ba13e8` | Nothing required live. `rag_retrieval` restamps across three divergence axes (nullable, `python_type` in the no-results branch, required). | **Likely unauthorable on the acceptance surface** — no retriever is provisioned. Do not attempt. | **no** — no live surface to drive it. |
 
 ---
@@ -305,3 +305,250 @@ type and plugin of whatever produces `final_cleanup`'s input connection, and
 union, then the pass-through arm fired alone and the sibling narrows to the
 emit-set model. Either way the recommendation is unchanged — both mechanisms
 sit outside `3d77d15bd`.
+
+---
+
+# Adversarial check of the round-3 report
+
+Target: `docs/acceptance/2026-08-05-battery-round-3-report.md` @ `e77e199f3`.
+Read-only; no AWS, code or tracker state touched. Verdicts are deliberately
+unsoftened — two items are OVERCLAIMED and one of those is load-bearing for an
+operator sign-off decision.
+
+**Summary: 2 UPHELD, 3 OVERCLAIMED, 1 CANNOT DETERMINE (blocking).** The two P1
+tickets survive intact; the ADR-036 headline and two "confirmed live" verdicts
+do not. Item 6 was not on the list I was given but sits in the same section and
+must be settled before sign-off.
+
+**The single most important correction is 5a**, because it is the one that
+changes an operator decision: `elspeth-9c01c943a5` is listed as confirmed on
+**1 of the 3 samples the round's own corpus mandates**, against a defect round 2
+observed at 1-in-2.
+
+## 1. ADR-036 "confirmed live, both halves" — OVERCLAIMED (conclusion survives, stated reason does not)
+
+The **conclusion is right**; the **discriminator the report leans on is not the
+thing that establishes it**.
+
+What is sound: `_process_single_with_state` verifies the bucket region
+**unconditionally**, for both location modes
+(`textract_document_analysis.py:770-778`) — so an alias carried as a literal
+bucket would HeadBucket a nonexistent name and fail-close as
+`bucket_region_unverified` (`:776`). Round 2 observed exactly that (run
+`e41d0e6b`). So "not `bucket_region_unverified`" does rule out *alias-as-literal*.
+
+Three problems with resting the claim there:
+
+1. **`service_error` can absolutely be produced by a mis-bound profile.** A
+   profile bound to a *real but wrong* bucket passes HeadBucket, passes the
+   region check, then fails `StartDocumentAnalysis` — landing on
+   `{"reason": "submit_failed", "error_type": "service_error"}`
+   (`:832-837`). The negative therefore excludes one specific mis-binding, not
+   mis-binding in general. The report's phrasing ("would have meant the alias
+   was still being HeadBucket-ed as a literal") is *literally* true but is
+   presented as if it certified correct binding.
+2. **Post-ADR-036 the negative is guaranteed by construction.** The allowlist
+   projection makes `bucket`/`bucket_field` web-inexpressible and the
+   `profile_alias_used_as_bucket` guard (`web/plugin_policy/validation.py:119`)
+   rejects the alias at compose time. An outcome that *cannot* occur is not a
+   discriminating observation.
+3. **Precision:** `service_error` is an `error_type`, not a `reason`. The
+   `reason` is `submit_failed` — the same code round 2 recorded for its
+   nonexistent object. Reporting the `error_type` as though it were the failure
+   reason makes the round-2/round-3 comparison harder than it needs to be.
+
+**The honest claim**, which is *stronger* than the one written: the profile
+bound correctly because **the real document was successfully analysed** — a
+success requires the correct bucket, a matching region, and a readable object.
+The absence of `bucket_region_unverified` is corroborating colour, not the
+proof. Rewrite the bullet to lead with the positive.
+
+**And that positive is validator-guaranteed, not transcribed.** Run
+`67d40936` returned **HTTP 200** with status `completed_with_failures`, and
+`web/execution/schemas.py:491-492` refuses to project that status unless
+`accounting.tokens.succeeded > 0` (this is the very check item 4 is about). So
+`succeeded ≥ 1` is enforced by the endpoint that served the response — it does
+not rest on reading "1/1" off a table. Cite the 200 itself as the evidence.
+
+## 2. Custody NFR — OVERCLAIMED (the test is non-probative)
+
+**The search cannot distinguish, and would have passed before ADR-036 too.**
+Retract it.
+
+- The ADR's custody assertion is about **call records** — the NFR test is
+  `test_profiled_textract_runtime_uses_private_binding_only_for_aws_calls`
+  (`tests/unit/web/execution/test_preflight_side_effects.py:418-420`), whose
+  docstring scopes it to "persist ZERO **call records** containing the operator
+  bucket literal". That is the audit DB, not a web projection.
+- The web projections searched **structurally cannot carry it**.
+  `RunDiagnosticsResponse` (`web/execution/schemas.py:965`) does not project
+  call records at all; the comment at `:955` states the payload "lives in the
+  audit DB under `calls.response_ref`". The only route by which a bucket
+  literal could reach `/outputs` or `/results` is **row data** — and in profile
+  mode the bucket is never in row data *by construction*.
+- **Would it have passed pre-ADR-036?** In the actual observed pre-state
+  (round 2, run `e41d0e6b`), the composer authored the **alias**
+  `acceptance-docs` as the bucket value — so the *real* bucket literal was
+  absent from row data then as well. A search for the real literal returns zero
+  in both worlds.
+
+The search does establish something real, but it is the *authoring* half —
+that no location vocabulary reached row data — which the report already claims
+separately from the composed graph. It is not independent evidence.
+
+**Honest claim:** "Custody NFR — **not verified live.** The ADR's assertion is
+over Landscape call records, which could not be queried remotely. The web-API
+search is not a substitute: those projections never carry call identity." The
+report's own scope-limit sentence is correct and should be promoted from a
+trailing caveat to the verdict.
+
+## 3. `elspeth-39118dd24f` (P1) — UPHELD
+
+The discriminator is exactly right, verified by direct construction of the
+transform's input model:
+
+| authored `schema` | `Input.extra` | required inputs |
+|---|---|---|
+| `observed` | `allow` | `[]` |
+| `flexible` + response field in `fields` | `allow` | `['complaint_text', 'summary']` |
+| `fixed` + response field in `fields` | `forbid` | `['complaint_text', 'summary']` |
+| `fixed`, response field **omitted** | `forbid` | `['complaint_text']` |
+
+`summary` is the node's own `response_field`, and it is demanded as a
+**required input** in both `fixed` and `flexible`. `observed` is genuinely
+immune — `create_schema_from_config` short-circuits to a dynamic schema with no
+fields at all (`plugins/infrastructure/schema_factory.py:119-121`), so g08/g10
+passed for the stated reason and not by luck. The fourth row confirms the
+discriminator is precisely "`schema.fields` contains the node's own response
+field", not merely "mode is fixed/flexible".
+
+**P1 is justified**, on failure totality rather than frequency: every row of an
+affected node fails, and the affected configuration is one the project already
+treats as real — `elspeth-d1f20e8385` (`52beec400`) exists *specifically* to fix
+restamping for "an LLMTransform with mode: fixed/flexible and authored fields".
+
+**Worth adding to the ticket:** this narrows `elspeth-d1f20e8385`'s reachable
+surface. Its fix only matters on the emit path, which is downstream of input
+validation — so for the fixed/flexible-**with**-response-field configuration,
+that fix is unreachable in production until `39118dd24f` lands. The
+fixed-**without**-response-field configuration (row 4) remains reachable, so the
+fix is not wholly dead — but this pairing should be cross-linked.
+
+## 4. `elspeth-47fa7c01eb` (P1) — UPHELD, and the open question is now ANSWERED: YES, reachable
+
+Both readings confirmed:
+
+- **Engine permits it.** `contracts/run_result.py` carries an explicit,
+  commented arm: `case (RunStatus.COMPLETED_WITH_FAILURES, _, True, False, True): return`
+  — annotated *"All-quarantined or success-plus-quarantine, no uncaught
+  failures."* With `rows_succeeded=0, rows_quarantined=N`:
+  `terminal_clean_indicator=True`, `failure_indicator=(N−N)>0=False`,
+  `has_quarantine=True` → legal `COMPLETED_WITH_FAILURES`.
+- **Web forbids it.** `web/execution/schemas.py:491-492` re-derives the
+  invariant as `if accounting.tokens.succeeded <= 0: raise`, dropping the
+  quarantine disjunct.
+
+**The reachability question the report could not answer:** an all-quarantined
+run yields `tokens.succeeded == 0` at the web layer, because quarantined tokens
+are recorded as `TerminalOutcome.FAILURE` with path `QUARANTINED_AT_SOURCE` and
+increment `failed_tokens` and `quarantined` — **never** `succeeded_tokens`
+(`web/execution/accounting.py:128-140`). So the combination is reachable
+end-to-end, and the "web dropped an arm" framing is correct as a general
+mechanism. It is not a hypothesis.
+
+Two caveats that belong on the ticket, neither of which undermines it:
+
+- The validator is **not new** — `"requires tokens.succeeded > 0"` is present in
+  round 2's deployed `173a81cbb` at the same line. This is a long-standing
+  divergence the round happened to trip, not a fix-wave regression.
+- The ticket's own open question (was `quarantined == 0` for `c69b6ab6`?)
+  stays genuinely open and is correctly flagged there. If it was zero, the web
+  layer was *correctly* refusing an illegal state and the second defect the
+  ticket posits is the real one for that instance — but the general mechanism
+  above stands regardless. **The report's confident framing outruns the
+  ticket's honest hedge; prefer the ticket's wording.**
+- Possible corroboration worth one query: round 2's `e41d0e6b` was described as
+  "all rows quarantined", which is this exact shape on the previous build.
+  Whether it 500'd then is unrecorded.
+
+## 5. Per-graph table — OVERCLAIMED in two specific places
+
+**5a. `elspeth-9c01c943a5` is listed under "Fixes confirmed live" on a single
+sample. This is the most consequential error in the report.**
+
+The round's own corpus mandates the opposite: g08 is *"Intermittent at 1-in-2,
+so a single clean pass proves nothing"* and *"Run this three times in three
+fresh sessions (`g08-s1`, `g08-s2`, `g08-s3`)"*
+(`round3-graph-corpus.md:435-436, 445`). The report's table records **one** g08
+run (`dc689cfe`). Round 2 observed the raw 500 on 1 of 2 attempts, so a single
+clean pass is consistent with the defect being fully present.
+
+**Honest claim:** `elspeth-9c01c943a5` — **not confirmed; 1 of 3 required
+samples clean.** Move it out of "Fixes confirmed live". This matters because
+the report drives sign-off on a P1, and stochastic items are explicitly never
+closed on a single pass.
+
+**The remedy is cheap and the report already names it.** g08 got one sample
+because of the round's own methodology finding — composes 422 under
+concurrency. So the fix is **re-drive g08 serially ×3**, not "accept the single
+pass". Serial composes demonstrably succeed (g01: 197s / HTTP 200), so the two
+missing samples cost wall-clock, not a redeploy.
+
+**5b. The PASS verdicts are sound for integrity but not for semantics.**
+
+The defensible half: for `status == "completed"` the web validator already
+enforces `closure == "closed"`, `succeeded > 0` and `failed == 0`
+(`schemas.py:478-484`), so "terminal state `completed`" is a stronger claim than
+it looks and does foreclose the stranded-token shape of `elspeth-82d4c5146c`.
+
+The gap: round 2 additionally verified **routing destinations**, and round 3 did
+not. Round 2's g04 recorded *"91/77 → `premium`, 44 → `standard`, `not-a-number`
+→ `bad_rows` quarantine, siblings unaffected"*; round 3's g02 records only
+`completed_with_failures 4/1/1`. A named-routing regression that sent every row
+to `standard` would still produce 4/1/1 and still be marked **PASS**. Likewise
+g03 and g06 carry no token accounting at all — just `completed`.
+
+**Honest claim:** g02/g03/g04/g06 are **integrity passes, not behavioural
+passes**. Either re-drive with per-destination assertions, or label them
+"terminal-state PASS; routing destinations unverified this round" so round 4
+knows the regression net has a hole in it.
+
+## 6. `elspeth-03f5728c33` "observed working incidentally" — CANNOT DETERMINE, and it blocks
+
+Not in the five I was asked to check, but it is the same class as 5a and it
+sits in "Fixes confirmed live", so it must be settled before sign-off.
+
+The report's evidence: *"on g01, `/validate` named two pending interpretation
+reviews that the `?status=pending` listing reported as empty. That is precisely
+the backstop."*
+
+Now read the ticket's **defect** signature: *"`/validate` then fails
+interpretation_review while `GET /interpretations?status=pending` returns
+nothing user-actionable."* Those are the same sentence. The fix's entire point
+is that `/validate` runs the surfacer in repair mode **before** delegating, so
+that afterwards the listing is **non-empty**.
+
+So the observation is either the fix or the defect, depending entirely on
+**query order**:
+
+| Order | Meaning |
+|---|---|
+| `?status=pending` read **before** `/validate` | Empty is expected pre-surfacing. Proves nothing either way. |
+| `?status=pending` read **after** `/validate` | The backstop did **not** surface. The report has recorded a **reproduction** as a confirmation. |
+
+**What would settle it:** the driver log's request ordering for that g01
+session — specifically whether the empty `?status=pending` response precedes or
+follows the `/validate` call, and whether a second `?status=pending` read was
+taken after `/validate`. If no post-`/validate` read exists, the claim is
+unsupported regardless of order and should move to "Not confirmed".
+
+I cannot resolve this from the report or the code; it needs the round's own
+transcript. **Treat as blocking** — if it resolves the wrong way it is a second
+confirmation to retract, next to `9c01c943a5`.
+
+## What I could not fault
+
+Items 3 and 4 survive attack. The "Not confirmed" section is honest and, in the
+`elspeth-9d13900064` case, notably disciplined — `verifying` is not `closed`
+and the report says so. The methodology finding (do not parallelise composes)
+is properly controlled by the serial g01 re-drive.
