@@ -30,7 +30,7 @@ These run immediately with no setup:
 | `deep_routing` | 20 | Multi-level cascading gates; fixture ends PARTIAL/exit 1 with 2 blocked rows quarantined by design |
 | `error_routing` | 17 | Error-triggered routing; fixture ends PARTIAL/exit 1 with 4 blocked rows quarantined by design |
 | `explicit_routing` | 10 | Named route destinations |
-| `fork_coalesce` | 5 | Parallel path fork/join DAG pattern |
+| `fork_coalesce` | 5 each | Parallel path fork/join DAG; ships five `settings*.yaml` files, run one at a time. `settings.yaml` coalesces both branches; `settings_per_branch.yaml` runs a different transform chain per branch (ARCH-15); the three union variants exercise the field-collision policies — `settings_union_last_wins.yaml` and `settings_union_first_wins.yaml` resolve the same collision to opposite branches (`path_b` / `path_a`), and `settings_union_fail.yaml` raises `CoalesceCollisionError` and exits non-zero **by design** |
 | `row_union_ab_experiment` | 8 (16 unioned, 1 comparison row) | Fork-based A/B: `row_union` releases both variant branches as one correlated group; run one `settings*.yaml` at a time. `settings_screened.yaml` ends PARTIAL **by design** (3 tickets screened out, their orphaned siblings fail closed) |
 | `json_explode` | 3 | JSON source with array expansion (3→6 output) |
 | `transform_pipeline` | 5 | Type coercion followed by dependent derived-field calculations |
@@ -47,6 +47,32 @@ Run pattern:
 ```bash
 elspeth run --settings examples/<name>/settings.yaml --execute
 ```
+
+### Exit 0 is not the corpus gate
+
+Six shipped configs end non-zero **by design**. A runner that treats any
+non-zero exit as failure will report phantom defects; encode the expected exit
+per config, not a blanket `-eq 0`:
+
+| Config | Exit | Why |
+|--------|------|-----|
+| `deep_routing/settings.yaml` | 1 | 2 blocked rows quarantined |
+| `error_routing/settings.yaml` | 1 | 4 blocked rows quarantined |
+| `row_union_ab_experiment/settings_screened.yaml` | 1 | 3 tickets screened out, orphaned siblings fail closed |
+| `fork_coalesce/settings_union_fail.yaml` | non-zero | raising `CoalesceCollisionError` is the point of the variant |
+| `chaosweb/settings.yaml` | 1, stochastic | injected fetch faults route to `scrape_failures.csv` |
+| `chaosllm_endurance/settings.yaml` | 1, stochastic | injected LLM faults route to `quarantined.json` |
+
+The first four are deterministic fixtures with fixed counts. The last two
+depend on randomly injected faults, so they may also exit 0 — for those the
+acceptance criterion is **conservation**, not the exit code: every source row
+reaches either the result sink or the error sink, with the failure reason
+retained in Landscape. The sink file carries only the original input fields;
+the reason lives in the audit trail (`transform_errors.error_details_json`).
+
+Checking the exit code alone is weak in both directions — an example that
+silently processed zero rows also exits 0. Compare each run's summary line
+against the row counts in the tables above.
 
 Do not run examples in a checkout while `pytest tests/` is running there.
 Example runs write working state into the checkout's `.elspeth/` by design
@@ -102,7 +128,7 @@ category.
 |---------|------|-------|
 | `chaosllm_sentiment` | 10 | Basic sentiment with fault injection |
 | `rate_limited_llm` | 8 | Rate limiter with ChaosLLM |
-| `chaosllm_endurance` | 10,000 | Long-running endurance test |
+| `chaosllm_endurance` | 10,000 | Long-running endurance test; may end PARTIAL/exit 1 with rows in `quarantined.json` — see "Exit 0 is not the corpus gate" |
 
 ### ChaosWeb (mock web server required)
 
@@ -116,7 +142,7 @@ elspeth run --settings examples/chaosweb/settings.yaml --execute
 
 | Example | Rows | Notes |
 |---------|------|-------|
-| `chaosweb` | 10 | Web scraping with fault injection |
+| `chaosweb` | 10 | Web scraping with fault injection; may end PARTIAL/exit 1 with rows in `scrape_failures.csv` — see "Exit 0 is not the corpus gate" |
 
 ### Chroma RAG (embedded, no external server)
 
