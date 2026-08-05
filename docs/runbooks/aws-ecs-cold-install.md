@@ -734,7 +734,14 @@ test -z "$(terraform -chdir=scenario-a state list)"
 The backend bucket is shared by every scenario and workspace, so destroying
 Scenario A proves nothing about Scenario B. Census every state object in the
 bucket — bootstrap teardown must not proceed while any of them still tracks
-resources:
+resources.
+
+`aws s3api get-object … /dev/stdout` emits **two** JSON documents: the object
+body first, then the CLI's own response metadata. `jq -e` takes its exit status
+from the *last* value it produced, so a bare `jq -e '(.resources // []) |
+length == 0'` grades the metadata document — which has no `.resources`, always
+satisfies the test, and makes the census pass unconditionally. Slurp the stream
+and assert against the first document, which is the state:
 
 ```bash
 for key in $(aws s3api list-objects-v2 \
@@ -745,11 +752,21 @@ for key in $(aws s3api list-objects-v2 \
   aws s3api get-object \
     --profile "$AWS_PROFILE" --region "$AWS_REGION" \
     --bucket "$STATE_BUCKET" --key "$key" /dev/stdout \
-    | jq -e '(.resources // []) | length == 0' >/dev/null || {
+    | jq -e -s '(.[0].resources // []) | length == 0' >/dev/null || {
     printf 'state object %s still tracks live resources\n' "$key" >&2
     exit 1
   }
 done
+```
+
+Confirm the gate discriminates before resting on it — a census that cannot fail
+is worse than none, because it reads as proof. Both directions:
+
+```bash
+printf '%s\n%s\n' '{"resources":[{"a":1}]}' '{"ETag":"x"}' \
+  | jq -e -s '(.[0].resources // []) | length == 0' >/dev/null; echo "tracked -> $? (want 1)"
+printf '%s\n%s\n' '{"resources":[]}' '{"ETag":"x"}' \
+  | jq -e -s '(.[0].resources // []) | length == 0' >/dev/null; echo "empty   -> $? (want 0)"
 ```
 
 The versioned backend bucket deliberately carries no `force_destroy`:
