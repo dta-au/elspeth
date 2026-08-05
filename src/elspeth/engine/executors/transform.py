@@ -544,6 +544,8 @@ class TransformExecutor:
         *,
         result: TransformResult,
         transform: TransformProtocol,
+        token: TokenInfo,
+        run_id: str,
         input_hash: str,
         duration_ms: float,
     ) -> None:
@@ -553,6 +555,11 @@ class TransformExecutor:
         PluginContractViolation: stable_hash calls canonical_json, which
         rejects NaN, Infinity, and non-serializable types. Per CLAUDE.md:
         plugin bugs must crash with clear error messages.
+
+        ``token``/``run_id`` are carried so the canonicalization violation can
+        terminalize the token like every other contract violation in this
+        executor (elspeth-82d4c5146c) — the crash is correct, the silent
+        pending token is not.
         """
         result.input_hash = input_hash
         try:
@@ -563,11 +570,18 @@ class TransformExecutor:
             else:
                 result.output_hash = None
         except (TypeError, ValueError) as e:
-            raise PluginContractViolation(
+            canonicalization_violation = PluginContractViolation(
                 f"Transform '{transform.name}' emitted non-canonical data: {e}. "
                 f"Ensure output contains only JSON-serializable types. "
                 f"Use None instead of NaN for missing values."
-            ) from e
+            )
+            self._record_terminal_contract_failure(
+                transform=transform,
+                token=token,
+                run_id=run_id,
+                violation=canonicalization_violation,
+            )
+            raise canonicalization_violation from e
         result.duration_ms = duration_ms
 
     def _prepare_success_completion(
@@ -816,6 +830,8 @@ class TransformExecutor:
                 self._populate_result_audit_fields(
                     result=result,
                     transform=transform,
+                    token=token,
+                    run_id=ctx.run_id,
                     input_hash=input_hash,
                     duration_ms=duration_ms,
                 )

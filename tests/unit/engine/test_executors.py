@@ -4655,6 +4655,18 @@ class TestTransformExecutorTerminality:
         assert kwargs["status"] == NodeStateStatus.FAILED
         assert "executor_post_process" in kwargs["error"].phase
 
+        # ...and the token's fate must be recorded, not just its node state
+        # (elspeth-82d4c5146c): a FAILED node_state with no terminal outcome is
+        # exactly the "a token state is plainly failed but tokens.failed=0"
+        # contradiction. Unlike an aggregation flush, a row-level transform
+        # violation is not retryable by journal resume — the row's fate is
+        # decided here, so a terminal record is the honest one.
+        factory.data_flow.record_token_outcome.assert_called_once()
+        outcome_kwargs = factory.data_flow.record_token_outcome.call_args.kwargs
+        assert outcome_kwargs["ref"].token_id == token.token_id
+        assert outcome_kwargs["outcome"] == TerminalOutcome.FAILURE
+        assert outcome_kwargs["path"] == TerminalPath.UNROUTED
+
     def test_contract_evolution_failure_marks_state_failed(self) -> None:
         """Contract evolution failure → state FAILED, not COMPLETED-then-crash.
 
