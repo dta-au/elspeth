@@ -2363,6 +2363,38 @@ def _check_schema_contracts(
         finally:
             transform.close()
 
+    def _probe_transform_declared_output_fields(plugin: str, options: Mapping[str, Any]) -> frozenset[str]:
+        """Read ``plugin``'s ``declared_output_fields``, closing the probe instance.
+
+        Deliberately NOT served from ``_probe_transform_output_schema``:
+        ``_output_schema_config.guaranteed_fields`` is a documented SUPERSET of
+        ``declared_output_fields`` (the invariant asserted in the LLM transform's
+        constructor), because guarantees also cover fields the transform merely
+        passes through or renames from. Only ``declared_output_fields`` is the
+        set the executor's collision preflight actually tests, so Rule D reads it
+        directly — substituting guarantees would reject rename sources and
+        pass-through fields the runtime never flags (elspeth-cfcd333f83).
+
+        A construction failure abstains with the empty set: a draft node whose
+        options do not yet build is owned by the existing config-validation
+        paths, and Rule D must not turn an incomplete draft into a hard error.
+        """
+        from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+
+        try:
+            transform = get_shared_plugin_manager().create_transform(
+                plugin,
+                prepare_validation_probe_options(options),
+            )
+        except Exception as exc:
+            if not _is_config_probe_exception(exc):
+                raise
+            return frozenset()
+        try:
+            return transform.declared_output_fields
+        finally:
+            transform.close()
+
     def _effective_producer_vote(producer: ProducerEntry) -> tuple[bool, frozenset[str]]:
         """Return (participates, guarantees) for preview propagation.
 
@@ -3581,6 +3613,84 @@ def _check_schema_contracts(
                     producer=node.id,
                     consumer=node.id,
                     missing_fields=tuple(sorted(missing)),
+                ),
+            )
+        )
+
+    # Rule D: a transform whose declared output fields collide with a field that
+    # DEFINITELY arrives on its input row (elspeth-cfcd333f83). The runtime
+    # surface is TransformExecutor._run_preflight, which calls
+    # ``detect_field_collisions(set(input_dict.keys()), transform.declared_output_fields)``
+    # and raises PluginContractViolation on the first row. Authoring previously
+    # accepted this shape — a "rewrite in place" llm transform whose
+    # ``response_field`` names a field the source already emits composed and
+    # passed /validate, then died on row 1.
+    #
+    # Why this is sound rather than a guess, in the two directions that matter:
+    #
+    # * The output side is an IDENTITY, not an inference. ``declared_output_fields``
+    #   is the very attribute the executor tests, read off a constructed instance,
+    #   so no per-plugin emit modelling is needed and no plugin gate applies —
+    #   unlike Rule C above, which must scope itself because it reasons about
+    #   *schema* semantics that differ per plugin. Plugins that legitimately
+    #   overwrite a field opt out at the source by keeping the set empty
+    #   (``ValueTransform`` does exactly this, precisely so the executor's
+    #   collision check does not fire), so Rule D inherits their abstention for
+    #   free and cannot second-guess it.
+    # * The input side is a LOWER BOUND. ``_connection_definite_emits`` reports
+    #   only fields that definitely arrive, contributing nothing for arms
+    #   Composer cannot resolve, and ``input_dict`` at the runtime call site is
+    #   the whole arriving row (``token.row_data.to_dict()``) with no projection
+    #   applied before the collision check. So every field this walk names is
+    #   genuinely a key the executor will see, and the intersection of an exact
+    #   set with a lower bound is a subset of the real collision set: non-empty
+    #   means a guaranteed row-1 failure, never a maybe.
+    #
+    # Scoped to ``node_type == "transform"`` and NOT to aggregations, which Rule C
+    # does include: the collision preflight exists only in TransformExecutor, so
+    # extending this to the aggregation executor would reject pipelines the
+    # runtime accepts.
+    for node in nodes:
+        if node.node_type != "transform" or node.plugin is None:
+            continue
+        if node.id in parse_failed_producers:
+            continue
+        declared_output = _probe_transform_declared_output_fields(node.plugin, node.options)
+        if not declared_output:
+            continue
+        # Seeded empty, NOT with ``{node.input}``: Rule A seeds its own input
+        # because it resolves the producer first and unions from the producer's
+        # input upward, whereas Rule D starts the walk AT this node's input.
+        # Pre-seeding it would trip the visited guard on the first call and make
+        # the rule silently inert.
+        definite_arrivals = _connection_definite_emits(node.input, visited_connections=frozenset())
+        collisions = declared_output & definite_arrivals
+        if not collisions:
+            continue
+        errors.append(
+            _err(
+                f"node:{node.id}",
+                f"Transform contract violation: node '{node.id}' ({node.plugin}) declares output fields "
+                f"[{_format_fields(declared_output)}] but [{_format_fields(collisions)}] already arrive(s) on its input row. "
+                f"The engine rejects a transform that would overwrite an existing input field, so this pipeline fails on the first row. "
+                f"Fix by renaming this transform's output (for an llm transform, set `response_field` to a name the row does not "
+                f"already carry, e.g. '{sorted(collisions)[0]}_result'), OR by renaming/dropping the incoming field upstream with a "
+                f"field_mapper before this node.",
+                "high",
+                # Reuses Rule C's code: same family (a per-transform contract the
+                # node violates on its own), and the code is already carried by
+                # the planner's closed repair-feedback catalogue, so the repair
+                # turn gets enrichment instead of a bare unregistered slug.
+                "transform_contract_violation",
+                # producer and consumer are both this node: the colliding field
+                # can arrive from several arms at once (a row_union unions them),
+                # so naming any single upstream producer would be arbitrary. The
+                # defect is node-scoped — this transform cannot run on the rows
+                # its own input delivers.
+                contract=SchemaContractDetail(
+                    producer=node.id,
+                    consumer=node.id,
+                    extra_fields=tuple(sorted(collisions)),
                 ),
             )
         )
