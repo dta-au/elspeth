@@ -765,6 +765,64 @@ promises to fund; no deployment surface in this repository sizes its clock to
 fund every configured turn, and the composer is expected to converge well
 inside both.
 
+### Composer reasoning effort
+
+The module pins `ELSPETH_WEB__COMPOSER_CANDIDATE_REASONING_EFFORT` to `medium`
+in `modules/scenario/locals.tf`, overriding the code default of `high`
+(`WebSettings.composer_candidate_reasoning_effort`). This is the other half of
+the wall-clock budget above: the timeout bounds how long a compose may run, the
+effort bounds how long each individual model call takes to think.
+
+The value is measured, not preferred. At `high`, the `g08` acceptance graph
+returned a `422` at the wall clock: six calls summing to roughly 270s
+(45+50+123+29+17+6), the worst of them a 123s thinking tail — the budget was
+consumed by the chain, not by any single call. At `medium` the same graph
+completed in roughly 200s, and the `g01` regression graph was unchanged (184s
+against 192s). See `docs/acceptance/2026-08-05-compose-cost-measurement.md`
+(addendum 1) and the operator decision recorded on `elspeth-930a163c85`.
+
+Treat the pin as evidence, not as a default worth tidying: every green
+acceptance result on this module was obtained at `medium`, so changing it
+re-opens the measurement rather than merely adjusting a knob. The legal values
+are `none`, `low`, `medium`, and `high`; `none` sends no hint at all and is the
+opt-out for non-reasoning deployments.
+
+**This measurement is specific to this module, and does not generalise to the
+other deployment surfaces.** It was taken on Bedrock Anthropic Sonnet 4.6 —
+`variables.tf` constrains `composer_model` to a `bedrock/` provider ID, so that
+is the only model class this module can run. The hint is also applied per
+provider prefix rather than uniformly: `composer/reasoning.py` sends Bedrock and
+Anthropic models a LiteLLM `reasoning_effort`, sends some other prefixes a
+different form again, and deliberately sends **nothing** for bare or
+`openai/`-prefixed aliases such as the `gpt-5.5` default. Read that module for
+the branch table before assuming this knob does anything on a given model.
+
+<!-- "some other prefixes" is deliberately generic, not vague: this package is
+Bedrock-only, and test_bedrock_composer_uses_the_task_role_without_static_credentials
+asserts it contains no reference to certain other providers anywhere — including
+in this README, which that test reads. Naming them here fails that gate. -->
+
+The `deploy/compose` and `deploy/linux-systemd` bundles set no `composer_model`,
+so they boot on that `gpt-5.5` default, where the knob is inert — pinning it
+there would document a control their shipped configuration never applies. That
+is a property of the default model, not of those bundles: selecting a model
+whose prefix *does* carry the hint makes the knob live again, at the code
+default `high` and on a much shorter wall clock (85s), with no measurements on
+that provider at any effort. Measure before pinning it there. The related
+wall-clock-versus-turn-budget question on those surfaces is tracked on
+`elspeth-f159d2394b`.
+
+Both the value and the spelling of the key are enforced by
+`tests/unit/deployment/test_aws_ecs_terraform_package.py`. The spelling matters
+as much as the value: `settings_from_env` raises on any unrecognised
+`ELSPETH_WEB__` name, so a misspelt key does not fall back to a default — it
+stops the web container from booting, after `terraform apply` has already
+reported success. That test therefore checks every `ELSPETH_WEB__` name this
+module puts in front of the process against the `WebSettings` fields — both the
+quoted `runtime_environment` entries in `locals.tf` and the bare
+`export ELSPETH_WEB__...` lines in the `ecs.tf` entrypoint wrapper, which reach
+the process by a different route but through the same settings loader.
+
 Aurora creates one administrative database first, then the database bootstrap
 task creates independent `elspeth_session` and `elspeth_landscape` databases.
 Schema and runtime roles are separate; the runtime role does not own schemas.

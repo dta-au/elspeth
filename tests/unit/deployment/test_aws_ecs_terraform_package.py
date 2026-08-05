@@ -10,7 +10,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 import yaml
@@ -2113,4 +2113,122 @@ def test_composer_wall_clock_fits_under_the_app_guard_and_the_alb() -> None:
         f"idle_timeout {alb_idle_seconds}s; the ALB would abort with a 504 before the "
         f"composer returned its 422 and the partial pipeline would be lost. Raise "
         f"idle_timeout in modules/scenario/network.tf first."
+    )
+
+
+def test_composer_candidate_reasoning_effort_is_pinned_to_the_measured_value() -> None:
+    """A cold install must boot on the effort the evidence was taken at.
+
+    The candidate role's reasoning effort is the other half of the
+    composer's wall-clock budget, and it was selected on measurement, not
+    taste: at the code default `high` the acceptance graph g08 returned a
+    422 at the 270s wall clock, its six calls summing to ~270s
+    (45+50+123+29+17+6) with the worst a 123s thinking tail — the budget
+    went to the chain, not to any one call. At `medium` the same graph
+    completed in ~200s and the regression graph g01 was unchanged (184s vs
+    192s) — `docs/acceptance/2026-08-05-compose-cost-measurement.md`,
+    addendum 1, the operator decision recorded on elspeth-930a163c85.
+
+    That decision was applied to the live task definition as an env-only
+    revision and never reached this module, so every green acceptance
+    result on this module was taken on a configuration a cold
+    `terraform apply` could not reproduce (elspeth-52af290183). Pinning it
+    here is what makes the shipped module and the measured evidence the
+    same deployment. The measurement is Bedrock-specific and does not
+    transfer to the other deployment surfaces; see the module README.
+
+    The pin is checked against `WebSettings` rather than against a literal
+    copy of the vocabulary, because the failure mode is asymmetric: an
+    unknown `ELSPETH_WEB__` name or an out-of-vocabulary value does not
+    degrade the composer, it stops the container from booting at all
+    (`settings_from_env` raises, `ReasoningEffort` is a closed `Literal`).
+    """
+    field_name = "composer_candidate_reasoning_effort"
+    assert field_name in WebSettings.model_fields, (
+        f"WebSettings no longer has a {field_name} field; the module would ship an unbootable environment"
+    )
+
+    effort_match = re.search(
+        r'\{\s*name\s*=\s*"ELSPETH_WEB__COMPOSER_CANDIDATE_REASONING_EFFORT",\s*value\s*=\s*"(?P<effort>[a-z]+)"\s*\}',
+        _text("modules/scenario/locals.tf"),
+    )
+    assert effort_match is not None, (
+        "the scenario module no longer pins ELSPETH_WEB__COMPOSER_CANDIDATE_REASONING_EFFORT, "
+        "so a cold install would fall back to the code default and silently revert the one "
+        "change measured to flip g08 from a 422 to a pass"
+    )
+    effort = effort_match.group("effort")
+
+    legal_efforts = get_args(WebSettings.model_fields[field_name].annotation)
+    assert effort in legal_efforts, f"pinned reasoning effort {effort!r} is not one of {legal_efforts}; the web task would refuse to boot"
+    assert effort == "medium", (
+        f"the scenario module pins reasoning effort {effort!r}, but every green acceptance "
+        f"result was obtained at 'medium'. Changing this pin re-opens the measurement: "
+        f"record the new evidence before changing the value."
+    )
+
+
+def test_every_shipped_web_environment_name_is_a_real_websettings_field() -> None:
+    """An unknown `ELSPETH_WEB__` name in this module is a boot outage.
+
+    `settings_from_env` raises `RuntimeError: Unknown ELSPETH_WEB__ setting`
+    on any name that is not a `WebSettings` field, so a misspelt key here
+    does not fall back to a default or get ignored — the web container
+    fails to start, after terraform has already reported success. Terraform
+    cannot see the Python model and the model cannot see terraform, so
+    nothing else in either tree closes this seam.
+
+    Asserted over the whole module rather than over one key: the cost of a
+    typo is identical whichever line it lands on. The names are matched
+    bare rather than only inside quotes, because the module puts a variable
+    in front of the process in three shapes and only one of them quotes the
+    name: `runtime_environment` in `locals.tf` emits
+    `{ name = "ELSPETH_WEB__X", ... }`, the `plugin_policy_projection` map
+    at the top of the same file uses each name as a bare HCL key that
+    `policy_environment` then emits verbatim, and the `ecs_identity_wrapper`
+    entrypoint in `ecs.tf` emits `export ELSPETH_WEB__X="$value"`. A
+    quoted-only match reads the first and silently skips the other two,
+    though all three reach the same `settings_from_env` call.
+
+    Comment lines are removed before scanning. The bare pattern cannot tell
+    a shipped name from one merely named in prose, so documenting a
+    *removed* setting — the form `deploy/elspeth-web.env` already uses —
+    would otherwise fail CI claiming the task cannot boot, while nothing is
+    shipped at all. Only whole-line comments are stripped: truncating at
+    every `#` would also cut string literals that legitimately contain one
+    (`iam_observability.tf` has a markdown heading, `storage_identity.tf` a
+    URL), and no name is reached only through a trailing comment.
+    """
+    prefix = "ELSPETH_WEB__"
+    name_pattern = rf"\b({prefix}[A-Z0-9_]+)"
+    tf_lines = itertools.chain.from_iterable(
+        path.read_text(encoding="utf-8").splitlines() for path in _source_files() if path.name.endswith(".tf")
+    )
+    tf_sources = "\n".join(line for line in tf_lines if not line.lstrip().startswith(("#", "//")))
+    shipped = sorted(set(re.findall(name_pattern, tf_sources)))
+    assert shipped, "no ELSPETH_WEB__ environment names found in the module; this test is no longer reading the shipped environment"
+
+    # Pinned directly rather than through a representative name: every name
+    # the entrypoint exports is also shipped as a quoted `runtime_environment`
+    # entry, so their presence proves nothing about which shapes are read.
+    assert re.findall(name_pattern, 'export ELSPETH_WEB__PORT="$port"') == [f"{prefix}PORT"], (
+        "the scan no longer matches an unquoted name, so the `export ELSPETH_WEB__...` lines "
+        "in the ecs.tf entrypoint and the bare plugin-policy map keys in locals.tf are "
+        "invisible to it again (elspeth-52af290183 review, F2/N1)"
+    )
+    assert re.findall(rf"export\s+({prefix}[A-Z0-9_]+)", tf_sources), (
+        "the ecs.tf entrypoint no longer exports any ELSPETH_WEB__ names; confirm they moved "
+        "into runtime_environment rather than out of this test's reach"
+    )
+
+    unknown = [name for name in shipped if name[len(prefix) :].lower() not in WebSettings.model_fields]
+    assert not unknown, (
+        f"the module ships ELSPETH_WEB__ names with no matching WebSettings field: {unknown}. settings_from_env raises on these, so the web task would fail to boot after a successful terraform apply."
+    )
+
+    # Being a real field is necessary but not sufficient: the deployment
+    # region is deliberately taken from the ambient AWS_REGION, and
+    # settings_from_env rejects the ELSPETH_WEB__ spelling by name.
+    assert f"{prefix}DEPLOYMENT_AWS_REGION" not in shipped, (
+        "the module sets the reserved ELSPETH_WEB__DEPLOYMENT_AWS_REGION; settings_from_env rejects it by name and the web task would fail to boot"
     )

@@ -389,6 +389,19 @@ locals {
     # under the 270s WebSettings guard. Raising it further requires raising
     # the ALB idle timeout first; see the terraform README.
     { name = "ELSPETH_WEB__COMPOSER_TIMEOUT_SECONDS", value = "240" },
+    # "medium", not the code default "high": the candidate role is the other
+    # half of the wall-clock budget above, and the value is measured rather
+    # than preferred. At "high" the g08 acceptance graph returned a 422 at the
+    # clock, its six calls summing to ~270s (45+50+123+29+17+6) with the worst
+    # a 123s thinking tail; the budget was consumed by the chain, not by any
+    # one call. At "medium" the same graph completed in ~200s with no
+    # regression on g01 (184s vs 192s). See
+    # docs/acceptance/2026-08-05-compose-cost-measurement.md addendum 1 and the
+    # operator decision on elspeth-930a163c85. This pin was applied to the live
+    # task definition as an env-only revision and was missing here until
+    # elspeth-52af290183, so a cold install silently reverted to "high" — the
+    # one combination no acceptance run has ever passed on.
+    { name = "ELSPETH_WEB__COMPOSER_CANDIDATE_REASONING_EFFORT", value = "medium" },
     { name = "ELSPETH_WEB__COMPOSER_RATE_LIMIT_PER_MINUTE", value = "30" },
     { name = "ELSPETH_WEB__COMPOSER_BOOT_PROBE_ENABLED", value = "true" },
     { name = "ELSPETH_WEB__COMPOSER_MODEL", value = var.composer_model },
