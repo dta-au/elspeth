@@ -210,6 +210,42 @@ def test_probe_config_instantiates() -> None:
     AzureDocumentIntelligence(AzureDocumentIntelligence.probe_config())
 
 
+# ── source_field must name an arriving column, not a created one ───────────
+#
+# source_field is read to locate the document and the analysis results are
+# written back onto the same row, so pointing it at an output target makes the
+# transform overwrite the column it reads. Nothing downstream catches it: the
+# executor's collision check compares declared_output_fields against the input
+# keys OF THE ROW, so it fires only once a row carries the column, and under
+# mode: observed there is no declared field for DAG validation to carry
+# (elspeth-09dc6407f1).
+
+
+def test_source_field_naming_the_content_target_is_rejected() -> None:
+    with pytest.raises(PluginConfigError, match="source_field names 'di_content', which azure_document_intelligence itself creates"):
+        _transform(source_field="di_content")
+
+
+def test_source_field_naming_an_extract_facet_target_is_rejected() -> None:
+    with pytest.raises(PluginConfigError, match="source_field names 'di_tables', which azure_document_intelligence itself creates"):
+        _transform(source_field="di_tables", extract={"tables": "di_tables"})
+
+
+def test_the_error_names_the_offending_value_and_the_plugin() -> None:
+    with pytest.raises(PluginConfigError) as excinfo:
+        _transform(source_field="di_pages", page_count_field="di_pages")
+
+    message = str(excinfo.value)
+    assert "source_field names 'di_pages', which azure_document_intelligence itself creates" in message
+    assert "Point source_field at a column that ARRIVES on the row" in message
+
+
+def test_a_source_field_naming_an_arriving_column_still_constructs() -> None:
+    transform = _transform()
+
+    assert transform.declared_input_fields == frozenset({"doc_url"})
+
+
 def test_process_raises_use_accept() -> None:
     t = _transform()
     with pytest.raises(NotImplementedError):

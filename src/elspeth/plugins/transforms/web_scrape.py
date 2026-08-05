@@ -456,7 +456,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:fdfca5c43a2ae397"
+    source_file_hash: str | None = "sha256:d7593fd5eb82baeb"
     config_model = WebScrapeConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("http", "network", "scraping")
@@ -522,6 +522,7 @@ class WebScrapeTransform(BaseTransform):
                 "fetch_url_final_ip",
             ]
         )
+        self._reject_input_options_naming_created_fields({"url_field": cfg.url_field})
 
         # Format and fingerprint mode
         self._format = cfg.format

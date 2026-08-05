@@ -566,18 +566,71 @@ class TestSelfCreatedFieldsAreOptionalOnInput:
         It is the general discrimination the base class has for
         consume-and-create plugins; 11 of the 12 batch transforms already route
         their configured input columns through it.
-        """
-        from elspeth.plugins.transforms.batch_top_k import BatchTopK
 
-        transform = BatchTopK(
+        ``mean`` is chosen so the ``required_fields`` limb of
+        ``consumed_input_fields`` is the ONLY thing protecting it: it is
+        self-created, and ``value_field`` points at ``amount``, so the
+        config-named-column surface does not reach it either. An earlier version
+        of this test used ``BatchTopK`` with ``field: count`` and NO
+        ``required_fields`` key at all — ``count`` arrived by the config-named
+        route, so the test passed unchanged with the limb deleted outright
+        (elspeth-3790106260). The two asserts below therefore state the routes
+        explicitly rather than trusting the name.
+        """
+        from elspeth.plugins.transforms.batch_stats import BatchStats
+
+        transform = BatchStats(
             {
-                "schema": {"mode": "flexible", "fields": ["count: int"]},
-                "field": "count",
+                "schema": {
+                    "mode": "flexible",
+                    "fields": ["amount: float", "mean: float"],
+                    "required_fields": ["mean"],
+                },
+                "value_field": "amount",
             }
         )
 
-        assert "count" in transform.declared_output_fields
-        assert "count" in _required_input_fields(transform)
+        assert "mean" in transform.self_created_input_fields
+        assert "mean" not in transform._config_named_input_columns()
+        assert "mean" not in transform.declared_input_fields
+        assert "mean" in _required_input_fields(transform)
+
+    def test_required_fields_survives_on_a_transform_that_builds_schemas_indirectly(self) -> None:
+        """The limb only protects a field if the plugin actually CAPTURED its schema config.
+
+        ``consumed_input_fields`` reads ``self._schema_config``. Ten registered
+        transforms — ``line_explode`` among them — passed their validated
+        ``schema_config`` to the schema factory but never stored it, so the limb
+        read the ``None`` class default and contributed nothing: a field named in
+        ``required_fields`` was demoted at runtime while
+        ``get_raw_node_required_fields`` still enforced it at build time
+        (elspeth-3790106260). Capture is now central, in
+        ``_initialize_declared_input_fields``.
+
+        ``line_explode`` is the measured case: ``source_field`` names ``body``,
+        so ``line`` is reachable only through ``required_fields``.
+        """
+        from elspeth.contracts.schema import get_raw_node_required_fields
+        from elspeth.plugins.transforms.line_explode import LineExplode
+
+        options = {
+            "source_field": "body",
+            "output_field": "line",
+            "schema": {
+                "mode": "fixed",
+                "fields": ["body: str", "line: str"],
+                "required_fields": ["line"],
+            },
+        }
+        transform = LineExplode(options)
+
+        assert transform._schema_config is not None
+        assert "line" in transform.self_created_input_fields
+        assert "line" not in transform._config_named_input_columns()
+        # The build-time contract and the runtime contract must name the same field.
+        assert get_raw_node_required_fields(options, owner="line_explode") == frozenset({"line"})
+        assert "line" in _required_input_fields(transform)
+        assert "line" not in transform.demoted_input_fields
 
     def test_declared_field_not_created_by_the_transform_stays_required(self) -> None:
         """Demotion is scoped to self-created fields; genuine inputs keep their contract."""

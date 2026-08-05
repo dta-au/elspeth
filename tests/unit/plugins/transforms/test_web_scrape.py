@@ -1253,6 +1253,52 @@ class TestWebScrapeDeclaredInputFields:
         assert transform.declared_input_fields == frozenset({"url", "tenant_id"})
 
 
+class TestUrlFieldMustNotNameACreatedField:
+    """``url_field`` must name an ARRIVING column, never one web_scrape writes.
+
+    ``url_field`` is read to get the URL and the created field is then written
+    over it, so pointing both at one column makes the transform consume its own
+    output. Nothing downstream catches it: the executor's collision check
+    compares ``declared_output_fields`` against the INPUT KEYS OF THE ROW, so it
+    fires only once a row actually carries the column, and under
+    ``mode: observed`` there is no declared field for DAG validation to carry
+    (elspeth-09dc6407f1).
+    """
+
+    def test_url_field_naming_the_content_target_is_rejected(self) -> None:
+        with pytest.raises(PluginConfigError, match="url_field names 'page_text', which web_scrape itself creates"):
+            WebScrapeTransform(_base_config(url_field="page_text", content_field="page_text"))
+
+    def test_url_field_naming_the_fingerprint_target_is_rejected(self) -> None:
+        with pytest.raises(PluginConfigError, match="url_field names 'page_fingerprint', which web_scrape itself creates"):
+            WebScrapeTransform(_base_config(url_field="page_fingerprint"))
+
+    def test_url_field_naming_a_hardcoded_operational_field_is_rejected(self) -> None:
+        """The created set is not only the configurable targets.
+
+        ``fetch_status`` and friends are literal constants in
+        ``declared_output_fields``, and an upstream column really can be called
+        that — a likelier authoring mistake than aiming ``url_field`` at the
+        content target.
+        """
+        with pytest.raises(PluginConfigError, match="url_field names 'fetch_status', which web_scrape itself creates"):
+            WebScrapeTransform(_base_config(url_field="fetch_status"))
+
+    def test_the_error_names_the_offending_value_and_the_plugin(self) -> None:
+        with pytest.raises(PluginConfigError) as excinfo:
+            WebScrapeTransform(_base_config(url_field="fetch_url_final"))
+
+        message = str(excinfo.value)
+        assert "url_field names 'fetch_url_final', which web_scrape itself creates" in message
+        assert "Point url_field at a column that ARRIVES on the row" in message
+
+    def test_a_url_field_naming_an_arriving_column_still_constructs(self) -> None:
+        """The arm that must not regress: rejecting legal configs is worse."""
+        transform = WebScrapeTransform(_base_config())
+
+        assert transform.declared_input_fields == frozenset({"url"})
+
+
 # ===========================================================================
 # allowed_hosts config validation
 # ===========================================================================

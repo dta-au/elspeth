@@ -255,7 +255,7 @@ class BlobFetch(BaseTransform):
     name = "blob_fetch"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:19956cd74a8a5110"
+    source_file_hash: str | None = "sha256:b324fc6c21c11889"
     config_model = BlobFetchConfig
     passes_through_input = True
     capability_tags: tuple[str, ...] = ("http", "network", "blob")
@@ -348,6 +348,83 @@ class BlobFetch(BaseTransform):
                 ),
             )
         return None
+
+    def forward_invariant_probe_rows(self, probe: PipelineRow) -> list[PipelineRow]:
+        """Inject a deterministic public-IP URL for invariant probing.
+
+        Without this the probe row never carries ``url_field``, ``process()``
+        returns ``validation_failed`` on the ``KeyError``, and ADR-009's forward
+        invariant — which treats a non-success probe as a legitimate processing
+        error and moves on — reports green while asserting nothing
+        (elspeth-6244cb5472). The address matches the ``allowed_hosts`` entry in
+        ``probe_config()``, so SSRF validation resolves without DNS.
+        """
+        return [
+            self._augment_invariant_probe_row(
+                probe,
+                field_name=self._url_field,
+                value="https://93.184.216.34/invariant-probe",
+            )
+        ]
+
+    def execute_forward_invariant_probe(
+        self,
+        probe_rows: list[PipelineRow],
+        ctx: TransformContext,
+    ) -> TransformResult:
+        """Drive the real process path with a hermetic no-network fetch seam.
+
+        Both seams must be stubbed for the probe to reach the enrichment path:
+        ``_fetch_url`` would otherwise open a socket, and ``_payload_store`` is
+        bound in ``on_start()``, which the isolated invariant harness never runs.
+        The stub response carries an allowlisted content-type and an IP-pinned
+        request URL because ``process()`` checks both — a probe that skipped
+        either would exercise less of the production path than it appears to.
+        """
+
+        class _InvariantPayloadStore:
+            def store(self, payload: bytes) -> str:
+                return "probe-processed-hash"
+
+        class _InvariantCall:
+            request_ref = "probe-request-hash"
+            response_ref = "probe-response-hash"
+
+        def _fake_fetch_url(
+            safe_request: SSRFSafeRequest,
+            probe_ctx: TransformContext,
+        ) -> tuple[httpx.Response, str, _InvariantCall]:
+            del probe_ctx
+            return (
+                httpx.Response(
+                    200,
+                    content=b"col_a,col_b\n1,2\n",
+                    headers={"content-type": "text/csv"},
+                    request=httpx.Request("GET", safe_request.connection_url),
+                ),
+                safe_request.original_url,
+                _InvariantCall(),
+            )
+
+        had_payload_store = "_payload_store" in self.__dict__
+        original_payload_store: Any = None
+        if had_payload_store:
+            original_payload_store = self.__dict__["_payload_store"]
+        had_fetch_override = "_fetch_url" in self.__dict__
+        original_fetch = self._fetch_url
+        try:
+            self.__dict__["_payload_store"] = _InvariantPayloadStore()
+            self.__dict__["_fetch_url"] = _fake_fetch_url
+            return super().execute_forward_invariant_probe(probe_rows, ctx)
+        finally:
+            if had_payload_store:
+                self.__dict__["_payload_store"] = original_payload_store
+            else:
+                delattr(self, "_payload_store")
+            if had_fetch_override:
+                self.__dict__["_fetch_url"] = original_fetch
+            else:
+                delattr(self, "_fetch_url")
 
     def on_start(self, ctx: LifecycleContext) -> None:
         super().on_start(ctx)

@@ -891,9 +891,13 @@ class ExpressionParser:
         as created when the transform actually reads it, a genuine input
         requirement is silently dropped and a contract violation stops being
         caught at the transform boundary. Hence ``complete=False`` must make
-        callers ABSTAIN from demoting rather than guess — and ValueTransform
-        rejects such a config at construction rather than shipping a contract
-        it cannot justify (elspeth-d6eeb3a71d).
+        callers ABSTAIN from demoting rather than guess. ValueTransform scopes
+        that abstention PER TARGET, and rejects at construction only where both
+        conditions hold: the non-literal subscript sits in the target's OWN
+        assigning expression, and the schema declares that target required on
+        input. Every other target an incomplete enumeration touches is left
+        UNPROVEN — neither demoted nor rejected, so it keeps the requirement
+        the author declared (elspeth-d6eeb3a71d, elspeth-f6ddcebbe3).
         """
         fields: set[str] = set()
         complete = True

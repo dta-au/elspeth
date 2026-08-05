@@ -337,6 +337,47 @@ class TestTransformLifecycle:
         assert original_provider.close_calls == 1
 
 
+class TestQueryFieldMustNotNameACreatedField:
+    """``query_field`` must name an ARRIVING column, never one retrieval writes.
+
+    The retrieval outputs are derived from ``output_prefix``, so a query field
+    named ``<prefix>__rag_context`` is read for the query and then overwritten
+    with the retrieved context. Nothing downstream catches it under
+    ``mode: observed`` (elspeth-09dc6407f1).
+    """
+
+    def test_query_field_naming_a_retrieval_output_is_rejected(self) -> None:
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        with pytest.raises(PluginConfigError, match="query_field names 'policy__rag_context', which rag_retrieval itself creates"):
+            _make_transform(query_field="policy__rag_context")
+
+    def test_the_error_names_the_offending_value_and_the_plugin(self) -> None:
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        with pytest.raises(PluginConfigError) as excinfo:
+            _make_transform(query_field="policy__rag_score")
+
+        message = str(excinfo.value)
+        assert "query_field names 'policy__rag_score', which rag_retrieval itself creates" in message
+        assert "Point query_field at a column that ARRIVES on the row" in message
+
+    def test_a_prefix_that_moves_the_created_set_moves_the_rejection(self) -> None:
+        """The created set follows ``output_prefix``, so the guard must too."""
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        transform = _make_transform(output_prefix="other", query_field="policy__rag_context")
+        assert transform.declared_input_fields == frozenset({"policy__rag_context"})
+
+        with pytest.raises(PluginConfigError, match="query_field names 'other__rag_context', which rag_retrieval itself creates"):
+            _make_transform(output_prefix="other", query_field="other__rag_context")
+
+    def test_a_query_field_naming_an_arriving_column_still_constructs(self) -> None:
+        transform = _make_transform()
+
+        assert transform.declared_input_fields == frozenset({"question"})
+
+
 def _ready_provider_result():
     """Default CollectionReadinessResult for tests that don't care about readiness."""
     from elspeth.contracts.probes import CollectionReadinessResult

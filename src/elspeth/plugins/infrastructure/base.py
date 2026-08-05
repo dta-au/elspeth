@@ -465,10 +465,14 @@ class BaseTransform(ABC):
     # None = no output contract provided (acceptable for shape-preserving transforms).
     _output_schema_config: SchemaConfig | None
 
-    # The transform's INPUT schema config. Concrete transforms that accept a
-    # `schema:` block set this from their validated config; the base default
-    # keeps it nominally present so `consumed_input_fields` can read
-    # `required_fields` without probing for the attribute (ADR-032).
+    # The transform's INPUT schema config. Captured centrally by
+    # `_initialize_declared_input_fields` from the validated config, so every
+    # transform on that path has it; a transform that rewrites its schema config
+    # assigns over the capture afterwards. The base default keeps it nominally
+    # present so `consumed_input_fields` can read `required_fields` without
+    # probing for the attribute (ADR-032). `None` therefore means a transform
+    # that never validated a config — not "declares no schema block", which is
+    # unrepresentable: `TransformDataConfig.schema_config` is required.
     _schema_config: SchemaConfig | None = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -575,6 +579,20 @@ class BaseTransform(ABC):
         immediately after ``<Config>.from_dict(...)`` succeeds. This preserves
         existing per-plugin validation/error semantics while centralizing the
         runtime normalization and batch-aware fail-closed guard.
+
+        Also captures the INPUT ``schema:`` block, for the same reason and at the
+        same seam. ``consumed_input_fields`` reads ``_schema_config``'s
+        ``required_fields`` as one of its two NON-NEGOTIABLE members, so a
+        transform that passed its ``schema_config`` to the schema factory without
+        storing it kept the ``None`` class default and lost that limb — demoting
+        at runtime a field ``get_raw_node_required_fields`` still enforced at
+        build time (elspeth-3790106260). Capturing here rather than per plugin
+        makes the limb unconditional on every transform that validates a config.
+
+        ``TransformDataConfig.schema_config`` is required and non-None, and this
+        runs BEFORE any plugin-specific assignment, so a transform that rewrites
+        its schema config — ``BatchStats`` unions ``group_by`` into
+        ``required_fields`` — still overwrites this with the wider set.
         """
         declared_input_fields = validated_config.declared_input_fields
         if declared_input_fields and self.is_batch_aware:
@@ -587,6 +605,7 @@ class BaseTransform(ABC):
             )
         self._validated_config = validated_config
         self.declared_input_fields = declared_input_fields
+        self._schema_config = validated_config.schema_config
 
     def effective_static_contract(self) -> frozenset[str]:
         """Return the transform's public static output guarantee surface.
@@ -817,6 +836,61 @@ class BaseTransform(ABC):
         """
         return self.declared_output_fields
 
+    def _reject_input_options_naming_created_fields(self, input_naming_options: Mapping[str, str | None]) -> None:
+        """Reject config options that point an INPUT column at a field this transform creates.
+
+        An option like ``web_scrape.url_field`` names a column the transform
+        READS; the transform then writes its created fields onto the same row.
+        Aiming one at the other makes the transform consume its own output —
+        it reads the column for a URL and immediately overwrites it with the
+        scraped content — which is never what an author means.
+
+        Nothing else rejects the shape. ``TransformExecutor``'s collision check
+        compares ``declared_output_fields`` against the input keys OF A ROW, so
+        it cannot fire until a row actually carries the column, and under
+        ``mode: observed`` there is no declared field for DAG validation to
+        carry either. Both authoring surfaces accepted it silently
+        (elspeth-09dc6407f1).
+
+        Call at the END of ``__init__``, after ``declared_output_fields`` (or a
+        ``self_created_input_fields`` override) is populated — the created set
+        is read here, not captured, so an earlier call sees an empty set and
+        passes vacuously. Pass the option NAME with its resolved column so the
+        error can say which option to repoint; that is the actionable half, and
+        the created field is rarely the one to rename. ``None`` values are
+        skipped, so optional locator options can be passed unconditionally.
+
+        Every offending option is reported at once: repointing one must not
+        merely reveal the next.
+
+        Raises:
+            PluginConfigError: If any option names a created field. This is the
+                type the composer's probe tolerance recognizes
+                (``_is_config_probe_exception``), so a draft pipeline surfaces
+                a validation error rather than crashing validation.
+        """
+        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+
+        created = self.self_created_input_fields
+        offenders = sorted((option, column) for option, column in input_naming_options.items() if column is not None and column in created)
+        if not offenders:
+            return
+
+        validated_config = self._validated_config
+        cause = (
+            "; ".join(f"{option} names {column!r}, which {self.name} itself creates" for option, column in offenders)
+            + ". Point "
+            + " and ".join(option for option, _ in offenders)
+            + " at a column that ARRIVES on the row, or rename the created field."
+        )
+        raise PluginConfigError(
+            f"Invalid configuration for {self.name}: {cause}",
+            cause=cause,
+            plugin_class=None if validated_config is None else type(validated_config).__name__,
+            plugin_name=self.name,
+            component_type="transform",
+        )
+
     @property
     def consumed_input_fields(self) -> frozenset[str]:
         """Fields this transform READS from the row, which must stay required.
@@ -844,7 +918,18 @@ class BaseTransform(ABC):
         surface the DAG does not check, and leaves untouched exactly the surface
         it does. Compile-time and runtime contracts therefore cannot diverge. Drop
         either surface from this union and a field the DAG still enforces at build
-        time becomes demotable at runtime, silently splitting the two layers. The third is this transform's own config:
+        time becomes demotable at runtime, silently splitting the two layers.
+
+        That holds only while both surfaces are POPULATED, which is the harder
+        half. Deleting a member is visible; leaving one empty is not. Ten
+        transforms passed their validated ``schema_config`` to the schema factory
+        and never stored it, so ``_schema_config`` kept its ``None`` class default
+        and this limb contributed an empty frozenset — the same split, reached
+        without touching this method (elspeth-3790106260). Both surfaces are now
+        populated centrally in ``_initialize_declared_input_fields``, and
+        ``tests/invariants/test_input_schema_config_is_captured.py`` asserts the
+        build-time and runtime required sets agree across the live registry.
+        The third is this transform's own config:
         any option that NAMES A COLUMN (``field``, ``group_by``, ``*_field``)
         contributes its value, unless the option is listed in
         ``output_naming_config_keys``.

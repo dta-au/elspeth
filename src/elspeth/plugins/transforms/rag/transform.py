@@ -55,7 +55,7 @@ class RAGRetrievalTransform(BaseTransform):
 
     name = "rag_retrieval"
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:68c81d582151d7be"
+    source_file_hash: str | None = "sha256:eaaa6cc43af4fb75"
     determinism: Determinism = Determinism.EXTERNAL_CALL
     config_model = RAGRetrievalConfig
     passes_through_input = True
@@ -184,6 +184,7 @@ class RAGRetrievalTransform(BaseTransform):
                 self._field_sources,
             ]
         )
+        self._reject_input_options_naming_created_fields({"query_field": self._rag_config.query_field})
 
         # Schemas — RAG adds fields, so output uses observed mode
         self.input_schema, self.output_schema = self._create_schemas(

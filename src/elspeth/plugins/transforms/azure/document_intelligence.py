@@ -270,7 +270,10 @@ class AzureDocumentIntelligenceConfig(TransformDataConfig):
     @property
     def declared_input_fields(self) -> frozenset[str]:
         """Declare ``source_field`` as required input so a missing reference is caught at
-        DAG/compose validation, not per-row at runtime (mirrors web_scrape's url_field)."""
+        DAG/compose validation rather than per-row at runtime (mirrors web_scrape's
+        url_field). That holds only where the upstream contract PARTICIPATES in the
+        guarantee vote: against an observed producer both static surfaces abstain by
+        design and the executor's per-row check stays the only enforcement."""
         return super().declared_input_fields | frozenset({self.source_field})
 
 
@@ -290,7 +293,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
     # Placeholder must be a sha256: literal so the hash normalizer matches it; recomputed by scripts/cicd/plugin_hash.
-    source_file_hash: str | None = "sha256:ba6c5e9717f41af7"
+    source_file_hash: str | None = "sha256:ac9091aa4e81f2d4"
     config_model = AzureDocumentIntelligenceConfig
     passes_through_input = True
     creates_tokens = False
@@ -374,6 +377,7 @@ class AzureDocumentIntelligence(BaseTransform, BatchTransformMixin):
         )
 
         self.declared_output_fields = frozenset(cfg.all_output_field_names())
+        self._reject_input_options_naming_created_fields({"source_field": cfg.source_field})
 
         schema_config = cfg.schema_config
         self.input_schema = create_schema_from_config(schema_config, "AzureDocumentIntelligenceInput", allow_coercion=False)

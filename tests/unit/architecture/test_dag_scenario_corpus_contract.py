@@ -444,12 +444,15 @@ EXPECTED_EVIDENCE_REGISTRY_SHA256 = "211538c740e06377a83f3c85a19e4326c72235b8fb8
 # corpus manifest. Rotated 2026-08-05 for the json_explode PH3 refresh
 # (elspeth-7a2c9a24c3): the manifest's expected node record carries that hash.
 # Rotated again 2026-08-05 for the value_transform PH3 refresh
-# (elspeth-d6eeb3a71d). Verified mechanical each time: the manifest diff is a
-# two lines swapping only hash tokens on the value_transform and json_explode
-# node records — schema_fields, schema_hash and schema_mode are unchanged (all
+# (elspeth-d6eeb3a71d). Rotated again 2026-08-06 for the value_transform PH3
+# refresh from the alias-aware read-analysis fix (elspeth-f605f0a94e): only the
+# three value_transform ``source_file_hash`` tokens on the union-collision-fail
+# node records changed. Verified mechanical each time: a field-by-field diff of
+# the live durable projection against the frozen expectation showed every other
+# field equal — schema_fields, schema_hash and schema_mode are unchanged (all
 # observed/null), and the csv/json source_file_hashes on the same line are
 # byte-identical, so no audit projection material moved.
-EXPECTED_CASE_REGISTRY_SHA256 = "1069a5695c945ff85e4ba00459f3fe330638229f63f529a60a72e97f7edf4f19"
+EXPECTED_CASE_REGISTRY_SHA256 = "84203d078ceb746c07004f9a7c485c6919a919eb0bfd4b130f1cb8150ac7d4f6"
 B2_COALESCE_POSITIVE_CASE_IDS = (
     "require-all-union",
     "require-all-nested",

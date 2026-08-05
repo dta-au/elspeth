@@ -1176,6 +1176,54 @@ def test_static_bucket_and_bucket_field_are_mutually_exclusive() -> None:
         _load(bucket="operator-owned-docs")
 
 
+# ── Input options must name arriving columns, not created ones ─────────────
+#
+# key_field / bucket_field / version_field locate the document; the output
+# targets are written back onto the same row. Pointing a locator at a target
+# makes the transform overwrite the column it reads. Nothing downstream
+# catches it: the executor's collision check compares declared_output_fields
+# against the input keys OF THE ROW, so it fires only once a row carries the
+# column, and under mode: observed there is no declared field for DAG
+# validation to carry (elspeth-09dc6407f1).
+
+
+@pytest.mark.parametrize("option", ["key_field", "bucket_field", "version_field"])
+def test_a_document_locator_naming_an_output_target_is_rejected(option: str) -> None:
+    with pytest.raises(PluginConfigError, match=f"{option} names 'textract_text', which aws_textract_document_analysis itself creates"):
+        AWSTextractDocumentAnalysis(_config(**{option: "textract_text"}))
+
+
+def test_a_locator_naming_an_extract_facet_target_is_rejected() -> None:
+    with pytest.raises(PluginConfigError, match="key_field names 'textract_forms', which aws_textract_document_analysis itself creates"):
+        AWSTextractDocumentAnalysis(_config(key_field="textract_forms", extract={"forms": "textract_forms"}))
+
+
+def test_the_error_names_the_offending_value_and_the_plugin() -> None:
+    with pytest.raises(PluginConfigError) as excinfo:
+        AWSTextractDocumentAnalysis(_config(bucket_field="textract_text"))
+
+    message = str(excinfo.value)
+    assert "bucket_field names 'textract_text', which aws_textract_document_analysis itself creates" in message
+    assert "Point bucket_field at a column that ARRIVES on the row" in message
+
+
+def test_every_offending_locator_is_named_at_once() -> None:
+    """One pass over the options, so repointing one does not just reveal the next."""
+    with pytest.raises(PluginConfigError) as excinfo:
+        AWSTextractDocumentAnalysis(_config(key_field="textract_text", bucket_field="textract_text"))
+
+    message = str(excinfo.value)
+    assert "bucket_field names 'textract_text'" in message
+    assert "key_field names 'textract_text'" in message
+    assert "Point bucket_field and key_field at a column that ARRIVES on the row" in message
+
+
+def test_locators_naming_arriving_columns_still_construct() -> None:
+    transform = AWSTextractDocumentAnalysis(_config(version_field="document_version"))
+
+    assert transform.declared_input_fields == frozenset({"document_bucket", "document_key", "document_version"})
+
+
 def test_one_of_static_bucket_or_bucket_field_is_required() -> None:
     config = _config()
     config.pop("bucket_field")

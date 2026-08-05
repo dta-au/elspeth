@@ -630,21 +630,54 @@ class TestValueTransformDemotesSelfCreatedInputs:
 
         assert transform.input_schema.model_fields["price"].is_required()
 
-    def test_dynamic_read_before_an_unread_required_target_is_rejected(self) -> None:
-        """The genuinely undecidable shape still fails closed at construction."""
-        from elspeth.plugins.infrastructure.config_base import PluginConfigError
+    def test_dynamic_read_before_an_unread_required_target_stays_required(self) -> None:
+        """A sibling's dynamic read withholds the demotion — it does not reject.
+
+        ``product``'s own expression reads nothing, so nothing about IT is
+        unanalysable; only the earlier unrelated subscript is. Rejecting on that
+        basis made the verdict depend on operation ORDER: the identical pair
+        listed the other way round builds (see the order test below). The
+        earlier dynamic read could still consume ``product`` from the input row,
+        so it must not be demoted either — the config is unprovable, not broken,
+        and unprovable means honour the author's ``required`` declaration
+        (elspeth-f6ddcebbe3, which mandates this inversion).
+        """
         from elspeth.plugins.transforms.value_transform import ValueTransform
 
-        with pytest.raises(PluginConfigError, match="read/create status cannot be determined"):
-            ValueTransform(
-                {
-                    "schema": {"mode": "flexible", "fields": [{"name": "product", "field_type": "str"}]},
-                    "operations": [
-                        {"target": "other", "expression": "row[row['k']]"},
-                        {"target": "product", "expression": "'x'"},
-                    ],
-                }
-            )
+        transform = ValueTransform(
+            {
+                "schema": {"mode": "flexible", "fields": [{"name": "product", "field_type": "str"}]},
+                "operations": [
+                    {"target": "other", "expression": "row[row['k']]"},
+                    {"target": "product", "expression": "'x'"},
+                ],
+            }
+        )
+
+        assert transform.input_schema.model_fields["product"].is_required()
+
+    def test_dynamic_read_position_does_not_change_whether_the_config_builds(self) -> None:
+        """Rejection is order-independent; demotion legitimately is not.
+
+        The same two operations in either order describe the same pipeline, so
+        one order must not reject while the other builds (elspeth-f6ddcebbe3).
+        Demotion is a different question: operations apply SEQUENTIALLY, so
+        whether a target is already assigned when a read runs genuinely depends
+        on position. Listed first, ``product`` is provably created before any
+        read and is demoted; listed after the dynamic subscript, that read could
+        have consumed it from the input row, so the requirement stands.
+        """
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        schema = {"mode": "flexible", "fields": [{"name": "product", "field_type": "str"}]}
+        dynamic_read = {"target": "other", "expression": "row[row['k']]"}
+        literal_write = {"target": "product", "expression": "'x'"}
+
+        dynamic_first = ValueTransform({"schema": schema, "operations": [dynamic_read, literal_write]})
+        literal_first = ValueTransform({"schema": schema, "operations": [literal_write, dynamic_read]})
+
+        assert dynamic_first.input_schema.model_fields["product"].is_required()
+        assert not literal_first.input_schema.model_fields["product"].is_required()
 
     def test_dynamic_key_read_is_legal_when_no_target_is_declared_required(self) -> None:
         """The abstention only matters when a declared required field is at stake."""
@@ -658,6 +691,102 @@ class TestValueTransformDemotesSelfCreatedInputs:
         )
 
         assert transform.input_schema.model_fields["other"].is_required()
+
+    def test_original_header_read_of_its_own_target_stays_required(self) -> None:
+        """A self-overwrite spelled with the ORIGINAL header is still a read.
+
+        ``PipelineRow`` resolves a field under both its normalized_name and its
+        original_name, and ``process`` rebuilds the row each operation precisely
+        to preserve that. So ``row['Price USD']`` reads the very field the
+        operation targets, and comparing the two spellings with string equality
+        classified the overwrite as a creation and dropped a genuine input
+        requirement (elspeth-f605f0a94e).
+        """
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": {
+                    "mode": "fixed",
+                    "fields": [{"name": "price_usd", "type": "float", "required": True, "nullable": False}],
+                },
+                "operations": [{"target": "price_usd", "expression": "row['Price USD'] * 1.05"}],
+            }
+        )
+
+        assert transform.self_created_input_fields == frozenset()
+        assert transform.demoted_input_fields == frozenset()
+        assert transform.input_schema.model_fields["price_usd"].is_required()
+        with pytest.raises(ValidationError):
+            transform.input_schema.model_validate({}, strict=True)
+
+    def test_original_header_read_settles_a_target_beside_a_dynamic_sibling_read(self) -> None:
+        """The alias read CONSUMES the target — it does not merely leave it unproven.
+
+        Discriminates the two ways a target can end up required. An unresolved
+        subscript in the target's own expression makes its status undecidable
+        and is rejected at construction; a resolved read — including one spelled
+        with the original header — settles the target as a genuine input, which
+        the sibling subscript cannot unsettle. Building at all is the assertion.
+        """
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": {"mode": "flexible", "fields": [{"name": "price_usd", "field_type": "float"}]},
+                "operations": [{"target": "price_usd", "expression": "row[row['k']] + row['Price USD']"}],
+            }
+        )
+
+        assert transform.input_schema.model_fields["price_usd"].is_required()
+
+    def test_original_header_read_of_an_already_created_target_keeps_the_demotion(self) -> None:
+        """Alias resolution must not turn a later read of a CREATED field into an input.
+
+        The mirror of the case above: operation 2 reads what operation 1 wrote,
+        just spelled with the original header. Sequential visibility means that
+        read sees the computed value, so ``price_usd`` is still created here and
+        must stay demoted — matching alias spellings on reads alone, without
+        matching them on assignments too, would silently lose the demotion.
+        """
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": {"mode": "flexible", "fields": [{"name": "price_usd", "field_type": "float"}]},
+                "operations": [
+                    {"target": "price_usd", "expression": "1.0"},
+                    {"target": "with_tax", "expression": "row['Price USD'] * 2"},
+                ],
+            }
+        )
+
+        assert transform.self_created_input_fields == frozenset({"price_usd", "with_tax"})
+        assert not transform.input_schema.model_fields["price_usd"].is_required()
+
+    def test_dynamic_reassignment_cannot_unsettle_an_earlier_proven_creation(self) -> None:
+        """A target's FIRST assignment settles it; a later dynamic key cannot revoke that.
+
+        ``x`` is provably created by operation 1 — nothing precedes it that could
+        read the field off the input row. Operation 2's unresolvable subscript
+        runs against a row that already carries the computed ``x``, so it says
+        nothing about the input. The old set arithmetic subtracted the
+        undecidable set from the created set unconditionally, letting operation 2
+        overturn operation 1's proof and reject the config outright.
+        """
+        from elspeth.plugins.transforms.value_transform import ValueTransform
+
+        transform = ValueTransform(
+            {
+                "schema": {"mode": "flexible", "fields": [{"name": "x", "field_type": "int"}]},
+                "operations": [
+                    {"target": "x", "expression": "1"},
+                    {"target": "x", "expression": "row[row['k']]"},
+                ],
+            }
+        )
+
+        assert not transform.input_schema.model_fields["x"].is_required()
 
     def test_observed_mode_targets_stay_legal(self) -> None:
         """Observed mode declares no required inputs, so targets never contradict it."""

@@ -28,6 +28,25 @@ from elspeth.core.expression_parser import (
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.config_base import TransformDataConfig
 from elspeth.plugins.infrastructure.results import TransformResult
+from elspeth.plugins.sources.field_normalization import ExternalHeaderError, normalize_field_name
+
+
+def _row_key_aliases(name: str) -> frozenset[str]:
+    """Every spelling under which ``name`` can resolve on a ``PipelineRow``.
+
+    A row resolves a field under BOTH its normalized_name and its original_name
+    (``SchemaContract.find_name``), and sources derive the former from the
+    latter with ``normalize_field_name``. So an operation target and an
+    expression literal name the same field whenever their alias sets meet, and
+    string equality is not that test.
+
+    A literal that normalizes to nothing names no field at all: the source
+    boundary rejects such a header, so no contract can carry one.
+    """
+    try:
+        return frozenset({name, normalize_field_name(name)})
+    except ExternalHeaderError:
+        return frozenset({name})
 
 
 def _retype_contract_field(
@@ -124,16 +143,18 @@ class ValueTransformConfig(TransformDataConfig):
         input — ``BaseTransform.input_schema`` demotes these to optional
         (elspeth-d6eeb3a71d).
 
-        An operation that reads its own target (``row['price'] * 1.1``) — or
-        any target read before its first assignment — is a genuine input
-        consumer and is NOT reported, so its input requirement survives.
+        An operation that reads its own target (``row['price'] * 1.1``, or the
+        same field under its original header) — or any target read before its
+        first assignment — is a genuine input consumer and is NOT reported, so
+        its input requirement survives.
 
         Conservative, and scoped PER TARGET: a read that cannot be statically
         resolved to a literal key (``row[row['k']]``) leaves undecidable only
-        those targets not already proven to be read — never the whole operation
-        list. See ``_analyse_operation_reads`` for why, and for the residual
-        that scoping accepts. An undecidable target that is also declared
-        required is rejected at construction by
+        the target of the operation carrying it, and merely unproven — required
+        but not rejected — those assigned after it. See
+        ``_analyse_operation_reads`` for why, and for the residuals that scoping
+        accepts. An undecidable target that is also declared required is
+        rejected at construction by
         ``_reject_unanalysable_reads_over_required_targets``.
 
         Supersedes the construction-time rejection landed as 7a5d72d34. That
@@ -149,18 +170,33 @@ class ValueTransformConfig(TransformDataConfig):
         return created
 
     def _analyse_operation_reads(self) -> tuple[frozenset[str], dict[str, str]]:
-        """Classify every target as read, created, or undecidable.
+        """Classify every target as read, created, undecidable, or unproven.
 
         Returns ``(created_before_read, {undecidable_target: blocking_expression})``.
+        A target in NEITHER result is UNPROVEN: not demoted and not rejected, so
+        the author's declaration stands. Only a proof demotes; only a proof of
+        the target's own unanalysability rejects.
 
-        Abstention is scoped to the TARGET, never to the whole operation list.
-        An unresolvable subscript makes it impossible to know which fields THAT
-        expression reads, so it can only cast doubt on targets not yet proven to
-        be read; a target with a literal read of its own name is settled, and a
-        sibling operation's dynamic key cannot unsettle it. Abandoning the whole
-        analysis on the first unresolvable read (as this did originally) rejected
-        provably-fine configs — the same false-unsatisfiability claim the
-        7a5d72d34 guard was retracted for.
+        Names are compared across every spelling a row resolves, not by string
+        equality. Targets and ``schema.fields`` are written in the normalized
+        name space while an expression literal may be the source's original
+        header, and a row resolves both — so ``row['Price USD']`` reads the very
+        field ``target: price_usd`` overwrites. Comparing the raw strings called
+        that a creation and dropped a genuine input requirement
+        (elspeth-f605f0a94e). Both sides expand to ``_row_key_aliases``, on
+        ASSIGNMENTS as well as reads: a later read of a field an earlier
+        operation wrote sees the computed value whichever spelling it uses, and
+        matching aliases on reads alone would lose that demotion.
+
+        Abstention is scoped to the TARGET, and only the target's OWN expression
+        can make it undecidable. An unresolvable subscript elsewhere in the list
+        means some earlier operation might have consumed this target from the
+        input row, so it is not provably created — but neither is it provably
+        broken, and rejecting on that basis made the verdict depend on operation
+        ORDER: the same pair listed the other way round built (elspeth-f6ddcebbe3).
+        Such a target is left unproven, which withholds the demotion without
+        inventing an unsatisfiability — the same false claim the 7a5d72d34 guard
+        was retracted for.
 
         KNOWN RESIDUAL, ACCEPTED DELIBERATELY — DO NOT ADD A GUARD FOR IT.
         Per-target scoping means a dynamic read is no longer treated as reading
@@ -177,40 +213,61 @@ class ValueTransformConfig(TransformDataConfig):
           exists when the dynamic read runs, so that read sees the COMPUTED
           value, never the input — demotion cannot affect it.
         * The genuinely unsafe shape is a dynamic read ordered BEFORE a demoted
-          target's assignment, and that shape is ALREADY REJECTED here: such a
-          read leaves the later target undecidable, so a declared-required
-          target trips the validator below. Swapping the two operations above
-          turns the config from BUILDS into a construction error.
+          target's assignment, and demotion is exactly what that shape does not
+          get: the earlier dynamic read leaves the later target unproven, so it
+          keeps its declared requirement. Swapping the two operations above
+          turns ``total`` from demoted into required — the hazard is closed by
+          withholding the demotion, not by rejecting the config.
 
         What is left is a dynamic key that resolves to a demoted field never
         assigned earlier — which fails as a KeyError from the dynamic key
         itself, a hazard inherent to non-literal subscripts rather than one
         demotion introduces. No shipped config uses a dynamic key at all
         (``row[row[`` appears nowhere in examples/, tests/fixtures/ or docs/).
-        The conservative alternative is whole-list abstention, which is exactly
-        the behaviour removed above for rejecting configs that work today: a
-        live false-reject is not worth trading for a theoretical one.
+
+        Alias resolution has its own residual, accepted on the same terms. It
+        reproduces the SOURCE boundary's original-to-normalized mapping, which
+        is the shipped way two spellings come to name one field; a
+        ``field_mapping`` rename can break that correspondence, so a literal
+        whose normalization matches no target could still resolve to one. The
+        upstream mapping does not exist at config time, so the only sound
+        alternative is to treat every unrecognised literal as a possible read of
+        every target — which withholds the demotion from the ordinary
+        ``{total: "row['price'] * row['qty']"}`` shape and restores the
+        elspeth-d6eeb3a71d trap it exists to prevent. A live false requirement
+        is not worth trading for a theoretical missed one.
         """
-        assigned: set[str] = set()
-        read_before_assign: set[str] = set()
+        assigned_keys: set[str] = set()
+        read_keys: set[str] = set()
+        created: set[str] = set()
         undecidable: dict[str, str] = {}
-        blocking_expression: str | None = None
+        classified: set[str] = set()
+        dynamic_read_seen = False
 
         for op in self.operations:
             reads = op.get_parser().static_field_reads()
-            # Literal reads resolve even in an expression that is incomplete
-            # overall, and they count before this operation's own assignment.
-            read_before_assign |= reads.fields - assigned
-            if not reads.complete and blocking_expression is None:
-                blocking_expression = op.expression
-            if op.target not in read_before_assign and blocking_expression is not None:
-                # Some earlier-or-current expression could have read this target
-                # before it was assigned; we cannot prove it is created here.
-                undecidable[op.target] = blocking_expression
-            assigned.add(op.target)
+            for literal in reads.fields:
+                literal_keys = _row_key_aliases(literal)
+                # Literal reads resolve even in an expression that is incomplete
+                # overall. A read of an already-assigned field sees the computed
+                # value, so it is not a read of the input row.
+                if literal_keys.isdisjoint(assigned_keys):
+                    read_keys |= literal_keys
+            target_keys = _row_key_aliases(op.target)
+            # The FIRST assignment settles a target: it fixes the window of
+            # operations that could have read the field off the input row.
+            if op.target not in classified:
+                classified.add(op.target)
+                if target_keys.isdisjoint(read_keys):
+                    if not reads.complete:
+                        undecidable[op.target] = op.expression
+                    elif not dynamic_read_seen:
+                        created.add(op.target)
+            assigned_keys |= target_keys
+            if not reads.complete:
+                dynamic_read_seen = True
 
-        created = frozenset(assigned - read_before_assign - set(undecidable))
-        return created, undecidable
+        return frozenset(created), undecidable
 
     @model_validator(mode="after")
     def _reject_unanalysable_reads_over_required_targets(self) -> ValueTransformConfig:
@@ -225,8 +282,11 @@ class ValueTransformConfig(TransformDataConfig):
         Deliberately much narrower than the guard removed from 7a5d72d34: that
         one fired when the analysis SUCCEEDED and proved the field was created,
         which is exactly the case demotion now handles. This one fires only for a
-        target whose OWN status is undecidable — a provable read or a provable
-        creation is never rejected, whatever a sibling operation does.
+        target whose OWN assigning expression carries the non-literal subscript.
+        A provable read, a provable creation, and a target merely stranded by
+        some OTHER operation's dynamic key are all left alone — the last of
+        those keeps its declared requirement instead, since an unprovable config
+        is not a broken one (elspeth-f6ddcebbe3).
         """
         declared_fields = self.schema_config.fields
         if not declared_fields:
@@ -275,7 +335,7 @@ class ValueTransform(BaseTransform):
     name = "value_transform"
     determinism = Determinism.DETERMINISTIC
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:69c86168099b080d"
+    source_file_hash: str | None = "sha256:05a567ef753e5833"
     config_model = ValueTransformConfig
     passes_through_input = True
     usage_when_to_use: str = (

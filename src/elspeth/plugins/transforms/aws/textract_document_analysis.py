@@ -374,7 +374,7 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
     name = "aws_textract_document_analysis"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:4dc903fb793e84f4"
+    source_file_hash: str | None = "sha256:c66b7e92392fba68"
     config_model = AWSTextractDocumentAnalysisConfig
     passes_through_input = True
     creates_tokens = False
@@ -460,6 +460,13 @@ class AWSTextractDocumentAnalysis(BaseTransform, BatchTransformMixin):
         )
 
         self.declared_output_fields = frozenset(cfg.all_output_field_names())
+        self._reject_input_options_naming_created_fields(
+            {
+                "bucket_field": cfg.bucket_field,
+                "key_field": cfg.key_field,
+                "version_field": cfg.version_field,
+            }
+        )
         self.input_schema, self.output_schema = self._create_schemas(
             cfg.schema_config,
             "AWSTextractDocumentAnalysis",
