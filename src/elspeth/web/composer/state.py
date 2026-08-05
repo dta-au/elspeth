@@ -2795,11 +2795,17 @@ def _check_schema_contracts(
         allows extra fields. A non-extras-allowing (``mode: fixed``) contract
         is enforced with ``extra='forbid'`` at the transform's own input
         preflight: rows either match the declared set exactly or die AT this
-        node, never downstream of it. For that case the emit set is pinned to
-        the declared effective set — Rule A at this node's own locked input
-        owns reporting the extras, and letting the declared-set fallback
-        compose upstream fields through it would cascade the same defect into
-        a spurious second report at the next consumer.
+        node, never downstream of it — so propagation always stops here, and
+        Rule A at this node's own locked input owns reporting the extras. The
+        firewall governs only the PROPAGATION answer, never the emit set: a
+        plugin-computed ``guaranteed_fields`` stays authoritative (the
+        declared effective set unions declared-required input fields — for a
+        reductive transform, exactly the fields it drops — and substituting
+        it would invent extras the runtime never emits). Only when no
+        computed set exists does the firewall pin the emit prediction to the
+        declared effective set, which also stops the declared-set fallback
+        composing upstream fields through it and re-reporting the same
+        defect one consumer downstream.
         """
         if is_source_producer_id(producer.producer_id):
             return _effective_producer_guarantees(producer), False
@@ -2830,12 +2836,18 @@ def _check_schema_contracts(
         try:
             output_config = transform._output_schema_config
             passes_through = transform.passes_through_input
-            if output_config is not None and not output_config.allows_extra_fields:
-                return output_config.get_effective_guaranteed_fields(), False
-            if output_config is None or output_config.guaranteed_fields is None:
-                # No computed emit set available — fall back to declared.
+            if output_config is None:
                 return _effective_producer_guarantees(producer), passes_through
-            return frozenset(output_config.guaranteed_fields), passes_through
+            extras_firewall = not output_config.allows_extra_fields
+            propagates = passes_through and not extras_firewall
+            if output_config.guaranteed_fields is not None:
+                # The plugin computed its own emit set — authoritative, and the
+                # only set that stays correct for REDUCTIVE transforms.
+                return frozenset(output_config.guaranteed_fields), propagates
+            if extras_firewall:
+                return output_config.get_effective_guaranteed_fields(), False
+            # No computed emit set available — fall back to declared.
+            return _effective_producer_guarantees(producer), propagates
         finally:
             transform.close()
 
