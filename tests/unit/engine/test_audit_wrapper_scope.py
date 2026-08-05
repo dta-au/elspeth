@@ -144,3 +144,44 @@ def test_sink_boundary_failure_outcomes_wrap_typed_recorder_failures() -> None:
             phase="boundary_check",
             violation=violation,
         )
+
+
+def test_sink_boundary_failure_outcomes_terminalize_every_token_in_the_batch() -> None:
+    """EVERY token in a failing batch gets a terminal outcome, not just the first.
+
+    Sinks write batches; a boundary violation fails the whole batch. Recording
+    an outcome for only some of its tokens leaves the rest pending forever on a
+    FAILED run — the "emitted=N, terminal=N-k" contradiction elspeth-82d4c5146c
+    and elspeth-207c9fbb0b exist to prevent, reintroduced for any batch of more
+    than one row.
+
+    Every other test of this helper uses a single-token batch, so truncating the
+    loop (``for token in tokens[:1]``) passes the entire suite. This is the case
+    that discriminates.
+    """
+    data_flow = _RecordingDataFlow()
+    executor = SinkExecutor(
+        execution=object(),
+        data_flow=data_flow,
+        span_factory=SpanFactory(),
+        run_id="run-1",
+    )
+    tokens = [make_token_info(token_id=f"token-{i}", row_id=f"row-{i}") for i in range(1, 4)]
+    # The violation names ONE failing token; the whole batch still fails.
+    violation = _make_violation(token_id=tokens[0].token_id, row_id=tokens[0].row_id)
+    _attach_contract_name_from_dispatcher(violation, "test_contract")
+
+    executor._record_boundary_failure_outcomes(
+        tokens=tokens,
+        sink_name="output",
+        phase="boundary_check",
+        violation=violation,
+    )
+
+    recorded = {call["ref"].token_id for call in data_flow.token_outcomes}
+    assert recorded == {"token-1", "token-2", "token-3"}
+    # Each token's context is rebuilt for its own row, not the triggering one.
+    by_token = {call["ref"].token_id: call["context"] for call in data_flow.token_outcomes}
+    assert by_token["token-2"]["token_id"] == "token-2"
+    assert by_token["token-2"]["row_id"] == "row-2"
+    assert by_token["token-2"]["failing_token_id"] == "token-1"
